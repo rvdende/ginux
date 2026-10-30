@@ -4282,10 +4282,7 @@ unsafe fn checksum(bytes: *const u8, length: usize) -> u8 {
 }
 
 fn verify_initial_frame_allocation(boot_info: &BootInfo) -> bool {
-    if !memory::initialize(
-        boot_info,
-        arch::x86_64::paging::INITIAL_IDENTITY_LIMIT as u64,
-    ) {
+    if !memory::initialize(boot_info, arch::x86_64::paging::direct_map_limit() as u64) {
         return false;
     }
     if !memory::verify_reservation_invariants() {
@@ -4335,10 +4332,7 @@ fn verify_initial_frame_allocation(boot_info: &BootInfo) -> bool {
         let scrubbed = reused.iter().all(|frame| frame_is_zero(*frame));
         scrubbed
             && memory::release_frames(memory::FrameOwner::KERNEL, reused)
-            && !memory::initialize(
-                boot_info,
-                arch::x86_64::paging::INITIAL_IDENTITY_LIMIT as u64,
-            )
+            && !memory::initialize(boot_info, arch::x86_64::paging::direct_map_limit() as u64)
     }
 }
 

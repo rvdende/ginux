@@ -1,4 +1,5 @@
 use core::arch::asm;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{pe::ImageSummary, BootInfo, UefiMemoryDescriptor, EFI_RUNTIME_SERVICES_CODE};
 
@@ -26,6 +27,9 @@ const MMIO_PDPT_INDEX: usize = ENTRY_COUNT - 1;
 const MMIO_WINDOW_BASE: usize = DIRECT_MAP_BASE + MMIO_PDPT_INDEX * (1 << 30);
 const FRAMEBUFFER_PDPT_INDEX: usize = ENTRY_COUNT - 2;
 const FRAMEBUFFER_WINDOW_BASE: usize = DIRECT_MAP_BASE + FRAMEBUFFER_PDPT_INDEX * (1 << 30);
+const GIBIBYTE: u64 = 1 << 30;
+const CPUID_EXTENDED_FEATURES: u32 = 0x8000_0001;
+const CPUID_PAGE_1GB: u32 = 1 << 26;
 const PAT_MSR: u32 = 0x277;
 // WB, WC, UC-, UC repeated. Entry 1 (PWT only) is write-combining instead of
 // the power-on write-through; every other mapping that sets PWT also sets PCD.
@@ -446,6 +450,30 @@ static mut FINE_PAGE_TABLES: [PageTable; MAX_FINE_TABLES] =
 static mut MMIO_DIRECTORY: PageTable = PageTable([0; ENTRY_COUNT]);
 static mut MMIO_TABLE: PageTable = PageTable([0; ENTRY_COUNT]);
 static mut FRAMEBUFFER_DIRECTORY: PageTable = PageTable([0; ENTRY_COUNT]);
+/// End of the physical range reachable through the direct map.
+static DIRECT_MAP_LIMIT: AtomicUsize = AtomicUsize::new(INITIAL_IDENTITY_LIMIT);
+
+/// Returns the end of the physical range the direct map covers.
+pub(crate) fn direct_map_limit() -> usize {
+    DIRECT_MAP_LIMIT.load(Ordering::Acquire)
+}
+
+/// Returns the end of the highest RAM region in the UEFI memory map.
+fn ram_end(boot_info: &BootInfo) -> u64 {
+    const RAM_TYPES: [u32; 6] = [1, 2, 3, 4, 7, 9];
+    let count = boot_info.memory_map_size / boot_info.memory_descriptor_size;
+    (0..count)
+        .map(|index| unsafe { read_descriptor(boot_info, index) })
+        .filter(|descriptor| RAM_TYPES.contains(&descriptor.memory_type))
+        .filter_map(|descriptor| {
+            descriptor
+                .page_count
+                .checked_mul(PAGE_SIZE as u64)
+                .and_then(|size| descriptor.physical_start.checked_add(size))
+        })
+        .max()
+        .unwrap_or(0)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -556,6 +584,20 @@ pub(crate) unsafe fn install_initial_identity_map(
                 .add(entry_index)
                 .write(physical_address | PRESENT | WRITABLE | LARGE_PAGE | NO_EXECUTE);
         }
+    }
+
+    // RAM above 4 GiB joins the direct map as 1 GiB pages, below the
+    // framebuffer and MMIO windows at the top of the slot.
+    let gibibytes = (ram_end(boot_info).div_ceil(GIBIBYTE) as usize).min(FRAMEBUFFER_PDPT_INDEX);
+    if gibibytes > DIRECTORY_COUNT
+        && core::arch::x86_64::__cpuid(CPUID_EXTENDED_FEATURES).edx & CPUID_PAGE_1GB != 0
+    {
+        for index in DIRECTORY_COUNT..gibibytes {
+            direct_pdpt
+                .add(index)
+                .write((index as u64 * GIBIBYTE) | PRESENT | WRITABLE | LARGE_PAGE | NO_EXECUTE);
+        }
+        DIRECT_MAP_LIMIT.store(gibibytes << 30, Ordering::Release);
     }
 
     let framebuffer = match framebuffer {
@@ -1409,7 +1451,7 @@ pub(crate) fn direct_map_range_address(physical: u64, length: usize) -> Option<u
     }
     let physical = usize::try_from(physical).ok()?;
     let end = physical.checked_add(length)?;
-    if end > INITIAL_IDENTITY_LIMIT {
+    if end > direct_map_limit() {
         return None;
     }
     DIRECT_MAP_BASE.checked_add(physical)
@@ -1420,12 +1462,13 @@ pub(crate) fn direct_map_address(physical: usize) -> Option<usize> {
 }
 
 pub(crate) fn direct_map_translation_is_bounded() -> bool {
-    direct_map_range_address(0, 1) == Some(DIRECT_MAP_BASE)
-        && direct_map_range_address((INITIAL_IDENTITY_LIMIT - 1) as u64, 1)
-            == Some(DIRECT_MAP_BASE + INITIAL_IDENTITY_LIMIT - 1)
+    let limit = direct_map_limit();
+    (INITIAL_IDENTITY_LIMIT..=FRAMEBUFFER_PDPT_INDEX << 30).contains(&limit)
+        && direct_map_range_address(0, 1) == Some(DIRECT_MAP_BASE)
+        && direct_map_range_address((limit - 1) as u64, 1) == Some(DIRECT_MAP_BASE + limit - 1)
         && direct_map_range_address(0, 0).is_none()
-        && direct_map_range_address(INITIAL_IDENTITY_LIMIT as u64, 1).is_none()
-        && direct_map_range_address((INITIAL_IDENTITY_LIMIT - 1) as u64, 2).is_none()
+        && direct_map_range_address(limit as u64, 1).is_none()
+        && direct_map_range_address((limit - 1) as u64, 2).is_none()
         && direct_map_range_address(u64::MAX, 1).is_none()
 }
 
