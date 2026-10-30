@@ -14435,9 +14435,11 @@ fn linux_runtime_brk(requested: u64) -> u64 {
     else {
         return current;
     };
+    // Pages below the initial limit are reserved at exec, so a break that
+    // stays inside them maps or releases nothing.
     if new_end > old_end {
         let start = old_end.max(initial_limit);
-        let pages = ((new_end - start) / PAGE_SIZE as u64) as usize;
+        let pages = (new_end.saturating_sub(start) / PAGE_SIZE as u64) as usize;
         let additional_pages = (0..pages)
             .filter(|page| {
                 !address_space::current_linux_runtime_page(start + (*page * PAGE_SIZE) as u64)
@@ -14458,7 +14460,7 @@ fn linux_runtime_brk(requested: u64) -> u64 {
         }
     } else if new_end < old_end {
         let start = new_end.max(initial_limit);
-        let pages = ((old_end - start) / PAGE_SIZE as u64) as usize;
+        let pages = (old_end.saturating_sub(start) / PAGE_SIZE as u64) as usize;
         for page in 0..pages {
             if !release_linux_runtime_page(address_space::remove_current_linux_runtime_page(
                 start + (page * PAGE_SIZE) as u64,
