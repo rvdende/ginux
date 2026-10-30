@@ -1,3 +1,15 @@
+//! Physical frame allocator.
+//!
+//! Every page of usable RAM has an 8-byte metadata word (generation, owner
+//! slot, and a live flag) and a bit in a free bitmap. Both tables are sized to
+//! the installed memory and carved from it at boot, so lookups are O(1) and no
+//! compile-time table limits how much memory can be in use.
+//!
+//! Single frames are taken lowest-first, which keeps page tables and DMA
+//! buffers below 4 GiB for as long as possible. Large contiguous extents, such
+//! as OCI layer staging and unpacked image filesystems, are taken
+//! highest-first so they do not exhaust low memory.
+
 use crate::{
     arch::x86_64::paging, BootInfo, UefiMemoryDescriptor, EFI_BOOT_SERVICES_CODE,
     EFI_BOOT_SERVICES_DATA, EFI_CONVENTIONAL_MEMORY,
@@ -7,13 +19,12 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 const PAGE_SIZE: u64 = 4096;
 const LOW_MEMORY_LIMIT: u64 = 1024 * 1024;
-const MAX_RANGES: usize = 128;
-const MAX_RECYCLED_FRAMES: usize = 262_144;
-const MAX_LIVE_FRAMES: usize = 262_144;
-const MAX_LIVE_INDEX: usize = MAX_LIVE_FRAMES * 2;
 const DOMAIN_FRAME_LIMIT: usize = 192;
-const LIVE_INDEX_EMPTY: u32 = 0;
-const LIVE_INDEX_TOMBSTONE: u32 = u32::MAX;
+/// Owner slots besides the kernel (slot 0).
+const OWNER_SLOTS: usize = 255;
+const META_OWNER: u64 = 0xff;
+const META_LIVE: u64 = 1 << 8;
+const META_GENERATION_SHIFT: u32 = 32;
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 static RUNTIME_EXTENT_STARTS: [AtomicU64; crate::control_abi::DOMAIN_LIMIT] =
@@ -21,14 +32,6 @@ static RUNTIME_EXTENT_STARTS: [AtomicU64; crate::control_abi::DOMAIN_LIMIT] =
 static RUNTIME_EXTENT_COUNTS: [AtomicUsize; crate::control_abi::DOMAIN_LIMIT] =
     [const { AtomicUsize::new(0) }; crate::control_abi::DOMAIN_LIMIT];
 static mut GLOBAL_ALLOCATOR: MaybeUninit<FrameAllocator> = MaybeUninit::uninit();
-
-#[derive(Clone, Copy)]
-struct Range {
-    next: u64,
-    end: u64,
-}
-
-const EMPTY_RANGE: Range = Range { next: 0, end: 0 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 // Process snapshots contain many leases. Keep the wire-like lease record
@@ -89,202 +92,280 @@ impl FrameLease {
     }
 }
 
-const EMPTY_LEASE: FrameLease = FrameLease {
-    address: 0,
-    generation: 0,
-};
-
-#[derive(Clone, Copy)]
-pub(crate) struct FrameAllocator<
-    const LIVE_LIMIT: usize = MAX_LIVE_FRAMES,
-    const RECYCLED_LIMIT: usize = MAX_RECYCLED_FRAMES,
-    const OWNER_LIMIT: usize = DOMAIN_FRAME_LIMIT,
-    const INDEX_LIMIT: usize = MAX_LIVE_INDEX,
-> {
-    ranges: [Range; MAX_RANGES],
-    range_count: usize,
-    active_range: usize,
+/// The allocator state. `metadata` and `free` point at tables covering the
+/// frames `first_frame..first_frame + frames`.
+pub(crate) struct FrameAllocator {
+    first_frame: u64,
+    frames: usize,
+    metadata: *mut u64,
+    free: *mut u64,
+    /// Lowest bitmap word that may hold a free bit.
+    cursor: usize,
+    free_frames: u64,
     allocated_frames: u64,
     reclaimed_boot_service_frames: u64,
-    live_frames: [FrameLease; LIVE_LIMIT],
-    live_owners: [FrameOwner; LIVE_LIMIT],
-    live_index: [u32; INDEX_LIMIT],
-    live_count: usize,
-    recycled: [FrameLease; RECYCLED_LIMIT],
-    recycled_count: usize,
+    owner_limit: usize,
+    owners: [u64; OWNER_SLOTS],
+    owner_counts: [usize; OWNER_SLOTS + 1],
 }
 
-impl<
-        const LIVE_LIMIT: usize,
-        const RECYCLED_LIMIT: usize,
-        const OWNER_LIMIT: usize,
-        const INDEX_LIMIT: usize,
-    > FrameAllocator<LIVE_LIMIT, RECYCLED_LIMIT, OWNER_LIMIT, INDEX_LIMIT>
-{
-    fn populate_uefi_map(&mut self, boot_info: &BootInfo, ceiling: u64) -> Option<()> {
-        let count = boot_info.memory_map_size / boot_info.memory_descriptor_size;
+impl FrameAllocator {
+    /// Creates an empty allocator over caller-provided tables.
+    ///
+    /// # Safety
+    ///
+    /// `metadata` must hold `frames` words and `free` `frames.div_ceil(64)`
+    /// words, both zeroed and valid for the allocator's lifetime.
+    unsafe fn with_tables(
+        first_frame: u64,
+        frames: usize,
+        metadata: *mut u64,
+        free: *mut u64,
+        owner_limit: usize,
+    ) -> Self {
+        Self {
+            first_frame,
+            frames,
+            metadata,
+            free,
+            cursor: 0,
+            free_frames: 0,
+            allocated_frames: 0,
+            reclaimed_boot_service_frames: 0,
+            owner_limit,
+            owners: [0; OWNER_SLOTS],
+            owner_counts: [0; OWNER_SLOTS + 1],
+        }
+    }
 
-        for index in 0..count {
-            let descriptor = unsafe {
-                let address = boot_info
-                    .memory_map
-                    .add(index * boot_info.memory_descriptor_size);
-                core::ptr::read_unaligned(address.cast::<UefiMemoryDescriptor>())
-            };
-            let boot_service = matches!(
-                descriptor.memory_type,
-                EFI_BOOT_SERVICES_CODE | EFI_BOOT_SERVICES_DATA
-            );
-            if descriptor.memory_type != EFI_CONVENTIONAL_MEMORY && !boot_service {
-                continue;
+    fn words(&self) -> usize {
+        self.frames.div_ceil(64)
+    }
+
+    fn index(&self, address: u64) -> Option<usize> {
+        if address < LOW_MEMORY_LIMIT || !address.is_multiple_of(PAGE_SIZE) {
+            return None;
+        }
+        let frame = (address / PAGE_SIZE).checked_sub(self.first_frame)?;
+        let index = usize::try_from(frame).ok()?;
+        (index < self.frames).then_some(index)
+    }
+
+    fn address(&self, index: usize) -> u64 {
+        (self.first_frame + index as u64) * PAGE_SIZE
+    }
+
+    fn metadata(&self, index: usize) -> u64 {
+        // SAFETY: index < frames, which the metadata table covers.
+        unsafe { self.metadata.add(index).read() }
+    }
+
+    fn set_metadata(&mut self, index: usize, value: u64) {
+        // SAFETY: index < frames, which the metadata table covers.
+        unsafe { self.metadata.add(index).write(value) }
+    }
+
+    fn is_free(&self, index: usize) -> bool {
+        // SAFETY: index / 64 < words(), which the bitmap covers.
+        unsafe { self.free.add(index / 64).read() & (1 << (index % 64)) != 0 }
+    }
+
+    fn mark_free(&mut self, index: usize, free: bool) {
+        // SAFETY: as for is_free.
+        unsafe {
+            let word = self.free.add(index / 64);
+            if free {
+                word.write(word.read() | 1 << (index % 64));
+            } else {
+                word.write(word.read() & !(1 << (index % 64)));
             }
-            let start = descriptor.physical_start.max(LOW_MEMORY_LIMIT);
-            let end = descriptor
-                .page_count
-                .checked_mul(PAGE_SIZE)
-                .and_then(|size| descriptor.physical_start.checked_add(size))?
-                .min(ceiling);
-            let start = start.div_ceil(PAGE_SIZE) * PAGE_SIZE;
-            let end = end / PAGE_SIZE * PAGE_SIZE;
-            if start < end {
-                self.insert_range(Range { next: start, end })?;
-                if boot_service {
-                    self.reclaimed_boot_service_frames = self
-                        .reclaimed_boot_service_frames
-                        .checked_add((end - start) / PAGE_SIZE)?;
+        }
+        if free {
+            self.free_frames += 1;
+            self.cursor = self.cursor.min(index / 64);
+        } else {
+            self.free_frames -= 1;
+        }
+    }
+
+    /// Adds `start..end` as allocatable memory.
+    fn add_free_range(&mut self, start: u64, end: u64) {
+        let mut address = start.max(LOW_MEMORY_LIMIT).div_ceil(PAGE_SIZE) * PAGE_SIZE;
+        while address + PAGE_SIZE <= end {
+            if let Some(index) = self.index(address) {
+                if !self.is_free(index) {
+                    self.mark_free(index, true);
+                }
+            }
+            address += PAGE_SIZE;
+        }
+    }
+
+    /// Removes `start..end` from the allocatable memory.
+    fn remove_free_range(&mut self, start: u64, end: u64) {
+        let mut address = start / PAGE_SIZE * PAGE_SIZE;
+        while address < end {
+            if let Some(index) = self.index(address) {
+                if self.is_free(index) {
+                    self.mark_free(index, false);
+                }
+            }
+            address += PAGE_SIZE;
+        }
+    }
+
+    fn slot(&self, owner: FrameOwner) -> Option<usize> {
+        if owner.is_kernel() {
+            return Some(0);
+        }
+        self.owners
+            .iter()
+            .position(|raw| *raw == owner.0)
+            .map(|position| position + 1)
+    }
+
+    fn slot_or_new(&mut self, owner: FrameOwner) -> Option<usize> {
+        if let Some(slot) = self.slot(owner) {
+            return Some(slot);
+        }
+        let position = self.owners.iter().position(|raw| *raw == 0)?;
+        self.owners[position] = owner.0;
+        Some(position + 1)
+    }
+
+    fn owner_live_count(&self, owner: FrameOwner) -> usize {
+        self.slot(owner).map_or(0, |slot| self.owner_counts[slot])
+    }
+
+    fn budget_allows(&self, owner: FrameOwner, count: usize) -> bool {
+        owner.is_kernel()
+            || self
+                .owner_live_count(owner)
+                .checked_add(count)
+                .is_some_and(|total| total <= self.owner_limit)
+    }
+
+    /// Marks a free frame live for `slot` with `generation`.
+    fn issue(&mut self, index: usize, slot: usize, generation: u32) -> FrameLease {
+        self.mark_free(index, false);
+        self.set_metadata(
+            index,
+            u64::from(generation) << META_GENERATION_SHIFT | META_LIVE | slot as u64,
+        );
+        self.owner_counts[slot] += 1;
+        self.allocated_frames += 1;
+        FrameLease {
+            address: self.address(index),
+            generation,
+        }
+    }
+
+    fn next_generation(&self, index: usize) -> Option<u32> {
+        ((self.metadata(index) >> META_GENERATION_SHIFT) as u32).checked_add(1)
+    }
+
+    fn lowest_free(&mut self) -> Option<usize> {
+        for word in self.cursor..self.words() {
+            // SAFETY: word < words(), which the bitmap covers.
+            let bits = unsafe { self.free.add(word).read() };
+            if bits != 0 {
+                self.cursor = word;
+                return Some(word * 64 + bits.trailing_zeros() as usize);
+            }
+        }
+        self.cursor = self.words();
+        None
+    }
+
+    /// Finds `count` consecutive free frames, searching upward or downward.
+    fn free_run(&self, count: usize, highest_first: bool) -> Option<usize> {
+        if count == 0 || count > self.frames {
+            return None;
+        }
+        let mut run = 0;
+        if highest_first {
+            for index in (0..self.frames).rev() {
+                run = if self.is_free(index) { run + 1 } else { 0 };
+                if run == count {
+                    return Some(index);
+                }
+            }
+        } else {
+            for index in 0..self.frames {
+                run = if self.is_free(index) { run + 1 } else { 0 };
+                if run == count {
+                    return Some(index + 1 - count);
                 }
             }
         }
-        self.sort_and_merge();
-        (self.range_count != 0).then_some(())
+        None
+    }
+
+    fn allocate_one(&mut self, owner: FrameOwner) -> Option<FrameLease> {
+        if !self.budget_allows(owner, 1) {
+            return None;
+        }
+        let index = self.lowest_free()?;
+        let generation = self.next_generation(index)?;
+        let slot = self.slot_or_new(owner)?;
+        Some(self.issue(index, slot, generation))
     }
 
     pub(crate) fn reserve<const N: usize>(&mut self, owner: FrameOwner) -> Option<[FrameLease; N]> {
-        if N == 0
-            || self.live_count.checked_add(N)? > LIVE_LIMIT
-            || (!owner.is_kernel() && self.owner_live_count(owner).checked_add(N)? > OWNER_LIMIT)
-            || self.allocated_frames.checked_add(N as u64).is_none()
-        {
+        if N == 0 || self.free_frames < N as u64 || !self.budget_allows(owner, N) {
             return None;
         }
-        let recycled = N.min(self.recycled_count);
-        if self.recycled[self.recycled_count - recycled..self.recycled_count]
-            .iter()
-            .any(|frame| frame.generation == u32::MAX)
-        {
-            return None;
-        }
-        let available_ranges = self.ranges[self.active_range..self.range_count]
-            .iter()
-            .try_fold(0_u64, |total, range| {
-                total.checked_add(range.end.saturating_sub(range.next) / PAGE_SIZE)
-            })?;
-        if available_ranges < (N - recycled) as u64 {
-            return None;
-        }
-        let mut frames = [EMPTY_LEASE; N];
-        for frame in &mut frames {
-            *frame = self.allocate_one(owner)?;
+        self.slot_or_new(owner)?;
+        let mut frames = [FrameLease::EMPTY; N];
+        for (index, frame) in frames.iter_mut().enumerate() {
+            match self.allocate_one(owner) {
+                Some(lease) => *frame = lease,
+                None => {
+                    let _ = self.release_slice(owner, &frames[..index]);
+                    return None;
+                }
+            }
         }
         Some(frames)
+    }
+
+    /// Issues `count` contiguous frames sharing one generation and returns the first.
+    fn reserve_run(
+        &mut self,
+        owner: FrameOwner,
+        count: usize,
+        highest_first: bool,
+    ) -> Option<FrameLease> {
+        if count == 0 || !self.budget_allows(owner, count) {
+            return None;
+        }
+        let start = self.free_run(count, highest_first)?;
+        let generation = (start..start + count).try_fold(1_u32, |generation, index| {
+            Some(generation.max(self.next_generation(index)?))
+        })?;
+        let slot = self.slot_or_new(owner)?;
+        for index in start..start + count {
+            self.issue(index, slot, generation);
+        }
+        Some(FrameLease {
+            address: self.address(start),
+            generation,
+        })
     }
 
     pub(crate) fn reserve_contiguous<const N: usize>(
         &mut self,
         owner: FrameOwner,
     ) -> Option<[FrameLease; N]> {
-        if N == 0
-            || self.live_count.checked_add(N)? > LIVE_LIMIT
-            || (!owner.is_kernel() && self.owner_live_count(owner).checked_add(N)? > OWNER_LIMIT)
-        {
-            return None;
-        }
-        let recycled_start = (self.recycled_count >= N)
-            .then(|| {
-                (0..=self.recycled_count - N).find(|start| {
-                    self.recycled[*start..*start + N]
-                        .iter()
-                        .enumerate()
-                        .all(|(index, frame)| {
-                            frame.address
-                                == self.recycled[*start].address + index as u64 * PAGE_SIZE
-                        })
-                })
-            })
-            .flatten();
-        if let Some(recycled_start) = recycled_start {
-            if self.recycled[recycled_start..recycled_start + N]
-                .iter()
-                .any(|frame| frame.generation == u32::MAX)
-            {
-                return None;
-            }
-            let mut frames = [EMPTY_LEASE; N];
-            for (index, frame) in frames.iter_mut().enumerate() {
-                let prior = self.recycled[recycled_start + index];
-                *frame = FrameLease {
-                    address: prior.address,
-                    generation: prior.generation.checked_add(1)?,
-                };
-                self.record_live(*frame, owner)?;
-            }
-            self.recycled
-                .copy_within(recycled_start + N..self.recycled_count, recycled_start);
-            let prior_count = self.recycled_count;
-            self.recycled_count -= N;
-            self.recycled[self.recycled_count..prior_count].fill(EMPTY_LEASE);
-            return Some(frames);
-        }
-        let size = (N as u64).checked_mul(PAGE_SIZE)?;
-        let range_index = (self.active_range..self.range_count).find(|index| {
-            self.ranges[*index]
-                .end
-                .checked_sub(self.ranges[*index].next)
-                .is_some_and(|available| available >= size)
-        })?;
-        let start = self.ranges[range_index].next;
-        self.ranges[range_index].next = start.checked_add(size)?;
-        let mut frames = [EMPTY_LEASE; N];
-        for (index, frame) in frames.iter_mut().enumerate() {
-            *frame = FrameLease {
-                address: start.checked_add((index as u64).checked_mul(PAGE_SIZE)?)?,
-                generation: 1,
-            };
-            self.record_live(*frame, owner)?;
-        }
-        Some(frames)
+        let first = self.reserve_run(owner, N, false)?;
+        Some(core::array::from_fn(|index| FrameLease {
+            address: first.address + index as u64 * PAGE_SIZE,
+            generation: first.generation,
+        }))
     }
 
     fn reserve_contiguous_extent(&mut self, owner: FrameOwner, count: usize) -> Option<FrameLease> {
-        if count == 0
-            || self.live_count.checked_add(count)? > LIVE_LIMIT
-            || (!owner.is_kernel()
-                && self.owner_live_count(owner).checked_add(count)? > OWNER_LIMIT)
-        {
-            return None;
-        }
-        let size = (count as u64).checked_mul(PAGE_SIZE)?;
-        let range_index = (self.active_range..self.range_count).find(|index| {
-            self.ranges[*index]
-                .end
-                .checked_sub(self.ranges[*index].next)
-                .is_some_and(|available| available >= size)
-        })?;
-        let start = self.ranges[range_index].next;
-        self.ranges[range_index].next = start.checked_add(size)?;
-        for index in 0..count {
-            self.record_live(
-                FrameLease {
-                    address: start.checked_add((index as u64).checked_mul(PAGE_SIZE)?)?,
-                    generation: 1,
-                },
-                owner,
-            )?;
-        }
-        Some(FrameLease {
-            address: start,
-            generation: 1,
-        })
+        self.reserve_run(owner, count, true)
     }
 
     fn release_contiguous_extent(
@@ -293,275 +374,85 @@ impl<
         start: FrameLease,
         count: usize,
     ) -> bool {
-        let Some(end) = (count as u64)
-            .checked_mul(PAGE_SIZE)
-            .and_then(|size| start.address.checked_add(size))
-        else {
+        let Some(first) = self.index(start.address) else {
             return false;
         };
         if count == 0
-            || start.address < LOW_MEMORY_LIMIT
-            || !start.address.is_multiple_of(PAGE_SIZE)
             || start.generation == 0
-            || self
-                .recycled_count
-                .checked_add(count)
-                .is_none_or(|value| value > RECYCLED_LIMIT)
-            || self.allocated_frames < count as u64
-            || self.live_count < count
-            || self.live_frames[..self.live_count]
-                .iter()
-                .zip(&self.live_owners[..self.live_count])
-                .filter(|(frame, frame_owner)| {
-                    **frame_owner == owner
-                        && frame.generation == start.generation
-                        && (start.address..end).contains(&frame.address())
-                        && frame.address.is_multiple_of(PAGE_SIZE)
-                })
-                .count()
-                != count
+            || first.checked_add(count).is_none_or(|end| end > self.frames)
+            || !(0..count).all(|offset| {
+                self.lease_matches(
+                    FrameLease {
+                        address: start.address + offset as u64 * PAGE_SIZE,
+                        generation: start.generation,
+                    },
+                    Some(owner),
+                )
+            })
         {
             return false;
         }
-        let mut index = 0;
-        while index < self.live_count {
-            let frame = self.live_frames[index];
-            if self.live_owners[index] == owner
-                && frame.generation == start.generation
-                && (start.address..end).contains(&frame.address())
-            {
-                if self.remove_live_index(frame.address()) != Some(index) {
-                    return false;
-                }
-                self.live_count -= 1;
-                if index != self.live_count {
-                    self.live_frames[index] = self.live_frames[self.live_count];
-                    self.live_owners[index] = self.live_owners[self.live_count];
-                    if !self.update_live_index(
-                        self.live_frames[index].address(),
-                        self.live_count,
-                        index,
-                    ) {
-                        return false;
-                    }
-                }
-                self.live_frames[self.live_count] = EMPTY_LEASE;
-                self.live_owners[self.live_count] = FrameOwner::KERNEL;
-                self.recycled[self.recycled_count] = frame;
-                self.recycled_count += 1;
-            } else {
-                index += 1;
-            }
+        for index in first..first + count {
+            self.retire(index);
         }
-        self.allocated_frames -= count as u64;
         true
     }
 
-    fn allocate_one(&mut self, owner: FrameOwner) -> Option<FrameLease> {
-        if self.live_count == LIVE_LIMIT
-            || (!owner.is_kernel() && self.owner_live_count(owner) >= OWNER_LIMIT)
-        {
-            return None;
-        }
-        if self.recycled_count != 0 {
-            self.recycled_count -= 1;
-            let prior = self.recycled[self.recycled_count];
-            self.recycled[self.recycled_count] = EMPTY_LEASE;
-            let lease = FrameLease {
-                address: prior.address,
-                generation: prior.generation.checked_add(1)?,
-            };
-            self.record_live(lease, owner)?;
-            return Some(lease);
-        }
-        while self.active_range < self.range_count {
-            let range = &mut self.ranges[self.active_range];
-            if range.next < range.end {
-                let address = range.next;
-                range.next += PAGE_SIZE;
-                let lease = FrameLease {
-                    address,
-                    generation: 1,
-                };
-                self.record_live(lease, owner)?;
-                return Some(lease);
-            }
-            self.active_range += 1;
-        }
-        None
-    }
-
-    fn live_index_start(address: u64) -> Option<usize> {
-        if INDEX_LIMIT < LIVE_LIMIT.checked_mul(2)? || !INDEX_LIMIT.is_power_of_two() {
-            return None;
-        }
-        let page = address.checked_div(PAGE_SIZE)?;
-        Some(page.wrapping_mul(0x9e37_79b9_7f4a_7c15) as usize & (INDEX_LIMIT - 1))
-    }
-
-    fn live_position(&self, address: u64) -> Option<usize> {
-        let start = Self::live_index_start(address)?;
-        for probe in 0..INDEX_LIMIT {
-            let slot = (start + probe) & (INDEX_LIMIT - 1);
-            match self.live_index[slot] {
-                LIVE_INDEX_EMPTY => return None,
-                LIVE_INDEX_TOMBSTONE => continue,
-                encoded => {
-                    let index = encoded.checked_sub(1)? as usize;
-                    if index < self.live_count && self.live_frames[index].address() == address {
-                        return Some(index);
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    fn insert_live_index(&mut self, address: u64, index: usize) -> bool {
-        let Some(encoded) = u32::try_from(index)
-            .ok()
-            .and_then(|value| value.checked_add(1))
-        else {
+    /// Returns whether `frame` is live with its generation and, when given,
+    /// held by `owner`.
+    fn lease_matches(&self, frame: FrameLease, owner: Option<FrameOwner>) -> bool {
+        let Some(index) = self.index(frame.address) else {
             return false;
         };
-        let Some(start) = Self::live_index_start(address) else {
-            return false;
-        };
-        let mut tombstone = None;
-        for probe in 0..INDEX_LIMIT {
-            let slot = (start + probe) & (INDEX_LIMIT - 1);
-            match self.live_index[slot] {
-                LIVE_INDEX_EMPTY => {
-                    self.live_index[tombstone.unwrap_or(slot)] = encoded;
-                    return true;
-                }
-                LIVE_INDEX_TOMBSTONE => {
-                    if tombstone.is_none() {
-                        tombstone = Some(slot);
-                    }
-                }
-                existing => {
-                    let existing = (existing - 1) as usize;
-                    if existing < self.live_count && self.live_frames[existing].address() == address
-                    {
-                        return false;
-                    }
-                }
-            };
-        }
-        if let Some(slot) = tombstone {
-            self.live_index[slot] = encoded;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn remove_live_index(&mut self, address: u64) -> Option<usize> {
-        let start = Self::live_index_start(address)?;
-        for probe in 0..INDEX_LIMIT {
-            let slot = (start + probe) & (INDEX_LIMIT - 1);
-            match self.live_index[slot] {
-                LIVE_INDEX_EMPTY => return None,
-                LIVE_INDEX_TOMBSTONE => continue,
-                encoded => {
-                    let index = encoded.checked_sub(1)? as usize;
-                    if index < self.live_count && self.live_frames[index].address() == address {
-                        self.live_index[slot] = LIVE_INDEX_TOMBSTONE;
-                        return Some(index);
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    fn update_live_index(&mut self, address: u64, old_index: usize, new_index: usize) -> bool {
-        let Some(old_encoded) = u32::try_from(old_index)
-            .ok()
-            .and_then(|value| value.checked_add(1))
-        else {
-            return false;
-        };
-        let Some(new_encoded) = u32::try_from(new_index)
-            .ok()
-            .and_then(|value| value.checked_add(1))
-        else {
-            return false;
-        };
-        let Some(start) = Self::live_index_start(address) else {
-            return false;
-        };
-        for probe in 0..INDEX_LIMIT {
-            let slot = (start + probe) & (INDEX_LIMIT - 1);
-            match self.live_index[slot] {
-                LIVE_INDEX_EMPTY => return false,
-                LIVE_INDEX_TOMBSTONE => continue,
-                current => {
-                    if current == old_encoded && self.live_frames[old_index].address() == address {
-                        self.live_index[slot] = new_encoded;
-                        return true;
-                    }
-                }
-            }
-        }
-        false
+        let metadata = self.metadata(index);
+        metadata & META_LIVE != 0
+            && (metadata >> META_GENERATION_SHIFT) as u32 == frame.generation
+            && owner.is_none_or(|owner| {
+                self.slot(owner)
+                    .is_some_and(|slot| (metadata & META_OWNER) as usize == slot)
+            })
     }
 
     fn can_release(&self, owner: FrameOwner, frames: &[FrameLease]) -> bool {
-        if frames.is_empty()
-            || self
-                .recycled_count
-                .checked_add(frames.len())
-                .is_none_or(|count| count > RECYCLED_LIMIT)
-            || self.allocated_frames < frames.len() as u64
-            || self.live_count < frames.len()
-        {
-            return false;
+        !frames.is_empty()
+            && self.allocated_frames >= frames.len() as u64
+            && frames.iter().enumerate().all(|(index, frame)| {
+                frame.generation != 0
+                    && !frames[..index]
+                        .iter()
+                        .any(|prior| prior.address == frame.address)
+                    && self.lease_matches(*frame, Some(owner))
+            })
+    }
+
+    /// Ends a live frame's lease. A frame whose generation is exhausted is
+    /// never handed out again.
+    fn retire(&mut self, index: usize) {
+        let metadata = self.metadata(index);
+        let slot = (metadata & META_OWNER) as usize;
+        self.set_metadata(index, metadata & !(META_LIVE | META_OWNER));
+        self.owner_counts[slot] -= 1;
+        if slot != 0 && self.owner_counts[slot] == 0 {
+            self.owners[slot - 1] = 0;
         }
-        for (index, frame) in frames.iter().enumerate() {
-            if frame.address < LOW_MEMORY_LIMIT
-                || frame.address % PAGE_SIZE != 0
-                || frame.generation == 0
-                || frames[..index]
-                    .iter()
-                    .any(|prior| prior.address == frame.address)
-                || !self.live_position(frame.address()).is_some_and(|position| {
-                    self.live_frames[position] == *frame && self.live_owners[position] == owner
-                })
-            {
-                return false;
-            }
+        self.allocated_frames -= 1;
+        if (metadata >> META_GENERATION_SHIFT) as u32 != u32::MAX {
+            self.mark_free(index, true);
         }
-        true
     }
 
     fn release_slice(&mut self, owner: FrameOwner, frames: &[FrameLease]) -> bool {
+        if frames.is_empty() {
+            return true;
+        }
         if !self.can_release(owner, frames) {
             return false;
         }
-        for frame in frames.iter().copied() {
-            let Some(index) = self.remove_live_index(frame.address()) else {
-                return false;
-            };
-            self.live_count -= 1;
-            if index != self.live_count {
-                self.live_frames[index] = self.live_frames[self.live_count];
-                self.live_owners[index] = self.live_owners[self.live_count];
-                if !self.update_live_index(
-                    self.live_frames[index].address(),
-                    self.live_count,
-                    index,
-                ) {
-                    return false;
-                }
+        for frame in frames {
+            if let Some(index) = self.index(frame.address) {
+                self.retire(index);
             }
-            self.live_frames[self.live_count] = EMPTY_LEASE;
-            self.live_owners[self.live_count] = FrameOwner::KERNEL;
-            self.recycled[self.recycled_count] = frame;
-            self.recycled_count += 1;
         }
-        self.allocated_frames -= frames.len() as u64;
         true
     }
 
@@ -570,133 +461,196 @@ impl<
         owner: FrameOwner,
         frames: [FrameLease; N],
     ) -> bool {
-        self.release_slice(owner, &frames)
-    }
-
-    fn record_live(&mut self, frame: FrameLease, owner: FrameOwner) -> Option<()> {
-        if self.live_count == LIVE_LIMIT || self.live_position(frame.address()).is_some() {
-            return None;
-        }
-        let allocated = self.allocated_frames.checked_add(1)?;
-        if !self.insert_live_index(frame.address(), self.live_count) {
-            return None;
-        }
-        self.live_frames[self.live_count] = frame;
-        self.live_owners[self.live_count] = owner;
-        self.live_count += 1;
-        self.allocated_frames = allocated;
-        Some(())
+        N != 0 && self.release_slice(owner, &frames)
     }
 
     fn transfer_owner(&mut self, from: FrameOwner, to: FrameOwner) -> Option<usize> {
-        if from == to || from == FrameOwner::KERNEL || to == FrameOwner::KERNEL {
+        if from == to || from.is_kernel() || to.is_kernel() {
             return None;
         }
-        let count = self.live_owners[..self.live_count]
-            .iter()
-            .filter(|owner| **owner == from)
-            .count();
-        if count == 0 {
+        let from_slot = self.slot(from)?;
+        let count = self.owner_counts[from_slot];
+        if count == 0 || !self.budget_allows(to, count) {
             return None;
         }
-        if self
-            .owner_live_count(to)
-            .checked_add(count)
-            .is_none_or(|total| total > OWNER_LIMIT)
-        {
-            return None;
-        }
-        for owner in &mut self.live_owners[..self.live_count] {
-            if *owner == from {
-                *owner = to;
+        match self.slot(to) {
+            // The new owner holds nothing yet: relabel the slot in place.
+            None => self.owners[from_slot - 1] = to.0,
+            Some(to_slot) => {
+                for index in 0..self.frames {
+                    let metadata = self.metadata(index);
+                    if metadata & META_LIVE != 0 && (metadata & META_OWNER) as usize == from_slot {
+                        self.set_metadata(index, metadata & !META_OWNER | to_slot as u64);
+                    }
+                }
+                self.owner_counts[to_slot] += count;
+                self.owner_counts[from_slot] = 0;
+                self.owners[from_slot - 1] = 0;
             }
         }
         Some(count)
     }
 
-    fn owner_live_count(&self, owner: FrameOwner) -> usize {
-        self.live_owners[..self.live_count]
-            .iter()
-            .filter(|live_owner| **live_owner == owner)
-            .count()
-    }
-
     fn owns(&self, owner: FrameOwner, frames: &[FrameLease]) -> bool {
-        frames.iter().all(|frame| {
-            self.live_position(frame.address()).is_some_and(|position| {
-                self.live_frames[position] == *frame && self.live_owners[position] == owner
-            })
-        })
+        frames
+            .iter()
+            .all(|frame| self.lease_matches(*frame, Some(owner)))
     }
 
     fn tracks_any(&self, frames: &[FrameLease]) -> bool {
-        !frames.is_empty()
-            && frames.iter().any(|frame| {
-                self.live_position(frame.address())
-                    .is_some_and(|position| self.live_frames[position] == *frame)
-            })
+        frames.iter().any(|frame| self.lease_matches(*frame, None))
     }
 
     fn owns_addresses(&self, owner: FrameOwner, addresses: &[u64]) -> bool {
+        let Some(slot) = self.slot(owner) else {
+            return false;
+        };
         !addresses.is_empty()
             && addresses.iter().all(|address| {
-                self.live_position(*address)
-                    .is_some_and(|position| self.live_owners[position] == owner)
+                self.index(*address).is_some_and(|index| {
+                    let metadata = self.metadata(index);
+                    metadata & META_LIVE != 0 && (metadata & META_OWNER) as usize == slot
+                })
             })
     }
 
-    fn available_frames(&self) -> u64 {
-        self.ranges[..self.range_count]
-            .iter()
-            .map(|range| (range.end - range.next) / PAGE_SIZE)
-            .sum()
+    fn live_lease(&self, owner: FrameOwner, address: u64) -> Option<FrameLease> {
+        let index = self.index(address)?;
+        let metadata = self.metadata(index);
+        let slot = self.slot(owner)?;
+        (metadata & META_LIVE != 0 && (metadata & META_OWNER) as usize == slot).then_some(
+            FrameLease {
+                address,
+                generation: (metadata >> META_GENERATION_SHIFT) as u32,
+            },
+        )
     }
 
-    fn insert_range(&mut self, range: Range) -> Option<()> {
-        if self.range_count == MAX_RANGES {
-            return None;
+    /// Takes `count` contiguous frames out of circulation without a lease,
+    /// for a domain's runtime extent, and returns the first address.
+    fn carve(&mut self, count: usize) -> Option<u64> {
+        let start = self.free_run(count, false)?;
+        for index in start..start + count {
+            self.mark_free(index, false);
         }
-        self.ranges[self.range_count] = range;
-        self.range_count += 1;
-        Some(())
-    }
-
-    fn sort_and_merge(&mut self) {
-        self.ranges[..self.range_count].sort_unstable_by_key(|range| range.next);
-        let mut output = 0;
-        for input in 0..self.range_count {
-            let range = self.ranges[input];
-            if output != 0 && range.next <= self.ranges[output - 1].end {
-                self.ranges[output - 1].end = self.ranges[output - 1].end.max(range.end);
-            } else {
-                self.ranges[output] = range;
-                output += 1;
-            }
-        }
-        self.range_count = output;
+        Some(self.address(start))
     }
 }
 
+/// The usable memory types in a UEFI memory map, and whether each is boot
+/// services memory reclaimed after ExitBootServices.
+fn usable(descriptor: &UefiMemoryDescriptor) -> Option<bool> {
+    match descriptor.memory_type {
+        EFI_CONVENTIONAL_MEMORY => Some(false),
+        EFI_BOOT_SERVICES_CODE | EFI_BOOT_SERVICES_DATA => Some(true),
+        _ => None,
+    }
+}
+
+fn for_each_descriptor(boot_info: &BootInfo, mut visit: impl FnMut(UefiMemoryDescriptor)) {
+    let count = boot_info.memory_map_size / boot_info.memory_descriptor_size;
+    for index in 0..count {
+        // SAFETY: kernel_main validated the memory-map bounds and descriptor size.
+        visit(unsafe {
+            core::ptr::read_unaligned(
+                boot_info
+                    .memory_map
+                    .add(index * boot_info.memory_descriptor_size)
+                    .cast::<UefiMemoryDescriptor>(),
+            )
+        });
+    }
+}
+
+fn descriptor_end(descriptor: &UefiMemoryDescriptor) -> Option<u64> {
+    descriptor
+        .page_count
+        .checked_mul(PAGE_SIZE)
+        .and_then(|size| descriptor.physical_start.checked_add(size))
+}
+
+/// Builds the allocator over usable memory below `ceiling`, the end of the
+/// kernel's direct map.
 pub(crate) fn initialize(boot_info: &BootInfo, ceiling: u64) -> bool {
     if INITIALIZED.load(Ordering::Acquire) {
         return false;
     }
-    // SAFETY: Bootstrap initialization is single-processor and interrupts do
-    // not access the allocator. Constructing the large tracking tables in
-    // their final static location avoids consuming the bounded kernel stack.
+    let (mut highest, mut largest) = (0_u64, (0_u64, 0_u64));
+    let mut malformed = false;
+    for_each_descriptor(boot_info, |descriptor| {
+        if usable(&descriptor).is_none() {
+            return;
+        }
+        let Some(end) = descriptor_end(&descriptor) else {
+            malformed = true;
+            return;
+        };
+        let start = descriptor.physical_start.max(LOW_MEMORY_LIMIT);
+        let end = end.min(ceiling);
+        if start < end {
+            highest = highest.max(end);
+            if end - start > largest.1 - largest.0 {
+                largest = (start, end);
+            }
+        }
+    });
+    if malformed || highest == 0 {
+        return false;
+    }
+    let frames = (highest / PAGE_SIZE) as usize;
+    let metadata_bytes = frames as u64 * 8;
+    let bitmap_bytes = frames.div_ceil(64) as u64 * 8;
+    // Place the tables at the top of the largest usable range.
+    let tables_size = (metadata_bytes + bitmap_bytes).div_ceil(PAGE_SIZE) * PAGE_SIZE;
+    let Some(tables_start) = largest
+        .1
+        .checked_sub(tables_size)
+        .filter(|start| *start >= largest.0)
+        .map(|start| start / PAGE_SIZE * PAGE_SIZE)
+    else {
+        return false;
+    };
+    let Some(tables) = paging::direct_map_range_address(tables_start, tables_size as usize) else {
+        return false;
+    };
+    // SAFETY: the tables lie in usable RAM inside the direct map and are
+    // removed from the free pool below before anything can allocate them.
+    // Bootstrap initialization is single-processor and interrupts do not
+    // access the allocator.
     unsafe {
-        let allocator = core::ptr::addr_of_mut!(GLOBAL_ALLOCATOR).cast::<FrameAllocator>();
-        core::ptr::write_bytes(
-            allocator.cast::<u8>(),
-            0,
-            core::mem::size_of::<FrameAllocator>(),
-        );
-        if (*allocator).populate_uefi_map(boot_info, ceiling).is_none() {
+        core::ptr::write_bytes(tables as *mut u8, 0, tables_size as usize);
+        let metadata = tables as *mut u64;
+        let free = (tables + metadata_bytes as usize) as *mut u64;
+        let mut allocator =
+            FrameAllocator::with_tables(0, frames, metadata, free, DOMAIN_FRAME_LIMIT);
+        let mut reclaimed = 0;
+        for_each_descriptor(boot_info, |descriptor| {
+            let (Some(boot_service), Some(end)) =
+                (usable(&descriptor), descriptor_end(&descriptor))
+            else {
+                return;
+            };
+            let before = allocator.free_frames;
+            allocator.add_free_range(descriptor.physical_start, end.min(ceiling));
+            if boot_service {
+                reclaimed += allocator.free_frames - before;
+            }
+        });
+        allocator.remove_free_range(tables_start, tables_start + tables_size);
+        allocator.reclaimed_boot_service_frames = reclaimed;
+        if allocator.free_frames == 0 {
             return false;
         }
+        core::ptr::addr_of_mut!(GLOBAL_ALLOCATOR)
+            .cast::<FrameAllocator>()
+            .write(allocator);
     }
     INITIALIZED.store(true, Ordering::Release);
     true
+}
+
+fn allocator() -> *mut FrameAllocator {
+    core::ptr::addr_of_mut!(GLOBAL_ALLOCATOR).cast::<FrameAllocator>()
 }
 
 pub(crate) fn allocate_frames<const N: usize>(owner: FrameOwner) -> Option<[FrameLease; N]> {
@@ -707,7 +661,7 @@ pub(crate) fn allocate_frames<const N: usize>(owner: FrameOwner) -> Option<[Fram
     // single-processor and callers keep interrupts disabled, so access is
     // serialized until an SMP-safe allocator replaces this path.
     unsafe {
-        let allocator = core::ptr::addr_of_mut!(GLOBAL_ALLOCATOR).cast::<FrameAllocator>();
+        let allocator = allocator();
         let frames = (*allocator).reserve::<N>(owner)?;
         for frame in &frames {
             let Some(address) = frame.direct_map_address() else {
@@ -724,34 +678,8 @@ pub(crate) fn allocate_frame_prefix<const N: usize>(
     owner: FrameOwner,
     count: usize,
 ) -> Option<[FrameLease; N]> {
-    if !INITIALIZED.load(Ordering::Acquire) || count == 0 || count > N {
-        return None;
-    }
-    // SAFETY: As with `allocate_frames`, bootstrap and syscall execution keep
-    // allocator access serialized. A partial reservation is rolled back
-    // atomically before returning failure.
-    unsafe {
-        let allocator = core::ptr::addr_of_mut!(GLOBAL_ALLOCATOR).cast::<FrameAllocator>();
-        let mut frames = [FrameLease::EMPTY; N];
-        for index in 0..count {
-            let Some(frame) = (*allocator).allocate_one(owner) else {
-                if index != 0 {
-                    let _ = (*allocator).release_slice(owner, &frames[..index]);
-                }
-                return None;
-            };
-            let Some(address) = frame.direct_map_address() else {
-                let _ = (*allocator).release_slice(owner, core::slice::from_ref(&frame));
-                if index != 0 {
-                    let _ = (*allocator).release_slice(owner, &frames[..index]);
-                }
-                return None;
-            };
-            core::ptr::write_bytes(address as *mut u8, 0, PAGE_SIZE as usize);
-            frames[index] = frame;
-        }
-        Some(frames)
-    }
+    let mut frames = [FrameLease::EMPTY; N];
+    allocate_frame_prefix_into(owner, &mut frames, count).then_some(frames)
 }
 
 pub(crate) fn allocate_frame_prefix_into(
@@ -763,22 +691,20 @@ pub(crate) fn allocate_frame_prefix_into(
         return false;
     }
     output.fill(FrameLease::EMPTY);
+    // SAFETY: As with `allocate_frames`, bootstrap and syscall execution keep
+    // allocator access serialized. A partial reservation is rolled back
+    // atomically before returning failure.
     unsafe {
-        let allocator = core::ptr::addr_of_mut!(GLOBAL_ALLOCATOR).cast::<FrameAllocator>();
+        let allocator = allocator();
         for index in 0..count {
-            let Some(frame) = (*allocator).allocate_one(owner) else {
-                if index != 0 {
-                    let _ = (*allocator).release_slice(owner, &output[..index]);
-                    output[..index].fill(FrameLease::EMPTY);
+            let frame = (*allocator).allocate_one(owner);
+            let address = frame.and_then(FrameLease::direct_map_address);
+            let (Some(frame), Some(address)) = (frame, address) else {
+                if let Some(frame) = frame {
+                    let _ = (*allocator).release_slice(owner, core::slice::from_ref(&frame));
                 }
-                return false;
-            };
-            let Some(address) = frame.direct_map_address() else {
-                let _ = (*allocator).release_slice(owner, core::slice::from_ref(&frame));
-                if index != 0 {
-                    let _ = (*allocator).release_slice(owner, &output[..index]);
-                    output[..index].fill(FrameLease::EMPTY);
-                }
+                let _ = (*allocator).release_slice(owner, &output[..index]);
+                output[..index].fill(FrameLease::EMPTY);
                 return false;
             };
             core::ptr::write_bytes(address as *mut u8, 0, PAGE_SIZE as usize);
@@ -797,7 +723,7 @@ pub(crate) fn allocate_contiguous_frames<const N: usize>(
     // SAFETY: Initialization published a valid allocator. Bootstrap is
     // single-processor and callers keep interrupts disabled.
     unsafe {
-        let allocator = core::ptr::addr_of_mut!(GLOBAL_ALLOCATOR).cast::<FrameAllocator>();
+        let allocator = allocator();
         let frames = (*allocator).reserve_contiguous::<N>(owner)?;
         for frame in &frames {
             let Some(address) = frame.direct_map_address() else {
@@ -817,15 +743,16 @@ pub(crate) fn allocate_contiguous_extent(
     if !INITIALIZED.load(Ordering::Acquire) || count == 0 {
         return None;
     }
+    // SAFETY: as for allocate_frames.
     unsafe {
-        let allocator = core::ptr::addr_of_mut!(GLOBAL_ALLOCATOR).cast::<FrameAllocator>();
+        let allocator = allocator();
         let first = (*allocator).reserve_contiguous_extent(owner, count)?;
-        let address = first.direct_map_address()?;
-        core::ptr::write_bytes(
-            address as *mut u8,
-            0,
-            count.checked_mul(PAGE_SIZE as usize)?,
-        );
+        let length = count.checked_mul(PAGE_SIZE as usize)?;
+        let Some(address) = paging::direct_map_range_address(first.address, length) else {
+            let _ = (*allocator).release_contiguous_extent(owner, first, count);
+            return None;
+        };
+        core::ptr::write_bytes(address as *mut u8, 0, length);
         Some((first, count))
     }
 }
@@ -838,15 +765,28 @@ pub(crate) fn scrub_and_release_contiguous_extent(
     if !INITIALIZED.load(Ordering::Acquire) || count == 0 {
         return false;
     }
-    let Some(address) = first.direct_map_address() else {
-        return false;
-    };
     let Some(length) = count.checked_mul(PAGE_SIZE as usize) else {
         return false;
     };
-    unsafe { core::ptr::write_bytes(address as *mut u8, 0, length) };
+    let Some(address) = paging::direct_map_range_address(first.address, length) else {
+        return false;
+    };
+    // SAFETY: as for allocate_frames. Ownership is checked before scrubbing so
+    // a stale lease cannot destroy a newer allocation's contents.
     unsafe {
-        let allocator = core::ptr::addr_of_mut!(GLOBAL_ALLOCATOR).cast::<FrameAllocator>();
+        let allocator = allocator();
+        if !(0..count).all(|offset| {
+            (*allocator).lease_matches(
+                FrameLease {
+                    address: first.address + offset as u64 * PAGE_SIZE,
+                    generation: first.generation,
+                },
+                Some(owner),
+            )
+        }) {
+            return false;
+        }
+        core::ptr::write_bytes(address as *mut u8, 0, length);
         (*allocator).release_contiguous_extent(owner, first, count)
     }
 }
@@ -861,19 +801,8 @@ pub(crate) fn allocate_runtime_extent<const N: usize>() -> Option<[FrameLease; N
     let start = if existing != 0 {
         (count == N).then_some(existing)?
     } else {
-        let size = (N as u64).checked_mul(PAGE_SIZE)?;
-        let start = unsafe {
-            let allocator = core::ptr::addr_of_mut!(GLOBAL_ALLOCATOR).cast::<FrameAllocator>();
-            let index = ((*allocator).active_range..(*allocator).range_count).find(|index| {
-                (*allocator).ranges[*index]
-                    .end
-                    .checked_sub((*allocator).ranges[*index].next)
-                    .is_some_and(|available| available >= size)
-            })?;
-            let start = (*allocator).ranges[index].next;
-            (*allocator).ranges[index].next = start.checked_add(size)?;
-            start
-        };
+        // SAFETY: as for allocate_frames.
+        let start = unsafe { (*allocator()).carve(N)? };
         RUNTIME_EXTENT_COUNTS[slot].store(N, Ordering::Release);
         RUNTIME_EXTENT_STARTS[slot].store(start, Ordering::Release);
         start
@@ -932,19 +861,17 @@ pub(crate) fn release_frames<const N: usize>(owner: FrameOwner, frames: [FrameLe
     if !INITIALIZED.load(Ordering::Acquire) {
         return false;
     }
-    unsafe {
-        let allocator = core::ptr::addr_of_mut!(GLOBAL_ALLOCATOR).cast::<FrameAllocator>();
-        (*allocator).release(owner, frames)
-    }
+    // SAFETY: as for allocate_frames.
+    unsafe { (*allocator()).release(owner, frames) }
 }
 
 pub(crate) fn frame_leases_releasable(owner: FrameOwner, frames: &[FrameLease]) -> bool {
     if !INITIALIZED.load(Ordering::Acquire) || frames.is_empty() {
         return false;
     }
+    // SAFETY: as for allocate_frames.
     unsafe {
-        let allocator = core::ptr::addr_of!(GLOBAL_ALLOCATOR).cast::<FrameAllocator>();
-        (*allocator).can_release(owner, frames)
+        (*allocator()).can_release(owner, frames)
             && frames
                 .iter()
                 .all(|frame| frame.direct_map_address().is_some())
@@ -952,14 +879,11 @@ pub(crate) fn frame_leases_releasable(owner: FrameOwner, frames: &[FrameLease]) 
 }
 
 pub(crate) fn live_frame_lease(owner: FrameOwner, address: u64) -> Option<FrameLease> {
-    if !INITIALIZED.load(Ordering::Acquire) || !address.is_multiple_of(PAGE_SIZE) {
+    if !INITIALIZED.load(Ordering::Acquire) {
         return None;
     }
-    unsafe {
-        let allocator = core::ptr::addr_of!(GLOBAL_ALLOCATOR).cast::<FrameAllocator>();
-        let position = (*allocator).live_position(address)?;
-        ((*allocator).live_owners[position] == owner).then_some((*allocator).live_frames[position])
-    }
+    // SAFETY: as for allocate_frames.
+    unsafe { (*allocator()).live_lease(owner, address) }
 }
 
 pub(crate) fn scrub_and_release_frames(owner: FrameOwner, frames: &[FrameLease]) -> bool {
@@ -971,7 +895,7 @@ pub(crate) fn scrub_and_release_frames(owner: FrameOwner, frames: &[FrameLease])
     // release preconditions are checked before any payload is destroyed, so a
     // stale or duplicate lease cannot scrub a newer allocation.
     unsafe {
-        let allocator = core::ptr::addr_of_mut!(GLOBAL_ALLOCATOR).cast::<FrameAllocator>();
+        let allocator = allocator();
         if !(*allocator).can_release(owner, frames)
             || frames
                 .iter()
@@ -993,19 +917,17 @@ pub(crate) fn transfer_frame_owner(from: FrameOwner, to: FrameOwner) -> Option<u
     if !INITIALIZED.load(Ordering::Acquire) {
         return None;
     }
-    unsafe {
-        let allocator = core::ptr::addr_of_mut!(GLOBAL_ALLOCATOR).cast::<FrameAllocator>();
-        (*allocator).transfer_owner(from, to)
-    }
+    // SAFETY: as for allocate_frames.
+    unsafe { (*allocator()).transfer_owner(from, to) }
 }
 
 pub(crate) fn frames_owned_by(owner: FrameOwner, frames: &[FrameLease]) -> bool {
     if !INITIALIZED.load(Ordering::Acquire) {
         return false;
     }
+    // SAFETY: as for allocate_frames.
     unsafe {
-        let allocator = core::ptr::addr_of!(GLOBAL_ALLOCATOR).cast::<FrameAllocator>();
-        (*allocator).owns(owner, frames) || owner.is_kernel() && runtime_extent_owns(frames)
+        (*allocator()).owns(owner, frames) || owner.is_kernel() && runtime_extent_owns(frames)
     }
 }
 
@@ -1013,19 +935,17 @@ pub(crate) fn any_frame_lease_live(frames: &[FrameLease]) -> bool {
     if !INITIALIZED.load(Ordering::Acquire) {
         return false;
     }
-    unsafe {
-        let allocator = core::ptr::addr_of!(GLOBAL_ALLOCATOR).cast::<FrameAllocator>();
-        (*allocator).tracks_any(frames)
-    }
+    // SAFETY: as for allocate_frames.
+    unsafe { (*allocator()).tracks_any(frames) }
 }
 
 pub(crate) fn frame_addresses_owned_by(owner: FrameOwner, addresses: &[u64]) -> bool {
     if !INITIALIZED.load(Ordering::Acquire) {
         return false;
     }
+    // SAFETY: as for allocate_frames.
     unsafe {
-        let allocator = core::ptr::addr_of!(GLOBAL_ALLOCATOR).cast::<FrameAllocator>();
-        (*allocator).owns_addresses(owner, addresses)
+        (*allocator()).owns_addresses(owner, addresses)
             || owner.is_kernel()
                 && !addresses.is_empty()
                 && RUNTIME_EXTENT_STARTS
@@ -1048,23 +968,23 @@ pub(crate) fn owner_live_frame_count(owner: FrameOwner) -> Option<usize> {
     if !INITIALIZED.load(Ordering::Acquire) {
         return None;
     }
-    unsafe {
-        let allocator = core::ptr::addr_of!(GLOBAL_ALLOCATOR).cast::<FrameAllocator>();
-        Some((*allocator).owner_live_count(owner))
-    }
+    // SAFETY: as for allocate_frames.
+    unsafe { Some((*allocator()).owner_live_count(owner)) }
 }
 
+/// Returns the total and currently free frame counts.
 pub(crate) fn frame_counts() -> Option<(u64, u64)> {
     if !INITIALIZED.load(Ordering::Acquire) {
         return None;
     }
+    // SAFETY: as for allocate_frames.
     unsafe {
-        let allocator = core::ptr::addr_of!(GLOBAL_ALLOCATOR).cast::<FrameAllocator>();
-        let available = (*allocator)
-            .available_frames()
-            .checked_add((*allocator).recycled_count as u64)?;
-        let total = available.checked_add((*allocator).allocated_frames)?;
-        Some((total, available))
+        let allocator = allocator();
+        let available = (*allocator).free_frames;
+        Some((
+            available.checked_add((*allocator).allocated_frames)?,
+            available,
+        ))
     }
 }
 
@@ -1072,130 +992,87 @@ pub(crate) fn reclaimed_boot_service_frame_count() -> Option<u64> {
     if !INITIALIZED.load(Ordering::Acquire) {
         return None;
     }
-    unsafe {
-        let allocator = core::ptr::addr_of!(GLOBAL_ALLOCATOR).cast::<FrameAllocator>();
-        Some((*allocator).reclaimed_boot_service_frames)
-    }
+    // SAFETY: as for allocate_frames.
+    unsafe { Some((*allocator()).reclaimed_boot_service_frames) }
 }
 
+/// Exercises reservation, release, ownership, budget, and contiguity rules on
+/// a private allocator over a synthetic memory map.
 pub(crate) fn verify_reservation_invariants() -> bool {
-    const TEST_FRAME_LIMIT: usize = 64;
-    const TEST_INDEX_LIMIT: usize = TEST_FRAME_LIMIT * 2;
-    type TestFrameAllocator =
-        FrameAllocator<TEST_FRAME_LIMIT, TEST_FRAME_LIMIT, 16, TEST_INDEX_LIMIT>;
-    let mut allocator = TestFrameAllocator {
-        ranges: [EMPTY_RANGE; MAX_RANGES],
-        range_count: 2,
-        active_range: 0,
-        allocated_frames: 0,
-        reclaimed_boot_service_frames: 0,
-        live_frames: [EMPTY_LEASE; TEST_FRAME_LIMIT],
-        live_owners: [FrameOwner::KERNEL; TEST_FRAME_LIMIT],
-        live_index: [LIVE_INDEX_EMPTY; TEST_INDEX_LIMIT],
-        live_count: 0,
-        recycled: [EMPTY_LEASE; TEST_FRAME_LIMIT],
-        recycled_count: 0,
-    };
-    allocator.ranges[0] = Range {
-        next: 0x10_0000,
-        end: 0x10_2000,
-    };
-    allocator.ranges[1] = Range {
-        next: 0x20_0000,
-        end: 0x20_1000,
+    // Frames 0x100..0x700 (1 MiB to 7 MiB) are tracked.
+    const FIRST_FRAME: u64 = 0x100;
+    const FRAMES: usize = 0x600;
+    static mut METADATA: [u64; FRAMES] = [0; FRAMES];
+    static mut FREE: [u64; FRAMES / 64] = [0; FRAMES / 64];
+    // SAFETY: the test tables are private to this single-threaded self-test.
+    let new_allocator = |ranges: &[(u64, u64)]| unsafe {
+        let metadata = core::ptr::addr_of_mut!(METADATA).cast::<u64>();
+        let free = core::ptr::addr_of_mut!(FREE).cast::<u64>();
+        metadata.write_bytes(0, FRAMES);
+        free.write_bytes(0, FRAMES / 64);
+        let mut allocator = FrameAllocator::with_tables(FIRST_FRAME, FRAMES, metadata, free, 16);
+        for (start, end) in ranges {
+            allocator.add_free_range(*start, *end);
+        }
+        allocator
     };
     let owner = FrameOwner(1);
     let other_owner = FrameOwner(2);
+    let third_owner = FrameOwner(3);
+
+    let mut allocator = new_allocator(&[(0x10_0000, 0x10_2000), (0x20_0000, 0x20_1000)]);
     let Some(first) = allocator.reserve::<2>(owner) else {
         return false;
     };
-    let before_failure = allocator;
-    let failed = allocator.reserve::<2>(owner).is_none();
-    let failure_was_atomic = allocator.active_range == before_failure.active_range
-        && allocator.ranges[0].next == before_failure.ranges[0].next
-        && allocator.ranges[1].next == before_failure.ranges[1].next
-        && allocator.allocated_frames == before_failure.allocated_frames;
+    let failed = allocator.reserve::<2>(owner).is_none()
+        && allocator.allocated_frames == 2
+        && allocator.free_frames == 1;
     let Some(last) = allocator.reserve::<1>(owner) else {
         return false;
     };
-    let before_forged_release = allocator;
     let forged_release_rejected = !allocator.release(
         owner,
         [FrameLease {
             address: 0x30_0000,
             generation: 1,
         }],
-    ) && allocator.allocated_frames
-        == before_forged_release.allocated_frames
-        && allocator.live_count == before_forged_release.live_count
-        && allocator.recycled_count == before_forged_release.recycled_count;
+    ) && allocator.allocated_frames == 3;
     let wrong_owner_rejected = !allocator.release(other_owner, first);
     let released = allocator.release(owner, first);
     let duplicate_rejected = !allocator.release(owner, first);
     let reused = allocator.reserve::<2>(other_owner);
     let stale_release_rejected = !allocator.release(other_owner, first);
+    let reuse_bumped_generation = reused.is_some_and(|leases| {
+        leases.map(FrameLease::address) == [0x10_0000, 0x10_1000]
+            && leases.iter().all(|lease| lease.generation == 2)
+    });
     let ownership_transferred = allocator.transfer_owner(owner, other_owner) == Some(1)
         && !allocator.owns(owner, &last)
         && allocator.owns(other_owner, &last)
         && allocator.owner_live_count(owner) == 0
         && allocator.owner_live_count(other_owner) == 3;
-    let mut budgeted = TestFrameAllocator {
-        ranges: [EMPTY_RANGE; MAX_RANGES],
-        range_count: 1,
-        active_range: 0,
-        allocated_frames: 0,
-        reclaimed_boot_service_frames: 0,
-        live_frames: [EMPTY_LEASE; TEST_FRAME_LIMIT],
-        live_owners: [FrameOwner::KERNEL; TEST_FRAME_LIMIT],
-        live_index: [LIVE_INDEX_EMPTY; TEST_INDEX_LIMIT],
-        live_count: 0,
-        recycled: [EMPTY_LEASE; TEST_FRAME_LIMIT],
-        recycled_count: 0,
-    };
-    budgeted.ranges[0] = Range {
-        next: 0x40_0000,
-        end: 0x40_0000 + 33 * PAGE_SIZE,
-    };
-    let before_over_budget = budgeted;
+    let exhausted = allocator.reserve::<1>(FrameOwner::KERNEL).is_none()
+        && allocator.free_frames == 0
+        && allocator.allocated_frames == 3;
+
+    let mut budgeted = new_allocator(&[(0x40_0000, 0x40_0000 + 33 * PAGE_SIZE)]);
     let over_budget_atomic = budgeted.reserve::<17>(owner).is_none()
-        && budgeted.live_count == before_over_budget.live_count
-        && budgeted.ranges[0].next == before_over_budget.ranges[0].next;
+        && budgeted.allocated_frames == 0
+        && budgeted.free_frames == 33;
     let budget_filled = budgeted.reserve::<16>(owner).is_some()
         && budgeted.reserve::<1>(owner).is_none()
         && budgeted.reserve::<1>(other_owner).is_some();
-    let third_owner = FrameOwner(3);
     let transfer_over_budget_rejected = budgeted.transfer_owner(owner, other_owner).is_none()
         && budgeted.owner_live_count(owner) == 16
         && budgeted.owner_live_count(other_owner) == 1;
     let bounded_transfer_completed = budgeted.transfer_owner(owner, third_owner) == Some(16)
         && budgeted.owner_live_count(owner) == 0
         && budgeted.owner_live_count(third_owner) == 16;
-    let mut contiguous = TestFrameAllocator {
-        ranges: [EMPTY_RANGE; MAX_RANGES],
-        range_count: 2,
-        active_range: 0,
-        allocated_frames: 0,
-        reclaimed_boot_service_frames: 0,
-        live_frames: [EMPTY_LEASE; TEST_FRAME_LIMIT],
-        live_owners: [FrameOwner::KERNEL; TEST_FRAME_LIMIT],
-        live_index: [LIVE_INDEX_EMPTY; TEST_INDEX_LIMIT],
-        live_count: 0,
-        recycled: [EMPTY_LEASE; TEST_FRAME_LIMIT],
-        recycled_count: 0,
-    };
-    contiguous.ranges[0] = Range {
-        next: 0x50_0000,
-        end: 0x50_2000,
-    };
-    contiguous.ranges[1] = Range {
-        next: 0x60_0000,
-        end: 0x60_4000,
-    };
-    let before_contiguous_failure = contiguous;
+
+    let mut contiguous = new_allocator(&[(0x50_0000, 0x50_2000), (0x60_0000, 0x60_4000)]);
     let contiguous_failure_atomic = contiguous.reserve_contiguous::<5>(owner).is_none()
-        && contiguous.live_count == before_contiguous_failure.live_count
-        && contiguous.ranges[0].next == before_contiguous_failure.ranges[0].next
-        && contiguous.ranges[1].next == before_contiguous_failure.ranges[1].next;
+        && contiguous.allocated_frames == 0
+        && contiguous.free_frames == 6;
     let contiguous_three = contiguous.reserve_contiguous::<3>(owner);
     let contiguous_two = contiguous.reserve_contiguous::<2>(owner);
     let contiguous_ranges_selected = contiguous_three.map(|frames| frames.map(FrameLease::address))
@@ -1211,22 +1088,26 @@ pub(crate) fn verify_reservation_invariants() -> bool {
             && frames.iter().all(|frame| frame.generation == 2)
             && contiguous.release(other_owner, frames)
     });
+    let extent = contiguous.reserve_contiguous_extent(owner, 4);
+    let extent_highest_first = extent.is_some_and(|first| first.address == 0x60_0000)
+        && contiguous.reserve_contiguous_extent(owner, 3).is_none()
+        && extent.is_some_and(|first| {
+            !contiguous.release_contiguous_extent(other_owner, first, 4)
+                && contiguous.release_contiguous_extent(owner, first, 4)
+                && contiguous.free_frames == 6
+        });
 
     first.map(FrameLease::address) == [0x10_0000, 0x10_1000]
         && failed
-        && failure_was_atomic
         && last.map(FrameLease::address) == [0x20_0000]
         && forged_release_rejected
         && wrong_owner_rejected
         && released
         && duplicate_rejected
-        && reused.map(|leases| leases.map(FrameLease::address)) == Some([0x10_1000, 0x10_0000])
-        && reused.is_some_and(|leases| leases.iter().all(|lease| lease.generation == 2))
+        && reuse_bumped_generation
         && stale_release_rejected
         && ownership_transferred
-        && allocator.allocated_frames == 3
-        && allocator.live_count == 3
-        && allocator.available_frames() == 0
+        && exhausted
         && allocator.reserve::<0>(owner).is_none()
         && over_budget_atomic
         && budget_filled
@@ -1236,4 +1117,5 @@ pub(crate) fn verify_reservation_invariants() -> bool {
         && contiguous_ranges_selected
         && contiguous_released
         && contiguous_recycle_preserved
+        && extent_highest_first
 }
