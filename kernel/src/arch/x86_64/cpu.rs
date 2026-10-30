@@ -1477,6 +1477,10 @@ static LINUX_THREAD_GENERATIONS: [BankedAtomicU32; LINUX_THREAD_LIMIT] =
     [const { BankedAtomicU32::new(0) }; LINUX_THREAD_LIMIT];
 static LINUX_THREAD_TIDS: [BankedAtomicU32; LINUX_THREAD_LIMIT] =
     [const { BankedAtomicU32::new(0) }; LINUX_THREAD_LIMIT];
+/// The process that created each cloned thread, or 0 for a process's main
+/// thread. The thread table is shared by every process in a domain.
+static LINUX_THREAD_OWNER_PIDS: [BankedAtomicU32; LINUX_THREAD_LIMIT] =
+    [const { BankedAtomicU32::new(0) }; LINUX_THREAD_LIMIT];
 static LINUX_THREAD_POINTERS: [BankedAtomicU64; LINUX_THREAD_LIMIT] =
     [const { BankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
 static LINUX_THREAD_TLS_EXTENTS: [BankedAtomicU64; LINUX_THREAD_LIMIT] =
@@ -5284,6 +5288,7 @@ fn reserve_linux_thread(
     );
     LINUX_THREAD_GENERATIONS[slot].store(generation, Ordering::SeqCst);
     LINUX_THREAD_TIDS[slot].store(tid, Ordering::SeqCst);
+    LINUX_THREAD_OWNER_PIDS[slot].store(current_linux_process_pid(), Ordering::SeqCst);
     LINUX_THREAD_POINTERS[slot].store(context.thread_pointer as u64, Ordering::SeqCst);
     LINUX_THREAD_TLS_EXTENTS[slot].store(context.extent as u64, Ordering::SeqCst);
     LINUX_THREAD_TLS_SIZES[slot].store(context.extent_size as u64, Ordering::SeqCst);
@@ -5599,6 +5604,7 @@ fn clear_linux_thread_slot(slot: usize) {
         }
     }
     LINUX_THREAD_TIDS[slot].store(0, Ordering::SeqCst);
+    LINUX_THREAD_OWNER_PIDS[slot].store(0, Ordering::SeqCst);
     LINUX_THREAD_POINTERS[slot].store(0, Ordering::SeqCst);
     LINUX_THREAD_TLS_EXTENTS[slot].store(0, Ordering::SeqCst);
     LINUX_THREAD_TLS_SIZES[slot].store(0, Ordering::SeqCst);
@@ -5679,6 +5685,20 @@ fn linux_thread_handle_by_tid(tid: u64) -> Option<LinuxThreadHandle> {
             .then(|| linux_thread_handle(slot))
             .flatten()
     })
+}
+
+/// Retires every thread that `pid` cloned except the calling one, as
+/// exit_group must and as a process exit implies.
+fn retire_linux_process_threads(pid: u32) {
+    let current = current_linux_thread_slot();
+    for slot in 0..LINUX_THREAD_LIMIT {
+        if Some(slot) != current
+            && LINUX_THREAD_OWNER_PIDS[slot].load(Ordering::SeqCst) == pid
+            && LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) != LINUX_THREAD_FREE
+        {
+            clear_linux_thread_slot(slot);
+        }
+    }
 }
 
 fn ready_linux_thread_handle() -> Option<LinuxThreadHandle> {
@@ -10233,7 +10253,14 @@ extern "sysv64" fn linux_syscall_handler(
         {
             linux_exit_child_to_parent(registers)
         }
+        LINUX_EXIT_SYSCALL
+            if current_linux_process_pid() != 1
+                && current_linux_tid().is_some_and(|tid| tid != current_linux_process_pid()) =>
+        {
+            linux_exit_child_to_parent(registers)
+        }
         LINUX_EXIT_SYSCALL | LINUX_EXIT_GROUP_SYSCALL if current_linux_process_pid() != 1 => {
+            retire_linux_process_threads(current_linux_process_pid());
             if LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
                 && !refresh_live_linux_process_registry(syscall_return)
             {
