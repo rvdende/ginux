@@ -215,6 +215,38 @@ root, execution, console, resource, image, and network state. OCI is only the
 transport and filesystem assembly format; it is not the runtime or security
 boundary.
 
+### Boot media and physical machines
+
+`make boot-media` packages the EFI image as removable media in `build/media`:
+
+- `ginux.iso` is a UEFI-bootable hybrid ISO. It can be burned to optical media
+  or written directly to a USB stick.
+- `ginux-usb.img` is a raw GPT disk image with one EFI system partition, for
+  firmware that does not boot hybrid ISOs from USB.
+
+Write either one to a stick (this erases the stick) and boot it in UEFI mode
+with Secure Boot disabled:
+
+```sh
+sudo dd if=build/media/ginux-usb.img of=/dev/sdX bs=4M conv=fsync status=progress
+```
+
+`make test-boot-media` boots both images in QEMU as a CD-ROM and as a USB stick
+on an xHCI controller, and requires each boot to reach the controller prompt.
+
+To install Ginux next to an existing Linux system on the target computer, run
+`sudo tools/images/install-to-esp.sh --boot-next` there. It copies the image to
+`EFI/ginux/ginux.efi` on the EFI system partition and registers a firmware boot
+entry outside the default boot order, so `--boot-next` boots Ginux once and the
+following reboot returns to the existing system.
+
+Physical hardware is not supported yet. The kernel still requires the QEMU
+virtio devices and an Intel VT-d IOMMU, and its console is the serial port.
+Bringing up a real machine starts with `sudo tools/hardware/probe.sh`, run
+under an existing Linux installation on that machine, which archives the
+firmware tables and device inventory that the storage, network, display, and
+IOMMU drivers will be written against.
+
 ## Verification
 
 Useful gates include:
