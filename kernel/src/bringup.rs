@@ -9,7 +9,7 @@
 
 use core::ptr::read_unaligned;
 
-use crate::drivers::{ahci, gpt, keyboard, nvme, pci, say, xhci, BlockDevice};
+use crate::drivers::{ahci, amd_iommu, gpt, keyboard, nvme, pci, realtek, say, xhci, BlockDevice};
 use crate::{BootInfo, UefiMemoryDescriptor, EFI_BOOT_SERVICES_CODE, EFI_BOOT_SERVICES_DATA};
 
 const EFI_LOADER_CODE: u32 = 1;
@@ -17,6 +17,7 @@ const EFI_LOADER_DATA: u32 = 2;
 const EFI_CONVENTIONAL_MEMORY: u32 = crate::EFI_CONVENTIONAL_MEMORY;
 const FOUR_GIB: u64 = 1 << 32;
 const MAX_CONTROLLERS: usize = 8;
+const MAX_IOMMUS: usize = 8;
 const LINE_CAPACITY: usize = 128;
 const EFI_RESET_COLD: u32 = 0;
 const EFI_RESET_SHUTDOWN: u32 = 2;
@@ -46,6 +47,7 @@ pub(crate) fn run(boot_info: &BootInfo) -> ! {
     report_memory(boot_info);
     report_acpi(boot_info.acpi_rsdp as u64);
     report_pci();
+    report_network();
     report_disks();
     let keyboards = open_keyboards();
 
@@ -95,6 +97,55 @@ fn report_pci() {
             device.interface,
             device.class_name()
         );
+    });
+}
+
+fn report_network() {
+    pci::for_each_function(|device| {
+        if device.class != 0x02 {
+            return;
+        }
+        let address = device.address;
+        say!(
+            "ginux: network {:02x}:{:02x}.{}: ",
+            address.bus,
+            address.device,
+            address.function
+        );
+        if !realtek::is_supported(&device) {
+            say!(
+                "{:04x}:{:04x} has no driver yet\n",
+                device.vendor,
+                device.device
+            );
+            return;
+        }
+        // SAFETY: the device is a supported Realtek controller with an
+        // identity-mapped BAR, and probing only reads registers.
+        let Some(report) = (unsafe { realtek::probe(address) }) else {
+            say!("Realtek {:04x} registers unavailable\n", device.device);
+            return;
+        };
+        let mac = report.mac;
+        say!(
+            "Realtek {:04x} chip {:#x}, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, ",
+            device.device,
+            report.chip,
+            mac[0],
+            mac[1],
+            mac[2],
+            mac[3],
+            mac[4],
+            mac[5]
+        );
+        match report.speed {
+            Some(speed) => say!(
+                "link up at {} Mb/s {} duplex\n",
+                speed,
+                if report.full_duplex { "full" } else { "half" }
+            ),
+            None => say!("no link\n"),
+        }
     });
 }
 
@@ -260,9 +311,10 @@ fn run_command(boot_info: &BootInfo, line: &[u8]) {
     match command {
         "" => {}
         "help" => {
-            say!("Commands: help, pci, acpi, mem, disks, clear, echo TEXT, reboot, poweroff\n")
+            say!("Commands: help, pci, acpi, mem, disks, net, clear, echo TEXT, reboot, poweroff\n")
         }
         "pci" => report_pci(),
+        "net" => report_network(),
         "acpi" => report_acpi(boot_info.acpi_rsdp as u64),
         "mem" => report_memory(boot_info),
         "disks" => report_disks(),
@@ -332,6 +384,7 @@ fn report_acpi(rsdp: u64) {
             (u64::from(read_unaligned((rsdp + 16) as *const u32)), 4)
         };
         let length = u64::from(read_unaligned((root + 4) as *const u32));
+        let mut iommus = [0_u64; MAX_IOMMUS];
         say!("ginux: ACPI tables:");
         let mut offset = 36;
         while offset + entry_size <= length {
@@ -348,7 +401,7 @@ fn report_acpi(rsdp: u64) {
             say!(" {}", core::str::from_utf8(&signature).unwrap_or("????"));
             match &signature {
                 b"APIC" => report_madt(table),
-                b"IVRS" => report_ivrs(table),
+                b"IVRS" => report_ivrs(table, &mut iommus),
                 b"DMAR" => say!("[Intel VT-d]"),
                 b"MCFG" => report_mcfg(table),
                 b"HPET" => say!("[{:#x}]", read_unaligned((table + 44) as *const u64)),
@@ -356,6 +409,23 @@ fn report_acpi(rsdp: u64) {
             }
         }
         say!("\n");
+        for base in iommus.into_iter().filter(|base| *base != 0) {
+            // SAFETY: the base comes from IVRS and the firmware identity map
+            // covers it; the registers read have no side effects.
+            let report = amd_iommu::probe(base);
+            say!(
+                "ginux: AMD-Vi {:#x}: {} by firmware, status {:#x}, features ",
+                base,
+                if report.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                report.status
+            );
+            let _ = report.write_features(&mut crate::drivers::Console);
+            say!("\n");
+        }
     }
 }
 
@@ -388,7 +458,7 @@ unsafe fn report_madt(table: u64) {
     say!("]");
 }
 
-unsafe fn report_ivrs(table: u64) {
+unsafe fn report_ivrs(table: u64, iommus: &mut [u64; MAX_IOMMUS]) {
     let length = u64::from(read_unaligned((table + 4) as *const u32));
     say!("[AMD-Vi");
     let mut offset = 48;
@@ -399,7 +469,14 @@ unsafe fn report_ivrs(table: u64) {
             break;
         }
         if matches!(kind, 0x10 | 0x11 | 0x40) {
-            say!(" {:#x}", read_unaligned((table + offset + 8) as *const u64));
+            let base = read_unaligned((table + offset + 8) as *const u64);
+            say!(" {:#x}", base);
+            // Several IVHD blocks of different types can describe one unit.
+            if !iommus.contains(&base) {
+                if let Some(free) = iommus.iter_mut().find(|slot| **slot == 0) {
+                    *free = base;
+                }
+            }
         }
         offset += size;
     }

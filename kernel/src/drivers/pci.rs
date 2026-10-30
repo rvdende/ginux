@@ -73,6 +73,12 @@ impl Function {
         (address != 0).then_some(address)
     }
 
+    /// Enables memory decoding only, for drivers that just read registers.
+    pub(crate) fn enable_memory(self) {
+        let command = self.read_u32(COMMAND);
+        self.write_u32(COMMAND, (command | u32::from(COMMAND_MEMORY)) & 0xffff);
+    }
+
     /// Enables memory decoding and bus mastering, and masks legacy INTx,
     /// because these drivers poll.
     pub(crate) fn enable_memory_and_bus_master(self) {

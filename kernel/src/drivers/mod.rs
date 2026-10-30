@@ -7,10 +7,12 @@
 //! main kernel.
 
 pub(crate) mod ahci;
+pub(crate) mod amd_iommu;
 pub(crate) mod gpt;
 pub(crate) mod keyboard;
 pub(crate) mod nvme;
 pub(crate) mod pci;
+pub(crate) mod realtek;
 pub(crate) mod xhci;
 
 use core::fmt::Write;

@@ -72,7 +72,8 @@ boot_profile() {
         -monitor "unix:$monitor,server=on,wait=off" \
         -serial "$serial" \
         -no-reboot \
-        -net none \
+        -netdev user,id=net0,restrict=on \
+        -device e1000e,netdev=net0 \
         -device amd-iommu \
         -device qemu-xhci,id=xhci \
         -device usb-tablet,bus=xhci.0 \
@@ -155,6 +156,8 @@ for expected in \
     'QEMU HARDDISK (serial GINUXSATA01), 131072 sectors of 512 bytes (64 MiB)' \
     'MiB Linux filesystem "sata-data"' \
     'NotBootKeyboard(' \
+    'by firmware, status' \
+    '8086:10d3 has no driver yet' \
     'keyboard 0627:0001 on port' \
     'Ginux bring-up shell' \
     'bring-up> echo usbok' \
