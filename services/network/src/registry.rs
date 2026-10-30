@@ -42,6 +42,8 @@ const TLS_RECORD_SIZE: usize = 16_640;
 const CERTIFICATE_SIZE: usize = 4096;
 const HTTP_HEADER_SIZE: usize = 8192;
 const METADATA_BODY_SIZE: usize = 64 * 1024;
+/// Bodies larger than this many MiB report progress at this interval.
+const BODY_PROGRESS_MIB: usize = 32;
 
 static CLOCK: AtomicU64 = AtomicU64::new(0);
 static PROGRESS_CAPABILITY: AtomicU64 = AtomicU64::new(0);
@@ -1162,15 +1164,40 @@ fn read_length(
     }
     let mut remaining = length - initial.len();
     let mut buffer = [0; 4096];
+    let mut reported = 0;
     while remaining != 0 {
         let requested = remaining.min(buffer.len());
-        let Ok(count) = stream.read(&mut buffer[..requested]) else {
-            return false;
+        let count = match stream.read(&mut buffer[..requested]) {
+            Ok(0) => {
+                progress(b"registry body ended early: connection closed");
+                return false;
+            }
+            Ok(count) => count,
+            Err(error) if embedded_io::Error::kind(&error) == ErrorKind::TimedOut => {
+                progress(b"registry body read failed: timed out");
+                return false;
+            }
+            Err(_) => {
+                progress(b"registry body read failed: socket error");
+                return false;
+            }
         };
-        if count == 0 || !sink.write(&buffer[..count]) {
+        if !sink.write(&buffer[..count]) {
+            progress(b"registry body staging write failed");
             return false;
         }
         remaining -= count;
+        let received = (length - remaining) >> 20;
+        if received >= reported + BODY_PROGRESS_MIB {
+            reported = received;
+            let mut message = String::<64>::new();
+            let _ = write!(
+                message,
+                "layer body {received} of {} MiB received",
+                length >> 20
+            );
+            progress(message.as_bytes());
+        }
     }
     true
 }
