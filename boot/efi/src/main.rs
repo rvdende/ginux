@@ -21,6 +21,16 @@ type EfiStatus = usize;
 const EFI_SUCCESS: EfiStatus = 0;
 const COM1: u16 = 0x3f8;
 const MEMORY_MAP_CAPACITY: usize = 128 * 1024;
+const PAGE_SIZE: usize = 4096;
+const ALLOCATE_MAX_ADDRESS: u32 = 1;
+const EFI_LOADER_CODE: u32 = 1;
+// The kernel's initial identity map covers the first 4 GiB.
+const IMAGE_ADDRESS_LIMIT: u64 = 0xffff_ffff;
+const PE_HEADER_OFFSET: usize = 0x3c;
+const PE_OPTIONAL_HEADER_OFFSET: usize = 24;
+const PE32_PLUS_BASE_RELOCATION_DIRECTORY: usize = 152;
+const IMAGE_REL_BASED_ABSOLUTE: u16 = 0;
+const IMAGE_REL_BASED_DIR64: u16 = 10;
 const ACPI_20_TABLE_GUID: EfiGuid = EfiGuid {
     data1: 0x8868_e871,
     data2: 0xe4f1,
@@ -122,6 +132,7 @@ type GetMemoryMap =
 type ExitBootServices = unsafe extern "efiapi" fn(EfiHandle, usize) -> EfiStatus;
 type HandleProtocol =
     unsafe extern "efiapi" fn(EfiHandle, *const EfiGuid, *mut *mut c_void) -> EfiStatus;
+type AllocatePages = unsafe extern "efiapi" fn(u32, u32, usize, *mut u64) -> EfiStatus;
 type LocateProtocol =
     unsafe extern "efiapi" fn(*const EfiGuid, *mut c_void, *mut *mut c_void) -> EfiStatus;
 
@@ -178,7 +189,7 @@ struct EfiBootServices {
     header: EfiTableHeader,
     raise_tpl: usize,
     restore_tpl: usize,
-    allocate_pages: usize,
+    allocate_pages: AllocatePages,
     free_pages: usize,
     get_memory_map: GetMemoryMap,
     allocate_pool: usize,
@@ -237,6 +248,11 @@ struct EfiSystemTable {
 struct MemoryMapStorage([u8; MEMORY_MAP_CAPACITY]);
 
 static mut MEMORY_MAP_STORAGE: MemoryMapStorage = MemoryMapStorage([0; MEMORY_MAP_CAPACITY]);
+// Kept in the image rather than on the firmware stack, which may lie above 4 GiB.
+static mut BOOT_INFO: core::mem::MaybeUninit<BootInfo> = core::mem::MaybeUninit::uninit();
+
+type Continuation =
+    unsafe extern "efiapi" fn(EfiHandle, *mut EfiSystemTable, *const u8, usize) -> EfiStatus;
 
 #[no_mangle]
 extern "efiapi" fn efi_main(image: EfiHandle, system_table: *mut EfiSystemTable) -> EfiStatus {
@@ -279,16 +295,95 @@ extern "efiapi" fn efi_main(image: EfiHandle, system_table: *mut EfiSystemTable)
     }
 
     // SAFETY: UEFI owns the system and service tables until ExitBootServices.
+    unsafe {
+        let boot_services = (*system_table).boot_services;
+        if boot_services.is_null() {
+            panic!("UEFI boot services are missing");
+        }
+        let (image_base, image_size) = loaded_image_bounds(image, boot_services);
+        if (image_base as u64).saturating_add(image_size as u64) <= IMAGE_ADDRESS_LIMIT {
+            return continue_boot(image, system_table, image_base, image_size);
+        }
+        // Firmware placed the image above 4 GiB, which the kernel's initial
+        // identity map does not reach. Continue in a relocated copy.
+        let relocated = relocate_below_limit(boot_services, image_base, image_size);
+        let offset = continue_boot as *const () as usize - image_base as usize;
+        let continuation: Continuation = core::mem::transmute(relocated.add(offset));
+        continuation(image, system_table, relocated, image_size)
+    }
+}
+
+/// Finishes booting from the image at `image_base`, which may be a relocated
+/// copy of the image firmware loaded.
+unsafe extern "efiapi" fn continue_boot(
+    image: EfiHandle,
+    system_table: *mut EfiSystemTable,
+    image_base: *const u8,
+    image_size: usize,
+) -> EfiStatus {
     // The handoff function validates the required pointers before using them.
-    let acpi_rsdp = unsafe { find_acpi_rsdp(system_table) };
+    let acpi_rsdp = find_acpi_rsdp(system_table);
     if acpi_rsdp.is_null() {
         panic!("UEFI did not provide an ACPI root pointer");
     }
-    let boot_info = unsafe { exit_boot_services(image, system_table, acpi_rsdp) };
+    let boot_info = exit_boot_services(image, system_table, acpi_rsdp, image_base, image_size);
+    let stored = core::ptr::addr_of_mut!(BOOT_INFO);
+    (*stored).write(boot_info);
 
-    // SAFETY: Boot services have ended, the memory-map storage is static, and
-    // the kernel entry never returns to firmware boot code.
-    unsafe { kernel_entry(core::ptr::addr_of!(boot_info)) }
+    // SAFETY: Boot services have ended, the memory-map storage and handoff are
+    // static, and the kernel entry never returns to firmware boot code.
+    kernel_entry((*stored).as_ptr())
+}
+
+/// Copies the loaded image below 4 GiB and applies its base relocations for
+/// the move, returning the new base.
+unsafe fn relocate_below_limit(
+    boot_services: *mut EfiBootServices,
+    base: *const u8,
+    size: usize,
+) -> *const u8 {
+    let mut address = IMAGE_ADDRESS_LIMIT;
+    let status = ((*boot_services).allocate_pages)(
+        ALLOCATE_MAX_ADDRESS,
+        EFI_LOADER_CODE,
+        size.div_ceil(PAGE_SIZE),
+        &mut address,
+    );
+    if status != EFI_SUCCESS {
+        panic!("no memory below 4 GiB for the EFI image");
+    }
+    let copy = address as *mut u8;
+    core::ptr::copy_nonoverlapping(base, copy, size);
+    let delta = (copy as u64).wrapping_sub(base as u64);
+
+    let read_u32 = |offset: usize| copy.add(offset).cast::<u32>().read_unaligned() as usize;
+    let optional_header = read_u32(PE_HEADER_OFFSET) + PE_OPTIONAL_HEADER_OFFSET;
+    let directory = optional_header + PE32_PLUS_BASE_RELOCATION_DIRECTORY;
+    let (table, table_size) = (read_u32(directory), read_u32(directory + 4));
+    let mut block = 0;
+    while block + 8 <= table_size {
+        let page = read_u32(table + block);
+        let block_size = read_u32(table + block + 4);
+        if block_size < 8 || block + block_size > table_size || page >= size {
+            panic!("malformed EFI image relocations");
+        }
+        for entry in (8..block_size).step_by(2) {
+            let value = copy
+                .add(table + block + entry)
+                .cast::<u16>()
+                .read_unaligned();
+            match value >> 12 {
+                IMAGE_REL_BASED_ABSOLUTE => {}
+                IMAGE_REL_BASED_DIR64 => {
+                    let target = copy.add(page + usize::from(value & 0x0fff)).cast::<u64>();
+                    target.write_unaligned(target.read_unaligned().wrapping_add(delta));
+                }
+                _ => panic!("unsupported EFI image relocation type"),
+            }
+        }
+        block += block_size;
+    }
+    copy
 }
 
 unsafe fn find_acpi_rsdp(system_table: *const EfiSystemTable) -> *const u8 {
@@ -315,13 +410,14 @@ unsafe fn exit_boot_services(
     image: EfiHandle,
     system_table: *mut EfiSystemTable,
     acpi_rsdp: *const u8,
+    image_base: *const u8,
+    image_size: usize,
 ) -> BootInfo {
     let boot_services = (*system_table).boot_services;
     let runtime_services = (*system_table).runtime_services;
     if boot_services.is_null() || runtime_services.is_null() {
         panic!("UEFI service table is missing");
     }
-    let (image_base, image_size) = loaded_image_bounds(image, boot_services);
     let unix_time = read_unix_time(runtime_services);
     let framebuffer = graphics_framebuffer(boot_services);
 
