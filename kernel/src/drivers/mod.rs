@@ -7,8 +7,10 @@
 //! main kernel.
 
 pub(crate) mod gpt;
+pub(crate) mod keyboard;
 pub(crate) mod nvme;
 pub(crate) mod pci;
+pub(crate) mod xhci;
 
 use core::fmt::Write;
 
@@ -50,12 +52,22 @@ impl DmaPage {
 }
 
 /// Waits until `ready` returns true or roughly `seconds` have elapsed.
+pub(crate) fn wait_until(seconds: u64, ready: impl FnMut() -> bool) -> bool {
+    wait_until_ms(seconds.saturating_mul(1000), ready)
+}
+
+/// Spins for at least `milliseconds`.
+pub(crate) fn delay_ms(milliseconds: u64) {
+    wait_until_ms(milliseconds, || false);
+}
+
+/// Waits until `ready` returns true or roughly `milliseconds` have elapsed.
 ///
 /// The bound assumes a timestamp counter of at most 5 GHz, so it never waits
 /// less than requested; slower counters wait proportionally longer.
-pub(crate) fn wait_until(seconds: u64, mut ready: impl FnMut() -> bool) -> bool {
+pub(crate) fn wait_until_ms(milliseconds: u64, mut ready: impl FnMut() -> bool) -> bool {
     let start = crate::arch::x86_64::timer::timestamp_counter();
-    let limit = seconds.saturating_mul(5_000_000_000);
+    let limit = milliseconds.saturating_mul(5_000_000);
     loop {
         if ready() {
             return true;

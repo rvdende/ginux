@@ -3,9 +3,10 @@
 # virtio reference profile: AMD IOMMU, an NVMe SSD with a GPT disk, AHCI,
 # xHCI with a USB keyboard, a VGA framebuffer, and no virtio devices.
 #
-# The first boot keeps a serial port and checks the bring-up report. The second
-# removes the serial port, as on most PCs, and checks that the framebuffer
-# console shows text. Screenshots are kept in build/qemu/hardware-profile/.
+# The first boot keeps a serial port, checks the bring-up report, and types a
+# command on the USB keyboard through the QEMU monitor. The second removes the
+# serial port, as on most PCs, and checks that the framebuffer console shows
+# text. Screenshots are kept in build/qemu/hardware-profile/.
 
 set -euo pipefail
 
@@ -104,10 +105,24 @@ stop_qemu() {
 
 echo "Booting the physical-hardware profile with QEMU/$accelerator using CPU $cpu_model"
 
+monitor_command() {
+    printf '%s\n' "$1" | socat - "UNIX-CONNECT:$work_dir/serial.monitor" >/dev/null
+}
+
 boot_profile serial "file:$work_dir/serial.log"
 for _ in $(seq 1 "$timeout_seconds"); do
+    grep -aq 'bring-up> ' "$work_dir/serial.log" && break
     grep -aq 'ginux: halted' "$work_dir/serial.log" && break
     grep -aEq '^GINUX_(BOOT|KERNEL)_PANIC' "$work_dir/serial.log" && break
+    sleep 1
+done
+# Type a command on the emulated USB keyboard.
+for key in e c h o spc u s b o k ret; do
+    monitor_command "sendkey $key"
+    sleep 0.2
+done
+for _ in $(seq 1 10); do
+    grep -aq '^usbok' <(tr -d '\r' <"$work_dir/serial.log") && break
     sleep 1
 done
 screenshot serial >/dev/null
@@ -128,7 +143,10 @@ for expected in \
     'partition 2: 128 MiB Linux filesystem "ubuntu-root"' \
     'partition 3: 16 MiB Linux swap "swap"' \
     'MiB Ginux volume "ginux-volume"' \
-    'ginux: halted'; do
+    'keyboard 0627:0001 on port' \
+    'Ginux bring-up shell' \
+    'bring-up> echo usbok' \
+    'usbok'; do
     if ! grep -Fq "$expected" "$output_dir/serial.log"; then
         echo "missing: $expected" >&2
         failed=1
@@ -138,7 +156,7 @@ if ((failed)); then
     cat "$output_dir/serial.log" >&2
     exit 1
 fi
-echo "ok   bring-up report over serial"
+echo "ok   bring-up report over serial and USB keyboard input"
 
 boot_profile no-serial none
 sleep "${GINUX_PROFILE_SCREEN_DELAY:-20}"

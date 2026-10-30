@@ -9,14 +9,17 @@
 
 use core::ptr::read_unaligned;
 
-use crate::drivers::{gpt, nvme, pci, say};
+use crate::drivers::{gpt, keyboard, nvme, pci, say, xhci};
 use crate::{BootInfo, UefiMemoryDescriptor, EFI_BOOT_SERVICES_CODE, EFI_BOOT_SERVICES_DATA};
 
 const EFI_LOADER_CODE: u32 = 1;
 const EFI_LOADER_DATA: u32 = 2;
 const EFI_CONVENTIONAL_MEMORY: u32 = crate::EFI_CONVENTIONAL_MEMORY;
 const FOUR_GIB: u64 = 1 << 32;
-const MAX_NVME_CONTROLLERS: usize = 8;
+const MAX_CONTROLLERS: usize = 8;
+const LINE_CAPACITY: usize = 128;
+const EFI_RESET_COLD: u32 = 0;
+const EFI_RESET_SHUTDOWN: u32 = 2;
 const MAX_LISTED_PARTITIONS: u32 = 128;
 
 /// Reports the platform and runs the hardware drivers, then halts.
@@ -42,9 +45,40 @@ pub(crate) fn run(boot_info: &BootInfo) -> ! {
     }
     report_memory(boot_info);
     report_acpi(boot_info.acpi_rsdp as u64);
+    report_pci();
+    report_disks();
+    let keyboard = open_keyboard();
 
-    let mut nvme_controllers = [None; MAX_NVME_CONTROLLERS];
-    let mut nvme_count = 0;
+    if keyboard.is_none() && !crate::SERIAL_PRESENT.load(core::sync::atomic::Ordering::Acquire) {
+        say!("ginux: no keyboard or serial input; halted\n");
+        halt();
+    }
+    shell(boot_info, keyboard)
+}
+
+fn halt() -> ! {
+    loop {
+        // SAFETY: bring-up runs with interrupts disabled and never resumes.
+        unsafe { core::arch::asm!("cli", "hlt", options(nomem, nostack)) };
+    }
+}
+
+/// Collects the PCI functions that satisfy `wanted`.
+fn functions(
+    wanted: impl Fn(&pci::Identity) -> bool,
+) -> ([Option<pci::Function>; MAX_CONTROLLERS], usize) {
+    let mut found = [None; MAX_CONTROLLERS];
+    let mut count = 0;
+    pci::for_each_function(|device| {
+        if wanted(&device) && count < MAX_CONTROLLERS {
+            found[count] = Some(device.address);
+            count += 1;
+        }
+    });
+    (found, count)
+}
+
+fn report_pci() {
     say!("ginux: PCI devices:\n");
     pci::for_each_function(|device| {
         say!(
@@ -59,22 +93,128 @@ pub(crate) fn run(boot_info: &BootInfo) -> ! {
             device.interface,
             device.class_name()
         );
-        if device.is_nvme() && nvme_count < MAX_NVME_CONTROLLERS {
-            nvme_controllers[nvme_count] = Some(device.address);
-            nvme_count += 1;
-        }
     });
+}
 
-    for function in nvme_controllers.iter().flatten() {
+fn report_disks() {
+    let (controllers, _) = functions(pci::Identity::is_nvme);
+    for function in controllers.iter().flatten() {
         probe_nvme(*function);
     }
+}
 
-    say!("ginux: bring-up complete; drivers for the remaining devices are not written yet\n");
-    say!("ginux: halted\n");
-    loop {
-        // SAFETY: bring-up runs with interrupts disabled and never resumes.
-        unsafe { core::arch::asm!("cli", "hlt", options(nomem, nostack)) };
+fn open_keyboard() -> Option<xhci::KeyboardController> {
+    let (controllers, count) = functions(pci::Identity::is_xhci);
+    if count == 0 {
+        say!("ginux: no xHCI controller\n");
+        return None;
     }
+    for function in controllers.iter().flatten() {
+        say!(
+            "ginux: xHCI {:02x}:{:02x}.{}: looking for a keyboard\n",
+            function.bus,
+            function.device,
+            function.function
+        );
+        // SAFETY: bring-up mode drives one controller at a time, and the
+        // firmware identity map covers its registers and the DMA pages.
+        match unsafe { xhci::KeyboardController::open(*function) } {
+            Ok(controller) => {
+                say!(
+                    "ginux:   keyboard {:04x}:{:04x} on port {}\n",
+                    controller.vendor,
+                    controller.product,
+                    controller.port
+                );
+                return Some(controller);
+            }
+            Err(error) => say!("ginux:   {:?}\n", error),
+        }
+    }
+    None
+}
+
+fn shell(boot_info: &BootInfo, mut usb: Option<xhci::KeyboardController>) -> ! {
+    say!("\nGinux bring-up shell. Type 'help' for commands.\n");
+    let mut decoder = keyboard::Keyboard::new();
+    let mut line = [0_u8; LINE_CAPACITY];
+    let mut length = 0;
+    say!("bring-up> ");
+    loop {
+        let mut pressed = [0_u8; 16];
+        let mut count = 0;
+        if let Some(report) = usb.as_mut().and_then(xhci::KeyboardController::poll) {
+            decoder.report(&report, |bytes| {
+                for byte in bytes {
+                    if count < pressed.len() {
+                        pressed[count] = *byte;
+                        count += 1;
+                    }
+                }
+            });
+        }
+        if crate::serial_input_ready() {
+            pressed[count] = crate::serial_read_byte_blocking();
+            count += 1;
+        }
+        for byte in pressed[..count].iter().copied() {
+            match byte {
+                b'\r' | b'\n' => {
+                    say!("\n");
+                    run_command(boot_info, &line[..length]);
+                    length = 0;
+                    say!("bring-up> ");
+                }
+                0x08 | 0x7f => {
+                    if length > 0 {
+                        length -= 1;
+                        say!("\x08 \x08");
+                    }
+                }
+                0x03 => {
+                    length = 0;
+                    say!("^C\nbring-up> ");
+                }
+                0x0c => {
+                    say!("\x1b[2J\x1b[Hbring-up> ");
+                    length = 0;
+                }
+                0x20..=0x7e if length < LINE_CAPACITY => {
+                    line[length] = byte;
+                    length += 1;
+                    crate::serial_write_raw(&[byte]);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn run_command(boot_info: &BootInfo, line: &[u8]) {
+    let text = core::str::from_utf8(line).unwrap_or("").trim();
+    let (command, argument) = text.split_once(' ').unwrap_or((text, ""));
+    match command {
+        "" => {}
+        "help" => {
+            say!("Commands: help, pci, acpi, mem, disks, clear, echo TEXT, reboot, poweroff\n")
+        }
+        "pci" => report_pci(),
+        "acpi" => report_acpi(boot_info.acpi_rsdp as u64),
+        "mem" => report_memory(boot_info),
+        "disks" => report_disks(),
+        "clear" => say!("\x1b[2J\x1b[H"),
+        "echo" => say!("{}\n", argument),
+        "reboot" => reset(boot_info, EFI_RESET_COLD),
+        "poweroff" => reset(boot_info, EFI_RESET_SHUTDOWN),
+        _ => say!("unknown command: {}\n", command),
+    }
+}
+
+fn reset(boot_info: &BootInfo, kind: u32) {
+    say!("ginux: resetting through UEFI runtime services\n");
+    // SAFETY: bring-up never calls SetVirtualAddressMap, so the runtime
+    // services remain callable through the firmware identity map.
+    unsafe { (boot_info.reset_system)(kind, 0, 0, core::ptr::null()) };
 }
 
 fn report_memory(boot_info: &BootInfo) {

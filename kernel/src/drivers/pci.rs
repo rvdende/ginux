@@ -133,6 +133,10 @@ impl Identity {
         }
     }
 
+    pub(crate) fn is_xhci(&self) -> bool {
+        (self.class, self.subclass, self.interface) == (0x0c, 0x03, 0x30)
+    }
+
     pub(crate) fn is_nvme(&self) -> bool {
         (self.class, self.subclass, self.interface) == (0x01, 0x08, 0x02)
     }
