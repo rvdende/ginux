@@ -797,7 +797,8 @@ const LINUX_PROC_PID2_STATM: &[u8] = b"256 64 32 16 0 32 0\n";
 pub(crate) const LINUX_EXEC_MAPPING_LIMIT: usize = 8;
 pub(crate) const LINUX_ACTIVE_IMAGE_MAPPING_LIMIT: usize = 640;
 pub(crate) const LINUX_PROCESS_HIERARCHY_LIMIT: usize = 1024;
-pub(crate) const LINUX_PROCESS_MAPPING_LIMIT: usize = 40_960;
+// Pages one Linux process may map; rustc's driver library alone is 74,000.
+pub(crate) const LINUX_PROCESS_MAPPING_LIMIT: usize = 262_144;
 const LINUX_EXEC_VECTOR_LIMIT: usize = 32;
 const LINUX_EXEC_STACK_SIZE: usize = PAGE_SIZE / 2;
 const LINUX_PLATFORM: &[u8] = b"x86_64\0";

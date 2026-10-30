@@ -198,26 +198,45 @@ impl ProcessExecutionContext {
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct ProcessAddressSpace {
     storage_slot: u8,
-    hierarchy_count: u16,
-    mapping_count: u16,
+    hierarchy_count: u32,
+    mapping_count: u32,
 }
 
-#[derive(Clone, Copy)]
+// Not Copy: an instance is several megabytes and lives only in an allocated extent.
 struct ProcessAddressSpaceStorage {
     hierarchy: [memory::FrameLease; PROCESS_HIERARCHY_LIMIT],
     mappings: [cpu::LinuxActiveImageMapping; PROCESS_PRIVATE_PAGE_LIMIT],
 }
 
-impl ProcessAddressSpaceStorage {
-    const EMPTY: Self = Self {
-        hierarchy: [memory::FrameLease::EMPTY; PROCESS_HIERARCHY_LIMIT],
-        mappings: [cpu::LinuxActiveImageMapping::EMPTY; PROCESS_PRIVATE_PAGE_LIMIT],
-    };
-}
+// Each slot's storage is several megabytes, so it is allocated from the frame
+// allocator the first time a process occupies the slot instead of being
+// reserved in the kernel image for every domain.
+static mut PROCESS_ADDRESS_SPACE_STORAGE: [*mut ProcessAddressSpaceStorage;
+    PROCESS_INSTANCE_LIMIT * PROCESS_RUNTIME_LIMIT] =
+    [core::ptr::null_mut(); PROCESS_INSTANCE_LIMIT * PROCESS_RUNTIME_LIMIT];
 
-static mut PROCESS_ADDRESS_SPACE_STORAGE: [[ProcessAddressSpaceStorage; PROCESS_RUNTIME_LIMIT];
-    PROCESS_INSTANCE_LIMIT] =
-    [[ProcessAddressSpaceStorage::EMPTY; PROCESS_RUNTIME_LIMIT]; PROCESS_INSTANCE_LIMIT];
+/// Returns the storage for `storage_slot` of the current process instance,
+/// allocating it on first use.
+fn address_space_storage(storage_slot: usize) -> Option<&'static mut ProcessAddressSpaceStorage> {
+    if storage_slot >= PROCESS_RUNTIME_LIMIT {
+        return None;
+    }
+    let index = current_process_instance() * PROCESS_RUNTIME_LIMIT + storage_slot;
+    // SAFETY: the kernel is single-processor; the table is only touched here.
+    let table = unsafe { &mut *core::ptr::addr_of_mut!(PROCESS_ADDRESS_SPACE_STORAGE) };
+    let entry = table.get_mut(index)?;
+    if entry.is_null() {
+        let length = size_of::<ProcessAddressSpaceStorage>();
+        let pages = length.div_ceil(PAGE_SIZE);
+        let (first, _) = memory::allocate_contiguous_extent(memory::FrameOwner::KERNEL, pages)?;
+        // The extent is zeroed, and every empty entry is all zeros.
+        *entry = crate::arch::x86_64::paging::direct_map_range_address(first.address(), length)?
+            as *mut ProcessAddressSpaceStorage;
+    }
+    // SAFETY: the pointer addresses a live, kernel-owned extent sized for
+    // the storage, and callers do not hold two references to one slot.
+    Some(unsafe { &mut **entry })
+}
 
 impl ProcessAddressSpace {
     fn new(
@@ -250,11 +269,7 @@ impl ProcessAddressSpace {
         {
             return None;
         }
-        let storage = unsafe {
-            &mut *core::ptr::addr_of_mut!(PROCESS_ADDRESS_SPACE_STORAGE)
-                .cast::<ProcessAddressSpaceStorage>()
-                .add(current_process_instance() * PROCESS_RUNTIME_LIMIT + storage_slot)
-        };
+        let storage = address_space_storage(storage_slot)?;
         // The published counts bound every reader. Overwrite only the live
         // prefixes instead of clearing the full elastic capacity on every
         // registry refresh.
@@ -262,8 +277,8 @@ impl ProcessAddressSpace {
         storage.mappings[..mappings.len()].copy_from_slice(mappings);
         Some(Self {
             storage_slot: storage_slot as u8,
-            hierarchy_count: u16::try_from(hierarchy.len()).ok()?,
-            mapping_count: u16::try_from(mappings.len()).ok()?,
+            hierarchy_count: u32::try_from(hierarchy.len()).ok()?,
+            mapping_count: u32::try_from(mappings.len()).ok()?,
         })
     }
 
@@ -279,34 +294,26 @@ impl ProcessAddressSpace {
         {
             return None;
         }
-        let storage = unsafe {
-            &mut *core::ptr::addr_of_mut!(PROCESS_ADDRESS_SPACE_STORAGE)
-                .cast::<ProcessAddressSpaceStorage>()
-                .add(current_process_instance() * PROCESS_RUNTIME_LIMIT + storage_slot)
-        };
+        let storage = address_space_storage(storage_slot)?;
         // Stale tail entries are unreachable because access is count-bounded.
         storage.hierarchy[..hierarchy.len()].copy_from_slice(hierarchy);
         storage.mappings[..mappings.len()].copy_from_slice(mappings);
         Some(Self {
             storage_slot: storage_slot as u8,
-            hierarchy_count: u16::try_from(hierarchy.len()).ok()?,
-            mapping_count: u16::try_from(mappings.len()).ok()?,
+            hierarchy_count: u32::try_from(hierarchy.len()).ok()?,
+            mapping_count: u32::try_from(mappings.len()).ok()?,
         })
     }
 
     fn storage(&self) -> &'static ProcessAddressSpaceStorage {
-        unsafe {
-            &*core::ptr::addr_of!(PROCESS_ADDRESS_SPACE_STORAGE)
-                .cast::<ProcessAddressSpaceStorage>()
-                .add(
-                    current_process_instance() * PROCESS_RUNTIME_LIMIT
-                        + usize::from(self.storage_slot),
-                )
-        }
+        // A ProcessAddressSpace exists only after its storage was allocated.
+        address_space_storage(usize::from(self.storage_slot))
+            .map(|storage| &*storage)
+            .expect("process address-space storage is allocated")
     }
 
     fn hierarchy(&self) -> &[memory::FrameLease] {
-        &self.storage().hierarchy[..usize::from(self.hierarchy_count)]
+        &self.storage().hierarchy[..self.hierarchy_count as usize]
     }
 
     fn root(&self) -> memory::FrameLease {
@@ -314,7 +321,7 @@ impl ProcessAddressSpace {
     }
 
     fn mappings(&self) -> &[cpu::LinuxActiveImageMapping] {
-        &self.storage().mappings[..usize::from(self.mapping_count)]
+        &self.storage().mappings[..self.mapping_count as usize]
     }
 
     fn is_valid(&self) -> bool {
@@ -2560,15 +2567,10 @@ fn replace_live_process_mapping_inner(
     let Some(space) = process.address_space.as_mut() else {
         return false;
     };
-    let storage = unsafe {
-        &mut *core::ptr::addr_of_mut!(PROCESS_ADDRESS_SPACE_STORAGE)
-            .cast::<ProcessAddressSpaceStorage>()
-            .add(
-                current_process_instance() * PROCESS_RUNTIME_LIMIT
-                    + usize::from(space.storage_slot),
-            )
+    let Some(storage) = address_space_storage(usize::from(space.storage_slot)) else {
+        return false;
     };
-    let Some(mapping) = storage.mappings[..usize::from(space.mapping_count)]
+    let Some(mapping) = storage.mappings[..space.mapping_count as usize]
         .iter_mut()
         .find(|mapping| mapping.address == address && mapping.frame == expected)
     else {
@@ -2605,15 +2607,10 @@ pub(crate) fn add_live_process_mapping(pid: u32, mapping: cpu::LinuxActiveImageM
     let Some(space) = process.address_space.as_mut() else {
         return false;
     };
-    let storage = unsafe {
-        &mut *core::ptr::addr_of_mut!(PROCESS_ADDRESS_SPACE_STORAGE)
-            .cast::<ProcessAddressSpaceStorage>()
-            .add(
-                current_process_instance() * PROCESS_RUNTIME_LIMIT
-                    + usize::from(space.storage_slot),
-            )
+    let Some(storage) = address_space_storage(usize::from(space.storage_slot)) else {
+        return false;
     };
-    let count = usize::from(space.mapping_count);
+    let count = space.mapping_count as usize;
     if count >= storage.mappings.len()
         || storage.mappings[..count]
             .iter()
