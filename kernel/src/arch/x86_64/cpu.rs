@@ -10094,6 +10094,7 @@ extern "sysv64" fn linux_syscall_handler(
             buffer,
             count,
             register(0),
+            register(1),
         ),
         LINUX_FUTEX_WAKE_SYSCALL => linux_futex_wake(first_argument, buffer, count, register(0)),
         LINUX_FUTEX_WAIT_SYSCALL => linux_futex_wait_live_return(
@@ -11522,7 +11523,9 @@ fn linux_clone_thread_request(
     user_rflags: u64,
 ) -> u64 {
     let runtime = LINUX_RUNTIME_MODE.load(Ordering::SeqCst);
-    if current_linux_tid() != Some(current_linux_process_pid()) {
+    // Any thread may create threads in the runtime (rustc's compiler thread
+    // spawns the codegen coordinator); the boot probe keeps the stricter rule.
+    if !runtime && current_linux_tid() != Some(current_linux_process_pid()) {
         return LINUX_EAGAIN;
     }
     if linux_nproc_limit_reached() {
@@ -13111,7 +13114,45 @@ fn linux_futex_live_return(
     operation: u64,
     value: u64,
     timeout: u64,
+    bitset: u64,
 ) -> u64 {
+    const FUTEX_WAIT_BITSET: u64 = 9;
+    const FUTEX_WAKE_BITSET: u64 = 10;
+    const FUTEX_PRIVATE_FLAG: u64 = 128;
+    const FUTEX_CLOCK_REALTIME: u64 = 256;
+    const FUTEX2_SIZE_U32: u64 = 2;
+    // Rust's standard library and glibc wait with FUTEX_WAIT_BITSET and an
+    // absolute timeout; the futex2 wait already implements those semantics.
+    let command = operation & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
+    let futex2_flags = FUTEX2_SIZE_U32 | (operation & FUTEX_PRIVATE_FLAG);
+    if command == FUTEX_WAIT_BITSET {
+        let clock = if operation & FUTEX_CLOCK_REALTIME != 0 {
+            LINUX_CLOCK_REALTIME
+        } else {
+            LINUX_CLOCK_MONOTONIC
+        };
+        // The classic futex call takes 32-bit values; callers such as Rust's
+        // std pass the bitset through a variadic argument whose upper half
+        // is unspecified, so truncate as Linux does.
+        return linux_futex_wait_live_return(
+            output,
+            caller,
+            address,
+            value & u64::from(u32::MAX),
+            bitset & u64::from(u32::MAX),
+            futex2_flags,
+            timeout,
+            clock,
+        );
+    }
+    if command == FUTEX_WAKE_BITSET && operation & FUTEX_CLOCK_REALTIME == 0 {
+        return linux_futex_wake(
+            address,
+            bitset & u64::from(u32::MAX),
+            value & u64::from(i32::MAX as u32),
+            futex2_flags,
+        );
+    }
     if !address.is_multiple_of(size_of::<u32>() as u64) {
         return LINUX_EINVAL;
     }
@@ -39415,7 +39456,13 @@ fn linux_executable_user_address(address: u64) -> bool {
     let code_end = code.saturating_add(ELF_PROBE_CODE_SIZE.load(Ordering::SeqCst));
     let loader = ELF_PROBE_LOADER_CODE_BASE.load(Ordering::SeqCst);
     let loader_end = loader.saturating_add(ELF_PROBE_LOADER_CODE_SIZE.load(Ordering::SeqCst));
-    (code..code_end).contains(&address) || (loader..loader_end).contains(&address)
+    // The cached ranges describe the last program the domain executed, which
+    // is not the current process after a child runs a different binary, and
+    // they never cover shared libraries. The page tables are authoritative.
+    (code..code_end).contains(&address)
+        || (loader..loader_end).contains(&address)
+        || LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
+            && address_space::current_linux_address_executable(address)
 }
 
 fn linux_signal_action_deliverable(handler: u64, flags: u64, restorer: u64) -> bool {
@@ -39895,6 +39942,12 @@ fn linux_kill_current(
             && !LINUX_SIGNAL_ACTIVE.load(Ordering::SeqCst)
         {
             linux_terminate_by_default_signal(signal)
+        } else if linux_default_signal_ignored(signal) {
+            // SIGCHLD, SIGURG, and SIGWINCH are discarded by default, and
+            // SIGCONT has nothing to resume in a running process. Failing
+            // here left the signal queued and turned every later system call
+            // result into ENOSYS once a child exited.
+            0
         } else {
             // SIGSTOP, SIGTSTP, SIGTTIN, and SIGTTOU require the pending
             // scheduler-visible stopped-process model.
