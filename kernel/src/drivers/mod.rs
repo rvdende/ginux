@@ -6,6 +6,7 @@
 //! in hardware bring-up mode (on the firmware page tables) and later from the
 //! main kernel.
 
+pub(crate) mod ahci;
 pub(crate) mod gpt;
 pub(crate) mod keyboard;
 pub(crate) mod nvme;
@@ -41,6 +42,14 @@ macro_rules! say {
     }};
 }
 pub(crate) use say;
+
+/// A disk that reads fixed-size blocks into a driver-owned buffer.
+pub(crate) trait BlockDevice {
+    fn block_size(&self) -> u32;
+
+    /// Reads `count` blocks starting at `block`, at most one 4 KiB page.
+    fn read_blocks(&mut self, block: u64, count: u32) -> Option<&[u8]>;
+}
 
 /// A 4 KiB page usable as a DMA buffer: the kernel image is identity mapped,
 /// so its address is also its physical address.

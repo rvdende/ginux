@@ -8,7 +8,7 @@
 use core::ptr::{addr_of, addr_of_mut};
 
 use super::pci::Function;
-use super::{wait_until, DmaPage};
+use super::{wait_until, BlockDevice, DmaPage};
 
 const REGISTER_CAPABILITIES: usize = 0x00;
 const REGISTER_VERSION: usize = 0x08;
@@ -346,4 +346,14 @@ fn read64(base: usize, offset: usize) -> u64 {
 fn write64(base: usize, offset: usize, value: u64) {
     write32(base, offset, value as u32);
     write32(base, offset + 4, (value >> 32) as u32);
+}
+
+impl BlockDevice for Controller {
+    fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
+    fn read_blocks(&mut self, block: u64, count: u32) -> Option<&[u8]> {
+        self.read(block, count).ok()
+    }
 }

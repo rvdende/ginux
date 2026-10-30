@@ -51,6 +51,10 @@ sgdisk --clear \
     --new=3:0:+16M --typecode=3:8200 --change-name=3:"swap" \
     --new=4:0:0 --typecode=4:80769f29-5413-45a3-abab-5b44b6125922 --change-name=4:"ginux-volume" \
     "$disk" >/dev/null
+# A second data disk on the SATA controller.
+sata="$work_dir/sata.raw"
+truncate -s 64M "$sata"
+sgdisk --clear --new=1:2048:0 --typecode=1:8300 --change-name=1:"sata-data" "$sata" >/dev/null
 
 boot_profile() {
     local label=$1 serial=$2
@@ -71,13 +75,18 @@ boot_profile() {
         -net none \
         -device amd-iommu \
         -device qemu-xhci,id=xhci \
+        -device usb-tablet,bus=xhci.0 \
         -device usb-kbd,bus=xhci.0 \
+        -device qemu-xhci,id=xhci2 \
+        -device usb-kbd,bus=xhci2.0 \
         -drive "if=none,id=nvm,format=raw,file=$disk" \
         -device "nvme,drive=nvm,serial=GINUXNVME01" \
         -drive "if=pflash,format=raw,readonly=on,file=$ovmf_code" \
         -drive "if=pflash,format=raw,file=$work_dir/vars.fd" \
         -drive "if=none,id=esp,format=raw,file=fat:rw:$esp_dir" \
-        -device "ide-hd,drive=esp,bootindex=1" &
+        -device "ide-hd,drive=esp,bootindex=1" \
+        -drive "if=none,id=sata,format=raw,file=$sata" \
+        -device "ide-hd,drive=sata,bus=ide.2,serial=GINUXSATA01" &
     qemu_pid=$!
 }
 
@@ -143,6 +152,9 @@ for expected in \
     'partition 2: 128 MiB Linux filesystem "ubuntu-root"' \
     'partition 3: 16 MiB Linux swap "swap"' \
     'MiB Ginux volume "ginux-volume"' \
+    'QEMU HARDDISK (serial GINUXSATA01), 131072 sectors of 512 bytes (64 MiB)' \
+    'MiB Linux filesystem "sata-data"' \
+    'NotBootKeyboard(' \
     'keyboard 0627:0001 on port' \
     'Ginux bring-up shell' \
     'bring-up> echo usbok' \
@@ -152,15 +164,26 @@ for expected in \
         failed=1
     fi
 done
+keyboards=$(grep -c 'keyboard 0627:0001 on port' "$output_dir/serial.log" || true)
+if ((keyboards != 2)); then
+    echo "expected keyboards on both xHCI controllers, found $keyboards" >&2
+    failed=1
+fi
 if ((failed)); then
     cat "$output_dir/serial.log" >&2
     exit 1
 fi
-echo "ok   bring-up report over serial and USB keyboard input"
+echo "ok   bring-up report over serial and USB keyboard input (two controllers)"
 
 boot_profile no-serial none
-sleep "${GINUX_PROFILE_SCREEN_DELAY:-20}"
-lit=$(screenshot no-serial)
+# Firmware enumeration time varies with the device set, so poll the screen
+# until the console has drawn the bring-up report.
+lit=0
+for _ in $(seq 1 "$timeout_seconds"); do
+    sleep 1
+    lit=$(screenshot no-serial)
+    ((lit >= 20000)) && break
+done
 stop_qemu
 if ((lit < 20000)); then
     echo "framebuffer console shows too little text without a serial port ($lit lit pixels)" >&2

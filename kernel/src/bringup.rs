@@ -9,7 +9,7 @@
 
 use core::ptr::read_unaligned;
 
-use crate::drivers::{gpt, keyboard, nvme, pci, say, xhci};
+use crate::drivers::{ahci, gpt, keyboard, nvme, pci, say, xhci, BlockDevice};
 use crate::{BootInfo, UefiMemoryDescriptor, EFI_BOOT_SERVICES_CODE, EFI_BOOT_SERVICES_DATA};
 
 const EFI_LOADER_CODE: u32 = 1;
@@ -47,13 +47,15 @@ pub(crate) fn run(boot_info: &BootInfo) -> ! {
     report_acpi(boot_info.acpi_rsdp as u64);
     report_pci();
     report_disks();
-    let keyboard = open_keyboard();
+    let keyboards = open_keyboards();
 
-    if keyboard.is_none() && !crate::SERIAL_PRESENT.load(core::sync::atomic::Ordering::Acquire) {
+    if keyboards.iter().all(Option::is_none)
+        && !crate::SERIAL_PRESENT.load(core::sync::atomic::Ordering::Acquire)
+    {
         say!("ginux: no keyboard or serial input; halted\n");
         halt();
     }
-    shell(boot_info, keyboard)
+    shell(boot_info, keyboards)
 }
 
 fn halt() -> ! {
@@ -101,50 +103,112 @@ fn report_disks() {
     for function in controllers.iter().flatten() {
         probe_nvme(*function);
     }
+    let (controllers, _) = functions(pci::Identity::is_ahci);
+    let mut slot = 0;
+    for function in controllers.iter().flatten() {
+        // SAFETY: bring-up mode is the only driver of these controllers, and
+        // the firmware identity map covers their registers.
+        let (base, ports, version) = match unsafe { ahci::open_controller(*function) } {
+            Ok(opened) => opened,
+            Err(error) => {
+                say!(
+                    "ginux: AHCI {:02x}:{:02x}.{}: {:?}\n",
+                    function.bus,
+                    function.device,
+                    function.function,
+                    error
+                );
+                continue;
+            }
+        };
+        say!(
+            "ginux: AHCI {:02x}:{:02x}.{}: version {}.{}, ports {:#x}\n",
+            function.bus,
+            function.device,
+            function.function,
+            version >> 16,
+            (version >> 8) & 0xff,
+            ports
+        );
+        for port in (0..32).filter(|port| ports & (1 << port) != 0) {
+            if slot == ahci::MAX_PORTS {
+                break;
+            }
+            // SAFETY: the controller was opened above and each port uses its
+            // own DMA set.
+            match unsafe { ahci::Disk::open(base, port, slot) } {
+                Ok(mut disk) => {
+                    slot += 1;
+                    let bytes = disk.sectors.saturating_mul(u64::from(disk.sector_size));
+                    say!(
+                        "ginux:   port {}: {} (serial {}), {} sectors of {} bytes ({} MiB)\n",
+                        disk.port(),
+                        trimmed(&disk.model),
+                        trimmed(&disk.serial),
+                        disk.sectors,
+                        disk.sector_size,
+                        bytes >> 20
+                    );
+                    list_partitions(&mut disk);
+                }
+                Err(ahci::Error::NoDevice) => {}
+                Err(error) => say!("ginux:   port {}: {:?}\n", port, error),
+            }
+        }
+    }
 }
 
-fn open_keyboard() -> Option<xhci::KeyboardController> {
+/// Every USB controller with at least one boot keyboard.
+type UsbKeyboards = [Option<xhci::Controller>; MAX_CONTROLLERS];
+
+fn open_keyboards() -> UsbKeyboards {
+    let mut opened = [const { None }; MAX_CONTROLLERS];
     let (controllers, count) = functions(pci::Identity::is_xhci);
     if count == 0 {
         say!("ginux: no xHCI controller\n");
-        return None;
     }
-    for function in controllers.iter().flatten() {
+    for (slot, function) in controllers.iter().flatten().enumerate() {
         say!(
-            "ginux: xHCI {:02x}:{:02x}.{}: looking for a keyboard\n",
+            "ginux: xHCI {:02x}:{:02x}.{}: looking for keyboards\n",
             function.bus,
             function.device,
             function.function
         );
-        // SAFETY: bring-up mode drives one controller at a time, and the
-        // firmware identity map covers its registers and the DMA pages.
-        match unsafe { xhci::KeyboardController::open(*function) } {
+        // SAFETY: bring-up mode is the only driver of these controllers, and
+        // the firmware identity map covers their registers and the DMA pool.
+        match unsafe { xhci::Controller::open(*function) } {
             Ok(controller) => {
-                say!(
-                    "ginux:   keyboard {:04x}:{:04x} on port {}\n",
-                    controller.vendor,
-                    controller.product,
-                    controller.port
-                );
-                return Some(controller);
+                for keyboard in controller.keyboards() {
+                    say!(
+                        "ginux:   keyboard {:04x}:{:04x} on port {}\n",
+                        keyboard.vendor,
+                        keyboard.product,
+                        keyboard.port
+                    );
+                }
+                opened[slot] = Some(controller);
             }
             Err(error) => say!("ginux:   {:?}\n", error),
         }
     }
-    None
+    opened
 }
 
-fn shell(boot_info: &BootInfo, mut usb: Option<xhci::KeyboardController>) -> ! {
+fn shell(boot_info: &BootInfo, mut usb: UsbKeyboards) -> ! {
     say!("\nGinux bring-up shell. Type 'help' for commands.\n");
-    let mut decoder = keyboard::Keyboard::new();
+    let mut decoders: [[keyboard::Keyboard; xhci::MAX_KEYBOARDS]; MAX_CONTROLLERS] =
+        core::array::from_fn(|_| core::array::from_fn(|_| keyboard::Keyboard::new()));
     let mut line = [0_u8; LINE_CAPACITY];
     let mut length = 0;
     say!("bring-up> ");
     loop {
         let mut pressed = [0_u8; 16];
         let mut count = 0;
-        if let Some(report) = usb.as_mut().and_then(xhci::KeyboardController::poll) {
-            decoder.report(&report, |bytes| {
+        for (controller, decoders) in usb.iter_mut().zip(decoders.iter_mut()) {
+            let Some((index, report)) = controller.as_mut().and_then(xhci::Controller::poll) else {
+                continue;
+            };
+            decoders[index].report(&report, |bytes| {
                 for byte in bytes {
                     if count < pressed.len() {
                         pressed[count] = *byte;
@@ -403,11 +467,11 @@ fn probe_nvme(function: pci::Function) {
     list_partitions(&mut controller);
 }
 
-fn list_partitions(controller: &mut nvme::Controller) {
-    let header = match controller.read(gpt::HEADER_LBA, 1) {
-        Ok(block) => gpt::parse_header(block),
-        Err(error) => {
-            say!("ginux:   reading the partition table failed: {:?}\n", error);
+fn list_partitions(disk: &mut impl BlockDevice) {
+    let header = match disk.read_blocks(gpt::HEADER_LBA, 1) {
+        Some(block) => gpt::parse_header(block),
+        None => {
+            say!("ginux:   reading the partition table failed\n");
             return;
         }
     };
@@ -416,7 +480,7 @@ fn list_partitions(controller: &mut nvme::Controller) {
         return;
     };
     say!("ginux:   GPT disk {}\n", header.disk);
-    let block_size = u64::from(controller.block_size);
+    let block_size = u64::from(disk.block_size());
     let entry_size = u64::from(header.entry_size);
     let mut cached_block = u64::MAX;
     let mut block = [0_u8; 4096];
@@ -424,10 +488,10 @@ fn list_partitions(controller: &mut nvme::Controller) {
         let byte_offset = index * entry_size;
         let lba = header.entries_lba + byte_offset / block_size;
         if lba != cached_block {
-            match controller.read(lba, 1) {
-                Ok(data) => block[..data.len()].copy_from_slice(data),
-                Err(error) => {
-                    say!("ginux:   reading partition entries failed: {:?}\n", error);
+            match disk.read_blocks(lba, 1) {
+                Some(data) => block[..data.len()].copy_from_slice(data),
+                None => {
+                    say!("ginux:   reading partition entries failed\n");
                     return;
                 }
             }

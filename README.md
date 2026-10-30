@@ -245,13 +245,13 @@ the QEMU virtio devices and an Intel VT-d IOMMU. On any other machine Ginux
 enters **hardware bring-up mode**: it shows its console on the UEFI framebuffer
 (no serial port needed), reports memory, ACPI tables, CPUs, the IOMMU type, and
 every PCI device, and runs the physical-hardware drivers in `kernel/src/drivers`:
-a read-only NVMe driver that lists GPT partitions and an xHCI driver for a USB
-boot keyboard on a root port. With a keyboard or serial port it then offers a
+read-only NVMe and AHCI (SATA) drivers that list GPT partitions, and an xHCI
+driver that runs USB boot keyboards on the root ports of every controller. With a keyboard or serial port it then offers a
 small bring-up shell (`help`, `pci`, `acpi`, `mem`, `disks`, `reboot`,
 `poweroff`). Nothing in bring-up mode writes to storage. `make
 test-hardware-profile` boots an AMD IOMMU, NVMe, AHCI, and xHCI QEMU machine
-without virtio, types a command on the emulated USB keyboard, and checks the
-framebuffer console with no serial port.
+and a SATA disk without virtio, types a command on one of two emulated USB
+keyboards, and checks the framebuffer console with no serial port.
 
 Bringing up a specific machine starts with `sudo tools/hardware/probe.sh`, run
 under an existing Linux installation on that machine, which archives the

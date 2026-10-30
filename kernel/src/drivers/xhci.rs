@@ -1,12 +1,14 @@
-//! Polling xHCI driver for one USB HID boot keyboard on a root port.
+//! Polling xHCI driver for USB HID boot keyboards on root ports.
 //!
-//! The driver takes the controller from firmware, resets it, and brings up the
-//! command and event rings without interrupts. It enumerates root ports, and
-//! for the first device that exposes a HID boot keyboard interface it
-//! configures the interrupt-IN endpoint and keeps one report transfer queued.
-//! Hubs are not supported yet, so the keyboard must be on a root port.
+//! The driver takes each controller from firmware, resets it, and brings up
+//! the command and event rings without interrupts. It enumerates root ports
+//! and configures every device that exposes a HID boot keyboard interface,
+//! keeping one report transfer queued per keyboard. Each controller draws its
+//! DMA memory from a static pool, so several controllers can run at once; a
+//! controller without keyboards returns its pages. Hubs are not supported yet,
+//! so keyboards must be on root ports.
 
-use core::ptr::{addr_of, addr_of_mut};
+use core::ptr::addr_of_mut;
 
 use super::pci::Function;
 use super::{delay_ms, say, wait_until_ms, DmaPage};
@@ -60,8 +62,10 @@ const TRB_DIRECTION_IN: u32 = 1 << 16;
 const COMPLETION_SUCCESS: u32 = 1;
 const COMPLETION_SHORT_PACKET: u32 = 13;
 const RING_TRBS: usize = 256;
-const MAX_SLOTS: u32 = 8;
-const MAX_SCRATCHPADS: usize = 64;
+const MAX_SLOTS: u32 = 32;
+const MAX_SCRATCHPADS: usize = 256;
+/// Keyboards configured on one controller.
+pub(crate) const MAX_KEYBOARDS: usize = 4;
 const ENDPOINT_CONTROL: u32 = 4;
 const ENDPOINT_INTERRUPT_IN: u32 = 7;
 const SPEED_FULL: u32 = 1;
@@ -74,18 +78,33 @@ const REQUEST_HID_SET_PROTOCOL: u8 = 0x0b;
 const DESCRIPTOR_DEVICE: u16 = 1;
 const DESCRIPTOR_CONFIGURATION: u16 = 2;
 const COMMAND_TIMEOUT_MS: u64 = 1000;
+const POOL_PAGES: usize = 1536;
 
-static mut DEVICE_CONTEXTS: DmaPage = DmaPage::ZERO;
-static mut SCRATCHPAD_ARRAY: DmaPage = DmaPage::ZERO;
-static mut SCRATCHPADS: [DmaPage; MAX_SCRATCHPADS] = [DmaPage::ZERO; MAX_SCRATCHPADS];
-static mut COMMAND_RING: DmaPage = DmaPage::ZERO;
-static mut EVENT_RING: DmaPage = DmaPage::ZERO;
-static mut EVENT_SEGMENTS: DmaPage = DmaPage::ZERO;
-static mut OUTPUT_CONTEXT: DmaPage = DmaPage::ZERO;
-static mut INPUT_CONTEXT: DmaPage = DmaPage::ZERO;
-static mut CONTROL_RING: DmaPage = DmaPage::ZERO;
-static mut INTERRUPT_RING: DmaPage = DmaPage::ZERO;
-static mut BUFFER: DmaPage = DmaPage::ZERO;
+static mut POOL: [DmaPage; POOL_PAGES] = [DmaPage::ZERO; POOL_PAGES];
+static mut POOL_NEXT: usize = 0;
+
+/// Takes `count` zeroed, contiguous pages from the DMA pool.
+fn pool_pages(count: usize) -> Option<*mut DmaPage> {
+    // SAFETY: bring-up is single-threaded; pages are handed out once.
+    unsafe {
+        let next = POOL_NEXT;
+        let end = next.checked_add(count).filter(|end| *end <= POOL_PAGES)?;
+        POOL_NEXT = end;
+        let pages = addr_of_mut!(POOL).cast::<DmaPage>().add(next);
+        pages.cast::<u8>().write_bytes(0, count * 4096);
+        Some(pages)
+    }
+}
+
+fn pool_mark() -> usize {
+    // SAFETY: as for pool_pages.
+    unsafe { POOL_NEXT }
+}
+
+fn pool_release_to(mark: usize) {
+    // SAFETY: callers release only pages they took after `mark` and no longer use.
+    unsafe { POOL_NEXT = mark.min(POOL_NEXT) }
+}
 
 // The fields are reported through Debug, which dead-code analysis ignores.
 #[allow(dead_code)]
@@ -94,6 +113,7 @@ pub(crate) enum Error {
     NoMemoryBar,
     HaltTimedOut,
     ResetTimedOut,
+    OutOfDmaMemory,
     TooManyScratchpads(usize),
     CommandTimedOut(u32),
     CommandFailed(u32, u32),
@@ -112,14 +132,17 @@ struct Ring {
 }
 
 impl Ring {
-    unsafe fn new(page: *mut DmaPage) -> Self {
-        let trbs = addr_of_mut!((*page).0).cast::<u32>();
-        trbs.write_bytes(0, RING_TRBS * 4);
-        // The last TRB links back to the start and toggles the cycle state.
-        let link = trbs.add((RING_TRBS - 1) * 4);
-        let base = trbs as u64;
-        link.write_volatile(base as u32);
-        link.add(1).write_volatile((base >> 32) as u32);
+    /// Builds a ring in the zeroed page `page`.
+    fn new(page: *mut DmaPage) -> Self {
+        let trbs = page.cast::<u32>();
+        // SAFETY: the page is a zeroed pool page owned by this ring.
+        unsafe {
+            // The last TRB links back to the start and toggles the cycle state.
+            let link = trbs.add((RING_TRBS - 1) * 4);
+            let base = trbs as u64;
+            link.write_volatile(base as u32);
+            link.add(1).write_volatile((base >> 32) as u32);
+        }
         Self {
             trbs,
             index: 0,
@@ -133,7 +156,7 @@ impl Ring {
 
     /// Writes one TRB and returns its physical address.
     fn push(&mut self, parameter: u64, status: u32, control: u32) -> u64 {
-        // SAFETY: index stays below the link TRB; the ring is a static page.
+        // SAFETY: index stays below the link TRB; the ring is a pool page.
         unsafe {
             let trb = self.trbs.add(self.index * 4);
             trb.write_volatile(parameter as u32);
@@ -170,37 +193,65 @@ impl Event {
     fn completion(&self) -> u32 {
         self.status >> 24
     }
+
+    fn slot(&self) -> u32 {
+        self.control >> 24
+    }
 }
 
-/// A controller with an addressed and configured boot keyboard.
-pub(crate) struct KeyboardController {
+/// A configured boot keyboard.
+pub(crate) struct Keyboard {
+    pub(crate) port: u32,
+    pub(crate) vendor: u16,
+    pub(crate) product: u16,
+    slot: u32,
+    endpoint: u32,
+    interrupt: Ring,
+    report: *mut DmaPage,
+}
+
+/// Per-device DMA pages used while addressing and configuring a device.
+struct DevicePages {
+    output: *mut DmaPage,
+    input: *mut DmaPage,
+    control: *mut DmaPage,
+    interrupt: *mut DmaPage,
+    buffer: *mut DmaPage,
+}
+
+/// A running controller with at least one configured keyboard.
+pub(crate) struct Controller {
     operational: usize,
     runtime: usize,
     doorbells: usize,
     context_size: usize,
+    device_contexts: *mut u64,
     commands: Ring,
     events: *mut u32,
     event_index: usize,
     event_cycle: bool,
-    control: Ring,
-    interrupt: Ring,
-    slot: u32,
-    endpoint: u32,
-    pub(crate) port: u32,
-    pub(crate) vendor: u16,
-    pub(crate) product: u16,
+    keyboards: [Option<Keyboard>; MAX_KEYBOARDS],
 }
 
-impl KeyboardController {
-    /// Takes over `function`, resets it, and configures the first boot
-    /// keyboard found on a root port.
+impl Controller {
+    /// Takes over `function`, resets it, and configures every boot keyboard
+    /// on its root ports. On failure the controller is halted and its DMA
+    /// pages are returned to the pool.
     ///
     /// # Safety
     ///
-    /// `function` must be an xHCI controller that no other code drives, and its
-    /// registers and the static DMA pages must be identity mapped. Only one
-    /// controller may be opened at a time because the DMA pages are shared.
+    /// `function` must be an xHCI controller that no other code drives, and
+    /// its registers and the DMA pool must be identity mapped.
     pub(crate) unsafe fn open(function: Function) -> Result<Self, Error> {
+        let mark = pool_mark();
+        let result = Self::open_inner(function);
+        if result.is_err() {
+            pool_release_to(mark);
+        }
+        result
+    }
+
+    unsafe fn open_inner(function: Function) -> Result<Self, Error> {
         let base = function.memory_bar(0).ok_or(Error::NoMemoryBar)? as usize;
         function.enable_memory_and_bus_master();
         take_from_firmware(base);
@@ -233,29 +284,24 @@ impl KeyboardController {
         if scratchpads > MAX_SCRATCHPADS {
             return Err(Error::TooManyScratchpads(scratchpads));
         }
-        let contexts = addr_of_mut!(DEVICE_CONTEXTS.0).cast::<u64>();
-        contexts.write_bytes(0, 512);
+        let device_contexts = pool_pages(1).ok_or(Error::OutOfDmaMemory)?.cast::<u64>();
         if scratchpads != 0 {
-            let array = addr_of_mut!(SCRATCHPAD_ARRAY.0).cast::<u64>();
-            let pages = addr_of_mut!(SCRATCHPADS).cast::<DmaPage>();
+            let array = pool_pages(1).ok_or(Error::OutOfDmaMemory)?.cast::<u64>();
+            let pages = pool_pages(scratchpads).ok_or(Error::OutOfDmaMemory)?;
             for index in 0..scratchpads {
-                let page = pages.add(index);
-                (*page).0.fill(0);
-                array.add(index).write(page as u64);
+                array.add(index).write(pages.add(index) as u64);
             }
-            contexts.write(array as u64);
+            device_contexts.write(array as u64);
         }
         let slots = (structural_1 & 0xff).min(MAX_SLOTS);
         write32(operational, OP_CONFIGURE, slots);
-        write64(operational, OP_DEVICE_CONTEXTS, contexts as u64);
+        write64(operational, OP_DEVICE_CONTEXTS, device_contexts as u64);
 
-        let commands = Ring::new(addr_of_mut!(COMMAND_RING));
+        let commands = Ring::new(pool_pages(1).ok_or(Error::OutOfDmaMemory)?);
         write64(operational, OP_COMMAND_RING, commands.address() | 1);
 
-        let events = addr_of_mut!(EVENT_RING.0).cast::<u32>();
-        events.write_bytes(0, RING_TRBS * 4);
-        let segments = addr_of_mut!(EVENT_SEGMENTS.0).cast::<u32>();
-        segments.write_bytes(0, 16);
+        let events = pool_pages(1).ok_or(Error::OutOfDmaMemory)?.cast::<u32>();
+        let segments = pool_pages(1).ok_or(Error::OutOfDmaMemory)?.cast::<u32>();
         segments.write(events as u32);
         segments.add(1).write((events as u64 >> 32) as u32);
         segments.add(2).write(RING_TRBS as u32);
@@ -275,17 +321,12 @@ impl KeyboardController {
             runtime,
             doorbells: base + (read32(base, CAP_DOORBELL_OFFSET) & !0x3) as usize,
             context_size,
+            device_contexts,
             commands,
             events,
             event_index: 0,
             event_cycle: true,
-            control: Ring::new(addr_of_mut!(CONTROL_RING)),
-            interrupt: Ring::new(addr_of_mut!(INTERRUPT_RING)),
-            slot: 0,
-            endpoint: 0,
-            port: 0,
-            vendor: 0,
-            product: 0,
+            keyboards: [const { None }; MAX_KEYBOARDS],
         };
         if capability_1 & (1 << 3) != 0 {
             for port in 1..=ports {
@@ -304,39 +345,68 @@ impl KeyboardController {
         if wait_until_ms(1000, || connected(&controller)) {
             delay_ms(100);
         }
+        let mut found = 0;
         for port in 1..=ports {
+            if found == MAX_KEYBOARDS {
+                break;
+            }
+            // A device that fails after its slot is enabled keeps its pages:
+            // the controller may still write to its contexts.
             match controller.try_port(port) {
-                Ok(()) => {
-                    controller.queue_report();
-                    return Ok(controller);
+                Ok(keyboard) => {
+                    controller.keyboards[found] = Some(keyboard);
+                    found += 1;
                 }
-                Err(Error::NotConnected) => {}
-                Err(error) => say!("ginux:     port {}: {:?}\n", port, error),
+                Err(error) => {
+                    if !matches!(error, Error::NotConnected) {
+                        say!("ginux:     port {}: {:?}\n", port, error);
+                    }
+                }
             }
         }
-        controller.stop();
-        Err(Error::NoKeyboard)
+        if found == 0 {
+            controller.stop();
+            return Err(Error::NoKeyboard);
+        }
+        for index in 0..found {
+            controller.queue_report(index);
+        }
+        Ok(controller)
     }
 
-    /// Returns the next keyboard report if one has arrived.
-    pub(crate) fn poll(&mut self) -> Option<[u8; 8]> {
+    /// Returns the configured keyboards.
+    pub(crate) fn keyboards(&self) -> impl Iterator<Item = &Keyboard> {
+        self.keyboards.iter().flatten()
+    }
+
+    /// Returns the next keyboard report and the index of the keyboard that
+    /// sent it, if one has arrived.
+    pub(crate) fn poll(&mut self) -> Option<(usize, [u8; 8])> {
         let event = self.next_event()?;
         if event.kind() != TRB_TRANSFER_EVENT {
             return None;
         }
-        let completion = event.completion();
-        let report = if matches!(completion, COMPLETION_SUCCESS | COMPLETION_SHORT_PACKET) {
-            // SAFETY: the controller completed the transfer into BUFFER.
-            let page = unsafe { &*addr_of!(BUFFER) };
+        let index = self.keyboards.iter().position(|keyboard| {
+            keyboard
+                .as_ref()
+                .is_some_and(|keyboard| keyboard.slot == event.slot())
+        })?;
+        let keyboard = self.keyboards[index].as_ref()?;
+        let report = if matches!(
+            event.completion(),
+            COMPLETION_SUCCESS | COMPLETION_SHORT_PACKET
+        ) {
+            // SAFETY: the controller completed the transfer into the report page.
+            let page = unsafe { &*keyboard.report };
             page.0[..8].try_into().ok()
         } else {
             None
         };
-        self.queue_report();
-        report
+        self.queue_report(index);
+        report.map(|report| (index, report))
     }
 
-    /// Halts the controller so another driver or controller can use the DMA pages.
+    /// Halts the controller.
     pub(crate) fn stop(&mut self) {
         write32(
             self.operational,
@@ -352,7 +422,7 @@ impl KeyboardController {
         self.operational + OP_PORTS + 0x10 * (port as usize - 1)
     }
 
-    fn try_port(&mut self, port: u32) -> Result<(), Error> {
+    fn try_port(&mut self, port: u32) -> Result<Keyboard, Error> {
         let register = self.port_register(port);
         let status = read32(register, 0);
         if status & PORT_CONNECTED == 0 {
@@ -375,50 +445,154 @@ impl KeyboardController {
             return Err(Error::PortResetFailed);
         }
         let speed = (status >> 10) & 0xf;
-        self.port = port;
-        self.address_device(port, speed)?;
+        let pages = DevicePages {
+            output: pool_pages(1).ok_or(Error::OutOfDmaMemory)?,
+            input: pool_pages(1).ok_or(Error::OutOfDmaMemory)?,
+            control: pool_pages(1).ok_or(Error::OutOfDmaMemory)?,
+            interrupt: pool_pages(1).ok_or(Error::OutOfDmaMemory)?,
+            buffer: pool_pages(1).ok_or(Error::OutOfDmaMemory)?,
+        };
+        let mut device = DeviceSetup {
+            controller: self,
+            pages: &pages,
+            control: Ring::new(pages.control),
+            slot: 0,
+            port,
+            speed,
+        };
+        let (vendor, product) = device.address()?;
         say!(
             "ginux:     port {}: device {:04x}:{:04x} at speed {}\n",
             port,
-            self.vendor,
-            self.product,
+            vendor,
+            product,
             speed
         );
-        self.configure_keyboard(speed)
+        let (slot, endpoint) = device.configure_keyboard().map_err(|error| match error {
+            Error::NoKeyboard => Error::NotBootKeyboard(vendor, product),
+            other => other,
+        })?;
+        Ok(Keyboard {
+            port,
+            vendor,
+            product,
+            slot,
+            endpoint,
+            interrupt: Ring::new(pages.interrupt),
+            report: pages.buffer,
+        })
     }
 
-    fn address_device(&mut self, port: u32, speed: u32) -> Result<(), Error> {
-        let completion = self.command(0, TRB_ENABLE_SLOT << 10)?;
-        self.slot = completion.control >> 24;
-        // SAFETY: the context pages are static DMA pages owned by this driver.
-        unsafe {
-            addr_of_mut!(DEVICE_CONTEXTS.0)
-                .cast::<u64>()
-                .add(self.slot as usize)
-                .write(addr_of!(OUTPUT_CONTEXT) as u64);
-            (*addr_of_mut!(OUTPUT_CONTEXT)).0.fill(0);
+    fn queue_report(&mut self, index: usize) {
+        let Some(keyboard) = self.keyboards[index].as_mut() else {
+            return;
+        };
+        keyboard.interrupt.push(
+            keyboard.report as u64,
+            8,
+            TRB_NORMAL << 10 | TRB_INTERRUPT_ON_COMPLETION,
+        );
+        let (slot, endpoint) = (keyboard.slot, keyboard.endpoint);
+        self.ring(slot, endpoint);
+    }
+
+    fn command(&mut self, parameter: u64, control: u32) -> Result<Event, Error> {
+        let kind = (control >> 10) & 0x3f;
+        let address = self.commands.push(parameter, 0, control);
+        self.ring(0, 0);
+        let mut result = Err(Error::CommandTimedOut(kind));
+        wait_until_ms(COMMAND_TIMEOUT_MS, || {
+            let Some(event) = self.next_event() else {
+                return false;
+            };
+            if event.kind() != TRB_COMMAND_COMPLETION || event.parameter != address {
+                return false;
+            }
+            result = if event.completion() == COMPLETION_SUCCESS {
+                Ok(event)
+            } else {
+                Err(Error::CommandFailed(kind, event.completion()))
+            };
+            true
+        });
+        result
+    }
+
+    fn ring(&self, slot: u32, target: u32) {
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        write32(self.doorbells, slot as usize * 4, target);
+    }
+
+    fn next_event(&mut self) -> Option<Event> {
+        // SAFETY: event_index stays within the event ring page.
+        let trb = unsafe { self.events.add(self.event_index * 4) };
+        let control = unsafe { trb.add(3).read_volatile() };
+        if (control & TRB_CYCLE != 0) != self.event_cycle {
+            return None;
         }
-        self.control = unsafe { Ring::new(addr_of_mut!(CONTROL_RING)) };
-        let packet = match speed {
+        let event = unsafe {
+            Event {
+                parameter: u64::from(trb.read_volatile())
+                    | u64::from(trb.add(1).read_volatile()) << 32,
+                status: trb.add(2).read_volatile(),
+                control,
+            }
+        };
+        self.event_index += 1;
+        if self.event_index == RING_TRBS {
+            self.event_index = 0;
+            self.event_cycle = !self.event_cycle;
+        }
+        let dequeue = self.events as u64 + (self.event_index * 16) as u64;
+        // Bit 3 (EHB) is write-one-to-clear and acknowledges the event.
+        write64(self.runtime + 0x20, 0x18, dequeue | 1 << 3);
+        Some(event)
+    }
+}
+
+/// State for addressing and configuring one device.
+struct DeviceSetup<'a> {
+    controller: &'a mut Controller,
+    pages: &'a DevicePages,
+    control: Ring,
+    slot: u32,
+    port: u32,
+    speed: u32,
+}
+
+impl DeviceSetup<'_> {
+    /// Enables a slot, addresses the device, and returns its vendor and
+    /// product IDs.
+    fn address(&mut self) -> Result<(u16, u16), Error> {
+        let completion = self.controller.command(0, TRB_ENABLE_SLOT << 10)?;
+        self.slot = completion.slot();
+        // SAFETY: the device-context array holds MAX_SLOTS + 1 entries.
+        unsafe {
+            self.controller
+                .device_contexts
+                .add(self.slot as usize)
+                .write(self.pages.output as u64);
+        }
+        let packet = match self.speed {
             SPEED_LOW => 8,
             SPEED_FULL | SPEED_HIGH => 64,
             _ => 512,
         };
         self.clear_input();
         self.input(0, 1, 0b11);
-        self.input(1, 0, speed << 20 | 1 << 27);
-        self.input(1, 1, port << 16);
+        self.input(1, 0, self.speed << 20 | 1 << 27);
+        self.input(1, 1, self.port << 16);
         self.write_endpoint0(packet);
-        self.command(
-            addr_of!(INPUT_CONTEXT) as u64,
+        self.controller.command(
+            self.pages.input as u64,
             TRB_ADDRESS_DEVICE << 10 | self.slot << 24,
         )?;
 
         // Read the first eight bytes to learn the real default-pipe packet size.
-        self.control_in(0x80, REQUEST_GET_DESCRIPTOR, DESCRIPTOR_DEVICE << 8, 0, 8)?;
-        let reported = u32::from(buffer()[7]);
+        self.control_in(REQUEST_GET_DESCRIPTOR, DESCRIPTOR_DEVICE << 8, 0, 8)?;
+        let reported = u32::from(self.buffer()[7]);
         // USB 3 devices report the default-pipe packet size as a power of two.
-        let actual = if speed > SPEED_HIGH {
+        let actual = if self.speed > SPEED_HIGH {
             1_u32.checked_shl(reported).unwrap_or(0)
         } else {
             reported
@@ -427,35 +601,31 @@ impl KeyboardController {
             self.clear_input();
             self.input(0, 1, 0b10);
             self.write_endpoint0(actual);
-            self.command(
-                addr_of!(INPUT_CONTEXT) as u64,
+            self.controller.command(
+                self.pages.input as u64,
                 TRB_EVALUATE_CONTEXT << 10 | self.slot << 24,
             )?;
         }
-        self.control_in(0x80, REQUEST_GET_DESCRIPTOR, DESCRIPTOR_DEVICE << 8, 0, 18)?;
-        let device = buffer();
-        self.vendor = u16::from_le_bytes([device[8], device[9]]);
-        self.product = u16::from_le_bytes([device[10], device[11]]);
-        Ok(())
+        self.control_in(REQUEST_GET_DESCRIPTOR, DESCRIPTOR_DEVICE << 8, 0, 18)?;
+        let device = self.buffer();
+        Ok((
+            u16::from_le_bytes([device[8], device[9]]),
+            u16::from_le_bytes([device[10], device[11]]),
+        ))
     }
 
-    fn configure_keyboard(&mut self, speed: u32) -> Result<(), Error> {
+    /// Selects the boot keyboard interface, configures its interrupt-IN
+    /// endpoint, and returns the slot and endpoint context index.
+    fn configure_keyboard(&mut self) -> Result<(u32, u32), Error> {
+        self.control_in(REQUEST_GET_DESCRIPTOR, DESCRIPTOR_CONFIGURATION << 8, 0, 9)?;
+        let total = u16::from_le_bytes([self.buffer()[2], self.buffer()[3]]).min(4096);
         self.control_in(
-            0x80,
-            REQUEST_GET_DESCRIPTOR,
-            DESCRIPTOR_CONFIGURATION << 8,
-            0,
-            9,
-        )?;
-        let total = u16::from_le_bytes([buffer()[2], buffer()[3]]).min(4096);
-        self.control_in(
-            0x80,
             REQUEST_GET_DESCRIPTOR,
             DESCRIPTOR_CONFIGURATION << 8,
             0,
             total,
         )?;
-        let descriptors = buffer();
+        let descriptors = self.buffer();
         let configuration = descriptors[5];
         let (mut interface, mut keyboard) = (None, None);
         let mut offset = 0;
@@ -489,7 +659,7 @@ impl KeyboardController {
             offset += length;
         }
         let Some((interface, number, packet, interval)) = keyboard else {
-            return Err(Error::NotBootKeyboard(self.vendor, self.product));
+            return Err(Error::NoKeyboard);
         };
 
         self.control_out(0x00, REQUEST_SET_CONFIGURATION, u16::from(configuration), 0)?;
@@ -497,8 +667,8 @@ impl KeyboardController {
         // SET_IDLE is optional; some keyboards stall it.
         let _ = self.control_out(0x21, REQUEST_HID_SET_IDLE, 0, u16::from(interface));
 
-        self.endpoint = u32::from(number) * 2 + 1;
-        let exponent = match speed {
+        let endpoint = u32::from(number) * 2 + 1;
+        let exponent = match self.speed {
             SPEED_LOW | SPEED_FULL => {
                 // Frames of 1 ms, expressed as 2^n microframes of 125 us.
                 let microframes = u32::from(interval.max(1)) * 8;
@@ -506,27 +676,26 @@ impl KeyboardController {
             }
             _ => u32::from(interval.clamp(1, 16)) - 1,
         };
-        self.interrupt = unsafe { Ring::new(addr_of_mut!(INTERRUPT_RING)) };
+        let ring = self.pages.interrupt as u64 | 1;
         self.clear_input();
-        self.input(0, 1, 1 | 1 << self.endpoint);
-        self.input(1, 0, speed << 20 | self.endpoint << 27);
+        self.input(0, 1, 1 | 1 << endpoint);
+        self.input(1, 0, self.speed << 20 | endpoint << 27);
         self.input(1, 1, self.port << 16);
-        let context = 1 + self.endpoint as usize;
+        let context = 1 + endpoint as usize;
         self.input(context, 0, exponent << 16);
         self.input(
             context,
             1,
             3 << 1 | ENDPOINT_INTERRUPT_IN << 3 | u32::from(packet) << 16,
         );
-        let ring = self.interrupt.address() | 1;
         self.input(context, 2, ring as u32);
         self.input(context, 3, (ring >> 32) as u32);
         self.input(context, 4, 8 | u32::from(packet) << 16);
-        self.command(
-            addr_of!(INPUT_CONTEXT) as u64,
+        self.controller.command(
+            self.pages.input as u64,
             TRB_CONFIGURE_ENDPOINT << 10 | self.slot << 24,
         )?;
-        Ok(())
+        Ok((self.slot, endpoint))
     }
 
     fn write_endpoint0(&mut self, packet: u32) {
@@ -538,18 +707,19 @@ impl KeyboardController {
     }
 
     fn clear_input(&mut self) {
-        // SAFETY: INPUT_CONTEXT is a static DMA page owned by this driver.
-        unsafe { (*addr_of_mut!(INPUT_CONTEXT)).0.fill(0) };
+        // SAFETY: the input context page belongs to this device setup.
+        unsafe { (*self.pages.input).0.fill(0) };
     }
 
     /// Writes dword `word` of input context entry `index` (0 is the input
     /// control context, 1 the slot, 2 endpoint 0, and so on).
     fn input(&mut self, index: usize, word: usize, value: u32) {
-        let offset = index * self.context_size + word * 4;
-        // SAFETY: offset stays within the 4 KiB INPUT_CONTEXT page for the
+        let offset = index * self.controller.context_size + word * 4;
+        // SAFETY: offset stays within the 4 KiB input context page for the
         // entries this driver writes (at most 32 contexts of 64 bytes).
         unsafe {
-            addr_of_mut!(INPUT_CONTEXT.0)
+            self.pages
+                .input
                 .cast::<u8>()
                 .add(offset)
                 .cast::<u32>()
@@ -557,15 +727,21 @@ impl KeyboardController {
         }
     }
 
+    /// The device's transfer buffer, read after its transfer completed.
+    fn buffer(&self) -> &'static [u8; 4096] {
+        // SAFETY: the buffer page belongs to this device and the transfer
+        // that filled it has completed.
+        unsafe { &(*self.pages.buffer).0 }
+    }
+
     fn control_in(
         &mut self,
-        request_type: u8,
         request: u8,
         value: u16,
         index: u16,
         length: u16,
     ) -> Result<(), Error> {
-        let setup = u64::from(request_type)
+        let setup = 0x80
             | u64::from(request) << 8
             | u64::from(value) << 16
             | u64::from(index) << 32
@@ -573,14 +749,14 @@ impl KeyboardController {
         self.control
             .push(setup, 8, TRB_SETUP << 10 | TRB_IMMEDIATE_DATA | 3 << 16);
         self.control.push(
-            addr_of!(BUFFER) as u64,
+            self.pages.buffer as u64,
             u32::from(length),
             TRB_DATA << 10 | TRB_DIRECTION_IN,
         );
         let status = self
             .control
             .push(0, 0, TRB_STATUS << 10 | TRB_INTERRUPT_ON_COMPLETION);
-        self.transfer(1, status)
+        self.transfer(status)
     }
 
     fn control_out(
@@ -601,35 +777,25 @@ impl KeyboardController {
             0,
             TRB_STATUS << 10 | TRB_INTERRUPT_ON_COMPLETION | TRB_DIRECTION_IN,
         );
-        self.transfer(1, status)
+        self.transfer(status)
     }
 
-    fn queue_report(&mut self) {
-        self.interrupt.push(
-            addr_of!(BUFFER) as u64,
-            8,
-            TRB_NORMAL << 10 | TRB_INTERRUPT_ON_COMPLETION,
-        );
-        self.ring(self.slot, self.endpoint);
-    }
-
-    /// Rings `endpoint` and waits for the transfer event of the TRB at `last`.
-    /// An error on any earlier TRB of the transfer ends the wait.
-    fn transfer(&mut self, endpoint: u32, last: u64) -> Result<(), Error> {
-        self.ring(self.slot, endpoint);
+    /// Rings endpoint 0 and waits for the transfer event of the TRB at
+    /// `last`. An error on any earlier TRB of the transfer ends the wait.
+    fn transfer(&mut self, last: u64) -> Result<(), Error> {
+        self.controller.ring(self.slot, 1);
         let mut result = Err(Error::TransferTimedOut);
         wait_until_ms(COMMAND_TIMEOUT_MS, || {
-            let Some(event) = self.next_event() else {
+            let Some(event) = self.controller.next_event() else {
                 return false;
             };
             if event.kind() != TRB_TRANSFER_EVENT {
                 return false;
             }
-            let succeeded = matches!(
+            if !matches!(
                 event.completion(),
                 COMPLETION_SUCCESS | COMPLETION_SHORT_PACKET
-            );
-            if !succeeded {
+            ) {
                 result = Err(Error::TransferFailed(event.completion()));
                 return true;
             }
@@ -640,59 +806,6 @@ impl KeyboardController {
             false
         });
         result
-    }
-
-    fn command(&mut self, parameter: u64, control: u32) -> Result<Event, Error> {
-        let kind = (control >> 10) & 0x3f;
-        let address = self.commands.push(parameter, 0, control);
-        self.ring(0, 0);
-        let mut result = Err(Error::CommandTimedOut(kind));
-        wait_until_ms(COMMAND_TIMEOUT_MS, || {
-            let Some(event) = self.next_event() else {
-                return false;
-            };
-            if event.kind() != TRB_COMMAND_COMPLETION || event.parameter != address {
-                return false;
-            }
-            result = if event.completion() == COMPLETION_SUCCESS {
-                Ok(event)
-            } else {
-                Err(Error::CommandFailed(kind, event.completion()))
-            };
-            true
-        });
-        result
-    }
-
-    fn ring(&self, slot: u32, target: u32) {
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        write32(self.doorbells, slot as usize * 4, target);
-    }
-
-    fn next_event(&mut self) -> Option<Event> {
-        // SAFETY: event_index stays within the static event ring page.
-        let trb = unsafe { self.events.add(self.event_index * 4) };
-        let control = unsafe { trb.add(3).read_volatile() };
-        if (control & TRB_CYCLE != 0) != self.event_cycle {
-            return None;
-        }
-        let event = unsafe {
-            Event {
-                parameter: u64::from(trb.read_volatile())
-                    | u64::from(trb.add(1).read_volatile()) << 32,
-                status: trb.add(2).read_volatile(),
-                control,
-            }
-        };
-        self.event_index += 1;
-        if self.event_index == RING_TRBS {
-            self.event_index = 0;
-            self.event_cycle = !self.event_cycle;
-        }
-        let dequeue = self.events as u64 + (self.event_index * 16) as u64;
-        // Bit 3 (EHB) is write-one-to-clear and acknowledges the event.
-        write64(self.runtime + 0x20, 0x18, dequeue | 1 << 3);
-        Some(event)
     }
 }
 
@@ -719,13 +832,6 @@ fn take_from_firmware(base: usize) {
         }
         offset += next;
     }
-}
-
-/// The shared transfer buffer. Callers read it only after the transfer that
-/// filled it has completed and before the next one is queued.
-fn buffer() -> &'static [u8; 4096] {
-    // SAFETY: BUFFER is a static DMA page; see above for the access discipline.
-    unsafe { &(*addr_of!(BUFFER)).0 }
 }
 
 fn read32(base: usize, offset: usize) -> u32 {
