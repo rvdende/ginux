@@ -8668,7 +8668,11 @@ fn update_current_linux_fs_base(thread_pointer: u64) -> bool {
 }
 
 fn configure_linux_syscall() -> Option<[u64; 5]> {
-    let star = (0x20_u64 << 48) | (u64::from(KERNEL_CODE_SELECTOR) << 32);
+    // SYSRET loads SS from STAR[63:48] + 8 and CS from STAR[63:48] + 16.
+    // Intel forces RPL 3 on both selectors, but AMD copies SS unchanged, so
+    // the base must already carry RPL 3 or the next IRET to user mode faults.
+    let sysret_base = u64::from(USER_DATA_SELECTOR) - 8;
+    let star = (sysret_base << 48) | (u64::from(KERNEL_CODE_SELECTOR) << 32);
     let lstar = ginux_linux_syscall_entry as *const () as u64;
     let fmask = (1_u64 << 9) | (1_u64 << 10) | (1_u64 << 18);
     unsafe {
