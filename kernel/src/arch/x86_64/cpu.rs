@@ -773,7 +773,6 @@ const LINUX_PROC_PID2_STOPPED_STATUS: &[u8] =
 const LINUX_PROC_PID2_ZOMBIE_STATUS: &[u8] =
     b"Name:\tinit\nState:\tZ (zombie)\nPid:\t2\nPPid:\t1\n";
 const LINUX_PROC_CPUINFO: &[u8] = b"processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 158\nmodel name\t: Ginux virtual x86-64 CPU\nstepping\t: 10\ncpu MHz\t\t: 1000.000\ncache size\t: 16384 KB\nphysical id\t: 0\nsiblings\t: 1\ncore id\t\t: 0\ncpu cores\t: 1\nfpu\t\t: yes\ncpuid level\t: 13\nflags\t\t: fpu tsc msr pae cx8 apic sep mtrr pge cmov pat clflush mmx fxsr sse sse2 syscall nx lm constant_tsc rep_good nopl xtopology cpuid tsc_known_freq pni ssse3 cx16 sse4_1 sse4_2 x2apic popcnt aes xsave avx rdrand hypervisor\nbogomips\t: 2000.00\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 46 bits physical, 48 bits virtual\n\n";
-const LINUX_PROC_MEMINFO: &[u8] = b"MemTotal:        1048576 kB\nMemFree:          786432 kB\nMemAvailable:     786432 kB\nBuffers:               0 kB\nCached:            65536 kB\nSwapCached:            0 kB\nActive:            32768 kB\nInactive:          32768 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nCommitLimit:       524288 kB\nCommitted_AS:      131072 kB\nVmallocTotal:   13743895347199 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugepagesize:       2048 kB\nDirectMap4k:      1048576 kB\n";
 const LINUX_PROC_STAT: &[u8] = b"cpu  1 0 1 100 0 0 0 0 0 0\ncpu0 1 0 1 100 0 0 0 0 0 0\nintr 0\nctxt 1\nbtime 0\nprocesses 1\nprocs_running 1\nprocs_blocked 0\nsoftirq 0 0 0 0 0 0 0 0 0 0 0\n";
 const LINUX_PROC_UPTIME: &[u8] = b"1.00 0.00\n";
 const LINUX_PROC_LOADAVG: &[u8] = b"0.00 0.00 0.00 1/1 1\n";
@@ -33982,6 +33981,52 @@ fn linux_user_namespace_file(state: u16) -> Option<&'static [u8]> {
     }
 }
 
+/// Renders /proc/meminfo from the frame allocator's counts.
+fn linux_proc_meminfo() -> &'static [u8] {
+    struct Buffer {
+        bytes: [u8; 1024],
+        length: usize,
+    }
+    impl core::fmt::Write for Buffer {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            let end = self.length + text.len();
+            self.bytes
+                .get_mut(self.length..end)
+                .ok_or(core::fmt::Error)?
+                .copy_from_slice(text.as_bytes());
+            self.length = end;
+            Ok(())
+        }
+    }
+    static mut MEMINFO: Buffer = Buffer {
+        bytes: [0; 1024],
+        length: 0,
+    };
+    let (total, free) = memory::frame_counts().unwrap_or((0, 0));
+    let (total, free) = (total * 4, free * 4);
+    let used = total - free;
+    // SAFETY: the kernel is single-processor and readers copy the bytes
+    // before another /proc/meminfo read can rewrite them.
+    let buffer = unsafe { &mut *core::ptr::addr_of_mut!(MEMINFO) };
+    buffer.length = 0;
+    let _ = core::fmt::Write::write_fmt(
+        buffer,
+        format_args!(
+            "MemTotal:       {total:>10} kB\nMemFree:        {free:>10} kB\n\
+             MemAvailable:   {free:>10} kB\nBuffers:        {zero:>10} kB\n\
+             Cached:         {zero:>10} kB\nSwapCached:     {zero:>10} kB\n\
+             Active:         {used:>10} kB\nInactive:       {zero:>10} kB\n\
+             SwapTotal:      {zero:>10} kB\nSwapFree:       {zero:>10} kB\n\
+             CommitLimit:    {total:>10} kB\nCommitted_AS:   {used:>10} kB\n\
+             VmallocTotal:   13743895347199 kB\nHugePages_Total:       0\n\
+             HugePages_Free:        0\nHugepagesize:       2048 kB\n\
+             DirectMap4k:    {total:>10} kB\n",
+            zero = 0
+        ),
+    );
+    &buffer.bytes[..buffer.length]
+}
+
 fn linux_regular_file(state: u16) -> Option<&'static [u8]> {
     if !linux_mount::current_root_is_read_only() {
         return None;
@@ -34014,7 +34059,7 @@ fn linux_regular_file(state: u16) -> Option<&'static [u8]> {
     }
     match state & !3 {
         LINUX_FILE_PROC_CPUINFO => return Some(LINUX_PROC_CPUINFO),
-        LINUX_FILE_PROC_MEMINFO => return Some(LINUX_PROC_MEMINFO),
+        LINUX_FILE_PROC_MEMINFO => return Some(linux_proc_meminfo()),
         LINUX_FILE_PROC_STAT => return Some(LINUX_PROC_STAT),
         LINUX_FILE_PROC_UPTIME => return Some(LINUX_PROC_UPTIME),
         LINUX_FILE_PROC_LOADAVG => return Some(LINUX_PROC_LOADAVG),
