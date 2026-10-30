@@ -48,19 +48,18 @@ pub(crate) unsafe fn probe(function: Function) -> Option<Report> {
     }
     let transmit = ((base + TRANSMIT_CONFIG) as *const u32).read_volatile();
     let phy = ((base + PHY_STATUS) as *const u16).read_volatile();
-    let speed = (phy & PHY_LINK != 0).then(|| {
-        if phy & PHY_2500_MBPS != 0 {
-            2500
-        } else if phy & PHY_1000_MBPS != 0 {
-            1000
-        } else if phy & PHY_100_MBPS != 0 {
-            100
-        } else if phy & PHY_10_MBPS != 0 {
-            10
-        } else {
-            0
-        }
-    });
+    let speed = if phy & PHY_2500_MBPS != 0 {
+        2500
+    } else if phy & PHY_1000_MBPS != 0 {
+        1000
+    } else if phy & PHY_100_MBPS != 0 {
+        100
+    } else if phy & PHY_10_MBPS != 0 {
+        10
+    } else {
+        0
+    };
+    let speed = (phy & PHY_LINK != 0).then_some(speed);
     Some(Report {
         mac,
         chip: (transmit >> 20) & 0x7cf,
