@@ -909,9 +909,11 @@ fn valid_entry_path(prefix: &[u8], path: &[u8]) -> bool {
 }
 
 fn valid_path(path: &[u8]) -> bool {
+    // Linux names are arbitrary bytes, and packages such as ca-certificates
+    // ship UTF-8 names, so only control characters are rejected.
     !path.is_empty()
         && path[0] != b'/'
-        && path.iter().all(|byte| byte.is_ascii_graphic())
+        && !path.iter().any(u8::is_ascii_control)
         && path
             .split(|byte| *byte == b'/')
             .all(|component| !component.is_empty() && component != b"." && component != b"..")
@@ -1116,6 +1118,25 @@ mod tests {
         let root = Rootfs::parse(&bytes).unwrap();
         assert!(root.find(b"etc/value").is_none());
         assert!(root.find(b"etc/.wh.value").is_none());
+    }
+
+    #[test]
+    fn accepts_utf8_and_space_names_but_rejects_control_characters() {
+        let name = "etc/ssl/certs/ca-cert-NetLock_F\u{151}tan\u{fa}s\u{ed}tv\u{e1}ny.pem";
+        // Two length digits, a space, "path=", the name, and a newline.
+        let record = format!("{} path={name}\n", name.len() + 9);
+        let mut bytes = archive(b"PaxHeaders/cert", record.as_bytes(), b'x', b"");
+        bytes.truncate(bytes.len() - TAR_BLOCK_SIZE * 2);
+        bytes.extend_from_slice(&archive(b"etc/ssl/certs/ascii", b"pem", b'0', b""));
+        let root = Rootfs::parse(&bytes).unwrap();
+        assert_eq!(root.find(name.as_bytes()).unwrap().data, b"pem");
+
+        let bytes = archive(b"usr/share/a b.txt", b"x", b'0', b"");
+        let root = Rootfs::parse(&bytes).unwrap();
+        assert!(root.find(b"usr/share/a b.txt").is_some());
+
+        assert!(Rootfs::parse(&archive(b"bin/line\nbreak", b"x", b'0', b"")).is_none());
+        assert!(Rootfs::parse(&archive(b"bin/del\x7f", b"x", b'0', b"")).is_none());
     }
 
     #[test]
