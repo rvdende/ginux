@@ -240,12 +240,20 @@ To install Ginux next to an existing Linux system on the target computer, run
 entry outside the default boot order, so `--boot-next` boots Ginux once and the
 following reboot returns to the existing system.
 
-Physical hardware is not supported yet. The kernel still requires the QEMU
-virtio devices and an Intel VT-d IOMMU, and its console is the serial port.
-Bringing up a real machine starts with `sudo tools/hardware/probe.sh`, run
+Physical hardware is not fully supported yet. The full system still requires
+the QEMU virtio devices and an Intel VT-d IOMMU. On any other machine Ginux
+enters **hardware bring-up mode**: it shows its console on the UEFI framebuffer
+(no serial port needed), reports memory, ACPI tables, CPUs, the IOMMU type, and
+every PCI device, and runs the physical-hardware drivers in `kernel/src/drivers`
+— currently a read-only NVMe driver that lists GPT partitions. Nothing in
+bring-up mode writes to storage. `make test-hardware-profile` boots an AMD
+IOMMU, NVMe, AHCI, and xHCI QEMU machine without virtio, with and without a
+serial port, and checks the report.
+
+Bringing up a specific machine starts with `sudo tools/hardware/probe.sh`, run
 under an existing Linux installation on that machine, which archives the
-firmware tables and device inventory that the storage, network, display, and
-IOMMU drivers will be written against.
+firmware tables and device inventory that the remaining storage, network,
+display, and IOMMU drivers will be written against.
 
 ## Verification
 

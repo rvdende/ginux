@@ -17,7 +17,7 @@ SYSTEM_PROFILE := profiles/minimal-system-v0/profile.tsv
 
 .DEFAULT_GOAL := help
 
-.PHONY: help doctor manifest system-image test-alpine test-rocky-shell test-rocky-dnf test-multi-domain test-linux-abi test-linux-runtime test-storage test-oci-cache probe-rocky-systemd test-rocky-systemd test-rocky-detached test-domain-responsiveness benchmark-rocky-systemd benchmark-prepare-linux benchmark-prepare-ginux benchmark-linux-comparison benchmark-ginux-boot benchmark-boot-comparison benchmark-ginux-sysbench benchmark-compare profile-rocky-systemd rocky-image rocky-image-check linux-probe controller-runtime network-service protocol-service volume-service abi-conformance architecture-check linux-compat-check build build-verification build-linux-profile run reset-storage boot-media test-boot-media test test-c1 test-c2 fmt gate clean
+.PHONY: help doctor manifest system-image test-alpine test-rocky-shell test-rocky-dnf test-multi-domain test-linux-abi test-linux-runtime test-storage test-oci-cache probe-rocky-systemd test-rocky-systemd test-rocky-detached test-domain-responsiveness benchmark-rocky-systemd benchmark-prepare-linux benchmark-prepare-ginux benchmark-linux-comparison benchmark-ginux-boot benchmark-boot-comparison benchmark-ginux-sysbench benchmark-compare profile-rocky-systemd rocky-image rocky-image-check linux-probe controller-runtime network-service protocol-service volume-service abi-conformance architecture-check linux-compat-check build build-verification build-linux-profile run reset-storage boot-media test-boot-media test-hardware-profile test test-c1 test-c2 fmt gate clean
 
 help:
 	@echo "Ginux development targets"
@@ -58,6 +58,7 @@ help:
 	@echo "  make reset-storage Delete the default persistent volume"
 	@echo "  make boot-media Build a UEFI hybrid ISO and a raw USB image in build/media"
 	@echo "  make test-boot-media Boot the ISO and USB image in QEMU as CD-ROM and USB stick"
+	@echo "  make test-hardware-profile Boot an AMD/NVMe/xHCI machine without virtio into bring-up mode"
 	@echo "  make test-storage Verify fresh, recovered, and reset persistent boots"
 	@echo "  make test-oci-cache Verify OCI layers are reused after reboot"
 	@echo "  make test    Build and verify the automated QEMU boot test"
@@ -217,6 +218,9 @@ boot-media: build
 
 test-boot-media: boot-media
 	@tests/qemu/boot-media.sh
+
+test-hardware-profile: build
+	@tests/qemu/hardware-profile.sh
 
 test-storage: build
 	@tests/qemu/persistent-storage.sh

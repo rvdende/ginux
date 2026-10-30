@@ -2,10 +2,12 @@
 
 mod address_space;
 mod arch;
+mod bringup;
 mod capability;
 mod control_abi;
 mod crypto;
 mod domain;
+mod drivers;
 mod executable;
 mod framebuffer;
 mod image_store;
@@ -323,7 +325,9 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     serial_write("ginux: OCI images require runtime registry ingestion\r\n");
 
     let Some(virtio_block) = arch::x86_64::pci::discover_virtio_block() else {
-        kernel_fail("ginux: modern virtio block device discovery failed\r\n");
+        // Not the QEMU reference machine: report the hardware and run the
+        // physical-device drivers instead of failing.
+        bringup::run(boot_info);
     };
     if !arch::x86_64::pci::verify_parser_rejections(virtio_block) {
         kernel_fail("ginux: malformed virtio PCI configuration accepted\r\n");
@@ -4411,8 +4415,23 @@ fn kernel_fail(message: &str) -> ! {
     }
 }
 
+static SERIAL_PRESENT: AtomicBool = AtomicBool::new(false);
+
 fn serial_init() {
-    // SAFETY: COM1 is part of the pinned QEMU machine profile.
+    // Physical machines often have no COM1; reads from an absent UART float to
+    // 0xff, which would otherwise look like a permanently ready receiver.
+    // SAFETY: probing the scratch register has no side effects on other devices.
+    let present = unsafe {
+        outb(COM1 + 7, 0xa5);
+        let first = inb(COM1 + 7) == 0xa5;
+        outb(COM1 + 7, 0x5a);
+        first && inb(COM1 + 7) == 0x5a
+    };
+    SERIAL_PRESENT.store(present, Ordering::Release);
+    if !present {
+        return;
+    }
+    // SAFETY: COM1 answered the scratch-register probe.
     unsafe {
         outb(COM1 + 1, 0x00);
         outb(COM1 + 3, 0x80);
@@ -4442,6 +4461,9 @@ pub(crate) fn serial_write_bytes(bytes: &[u8]) {
 
 fn serial_write_raw(bytes: &[u8]) {
     framebuffer::write(bytes);
+    if !SERIAL_PRESENT.load(Ordering::Acquire) {
+        return;
+    }
     for byte in bytes.iter().copied() {
         while unsafe { inb(COM1 + 5) } & 0x20 == 0 {
             core::hint::spin_loop();
@@ -4460,7 +4482,7 @@ pub(crate) fn serial_read_byte_blocking() -> u8 {
 }
 
 pub(crate) fn serial_input_ready() -> bool {
-    (unsafe { inb(COM1 + 5) } & 0x01) != 0
+    SERIAL_PRESENT.load(Ordering::Acquire) && (unsafe { inb(COM1 + 5) } & 0x01) != 0
 }
 
 fn serial_write_usize(value: usize) {
