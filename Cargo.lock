@@ -379,6 +379,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
 
 [[package]]
+name = "font8x8"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "875488b8711a968268c7cf5d139578713097ca4635a76044e8fe8eedf831d07e"
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -430,6 +436,7 @@ name = "ginux-kernel"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "font8x8",
  "ginux-image-store",
  "ginux-native-abi",
  "ginux-oci",

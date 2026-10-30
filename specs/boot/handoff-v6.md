@@ -1,6 +1,6 @@
 # Ginux Boot Handoff v6
 
-**Status:** Superseded by the internal version-7 structure in source; retained
+**Status:** Superseded by [handoff v8](handoff-v8.md); retained
 as the architectural contract for the wall-clock addition.
 
 The unified EFI image reads the firmware wall clock before

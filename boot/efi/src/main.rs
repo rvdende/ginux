@@ -10,7 +10,10 @@ use generated_boot::{
     BOOT_MANIFEST, BOOT_MANIFEST_SHA256, BOOT_MANIFEST_SIGNATURE, CONTROLLER_RUNTIME,
     CONTROL_PLANE_BUNDLE, ROOT_IMAGE,
 };
-use ginux_kernel::{kernel_entry, BootInfo, ResetSystem, BOOT_INFO_MAGIC, BOOT_INFO_VERSION};
+use ginux_kernel::{
+    kernel_entry, BootFramebuffer, BootInfo, ResetSystem, BOOT_INFO_MAGIC, BOOT_INFO_VERSION,
+    FRAMEBUFFER_FORMAT_BGRX, FRAMEBUFFER_FORMAT_NONE, FRAMEBUFFER_FORMAT_RGBX,
+};
 
 type EfiHandle = *mut c_void;
 type EfiStatus = usize;
@@ -30,6 +33,15 @@ const ACPI_10_TABLE_GUID: EfiGuid = EfiGuid {
     data3: 0x11d3,
     data4: [0x9a, 0x16, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d],
 };
+static GRAPHICS_OUTPUT_PROTOCOL_GUID: EfiGuid = EfiGuid {
+    data1: 0x9042_a9de,
+    data2: 0x23dc,
+    data3: 0x4a38,
+    data4: [0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a],
+};
+const GOP_PIXEL_RGB_RESERVED: u32 = 0;
+const GOP_PIXEL_BGR_RESERVED: u32 = 1;
+const GOP_PIXEL_BIT_MASK: u32 = 2;
 static LOADED_IMAGE_PROTOCOL_GUID: EfiGuid = EfiGuid {
     data1: 0x5b1b_31a1,
     data2: 0x9562,
@@ -110,6 +122,39 @@ type GetMemoryMap =
 type ExitBootServices = unsafe extern "efiapi" fn(EfiHandle, usize) -> EfiStatus;
 type HandleProtocol =
     unsafe extern "efiapi" fn(EfiHandle, *const EfiGuid, *mut *mut c_void) -> EfiStatus;
+type LocateProtocol =
+    unsafe extern "efiapi" fn(*const EfiGuid, *mut c_void, *mut *mut c_void) -> EfiStatus;
+
+#[repr(C)]
+struct EfiGraphicsOutputProtocol {
+    query_mode: usize,
+    set_mode: usize,
+    blt: usize,
+    mode: *const EfiGraphicsOutputMode,
+}
+
+#[repr(C)]
+struct EfiGraphicsOutputMode {
+    max_mode: u32,
+    mode: u32,
+    info: *const EfiGraphicsOutputModeInformation,
+    size_of_info: usize,
+    frame_buffer_base: u64,
+    frame_buffer_size: usize,
+}
+
+#[repr(C)]
+struct EfiGraphicsOutputModeInformation {
+    version: u32,
+    horizontal_resolution: u32,
+    vertical_resolution: u32,
+    pixel_format: u32,
+    red_mask: u32,
+    green_mask: u32,
+    blue_mask: u32,
+    reserved_mask: u32,
+    pixels_per_scan_line: u32,
+}
 
 #[repr(C)]
 struct EfiLoadedImageProtocol {
@@ -158,6 +203,17 @@ struct EfiBootServices {
     exit: usize,
     unload_image: usize,
     exit_boot_services: ExitBootServices,
+    get_next_monotonic_count: usize,
+    stall: usize,
+    set_watchdog_timer: usize,
+    connect_controller: usize,
+    disconnect_controller: usize,
+    open_protocol: usize,
+    close_protocol: usize,
+    open_protocol_information: usize,
+    protocols_per_handle: usize,
+    locate_handle_buffer: usize,
+    locate_protocol: LocateProtocol,
 }
 
 #[repr(C)]
@@ -267,6 +323,7 @@ unsafe fn exit_boot_services(
     }
     let (image_base, image_size) = loaded_image_bounds(image, boot_services);
     let unix_time = read_unix_time(runtime_services);
+    let framebuffer = graphics_framebuffer(boot_services);
 
     let memory_map = core::ptr::addr_of_mut!(MEMORY_MAP_STORAGE.0).cast::<u8>();
 
@@ -317,11 +374,60 @@ unsafe fn exit_boot_services(
                 reset_system: (*runtime_services).reset_system,
                 image_base,
                 image_size,
+                framebuffer,
             };
         }
     }
 
     panic!("failed to exit UEFI boot services");
+}
+
+/// Describes the framebuffer of the active Graphics Output Protocol mode, or
+/// returns an empty description when there is none Ginux can draw on.
+unsafe fn graphics_framebuffer(boot_services: *mut EfiBootServices) -> BootFramebuffer {
+    let none = BootFramebuffer {
+        base: 0,
+        size: 0,
+        width: 0,
+        height: 0,
+        stride: 0,
+        format: FRAMEBUFFER_FORMAT_NONE,
+    };
+    let mut interface = core::ptr::null_mut();
+    let status = ((*boot_services).locate_protocol)(
+        &GRAPHICS_OUTPUT_PROTOCOL_GUID,
+        core::ptr::null_mut(),
+        &mut interface,
+    );
+    let gop = interface.cast::<EfiGraphicsOutputProtocol>();
+    if status != EFI_SUCCESS || gop.is_null() || (*gop).mode.is_null() {
+        return none;
+    }
+    let mode = &*(*gop).mode;
+    if mode.info.is_null() || mode.size_of_info < size_of::<EfiGraphicsOutputModeInformation>() {
+        return none;
+    }
+    let info = &*mode.info;
+    let format = match (
+        info.pixel_format,
+        info.red_mask,
+        info.green_mask,
+        info.blue_mask,
+    ) {
+        (GOP_PIXEL_RGB_RESERVED, ..) => FRAMEBUFFER_FORMAT_RGBX,
+        (GOP_PIXEL_BGR_RESERVED, ..) => FRAMEBUFFER_FORMAT_BGRX,
+        (GOP_PIXEL_BIT_MASK, 0x0000_00ff, 0x0000_ff00, 0x00ff_0000) => FRAMEBUFFER_FORMAT_RGBX,
+        (GOP_PIXEL_BIT_MASK, 0x00ff_0000, 0x0000_ff00, 0x0000_00ff) => FRAMEBUFFER_FORMAT_BGRX,
+        _ => return none,
+    };
+    BootFramebuffer {
+        base: mode.frame_buffer_base,
+        size: mode.frame_buffer_size as u64,
+        width: info.horizontal_resolution,
+        height: info.vertical_resolution,
+        stride: info.pixels_per_scan_line,
+        format,
+    }
 }
 
 unsafe fn read_unix_time(runtime_services: *mut EfiRuntimeServices) -> u64 {

@@ -7,6 +7,7 @@ mod control_abi;
 mod crypto;
 mod domain;
 mod executable;
+mod framebuffer;
 mod image_store;
 mod initramfs;
 mod ipc;
@@ -62,7 +63,13 @@ const PERSISTENT_LOCAL_CONFIG_SIZE: usize =
     arch::x86_64::cpu::PERSISTENT_DOMAIN_CONFIG_SIZE + network::PERSISTENT_NETWORK_CONFIG_SIZE;
 const KERNEL_STACK_TOP_OFFSET: usize = PAGE_SIZE + KERNEL_STACK_SIZE;
 pub const BOOT_INFO_MAGIC: u64 = 0x0049_4258_554e_4947;
-pub const BOOT_INFO_VERSION: u32 = 7;
+pub const BOOT_INFO_VERSION: u32 = 8;
+/// No usable linear framebuffer was found.
+pub const FRAMEBUFFER_FORMAT_NONE: u32 = 0;
+/// 32-bit pixels with bytes ordered red, green, blue, reserved.
+pub const FRAMEBUFFER_FORMAT_RGBX: u32 = 1;
+/// 32-bit pixels with bytes ordered blue, green, red, reserved.
+pub const FRAMEBUFFER_FORMAT_BGRX: u32 = 2;
 
 fn initialize_linux_realtime(unix_time: u64, timestamp_counter: u64) -> bool {
     if unix_time < 1_577_836_800 || timestamp_counter == 0 {
@@ -138,6 +145,23 @@ pub struct BootInfo {
     pub reset_system: ResetSystem,
     pub image_base: *const u8,
     pub image_size: usize,
+    pub framebuffer: BootFramebuffer,
+}
+
+/// The linear framebuffer the firmware left active, if any.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BootFramebuffer {
+    /// Physical address of the first pixel.
+    pub base: u64,
+    /// Bytes the firmware reports for the framebuffer.
+    pub size: u64,
+    pub width: u32,
+    pub height: u32,
+    /// Pixels per scan line.
+    pub stride: u32,
+    /// One of the `FRAMEBUFFER_FORMAT_*` values.
+    pub format: u32,
 }
 
 #[repr(C)]
@@ -188,6 +212,11 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         || boot_info.size < size_of::<BootInfo>() as u32
     {
         kernel_fail("ginux: incompatible boot information\r\n");
+    }
+    // UEFI's page tables identity-map the framebuffer until Ginux installs its own.
+    if framebuffer::init(&boot_info.framebuffer, boot_info.framebuffer.base as usize) {
+        serial_write_raw(b"ginux: booting\r\n");
+        serial_write_raw(b"ginux: firmware framebuffer console active\r\n");
     }
     if boot_info.memory_map.is_null()
         || boot_info.memory_map_size == 0
@@ -431,6 +460,8 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
                 (virtio_network_notify_physical, virtio_network_notify_length),
                 (virtio_network_msix_physical, virtio_network_msix_length),
             ],
+            framebuffer::mapped_length(&boot_info.framebuffer)
+                .map(|length| (boot_info.framebuffer.base, length)),
         )
     };
     let Ok(arch::x86_64::paging::InitialMmioMappings {
@@ -441,6 +472,7 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         network_device: virtio_network_device_mmio,
         network_notification: virtio_network_notify_mmio,
         network_msix: virtio_network_msix_mmio,
+        framebuffer: framebuffer_window,
     }) = result
     else {
         if let Err(error) = result {
@@ -450,6 +482,10 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         }
         kernel_fail("ginux: page-table transition failed\r\n");
     };
+    if let Some(window) = framebuffer_window {
+        // SAFETY: the window maps the framebuffer that init validated.
+        unsafe { framebuffer::relocate(window) };
+    }
     serial_write("ginux: kernel page tables active\r\n");
     if !arch::x86_64::cpu::execute_disable_enabled()
         || !arch::x86_64::paging::identity_map_obeys_wx(boot_info, &image)
@@ -4405,6 +4441,7 @@ pub(crate) fn serial_write_bytes(bytes: &[u8]) {
 }
 
 fn serial_write_raw(bytes: &[u8]) {
+    framebuffer::write(bytes);
     for byte in bytes.iter().copied() {
         while unsafe { inb(COM1 + 5) } & 0x20 == 0 {
             core::hint::spin_loop();
