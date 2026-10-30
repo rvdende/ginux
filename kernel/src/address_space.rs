@@ -149,7 +149,9 @@ static LAST_UNSAFE_DEVICE_QUIESCE_WAS_ACTIVE: AtomicBool = AtomicBool::new(false
 static INTERACTIVE_CONTROLLER_IMAGE: AtomicUsize = AtomicUsize::new(0);
 static INTERACTIVE_CONTROLLER_IMAGE_SIZE: AtomicUsize = AtomicUsize::new(0);
 static INTERACTIVE_CONTROLLER_DOMAIN: AtomicU64 = AtomicU64::new(0);
-const LINUX_RUNTIME_FRAME_CAPACITY: usize = 440;
+// An init image may fill every image mapping slot that exec allows; the heap
+// and stack pages come from the same extent.
+const LINUX_RUNTIME_FRAME_CAPACITY: usize = cpu::LINUX_ACTIVE_IMAGE_MAPPING_LIMIT + 64;
 const LINUX_OWNED_FRAME_COUNT: usize = 10;
 static LINUX_RUNTIME_ACTIVE: [AtomicBool; crate::control_abi::DOMAIN_LIMIT] =
     [const { AtomicBool::new(false) }; crate::control_abi::DOMAIN_LIMIT];
