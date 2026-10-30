@@ -142,6 +142,8 @@ const LINUX_CLONE_SETTLS: u64 = 0x0008_0000;
 const LINUX_CLONE_PARENT_SETTID: u64 = 0x0010_0000;
 const LINUX_CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
 const LINUX_CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+// Ignored by Linux since 2.6, but still passed by musl's pthread_create.
+const LINUX_CLONE_DETACHED: u64 = 0x0040_0000;
 const LINUX_CLONE_PIDFD: u64 = 0x0000_1000;
 const LINUX_CLONE_VFORK: u64 = 0x0000_4000;
 const LINUX_CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
@@ -161,6 +163,7 @@ const LINUX_BOUNDED_THREAD_CLONE_FLAGS: u64 = LINUX_CLONE_VM
     | LINUX_CLONE_CHILD_SETTID;
 
 fn linux_thread_clone_flags_supported(flags: u64) -> bool {
+    let flags = flags & !LINUX_CLONE_DETACHED;
     flags == LINUX_BOUNDED_THREAD_CLONE_FLAGS
         || flags == LINUX_BOUNDED_THREAD_CLONE_FLAGS & !LINUX_CLONE_CHILD_SETTID
 }
@@ -4636,6 +4639,7 @@ pub(crate) fn mark_configured_container_booting() {
 }
 
 pub(crate) fn stop_configured_container() {
+    crate::linux_exe::forget_instance(LINUX_EXECUTION_INSTANCE.load(Ordering::SeqCst));
     if let Some(slot) = active_container_slot() {
         if matches!(
             u64::from(CONTAINER_CONTROL_STATES[slot].load(Ordering::SeqCst)),
@@ -5336,7 +5340,7 @@ fn construct_linux_clone_context(
         || LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) != LINUX_THREAD_READY
         || current_linux_thread_slot() == Some(slot)
         || request.tls != context.thread_pointer as u64
-        || request.child_stack & 15 != 0
+        || request.child_stack & 7 != 0
         || request.child_stack < LINUX_THREAD_STACK_BASES[slot].load(Ordering::SeqCst)
         || LINUX_THREAD_STACK_BASES[slot]
             .load(Ordering::SeqCst)
@@ -9626,8 +9630,8 @@ extern "sysv64" fn linux_syscall_handler(
                     saved_registers.rdi,
                     saved_registers.rsi,
                     saved_registers.rdx,
+                    saved_registers.r10,
                     saved_registers.r8,
-                    saved_registers.r9,
                     result,
                 ] {
                     serial_write_u64(value);
@@ -11471,12 +11475,14 @@ fn linux_clone3(
 }
 
 fn linux_clone_thread(registers: LinuxSyscallFrame, user_rip: u64, user_rflags: u64) -> u64 {
+    // x86-64 clone(flags, stack, parent_tid, child_tid, tls) passes its
+    // arguments in rdi, rsi, rdx, r10, and r8.
     let request = LinuxCloneRequest {
         flags: registers.rdi,
         child_stack: registers.rsi,
         parent_tid: registers.rdx,
-        child_tid: registers.r8,
-        tls: registers.r9,
+        child_tid: registers.r10,
+        tls: registers.r8,
     };
     linux_clone_thread_request(request, registers, user_rip, user_rflags)
 }
@@ -11509,9 +11515,11 @@ fn linux_clone_thread_request(
         let Ok(stack_top) = usize::try_from(request.child_stack) else {
             return LINUX_EINVAL;
         };
+        // Linux does not require an aligned child stack; musl passes 16n - 8
+        // because it pushes the thread argument before the system call.
         if !linux_thread_clone_flags_supported(request.flags)
             || stack_top == 0
-            || stack_top & 15 != 0
+            || stack_top & 7 != 0
             || !linux_readable_user_range_contains(request.tls, 16)
         {
             return LINUX_EINVAL;
@@ -22119,7 +22127,13 @@ fn linux_readlink_at(
     }
     let exec_node = ELF_PROBE_EXEC_NODE.load(Ordering::SeqCst);
     let mut measured_path = [0_u8; 64];
-    let executable = if exec_node == 0 {
+    let recorded = crate::linux_exe::lookup(
+        LINUX_EXECUTION_INSTANCE.load(Ordering::SeqCst),
+        current_linux_process_pid(),
+    );
+    let executable = if let Some(path) = recorded {
+        path
+    } else if exec_node == 0 {
         b"/init" as &[u8]
     } else {
         let Some(name) = initramfs::published_file_name_by_node(exec_node) else {
@@ -23321,6 +23335,7 @@ fn linux_rootfs_execve_source(
         u64::from_ne_bytes(name[8..].try_into().unwrap_or([0; 8])),
         Ordering::SeqCst,
     );
+    crate::linux_exe::record(LINUX_EXECUTION_INSTANCE.load(Ordering::SeqCst), pid, path);
     ELF_PROBE_BRK.store(heap_base as u64, Ordering::SeqCst);
     let Some(main_code) = plan.main_executable() else {
         return LINUX_ENOEXEC;

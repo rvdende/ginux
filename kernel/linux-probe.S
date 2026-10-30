@@ -1407,8 +1407,8 @@ linux_clone_repeat:
     mov edi, 0x13d0f00
     mov esi, 0x413000
     mov edx, 0x405194
-    lea r8d, [edx + 4]
-    mov r9d, 0x410fc0
+    lea r10d, [edx + 4]
+    mov r8d, 0x410fc0
     push 56
     pop rax
     syscall
