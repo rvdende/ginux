@@ -867,6 +867,9 @@ struct RelocatableImage<'a> {
     segments: [Option<Segment<'a>>; MAX_RELOCATABLE_LOAD_SEGMENT_COUNT],
     segment_count: usize,
     interpreter: Option<&'a [u8]>,
+    /// The load bias a non-PIE (`ET_EXEC`) image must use. Its addresses are
+    /// stored relative to this bias, as if it were a PIE linked at zero.
+    fixed_bias: Option<u64>,
 }
 
 pub(crate) struct InterpretedLoadPlan<'main, 'interpreter> {
@@ -1115,10 +1118,13 @@ pub(crate) fn plan_relocatable_process<'main, 'interpreter>(
 ) -> Option<RelocatableProcessPlan<'main, 'interpreter>> {
     let main_image = parse_relocatable(main_bytes)?;
     let interpreter_image = parse_relocatable(interpreter_bytes)?;
-    if main_image.interpreter != Some(interpreter_path) || interpreter_image.interpreter.is_some() {
+    if main_image.interpreter != Some(interpreter_path)
+        || interpreter_image.interpreter.is_some()
+        || interpreter_image.fixed_bias.is_some()
+    {
         return None;
     }
-    let main = plan_relocatable(&main_image, main_base)?;
+    let main = plan_relocatable(&main_image, main_image.fixed_bias.unwrap_or(main_base))?;
     let interpreter = plan_relocatable(&interpreter_image, interpreter_base)?;
     if relocatable_plans_overlap(&main, &interpreter) {
         return None;
@@ -1139,10 +1145,13 @@ pub(crate) fn plan_relocatable_process_auto<'main, 'interpreter>(
     const LOAD_ALIGNMENT: u64 = PAGE_SIZE as u64;
     let main_image = parse_relocatable(main_bytes)?;
     let interpreter_image = parse_relocatable(interpreter_bytes)?;
-    if main_image.interpreter != Some(interpreter_path) || interpreter_image.interpreter.is_some() {
+    if main_image.interpreter != Some(interpreter_path)
+        || interpreter_image.interpreter.is_some()
+        || interpreter_image.fixed_bias.is_some()
+    {
         return None;
     }
-    let main = plan_relocatable(&main_image, main_base)?;
+    let main = plan_relocatable(&main_image, main_image.fixed_bias.unwrap_or(main_base))?;
     let main_end = main.segments[..main.segment_count]
         .iter()
         .flatten()
@@ -1175,7 +1184,7 @@ pub(crate) fn plan_relocatable_static(
 ) -> Option<RelocatableLoadPlan<'_>> {
     let image = parse_relocatable(bytes)?;
     image.interpreter.is_none().then_some(())?;
-    plan_relocatable(&image, load_bias)
+    plan_relocatable(&image, image.fixed_bias.unwrap_or(load_bias))
 }
 
 pub(crate) fn plan_static_exec(bytes: &[u8]) -> Option<LoadPlan<'_>> {
@@ -1197,7 +1206,7 @@ fn parse_relocatable(bytes: &[u8]) -> Option<RelocatableImage<'_>> {
         || !matches!(bytes[7], 0 | 3)
         || bytes[8] != 0
         || bytes[9..16].iter().any(|byte| *byte != 0)
-        || read_u16(bytes, 16)? != ET_DYN
+        || !matches!(read_u16(bytes, 16)?, ET_EXEC | ET_DYN)
         || read_u16(bytes, 18)? != EM_X86_64
         || read_u32(bytes, 20)? != 1
         || read_u64(bytes, 32)? != ELF_HEADER_SIZE as u64
@@ -1308,13 +1317,32 @@ fn parse_relocatable(bytes: &[u8]) -> Option<RelocatableImage<'_>> {
     if phdr_address.is_some_and(|address| address != mapped_program_headers) {
         return None;
     }
+    let fixed_bias = if read_u16(bytes, 16)? == ET_EXEC {
+        let bias = segments[..segment_count]
+            .iter()
+            .flatten()
+            .map(|segment| segment.virtual_address)
+            .min()?
+            & !(PAGE_SIZE as u64 - 1);
+        if bias < MIN_USER_ADDRESS {
+            return None;
+        }
+        for segment in segments[..segment_count].iter_mut().flatten() {
+            segment.virtual_address -= bias;
+        }
+        Some(bias)
+    } else {
+        None
+    };
+    let bias = fixed_bias.unwrap_or(0);
     Some(RelocatableImage {
-        entry,
-        program_headers: mapped_program_headers,
+        entry: entry - bias,
+        program_headers: mapped_program_headers - bias,
         program_header_count: program_header_count as u16,
         segments,
         segment_count,
         interpreter,
+        fixed_bias,
     })
 }
 

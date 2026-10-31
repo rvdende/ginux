@@ -886,7 +886,16 @@ pub(crate) fn executable_program_headers(init: &[u8]) -> Option<([u64; 16], usiz
 pub(crate) fn launch_arguments<'a>(init: &'a [u8]) -> Option<LaunchArguments<'a>> {
     let rootfs = rootfs()?;
     let (_, executable) = lookup_in(&rootfs, init)?;
-    if let Some((interpreter, argument)) = shebang_command(executable.data) {
+    Some(launch_arguments_for_image(init, executable.data))
+}
+
+/// Returns the leading arguments for executing `image` as `init`, which
+/// name the interpreter first when `image` is a script.
+pub(crate) fn launch_arguments_for_image<'a>(
+    init: &'a [u8],
+    image: &'a [u8],
+) -> LaunchArguments<'a> {
+    if let Some((interpreter, argument)) = shebang_command(image) {
         let mut values = [b"" as &[u8]; 3];
         values[0] = interpreter;
         let count = if let Some(argument) = argument {
@@ -897,18 +906,37 @@ pub(crate) fn launch_arguments<'a>(init: &'a [u8]) -> Option<LaunchArguments<'a>
             values[1] = init;
             2
         };
-        Some(LaunchArguments {
+        LaunchArguments {
             values,
             count,
             execfn: count - 1,
-        })
+        }
     } else {
-        Some(LaunchArguments {
+        LaunchArguments {
             values: [init, b"", b""],
             count: 1,
             execfn: 0,
-        })
+        }
     }
+}
+
+/// Plans a process for an executable that lives outside the published root,
+/// such as a file written at runtime. Script and dynamic-loader interpreters
+/// still come from the published root.
+pub(crate) fn process_plan_for_image(
+    image: &[u8],
+) -> Option<crate::linux_elf::RelocatableExecutablePlan<'_, '_>> {
+    let rootfs = rootfs()?;
+    let executable = if let Some((interpreter, _)) = shebang_command(image) {
+        let (_, script_interpreter) = lookup_in(&rootfs, interpreter)?;
+        if script_interpreter.kind != EntryKind::File || script_interpreter.mode & 0o111 == 0 {
+            return None;
+        }
+        script_interpreter.data
+    } else {
+        image
+    };
+    plan_executable_in(&rootfs, executable)
 }
 
 fn process_plan_in<'a>(
@@ -926,11 +954,18 @@ fn process_plan_in<'a>(
         }
         executable = script_interpreter;
     }
-    let Some(interpreter_path) = crate::linux_elf::relocatable_interpreter(executable.data) else {
-        return crate::linux_elf::plan_relocatable_static(executable.data, 0x40_0000)
+    plan_executable_in(rootfs, executable.data)
+}
+
+fn plan_executable_in<'a>(
+    rootfs: &Rootfs<'a>,
+    executable: &'a [u8],
+) -> Option<crate::linux_elf::RelocatableExecutablePlan<'a, 'a>> {
+    let Some(interpreter_path) = crate::linux_elf::relocatable_interpreter(executable) else {
+        return crate::linux_elf::plan_relocatable_static(executable, 0x40_0000)
             .map(crate::linux_elf::RelocatableExecutablePlan::Static)
             .or_else(|| {
-                crate::linux_elf::plan_static_exec(executable.data)
+                crate::linux_elf::plan_static_exec(executable)
                     .map(crate::linux_elf::RelocatableExecutablePlan::Fixed)
             });
     };
@@ -939,7 +974,7 @@ fn process_plan_in<'a>(
         return None;
     }
     crate::linux_elf::plan_relocatable_process_auto(
-        executable.data,
+        executable,
         0x40_0000,
         interpreter_path,
         interpreter.data,

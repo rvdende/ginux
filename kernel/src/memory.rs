@@ -674,14 +674,6 @@ pub(crate) fn allocate_frames<const N: usize>(owner: FrameOwner) -> Option<[Fram
     }
 }
 
-pub(crate) fn allocate_frame_prefix<const N: usize>(
-    owner: FrameOwner,
-    count: usize,
-) -> Option<[FrameLease; N]> {
-    let mut frames = [FrameLease::EMPTY; N];
-    allocate_frame_prefix_into(owner, &mut frames, count).then_some(frames)
-}
-
 pub(crate) fn allocate_frame_prefix_into(
     owner: FrameOwner,
     output: &mut [FrameLease],

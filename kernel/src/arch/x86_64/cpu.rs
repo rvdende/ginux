@@ -481,6 +481,8 @@ const LINUX_PROBE_EXIT_STATUS: u64 = 42;
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 const LINUX_CAPABILITY_DATA_SIZE: usize = 24;
 const LINUX_RETURN_TO_KERNEL: u64 = (-4096_i64) as u64;
+/// The length of the `syscall` instruction, for restarting a syscall.
+const LINUX_SYSCALL_INSTRUCTION_SIZE: u64 = 2;
 const LINUX_RETURN_FROM_SIGNAL: u64 = (-4095_i64) as u64;
 const LINUX_EPERM: u64 = u64::MAX;
 const LINUX_EIO: u64 = u64::MAX - 4;
@@ -671,6 +673,9 @@ const LINUX_TIOCNOTTY: u64 = 0x5422;
 const LINUX_TIOCGSID: u64 = 0x5429;
 const LINUX_TIOCVHANGUP: u64 = 0x5437;
 const LINUX_FIONREAD: u64 = 0x541b;
+const LINUX_FIONBIO: u64 = 0x5421;
+const LINUX_FIONCLEX: u64 = 0x5450;
+const LINUX_FIOCLEX: u64 = 0x5451;
 const LINUX_DESCRIPTOR_INPUT: u16 = 1;
 const LINUX_DESCRIPTOR_OUTPUT: u16 = 2;
 const LINUX_DEVICE_ZERO: u16 = 1 << 2;
@@ -801,6 +806,14 @@ pub(crate) const LINUX_PROCESS_HIERARCHY_LIMIT: usize = 1024;
 pub(crate) const LINUX_PROCESS_MAPPING_LIMIT: usize = 262_144;
 const LINUX_EXEC_VECTOR_LIMIT: usize = 32;
 const LINUX_EXEC_STACK_SIZE: usize = PAGE_SIZE / 2;
+/// Pages for the runtime exec argument, environment and auxiliary-vector
+/// image. Linux allows more, but this covers compiler and linker command lines.
+const LINUX_EXEC_ARGUMENT_PAGES: usize = 32;
+/// The most argv or envp entries a runtime exec accepts.
+const LINUX_EXEC_ARGUMENT_LIMIT: usize = 8192;
+/// The most pages a runtime exec copies in for its program and loader
+/// segments (256 MiB).
+const LINUX_EXEC_IMAGE_PAGE_LIMIT: usize = 65_536;
 const LINUX_PLATFORM: &[u8] = b"x86_64\0";
 const LINUX_F_DUPFD: u64 = 0;
 const LINUX_F_GETFD: u64 = 1;
@@ -839,6 +852,7 @@ const LINUX_O_EXCL: u64 = 0x80;
 const LINUX_O_TRUNC: u64 = 0x200;
 const LINUX_O_APPEND: u64 = 0x400;
 const LINUX_O_NONBLOCK: u64 = 0x800;
+const LINUX_O_ACCMODE: u64 = 3;
 const LINUX_PRIVATE_SECRET_DESCRIPTOR: u32 = 1 << 31;
 const LINUX_PRIVATE_IO_URING_DESCRIPTOR: u32 = 1 << 29;
 const LINUX_O_LARGEFILE: u64 = 0x8000;
@@ -2798,6 +2812,7 @@ pub(crate) fn resume_live_linux_process(
             && returned_fs < 1 << 47
             && (LINUX_PROCESS_CHILD_EXITED.load(Ordering::SeqCst)
                 || LINUX_PROCESS_CHILD_EXECUTED.load(Ordering::SeqCst)
+                || LINUX_PROCESS_CHILD_YIELDED.load(Ordering::SeqCst)
                 || LINUX_FORK_REQUESTED.load(Ordering::SeqCst)
                 || LINUX_RUNTIME_BACKGROUND_SUSPENDED.load(Ordering::Acquire));
     unsafe { write_msr(FS_BASE_MSR, saved_fs) };
@@ -4129,7 +4144,14 @@ fn execute_deferred_live_fork() -> bool {
         return false;
     }
     if let Some((slot, _, _)) = parent_runtime.tid {
-        LINUX_THREAD_TIDS[slot].store(child.pid, Ordering::SeqCst);
+        if LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
+            if !fork_linux_thread_slot(slot, child.pid) {
+                serial_write("ginux: Linux fork thread slot exhausted\r\n");
+                return false;
+            }
+        } else {
+            LINUX_THREAD_TIDS[slot].store(child.pid, Ordering::SeqCst);
+        }
         LINUX_NEXT_TID.store(child.pid.saturating_add(1), Ordering::SeqCst);
     }
     let child_tid_address = LINUX_FORK_CHILD_TID_ADDRESS.swap(0, Ordering::SeqCst);
@@ -4201,6 +4223,7 @@ fn execute_deferred_live_fork() -> bool {
         let Some(runnable_child) = linux_process::dispatch_live_process(child.pid) else {
             return false;
         };
+        restore_linux_process_current_thread(child.pid);
         child_resumed = sync_live_linux_process_address_space(child.pid)
             && restore_saved_linux_process_runtime_state(child.pid)
             && restore_linux_process_extended_state(child.pid)
@@ -4256,11 +4279,15 @@ fn execute_deferred_live_fork() -> bool {
     if !save_linux_process_extended_state(child.pid) {
         return false;
     }
+    restore_linux_process_current_thread(parent_pid);
     if !restore_saved_linux_process_runtime_state(parent_pid) {
         return false;
     }
     if !restore_linux_process_extended_state(parent_pid) {
         return false;
+    }
+    if child_exited {
+        retire_linux_process_threads(child.pid);
     }
     if new_mount_namespace && !child_executed && !linux_mount::retire(child_mount_namespace) {
         return false;
@@ -5632,6 +5659,54 @@ fn clear_linux_thread_slot(slot: usize) {
     LINUX_THREAD_STATES[slot].store(LINUX_THREAD_FREE, Ordering::SeqCst);
 }
 
+/// Gives a forked child its own main-thread slot, with the attributes of the
+/// forking thread, and makes it current. The parent's slots keep their saved
+/// state, so a fork from any of its threads leaves them intact.
+fn fork_linux_thread_slot(parent_slot: usize, pid: u32) -> bool {
+    let Some(slot) = LINUX_THREAD_STATES
+        .iter()
+        .position(|state| state.load(Ordering::SeqCst) == LINUX_THREAD_FREE)
+    else {
+        return false;
+    };
+    let Some(generation) = LINUX_THREAD_GENERATIONS[slot]
+        .load(Ordering::SeqCst)
+        .checked_add(1)
+    else {
+        return false;
+    };
+    for table in [
+        &LINUX_THREAD_POINTERS,
+        &LINUX_THREAD_TLS_EXTENTS,
+        &LINUX_THREAD_TLS_SIZES,
+        &LINUX_THREAD_STACK_BASES,
+        &LINUX_THREAD_STACK_SIZES,
+        &LINUX_THREAD_ROBUST_LISTS,
+        &LINUX_THREAD_RSEQ_POINTERS,
+        &LINUX_THREAD_SIGNAL_MASKS,
+    ] {
+        table[slot].store(table[parent_slot].load(Ordering::SeqCst), Ordering::SeqCst);
+    }
+    for table in [&LINUX_THREAD_RSEQ_LENGTHS, &LINUX_THREAD_RSEQ_SIGNATURES] {
+        table[slot].store(table[parent_slot].load(Ordering::SeqCst), Ordering::SeqCst);
+    }
+    clear_linux_thread_execution(slot);
+    LINUX_THREAD_WAIT_KINDS[slot].store(LINUX_THREAD_WAIT_NONE, Ordering::SeqCst);
+    LINUX_THREAD_GENERATIONS[slot].store(generation, Ordering::SeqCst);
+    LINUX_THREAD_TIDS[slot].store(pid, Ordering::SeqCst);
+    LINUX_THREAD_OWNER_PIDS[slot].store(pid, Ordering::SeqCst);
+    LINUX_THREAD_STATES[slot].store(LINUX_THREAD_RUNNING, Ordering::SeqCst);
+    LINUX_CURRENT_THREAD_SLOT.store(slot as u8, Ordering::SeqCst);
+    true
+}
+
+/// Returns whether the thread in `slot` belongs to the current process.
+/// Runtime domains keep every process's threads in one table.
+fn linux_thread_slot_in_current_process(slot: usize) -> bool {
+    !LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
+        || LINUX_THREAD_OWNER_PIDS[slot].load(Ordering::SeqCst) == current_linux_process_pid()
+}
+
 fn clear_linux_thread_execution(slot: usize) {
     for register in &LINUX_THREAD_REGISTERS[slot] {
         register.store(0, Ordering::SeqCst);
@@ -5703,10 +5778,11 @@ fn retire_linux_process_threads(pid: u32) {
 
 fn ready_linux_thread_handle() -> Option<LinuxThreadHandle> {
     (0..LINUX_THREAD_LIMIT).find_map(|slot| {
-        (LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) == LINUX_THREAD_READY)
-            .then(|| linux_thread_handle(slot))
-            .flatten()
-            .filter(|handle| linux_thread_return_context(*handle).is_some())
+        (LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) == LINUX_THREAD_READY
+            && linux_thread_slot_in_current_process(slot))
+        .then(|| linux_thread_handle(slot))
+        .flatten()
+        .filter(|handle| linux_thread_return_context(*handle).is_some())
     })
 }
 
@@ -5717,10 +5793,11 @@ fn yield_ready_linux_thread_handle() -> Option<LinuxThreadHandle> {
     let last_preempted = LINUX_LAST_PREEMPTED_THREAD_SLOT.load(Ordering::Acquire);
     (0..LINUX_THREAD_LIMIT).find_map(|slot| {
         (slot != usize::from(last_preempted)
-            && LINUX_THREAD_STATES[slot].load(Ordering::Acquire) == LINUX_THREAD_READY)
-            .then(|| linux_thread_handle(slot))
-            .flatten()
-            .filter(|handle| linux_thread_return_context(*handle).is_some())
+            && LINUX_THREAD_STATES[slot].load(Ordering::Acquire) == LINUX_THREAD_READY
+            && linux_thread_slot_in_current_process(slot))
+        .then(|| linux_thread_handle(slot))
+        .flatten()
+        .filter(|handle| linux_thread_return_context(*handle).is_some())
     })
 }
 
@@ -9366,6 +9443,9 @@ extern "sysv64" fn linux_syscall_handler(
         LINUX_PKEY_ALLOC_SYSCALL => linux_pkey_alloc(first_argument, buffer),
         LINUX_PKEY_FREE_SYSCALL => linux_pkey_free(first_argument),
         LINUX_IOCTL_SYSCALL => {
+            if let Some(result) = linux_generic_ioctl(first_argument, buffer, count) {
+                return result;
+            }
             if linux_userfaultfd_descriptor(first_argument) {
                 return linux_userfaultfd_ioctl(first_argument, buffer, count);
             }
@@ -9641,6 +9721,40 @@ extern "sysv64" fn linux_syscall_handler(
                     LINUX_FORK_CHILD_TID_ADDRESS.store(child_tid, Ordering::SeqCst);
                 }
                 result
+            }
+        }
+        LINUX_CLONE_SYSCALL
+            if runtime_mode
+                && saved_registers.rdi & LINUX_CLONE_THREAD == 0
+                && saved_registers.rdi & 0xff == LINUX_SIGCHLD =>
+        {
+            // musl's posix_spawn creates its child with
+            // clone(CLONE_VM | CLONE_VFORK | SIGCHLD, stack), the process
+            // form that clone3 already routes to the fork machinery.
+            let flags = saved_registers.rdi;
+            let child_stack = saved_registers.rsi;
+            if flags & !(0xff | LINUX_CLONE_VM | LINUX_CLONE_VFORK) != 0
+                || flags & LINUX_CLONE_VFORK == 0
+                || child_stack == 0
+            {
+                LINUX_EINVAL
+            } else if !materialize_linux_runtime_user_range(
+                (child_stack - 1) & !(PAGE_SIZE as u64 - 1),
+                PAGE_SIZE,
+                true,
+            ) {
+                LINUX_EFAULT
+            } else {
+                linux_request_process_fork(
+                    true,
+                    syscall_return,
+                    false,
+                    false,
+                    child_stack,
+                    0,
+                    0,
+                    false,
+                )
             }
         }
         LINUX_CLONE_SYSCALL => {
@@ -10221,7 +10335,14 @@ extern "sysv64" fn linux_syscall_handler(
         LINUX_KCMP_SYSCALL => linux_kcmp(first_argument, buffer, count, register(0), register(2)),
         LINUX_CACHESTAT_SYSCALL => linux_cachestat(first_argument, buffer, count, register(0)),
         LINUX_MEMBARRIER_SYSCALL => linux_membarrier(first_argument, buffer, count),
-        LINUX_WAIT4_SYSCALL => linux_wait4(first_argument, buffer, count, register(0)),
+        LINUX_WAIT4_SYSCALL => linux_wait4_live(
+            registers,
+            first_argument,
+            buffer,
+            count,
+            register(0),
+            syscall_return,
+        ),
         LINUX_WAITID_SYSCALL => linux_waitid_live(
             registers,
             first_argument,
@@ -10948,6 +11069,40 @@ fn linux_controller_pipe_write(descriptor: u64, address: u64, count: u64) -> u64
     total as u64
 }
 
+/// Handles the ioctls Linux applies to every descriptor before asking the
+/// file's own driver, by way of the equivalent fcntl calls.
+fn linux_generic_ioctl(descriptor: u64, request: u64, argument: u64) -> Option<u64> {
+    match u64::from(request as u32) {
+        LINUX_FIOCLEX => Some(linux_descriptor_fcntl(
+            descriptor,
+            LINUX_F_SETFD,
+            u64::from(LINUX_FD_CLOEXEC),
+        )),
+        LINUX_FIONCLEX => Some(linux_descriptor_fcntl(descriptor, LINUX_F_SETFD, 0)),
+        LINUX_FIONBIO => {
+            let mut value = [0_u8; size_of::<i32>()];
+            if !copy_from_linux_user(argument, &mut value) {
+                return Some(LINUX_EFAULT);
+            }
+            let flags = linux_descriptor_fcntl(descriptor, LINUX_F_GETFL, 0);
+            if flags >= u64::MAX - 4095 {
+                return Some(flags);
+            }
+            let flags = if i32::from_ne_bytes(value) != 0 {
+                flags | LINUX_O_NONBLOCK
+            } else {
+                flags & !LINUX_O_NONBLOCK
+            };
+            Some(linux_descriptor_fcntl(
+                descriptor,
+                LINUX_F_SETFL,
+                flags & !LINUX_O_ACCMODE,
+            ))
+        }
+        _ => None,
+    }
+}
+
 fn linux_controller_pipe_ioctl(descriptor: u64, request: u64, output: u64) -> u64 {
     if request != LINUX_FIONREAD {
         return LINUX_ENOTTY;
@@ -11369,7 +11524,11 @@ fn linux_request_process_fork(
     clear_sighand: bool,
 ) -> u64 {
     let refreshed = refresh_live_linux_process_registry(caller);
+    // A runtime process may fork from any thread (rustc spawns its linker
+    // from its compiler thread). The child takes over the calling thread's
+    // slot with tid == pid, and the parent's tid is restored with its state.
     if current_linux_tid() != Some(current_linux_process_pid())
+        && !LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
         || !refreshed
         || linux_nproc_limit_reached()
         || LINUX_FORK_REQUESTED
@@ -11846,7 +12005,8 @@ fn linux_child_wait_state(
 
 fn linux_wait4(pid: u64, status_address: u64, options: u64, rusage: u64) -> u64 {
     let parent_pid = current_linux_process_pid();
-    if current_linux_tid() != Some(parent_pid) {
+    // Any thread may wait for the children of its process.
+    if !LINUX_RUNTIME_MODE.load(Ordering::SeqCst) && current_linux_tid() != Some(parent_pid) {
         return LINUX_ECHILD;
     }
     let pid = pid as u32 as i32;
@@ -11926,7 +12086,9 @@ fn linux_wait4(pid: u64, status_address: u64, options: u64, rusage: u64) -> u64 
 fn linux_waitid(id_type: u64, id: u64, information: u64, options: u64, rusage: u64) -> u64 {
     const SIGNAL_INFORMATION_SIZE: usize = size_of::<LinuxSignalInformation>();
 
-    if current_linux_tid() != Some(current_linux_process_pid()) {
+    if !LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
+        && current_linux_tid() != Some(current_linux_process_pid())
+    {
         return LINUX_ECHILD;
     }
     let id_type = u64::from(id_type as u32);
@@ -12067,6 +12229,92 @@ fn linux_waitid_live(
         return LINUX_ECHILD;
     }
     linux_waitid(id_type, id, information, options, rusage)
+}
+
+fn linux_wait4_live(
+    output: *mut LinuxSyscallFrame,
+    pid: u64,
+    status_address: u64,
+    options: u64,
+    rusage: u64,
+    caller: LinuxUserContext,
+) -> u64 {
+    loop {
+        let result = linux_wait4(pid, status_address, options, rusage);
+        if result != LINUX_ENOSYS || options as u32 as u64 & LINUX_WNOHANG != 0 {
+            return result;
+        }
+        match run_other_linux_processes(output, caller, LINUX_WAIT4_SYSCALL) {
+            Some(LinuxBlockedWait::Recheck) => {}
+            Some(LinuxBlockedWait::Return(result)) => return result,
+            None => return LINUX_ECHILD,
+        }
+    }
+}
+
+/// What a blocking syscall does after letting other processes run.
+enum LinuxBlockedWait {
+    /// Check the wait condition again in this call.
+    Recheck,
+    /// Return this result; it may resume another context.
+    Return(u64),
+}
+
+/// Lets other processes in the domain run while the current one blocks in
+/// syscall `number`. Processes run cooperatively, nested inside the fork or
+/// wait syscalls of their ancestors, and only init drives the run queue. Any
+/// other process therefore yields to its executor and restarts the syscall
+/// when resumed, as Linux restarts an interrupted wait. Returns `None` when
+/// nothing else can run.
+fn run_other_linux_processes(
+    output: *mut LinuxSyscallFrame,
+    caller: LinuxUserContext,
+    number: u64,
+) -> Option<LinuxBlockedWait> {
+    if !LINUX_RUNTIME_MODE.load(Ordering::SeqCst) || ready_linux_thread_handle().is_some() {
+        return None;
+    }
+    let pid = current_linux_process_pid();
+    if pid != 1 {
+        let mut restart = caller;
+        restart.rip = caller.rip.wrapping_sub(LINUX_SYSCALL_INSTRUCTION_SIZE);
+        return yield_current_linux_process(restart, number)
+            .then_some(LinuxBlockedWait::Return(LINUX_RETURN_TO_KERNEL));
+    }
+    // The deepest running descendant is most likely what this process waits
+    // for, such as a linker under a compiler driver; failing that, take the
+    // next process in the run queue.
+    let mut descendant = None;
+    let mut ancestor = pid;
+    for _ in 0..linux_process::PROCESS_RUNTIME_LIMIT {
+        let Some(child) = linux_process::live_running_child_pid(ancestor) else {
+            break;
+        };
+        descendant = Some(child);
+        ancestor = child;
+    }
+    if !refresh_live_linux_process_registry(caller)
+        || !(descendant.is_some_and(|child| run_scheduled_linux_process(pid, Some(child)))
+            || run_next_scheduled_linux_process(pid))
+    {
+        return None;
+    }
+    if LINUX_RUNTIME_SUSPENDED.load(Ordering::Acquire) {
+        return Some(LinuxBlockedWait::Return(LINUX_RETURN_TO_KERNEL));
+    }
+    if !restore_linux_process_live_return(output, pid) {
+        return Some(LinuxBlockedWait::Return(LINUX_EINVAL));
+    }
+    let mut interrupted = caller;
+    interrupted.rax = LINUX_EINTR;
+    let delivered = linux_deliver_pending_signal(output, interrupted, (caller.rip, caller.rflags));
+    Some(if delivered != 0 {
+        LinuxBlockedWait::Return(delivered)
+    } else if LINUX_SIGNAL_ACTIVE.load(Ordering::SeqCst) {
+        LinuxBlockedWait::Return(0)
+    } else {
+        LinuxBlockedWait::Recheck
+    })
 }
 
 fn linux_sched_yield_live_return(
@@ -13162,14 +13410,22 @@ fn linux_futex_live_return(
     }
     match operation {
         0 | 128 => {
-            if u64::from(u32::from_ne_bytes(bytes)) != value {
+            // musl passes the expected value as a sign-extended int; Linux
+            // compares only the 32-bit futex word.
+            if u32::from_ne_bytes(bytes) != value as u32 {
                 return LINUX_EAGAIN;
             }
             let Some(current) = current_linux_thread_handle() else {
                 return LINUX_ESRCH;
             };
             let Some(target) = ready_linux_thread_handle() else {
-                return LINUX_ENOSYS;
+                // Another process may be the one to change the futex word.
+                return match run_other_linux_processes(output, caller, LINUX_FUTEX_SYSCALL) {
+                    Some(LinuxBlockedWait::Return(result)) => result,
+                    // Callers recheck their condition after any wakeup.
+                    Some(LinuxBlockedWait::Recheck) => 0,
+                    None => LINUX_ENOSYS,
+                };
             };
             let Some(tls) = linux_thread_context(current) else {
                 return LINUX_ESRCH;
@@ -13987,6 +14243,20 @@ fn save_current_linux_process_runtime_state(pid: u32) {
             timer::timestamp_counter().saturating_sub(started),
             Ordering::Relaxed,
         );
+    }
+}
+
+/// Makes the saved current thread of `pid` current again when switching to
+/// it from another process, since each process runs on its own thread slots.
+/// Only a state saved when the process last left user mode is fresh enough.
+fn restore_linux_process_current_thread(pid: u32) {
+    if !LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
+        return;
+    }
+    if let Some(state) = linux_process_runtime_state(pid)
+        .filter(|state| state.valid && usize::from(state.thread_slot) < LINUX_THREAD_LIMIT)
+    {
+        LINUX_CURRENT_THREAD_SLOT.store(state.thread_slot, Ordering::SeqCst);
     }
 }
 
@@ -22930,6 +23200,24 @@ fn linux_execveat(
     )
 }
 
+/// Resets every caught signal to its default action and disables the
+/// alternate signal stack, as execve must: the old handlers' addresses mean
+/// nothing in the new image. Ignored signals stay ignored.
+fn reset_linux_caught_signals_on_exec() {
+    const SIG_IGN: u64 = 1;
+    for index in 0..LINUX_SIGNAL_COUNT {
+        if ELF_PROBE_SIGNAL_HANDLERS[index].load(Ordering::SeqCst) > SIG_IGN {
+            ELF_PROBE_SIGNAL_HANDLERS[index].store(0, Ordering::SeqCst);
+            ELF_PROBE_SIGNAL_FLAGS[index].store(0, Ordering::SeqCst);
+            ELF_PROBE_SIGNAL_RESTORERS[index].store(0, Ordering::SeqCst);
+            ELF_PROBE_SIGNAL_ACTION_MASKS[index].store(0, Ordering::SeqCst);
+        }
+    }
+    ELF_PROBE_ALT_STACK_FLAGS.store(LINUX_SS_DISABLE, Ordering::SeqCst);
+    ELF_PROBE_ALT_STACK_POINTER.store(0, Ordering::SeqCst);
+    ELF_PROBE_ALT_STACK_SIZE.store(0, Ordering::SeqCst);
+}
+
 fn linux_rootfs_execve(path: &[u8], arguments_address: u64, environment_address: u64) -> u64 {
     linux_rootfs_execve_source(path, arguments_address, environment_address, None)
 }
@@ -22963,7 +23251,34 @@ fn linux_rootfs_execve_source(
         serial_write(" ms\r\n");
         write_linux_boot_profile();
     }
-    let Some(plan) = crate::published_rootfs::process_plan(path) else {
+    // Resolve relative paths and `.` and `..` components, as a path walk
+    // would, before looking in the overlay or the published root.
+    let mut absolute = [0_u8; crate::linux_overlay::PATH_CAPACITY + 1];
+    let path = match linux_absolute_exec_path(path, &mut absolute) {
+        Some(length) if domain_exec_slot.is_none() => &absolute[..length],
+        _ => path,
+    };
+    let mut overlay_image = None;
+    if domain_exec_slot.is_none() {
+        match linux_overlay_exec_image(path) {
+            Ok(image) => overlay_image = image,
+            Err(error) => return error,
+        }
+    }
+    let overlay_bytes = overlay_image
+        .as_mut()
+        .map(|(image, size)| &image.bytes_mut()[..*size]);
+    let plan = match overlay_bytes {
+        Some(image) => crate::published_rootfs::process_plan_for_image(image),
+        None => crate::published_rootfs::process_plan(path),
+    };
+    let Some(plan) = plan else {
+        if overlay_bytes.is_some() {
+            serial_write("ginux: Linux exec of runtime file rejected: ");
+            crate::serial_write_bytes(path);
+            serial_write("\r\n");
+            return LINUX_ENOEXEC;
+        }
         use crate::published_rootfs::ProcessPlanFailure;
         let failure = match crate::published_rootfs::process_plan_failure(path) {
             ProcessPlanFailure::RootfsUnavailable => 1,
@@ -22997,9 +23312,28 @@ fn linux_rootfs_execve_source(
             }
             serial_write("\r\n");
         }
-        return LINUX_ENOEXEC;
+        // PATH searches in libc try the next directory only on ENOENT, so a
+        // missing file must not be reported as ENOEXEC.
+        return match crate::published_rootfs::process_plan_failure(path) {
+            ProcessPlanFailure::RootfsUnavailable
+            | ProcessPlanFailure::ExecutableNotFound
+            | ProcessPlanFailure::ScriptInterpreterNotFound(_)
+            | ProcessPlanFailure::DynamicLoaderNotFound(_) => LINUX_ENOENT,
+            ProcessPlanFailure::NotRegularFile
+            | ProcessPlanFailure::NotExecutable
+            | ProcessPlanFailure::ScriptInterpreterNotExecutable(_)
+            | ProcessPlanFailure::DynamicLoaderNotExecutable(_) => LINUX_EACCES,
+            ProcessPlanFailure::UnsupportedExecutable
+            | ProcessPlanFailure::UnsupportedLoadLayout => LINUX_ENOEXEC,
+        };
     };
-    let Some(launch_arguments) = crate::published_rootfs::launch_arguments(path) else {
+    let launch_arguments = match overlay_bytes {
+        Some(image) => Some(crate::published_rootfs::launch_arguments_for_image(
+            path, image,
+        )),
+        None => crate::published_rootfs::launch_arguments(path),
+    };
+    let Some(launch_arguments) = launch_arguments else {
         return LINUX_ENOEXEC;
     };
     let startup = plan.startup();
@@ -23020,172 +23354,44 @@ fn linux_rootfs_execve_source(
         }
         serial_write("\r\n");
     }
-    let (argument_pointers, original_argument_count) = if let Some(slot) = domain_exec_slot {
-        (
-            [0_u64; LINUX_EXEC_VECTOR_LIMIT],
-            usize::from(CONTAINER_EXEC_ARGUMENT_COUNTS[slot].load(Ordering::Acquire)),
-        )
-    } else {
-        match linux_exec_vector(arguments_address, true) {
-            Ok(vector) => vector,
-            Err(error) => return error,
-        }
-    };
-    let Some(argument_count) = launch_arguments
-        .count
-        .checked_add(original_argument_count.saturating_sub(1))
-        .filter(|count| *count <= LINUX_EXEC_VECTOR_LIMIT)
-    else {
-        return LINUX_E2BIG;
-    };
-    let (environment_pointers, environment_count) = if domain_exec_slot.is_some() {
-        ([0_u64; LINUX_EXEC_VECTOR_LIMIT], 0)
-    } else {
-        match linux_exec_vector(environment_address, false) {
-            Ok(vector) => vector,
-            Err(error) => return error,
-        }
-    };
     let stack_page = ELF_PROBE_STACK.load(Ordering::SeqCst) & !(PAGE_SIZE as u64 - 1);
-    let new_stack = stack_page + PAGE_SIZE as u64 - LINUX_EXEC_STACK_SIZE as u64;
-    let mut stack_image = [0_u8; LINUX_EXEC_STACK_SIZE];
-    let table_words =
-        1 + argument_count + 1 + environment_count + 1 + crate::linux_elf::AUXILIARY_VECTOR_WORDS;
-    let mut string_offset = table_words * size_of::<u64>();
-    let string_limit = stack_image.len().saturating_sub(LINUX_PLATFORM.len() + 16);
-    stack_image[..8].copy_from_slice(&(argument_count as u64).to_ne_bytes());
-    let mut execfn_address = 0;
-    for index in 0..argument_count {
-        let length = if index < launch_arguments.count {
-            let value = launch_arguments.values[index];
-            let Some(length) = value.len().checked_add(1) else {
-                return LINUX_E2BIG;
-            };
-            let Some(end) = string_offset
-                .checked_add(length)
-                .filter(|end| *end <= string_limit)
-            else {
-                return LINUX_E2BIG;
-            };
-            let Some(output) = stack_image.get_mut(string_offset..end) else {
-                return LINUX_E2BIG;
-            };
-            output[..value.len()].copy_from_slice(value);
-            output[value.len()] = 0;
-            length
-        } else {
-            let original_index = 1 + index - launch_arguments.count;
-            let Some(remaining) = stack_image.get_mut(string_offset..string_limit) else {
-                return LINUX_E2BIG;
-            };
-            if let Some(slot) = domain_exec_slot {
-                let length = usize::from(
-                    CONTAINER_EXEC_ARGUMENT_SIZES[slot][original_index].load(Ordering::Acquire),
-                );
-                let Some(output) = remaining.get_mut(..length.saturating_add(1)) else {
-                    return LINUX_E2BIG;
-                };
-                for (byte, cell) in output[..length]
-                    .iter_mut()
-                    .zip(CONTAINER_EXEC_ARGUMENTS[slot][original_index].iter())
-                {
-                    *byte = cell.load(Ordering::Acquire);
-                }
-                output[length] = 0;
-                length.saturating_add(1)
-            } else {
-                match copy_linux_c_string(argument_pointers[original_index], remaining) {
-                    Ok(length) => length.saturating_add(1),
-                    Err(LINUX_ENAMETOOLONG) => return LINUX_E2BIG,
-                    Err(error) => return error,
-                }
-            }
-        };
-        let Some(end) = string_offset.checked_add(length) else {
-            return LINUX_E2BIG;
-        };
-        if end > string_limit {
-            return LINUX_E2BIG;
-        }
-        let address = new_stack + string_offset as u64;
-        stack_image[(1 + index) * 8..(2 + index) * 8].copy_from_slice(&address.to_ne_bytes());
-        if index == launch_arguments.execfn {
-            execfn_address = address;
-        }
-        string_offset = end;
-    }
-    if execfn_address == 0 {
-        return LINUX_ENOEXEC;
-    }
-    let environment_word = 1 + argument_count + 1;
-    for (index, pointer) in environment_pointers[..environment_count].iter().enumerate() {
-        let Some(remaining) = stack_image.get_mut(string_offset..string_limit) else {
-            return LINUX_E2BIG;
-        };
-        let length = match copy_linux_c_string(*pointer, remaining) {
-            Ok(length) => length.saturating_add(1),
-            Err(LINUX_ENAMETOOLONG) => return LINUX_E2BIG,
-            Err(error) => return error,
-        };
-        let Some(end) = string_offset.checked_add(length) else {
-            return LINUX_E2BIG;
-        };
-        if end > string_limit {
-            return LINUX_E2BIG;
-        }
-        stack_image[(environment_word + index) * 8..(environment_word + index + 1) * 8]
-            .copy_from_slice(&(new_stack + string_offset as u64).to_ne_bytes());
-        string_offset = end;
-    }
-    let platform_offset = string_offset;
-    let Some(platform_end) = platform_offset.checked_add(LINUX_PLATFORM.len()) else {
-        return LINUX_E2BIG;
-    };
-    let Some(output) = stack_image.get_mut(platform_offset..platform_end) else {
-        return LINUX_E2BIG;
-    };
-    output.copy_from_slice(LINUX_PLATFORM);
-    let Some(random) = linux_startup_random() else {
-        return LINUX_EIO;
-    };
-    let random_offset = platform_end;
-    let Some(random_end) = random_offset.checked_add(random.len()) else {
-        return LINUX_E2BIG;
-    };
-    let Some(output) = stack_image.get_mut(random_offset..random_end) else {
-        return LINUX_E2BIG;
-    };
-    output.copy_from_slice(&random);
-    let auxiliary_word = environment_word + environment_count + 1;
-    for (index, value) in crate::linux_elf::auxiliary_vector(
+    let (mut stack_image, new_stack) = match build_linux_exec_stack_image(
+        &launch_arguments,
+        arguments_address,
+        environment_address,
+        domain_exec_slot,
         startup,
-        execfn_address,
-        new_stack + platform_offset as u64,
-        new_stack + random_offset as u64,
-        crate::linux_elf::VDSO_ADDRESS,
-    )
-    .into_iter()
-    .enumerate()
-    {
-        stack_image[(auxiliary_word + index) * 8..(auxiliary_word + index + 1) * 8]
-            .copy_from_slice(&value.to_ne_bytes());
-    }
+        stack_page + PAGE_SIZE as u64,
+    ) {
+        Ok(image) => image,
+        Err(error) => return error,
+    };
 
     let replacement_count = (0..plan.segment_count()).try_fold(0_usize, |count, index| {
         count.checked_add(plan.segment(index)?.page_count)
     });
     let Some(replacement_count) =
-        replacement_count.filter(|count| (1..=LINUX_ACTIVE_IMAGE_MAPPING_LIMIT).contains(count))
+        replacement_count.filter(|count| (1..=LINUX_EXEC_IMAGE_PAGE_LIMIT).contains(count))
     else {
         serial_write("ginux: Linux exec replacement page count invalid: ");
         serial_write_u64(replacement_count.unwrap_or(0) as u64);
         serial_write("\r\n");
         return LINUX_ENOEXEC;
     };
-    let Some(replacements) = memory::allocate_frame_prefix::<LINUX_ACTIVE_IMAGE_MAPPING_LIMIT>(
-        memory::FrameOwner::KERNEL,
-        replacement_count,
-    ) else {
+    let mut replacement_scratch =
+        LinuxExecScratch::allocate(replacement_count * size_of::<memory::FrameLease>());
+    let Some(replacements) = replacement_scratch
+        .as_mut()
+        .and_then(|scratch| scratch.frame_leases(replacement_count))
+        .and_then(|replacements| {
+            memory::allocate_frame_prefix_into(
+                memory::FrameOwner::KERNEL,
+                replacements,
+                replacement_count,
+            )
+            .then_some(replacements)
+        })
+    else {
         serial_write("ginux: Linux exec frame allocation failed count: ");
         serial_write_u64(replacement_count as u64);
         serial_write("\r\n");
@@ -23381,11 +23587,16 @@ fn linux_rootfs_execve_source(
     let Some(stack_mapping) = linux_process::live_process_mapping(pid, stack_page as usize) else {
         return LINUX_ENOEXEC;
     };
+    // The top page is written through its frame; any part of a larger image
+    // below it goes through the user mapping, which grows the stack on demand.
+    let image = stack_image.bytes();
+    let (lower, top) = image.split_at(image.len().saturating_sub(PAGE_SIZE));
     if !address_space::materialize_linux_exec_stack_frame(
         stack_mapping.frame,
-        PAGE_SIZE - LINUX_EXEC_STACK_SIZE,
-        &stack_image,
-    ) {
+        PAGE_SIZE - top.len(),
+        top,
+    ) || !lower.is_empty() && !copy_to_linux_user(new_stack, lower)
+    {
         serial_write("ginux: Linux exec stack image failed\r\n");
         return LINUX_ENOMEM;
     }
@@ -23405,6 +23616,7 @@ fn linux_rootfs_execve_source(
         Ordering::SeqCst,
     );
     crate::linux_exe::record(LINUX_EXECUTION_INSTANCE.load(Ordering::SeqCst), pid, path);
+    reset_linux_caught_signals_on_exec();
     ELF_PROBE_BRK.store(heap_base as u64, Ordering::SeqCst);
     let Some(main_code) = plan.main_executable() else {
         return LINUX_ENOEXEC;
@@ -23471,6 +23683,285 @@ fn linux_rootfs_execve_source(
     0
 }
 
+/// Returns whether threads other than the caller would survive an exec.
+/// The thread table is shared by a domain's processes, so in the runtime only
+/// threads the current process cloned count; the boot probe keeps the rule
+/// that the caller must be the only thread.
+fn linux_exec_blocked_by_other_threads() -> bool {
+    let current = current_linux_thread_slot();
+    let pid = current_linux_process_pid();
+    let runtime = LINUX_RUNTIME_MODE.load(Ordering::SeqCst);
+    (0..LINUX_THREAD_LIMIT).any(|slot| {
+        Some(slot) != current
+            && LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) != LINUX_THREAD_FREE
+            && (!runtime || LINUX_THREAD_OWNER_PIDS[slot].load(Ordering::SeqCst) == pid)
+    })
+}
+
+/// Writes the absolute, normalized form of exec `path` to `output` and
+/// returns its length.
+fn linux_absolute_exec_path(
+    path: &[u8],
+    output: &mut [u8; crate::linux_overlay::PATH_CAPACITY + 1],
+) -> Option<usize> {
+    let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    let length = linux_canonical_path_at(u64::from(LINUX_AT_FDCWD), path, &mut canonical).ok()?;
+    output[0] = b'/';
+    output[1..=length].copy_from_slice(&canonical[..length]);
+    Some(length + 1)
+}
+
+/// Reads an executable written at runtime into a kernel extent. Returns the
+/// extent and the file size, or `None` when absolute `path` does not name a
+/// file in the overlay.
+fn linux_overlay_exec_image(path: &[u8]) -> Result<Option<(LinuxExecScratch, usize)>, u64> {
+    let Some(metadata) = path
+        .strip_prefix(b"/")
+        .and_then(crate::linux_overlay::lookup)
+    else {
+        return Ok(None);
+    };
+    match metadata.kind {
+        crate::linux_overlay::NodeKind::File => {}
+        crate::linux_overlay::NodeKind::Symlink => return Ok(None),
+        _ => return Err(LINUX_EACCES),
+    }
+    if metadata.mode & 0o111 == 0 {
+        return Err(LINUX_EACCES);
+    }
+    if metadata.size == 0 || metadata.size > LINUX_EXEC_IMAGE_PAGE_LIMIT * PAGE_SIZE {
+        return Err(LINUX_ENOEXEC);
+    }
+    let mut image = LinuxExecScratch::allocate(metadata.size).ok_or(LINUX_ENOMEM)?;
+    if crate::linux_overlay::read(metadata.handle, 0, &mut image.bytes_mut()[..metadata.size])
+        != Some(metadata.size)
+    {
+        return Err(LINUX_EIO);
+    }
+    Ok(Some((image, metadata.size)))
+}
+
+/// A zeroed, kernel-owned extent for exec data too large for the kernel
+/// stack. It is scrubbed and released when dropped.
+struct LinuxExecScratch {
+    first: memory::FrameLease,
+    pages: usize,
+}
+
+impl LinuxExecScratch {
+    fn allocate(bytes: usize) -> Option<Self> {
+        let pages = bytes.div_ceil(PAGE_SIZE).max(1);
+        let (first, _) = memory::allocate_contiguous_extent(memory::FrameOwner::KERNEL, pages)?;
+        Some(Self { first, pages })
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        let length = self.pages * PAGE_SIZE;
+        let Some(address) = paging::direct_map_range_address(self.first.address(), length) else {
+            return &mut [];
+        };
+        // SAFETY: the extent is live, kernel-owned, contiguous, and only
+        // reachable through this value.
+        unsafe { core::slice::from_raw_parts_mut(address as *mut u8, length) }
+    }
+
+    /// Views the start of the extent as `count` frame leases, which are all
+    /// empty while the extent is still zeroed.
+    fn frame_leases(&mut self, count: usize) -> Option<&mut [memory::FrameLease]> {
+        let bytes = self.bytes_mut();
+        if count.checked_mul(size_of::<memory::FrameLease>())? > bytes.len() {
+            return None;
+        }
+        // SAFETY: the page-aligned extent holds `count` leases, a lease is
+        // plain integers, and the borrow of `self` keeps the view unique.
+        Some(unsafe {
+            core::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<memory::FrameLease>(), count)
+        })
+    }
+}
+
+impl Drop for LinuxExecScratch {
+    fn drop(&mut self) {
+        let _ = memory::scrub_and_release_contiguous_extent(
+            memory::FrameOwner::KERNEL,
+            self.first,
+            self.pages,
+        );
+    }
+}
+
+/// The argument, environment and auxiliary-vector block that exec places at
+/// the top of the new stack, staged in kernel frames because the strings are
+/// read from the old image.
+struct LinuxExecStackImage {
+    scratch: LinuxExecScratch,
+    length: usize,
+}
+
+impl LinuxExecStackImage {
+    fn bytes(&mut self) -> &[u8] {
+        let length = self.length;
+        &self.scratch.bytes_mut()[..length]
+    }
+}
+
+/// Builds the initial stack for an exec whose stack ends at `stack_top`, and
+/// returns it with the new stack pointer. Pointer words hold offsets into the
+/// image until its final size, and so its address, is known.
+fn build_linux_exec_stack_image(
+    launch_arguments: &crate::published_rootfs::LaunchArguments<'_>,
+    arguments_address: u64,
+    environment_address: u64,
+    domain_exec_slot: Option<usize>,
+    startup: crate::linux_elf::ProcessStartup,
+    stack_top: u64,
+) -> Result<(LinuxExecStackImage, u64), u64> {
+    let original_argument_count = if let Some(slot) = domain_exec_slot {
+        usize::from(CONTAINER_EXEC_ARGUMENT_COUNTS[slot].load(Ordering::Acquire))
+    } else {
+        linux_exec_vector_length(arguments_address, true)?
+    };
+    let argument_count = launch_arguments
+        .count
+        .checked_add(original_argument_count.saturating_sub(1))
+        .filter(|count| *count <= LINUX_EXEC_ARGUMENT_LIMIT)
+        .ok_or(LINUX_E2BIG)?;
+    let environment_count = if domain_exec_slot.is_some() {
+        0
+    } else {
+        linux_exec_vector_length(environment_address, false)?
+    };
+    let mut image = LinuxExecStackImage {
+        scratch: LinuxExecScratch::allocate(LINUX_EXEC_ARGUMENT_PAGES * PAGE_SIZE)
+            .ok_or(LINUX_ENOMEM)?,
+        length: 0,
+    };
+    let buffer = image.scratch.bytes_mut();
+    let environment_word = 1 + argument_count + 1;
+    let auxiliary_word = environment_word + environment_count + 1;
+    let table_words = auxiliary_word + crate::linux_elf::AUXILIARY_VECTOR_WORDS;
+    let mut cursor = table_words
+        .checked_mul(size_of::<u64>())
+        .filter(|end| *end <= buffer.len())
+        .ok_or(LINUX_E2BIG)?;
+    let write_word = |buffer: &mut [u8], word: usize, value: u64| {
+        buffer[word * 8..(word + 1) * 8].copy_from_slice(&value.to_ne_bytes());
+    };
+    let string_error = |error| {
+        if error == LINUX_ENAMETOOLONG {
+            LINUX_E2BIG
+        } else {
+            error
+        }
+    };
+    write_word(buffer, 0, argument_count as u64);
+    let mut execfn_offset = None;
+    for index in 0..argument_count {
+        let remaining = &mut buffer[cursor..];
+        let length = if index < launch_arguments.count {
+            let value = launch_arguments.values[index];
+            let output = remaining.get_mut(..=value.len()).ok_or(LINUX_E2BIG)?;
+            output[..value.len()].copy_from_slice(value);
+            output[value.len()] = 0;
+            value.len()
+        } else if let Some(slot) = domain_exec_slot {
+            let original_index = 1 + index - launch_arguments.count;
+            let length = usize::from(
+                CONTAINER_EXEC_ARGUMENT_SIZES[slot][original_index].load(Ordering::Acquire),
+            );
+            let output = remaining.get_mut(..=length).ok_or(LINUX_E2BIG)?;
+            for (byte, cell) in output[..length]
+                .iter_mut()
+                .zip(CONTAINER_EXEC_ARGUMENTS[slot][original_index].iter())
+            {
+                *byte = cell.load(Ordering::Acquire);
+            }
+            output[length] = 0;
+            length
+        } else {
+            let original_index = 1 + index - launch_arguments.count;
+            let pointer = linux_exec_vector_entry(arguments_address, original_index)?;
+            copy_linux_c_string(pointer, remaining).map_err(string_error)?
+        };
+        if index == launch_arguments.execfn {
+            execfn_offset = Some(cursor);
+        }
+        write_word(buffer, 1 + index, cursor as u64);
+        cursor += length + 1;
+    }
+    let execfn_offset = execfn_offset.ok_or(LINUX_ENOEXEC)?;
+    for index in 0..environment_count {
+        let pointer = linux_exec_vector_entry(environment_address, index)?;
+        let length = copy_linux_c_string(pointer, &mut buffer[cursor..]).map_err(string_error)?;
+        write_word(buffer, environment_word + index, cursor as u64);
+        cursor += length + 1;
+    }
+    let platform_offset = cursor;
+    buffer
+        .get_mut(platform_offset..platform_offset + LINUX_PLATFORM.len())
+        .ok_or(LINUX_E2BIG)?
+        .copy_from_slice(LINUX_PLATFORM);
+    let random = linux_startup_random().ok_or(LINUX_EIO)?;
+    let random_offset = platform_offset + LINUX_PLATFORM.len();
+    buffer
+        .get_mut(random_offset..random_offset + random.len())
+        .ok_or(LINUX_E2BIG)?
+        .copy_from_slice(&random);
+    let length = (random_offset + random.len())
+        .max(LINUX_EXEC_STACK_SIZE)
+        .next_multiple_of(16);
+    if length > buffer.len() {
+        return Err(LINUX_E2BIG);
+    }
+    let new_stack = stack_top - length as u64;
+    for word in (1..=argument_count).chain(environment_word..environment_word + environment_count) {
+        let offset = u64::from_ne_bytes(
+            buffer[word * 8..(word + 1) * 8]
+                .try_into()
+                .map_err(|_| LINUX_EFAULT)?,
+        );
+        write_word(buffer, word, new_stack + offset);
+    }
+    for (index, value) in crate::linux_elf::auxiliary_vector(
+        startup,
+        new_stack + execfn_offset as u64,
+        new_stack + platform_offset as u64,
+        new_stack + random_offset as u64,
+        crate::linux_elf::VDSO_ADDRESS,
+    )
+    .into_iter()
+    .enumerate()
+    {
+        write_word(buffer, auxiliary_word + index, value);
+    }
+    image.length = length;
+    Ok((image, new_stack))
+}
+
+/// Counts the entries of a NULL-terminated user pointer vector.
+fn linux_exec_vector_length(address: u64, require_nonempty: bool) -> Result<usize, u64> {
+    for index in 0..=LINUX_EXEC_ARGUMENT_LIMIT {
+        if linux_exec_vector_entry(address, index)? == 0 {
+            if require_nonempty && index == 0 {
+                return Err(LINUX_E2BIG);
+            }
+            return Ok(index);
+        }
+    }
+    Err(LINUX_E2BIG)
+}
+
+fn linux_exec_vector_entry(address: u64, index: usize) -> Result<u64, u64> {
+    let pointer_address = address
+        .checked_add((index * size_of::<u64>()) as u64)
+        .ok_or(LINUX_EFAULT)?;
+    let mut bytes = [0_u8; size_of::<u64>()];
+    if !copy_from_linux_user(pointer_address, &mut bytes) {
+        return Err(LINUX_EFAULT);
+    }
+    Ok(u64::from_ne_bytes(bytes))
+}
+
 fn linux_execve_at(
     directory: u64,
     path_address: u64,
@@ -23479,11 +23970,7 @@ fn linux_execve_at(
     allow_empty_path: bool,
 ) -> u64 {
     if current_linux_tid() != Some(current_linux_process_pid())
-        || LINUX_THREAD_STATES
-            .iter()
-            .filter(|state| state.load(Ordering::SeqCst) != LINUX_THREAD_FREE)
-            .count()
-            != 1
+        || linux_exec_blocked_by_other_threads()
     {
         if LINUX_RUNTIME_MODE.load(Ordering::SeqCst) && current_linux_process_pid() != 1 {
             serial_write("ginux: Linux child exec precondition rejected\r\n");
@@ -29782,6 +30269,11 @@ fn linux_poll_wait_live_return(
         let deadline = duration.and_then(|duration| {
             linux_elapsed_nanoseconds().and_then(|now| now.checked_add(duration))
         });
+        let poll_syscall = if wait_kind == LINUX_THREAD_WAIT_PPOLL {
+            LINUX_PPOLL_SYSCALL
+        } else {
+            LINUX_POLL_SYSCALL
+        };
         loop {
             ready = 0;
             for pollfd in active.as_chunks_mut::<8>().0 {
@@ -29806,6 +30298,18 @@ fn linux_poll_wait_live_return(
                 } else {
                     LINUX_EFAULT
                 };
+            }
+            // Let another thread of this process run while this one
+            // blocks below. Without one, another process, such as a spawned
+            // child writing to a pipe, may be the only one that can make a
+            // descriptor ready.
+            if ready_linux_thread_handle().is_some() {
+                break;
+            }
+            if let Some(LinuxBlockedWait::Return(result)) =
+                run_other_linux_processes(output, caller, poll_syscall)
+            {
+                return result;
             }
             core::hint::spin_loop();
         }
@@ -31833,6 +32337,7 @@ fn run_scheduled_linux_process(parent_pid: u32, target_pid: Option<u32>) -> bool
     let Some(selected) = selected else {
         return false;
     };
+    restore_linux_process_current_thread(selected.pid);
     if selected.pid == parent_pid
         || !restore_saved_linux_process_runtime_state(selected.pid)
         || !restore_linux_process_extended_state(selected.pid)
@@ -31918,9 +32423,13 @@ fn run_scheduled_linux_process(parent_pid: u32, target_pid: Option<u32>) -> bool
         parent.is_some_and(|dispatch| dispatch.pid == parent_pid)
     };
     LINUX_CURRENT_PROCESS_PID.store(parent_pid, Ordering::SeqCst);
+    restore_linux_process_current_thread(parent_pid);
     let restored = restore_saved_linux_process_runtime_state(parent_pid)
-        && restore_linux_process_extended_state(parent_pid)
-        && returned;
+        && restore_linux_process_extended_state(parent_pid);
+    if exit.is_some() {
+        retire_linux_process_threads(selected.pid);
+    }
+    let restored = restored && returned;
     linux_boot_profile_lifecycle_phase(6, profile_started);
     restored
 }
@@ -33300,7 +33809,10 @@ fn linux_descriptor_readv(descriptor: u64, vectors: u64, count: u64) -> u64 {
         return result;
     }
     let device = linux_device_descriptor(descriptor);
-    if linux_overlay_descriptor_handle(descriptor).is_some() || linux_tmp_file(device) {
+    if linux_overlay_descriptor_handle(descriptor).is_some()
+        || linux_rootfs_entry(descriptor).is_some()
+        || linux_tmp_file(device)
+    {
         let (ranges, vector_count) = match linux_socket_iov_ranges(vectors, count, true) {
             Ok(ranges) => ranges,
             Err(error) => return error,
@@ -33348,18 +33860,15 @@ fn linux_descriptor_readv(descriptor: u64, vectors: u64, count: u64) -> u64 {
         let Ok(length) = usize::try_from(length) else {
             return LINUX_EINVAL;
         };
-        let Some(next_total) = total.checked_add(length) else {
+        // Linux accepts empty vectors, and musl's stdio relies on them.
+        let Some(next_total) = total
+            .checked_add(length)
+            .filter(|total| *total <= isize::MAX as usize)
+        else {
             return LINUX_EINVAL;
         };
-        if length == 0
-            || next_total > LINUX_WRITE_LIMIT
-            || !linux_writable_user_range_contains(address, length)
-        {
-            return if length != 0 && next_total <= LINUX_WRITE_LIMIT {
-                LINUX_EFAULT
-            } else {
-                LINUX_EINVAL
-            };
+        if length != 0 && !linux_writable_user_range_contains(address, length) {
+            return LINUX_EFAULT;
         }
         ranges[index] = (address, length);
         total = next_total;
@@ -33386,11 +33895,13 @@ fn linux_descriptor_readv(descriptor: u64, vectors: u64, count: u64) -> u64 {
         let returned = file.len().saturating_sub(start).min(total);
         let mut copied = 0;
         for (address, length) in ranges[..vector_count].iter().copied() {
-            let length = length.min(returned - copied);
-            if length == 0 {
+            if copied == returned {
                 break;
             }
-            if !copy_to_linux_user(address, &file[start + copied..start + copied + length]) {
+            let length = length.min(returned - copied);
+            if length != 0
+                && !copy_to_linux_user(address, &file[start + copied..start + copied + length])
+            {
                 return LINUX_EFAULT;
             }
             copied += length;
@@ -33403,8 +33914,11 @@ fn linux_descriptor_readv(descriptor: u64, vectors: u64, count: u64) -> u64 {
     }
     let zeros = [0_u8; LINUX_WRITE_LIMIT];
     for (address, length) in ranges[..vector_count].iter().copied() {
-        if !copy_to_linux_user(address, &zeros[..length]) {
-            return LINUX_EFAULT;
+        for offset in (0..length).step_by(LINUX_WRITE_LIMIT) {
+            let chunk = (length - offset).min(LINUX_WRITE_LIMIT);
+            if !copy_to_linux_user(address + offset as u64, &zeros[..chunk]) {
+                return LINUX_EFAULT;
+            }
         }
     }
     total as u64
