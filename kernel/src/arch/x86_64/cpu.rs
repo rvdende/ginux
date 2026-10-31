@@ -13389,6 +13389,27 @@ struct LinuxPreemptedContext {
     rip: u64,
     rsp: u64,
     rflags: u64,
+    /// Interrupted to take a signal rather than to give up the CPU.
+    signal: bool,
+}
+
+/// Ticks between looks at the signal queues of a process running user code;
+/// the pending set and the real timer are checked on every tick.
+const LINUX_SIGNAL_QUEUE_CHECK_TICKS: u32 = 10;
+
+/// Whether the process running user code has a signal to take: its real
+/// timer has expired, or a signal it does not block is pending. Linux
+/// delivers it on return from the interrupt; the process may never make
+/// another system call (a busy loop waiting for SIGALRM, or one to stop with
+/// SIGINT).
+fn linux_signal_due_from_timer(check_queues: bool) -> bool {
+    let deadline = X86_RUNTIME
+        .ELF_PROBE_REAL_TIMER_DEADLINE
+        .load(Ordering::SeqCst);
+    let requested = !X86_RUNTIME.ELF_PROBE_SIGNAL_MASK.load(Ordering::SeqCst);
+    deadline != 0 && linux_elapsed_nanoseconds().is_some_and(|now| now >= deadline)
+        || X86_RUNTIME.ELF_PROBE_PENDING_SIGNALS.load(Ordering::SeqCst) & requested != 0
+        || check_queues && linux_peek_dynamic_signal(requested).is_some()
 }
 
 static LINUX_PREEMPTED_CONTEXT: crate::sync::IrqSpinLock<Option<LinuxPreemptedContext>> =
@@ -13412,7 +13433,10 @@ fn linux_preempt_process_from_timer(frame: &mut UserInterruptFrame) {
     let Some(mut context) = frame.user_context(USER_CODE_SELECTOR, USER_DATA_SELECTOR) else {
         return;
     };
-    if LINUX_PROCESS_SLICE.fetch_add(1, Ordering::SeqCst) + 1 < LINUX_PROCESS_SLICE_TICKS {
+    let ticks = LINUX_PROCESS_SLICE.fetch_add(1, Ordering::SeqCst) + 1;
+    let signal_due = !X86_RUNTIME.LINUX_SIGNAL_ACTIVE.load(Ordering::SeqCst)
+        && linux_signal_due_from_timer(ticks.is_multiple_of(LINUX_SIGNAL_QUEUE_CHECK_TICKS));
+    if ticks < LINUX_PROCESS_SLICE_TICKS && !signal_due {
         return;
     }
     let pid = current_linux_process_pid();
@@ -13432,7 +13456,10 @@ fn linux_preempt_process_from_timer(frame: &mut UserInterruptFrame) {
         == pid;
     let yieldable =
         (nesting != 0 || transaction_child) && !linux_process::live_process_shares_parent_vm(pid);
-    if pid == 1 || !yieldable || remote || signal || (entry..entry + 9).contains(&context.rip) {
+    if remote
+        || (entry..entry + 9).contains(&context.rip)
+        || !signal_due && (pid == 1 || !yieldable || signal)
+    {
         return;
     }
     let preempted = LinuxPreemptedContext {
@@ -13457,11 +13484,14 @@ fn linux_preempt_process_from_timer(frame: &mut UserInterruptFrame) {
         rip: context.rip,
         rsp: context.rsp,
         rflags: context.rflags,
+        signal: signal_due,
     };
     context.rip = entry;
     if frame.restore_user_context(context, USER_CODE_SELECTOR, USER_DATA_SELECTOR) {
         *LINUX_PREEMPTED_CONTEXT.lock() = Some(preempted);
-        LINUX_PROCESS_SLICE.store(0, Ordering::SeqCst);
+        if !signal_due {
+            LINUX_PROCESS_SLICE.store(0, Ordering::SeqCst);
+        }
     }
 }
 
@@ -13480,6 +13510,9 @@ fn linux_complete_timer_preemption(output: *mut LinuxSyscallFrame, user_rip: u64
         pending.filter(|preempted| preempted.pid == pid)?;
         pending.take()?
     };
+    if preempted.signal {
+        return Some(linux_deliver_signal_to_interrupted(output, &preempted));
+    }
     let recorded = live_runtime_linux_process_address_space_snapshot().is_some_and(|snapshot| {
         linux_process::refresh_validated_runtime_process_registry(
             pid,
@@ -13518,6 +13551,56 @@ fn linux_complete_timer_preemption(output: *mut LinuxSyscallFrame, user_rip: u64
         .LINUX_PROCESS_LAST_BLOCKED_PID
         .store(pid, Ordering::SeqCst);
     Some(LINUX_RETURN_TO_KERNEL)
+}
+
+/// Delivers the pending signal to a process the timer interrupted in user
+/// code, with exactly the interrupted registers in its signal frame (rcx and
+/// r11 are live there, not clobbered as by a system call); with nothing to
+/// deliver after all, the process carries on where it was.
+fn linux_deliver_signal_to_interrupted(
+    output: *mut LinuxSyscallFrame,
+    preempted: &LinuxPreemptedContext,
+) -> u64 {
+    let general = preempted.general;
+    let _ = refresh_linux_real_timer();
+    let interrupted = LinuxUserContext {
+        registers: LinuxSyscallFrame {
+            r15: general[14],
+            r14: general[13],
+            r13: general[12],
+            r12: general[11],
+            rbp: general[6],
+            rbx: general[1],
+            r10: general[9],
+            r9: general[8],
+            r8: general[7],
+            rdx: general[3],
+            rsi: general[4],
+            rdi: general[5],
+        },
+        rip: preempted.rip,
+        rsp: preempted.rsp,
+        rflags: preempted.rflags,
+        rax: general[0],
+        fs_base: active_fs_base(),
+    };
+    let delivered = linux_deliver_pending_signal(output, interrupted, (general[2], general[10]));
+    // A handler is entered through the frame the call returns with (and the
+    // signal is then active); other results end or stop the process.
+    if delivered != 0 || X86_RUNTIME.LINUX_SIGNAL_ACTIVE.load(Ordering::SeqCst) {
+        return delivered;
+    }
+    if write_linux_exact_live_return(
+        output,
+        general,
+        preempted.rip,
+        preempted.rsp,
+        preempted.rflags,
+    ) {
+        LINUX_RETURN_FROM_IRET
+    } else {
+        LINUX_EINVAL
+    }
 }
 
 /// Returns from the current system call to `rip` with exactly the registers
