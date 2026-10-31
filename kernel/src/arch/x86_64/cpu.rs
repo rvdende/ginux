@@ -15057,7 +15057,12 @@ fn linux_runtime_brk(requested: u64) -> u64 {
     }
     let initial_limit = ELF_PROBE_BRK_LIMIT.load(Ordering::SeqCst);
     let base = initial_limit.saturating_sub((LINUX_RUNTIME_HEAP_PAGES * PAGE_SIZE) as u64);
-    if requested < base || requested >= LINUX_RUNTIME_DYNAMIC_MMAP_BASE {
+    // The main thread's stack grows down to just above the initial limit,
+    // into pages it has not touched yet. A break beyond the limit reserved
+    // those pages for the heap, and the stack later grew over them, so malloc
+    // metadata and stack frames shared memory. Allocators fall back to mmap
+    // when the break cannot grow.
+    if requested < base || requested > initial_limit {
         return current;
     }
     let (Some(old_end), Some(new_end)) = (linux_page_ceil(current), linux_page_ceil(requested))
@@ -23953,11 +23958,15 @@ fn linux_rootfs_execve_source(
     let _ = set_current_linux_robust_list(0);
     // Drop the old program's mmap area; the new image's own pages are kept.
     // The high image window is left alone: releasing it from a vfork child
-    // of a high-loaded program unmapped that program's own code.
+    // of a high-loaded program unmapped that program's own code. A vfork
+    // child's pages are all its parent's, so it frees none of them, even
+    // ones the parent's registry no longer lists.
+    let shares_parent_vm = linux_process::live_process_shares_parent_vm(pid);
     if !address_space::release_current_linux_runtime_mappings_preserving(
         LINUX_RUNTIME_DYNAMIC_MMAP_BASE,
         |frame| {
-            crate::linux_file_cache::contains(frame)
+            shares_parent_vm
+                || crate::linux_file_cache::contains(frame)
                 || if prepared_frame_references {
                     linux_process::prepared_live_frame_referenced_by_other_process(frame)
                 } else {

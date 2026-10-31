@@ -422,6 +422,9 @@ struct Process {
     scheduler_thread: Option<scheduler::ProcessThreadHandle>,
     state: ProcessState,
     wait_event: Option<ProcessWaitEvent>,
+    /// A CLONE_VM child that has not executed yet: every page it maps is
+    /// its parent's.
+    shares_parent_vm: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -899,6 +902,9 @@ impl ProcessTable {
             if attachments_inherited
                 && self.commit_fork_inner(handle, child_space, parent_context.fork_child(), false)
             {
+                if let Some(child) = self.process_mut(handle) {
+                    child.shares_parent_vm = share_vm;
+                }
                 LIVE_FORK_EXECUTION_STAGE.store(1139, Ordering::Release);
                 return true;
             }
@@ -1338,6 +1344,7 @@ impl ProcessTable {
             scheduler_thread: None,
             state,
             wait_event: None,
+            shares_parent_vm: false,
         });
         Some(handle)
     }
@@ -1461,6 +1468,7 @@ impl ProcessTable {
         }
         process.context = Some(context);
         process.executed = true;
+        process.shares_parent_vm = false;
         true
     }
 
@@ -2509,6 +2517,17 @@ pub(crate) fn mark_live_process_address_space_stale(pid: u32) -> bool {
     };
     space.stale = true;
     true
+}
+
+/// Whether `pid` is a CLONE_VM child that has not executed yet, whose
+/// pages all belong to its parent.
+pub(crate) fn live_process_shares_parent_vm(pid: u32) -> bool {
+    live_process_table_mut().is_some_and(|table| {
+        table
+            .handle_by_pid(pid)
+            .and_then(|handle| table.process(handle))
+            .is_some_and(|process| process.shares_parent_vm)
+    })
 }
 
 pub(crate) fn live_mapping_referenced_by_other_process(
