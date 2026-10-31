@@ -1865,6 +1865,13 @@ static DOMAIN_PERSONALITIES: [[AtomicU8; control_abi::DOMAIN_MAX_PERSONALITY_SIZ
 static CONTAINER_SELECTED_SLOT: AtomicU8 = AtomicU8::new(CONTAINER_SLOT_NONE);
 static CONTAINER_ACTIVE_SLOT: AtomicU8 = AtomicU8::new(CONTAINER_SLOT_NONE);
 static CONTAINER_RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Detached starts waiting behind another domain's start, which holds the
+/// single selected-slot lifecycle request until the controller goes idle.
+static CONTAINER_START_PENDING: [AtomicBool; control_abi::DOMAIN_LIMIT] =
+    [const { AtomicBool::new(false) }; control_abi::DOMAIN_LIMIT];
+/// The background domain resumed last, where the round-robin search for
+/// the next one starts.
+static CONTAINER_LAST_RESUMED_SLOT: AtomicU8 = AtomicU8::new(0);
 static CONTAINER_HOST_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 static CONTAINER_MANAGEMENT_ENABLED: AtomicBool = AtomicBool::new(false);
 static LINUX_ABI_TEST_RESULTS: AtomicU64 = AtomicU64::new(0);
@@ -1897,6 +1904,8 @@ static LINUX_RUNTIME_SUSPEND_REQUESTED: BankedAtomicBool = BankedAtomicBool::new
 static LINUX_RUNTIME_BACKGROUND_YIELD_REQUESTED: BankedAtomicBool = BankedAtomicBool::new(false);
 static LINUX_RUNTIME_BACKGROUND_SUSPENDED: BankedAtomicBool = BankedAtomicBool::new(false);
 static LINUX_RUNTIME_BACKGROUND_TICKS: BankedAtomicU32 = BankedAtomicU32::new(0);
+/// Background checks since a detached domain last gave other domains a turn.
+static LINUX_RUNTIME_BACKGROUND_QUANTA: AtomicU32 = AtomicU32::new(0);
 static LINUX_RUNTIME_SUSPENDED: BankedAtomicBool = BankedAtomicBool::new(false);
 static LINUX_RUNTIME_SUSPEND_ADDRESS: BankedAtomicU64 = BankedAtomicU64::new(0);
 static LINUX_RUNTIME_SUSPEND_COUNT: BankedAtomicU64 = BankedAtomicU64::new(0);
@@ -40609,7 +40618,13 @@ pub(crate) fn expire_linux_waits_from_timer(frame: &mut UserInterruptFrame) {
         && LINUX_RUNTIME_BACKGROUND_TICKS.fetch_add(1, Ordering::AcqRel) + 1 >= 5
     {
         LINUX_RUNTIME_BACKGROUND_TICKS.store(0, Ordering::Release);
-        if crate::serial_input_ready() {
+        // Other detached domains get a turn about every 100 ms.
+        let turn_over = active_container_slot().is_some_and(other_background_work_waiting)
+            && LINUX_RUNTIME_BACKGROUND_QUANTA.fetch_add(1, Ordering::AcqRel) + 1 >= 20;
+        if turn_over {
+            LINUX_RUNTIME_BACKGROUND_QUANTA.store(0, Ordering::Release);
+        }
+        if crate::serial_input_ready() || turn_over {
             LINUX_RUNTIME_BACKGROUND_YIELD_REQUESTED.store(true, Ordering::Release);
         }
     }
@@ -44354,6 +44369,27 @@ fn container_control(domain_id: u64, capability: u64, frame: *mut UserTrapFrame)
         {
             let slot = requested_slot.unwrap_or(0);
             let embedded = container_image_is_embedded(slot);
+            // Another detached start still holds the lifecycle request until
+            // the controller goes idle; queue this one behind it.
+            if operation == control_abi::DOMAIN_RESTART
+                && selected_container_slot().is_some_and(|selected| selected != slot)
+                && (CONTAINER_PULL_REQUESTED.load(Ordering::Acquire)
+                    || CONTAINER_INSTALL_REQUESTED.load(Ordering::Acquire)
+                    || CONTAINER_RESTART_REQUESTED.load(Ordering::Acquire))
+            {
+                reset_container_console(slot, false);
+                if !embedded {
+                    CONTAINER_CONTROL_STATES[slot]
+                        .store(control_abi::DOMAIN_STATE_STARTING as u8, Ordering::Release);
+                }
+                CONTAINER_START_PENDING[slot].store(true, Ordering::Release);
+                return if embedded {
+                    control_abi::DOMAIN_STATE_STOPPED
+                } else {
+                    control_abi::DOMAIN_STATE_STARTING
+                };
+            }
+            CONTAINER_START_PENDING[slot].store(false, Ordering::Release);
             CONTAINER_SELECTED_SLOT.store(slot as u8, Ordering::SeqCst);
             reset_container_console(slot, operation == control_abi::DOMAIN_START_ATTACHED);
             if !embedded {
@@ -44593,18 +44629,48 @@ fn queue_background_container_work() -> bool {
     {
         return true;
     }
-    let Some(slot) = (0..control_abi::DOMAIN_LIMIT).find(|slot| {
-        matches!(
-            container_state(*slot),
-            control_abi::DOMAIN_STATE_BOOTING | control_abi::DOMAIN_STATE_RUNNING
-        ) && CONTAINER_BACKGROUND_SUSPENDED[*slot].load(Ordering::Acquire)
-            && address_space::linux_runtime_is_suspended(*slot)
-    }) else {
+    // Start the next queued detached domain.
+    if let Some(slot) = (0..control_abi::DOMAIN_LIMIT)
+        .find(|slot| CONTAINER_START_PENDING[*slot].swap(false, Ordering::AcqRel))
+    {
+        CONTAINER_SELECTED_SLOT.store(slot as u8, Ordering::Release);
+        if container_image_is_embedded(slot) || crate::published_rootfs::is_installed(slot) {
+            CONTAINER_RESTART_REQUESTED.store(true, Ordering::Release);
+        } else {
+            CONTAINER_PULL_REQUESTED.store(true, Ordering::Release);
+        }
+        return true;
+    }
+    // Otherwise resume the suspended background domains in turn.
+    let start = usize::from(CONTAINER_LAST_RESUMED_SLOT.load(Ordering::Acquire)) + 1;
+    let Some(slot) = (start..start + control_abi::DOMAIN_LIMIT)
+        .map(|slot| slot % control_abi::DOMAIN_LIMIT)
+        .find(|slot| background_container_resumable(*slot))
+    else {
         return false;
     };
+    CONTAINER_LAST_RESUMED_SLOT.store(slot as u8, Ordering::Release);
     CONTAINER_SELECTED_SLOT.store(slot as u8, Ordering::Release);
     CONTAINER_RESTART_REQUESTED.store(true, Ordering::Release);
     true
+}
+
+fn background_container_resumable(slot: usize) -> bool {
+    matches!(
+        container_state(slot),
+        control_abi::DOMAIN_STATE_BOOTING | control_abi::DOMAIN_STATE_RUNNING
+    ) && CONTAINER_BACKGROUND_SUSPENDED[slot].load(Ordering::Acquire)
+        && address_space::linux_runtime_is_suspended(slot)
+}
+
+/// Whether a domain other than `running` has background work waiting: a
+/// queued start or a suspended domain to resume.
+fn other_background_work_waiting(running: usize) -> bool {
+    CONTAINER_START_PENDING
+        .iter()
+        .any(|pending| pending.load(Ordering::Acquire))
+        || (0..control_abi::DOMAIN_LIMIT)
+            .any(|slot| slot != running && background_container_resumable(slot))
 }
 
 fn next_container_cursor(cursor: usize) -> u64 {

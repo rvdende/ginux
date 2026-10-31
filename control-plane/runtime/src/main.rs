@@ -553,11 +553,12 @@ extern "C" fn ginux_controller_main() -> ! {
         write(console, b"eth0: automatic DHCP configuration\r\n");
         set_dhcp_network(console, network);
     }
+    let mut states = DomainStates::new();
     loop {
+        // Changes the last command made were reported by the command itself.
+        states.refresh(host, None);
         write(console, b"ginux> ");
-        let mut background = NativeDomainRequestV3::zeroed();
-        let _ = domain_call(host, NATIVE_DOMAIN_POLL_BACKGROUND, &mut background);
-        let length = read_line(console, &mut line);
+        let length = read_line(console, host, &mut states, &mut line);
         let Some(command) = line.get(..length) else {
             exit(NATIVE_SERVICE_EXIT_REJECTED);
         };
@@ -644,9 +645,26 @@ extern "C" fn ginux_controller_main() -> ! {
     }
 }
 
-fn read_line(console: u64, line: &mut [u8; MAX_LINE]) -> usize {
+fn read_line(
+    console: u64,
+    host: u64,
+    states: &mut DomainStates,
+    line: &mut [u8; MAX_LINE],
+) -> usize {
     let mut length = 0;
     loop {
+        // While the operator is idle, detached domains pull their images and
+        // run. Report what changed, then redraw the prompt and the input.
+        let mut background = NativeDomainRequestV3::zeroed();
+        if domain_call(host, NATIVE_DOMAIN_POLL_BACKGROUND, &mut background) == 1 {
+            if states.refresh(host, Some(console)) {
+                write(console, b"ginux> ");
+                if length != 0 {
+                    write(console, &line[..length]);
+                }
+            }
+            continue;
+        }
         let byte = read_console_byte(console);
         match byte {
             b'\r' | b'\n' => {
@@ -672,6 +690,70 @@ fn read_line(console: u64, line: &mut [u8; MAX_LINE]) -> usize {
             }
             _ => {}
         }
+    }
+}
+
+/// The last state seen for each domain, so the controller can report what
+/// changes while detached domains run in the background.
+struct DomainStates {
+    entries: [([u8; NATIVE_DOMAIN_MAX_NAME_SIZE], usize, u64); NATIVE_DOMAIN_LIMIT],
+    count: usize,
+}
+
+impl DomainStates {
+    const fn new() -> Self {
+        Self {
+            entries: [([0; NATIVE_DOMAIN_MAX_NAME_SIZE], 0, 0); NATIVE_DOMAIN_LIMIT],
+            count: 0,
+        }
+    }
+
+    /// Re-reads every domain's state. With a console, reports each domain
+    /// that became running, stopped or failed since the last refresh, and
+    /// returns whether anything was written.
+    fn refresh(&mut self, host: u64, console: Option<u64>) -> bool {
+        let previous = self.entries;
+        let previous_count = self.count;
+        self.count = 0;
+        let mut reported = false;
+        let mut cursor = 0;
+        while let Some((state, request)) = next_domain(host, cursor) {
+            let name = request_name(&request);
+            let length = name.len().min(NATIVE_DOMAIN_MAX_NAME_SIZE);
+            let changed = previous[..previous_count]
+                .iter()
+                .find(|(other, other_length, _)| other[..*other_length] == name[..length])
+                .is_some_and(|(_, _, old)| *old != state);
+            if let Some(console) = console.filter(|_| {
+                changed
+                    && matches!(
+                        state,
+                        NATIVE_DOMAIN_STATE_RUNNING
+                            | NATIVE_DOMAIN_STATE_STOPPED
+                            | NATIVE_DOMAIN_STATE_FAILED
+                    )
+            }) {
+                if !reported {
+                    write(console, b"\r\n");
+                }
+                reported = true;
+                write(console, &name[..length]);
+                write(console, b": ");
+                write(console, domain_state_name(state));
+                write(console, b"\r\n");
+            }
+            if let Some(entry) = self.entries.get_mut(self.count) {
+                entry.0[..length].copy_from_slice(&name[..length]);
+                entry.1 = length;
+                entry.2 = state;
+                self.count += 1;
+            }
+            if request.value == NATIVE_DOMAIN_CURSOR_END || request.value <= cursor {
+                break;
+            }
+            cursor = request.value;
+        }
+        reported
     }
 }
 

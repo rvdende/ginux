@@ -69,19 +69,22 @@ dd if=/dev/zero of="$volume_image" bs=1048576 count=1 2>/dev/null
         'domain new alpine' \
         'domain set alpine image=alpine:latest init=/bin/sh' \
         'domain start alpine'
-    wait_for 'alpine: running (detached)'
+    # A detached start returns while the image is pulled in the background.
+    wait_for 'alpine: starting (detached)'
     printf '%s\n' \
         'domain new alpine2' \
         'domain set alpine2 image=alpine:latest init=/bin/sh' \
         'domain start alpine2'
-    wait_for 'alpine2: running (detached)'
+    wait_for 'alpine2: starting (detached)'
     printf '%s\n' \
         'domain new rocky' \
         'domain set rocky image=rockylinux/rockylinux:10 init=/usr/bin/true' \
         'domain start rocky'
-    wait_for_count 'ginux: OCI image ready' 3 240
-    wait_for_count 'ginux: entering configured Linux init' 3 30
-    wait_for 'rocky: stopped'
+    # Background domains pull and boot quietly; the controller reports
+    # each one's state as it changes.
+    wait_for 'alpine: running' 240
+    wait_for 'alpine2: running' 240
+    wait_for 'rocky: stopped' 240
     printf '%s\n' 'domain list' 'ps'
     wait_for 'alpine          running     linux'
     wait_for 'alpine2         running     linux'
