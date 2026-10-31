@@ -64,14 +64,17 @@ through a Linux ABI personality. It is not a rewrite of Linux:
   `PATH=/usr/share/code/resources/app/node_modules.asar.unpacked/@vscode/ripgrep-universal/bin/linux-x64:$PATH`.
 - Key suites: `make check`, `make userland-check`, `make test-alpine`,
   `tests/qemu/rust-workloads.sh` (cargo builds serde inside Ginux),
-  `make test-rust-userland`, `make test-desktop`, `make test-boot-media`,
+  `make test-rust-userland`, `make test-desktop`,
+  `make test-desktop-virtio-gpu`, `make test-boot-media`,
   `make test-hardware-profile`.
 - `tools/qemu/run.sh` boots whatever is in the ESP directory and does not
   build. `make build ESP_DIR=dir` with `GINUX_ESP_DIR=dir` keeps a separate
   image so a running VM's `build/esp` is not rewritten under it.
 - run.sh switches: `GINUX_QEMU_MONITOR=sock` (HMP monitor: `screendump`,
   `sendkey`, `info registers`), `GINUX_QEMU_DISPLAY=gtk`,
-  `GINUX_QEMU_USB_INPUT=1`, `GINUX_QEMU_LOG=file` (pauses instead of exiting
+  `GINUX_QEMU_USB_INPUT=1`, `GINUX_QEMU_GPU=virtio` (virtio-gpu, no VGA;
+  `virtio-vga` keeps a VGA framebuffer for the firmware) with
+  `GINUX_QEMU_GPU_SIZE=WxH` (docs/GRAPHICS.md), `GINUX_QEMU_LOG=file` (pauses instead of exiting
   on a guest reset), `GINUX_QEMU_LOG_INTERRUPTS=1` with `QEMU_ACCEL=tcg`
   (logs every exception: finds triple faults).
 

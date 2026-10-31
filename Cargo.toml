@@ -11,6 +11,7 @@ members = [
     "crates/runtime-memory",
     "crates/usb-audio",
     "crates/usb-hid",
+    "crates/virtio-gpu",
     "crates/volume-format",
     "crates/volume-service",
     "kernel",

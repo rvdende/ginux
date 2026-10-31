@@ -8,6 +8,11 @@
 # through xHCI, evdev and the compositor to the terminal's shell, which
 # must echo a marker to the serial console, and a QEMU screendump of the
 # real framebuffer must show the compositor's title bar and the terminal.
+#
+# With GINUX_QEMU_GPU=virtio (make test-desktop-virtio-gpu) the machine has
+# no VGA at all, only a virtio-gpu: Ginux must drive it as the display, in
+# the mode the host reports (GINUX_QEMU_GPU_SIZE), and the screendump of its
+# scanout shows only what the driver flushed from /dev/fb0.
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "$0")/../.." && pwd)
@@ -16,6 +21,11 @@ output_file="$work_dir/serial.log"
 volume_image="$work_dir/volume.raw"
 qemu_pid_file="$work_dir/qemu.pid"
 screenshot="$work_dir/screen.ppm"
+gpu="${GINUX_QEMU_GPU:-std}"
+artifact="wayland-desktop"
+if [[ "$gpu" != std ]]; then
+    artifact+="-$gpu"
+fi
 # Unix socket paths are limited to 108 bytes, so the monitor lives in target/.
 monitor="$repo_root/target/desktop-monitor.$$"
 qemu_pid=""
@@ -36,8 +46,8 @@ cleanup() {
         kill "$qemu_pid" 2>/dev/null || true
         wait "$qemu_pid" 2>/dev/null || true
     fi
-    cp "$output_file" "$repo_root/target/wayland-desktop-serial.log" 2>/dev/null || true
-    cp "$screenshot" "$repo_root/target/wayland-desktop.ppm" 2>/dev/null || true
+    cp "$output_file" "$repo_root/target/$artifact-serial.log" 2>/dev/null || true
+    cp "$screenshot" "$repo_root/target/$artifact.ppm" 2>/dev/null || true
     rm -rf "$work_dir" "$monitor"
 }
 trap cleanup EXIT
@@ -143,14 +153,32 @@ if [[ ! -s "$screenshot" ]]; then
     echo "Wayland desktop test failed: no screendump." >&2
     exit 1
 fi
+# On a virtio-gpu the driver must have become the display, and the screen
+# must have the mode it reported.
+expected_mode=""
+if [[ "$gpu" != std ]]; then
+    expected_mode=$(grep -aoE 'virtio-gpu [0-9a-f:.]+ display [0-9]+x[0-9]+' "$output_file" |
+        grep -oE '[0-9]+x[0-9]+$' || true)
+    if [[ -z "$expected_mode" ]]; then
+        grep -a 'virtio-gpu' "$output_file" || true
+        echo "Wayland desktop test failed: virtio-gpu did not become the display." >&2
+        exit 1
+    fi
+    if [[ -n "${GINUX_QEMU_GPU_SIZE:-}" && "$expected_mode" != "$GINUX_QEMU_GPU_SIZE" ]]; then
+        echo "Wayland desktop test failed: virtio-gpu mode $expected_mode, host asked for $GINUX_QEMU_GPU_SIZE." >&2
+        exit 1
+    fi
+fi
 # The focused window's title bar (0x2f5d8c) and the terminal background
 # (0x101418) must both cover a window-sized area of the real framebuffer.
-python3 -I - "$screenshot" <<'EOF'
+python3 -I - "$screenshot" "$expected_mode" <<'EOF'
 import sys
 
 data = open(sys.argv[1], "rb").read()
 fields = data.split(maxsplit=4)
 width, height = int(fields[1]), int(fields[2])
+if sys.argv[2] and f"{width}x{height}" != sys.argv[2]:
+    sys.exit(f"Wayland desktop test failed: screen is {width}x{height}, not {sys.argv[2]}.")
 pixels = fields[4][: width * height * 3]
 counts = {}
 for offset in range(0, len(pixels), 3):

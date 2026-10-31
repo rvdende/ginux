@@ -443,6 +443,7 @@ dependencies = [
  "ginux-oci-cache",
  "ginux-usb-audio",
  "ginux-usb-hid",
+ "ginux-virtio-gpu",
  "ginux-volume-format",
  "ginux-volume-service",
  "miniz_oxide",
@@ -520,6 +521,10 @@ version = "0.1.0"
 
 [[package]]
 name = "ginux-usb-hid"
+version = "0.1.0"
+
+[[package]]
+name = "ginux-virtio-gpu"
 version = "0.1.0"
 
 [[package]]

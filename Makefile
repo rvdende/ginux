@@ -17,7 +17,7 @@ SYSTEM_PROFILE := profiles/minimal-system-v0/profile.tsv
 
 .DEFAULT_GOAL := help
 
-.PHONY: help doctor manifest system-image test-alpine test-rocky-shell test-rocky-dnf test-multi-domain test-multi-domain-detached test-linux-abi test-linux-runtime test-storage test-oci-cache test-smp test-rocky-smp-futex test-rocky-smp-shared-page test-rocky-smp-thread-context probe-rocky-systemd test-rocky-systemd test-rocky-detached test-domain-responsiveness benchmark-rocky-systemd benchmark-prepare-linux benchmark-prepare-ginux benchmark-linux-comparison benchmark-ginux-boot benchmark-boot-comparison benchmark-ginux-sysbench benchmark-compare benchmark-topology-matrix benchmark-topology-compare profile-rocky-systemd rocky-image rocky-image-check linux-probe controller-runtime network-service protocol-service volume-service abi-conformance architecture-check linux-compat-check build build-verification build-linux-profile run reset-storage boot-media test-boot-media test-hardware-profile test-rust-workloads test-desktop test-rust-userland rust-rootfs userland userland-check ltp test-ltp test test-c1 test-c2 fmt gate clean
+.PHONY: help doctor manifest system-image test-alpine test-rocky-shell test-rocky-dnf test-multi-domain test-multi-domain-detached test-linux-abi test-linux-runtime test-storage test-oci-cache test-smp test-rocky-smp-futex test-rocky-smp-shared-page test-rocky-smp-thread-context probe-rocky-systemd test-rocky-systemd test-rocky-detached test-domain-responsiveness benchmark-rocky-systemd benchmark-prepare-linux benchmark-prepare-ginux benchmark-linux-comparison benchmark-ginux-boot benchmark-boot-comparison benchmark-ginux-sysbench benchmark-compare benchmark-topology-matrix benchmark-topology-compare profile-rocky-systemd rocky-image rocky-image-check linux-probe controller-runtime network-service protocol-service volume-service abi-conformance architecture-check linux-compat-check build build-verification build-linux-profile run reset-storage boot-media test-boot-media test-hardware-profile test-rust-workloads test-desktop test-desktop-virtio-gpu test-rust-userlandrust-rootfs userland userland-check ltp test-ltp test test-c1 test-c2 fmt gate clean
 
 help:
 	@echo "Ginux development targets"
@@ -32,6 +32,7 @@ help:
 	@echo "  make rust-rootfs         Build the all-Rust root filesystem embedded as image=builtin://rust"
 	@echo "  make test-rust-userland  Boot a builtin://rust domain and run its brush/uutils test"
 	@echo "  make test-desktop        Run the Wayland compositor and terminal on /dev/fb0, all-Rust userland"
+	@echo "  make test-desktop-virtio-gpu  The same desktop on a virtio-gpu display (no VGA)"
 	@echo "  make ltp                 Build the LTP syscall tests statically for musl (Docker)"
 	@echo "  make test-ltp            Run the LTP syscall tests in an Alpine domain (docs/LTP.md)"
 	@echo "  make test-rocky-shell Download Rocky at runtime and verify its glibc shell in QEMU"
@@ -272,6 +273,11 @@ test-rust-userland: rust-rootfs build
 test-desktop: rust-rootfs build
 	@tests/qemu/wayland-desktop.sh
 
+# The same desktop with a virtio-gpu as the only display adapter, in a mode
+# the host picks (not the firmware's 1280x800).
+test-desktop-virtio-gpu: rust-rootfs build
+	@GINUX_QEMU_GPU=virtio GINUX_QEMU_GPU_SIZE=1024x768 tests/qemu/wayland-desktop.sh
+
 test-storage: build
 	@tests/qemu/persistent-storage.sh
 
@@ -330,6 +336,8 @@ check: manifest architecture-check linux-compat-check
 	@cargo test --package ginux-usb-audio
 	@cargo clippy --package ginux-usb-hid --all-targets -- -D warnings
 	@cargo test --package ginux-usb-hid
+	@cargo clippy --package ginux-virtio-gpu --all-targets -- -D warnings
+	@cargo test --package ginux-virtio-gpu
 	@cargo clippy --package ginux-controller-runtime --target x86_64-unknown-none -- -D warnings
 	@cargo clippy --package ginux-protocol-state -- -D warnings
 	@cargo test --package ginux-protocol-state

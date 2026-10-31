@@ -140,8 +140,8 @@ coverage, and a physical-hardware matrix remain future work.
 | Linux userspace | Selected Alpine and Rocky programs; Rocky systemd reaches `multi-user.target`; in the official `rust:alpine` image, cargo downloads crates from crates.io, builds a project using `serde` with derive (build scripts, proc macros, rustc linking through `cc`), and `cargo install`s the uutils (Rust coreutils) multicall binary, which then runs | No distribution-wide compatibility claim |
 | Storage | Persistent configuration and verified OCI layer cache | Writable domain persistence and production recovery remain incomplete |
 | Networking | Host DHCP/DNS, virtual-link configuration, loopback, and tested lifecycle | Independent per-domain packet paths and leases remain unfinished |
-| Devices | QEMU virtio block/network, MSI-X, and VT-d paths | No GPU, NVMe, broad hardware, or stable third-party driver ABI |
-| Desktop | A Rust Wayland compositor and terminal run in an Alpine domain on the firmware framebuffer (`/dev/fb0`), with USB keyboard and tablet input through evdev | Software rendering at the firmware's mode; no XKB keymap, pseudo-terminals, clipboard or popups |
+| Devices | QEMU virtio block/network, MSI-X, and VT-d paths; a polled virtio-gpu 2D display driver ([docs/GRAPHICS.md](docs/GRAPHICS.md)) | No GPU acceleration, NVMe, broad hardware, or stable third-party driver ABI |
+| Desktop | A Rust Wayland compositor and terminal run in an Alpine domain on `/dev/fb0` (the firmware framebuffer, or a virtio-gpu in the mode the host asks for), with USB keyboard and tablet input through evdev | Software rendering at a fixed mode; no XKB keymap, pseudo-terminals, clipboard or popups |
 | Performance | Matched 1/2/4-vCPU QEMU comparison using the same Rocky userspace and sysbench binary | Not a native-hardware or general kernel benchmark; four-thread scheduling remains weak |
 | Security | Capability and generation mechanisms exercised by tests | No independent audit or production security claim |
 
@@ -227,8 +227,9 @@ pure-Rust `wayland-server` backend, and `ginux-term`, a terminal client;
 `ginux-fetch` prints a neofetch-style system summary. They are static
 `x86_64-unknown-linux-musl` binaries in their own Cargo workspace, so their
 crates.io dependencies stay out of the kernel build. The compositor
-draws in software onto `/dev/fb0`, the firmware framebuffer exposed through
-Linux fbdev, and reads keyboards and pointers from `/dev/input/eventN`, which
+draws in software onto `/dev/fb0`, the firmware framebuffer or a virtio-gpu
+surface ([docs/GRAPHICS.md](docs/GRAPHICS.md)) exposed through Linux fbdev,
+and reads keyboards and pointers from `/dev/input/eventN`, which
 the kernel feeds from USB keyboards, boot mice and QEMU's USB tablet. Clients
 share window buffers through memfd pools passed with `SCM_RIGHTS`; Ginux maps
 a memfd's own pages into every process that maps it.
@@ -238,6 +239,7 @@ just desktop            # build, boot in a QEMU window and start the desktop
 make userland           # build ginux-wm, ginux-term, ginux-fetch and ginux-init
 make userland-check     # format check, clippy and unit tests on the host
 make test-desktop       # type into the terminal on USB, check a screendump
+make test-desktop-virtio-gpu # the same on a virtio-gpu display, no VGA
 make test-rust-userland # boot the all-Rust domain and run brush and uutils
 ```
 

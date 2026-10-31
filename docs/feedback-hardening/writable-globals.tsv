@@ -496,6 +496,7 @@ interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_RUNTIME
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_SOCKET_SINGLE_ATTEMPT	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu/architecture.rs	CPU_STACKS	per-cpu-arch	allowlist	none	explicit-per-cpu-stack-owner-root
 interior-mutable	kernel/src/drivers/usb_input.rs	PUMPING	platform-device	allowlist	none	usb-input-pump-reentrancy-latch
+interior-mutable	kernel/src/drivers/virtio_gpu.rs	SCANOUT	platform-device	allowlist	none	try-latched-virtio-gpu-scanout-owner
 interior-mutable	kernel/src/framebuffer.rs	BUSY	platform-device	allowlist	none	framebuffer-console-reentrancy-latch
 interior-mutable	kernel/src/framebuffer.rs	OWNED	platform-device	allowlist	none	framebuffer-domain-ownership-flag
 interior-mutable	kernel/src/framebuffer.rs	READY	platform-device	allowlist	none	framebuffer-publication-flag
