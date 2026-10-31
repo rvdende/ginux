@@ -5745,6 +5745,75 @@ pub(crate) fn remove_current_linux_runtime_page(address: u64) -> LinuxRuntimePag
     old
 }
 
+/// Frees the page tables covering [start, end) that no longer map or reserve
+/// anything, and each directory above them that empties as a result, so a
+/// process that maps and unmaps across its address space does not pile up
+/// empty tables (which also overflowed its registry snapshot). The root and
+/// any table not wholly owned by user mappings are kept.
+pub(crate) fn prune_current_linux_page_tables(start: u64, end: u64) -> bool {
+    const TABLE_SPAN: u64 = 1 << 21;
+    if start >= end || end > 1 << 47 {
+        return false;
+    }
+    let table_empty = |table: u64| {
+        mapped_frame::<u64>(table).is_some_and(|entries| {
+            (0..ENTRY_COUNT).all(|index| unsafe { entries.add(index).read() } == 0)
+        })
+    };
+    let root = current_root();
+    let mut pruned = false;
+    let mut address = start & !(TABLE_SPAN - 1);
+    while address < end {
+        // The root, directory-pointer and directory entries leading to the
+        // page table that maps `address`.
+        let mut entries = [core::ptr::null_mut::<u64>(); 3];
+        let mut table = root;
+        let mut complete = true;
+        for (level, shift) in [39, 30, 21].into_iter().enumerate() {
+            let Some(base) = mapped_frame::<u64>(table) else {
+                return false;
+            };
+            let entry = unsafe { base.add(((address >> shift) & 0x1ff) as usize) };
+            let value = unsafe { entry.read() };
+            if value & (PRESENT | USER | LARGE_PAGE) != PRESENT | USER {
+                complete = false;
+                break;
+            }
+            entries[level] = entry;
+            table = value & ADDRESS_MASK;
+        }
+        if complete {
+            for entry in entries.into_iter().rev() {
+                let child = unsafe { entry.read() } & ADDRESS_MASK;
+                if !table_empty(child) {
+                    break;
+                }
+                let Some(lease) = memory::live_frame_lease(memory::FrameOwner::KERNEL, child)
+                else {
+                    return false;
+                };
+                unsafe { entry.write(0) };
+                if !memory::scrub_and_release_frames(
+                    memory::FrameOwner::KERNEL,
+                    core::slice::from_ref(&lease),
+                ) {
+                    return false;
+                }
+                pruned = true;
+            }
+        }
+        address = match address.checked_add(TABLE_SPAN) {
+            Some(next) => next,
+            None => break,
+        };
+    }
+    if pruned {
+        // Drop paging-structure caches that may still hold the freed tables.
+        unsafe { activate(root) };
+    }
+    true
+}
+
 pub(crate) fn protect_current_linux_runtime_page(address: u64, protection: u8) -> bool {
     if !matches!(protection, 0 | 1 | 3 | 5) {
         return false;

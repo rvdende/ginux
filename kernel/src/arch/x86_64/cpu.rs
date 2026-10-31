@@ -807,7 +807,7 @@ const LINUX_PROC_PID2_ZOMBIE_STAT: &[u8] = b"2 (init) Z 1 1 1 0 -1 4194560 0 0 0
 const LINUX_PROC_PID2_STATM: &[u8] = b"256 64 32 16 0 32 0\n";
 pub(crate) const LINUX_EXEC_MAPPING_LIMIT: usize = 8;
 pub(crate) const LINUX_ACTIVE_IMAGE_MAPPING_LIMIT: usize = 640;
-pub(crate) const LINUX_PROCESS_HIERARCHY_LIMIT: usize = 1024;
+pub(crate) const LINUX_PROCESS_HIERARCHY_LIMIT: usize = 8192;
 // Pages one Linux process may map; rustc's driver library alone is 74,000.
 pub(crate) const LINUX_PROCESS_MAPPING_LIMIT: usize = 262_144;
 const LINUX_EXEC_VECTOR_LIMIT: usize = 32;
@@ -5638,19 +5638,27 @@ fn switch_linux_thread(handle: LinuxThreadHandle) -> bool {
     let Some(context) = linux_thread_context(handle) else {
         return false;
     };
+    // Only a running thread of this process stops running here. A slot left
+    // current by another process is that process's running thread, and
+    // demoting it, or saving this CPU state into it, would corrupt it.
+    let prior = usize::from(LINUX_CURRENT_THREAD_SLOT.load(Ordering::SeqCst));
+    let prior = (prior < LINUX_THREAD_LIMIT).then_some(prior);
+    let prior = match prior {
+        Some(prior) if !linux_thread_slot_in_current_process(prior) => {
+            report_stale_linux_thread_slot(prior);
+            None
+        }
+        prior => prior,
+    };
     if LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) != LINUX_THREAD_READY
+        || prior.is_some_and(|prior| {
+            LINUX_THREAD_STATES[prior].load(Ordering::SeqCst) != LINUX_THREAD_RUNNING
+        })
         || !install_linux_tls_context(context)
     {
         return false;
     }
-    let prior = LINUX_CURRENT_THREAD_SLOT.load(Ordering::SeqCst);
-    if prior != LINUX_THREAD_SLOT_NONE {
-        let prior = usize::from(prior);
-        if prior >= LINUX_THREAD_LIMIT
-            || LINUX_THREAD_STATES[prior].load(Ordering::SeqCst) != LINUX_THREAD_RUNNING
-        {
-            return false;
-        }
+    if let Some(prior) = prior {
         LINUX_THREAD_SIGNAL_MASKS[prior].store(
             ELF_PROBE_SIGNAL_MASK.load(Ordering::SeqCst),
             Ordering::SeqCst,
@@ -5665,6 +5673,7 @@ fn switch_linux_thread(handle: LinuxThreadHandle) -> bool {
     );
     LINUX_THREAD_STATES[slot].store(LINUX_THREAD_RUNNING, Ordering::SeqCst);
     LINUX_CURRENT_THREAD_SLOT.store(handle.slot, Ordering::SeqCst);
+    LINUX_THREAD_ROUND_ROBIN.store(handle.slot, Ordering::SeqCst);
     true
 }
 
@@ -5815,9 +5824,16 @@ fn clear_linux_thread_execution(slot: usize) {
 
 fn current_linux_thread_slot() -> Option<usize> {
     let slot = usize::from(LINUX_CURRENT_THREAD_SLOT.load(Ordering::SeqCst));
-    (slot < LINUX_THREAD_LIMIT
-        && LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) == LINUX_THREAD_RUNNING)
-        .then_some(slot)
+    if slot >= LINUX_THREAD_LIMIT
+        || LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) != LINUX_THREAD_RUNNING
+    {
+        return None;
+    }
+    if !linux_thread_slot_in_current_process(slot) {
+        report_stale_linux_thread_slot(slot);
+        return None;
+    }
+    Some(slot)
 }
 
 fn store_current_linux_signal_mask(mask: u64) {
@@ -5844,6 +5860,24 @@ fn linux_thread_handle(slot: usize) -> Option<LinuxThreadHandle> {
 
 fn current_linux_thread_handle() -> Option<LinuxThreadHandle> {
     linux_thread_handle(current_linux_thread_slot()?)
+}
+
+/// Reports, once, a current thread slot owned by a process other than the
+/// current one: a process switch that did not make its own thread current.
+fn report_stale_linux_thread_slot(slot: usize) {
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    if !REPORTED.swap(true, Ordering::SeqCst) {
+        serial_write("ginux: stale current thread slot/owner/pid: ");
+        for value in [
+            slot as u64,
+            u64::from(LINUX_THREAD_OWNER_PIDS[slot].load(Ordering::SeqCst)),
+            u64::from(current_linux_process_pid()),
+        ] {
+            serial_write_u64(value);
+            serial_write(" ");
+        }
+        serial_write("\r\n");
+    }
 }
 
 fn linux_thread_handle_by_tid(tid: u64) -> Option<LinuxThreadHandle> {
@@ -5888,14 +5922,24 @@ fn retire_linux_process_threads(pid: u32) {
     }
 }
 
+/// The slot most recently switched to, where the round-robin search for the
+/// next ready thread starts.
+static LINUX_THREAD_ROUND_ROBIN: BankedAtomicU8 = BankedAtomicU8::new(0);
+
+/// The next ready thread of the current process after the one most recently
+/// run, so every ready thread gets a turn; always taking the lowest slot let
+/// two threads alternate while later ones starved.
 fn ready_linux_thread_handle() -> Option<LinuxThreadHandle> {
-    (0..LINUX_THREAD_LIMIT).find_map(|slot| {
-        (LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) == LINUX_THREAD_READY
-            && linux_thread_slot_in_current_process(slot))
-        .then(|| linux_thread_handle(slot))
-        .flatten()
-        .filter(|handle| linux_thread_return_context(*handle).is_some())
-    })
+    let start = usize::from(LINUX_THREAD_ROUND_ROBIN.load(Ordering::SeqCst)) + 1;
+    (start..start + LINUX_THREAD_LIMIT)
+        .map(|slot| slot % LINUX_THREAD_LIMIT)
+        .find_map(|slot| {
+            (LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) == LINUX_THREAD_READY
+                && linux_thread_slot_in_current_process(slot))
+            .then(|| linux_thread_handle(slot))
+            .flatten()
+            .filter(|handle| linux_thread_return_context(*handle).is_some())
+        })
 }
 
 fn yield_ready_linux_thread_handle() -> Option<LinuxThreadHandle> {
@@ -5903,14 +5947,17 @@ fn yield_ready_linux_thread_handle() -> Option<LinuxThreadHandle> {
     // Do not let a sibling's voluntary yield immediately hand the CPU back;
     // the next timer quantum will make it eligible through preemption.
     let last_preempted = LINUX_LAST_PREEMPTED_THREAD_SLOT.load(Ordering::Acquire);
-    (0..LINUX_THREAD_LIMIT).find_map(|slot| {
-        (slot != usize::from(last_preempted)
-            && LINUX_THREAD_STATES[slot].load(Ordering::Acquire) == LINUX_THREAD_READY
-            && linux_thread_slot_in_current_process(slot))
-        .then(|| linux_thread_handle(slot))
-        .flatten()
-        .filter(|handle| linux_thread_return_context(*handle).is_some())
-    })
+    let start = usize::from(LINUX_THREAD_ROUND_ROBIN.load(Ordering::SeqCst)) + 1;
+    (start..start + LINUX_THREAD_LIMIT)
+        .map(|slot| slot % LINUX_THREAD_LIMIT)
+        .find_map(|slot| {
+            (slot != usize::from(last_preempted)
+                && LINUX_THREAD_STATES[slot].load(Ordering::Acquire) == LINUX_THREAD_READY
+                && linux_thread_slot_in_current_process(slot))
+            .then(|| linux_thread_handle(slot))
+            .flatten()
+            .filter(|handle| linux_thread_return_context(*handle).is_some())
+        })
 }
 
 fn block_current_linux_thread(kind: u8, key: u64, output: u64, deadline: u64) -> bool {
@@ -10527,6 +10574,9 @@ extern "sysv64" fn linux_syscall_handler(
                 // tables directly. Returning an errno here would resume a
                 // process after libc has committed to termination.
                 serial_write("ginux: child exit using last validated process snapshot\r\n");
+                let _ = linux_process::mark_live_process_address_space_stale(
+                    current_linux_process_pid(),
+                );
             }
             // The service manager owns reporting ordinary userspace process
             // failures. Keep the raw exit trace available to verification
@@ -20428,6 +20478,12 @@ fn linux_runtime_munmap(address: u64, length: u64) -> u64 {
         )) {
             return LINUX_EINVAL;
         }
+    }
+    if !address_space::prune_current_linux_page_tables(
+        address,
+        address + (pages * PAGE_SIZE) as u64,
+    ) {
+        return LINUX_EINVAL;
     }
     0
 }

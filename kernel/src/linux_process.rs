@@ -200,6 +200,9 @@ struct ProcessAddressSpace {
     storage_slot: u8,
     hierarchy_count: u32,
     mapping_count: u32,
+    /// The process changed its mappings after this snapshot, so its lists
+    /// may name frames it already freed and that now belong to others.
+    stale: bool,
 }
 
 // Not Copy: an instance is several megabytes and lives only in an allocated extent.
@@ -279,6 +282,7 @@ impl ProcessAddressSpace {
             storage_slot: storage_slot as u8,
             hierarchy_count: u32::try_from(hierarchy.len()).ok()?,
             mapping_count: u32::try_from(mappings.len()).ok()?,
+            stale: false,
         })
     }
 
@@ -302,6 +306,7 @@ impl ProcessAddressSpace {
             storage_slot: storage_slot as u8,
             hierarchy_count: u32::try_from(hierarchy.len()).ok()?,
             mapping_count: u32::try_from(mappings.len()).ok()?,
+            stale: false,
         })
     }
 
@@ -1695,6 +1700,7 @@ pub(crate) fn verify_lifecycle_contract() -> bool {
         storage_slot: 3,
         hierarchy_count: first_space.hierarchy_count,
         mapping_count: first_space.mapping_count,
+        stale: false,
     };
     if init.pid != 1
         || rejected_child.pid != 2
@@ -2485,6 +2491,26 @@ pub(crate) fn allocate_live_thread_id() -> Option<u32> {
     Some(tid)
 }
 
+/// Marks `pid`'s registered address space as older than its mappings, when
+/// a final snapshot could not be taken, so its release frees only what the
+/// live page tables show.
+pub(crate) fn mark_live_process_address_space_stale(pid: u32) -> bool {
+    let Some(table) = live_process_table_mut() else {
+        return false;
+    };
+    let Some(handle) = table.handle_by_pid(pid) else {
+        return false;
+    };
+    let Some(space) = table
+        .process_mut(handle)
+        .and_then(|process| process.address_space.as_mut())
+    else {
+        return false;
+    };
+    space.stale = true;
+    true
+}
+
 pub(crate) fn live_mapping_referenced_by_other_process(
     pid: u32,
     frame: memory::FrameLease,
@@ -3136,6 +3162,12 @@ fn release_live_process_address_space(
     let page_table_started = crate::arch::x86_64::timer::timestamp_counter();
     if !address_space::retire_linux_child_address_space(space.root()) {
         return false;
+    }
+    // Retiring the live tree freed its page tables. A stale snapshot's lists
+    // may name frames already freed and handed to other processes, and
+    // freeing those again would corrupt them, so its private pages leak.
+    if space.stale {
+        return true;
     }
     if cfg!(feature = "linux-boot-profile") {
         crate::arch::x86_64::cpu::linux_boot_profile_record_lifecycle_phase(7, page_table_started);
