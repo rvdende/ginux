@@ -40672,6 +40672,15 @@ fn linux_deliver_signal_to_blocked_wait(
     };
     let saved_sender = linux_thread_return_context(sender);
     let slot = usize::from(target.slot);
+    // A blocked thread of another process, such as the writer of a pipe
+    // shared with a child, runs in that process's address space: queue the
+    // signal for its process and wake it rather than switching to it here.
+    if !linux_thread_slot_in_current_process(slot) {
+        let owner = LINUX_THREAD_OWNER_PIDS[slot].load(Ordering::SeqCst);
+        let queued = linux_queue_process_signal(owner, signal, signal_code, None);
+        wake_linux_descriptor_waits();
+        return if queued == 0 { 0 } else { queued };
+    }
     let wait_kind = LINUX_THREAD_WAIT_KINDS[slot].load(Ordering::SeqCst);
     if sender == target
         || LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) != LINUX_THREAD_BLOCKED
