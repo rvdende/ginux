@@ -23302,6 +23302,15 @@ fn linux_proc_numeric_file(path: &[u8], absolute: bool) -> Option<(u32, &[u8])> 
     (pid != 0).then_some((pid, name))
 }
 
+/// The process and file name of a `/proc/PID/NAME` or `/proc/self/NAME` path.
+fn linux_proc_process_file(path: &[u8]) -> Option<(u32, &[u8])> {
+    match path.strip_prefix(b"/proc/self/") {
+        Some([]) => None,
+        Some(name) => Some((current_linux_process_pid(), name)),
+        None => linux_proc_numeric_file(path, true),
+    }
+}
+
 fn linux_proc_fdinfo_target(path: &[u8]) -> Option<u64> {
     let descriptor = path.strip_prefix(b"/proc/self/fdinfo/")?;
     let descriptor = descriptor.iter().try_fold(0_u64, |value, byte| {
@@ -26035,8 +26044,8 @@ fn linux_openat(directory: u64, path_address: u64, flags: u64, mode: u64) -> u64
     let path = &path[..path_length];
     let tmp_path = path == b"/tmp/ginux-ready";
     let proc_fdinfo_target = linux_proc_fdinfo_target(path);
-    let proc_dynamic_pid = linux_proc_numeric_file(path, true)
-        .filter(|(_, name)| matches!(*name, b"status" | b"stat" | b"statm"))
+    let proc_dynamic_pid = linux_proc_process_file(path)
+        .filter(|(_, name)| matches!(*name, b"status" | b"stat" | b"statm" | b"oom_score_adj"))
         .map(|(pid, _)| pid);
     let virtual_device = matches!(
         path,
@@ -29943,6 +29952,7 @@ fn linux_descriptor_read(descriptor: u64, address: u64, count: u64) -> u64 {
             | LINUX_FILE_PROC_DYNAMIC_STAT
             | LINUX_FILE_PROC_DYNAMIC_STATUS
             | LINUX_FILE_PROC_DYNAMIC_STATM
+            | LINUX_FILE_PROC_OOM_SCORE_ADJ
     ) {
         let offset = linux_descriptor_offset(descriptor).load(Ordering::SeqCst);
         let result = linux_regular_file_read_at(descriptor, address, count, offset);
@@ -30078,6 +30088,7 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
         LINUX_FILE_PROC_DYNAMIC_STAT
             | LINUX_FILE_PROC_DYNAMIC_STATUS
             | LINUX_FILE_PROC_DYNAMIC_STATM
+            | LINUX_FILE_PROC_OOM_SCORE_ADJ
     ) {
         let Some(pid) = linux_proc_dynamic_descriptor_pid(descriptor) else {
             return LINUX_EBADF;
@@ -30121,6 +30132,17 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
             }
             LINUX_FILE_PROC_DYNAMIC_STATM => {
                 append_linux_bytes(&mut file, &mut used, b"256 64 32 16 0 32 0\n")
+            }
+            LINUX_FILE_PROC_OOM_SCORE_ADJ => {
+                linux_process::live_process_oom_score_adj(pid).is_some_and(|value| {
+                    (value >= 0 || append_linux_bytes(&mut file, &mut used, b"-"))
+                        && append_linux_decimal(
+                            &mut file,
+                            &mut used,
+                            u64::from(value.unsigned_abs()),
+                        )
+                        && append_linux_bytes(&mut file, &mut used, b"\n")
+                })
             }
             _ => false,
         };
@@ -34693,6 +34715,9 @@ fn linux_descriptor_write(descriptor: u64, address: u64, count: u64) -> u64 {
     if linux_secret_descriptor(descriptor) {
         return LINUX_EINVAL;
     }
+    if device & !3 == LINUX_FILE_PROC_OOM_SCORE_ADJ {
+        return linux_proc_oom_score_adj_write(descriptor, device, address, count);
+    }
     if let Some(result) = linux_overlay_write(descriptor, device, address, count) {
         return result;
     }
@@ -34927,6 +34952,61 @@ fn linux_bounded_console_write(address: u64, count: u64) -> u64 {
     count
 }
 
+/// Writes `/proc/PID/oom_score_adj` as Linux does: at most 12 bytes are read,
+/// surrounding whitespace is ignored and the value must lie in -1000..=1000.
+fn linux_proc_oom_score_adj_write(descriptor: u64, device: u16, address: u64, count: u64) -> u64 {
+    if device & 3 & LINUX_DESCRIPTOR_OUTPUT == 0 {
+        return LINUX_EBADF;
+    }
+    let Some(pid) = linux_proc_dynamic_descriptor_pid(descriptor) else {
+        return LINUX_EBADF;
+    };
+    let mut text = [0_u8; 12];
+    let length = usize::try_from(count).map_or(text.len(), |count| count.min(text.len()));
+    if !copy_from_linux_user(address, &mut text[..length]) {
+        return LINUX_EFAULT;
+    }
+    let text = text[..length]
+        .split(|byte| *byte == 0)
+        .next()
+        .unwrap_or_default();
+    let Some(value) = linux_parse_kernel_integer(text.trim_ascii())
+        .filter(|value| (-1000..=1000).contains(value))
+        .and_then(|value| i16::try_from(value).ok())
+    else {
+        return LINUX_EINVAL;
+    };
+    if linux_process::set_live_process_oom_score_adj(pid, value) {
+        length as u64
+    } else {
+        LINUX_ESRCH
+    }
+}
+
+/// Parses an integer as Linux's `kstrtoint(text, 0, ...)`: an optional sign,
+/// then decimal, `0x` hexadecimal or `0`-prefixed octal digits.
+fn linux_parse_kernel_integer(text: &[u8]) -> Option<i64> {
+    let (negative, digits) = match text {
+        [b'-', rest @ ..] => (true, rest),
+        [b'+', rest @ ..] => (false, rest),
+        _ => (false, text),
+    };
+    let (radix, digits) = match digits {
+        [b'0', b'x' | b'X', rest @ ..] => (16, rest),
+        [b'0', rest @ ..] if !rest.is_empty() => (8, rest),
+        _ => (10, digits),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let magnitude = digits.iter().try_fold(0_i64, |value, digit| {
+        value
+            .checked_mul(i64::from(radix))?
+            .checked_add(i64::from(char::from(*digit).to_digit(radix)?))
+    })?;
+    Some(if negative { -magnitude } else { magnitude })
+}
+
 fn linux_descriptor_writev(descriptor: u64, vectors: u64, count: u64) -> u64 {
     if let Some(result) = linux_socket_writev(descriptor, vectors, count) {
         return result;
@@ -34935,7 +35015,10 @@ fn linux_descriptor_writev(descriptor: u64, vectors: u64, count: u64) -> u64 {
         return result;
     }
     let device = linux_device_descriptor(descriptor);
-    if linux_overlay_descriptor_handle(descriptor).is_some() || linux_tmp_file(device) {
+    if linux_overlay_descriptor_handle(descriptor).is_some()
+        || linux_tmp_file(device)
+        || device & !3 == LINUX_FILE_PROC_OOM_SCORE_ADJ
+    {
         let (ranges, vector_count) = match linux_socket_iov_ranges(vectors, count, false) {
             Ok(ranges) => ranges,
             Err(error) => return error,
@@ -35472,6 +35555,7 @@ fn linux_proc_dynamic_descriptor_pid(descriptor: u64) -> Option<u32> {
         LINUX_FILE_PROC_DYNAMIC_STAT
             | LINUX_FILE_PROC_DYNAMIC_STATUS
             | LINUX_FILE_PROC_DYNAMIC_STATM
+            | LINUX_FILE_PROC_OOM_SCORE_ADJ
     )
     .then(|| linux_descriptor_tmp_generation(descriptor))
     .flatten()?
@@ -35669,7 +35753,6 @@ fn linux_regular_file(state: u16) -> Option<&'static [u8]> {
         LINUX_FILE_PROC_PROCESS_ENVIRON => return Some(LINUX_PROC_PROCESS_ENVIRON),
         LINUX_FILE_PROC_FILE_MAX => return Some(LINUX_PROC_FILE_MAX),
         LINUX_FILE_PROC_NR_OPEN => return Some(LINUX_PROC_NR_OPEN),
-        LINUX_FILE_PROC_OOM_SCORE_ADJ => return Some(LINUX_PROC_OOM_SCORE_ADJ),
         LINUX_FILE_PROC_USER_NAMESPACE => return Some(b""),
         LINUX_FILE_PROC_FDINFO => return Some(b""),
         LINUX_FILE_PROC_HOSTNAME => return Some(b"ginux\n"),

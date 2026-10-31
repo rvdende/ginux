@@ -25,9 +25,12 @@ through a Linux ABI personality. It is not a rewrite of Linux:
 
 ## Roadmap (in order)
 
-1. **Merge upstream** (github.com/gmkurtzer/ginux): multi-core (SMP), the
-   split of `kernel/src/arch/x86_64/cpu.rs` into modules, hardening.
-2. **Per-thread kernel stacks and a preemptive per-CPU scheduler.** Today a
+1. ~~Merge upstream~~ (done 2026-10-31, fb3f793b: SMP, `cpu/` modules,
+   lock ranks, runtime owner structs). Keep merging upstream regularly
+   (`git fetch upstream`); new globals go in upstream's owner structs and
+   `docs/feedback-hardening/writable-globals.tsv`.
+2. **Per-thread kernel stacks and a preemptive per-CPU scheduler**
+   (design and migration steps: `docs/SCHEDULER.md`). Today a
    process runs nested inside the syscall of the process that started it, on
    one kernel stack: that bounds process-tree depth (the stack is 2 MiB as a
    stopgap), and a parent can be resumed nested inside its child's syscall
@@ -39,7 +42,8 @@ through a Linux ABI personality. It is not a rewrite of Linux:
    arrays (32 threads, 16 processes, 64 sockets per domain). Move large
    structures off the kernel stack.
 4. **Compatibility driven by the Linux Test Project (LTP)** rather than by
-   finding bugs one program at a time.
+   finding bugs one program at a time: `just test-ltp` (docs/LTP.md has the
+   baseline and failure clusters).
 5. **Drivers:** virtio in VMs; Rust drivers for the hardware we target (this
    PC: Ryzen 7600X, AMD-Vi, NVMe, AMD xHCI, RTL8125, MT7922 Wi-Fi, Radeon
    RX 6800) — ultimately a GPU driver for Vulkan; software Vulkan meanwhile.
@@ -55,6 +59,9 @@ through a Linux ABI personality. It is not a rewrite of Linux:
   OVMF_VARS=/usr/share/OVMF/OVMF_VARS_4M.fd`; the shared `/tmp` is often full,
   so set `TMPDIR` to a private directory (not for `test-hardware-profile`,
   whose monitor socket path must stay under 108 bytes).
+- `make check` needs ripgrep (`rg`) for the architecture checks; it is not
+  installed system-wide, so put VS Code's copy on PATH:
+  `PATH=/usr/share/code/resources/app/node_modules.asar.unpacked/@vscode/ripgrep-universal/bin/linux-x64:$PATH`.
 - Key suites: `make check`, `make userland-check`, `make test-alpine`,
   `tests/qemu/rust-workloads.sh` (cargo builds serde inside Ginux),
   `make test-rust-userland`, `make test-desktop`, `make test-boot-media`,

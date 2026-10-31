@@ -748,7 +748,6 @@ pub(super) const LINUX_PROC_PROCESS_CMDLINE: &[u8] = b"/sbin/init\0";
 pub(super) const LINUX_PROC_PROCESS_ENVIRON: &[u8] = b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\0PWD=/\0TERM=linux\0container=ginux\0SYSTEMD_GETTY_AUTO=1\0";
 pub(super) const LINUX_PROC_FILE_MAX: &[u8] = b"9223372036854775807\n";
 pub(super) const LINUX_PROC_NR_OPEN: &[u8] = b"1048576\n";
-pub(super) const LINUX_PROC_OOM_SCORE_ADJ: &[u8] = b"0\n";
 pub(super) const LINUX_PROC_PID1_STAT: &[u8] = b"1 (init) S 0 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 1 1048576 256 0 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0\n";
 pub(super) const LINUX_PROC_PID1_STATM: &[u8] = b"256 64 32 16 0 32 0\n";
 pub(super) const LINUX_PROC_PID2_RUNNING_STAT: &[u8] = b"2 (init) R 1 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 1 1048576 256 0 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0\n";

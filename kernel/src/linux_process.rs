@@ -474,6 +474,8 @@ struct Process {
     context: Option<ProcessExecutionContext>,
     scheduler_thread: Option<scheduler::ProcessThreadHandle>,
     cpu_affinity: u64,
+    /// `/proc/PID/oom_score_adj`: inherited across fork, kept across exec.
+    oom_score_adj: i16,
     state: ProcessState,
     wait_event: Option<ProcessWaitEvent>,
     /// A child forked onto its parent's pages (CLONE_VM, or a vfork child
@@ -1433,10 +1435,15 @@ impl ProcessTable {
             generation,
             pid,
         };
-        let (process_group, session, cpu_affinity) = parent
+        let (process_group, session, cpu_affinity, oom_score_adj) = parent
             .and_then(|parent| self.process(parent))
-            .map_or((pid, pid, u64::MAX), |parent| {
-                (parent.process_group, parent.session, parent.cpu_affinity)
+            .map_or((pid, pid, u64::MAX, 0), |parent| {
+                (
+                    parent.process_group,
+                    parent.session,
+                    parent.cpu_affinity,
+                    parent.oom_score_adj,
+                )
             });
         self.generations[slot] = generation;
         self.processes[slot] = Some(Process {
@@ -1452,6 +1459,7 @@ impl ProcessTable {
             context,
             scheduler_thread: None,
             cpu_affinity,
+            oom_score_adj,
             state,
             wait_event: None,
             shares_parent_vm: false,
@@ -2701,6 +2709,38 @@ pub(crate) fn live_process_cpu_affinity(pid: u32) -> Option<u64> {
         ProcessState::Running | ProcessState::Stopped { .. } | ProcessState::Zombie { .. }
     )
     .then_some(process.cpu_affinity)
+}
+
+pub(crate) fn live_process_oom_score_adj(pid: u32) -> Option<i16> {
+    let table = live_process_table_mut()?;
+    let process = table.process(table.handle_by_pid(pid)?)?;
+    matches!(
+        process.state,
+        ProcessState::Running | ProcessState::Stopped { .. } | ProcessState::Zombie { .. }
+    )
+    .then_some(process.oom_score_adj)
+}
+
+/// Sets `/proc/PID/oom_score_adj`; the caller has checked the Linux range
+/// -1000..=1000.
+pub(crate) fn set_live_process_oom_score_adj(pid: u32, value: i16) -> bool {
+    let Some(table) = live_process_table_mut() else {
+        return false;
+    };
+    let Some(process) = table
+        .handle_by_pid(pid)
+        .and_then(|handle| table.process_mut(handle))
+    else {
+        return false;
+    };
+    if !matches!(
+        process.state,
+        ProcessState::Running | ProcessState::Stopped { .. }
+    ) {
+        return false;
+    }
+    process.oom_score_adj = value;
+    true
 }
 
 pub(crate) fn set_live_process_cpu_affinity(pid: u32, mask: u64) -> bool {
