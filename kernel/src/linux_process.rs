@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 use core::{
     cell::UnsafeCell,
     mem::{size_of, MaybeUninit},
-    sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering},
 };
 
 use crate::{address_space, arch::x86_64::cpu, control_abi, linux_user, memory, scheduler};
@@ -50,6 +50,9 @@ struct ProcessRuntimeState {
     fork_child_executed: AtomicBool,
     fork_execution_stage: AtomicU32,
     fork_child_diagnostic: AtomicU32,
+    /// Timestamp-counter cycles up to which the running process's CPU time
+    /// is charged, or 0 before the first charge.
+    cpu_mark: AtomicU64,
     tables: UnsafeCell<[ProcessTable; PROCESS_INSTANCE_LIMIT]>,
     test_table: UnsafeCell<MaybeUninit<ProcessTable>>,
 }
@@ -104,6 +107,7 @@ static PROCESS_RUNTIME: ProcessRuntimeOwner =
         fork_child_executed: AtomicBool::new(false),
         fork_execution_stage: AtomicU32::new(0),
         fork_child_diagnostic: AtomicU32::new(0),
+        cpu_mark: AtomicU64::new(0),
         tables: UnsafeCell::new([const { ProcessTable::new() }; PROCESS_INSTANCE_LIMIT]),
         test_table: UnsafeCell::new(MaybeUninit::uninit()),
     }));
@@ -486,6 +490,8 @@ struct Process {
     /// Gave up the CPU in a blocking system call and has not been dispatched
     /// since: Linux's interruptible sleep ('S').
     waiting: bool,
+    /// CPU time used, in timestamp-counter cycles.
+    cpu_cycles: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1471,6 +1477,7 @@ impl ProcessTable {
             wait_event: None,
             shares_parent_vm: false,
             waiting: false,
+            cpu_cycles: 0,
         });
         Some(handle)
     }
@@ -2684,6 +2691,43 @@ pub(crate) fn live_process_status(pid: u32) -> Option<LiveProcessStatus> {
         parent_pid: process.parent.map_or(0, |parent| parent.pid),
         state,
     })
+}
+
+/// Charges the CPU time since the last charge to `pid`, the process that
+/// ran meanwhile, at timestamp `now`. Saving a process's state charges it;
+/// switching another one in starts its interval.
+pub(crate) fn charge_live_process_cpu(pid: u32, now: u64) {
+    let mark = process_runtime().cpu_mark.swap(now, Ordering::Relaxed);
+    if mark == 0 || now <= mark {
+        return;
+    }
+    if let Some(process) = live_process_table_mut().and_then(|table| {
+        let handle = table.handle_by_pid(pid)?;
+        table.process_mut(handle)
+    }) {
+        process.cpu_cycles = process.cpu_cycles.saturating_add(now - mark);
+    }
+}
+
+/// Starts the CPU interval of a process switched in at timestamp `now`.
+pub(crate) fn start_live_process_cpu(now: u64) {
+    process_runtime().cpu_mark.store(now, Ordering::Relaxed);
+}
+
+/// The CPU time `pid` has used, in timestamp-counter cycles, at `now`; for
+/// the running process this includes its current interval.
+pub(crate) fn live_process_cpu_cycles(pid: u32, running: bool, now: u64) -> Option<u64> {
+    let table = live_process_table_mut()?;
+    let cycles = table.process(table.handle_by_pid(pid)?)?.cpu_cycles;
+    if !running {
+        return Some(cycles);
+    }
+    let mark = process_runtime().cpu_mark.load(Ordering::Relaxed);
+    if mark == 0 {
+        process_runtime().cpu_mark.store(now, Ordering::Relaxed);
+        return Some(cycles);
+    }
+    Some(cycles.saturating_add(now.saturating_sub(mark)))
 }
 
 /// Records whether a process waits in a blocking system call: set when it

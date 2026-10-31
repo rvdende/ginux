@@ -471,10 +471,20 @@ pub(super) extern "sysv64" fn linux_syscall_handler(
         LINUX_SEMCTL_SYSCALL => linux_semctl(first_argument, buffer, count, register(0)),
         LINUX_SHMDT_SYSCALL => linux_shmdt(first_argument),
         LINUX_MSGGET_SYSCALL => linux_msgget(first_argument, buffer),
-        LINUX_MSGSND_SYSCALL => linux_msgsnd(first_argument, buffer, count, register(0)),
-        LINUX_MSGRCV_SYSCALL => {
-            linux_msgrcv(first_argument, buffer, count, register(0), register(2))
-        }
+        LINUX_MSGSND_SYSCALL => linux_message_wait_live(
+            registers,
+            syscall_return,
+            number,
+            (first_argument, register(0)),
+            || linux_msgsnd(first_argument, buffer, count, register(0)),
+        ),
+        LINUX_MSGRCV_SYSCALL => linux_message_wait_live(
+            registers,
+            syscall_return,
+            number,
+            (first_argument, register(2)),
+            || linux_msgrcv(first_argument, buffer, count, register(0), register(2)),
+        ),
         LINUX_MSGCTL_SYSCALL => linux_msgctl(first_argument, buffer, count),
         LINUX_MQ_OPEN_SYSCALL => linux_mq_open(first_argument, buffer, count, register(0)),
         LINUX_MQ_UNLINK_SYSCALL => linux_mq_unlink(first_argument),
@@ -1684,8 +1694,12 @@ pub(super) extern "sysv64" fn linux_syscall_handler(
     {
         let mut interrupted = syscall_return;
         interrupted.rax = result;
-        let delivered =
-            linux_deliver_pending_signal(registers, interrupted, (user_rip, user_rflags));
+        let delivered = linux_deliver_pending_signal_restarting(
+            registers,
+            interrupted,
+            (user_rip, user_rflags),
+            Some(number),
+        );
         if delivered != 0 {
             delivered
         } else if X86_RUNTIME.LINUX_SIGNAL_ACTIVE.load(Ordering::SeqCst) {

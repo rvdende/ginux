@@ -64,12 +64,15 @@ struct SemaphoreUndo {
 struct SemaphoreProcesses {
     waits: Vec<SemaphoreWait>,
     undo: Vec<SemaphoreUndo>,
+    /// Processes waiting in msgsnd or msgrcv, with the queue they wait on.
+    message_waits: Vec<(u32, u32)>,
 }
 
 impl SemaphoreProcesses {
     const EMPTY: Self = Self {
         waits: Vec::new(),
         undo: Vec::new(),
+        message_waits: Vec::new(),
     };
 }
 
@@ -735,6 +738,7 @@ fn undo_process_semaphores(guard: &mut Guard, pid: u32) {
     let instance = guard.instance;
     let processes = guard.semaphore_processes();
     processes.waits.retain(|wait| wait.pid != pid);
+    processes.message_waits.retain(|(waiter, _)| *waiter != pid);
     processes.undo.retain(|undo| {
         if undo.pid != pid {
             return true;
@@ -773,6 +777,39 @@ pub(crate) fn begin_semaphore_wait(wait: SemaphoreWait) -> Result<(), Error> {
     waits.try_reserve(1).map_err(|_| Error::NoMemory)?;
     waits.push(wait);
     Ok(())
+}
+
+/// The queue `pid` waited on in an earlier, restarted msgsnd or msgrcv.
+pub(crate) fn message_wait(pid: u32) -> Option<u32> {
+    let mut guard = Guard::acquire()?;
+    guard
+        .semaphore_processes()
+        .message_waits
+        .iter()
+        .find(|(waiter, _)| *waiter == pid)
+        .map(|(_, id)| *id)
+}
+
+/// Records that `pid` waits on queue `id` in msgsnd or msgrcv.
+pub(crate) fn begin_message_wait(pid: u32, id: u32) -> Result<(), Error> {
+    let mut guard = Guard::acquire().ok_or(Error::Invalid)?;
+    let waits = &mut guard.semaphore_processes().message_waits;
+    if let Some(existing) = waits.iter_mut().find(|(waiter, _)| *waiter == pid) {
+        existing.1 = id;
+        return Ok(());
+    }
+    waits.try_reserve(1).map_err(|_| Error::NoMemory)?;
+    waits.push((pid, id));
+    Ok(())
+}
+
+pub(crate) fn end_message_wait(pid: u32) {
+    if let Some(mut guard) = Guard::acquire() {
+        guard
+            .semaphore_processes()
+            .message_waits
+            .retain(|(waiter, _)| *waiter != pid);
+    }
 }
 
 pub(crate) fn end_semaphore_wait(pid: u32) {

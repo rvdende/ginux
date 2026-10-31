@@ -240,6 +240,27 @@ pub(super) fn linux_clock_supported(clock: u64) -> bool {
     )
 }
 
+/// The CPU time process `pid` has used, in timestamp-counter cycles.
+pub(super) fn linux_process_cpu_cycles(pid: u32) -> u64 {
+    linux_process::live_process_cpu_cycles(
+        pid,
+        pid == current_linux_process_pid(),
+        timer::timestamp_counter(),
+    )
+    .unwrap_or(0)
+}
+
+/// The CPU time process `pid` has used, in clock ticks (USER_HZ).
+pub(super) fn linux_process_cpu_ticks(pid: u32) -> u64 {
+    let frequency = X86_RUNTIME.ELF_PROBE_CLOCK_FREQUENCY.load(Ordering::SeqCst);
+    if frequency == 0 {
+        return 0;
+    }
+    let cycles = linux_process_cpu_cycles(pid);
+    cycles / frequency * LINUX_CLOCK_TICKS_PER_SECOND
+        + cycles % frequency * LINUX_CLOCK_TICKS_PER_SECOND / frequency
+}
+
 pub(super) fn linux_times(output_address: u64) -> u64 {
     let frequency = X86_RUNTIME.ELF_PROBE_CLOCK_FREQUENCY.load(Ordering::SeqCst);
     let epoch = X86_RUNTIME.ELF_PROBE_CLOCK_EPOCH.load(Ordering::SeqCst);
@@ -251,7 +272,8 @@ pub(super) fn linux_times(output_address: u64) -> u64 {
         + elapsed % frequency * LINUX_CLOCK_TICKS_PER_SECOND / frequency;
     if output_address != 0 {
         let mut accounting = [0_u8; 32];
-        accounting[..8].copy_from_slice(&ticks.to_ne_bytes());
+        accounting[..8]
+            .copy_from_slice(&linux_process_cpu_ticks(current_linux_process_pid()).to_ne_bytes());
         if !copy_to_linux_user(output_address, &accounting) {
             return LINUX_EFAULT;
         }
@@ -307,11 +329,14 @@ pub(super) fn linux_getrusage(who: u64, output_address: u64) -> u64 {
     }
     let mut usage = [0_u8; 144];
     if !children {
-        let Some((seconds, nanoseconds)) = linux_elapsed_time() else {
+        let frequency = X86_RUNTIME.ELF_PROBE_CLOCK_FREQUENCY.load(Ordering::SeqCst);
+        if frequency == 0 {
             return LINUX_ENOSYS;
-        };
-        usage[..8].copy_from_slice(&seconds.to_ne_bytes());
-        usage[8..16].copy_from_slice(&(nanoseconds / 1_000).to_ne_bytes());
+        }
+        let cycles = linux_process_cpu_cycles(current_linux_process_pid());
+        let microseconds = cycles % frequency * 1_000_000 / frequency;
+        usage[..8].copy_from_slice(&(cycles / frequency).to_ne_bytes());
+        usage[8..16].copy_from_slice(&microseconds.to_ne_bytes());
         let resident_kib = address_space::current_linux_user_page_count()
             .and_then(|pages| pages.checked_mul(PAGE_SIZE / 1024))
             .and_then(|kib| u64::try_from(kib).ok())

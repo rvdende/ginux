@@ -13198,8 +13198,12 @@ fn run_other_linux_processes(
         let signal_was_active = X86_RUNTIME.LINUX_SIGNAL_ACTIVE.load(Ordering::SeqCst);
         let mut interrupted = caller;
         interrupted.rax = LINUX_EINTR;
-        let delivered =
-            linux_deliver_pending_signal(output, interrupted, (caller.rip, caller.rflags));
+        let delivered = linux_deliver_pending_signal_restarting(
+            output,
+            interrupted,
+            (caller.rip, caller.rflags),
+            Some(number),
+        );
         if delivered != 0 {
             return Some(LinuxBlockedWait::Return(delivered));
         }
@@ -13249,7 +13253,12 @@ fn run_other_linux_processes(
     }
     let mut interrupted = caller;
     interrupted.rax = LINUX_EINTR;
-    let delivered = linux_deliver_pending_signal(output, interrupted, (caller.rip, caller.rflags));
+    let delivered = linux_deliver_pending_signal_restarting(
+        output,
+        interrupted,
+        (caller.rip, caller.rflags),
+        Some(number),
+    );
     Some(if delivered != 0 {
         LinuxBlockedWait::Return(delivered)
     } else if X86_RUNTIME.LINUX_SIGNAL_ACTIVE.load(Ordering::SeqCst) {
@@ -14746,6 +14755,7 @@ fn stage_linux_fork_child_runtime_state(
 
 fn save_current_linux_process_runtime_state(pid: u32) {
     let started = cfg!(feature = "linux-boot-profile").then(timer::timestamp_counter);
+    linux_process::charge_live_process_cpu(pid, timer::timestamp_counter());
     if let (Some(state), Some(destination)) = (
         capture_linux_process_runtime_state(),
         linux_process_runtime_state(pid),
@@ -14768,6 +14778,7 @@ fn restore_saved_linux_process_runtime_state(pid: u32) -> bool {
     let Some(state) = linux_process_runtime_state(pid).filter(|state| state.valid) else {
         return false;
     };
+    linux_process::start_live_process_cpu(timer::timestamp_counter());
     restore_linux_process_runtime_state(state);
     let Some(threads) = linux_process_thread_runtime_state(pid) else {
         return false;
@@ -16187,6 +16198,61 @@ fn linux_msgget(key: u64, flags: u64) -> u64 {
         flags & IPC_EXCL != 0,
     )
     .map_or_else(linux_sysv_ipc_error, u64::from)
+}
+
+/// msgsnd and msgrcv: `attempt` runs the call once. Without IPC_NOWAIT a
+/// full queue or a missing message waits until the call completes, a signal
+/// arrives (EINTR: neither call restarts after an SA_RESTART handler) or the
+/// queue is removed (EIDRM); with it msgsnd fails with EAGAIN and msgrcv
+/// with ENOMSG. The wait outlives the call's restarts, so a removal is seen
+/// as one.
+fn linux_message_wait_live(
+    output: *mut LinuxSyscallFrame,
+    caller: LinuxUserContext,
+    number: u64,
+    (id, flags): (u64, u64),
+    mut attempt: impl FnMut() -> u64,
+) -> u64 {
+    const IPC_NOWAIT: u64 = 0o4000;
+    let pid = current_linux_process_pid();
+    loop {
+        let waited = crate::linux_sysv_ipc::message_wait(pid) == Some(id as u32);
+        let result = attempt();
+        if result != LINUX_EAGAIN {
+            crate::linux_sysv_ipc::end_message_wait(pid);
+            return if result == LINUX_EINVAL && waited {
+                LINUX_EIDRM
+            } else {
+                result
+            };
+        }
+        if flags & IPC_NOWAIT != 0 {
+            crate::linux_sysv_ipc::end_message_wait(pid);
+            return if number == LINUX_MSGRCV_SYSCALL {
+                LINUX_ENOMSG
+            } else {
+                LINUX_EAGAIN
+            };
+        }
+        if crate::linux_sysv_ipc::begin_message_wait(pid, id as u32).is_err() {
+            return LINUX_ENOMEM;
+        }
+        match run_other_linux_processes(output, caller, number) {
+            Some(LinuxBlockedWait::Recheck) => {}
+            // Yielded: the call starts again and finds its wait.
+            Some(LinuxBlockedWait::Return(LINUX_RETURN_TO_KERNEL)) => {
+                return LINUX_RETURN_TO_KERNEL;
+            }
+            Some(LinuxBlockedWait::Return(result)) => {
+                crate::linux_sysv_ipc::end_message_wait(pid);
+                return result;
+            }
+            None => {
+                crate::linux_sysv_ipc::end_message_wait(pid);
+                return LINUX_EINTR;
+            }
+        }
+    }
 }
 
 fn linux_msgsnd(id: u64, message: u64, size: u64, flags: u64) -> u64 {
@@ -30636,7 +30702,9 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
                     && append_linux_bytes(&mut file, &mut used, &[state_letter])
                     && append_linux_bytes(&mut file, &mut used, b" ")
                     && append_linux_decimal(&mut file, &mut used, u64::from(status.parent_pid))
-                    && append_linux_bytes(&mut file, &mut used, b" 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 1 1048576 256 0 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0\n")
+                    && append_linux_bytes(&mut file, &mut used, b" 1 1 0 -1 4194560 0 0 0 0 ")
+                    && append_linux_decimal(&mut file, &mut used, linux_process_cpu_ticks(pid))
+                    && append_linux_bytes(&mut file, &mut used, b" 0 0 0 20 0 1 0 1 1048576 256 0 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0\n")
             }
             LINUX_FILE_PROC_DYNAMIC_STATM => {
                 append_linux_bytes(&mut file, &mut used, b"256 64 32 16 0 32 0\n")

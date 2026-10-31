@@ -1038,10 +1038,10 @@ pub(super) fn linux_executable_user_address(address: u64) -> bool {
 }
 
 pub(super) fn linux_signal_action_deliverable(handler: u64, flags: u64, restorer: u64) -> bool {
-    // SA_RESTART handlers run like others, but a blocking call they
-    // interrupt still returns EINTR rather than restarting; Rust's standard
-    // library and tokio retry EINTR. SA_NOCLDSTOP and SA_NOCLDWAIT only
-    // concern stopped and exiting children, which need no handler change.
+    // A blocking call interrupted for an SA_RESTART handler restarts after
+    // it (linux_deliver_pending_signal_restarting). SA_NOCLDSTOP and
+    // SA_NOCLDWAIT only concern stopped and exiting children, which need no
+    // handler change.
     let supported = LINUX_SA_SIGINFO
         | LINUX_SA_RESTORER
         | LINUX_SA_RESTART
@@ -2299,6 +2299,50 @@ pub(super) fn linux_deliver_pending_signal(
     interrupted: LinuxUserContext,
     return_registers: (u64, u64),
 ) -> u64 {
+    linux_deliver_pending_signal_restarting(output, interrupted, return_registers, None)
+}
+
+/// System calls Linux restarts after a handler installed with SA_RESTART
+/// (signal(7)). Others, such as poll, select, epoll_wait, nanosleep, semop
+/// and timed futex waits, fail with EINTR whatever the handler's flags.
+fn linux_syscall_restartable(number: u64) -> bool {
+    matches!(
+        number,
+        LINUX_READ_SYSCALL
+            | LINUX_READV_SYSCALL
+            | LINUX_PREAD64_SYSCALL
+            | LINUX_PREADV_SYSCALL
+            | LINUX_WRITE_SYSCALL
+            | LINUX_WRITEV_SYSCALL
+            | LINUX_PWRITE64_SYSCALL
+            | LINUX_PWRITEV_SYSCALL
+            | LINUX_WAIT4_SYSCALL
+            | LINUX_WAITID_SYSCALL
+            | LINUX_IOCTL_SYSCALL
+            | LINUX_OPEN_SYSCALL
+            | LINUX_OPENAT_SYSCALL
+            | LINUX_CONNECT_SYSCALL
+            | LINUX_ACCEPT_SYSCALL
+            | LINUX_ACCEPT4_SYSCALL
+            | LINUX_RECVFROM_SYSCALL
+            | LINUX_RECVMSG_SYSCALL
+            | LINUX_SENDTO_SYSCALL
+            | LINUX_SENDMSG_SYSCALL
+            | LINUX_FLOCK_SYSCALL
+            | LINUX_FCNTL_SYSCALL
+            | LINUX_GETRANDOM_SYSCALL
+    )
+}
+
+/// Delivers a pending signal. For system call `restart` interrupted with
+/// EINTR, a handler installed with SA_RESTART returns into the call again,
+/// as Linux restarts it, instead of making it fail.
+pub(super) fn linux_deliver_pending_signal_restarting(
+    output: *mut LinuxSyscallFrame,
+    mut interrupted: LinuxUserContext,
+    return_registers: (u64, u64),
+    restart: Option<u64>,
+) -> u64 {
     if X86_RUNTIME.LINUX_SIGNAL_ACTIVE.load(Ordering::SeqCst) {
         return 0;
     }
@@ -2320,6 +2364,16 @@ pub(super) fn linux_deliver_pending_signal(
     );
     let index = signal as usize - 1;
     let signal_bit = 1 << (signal - 1);
+    if let Some(number) = restart.filter(|number| {
+        interrupted.rax == LINUX_EINTR
+            && linux_syscall_restartable(*number)
+            && X86_RUNTIME.ELF_PROBE_SIGNAL_HANDLERS[index].load(Ordering::SeqCst) > 1
+            && X86_RUNTIME.ELF_PROBE_SIGNAL_FLAGS[index].load(Ordering::SeqCst) & LINUX_SA_RESTART
+                != 0
+    }) {
+        interrupted.rax = number;
+        interrupted.rip = interrupted.rip.wrapping_sub(LINUX_SYSCALL_INSTRUCTION_SIZE);
+    }
     let code = dynamic.map_or_else(
         || X86_RUNTIME.ELF_PROBE_PENDING_SIGNAL_CODES[index].load(Ordering::SeqCst) as i32,
         |(_, pending)| pending.code,
