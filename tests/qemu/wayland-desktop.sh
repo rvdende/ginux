@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Boots Ginux, starts an Alpine domain, and runs the Rust Wayland desktop
-# from userland/ in it: ginux-wm composes onto /dev/fb0 and ginux-term
+# Boots Ginux, starts a domain on the boot image's all-Rust root filesystem
+# (image=builtin://rust: ginux-init, brush, uutils and the programs from
+# userland/), and runs the Rust Wayland desktop: ginux-wm composes onto
+# /dev/fb0 and ginux-term
 # connects over a Wayland socket, sharing its window buffers through memfd
 # pools passed with SCM_RIGHTS. Keys typed on QEMU's USB keyboard travel
 # through xHCI, evdev and the compositor to the terminal's shell, which
 # must echo a marker to the serial console, and a QEMU screendump of the
 # real framebuffer must show the compositor's title bar and the terminal.
-# The guest downloads the static binaries from a host HTTP server at
-# 10.0.2.2.
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "$0")/../.." && pwd)
@@ -18,10 +18,7 @@ qemu_pid_file="$work_dir/qemu.pid"
 screenshot="$work_dir/screen.ppm"
 # Unix socket paths are limited to 108 bytes, so the monitor lives in target/.
 monitor="$repo_root/target/desktop-monitor.$$"
-http_port="${GINUX_DESKTOP_HTTP_PORT:-18184}"
-serve_dir="$work_dir/serve"
 qemu_pid=""
-http_pid=""
 
 stop_qemu() {
     local pid=""
@@ -38,9 +35,6 @@ cleanup() {
     if [[ -n "$qemu_pid" ]] && kill -0 "$qemu_pid" 2>/dev/null; then
         kill "$qemu_pid" 2>/dev/null || true
         wait "$qemu_pid" 2>/dev/null || true
-    fi
-    if [[ -n "$http_pid" ]]; then
-        kill "$http_pid" 2>/dev/null || true
     fi
     cp "$output_file" "$repo_root/target/wayland-desktop-serial.log" 2>/dev/null || true
     cp "$screenshot" "$repo_root/target/wayland-desktop.ppm" 2>/dev/null || true
@@ -88,29 +82,17 @@ type_text() {
     monitor_command "sendkey ret"
 }
 
-(cd "$repo_root/userland" && cargo build --release --target x86_64-unknown-linux-musl)
-mkdir -p "$serve_dir"
-cp "$repo_root/userland/target/x86_64-unknown-linux-musl/release/ginux-wm" \
-    "$repo_root/userland/target/x86_64-unknown-linux-musl/release/ginux-term" "$serve_dir/"
-python3 -I -m http.server "$http_port" --bind 127.0.0.1 --directory "$serve_dir" \
-    >/dev/null 2>&1 &
-http_pid=$!
-
-fetch="wget -q http://10.0.2.2:${http_port}"
 dd if=/dev/zero of="$volume_image" bs=1048576 count=1 2>/dev/null
 : >"$output_file"
 {
     wait_for 'ginux> ' 300
     printf '%s\n' \
         'domain new desktop' \
-        'domain set desktop image=alpine:latest init=/bin/sh' \
+        'domain set desktop image=builtin://rust init=/sbin/init' \
         'domain start desktop --attach'
-    wait_for 'ginux: OCI image ready' 900
-    sleep 5
-    printf '%s\n' \
-        "cd /tmp && $fetch/ginux-wm && $fetch/ginux-term && chmod +x ginux-wm ginux-term && echo FETCHED\"_OK\""
-    wait_for '^FETCHED_OK' 120
-    printf '%s\n' "./ginux-wm --terminal /tmp/ginux-term --spawn /tmp/ginux-term &"
+    wait_for 'all written in Rust' 300
+    sleep 2
+    printf '%s\n' "ginux-wm --terminal ginux-term --spawn ginux-term &"
     wait_for 'GINUX_WM_READY' 60
     # Give the terminal time to connect, draw and take keyboard focus.
     sleep 15

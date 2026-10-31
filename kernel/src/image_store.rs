@@ -12,6 +12,13 @@ const OBJECT_LIMIT: usize = ginux_oci::OCI_LAYER_LIMIT;
 pub(crate) const CACHE_QUOTA: usize = usize::MAX;
 
 static INSTALLED: AtomicBool = AtomicBool::new(false);
+/// The all-Rust root filesystem carried in the boot image (a gzip'd POSIX
+/// tar) for `image=builtin://rust`: its physical address and length.
+static BUILTIN_ROOTFS_ADDRESS: AtomicU64 = AtomicU64::new(0);
+static BUILTIN_ROOTFS_LENGTH: AtomicUsize = AtomicUsize::new(0);
+
+/// The image reference that selects the boot image's Rust root filesystem.
+pub(crate) const BUILTIN_RUST_IMAGE: &[u8] = b"builtin://rust";
 static mut STORE: MaybeUninit<ImageStore<RamBackend, OBJECT_LIMIT>> = MaybeUninit::uninit();
 static mut PUBLISHED_LAYERS: [Digest; ginux_oci::OCI_LAYER_LIMIT] =
     [Digest([0; 32]); ginux_oci::OCI_LAYER_LIMIT];
@@ -177,6 +184,41 @@ pub(crate) fn install() -> bool {
         )));
     }
     true
+}
+
+/// Records the boot image's Rust root filesystem; called once during boot.
+pub(crate) fn set_builtin_rootfs(physical: u64, length: usize) {
+    BUILTIN_ROOTFS_ADDRESS.store(physical, Ordering::Release);
+    BUILTIN_ROOTFS_LENGTH.store(length, Ordering::Release);
+}
+
+pub(crate) fn builtin_rootfs_available() -> bool {
+    BUILTIN_ROOTFS_LENGTH.load(Ordering::Acquire) != 0
+}
+
+/// Stages the boot image's Rust root filesystem as the image's only layer,
+/// as a registry pull would, so installation unpacks and checks it with the
+/// same code. Its digest is computed here: the bytes come from the boot
+/// image, whose integrity is the boot chain's to establish.
+pub(crate) fn stage_builtin_layer() -> bool {
+    let length = BUILTIN_ROOTFS_LENGTH.load(Ordering::Acquire);
+    let Some(address) = crate::arch::x86_64::paging::direct_map_range_address(
+        BUILTIN_ROOTFS_ADDRESS.load(Ordering::Acquire),
+        length,
+    ) else {
+        return false;
+    };
+    // SAFETY: set_builtin_rootfs recorded read-only boot-image data that
+    // stays mapped for the kernel's lifetime.
+    let bytes = unsafe { core::slice::from_raw_parts(address as *const u8, length) };
+    let Ok(handle) = stage(crate::crypto::sha256(bytes), length) else {
+        return false;
+    };
+    if append(handle, bytes) != Ok(length) {
+        let _ = abort(handle);
+        return false;
+    }
+    publish(handle).is_ok()
 }
 
 pub(crate) fn stage(digest: [u8; 32], length: usize) -> Result<StagingHandle, StoreError> {

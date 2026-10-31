@@ -7,7 +7,7 @@ ovmf_vars := env_var_or_default("OVMF_VARS", "/usr/share/OVMF/OVMF_VARS_4M.fd")
 default:
     @just --list
 
-# Build, boot Ginux in a window and start the Rust Wayland desktop in an Alpine domain.
+# Build, boot Ginux in a window and start the Rust Wayland desktop on the all-Rust userland.
 desktop:
     tools/qemu/desktop.sh
 
@@ -39,3 +39,11 @@ check:
 # Run the end-to-end desktop test (USB typing, screendump, clean shutdown).
 test-desktop:
     OVMF_CODE={{ovmf_code}} OVMF_VARS={{ovmf_vars}} make test-desktop
+
+# Boot the all-Rust userland domain and run its shell test.
+test-rust-userland:
+    OVMF_CODE={{ovmf_code}} OVMF_VARS={{ovmf_vars}} make test-rust-userland
+
+# Build build/rootfs-rust.tar.gz, the all-Rust root filesystem for builtin://rust.
+rust-rootfs:
+    make rust-rootfs

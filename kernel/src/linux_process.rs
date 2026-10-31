@@ -1102,6 +1102,7 @@ impl ProcessTable {
         self.child_wait_state_matching(
             parent,
             |process| pid.is_none_or(|pid| process.handle.pid == pid),
+            true,
             report_stopped,
             report_continued,
         )
@@ -1117,15 +1118,20 @@ impl ProcessTable {
         self.child_wait_state_matching(
             parent,
             |process| process.process_group == process_group,
+            true,
             report_stopped,
             report_continued,
         )
     }
 
+    /// The wait-visible state of the first matching child. Exited children
+    /// are reported only with `report_exited`: waitid(2) without WEXITED
+    /// must not see, and so must not reap, them.
     fn child_wait_state_matching(
         &self,
         parent: ProcessHandle,
         matches: impl Fn(&Process) -> bool,
+        report_exited: bool,
         report_stopped: bool,
         report_continued: bool,
     ) -> Option<ChildWaitState> {
@@ -1139,7 +1145,7 @@ impl ProcessTable {
             .filter(|process| process.parent == Some(parent) && matches(process));
         let child = children
             .clone()
-            .find(|process| matches!(process.state, ProcessState::Zombie { .. }))
+            .find(|process| report_exited && matches!(process.state, ProcessState::Zombie { .. }))
             .or_else(|| {
                 children.clone().find(|process| {
                     report_stopped
@@ -1167,6 +1173,7 @@ impl ProcessTable {
             | ProcessState::Stopped { .. }
             | ProcessState::Preparing
             | ProcessState::Exiting => Some(ChildWaitState::Running),
+            ProcessState::Zombie { .. } if !report_exited => Some(ChildWaitState::Running),
             ProcessState::Zombie { status } => Some(ChildWaitState::Exited {
                 pid: child.handle.pid,
                 status,
@@ -3473,23 +3480,42 @@ pub(crate) fn wait_live_child(parent_pid: u32, child_pid: u32) -> Option<(u32, u
 pub(crate) fn live_child_wait_state(
     parent_pid: u32,
     child_pid: Option<u32>,
-    report_stopped: bool,
-    report_continued: bool,
+    events: ChildWaitEvents,
 ) -> Option<ChildWaitState> {
     let table = live_process_table_mut()?;
     let parent = table.handle_by_pid(parent_pid)?;
-    table.child_wait_state(parent, child_pid, report_stopped, report_continued)
+    table.child_wait_state_matching(
+        parent,
+        |process| child_pid.is_none_or(|pid| process.handle.pid == pid),
+        events.exited,
+        events.stopped,
+        events.continued,
+    )
 }
 
 pub(crate) fn live_child_group_wait_state(
     parent_pid: u32,
     process_group: u32,
-    report_stopped: bool,
-    report_continued: bool,
+    events: ChildWaitEvents,
 ) -> Option<ChildWaitState> {
     let table = live_process_table_mut()?;
     let parent = table.handle_by_pid(parent_pid)?;
-    table.child_group_wait_state(parent, process_group, report_stopped, report_continued)
+    table.child_wait_state_matching(
+        parent,
+        |process| process.process_group == process_group,
+        events.exited,
+        events.stopped,
+        events.continued,
+    )
+}
+
+/// Which child state changes a wait reports (WEXITED, WUNTRACED/WSTOPPED,
+/// WCONTINUED).
+#[derive(Clone, Copy)]
+pub(crate) struct ChildWaitEvents {
+    pub(crate) exited: bool,
+    pub(crate) stopped: bool,
+    pub(crate) continued: bool,
 }
 
 pub(crate) fn consume_live_child_wait_event(parent_pid: u32, child_pid: u32) -> bool {

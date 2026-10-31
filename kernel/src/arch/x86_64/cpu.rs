@@ -918,7 +918,10 @@ const LINUX_SI_TKILL: i32 = -6;
 const LINUX_SI_KERNEL: i32 = 0x80;
 const LINUX_SEGV_MAPERR: i32 = 1;
 const LINUX_SEGV_ACCERR: i32 = 2;
+const LINUX_SA_NOCLDSTOP: u64 = 0x0000_0001;
+const LINUX_SA_NOCLDWAIT: u64 = 0x0000_0002;
 const LINUX_SA_SIGINFO: u64 = 0x0000_0004;
+const LINUX_SA_RESTART: u64 = 0x1000_0000;
 const LINUX_SA_RESTORER: u64 = 0x0400_0000;
 const LINUX_SA_ONSTACK: u64 = 0x0800_0000;
 const LINUX_SA_NODEFER: u64 = 0x4000_0000;
@@ -1721,6 +1724,10 @@ static ELF_PROBE_EPOLL_DATA: [BankedAtomicU64; LINUX_DESCRIPTOR_TABLE_LIMIT as u
     [const { BankedAtomicU64::new(0) }; LINUX_DESCRIPTOR_TABLE_LIMIT as usize];
 static LINUX_RUNTIME_EPOLL_ACTIVE: [BankedAtomicU8; LINUX_DEVICE_DESCRIPTOR_COUNT] =
     [const { BankedAtomicU8::new(0) }; LINUX_DEVICE_DESCRIPTOR_COUNT];
+/// For an epoll descriptor duplicated from another, the descriptor (+ 1)
+/// that owns the shared instance's watches; 0 when it owns them itself.
+static LINUX_RUNTIME_EPOLL_ALIASES: [BankedAtomicU16; LINUX_DEVICE_DESCRIPTOR_COUNT] =
+    [const { BankedAtomicU16::new(0) }; LINUX_DEVICE_DESCRIPTOR_COUNT];
 static LINUX_RUNTIME_EPOLL_WATCH_EPOLL: [BankedAtomicU16; LINUX_DESCRIPTOR_TABLE_LIMIT as usize] =
     [const { BankedAtomicU16::new(0) }; LINUX_DESCRIPTOR_TABLE_LIMIT as usize];
 static LINUX_RUNTIME_EPOLL_WATCH_TARGET: [BankedAtomicU16; LINUX_DESCRIPTOR_TABLE_LIMIT as usize] =
@@ -2128,6 +2135,7 @@ ginux_fatal_exception_call:
     mov rsi, [rsp + 128]
     mov rdx, cr2
     mov rcx, [rsp + 136]
+    mov r8, rsp
     and rsp, -16
     call {fatal_exception_handler}
     ud2
@@ -7420,6 +7428,9 @@ pub(crate) fn verify_linux_elf_entry(execution: &LinuxElfExecution<'_>) -> Linux
     for active in &LINUX_RUNTIME_EPOLL_ACTIVE {
         active.store(0, Ordering::SeqCst);
     }
+    for alias in &LINUX_RUNTIME_EPOLL_ALIASES {
+        alias.store(0, Ordering::SeqCst);
+    }
     ELF_PROBE_EVENTFD_DESCRIPTOR.store(0, Ordering::SeqCst);
     ELF_PROBE_EVENTFD_COUNTER.store(0, Ordering::SeqCst);
     ELF_PROBE_EVENTFD_FLAGS.store(0, Ordering::SeqCst);
@@ -12337,25 +12348,16 @@ enum LinuxChildWaitSelector {
 fn linux_child_wait_state(
     parent: u32,
     selector: LinuxChildWaitSelector,
-    report_stopped: bool,
-    report_continued: bool,
+    events: linux_process::ChildWaitEvents,
 ) -> Option<linux_process::ChildWaitState> {
     match selector {
-        LinuxChildWaitSelector::Any => {
-            linux_process::live_child_wait_state(parent, None, report_stopped, report_continued)
+        LinuxChildWaitSelector::Any => linux_process::live_child_wait_state(parent, None, events),
+        LinuxChildWaitSelector::Process(pid) => {
+            linux_process::live_child_wait_state(parent, Some(pid), events)
         }
-        LinuxChildWaitSelector::Process(pid) => linux_process::live_child_wait_state(
-            parent,
-            Some(pid),
-            report_stopped,
-            report_continued,
-        ),
-        LinuxChildWaitSelector::ProcessGroup(group) => linux_process::live_child_group_wait_state(
-            parent,
-            group,
-            report_stopped,
-            report_continued,
-        ),
+        LinuxChildWaitSelector::ProcessGroup(group) => {
+            linux_process::live_child_group_wait_state(parent, group, events)
+        }
     }
 }
 
@@ -12392,8 +12394,11 @@ fn linux_wait4(pid: u64, status_address: u64, options: u64, rusage: u64) -> u64 
     let Some(state) = linux_child_wait_state(
         parent_pid,
         selector,
-        options & LINUX_WUNTRACED != 0,
-        options & LINUX_WCONTINUED != 0,
+        linux_process::ChildWaitEvents {
+            exited: true,
+            stopped: options & LINUX_WUNTRACED != 0,
+            continued: options & LINUX_WCONTINUED != 0,
+        },
     ) else {
         serial_write("ginux: wait4 no child parent/selector/options: ");
         serial_write_u64(u64::from(parent_pid));
@@ -12499,11 +12504,17 @@ fn linux_waitid(id_type: u64, id: u64, information: u64, options: u64, rusage: u
         return LINUX_EFAULT;
     }
     let parent = current_linux_process_pid();
+    // Exited children are visible only when WEXITED is asked for; brush polls
+    // for stopped children with waitid(WSTOPPED | WNOHANG) and must not reap
+    // the children its runtime waits for.
     let Some(state) = linux_child_wait_state(
         parent,
         selector,
-        options & LINUX_WUNTRACED != 0,
-        options & LINUX_WCONTINUED != 0,
+        linux_process::ChildWaitEvents {
+            exited: options & LINUX_WEXITED != 0,
+            stopped: options & LINUX_WUNTRACED != 0,
+            continued: options & LINUX_WCONTINUED != 0,
+        },
     ) else {
         return LINUX_ECHILD;
     };
@@ -14414,6 +14425,7 @@ struct LinuxDescriptorRuntimeState {
     epoll_events: [u32; LINUX_DESCRIPTOR_TABLE_LIMIT as usize],
     epoll_data: [u64; LINUX_DESCRIPTOR_TABLE_LIMIT as usize],
     runtime_epoll_active: [u8; LINUX_DEVICE_DESCRIPTOR_COUNT],
+    runtime_epoll_aliases: [u16; LINUX_DEVICE_DESCRIPTOR_COUNT],
     runtime_epoll_watch_epoll: [u16; LINUX_DESCRIPTOR_TABLE_LIMIT as usize],
     runtime_epoll_watch_target: [u16; LINUX_DESCRIPTOR_TABLE_LIMIT as usize],
     runtime_eventfd_active: [u64; LINUX_DESCRIPTOR_FLAG_WORD_COUNT],
@@ -14456,6 +14468,7 @@ impl LinuxDescriptorRuntimeState {
         epoll_events: [0; LINUX_DESCRIPTOR_TABLE_LIMIT as usize],
         epoll_data: [0; LINUX_DESCRIPTOR_TABLE_LIMIT as usize],
         runtime_epoll_active: [0; LINUX_DEVICE_DESCRIPTOR_COUNT],
+        runtime_epoll_aliases: [0; LINUX_DEVICE_DESCRIPTOR_COUNT],
         runtime_epoll_watch_epoll: [0; LINUX_DESCRIPTOR_TABLE_LIMIT as usize],
         runtime_epoll_watch_target: [0; LINUX_DESCRIPTOR_TABLE_LIMIT as usize],
         runtime_eventfd_active: [0; LINUX_DESCRIPTOR_FLAG_WORD_COUNT],
@@ -14955,6 +14968,9 @@ fn capture_linux_descriptor_runtime_state() -> LinuxDescriptorRuntimeState {
         runtime_epoll_active: core::array::from_fn(|index| {
             LINUX_RUNTIME_EPOLL_ACTIVE[index].load(Ordering::SeqCst)
         }),
+        runtime_epoll_aliases: core::array::from_fn(|index| {
+            LINUX_RUNTIME_EPOLL_ALIASES[index].load(Ordering::SeqCst)
+        }),
         runtime_epoll_watch_epoll: core::array::from_fn(|index| {
             LINUX_RUNTIME_EPOLL_WATCH_EPOLL[index].load(Ordering::SeqCst)
         }),
@@ -15115,6 +15131,8 @@ fn install_linux_descriptor_runtime_state(state: &LinuxDescriptorRuntimeState) {
     for index in 0..LINUX_DEVICE_DESCRIPTOR_COUNT {
         LINUX_RUNTIME_EPOLL_ACTIVE[index]
             .store(state.runtime_epoll_active[index], Ordering::SeqCst);
+        LINUX_RUNTIME_EPOLL_ALIASES[index]
+            .store(state.runtime_epoll_aliases[index], Ordering::SeqCst);
         let word = index / 64;
         let bit = index % 64;
         LINUX_RUNTIME_EVENTFD_ACTIVE[index].store(
@@ -31637,6 +31655,12 @@ fn wake_linux_timerfd_read_waits() -> u32 {
     woken
 }
 
+fn linux_console_input_descriptor(descriptor: u64) -> bool {
+    let device = linux_device_descriptor(descriptor);
+    u16::from(linux_console_descriptor(descriptor)) & LINUX_DESCRIPTOR_INPUT != 0
+        || device & LINUX_DEVICE_CONSOLE != 0 && matches!(device & 3, LINUX_DESCRIPTOR_INPUT | 3)
+}
+
 fn linux_descriptor_read_live_return(
     output: *mut LinuxSyscallFrame,
     caller: LinuxUserContext,
@@ -31652,6 +31676,17 @@ fn linux_descriptor_read_live_return(
             descriptor,
             || linux_descriptor_read(descriptor, address, count),
         );
+    }
+    // A console read with nothing typed yet would wait inside the kernel and
+    // keep this process's other threads from running (brush reads input on
+    // its own thread, so its main thread could never finish `exit`). Let a
+    // ready sibling thread run and read again later instead.
+    if LINUX_RUNTIME_MODE.load(Ordering::Acquire)
+        && linux_console_input_descriptor(descriptor)
+        && !crate::serial_input_ready()
+        && ready_linux_thread_handle().is_some()
+    {
+        return linux_retry_later_live_return(output, caller, LINUX_READ_SYSCALL);
     }
     let immediate = linux_descriptor_read(descriptor, address, count);
     if LINUX_RUNTIME_MODE.load(Ordering::Acquire)
@@ -33051,6 +33086,7 @@ fn linux_epoll_ctl(epoll: u64, operation: u64, descriptor: u64, event_address: u
     if descriptor == epoll {
         return LINUX_EINVAL;
     }
+    let epoll = linux_epoll_instance(epoll);
     if !linux_descriptor_open(descriptor) {
         return LINUX_EBADF;
     }
@@ -33138,6 +33174,7 @@ fn linux_epoll_event(epoll: u64) -> Result<Option<[u8; 12]>, u64> {
     if !linux_epoll_descriptor(epoll) {
         return Err(LINUX_EBADF);
     }
+    let epoll = linux_epoll_instance(epoll);
     let runtime = LINUX_RUNTIME_MODE.load(Ordering::SeqCst);
     for slot in 0..LINUX_DESCRIPTOR_TABLE_LIMIT as usize {
         let target = if runtime {
@@ -33172,6 +33209,62 @@ fn linux_epoll_event(epoll: u64) -> Result<Option<[u8; 12]>, u64> {
         }
     }
     Ok(None)
+}
+
+/// The descriptor that owns an epoll instance's watches: the descriptor
+/// itself, unless it was duplicated from another epoll descriptor.
+fn linux_epoll_instance(descriptor: u64) -> u64 {
+    descriptor
+        .checked_sub(LINUX_AUX_DESCRIPTOR_FIRST)
+        .and_then(|index| LINUX_RUNTIME_EPOLL_ALIASES.get(index as usize))
+        .map(|alias| alias.load(Ordering::SeqCst))
+        .filter(|alias| *alias != 0)
+        .map_or(descriptor, |alias| u64::from(alias - 1))
+}
+
+/// Makes `target` another descriptor for the epoll instance `source` refers
+/// to, as dup(2) does; tokio duplicates its epoll descriptor this way.
+fn linux_epoll_dup(source: u64, target: u64) -> u64 {
+    if source == target {
+        return target;
+    }
+    if !LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
+        || target < LINUX_AUX_DESCRIPTOR_FIRST
+        || target >= linux_nofile_soft_limit()
+    {
+        return LINUX_EBADF;
+    }
+    if linux_descriptor_open(target) && linux_descriptor_close(target) != 0 {
+        return LINUX_EBADF;
+    }
+    let instance = linux_epoll_instance(source);
+    let index = (target - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
+    LINUX_RUNTIME_EPOLL_ALIASES[index].store(instance as u16 + 1, Ordering::SeqCst);
+    LINUX_RUNTIME_EPOLL_ACTIVE[index].store(1, Ordering::SeqCst);
+    set_linux_descriptor_close_on_exec(target, false);
+    target
+}
+
+/// When the descriptor owning an epoll instance closes while duplicates
+/// remain, moves the instance's watches to the first duplicate and points
+/// the others at it. Returns false if there was no duplicate.
+fn linux_epoll_hand_over(owner: u64) -> bool {
+    let owner_value = owner as u16 + 1;
+    let Some(heir) = (0..LINUX_DEVICE_DESCRIPTOR_COUNT)
+        .find(|index| LINUX_RUNTIME_EPOLL_ALIASES[*index].load(Ordering::SeqCst) == owner_value)
+    else {
+        return false;
+    };
+    let heir_descriptor = heir as u64 + LINUX_AUX_DESCRIPTOR_FIRST;
+    let heir_value = heir_descriptor as u16 + 1;
+    LINUX_RUNTIME_EPOLL_ALIASES[heir].store(0, Ordering::SeqCst);
+    for alias in &LINUX_RUNTIME_EPOLL_ALIASES {
+        let _ = alias.compare_exchange(owner_value, heir_value, Ordering::SeqCst, Ordering::SeqCst);
+    }
+    for watch in &LINUX_RUNTIME_EPOLL_WATCH_EPOLL {
+        let _ = watch.compare_exchange(owner_value, heir_value, Ordering::SeqCst, Ordering::SeqCst);
+    }
+    true
 }
 
 fn linux_epoll_forget_descriptor(descriptor: u64) {
@@ -36388,7 +36481,11 @@ fn linux_descriptor_close_with_wake_inner(descriptor: u64, wake_waiters: bool) -
         if LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
             let index = (descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
             LINUX_RUNTIME_EPOLL_ACTIVE[index].store(0, Ordering::SeqCst);
-            linux_epoll_forget_owner(descriptor);
+            if LINUX_RUNTIME_EPOLL_ALIASES[index].swap(0, Ordering::SeqCst) == 0
+                && !linux_epoll_hand_over(descriptor)
+            {
+                linux_epoll_forget_owner(descriptor);
+            }
         } else {
             ELF_PROBE_EPOLL_DESCRIPTOR.store(0, Ordering::SeqCst);
             for target in 0..LINUX_DESCRIPTOR_TABLE_LIMIT as usize {
@@ -36582,6 +36679,9 @@ fn linux_finish_descriptor_dup(source: u64, target: u64) -> u64 {
 fn linux_console_dup2(source: u64, target: u64) -> u64 {
     let source = u64::from(source as u32);
     let target = u64::from(target as u32);
+    if linux_epoll_descriptor(source) {
+        return linux_epoll_dup(source, target);
+    }
     let device = linux_device_descriptor(source);
     if device != 0 {
         if source == target {
@@ -36862,6 +36962,8 @@ fn linux_descriptor_fcntl(descriptor: u64, command: u64, argument: u64) -> u64 {
     if state == 0 {
         if linux_epoll_descriptor(descriptor) {
             return match command {
+                LINUX_F_DUPFD => linux_console_dup_at_least(descriptor, argument, false),
+                LINUX_F_DUPFD_CLOEXEC => linux_console_dup_at_least(descriptor, argument, true),
                 LINUX_F_GETFD | LINUX_F_SETFD => {
                     linux_fcntl_descriptor_flags(descriptor, command, argument)
                 }
@@ -37697,8 +37799,11 @@ fn verify_linux_cross_process_prlimit(pid: u32) -> bool {
         && linux_process::live_child_wait_state(
             current_linux_process_pid(),
             Some(pid),
-            false,
-            false,
+            linux_process::ChildWaitEvents {
+                exited: true,
+                stopped: false,
+                continued: false,
+            },
         ) == Some(linux_process::ChildWaitState::Exited {
             pid,
             status: LINUX_PROBE_EXIT_STATUS as u8,
@@ -41440,11 +41545,18 @@ fn linux_executable_user_address(address: u64) -> bool {
 }
 
 fn linux_signal_action_deliverable(handler: u64, flags: u64, restorer: u64) -> bool {
+    // SA_RESTART handlers run like others, but a blocking call they
+    // interrupt still returns EINTR rather than restarting; Rust's standard
+    // library and tokio retry EINTR. SA_NOCLDSTOP and SA_NOCLDWAIT only
+    // concern stopped and exiting children, which need no handler change.
     let supported = LINUX_SA_SIGINFO
         | LINUX_SA_RESTORER
         | LINUX_SA_ONSTACK
         | LINUX_SA_NODEFER
-        | LINUX_SA_RESETHAND;
+        | LINUX_SA_RESETHAND
+        | LINUX_SA_RESTART
+        | LINUX_SA_NOCLDSTOP
+        | LINUX_SA_NOCLDWAIT;
     handler > 1
         && flags & LINUX_SA_RESTORER != 0
         && flags & !supported == 0
@@ -45342,7 +45454,10 @@ fn valid_container_image(image: &[u8]) -> bool {
 }
 
 fn canonical_container_image(image: &[u8], output: &mut [u8]) -> Option<usize> {
-    if image == b"embedded://minimal-system-v0" {
+    if image == b"embedded://minimal-system-v0"
+        || image == crate::image_store::BUILTIN_RUST_IMAGE
+            && crate::image_store::builtin_rootfs_available()
+    {
         output.get_mut(..image.len())?.copy_from_slice(image);
         return Some(image.len());
     }
@@ -46503,23 +46618,115 @@ unsafe fn write_msr(msr: u32, value: u64) {
     asm!("wrmsr", in("ecx") msr, in("eax") value as u32, in("edx") (value >> 32) as u32, options(nomem, nostack, preserves_flags));
 }
 
+/// Set while a fatal kernel exception is being reported, so a fault in the
+/// report itself prints one line instead of recursing into a triple fault.
+static FATAL_EXCEPTION_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Writes `label` and `value` in hex straight to the UART and framebuffer,
+/// bypassing the domain console path, which may itself be what faulted.
+fn fatal_write_hex(label: &str, value: u64) {
+    let mut text = [0_u8; 18];
+    text[0] = b'0';
+    text[1] = b'x';
+    for (index, digit) in text[2..].iter_mut().enumerate() {
+        let nibble = (value >> ((15 - index) * 4)) & 0xf;
+        *digit = b"0123456789abcdef"[nibble as usize];
+    }
+    crate::serial_write_raw(label.as_bytes());
+    crate::serial_write_raw(&text);
+}
+
+/// Reports a fatal kernel exception: the vector and fault details, every
+/// saved register, control registers, kernel return addresses found on the
+/// interrupted stack (with the image base, for symbolizing them), and then
+/// the Linux state, which is read last since it is the likeliest to fault.
 extern "sysv64" fn fatal_exception_handler(
     vector: u64,
     error: u64,
     fault_address: u64,
     instruction: u64,
+    frame: *const u64,
 ) -> ! {
-    serial_write("ginux: fatal exception vector: ");
-    serial_write_u64(vector);
-    serial_write("\r\nginux: exception error code: ");
-    serial_write_u64(error);
-    serial_write("\r\nginux: exception instruction: ");
-    serial_write_u64(instruction);
-    if vector == 14 {
-        serial_write("\r\nginux: page fault address: ");
-        serial_write_u64(fault_address);
+    if FATAL_EXCEPTION_ACTIVE.swap(true, Ordering::SeqCst) {
+        fatal_write_hex("\r\nginux: nested fatal exception vector ", vector);
+        fatal_write_hex(" at ", instruction);
+        crate::serial_write_raw(b"\r\nGINUX_KERNEL_PANIC\r\n");
+        loop {
+            core::hint::spin_loop();
+        }
     }
-    serial_write("\r\nginux: exception Linux snapshot/fork/pid: ");
+    const REGISTERS: [&str; 15] = [
+        "r15", "r14", "r13", "r12", "r11", "r10", "r9", "r8", "rbp", "rdi", "rsi", "rdx", "rcx",
+        "rbx", "rax",
+    ];
+    fatal_write_hex("\r\nginux: fatal exception vector ", vector);
+    fatal_write_hex(" error ", error);
+    fatal_write_hex(" rip ", instruction);
+    if vector == 14 {
+        fatal_write_hex(" cr2 ", fault_address);
+    }
+    // SAFETY: the entry stub pushed the 15 general registers, then the vector
+    // and error code, and the CPU pushed rip, cs, rflags, rsp and ss.
+    let saved = |index: usize| unsafe { frame.add(index).read_volatile() };
+    crate::serial_write_raw(b"\r\nginux: registers");
+    for (index, name) in REGISTERS.iter().enumerate() {
+        if index % 5 == 0 {
+            crate::serial_write_raw(b"\r\n ");
+        }
+        crate::serial_write_raw(b" ");
+        fatal_write_hex(name, saved(index));
+    }
+    fatal_write_hex("\r\n  cs ", saved(18));
+    fatal_write_hex(" rflags ", saved(19));
+    fatal_write_hex(" rsp ", saved(20));
+    fatal_write_hex(" ss ", saved(21));
+    let (cr0, cr3, cr4): (u64, u64, u64);
+    // SAFETY: reading control registers has no side effects.
+    unsafe {
+        asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));
+        asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
+        asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+    }
+    fatal_write_hex("\r\n  cr0 ", cr0);
+    fatal_write_hex(" cr2 ", fault_address);
+    fatal_write_hex(" cr3 ", cr3);
+    fatal_write_hex(" cr4 ", cr4);
+    let (image_base, image_size) = crate::kernel_image_range();
+    fatal_write_hex("\r\nginux: kernel image base ", image_base);
+    fatal_write_hex(" size ", image_size);
+    // Kernel-mode faults only: scan the interrupted stack for values that
+    // point into the kernel image, which include the return addresses.
+    let interrupted_stack = saved(20);
+    if saved(18) & 3 == 0 && image_size != 0 {
+        crate::serial_write_raw(b"\r\nginux: kernel addresses on stack:");
+        let mut found = 0;
+        // An overflow faults with rsp on the guard page; scanning then starts
+        // on the first mapped page above it.
+        let mut start = interrupted_stack;
+        for _ in 0..2 {
+            if crate::arch::x86_64::paging::kernel_address_is_mapped(start) {
+                break;
+            }
+            start = (start | 0xfff) + 1;
+        }
+        for slot in 0..512_u64 {
+            let address = start.wrapping_add(slot * 8);
+            if !crate::arch::x86_64::paging::kernel_address_is_mapped(address) {
+                break;
+            }
+            // SAFETY: the page holding `address` is mapped, checked above.
+            let value = unsafe { (address as *const u64).read_volatile() };
+            if value > image_base && value < image_base + image_size {
+                crate::serial_write_raw(b" ");
+                fatal_write_hex("", value);
+                found += 1;
+                if found == 24 {
+                    break;
+                }
+            }
+        }
+    }
+    crate::serial_write_raw(b"\r\nginux: Linux snapshot/fork/pid: ");
     serial_write_u64(u64::from(
         LINUX_PROCESS_SNAPSHOT_STAGE.load(Ordering::SeqCst),
     ));
@@ -46527,7 +46734,11 @@ extern "sysv64" fn fatal_exception_handler(
     serial_write_u64(u64::from(linux_process::live_fork_execution_stage()));
     serial_write(" ");
     serial_write_u64(u64::from(current_linux_process_pid()));
-    serial_write("\r\nGINUX_KERNEL_PANIC\r\n");
+    serial_write(" tid ");
+    serial_write_u64(u64::from(current_linux_tid().unwrap_or(0)));
+    crate::serial_write_raw(b"\r\n");
+    write_linux_runtime_syscall_trace();
+    crate::serial_write_raw(b"GINUX_KERNEL_PANIC\r\n");
     loop {
         core::hint::spin_loop();
     }

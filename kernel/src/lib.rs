@@ -44,6 +44,18 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const COM1: u16 = 0x3f8;
 static OPERATOR_CONSOLE_READY: AtomicBool = AtomicBool::new(false);
+/// Where the loaded kernel image lies, so crash reports can name code
+/// addresses relative to it.
+static KERNEL_IMAGE_BASE: AtomicU64 = AtomicU64::new(0);
+static KERNEL_IMAGE_SIZE: AtomicU64 = AtomicU64::new(0);
+
+/// The loaded kernel image's base address and size.
+pub(crate) fn kernel_image_range() -> (u64, u64) {
+    (
+        KERNEL_IMAGE_BASE.load(Ordering::Relaxed),
+        KERNEL_IMAGE_SIZE.load(Ordering::Relaxed),
+    )
+}
 static BACKGROUND_DOMAIN_OUTPUT: AtomicBool = AtomicBool::new(false);
 static LINUX_REALTIME_EPOCH_SECONDS: AtomicU64 = AtomicU64::new(0);
 static LINUX_REALTIME_EPOCH_TSC: AtomicU64 = AtomicU64::new(0);
@@ -61,7 +73,11 @@ const EFI_CONVENTIONAL_MEMORY: u32 = 7;
 const UEFI_PAGES_PER_MIB: u64 = 256;
 const PAGE_SIZE: usize = 4096;
 const Q35_IOMMU_REGISTER_BASE: u64 = 0xfed9_0000;
-const KERNEL_STACK_SIZE: usize = 512 * 1024;
+// Linux processes run nested inside the syscalls of the processes that
+// started them, all on this stack, so its depth bounds how deep a process
+// tree (a shell running a compositor running a terminal running a shell) can
+// be. 512 KiB overflowed under the all-Rust desktop and a cargo build.
+const KERNEL_STACK_SIZE: usize = 2 * 1024 * 1024;
 const KERNEL_STACK_STORAGE_SIZE: usize = PAGE_SIZE + KERNEL_STACK_SIZE + PAGE_SIZE;
 const PERSISTENT_LOCAL_CONFIG_SIZE: usize =
     arch::x86_64::cpu::PERSISTENT_DOMAIN_CONFIG_SIZE + network::PERSISTENT_NETWORK_CONFIG_SIZE;
@@ -217,6 +233,15 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     {
         kernel_fail("ginux: incompatible boot information\r\n");
     }
+    KERNEL_IMAGE_BASE.store(boot_info.image_base as u64, Ordering::Relaxed);
+    KERNEL_IMAGE_SIZE.store(boot_info.image_size as u64, Ordering::Relaxed);
+    // Crash addresses are symbolized relative to this base
+    // (tools/debug/symbolize.sh).
+    serial_write_raw(b"ginux: kernel image base ");
+    serial_write_hex(boot_info.image_base as u64);
+    serial_write_raw(b" size ");
+    serial_write_hex(boot_info.image_size as u64);
+    serial_write_raw(b"\r\n");
     // UEFI's page tables identity-map the framebuffer until Ginux installs its own.
     if framebuffer::init(&boot_info.framebuffer, boot_info.framebuffer.base as usize) {
         serial_write_raw(b"ginux: booting\r\n");
@@ -321,10 +346,24 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         kernel_fail("ginux: modified root-image measurement accepted\r\n");
     }
     serial_write("ginux: root-image measurement rejection verified\r\n");
+    // The boot image may carry the all-Rust root filesystem for
+    // `image=builtin://rust`; it must lie inside the loaded image.
     if boot_info.oci_rootfs_size != 0 || !boot_info.oci_rootfs.is_null() {
-        kernel_fail("ginux: boot-embedded OCI images are unsupported\r\n");
+        let start = boot_info.oci_rootfs as usize;
+        let image_start = boot_info.image_base as usize;
+        let inside_image = boot_info.oci_rootfs_size != 0
+            && start >= image_start
+            && start
+                .checked_add(boot_info.oci_rootfs_size)
+                .is_some_and(|end| end <= image_start + boot_info.image_size);
+        if !inside_image {
+            kernel_fail("ginux: boot-embedded root filesystem lies outside the boot image\r\n");
+        }
+        image_store::set_builtin_rootfs(start as u64, boot_info.oci_rootfs_size);
+        serial_write("ginux: builtin Rust root filesystem available (");
+        serial_write_usize(boot_info.oci_rootfs_size);
+        serial_write(" bytes)\r\n");
     }
-    serial_write("ginux: OCI images require runtime registry ingestion\r\n");
 
     let Some(virtio_block) = arch::x86_64::pci::discover_virtio_block() else {
         // Not the QEMU reference machine: report the hardware and run the
@@ -527,7 +566,12 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     ) || !arch::x86_64::paging::identity_range_is_read_only_data(
         boot_info.root_image as usize,
         boot_info.root_image_size,
-    ) {
+    ) || boot_info.oci_rootfs_size != 0
+        && !arch::x86_64::paging::identity_range_is_read_only_data(
+            boot_info.oci_rootfs as usize,
+            boot_info.oci_rootfs_size,
+        )
+    {
         kernel_fail("ginux: boot policy inputs remain mutable or executable\r\n");
     }
     serial_write("ginux: boot policy inputs immutable and non-executable\r\n");
@@ -4015,7 +4059,17 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
             let mut downloaded = false;
             let mut cache_hit = false;
             let mut cache_repair = false;
-            if image_size != 0 {
+            // The builtin image comes from the boot image: no cache or pull.
+            let builtin = &image[..image_size] == image_store::BUILTIN_RUST_IMAGE;
+            if builtin {
+                downloaded = image_store::stage_builtin_layer();
+                serial_write(if downloaded {
+                    "ginux: builtin Rust root filesystem staged\r\n"
+                } else {
+                    "ginux: builtin Rust root filesystem unavailable\r\n"
+                });
+            }
+            if image_size != 0 && !builtin {
                 serial_write("ginux: checking OCI cache ");
                 serial_write_bytes(&image[..image_size]);
                 serial_write("\r\n");
@@ -4058,7 +4112,7 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
                     }
                 }
             }
-            if image_size != 0 && !cache_hit {
+            if image_size != 0 && !cache_hit && !builtin {
                 serial_write("ginux: pulling OCI image ");
                 serial_write_bytes(&image[..image_size]);
                 serial_write("\r\n");
@@ -4095,7 +4149,7 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
                 pull_started,
                 transfer_finished,
             );
-            if downloaded && !cache_hit {
+            if downloaded && !cache_hit && !builtin {
                 match persist_oci_layers(
                     virtio_block,
                     virtio_mmio,
@@ -4141,7 +4195,8 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
                 image_size != 0 && (cached_rootfs || image_store::install_published_layers(slot))
             });
             serial_write_elapsed("ginux: timing OCI unpack/publish: ", unpack_started);
-            if success && !cached_rootfs {
+            let builtin = &image[..image_size] == image_store::BUILTIN_RUST_IMAGE;
+            if success && !cached_rootfs && !builtin {
                 if let Some((bytes, newly_stored)) = persist_oci_rootfs(
                     virtio_block,
                     virtio_mmio,
@@ -4487,7 +4542,7 @@ pub(crate) fn serial_write_bytes(bytes: &[u8]) {
     serial_write_raw(bytes);
 }
 
-fn serial_write_raw(bytes: &[u8]) {
+pub(crate) fn serial_write_raw(bytes: &[u8]) {
     framebuffer::write(bytes);
     if !SERIAL_PRESENT.load(Ordering::Acquire) {
         return;
@@ -4911,6 +4966,14 @@ fn serial_write_elapsed_at(label: &str, started: u64, finished: u64) {
     serial_write(label);
     serial_write_u64(milliseconds);
     serial_write(" ms\r\n");
+}
+
+fn serial_write_hex(value: u64) {
+    let mut text = *b"0x0000000000000000";
+    for (index, digit) in text[2..].iter_mut().enumerate() {
+        *digit = b"0123456789abcdef"[((value >> ((15 - index) * 4)) & 0xf) as usize];
+    }
+    serial_write_raw(&text);
 }
 
 pub(crate) fn serial_write_u64(mut value: u64) {

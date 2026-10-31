@@ -1584,6 +1584,36 @@ pub(crate) fn direct_map_range_address(physical: u64, length: usize) -> Option<u
     DIRECT_MAP_BASE.checked_add(physical)
 }
 
+/// Whether `address` is mapped present by the active page tables, which
+/// are read through the direct map. Crash reports check this before
+/// reading memory they cannot trust.
+pub(crate) fn kernel_address_is_mapped(address: u64) -> bool {
+    // Canonical 48-bit addresses only.
+    if (address as i64) << 16 >> 16 != address as i64 {
+        return false;
+    }
+    let root: u64;
+    // SAFETY: reading CR3 has no side effects.
+    unsafe { asm!("mov {}, cr3", out(reg) root, options(nomem, nostack, preserves_flags)) };
+    let mut table = root & ADDRESS_MASK as u64;
+    for level in 0..4 {
+        let index = ((address >> (39 - 9 * level)) & 0x1ff) as usize;
+        let Some(entries) = direct_map_range_address(table, PAGE_SIZE) else {
+            return false;
+        };
+        // SAFETY: the table page lies inside the direct map, checked above.
+        let entry = unsafe { (entries as *const u64).add(index).read_volatile() };
+        if entry & PRESENT == 0 {
+            return false;
+        }
+        if level == 3 || level != 0 && entry & LARGE_PAGE != 0 {
+            return true;
+        }
+        table = entry & ADDRESS_MASK as u64;
+    }
+    true
+}
+
 pub(crate) fn direct_map_address(physical: usize) -> Option<usize> {
     direct_map_range_address(physical as u64, 1)
 }

@@ -2,7 +2,11 @@
 #![no_std]
 
 mod generated_boot;
+mod builtin_rootfs {
+    include!(concat!(env!("OUT_DIR"), "/builtin_rootfs.rs"));
+}
 
+use builtin_rootfs::BUILTIN_ROOTFS;
 use core::arch::asm;
 use core::ffi::c_void;
 use core::panic::PanicInfo;
@@ -464,8 +468,12 @@ unsafe fn exit_boot_services(
                 controller_runtime_size: CONTROLLER_RUNTIME.len(),
                 root_image: ROOT_IMAGE.as_ptr(),
                 root_image_size: ROOT_IMAGE.len(),
-                oci_rootfs: core::ptr::null(),
-                oci_rootfs_size: 0,
+                oci_rootfs: if BUILTIN_ROOTFS.is_empty() {
+                    core::ptr::null()
+                } else {
+                    BUILTIN_ROOTFS.as_ptr()
+                },
+                oci_rootfs_size: BUILTIN_ROOTFS.len(),
                 unix_time,
                 reset_system: (*runtime_services).reset_system,
                 image_base,

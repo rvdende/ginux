@@ -234,15 +234,26 @@ share window buffers through memfd pools passed with `SCM_RIGHTS`; Ginux maps
 a memfd's own pages into every process that maps it.
 
 ```sh
-just desktop        # build, boot in a QEMU window and start the desktop in Alpine
-make userland       # build ginux-wm and ginux-term
-make userland-check # format check, clippy and unit tests on the host
-make test-desktop   # run both in Alpine, type into the terminal, check a screendump
+just desktop            # build, boot in a QEMU window and start the desktop
+make userland           # build ginux-wm, ginux-term, ginux-fetch and ginux-init
+make userland-check     # format check, clippy and unit tests on the host
+make test-desktop       # type into the terminal on USB, check a screendump
+make test-rust-userland # boot the all-Rust domain and run brush and uutils
 ```
 
-In a domain started with the binaries available (the test serves them over
-HTTP to `/tmp`), run `ginux-wm --terminal /tmp/ginux-term --spawn
-/tmp/ginux-term`. Windows get server-side title bars with close and maximize
+### All-Rust userland
+
+`make rust-rootfs` builds `build/rootfs-rust.tar.gz`, a root filesystem whose
+programs are all Rust: `ginux-init` as process 1, the bash-compatible
+[brush](https://github.com/reubeno/brush) shell as `/bin/sh`, the
+[uutils](https://github.com/uutils/coreutils) coreutils multicall binary with a
+link per utility, and the desktop programs. When it exists, the boot image
+embeds it, and a domain set to `image=builtin://rust init=/sbin/init` boots it
+directly, with no registry pull; `just desktop` and the desktop test use it.
+The programs are static musl binaries, so libc is still musl, a C library.
+
+In the domain's shell, run `ginux-wm --terminal ginux-term --spawn
+ginux-term &` to start the desktop. Windows get server-side title bars with close and maximize
 buttons; drag a window by its title bar or with Alt and the left button.
 Alt+Enter opens a terminal, Alt+Tab cycles focus, Alt+Q closes and Alt+M
 maximizes; Control+Alt+Backspace quits. To see and use it in a window, boot

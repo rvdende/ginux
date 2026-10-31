@@ -4398,8 +4398,30 @@ pub(crate) fn resume_live_linux_process(
     unsafe { activate(root.address()) };
     let resumed = current_root() == root.address()
         && cpu::resume_live_linux_process(entry, stack, fs_base, general, rflags);
+    // The process that was running before may have been torn down while the
+    // resumed one ran; loading its freed root would leave no kernel mapping
+    // and triple-fault. Fall back to the kernel's tables and report it.
+    if !linux_root_is_usable(previous) {
+        unsafe { activate(paging::kernel_root_address()) };
+        crate::serial_write_raw(b"ginux: resume returned to a released address space; root ");
+        crate::serial_write_u64(previous);
+        crate::serial_write_raw(b" resumed root ");
+        crate::serial_write_u64(root.address());
+        crate::serial_write_raw(b"\r\n");
+        return false;
+    }
     unsafe { activate(previous) };
     resumed && current_root() == previous
+}
+
+/// Whether `root` can still be loaded into CR3: the kernel's own tables, or a
+/// live kernel-owned frame whose first entry (the kernel's low mappings) is
+/// present. A released root is scrubbed, so it fails both tests.
+fn linux_root_is_usable(root: u64) -> bool {
+    root == paging::kernel_root_address()
+        || memory::live_frame_lease(memory::FrameOwner::KERNEL, root).is_some()
+            && mapped_frame::<u64>(root)
+                .is_some_and(|entries| unsafe { entries.read() } & PRESENT != 0)
 }
 
 pub(crate) fn with_live_linux_process_root<T>(

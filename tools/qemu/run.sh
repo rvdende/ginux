@@ -62,6 +62,19 @@ if [[ "${GINUX_QEMU_USB_INPUT:-}" == "1" ]]; then
     )
 fi
 qemu_netdev="user,id=ginux-net,restrict=off"
+# GINUX_QEMU_LOG names a file for QEMU's CPU reset and guest error log.
+# It also keeps QEMU paused, instead of exiting, when the guest resets or
+# triple-faults, so the monitor can still read the CPU state.
+qemu_log=()
+if [[ -n "${GINUX_QEMU_LOG:-}" ]]; then
+    # GINUX_QEMU_LOG_INTERRUPTS=1 also logs every exception and interrupt
+    # (QEMU_ACCEL=tcg only), which shows the faults that led to a reset.
+    events=cpu_reset,guest_errors
+    if [[ "${GINUX_QEMU_LOG_INTERRUPTS:-}" == "1" ]]; then
+        events+=",int"
+    fi
+    qemu_log=(-d "$events" -D "$GINUX_QEMU_LOG" -no-shutdown)
+fi
 # GINUX_QEMU_DISPLAY selects a QEMU display such as gtk or sdl, to see the
 # framebuffer (and a Wayland desktop on /dev/fb0) in a window.
 display="${GINUX_QEMU_DISPLAY:-none}"
@@ -87,6 +100,7 @@ exec "$qemu" \
     -monitor "$monitor" \
     -serial stdio \
     -no-reboot \
+    ${qemu_log[@]+"${qemu_log[@]}"} \
     -net none \
     -device "intel-iommu,intremap=off" \
     -device "virtio-blk-pci,drive=ginux-volume,disable-legacy=on,iommu_platform=on,serial=ginux-volume" \
