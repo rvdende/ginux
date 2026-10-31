@@ -1,5 +1,34 @@
 use super::*;
 
+/// Every this many system calls of a domain, one line names the process,
+/// thread and call that made the last one. A process spinning in a loop of
+/// system calls shows within seconds; ordinary work prints little. Written
+/// from the system call path, never from an interrupt.
+const LINUX_SYSCALL_HEARTBEAT: u64 = 1 << 24;
+
+fn write_linux_syscall_heartbeat(count: u64, number: u64, registers: &LinuxSyscallFrame) {
+    serial_write("ginux: syscall heartbeat count/pid/tid/number/arguments/previous-result: ");
+    let previous = (count as usize + LINUX_RUNTIME_SYSCALL_TRACE_LIMIT - 2)
+        % LINUX_RUNTIME_SYSCALL_TRACE_LIMIT;
+    for value in [
+        count,
+        u64::from(current_linux_process_pid()),
+        current_linux_tid().map_or(0, u64::from),
+        number,
+        registers.rdi,
+        registers.rsi,
+        registers.rdx,
+        registers.r10,
+        X86_RUNTIME.LINUX_RUNTIME_SYSCALL_RESULT_TRACE[previous].load(Ordering::SeqCst),
+    ] {
+        serial_write_u64(value);
+        serial_write(" ");
+    }
+    serial_write("(");
+    serial_write(linux_descriptor_kind_name(registers.rdi));
+    serial_write(")\r\n");
+}
+
 pub(super) extern "sysv64" fn linux_syscall_handler(
     number: u64,
     registers: *mut LinuxSyscallFrame,
@@ -130,17 +159,18 @@ pub(super) extern "sysv64" fn linux_syscall_handler(
     // `syscall_return`; they wait for its next call in that case.
     let calling_thread = current_linux_thread_handle();
     let _profile = LinuxBootSyscallProfile::start(number, runtime_mode);
-    let trace_index = if !matches!(
-        number,
-        LINUX_CLOCK_GETTIME_SYSCALL | LINUX_SCHED_YIELD_SYSCALL
-    ) && (runtime_mode
-        || cfg!(feature = "verification-boot")
-            && X86_RUNTIME.ELF_PROBE_SYSTEM_INIT.load(Ordering::SeqCst))
+    let trace_index = if number != LINUX_CLOCK_GETTIME_SYSCALL
+        && (runtime_mode
+            || cfg!(feature = "verification-boot")
+                && X86_RUNTIME.ELF_PROBE_SYSTEM_INIT.load(Ordering::SeqCst))
     {
-        let index = X86_RUNTIME
+        let count = X86_RUNTIME
             .LINUX_RUNTIME_SYSCALL_TRACE_COUNT
-            .fetch_add(1, Ordering::SeqCst) as usize
-            % LINUX_RUNTIME_SYSCALL_TRACE_LIMIT;
+            .fetch_add(1, Ordering::SeqCst);
+        if runtime_mode && (count + 1).is_multiple_of(LINUX_SYSCALL_HEARTBEAT) {
+            write_linux_syscall_heartbeat(count + 1, number, &saved_registers);
+        }
+        let index = count as usize % LINUX_RUNTIME_SYSCALL_TRACE_LIMIT;
         X86_RUNTIME.LINUX_RUNTIME_SYSCALL_TRACE[index].store(number, Ordering::SeqCst);
         Some(index)
     } else {

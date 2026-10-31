@@ -32,6 +32,14 @@ const FRAMEBUFFER_PDPT_INDEX: usize = ENTRY_COUNT - 2;
 const FRAMEBUFFER_WINDOW_BASE: usize = DIRECT_MAP_BASE + FRAMEBUFFER_PDPT_INDEX * (1 << 30);
 const DEVICE_PDPT_INDEX: usize = ENTRY_COUNT - 3;
 const DEVICE_WINDOW_BASE: usize = DIRECT_MAP_BASE + DEVICE_PDPT_INDEX * (1 << 30);
+/// 1 GiB of kernel virtual space for kernel stacks, mapped a page at a time
+/// so that unmapped guard pages can sit between them (see
+/// `map_kernel_stack_page`). It lies below the device window, so the direct
+/// map stops below it.
+const KERNEL_STACK_PDPT_INDEX: usize = ENTRY_COUNT - 4;
+pub(crate) const KERNEL_STACK_WINDOW_BASE: usize =
+    DIRECT_MAP_BASE + KERNEL_STACK_PDPT_INDEX * (1 << 30);
+pub(crate) const KERNEL_STACK_WINDOW_SIZE: usize = 1 << 30;
 /// Register ranges the device window maps for drivers beyond the reference
 /// devices, such as USB host controllers.
 pub(crate) const MAX_DEVICE_REGIONS: usize = 4;
@@ -461,6 +469,10 @@ struct PagingOwner {
     framebuffer_directory: UnsafeCell<PageTable>,
     device_directory: UnsafeCell<PageTable>,
     device_table: UnsafeCell<PageTable>,
+    /// The kernel stack window's page directory. Unlike the other tables it
+    /// stays writable after boot: page tables for stacks are added to it
+    /// while the kernel runs.
+    kernel_stack_directory: UnsafeCell<PageTable>,
     /// End of the physical range reachable through the direct map once RAM
     /// above the initial identity map joins it; zero until then. (A zero
     /// initializer keeps this owner, and its page tables, out of the image's
@@ -481,6 +493,7 @@ static PAGING: PagingOwner = PagingOwner {
     framebuffer_directory: UnsafeCell::new(PageTable([0; ENTRY_COUNT])),
     device_directory: UnsafeCell::new(PageTable([0; ENTRY_COUNT])),
     device_table: UnsafeCell::new(PageTable([0; ENTRY_COUNT])),
+    kernel_stack_directory: UnsafeCell::new(PageTable([0; ENTRY_COUNT])),
     direct_map_limit: AtomicUsize::new(0),
 };
 
@@ -631,7 +644,7 @@ pub(crate) unsafe fn install_initial_identity_map(
 
     // RAM above 4 GiB joins the direct map as 1 GiB pages, below the
     // device, framebuffer and MMIO windows at the top of the slot.
-    let gibibytes = (ram_end(boot_info).div_ceil(GIBIBYTE) as usize).min(DEVICE_PDPT_INDEX);
+    let gibibytes = (ram_end(boot_info).div_ceil(GIBIBYTE) as usize).min(KERNEL_STACK_PDPT_INDEX);
     if gibibytes > DIRECTORY_COUNT
         && core::arch::x86_64::__cpuid(CPUID_EXTENDED_FEATURES).edx & CPUID_PAGE_1GB != 0
     {
@@ -1096,6 +1109,12 @@ pub(crate) unsafe fn install_initial_identity_map(
         device_msix_mmio_mapping,
     ];
     let devices = map_device_window(direct_pdpt, device_regions, &reference_mmio)?;
+    let stack_directory =
+        core::ptr::addr_of_mut!((*PAGING.kernel_stack_directory.get()).0).cast::<u64>();
+    zero_entries(stack_directory);
+    direct_pdpt
+        .add(KERNEL_STACK_PDPT_INDEX)
+        .write(stack_directory as u64 | PRESENT | WRITABLE);
 
     let fine_tables = PAGING.fine_page_tables.get().cast::<PageTable>();
     let mut fine_regions = [usize::MAX; MAX_FINE_TABLES];
@@ -1531,6 +1550,66 @@ unsafe fn map_device_window(
         .add(DEVICE_PDPT_INDEX)
         .write(directory as u64 | PRESENT | WRITABLE);
     Ok(mappings)
+}
+
+/// Maps the page at `physical` writable and non-executable at `address` in the
+/// kernel stack window. A missing page table for its 2 MiB region is made
+/// from `table`, a zeroed frame the caller supplies (and gets back unused
+/// when the table exists). Returns false if `address` is outside the window,
+/// unaligned, or already mapped.
+///
+/// The caller serializes calls. Pages are only ever added to the window,
+/// never removed, so no other CPU can hold a stale translation for them.
+pub(crate) fn map_kernel_stack_page(
+    address: usize,
+    physical: u64,
+    table: &mut Option<u64>,
+) -> bool {
+    let Some(offset) = address.checked_sub(KERNEL_STACK_WINDOW_BASE) else {
+        return false;
+    };
+    if offset >= KERNEL_STACK_WINDOW_SIZE
+        || !offset.is_multiple_of(PAGE_SIZE)
+        || !physical.is_multiple_of(PAGE_SIZE as u64)
+        || physical & !(ADDRESS_MASK as u64) != 0
+    {
+        return false;
+    }
+    let directory = PAGING.kernel_stack_directory.get().cast::<u64>();
+    let directory_index = offset / LARGE_PAGE_SIZE as usize;
+    // SAFETY: the directory is this owner's, installed in the shared direct
+    // PDPT at boot and left writable; the caller serializes writers.
+    let entry = unsafe { directory.add(directory_index).read() };
+    let table_physical = if entry & PRESENT != 0 {
+        entry & ADDRESS_MASK as u64
+    } else {
+        let Some(frame) = table.take() else {
+            return false;
+        };
+        // SAFETY: as above; the frame is zeroed and now belongs to the window.
+        unsafe {
+            directory
+                .add(directory_index)
+                .write(frame | PRESENT | WRITABLE)
+        };
+        frame
+    };
+    let Some(entries) = direct_map_range_address(table_physical, PAGE_SIZE) else {
+        return false;
+    };
+    let entries = entries as *mut u64;
+    let index = (offset % LARGE_PAGE_SIZE as usize) / PAGE_SIZE;
+    // SAFETY: the table frame is mapped through the direct map and is only
+    // written here, under the caller's serialization.
+    unsafe {
+        if entries.add(index).read() & PRESENT != 0 {
+            return false;
+        }
+        entries
+            .add(index)
+            .write(physical | PRESENT | WRITABLE | NO_EXECUTE);
+    }
+    true
 }
 
 /// Maps a framebuffer write-combining into the direct-map slot reserved for it

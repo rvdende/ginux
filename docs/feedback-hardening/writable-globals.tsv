@@ -547,5 +547,5 @@ static-mut	kernel/src/linux_input.rs	PUMP	platform-device	allowlist	none	seriali
 static-mut	kernel/src/memory.rs	FREE	verification-only	allowlist	none	private-allocator-self-test-tables
 static-mut	kernel/src/memory.rs	METADATA	verification-only	allowlist	none	private-allocator-self-test-tables
 interior-mutable	kernel/src/arch/x86_64/cpu/activation.rs	ACTIVE_PIDS	process-runtime	allowlist	none	locked-activation-reentry-diagnostic
-interior-mutable	kernel/src/arch/x86_64/cpu/activation.rs	FREE_STACKS	process-runtime	allowlist	none	locked-activation-stack-pool
+interior-mutable	kernel/src/arch/x86_64/cpu/activation.rs	STACK_POOL	process-runtime	allowlist	none	locked-activation-stack-pool
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_DOMAIN_EXEC_DEPTH	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing

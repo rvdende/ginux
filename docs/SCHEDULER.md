@@ -87,10 +87,12 @@ calls act as the scheduler.
    frame allocator plus frame runs for large objects.
 2. Done: activation stacks (`cpu/activation.rs`). Every entry into a Linux
    process on the boot CPU runs it, and its system calls, on a kernel stack
-   of its own (256 KiB, red zone checked when the activation ends), in
-   today's order. A process entered while an earlier activation of it is
-   still inside a system call is reported ("re-entered during its own
-   system call").
+   of its own (256 KiB) in today's order. Stacks are mapped page by page in
+   a kernel stack window (`paging::map_kernel_stack_page`), one per 512 KiB
+   slot with the rest of the slot unmapped, so an overflow faults on a guard
+   page (a double fault) instead of corrupting memory. A process entered
+   while an earlier activation of it is still inside a system call is
+   reported ("re-entered during its own system call").
 3. Parent-first fork, Linux's default order (`LINUX_PARENT_FIRST_FORK` in
    cpu.rs, implemented but off): plain forks resume the parent with the
    child's pid and leave the child ready in the run queue; vfork, CLONE_VM,
@@ -113,5 +115,3 @@ calls act as the scheduler.
    splitting `kernel_entry_lock` into per-subsystem locks so CPUs run kernel
    code in parallel (lock ranks from
    `docs/feedback-hardening/SYNCHRONIZATION.md`).
-7. Guard pages: map activation stacks in a kernel virtual region with an
-   unmapped page below each, instead of the red-zone check.
