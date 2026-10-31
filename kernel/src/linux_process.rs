@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use core::{
     cell::UnsafeCell,
     mem::{size_of, MaybeUninit},
@@ -6,8 +7,12 @@ use core::{
 
 use crate::{address_space, arch::x86_64::cpu, control_abi, linux_user, memory, scheduler};
 
-pub(crate) const PROCESS_LIMIT: usize = 64;
-pub(crate) const PROCESS_RUNTIME_LIMIT: usize = PROCESS_LIMIT;
+/// Processes a domain's table holds, zombies included. The table grows on
+/// demand up to this (slots are u8).
+pub(crate) const PROCESS_LIMIT: usize = 256;
+/// Processes with an address space at once: a zombie releases its runtime
+/// slot when it exits, so many unreaped zombies need table slots only.
+pub(crate) const PROCESS_RUNTIME_LIMIT: usize = 64;
 const PROCESS_HIERARCHY_LIMIT: usize = cpu::LINUX_PROCESS_HIERARCHY_LIMIT;
 const PROCESS_PRIVATE_PAGE_LIMIT: usize = cpu::LINUX_PROCESS_MAPPING_LIMIT;
 const PROCESS_PRIVATE_COPY_LIMIT: usize = cpu::LINUX_PROCESS_MAPPING_LIMIT;
@@ -551,8 +556,11 @@ pub(crate) enum ProcessGroupError {
 
 struct ProcessTable {
     owner_domain: u64,
-    processes: [Option<Process>; PROCESS_LIMIT],
-    generations: [u32; PROCESS_LIMIT],
+    /// Indexed by a handle's slot; grows on demand up to PROCESS_LIMIT and
+    /// never shrinks, so slots stay valid.
+    processes: Vec<Option<Process>>,
+    /// The generation each slot last handed out, parallel to `processes`.
+    generations: Vec<u32>,
     next_pid: u32,
     init: Option<ProcessHandle>,
 }
@@ -561,8 +569,8 @@ impl ProcessTable {
     const fn new() -> Self {
         Self {
             owner_domain: 0,
-            processes: [None; PROCESS_LIMIT],
-            generations: [0; PROCESS_LIMIT],
+            processes: Vec::new(),
+            generations: Vec::new(),
             next_pid: 1,
             init: None,
         }
@@ -1465,7 +1473,17 @@ impl ProcessTable {
         context: Option<ProcessExecutionContext>,
         state: ProcessState,
     ) -> Option<ProcessHandle> {
-        let slot = self.processes.iter().position(Option::is_none)?;
+        let slot = match self.processes.iter().position(Option::is_none) {
+            Some(slot) => slot,
+            None if self.processes.len() < PROCESS_LIMIT => {
+                self.processes.try_reserve(1).ok()?;
+                self.generations.try_reserve(1).ok()?;
+                self.processes.push(None);
+                self.generations.push(0);
+                self.processes.len() - 1
+            }
+            None => return None,
+        };
         let generation = self.generations[slot].checked_add(1)?;
         let pid = self.next_pid;
         self.next_pid = self.next_pid.checked_add(1)?;
@@ -2273,12 +2291,10 @@ pub(crate) fn install_live_process_registry(
                 .and_then(cpu::container_domain_id)
                 .unwrap_or(0),
         );
-        let processes = core::ptr::addr_of_mut!((*table).processes).cast::<Option<Process>>();
-        let generations = core::ptr::addr_of_mut!((*table).generations).cast::<u32>();
-        for index in 0..PROCESS_LIMIT {
-            processes.add(index).write(None);
-            generations.add(index).write(0);
-        }
+        // The tables start const-initialized, so the vectors are valid here;
+        // emptying them keeps their memory for the next domain.
+        (*table).processes.clear();
+        (*table).generations.clear();
         core::ptr::addr_of_mut!((*table).next_pid).write(1);
         core::ptr::addr_of_mut!((*table).init).write(None);
     }
@@ -2527,7 +2543,7 @@ pub(crate) fn force_stop_runtime_process_registry() -> bool {
         return false;
     }
 
-    for slot in 0..PROCESS_LIMIT {
+    for slot in 0..table.processes.len() {
         let Some(process) = table.processes[slot] else {
             continue;
         };

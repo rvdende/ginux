@@ -51,7 +51,9 @@ impl Queue {
         head: memory::FrameLease::EMPTY,
         pages: 0,
         pending: 0,
-        next_sequence: 1,
+        // Sequence numbers only order entries among themselves; starting at
+        // 0 keeps the queue tables all-zero, out of the image's data.
+        next_sequence: 0,
     };
 }
 
@@ -274,7 +276,7 @@ pub(crate) fn enqueue(
         target = Some((frame, 0));
     }
     let sequence = queue.next_sequence;
-    queue.next_sequence = queue.next_sequence.checked_add(1).unwrap_or(1);
+    queue.next_sequence = queue.next_sequence.wrapping_add(1);
     let (frame, index) = target.ok_or(Error::Invalid)?;
     page_mut(frame).ok_or(Error::Invalid)?.entries[index] = Entry {
         sequence,
