@@ -809,10 +809,23 @@ fn resolve_link(path: &[u8], link: &[u8], output: &mut [u8]) -> Option<usize> {
     (length != 0).then_some(length)
 }
 
+/// The load address of a position-independent main executable, unless a
+/// caller asks for another.
+pub(crate) const LOW_LOAD_BASE: u64 = 0x40_0000;
+
 pub(crate) fn process_plan(
     init: &[u8],
 ) -> Option<crate::linux_elf::RelocatableExecutablePlan<'static, 'static>> {
-    process_plan_in(&rootfs()?, init)
+    process_plan_at(init, LOW_LOAD_BASE)
+}
+
+/// Plans `init` with a position-independent main executable loaded at
+/// `main_base`; a fixed-address executable keeps its own addresses.
+pub(crate) fn process_plan_at(
+    init: &[u8],
+    main_base: u64,
+) -> Option<crate::linux_elf::RelocatableExecutablePlan<'static, 'static>> {
+    process_plan_in(&rootfs()?, init, main_base)
 }
 
 pub(crate) fn process_plan_failure(init: &[u8]) -> ProcessPlanFailure<'static> {
@@ -925,6 +938,7 @@ pub(crate) fn launch_arguments_for_image<'a>(
 /// still come from the published root.
 pub(crate) fn process_plan_for_image(
     image: &[u8],
+    main_base: u64,
 ) -> Option<crate::linux_elf::RelocatableExecutablePlan<'_, '_>> {
     let rootfs = rootfs()?;
     let executable = if let Some((interpreter, _)) = shebang_command(image) {
@@ -936,12 +950,13 @@ pub(crate) fn process_plan_for_image(
     } else {
         image
     };
-    plan_executable_in(&rootfs, executable)
+    plan_executable_in(&rootfs, executable, main_base)
 }
 
 fn process_plan_in<'a>(
     rootfs: &Rootfs<'a>,
     init: &[u8],
+    main_base: u64,
 ) -> Option<crate::linux_elf::RelocatableExecutablePlan<'a, 'a>> {
     let (_, mut executable) = lookup_in(rootfs, init)?;
     if executable.kind != EntryKind::File || executable.mode & 0o111 == 0 {
@@ -954,15 +969,16 @@ fn process_plan_in<'a>(
         }
         executable = script_interpreter;
     }
-    plan_executable_in(rootfs, executable.data)
+    plan_executable_in(rootfs, executable.data, main_base)
 }
 
 fn plan_executable_in<'a>(
     rootfs: &Rootfs<'a>,
     executable: &'a [u8],
+    main_base: u64,
 ) -> Option<crate::linux_elf::RelocatableExecutablePlan<'a, 'a>> {
     let Some(interpreter_path) = crate::linux_elf::relocatable_interpreter(executable) else {
-        return crate::linux_elf::plan_relocatable_static(executable, 0x40_0000)
+        return crate::linux_elf::plan_relocatable_static(executable, main_base)
             .map(crate::linux_elf::RelocatableExecutablePlan::Static)
             .or_else(|| {
                 crate::linux_elf::plan_static_exec(executable)
@@ -975,7 +991,7 @@ fn plan_executable_in<'a>(
     }
     crate::linux_elf::plan_relocatable_process_auto(
         executable,
-        0x40_0000,
+        main_base,
         interpreter_path,
         interpreter.data,
     )

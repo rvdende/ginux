@@ -811,6 +811,12 @@ const LINUX_EXEC_STACK_SIZE: usize = PAGE_SIZE / 2;
 const LINUX_EXEC_ARGUMENT_PAGES: usize = 32;
 /// The most argv or envp entries a runtime exec accepts.
 const LINUX_EXEC_ARGUMENT_LIMIT: usize = 8192;
+/// Programs load low only if they end below the runtime heap.
+const LINUX_EXEC_LOW_LIMIT: u64 = 0x80_0000;
+/// Where position-independent programs too large for the low window load:
+/// the third 512 GiB slot of the address space, which mmap does not reach.
+const LINUX_EXEC_HIGH_LOAD_BASE: u64 = 0x100_0000_0000;
+const LINUX_EXEC_HIGH_LIMIT: u64 = 0x180_0000_0000;
 /// The most pages a runtime exec copies in for its program and loader
 /// segments (256 MiB).
 const LINUX_EXEC_IMAGE_PAGE_LIMIT: usize = 65_536;
@@ -1461,7 +1467,7 @@ static ELF_PROBE_SIBLING_STACK_FRAME: BankedAtomicU64 = BankedAtomicU64::new(0);
 static ELF_PROBE_SIBLING_STACK_GENERATION: BankedAtomicU32 = BankedAtomicU32::new(0);
 static ELF_PROBE_RECLAIM_SIBLING_STACK_FRAME: BankedAtomicU64 = BankedAtomicU64::new(0);
 static ELF_PROBE_RECLAIM_SIBLING_STACK_GENERATION: BankedAtomicU32 = BankedAtomicU32::new(0);
-const LINUX_THREAD_LIMIT: usize = 16;
+const LINUX_THREAD_LIMIT: usize = 32;
 const LINUX_THREAD_FREE: u8 = 0;
 const LINUX_THREAD_READY: u8 = 1;
 const LINUX_THREAD_RUNNING: u8 = 2;
@@ -10214,6 +10220,7 @@ extern "sysv64" fn linux_syscall_handler(
         LINUX_FUTEX_WAIT_SYSCALL => linux_futex_wait_live_return(
             registers,
             syscall_return,
+            LINUX_FUTEX_WAIT_SYSCALL,
             first_argument,
             buffer,
             count,
@@ -13385,6 +13392,7 @@ fn linux_futex_live_return(
         return linux_futex_wait_live_return(
             output,
             caller,
+            LINUX_FUTEX_SYSCALL,
             address,
             value & u64::from(u32::MAX),
             bitset & u64::from(u32::MAX),
@@ -13535,6 +13543,7 @@ fn linux_futex_wake(address: u64, mask: u64, count: u64, flags: u64) -> u64 {
 fn linux_futex_wait_live_return(
     output: *mut LinuxSyscallFrame,
     caller: LinuxUserContext,
+    number: u64,
     address: u64,
     value: u64,
     mask: u64,
@@ -13594,7 +13603,13 @@ fn linux_futex_wait_live_return(
         return LINUX_ESRCH;
     };
     let Some(target) = ready_linux_thread_handle() else {
-        return LINUX_ENOSYS;
+        // Another process may be the one to change the futex word.
+        return match run_other_linux_processes(output, caller, number) {
+            Some(LinuxBlockedWait::Return(result)) => result,
+            // Callers recheck their condition after any wakeup.
+            Some(LinuxBlockedWait::Recheck) => 0,
+            None => LINUX_ENOSYS,
+        };
     };
     let Some(tls) = linux_thread_context(current) else {
         return LINUX_ESRCH;
@@ -13673,6 +13688,7 @@ fn linux_futex_waitv_live_return(
     linux_futex_wait_live_return(
         output,
         caller,
+        LINUX_FUTEX_WAITV_SYSCALL,
         address,
         value,
         u64::from(u32::MAX),
@@ -14762,7 +14778,10 @@ fn linux_runtime_mapping_range(address: u64, length: u64) -> Option<(u64, usize)
     }
     let pages = usize::try_from(length.div_ceil(PAGE_SIZE as u64)).ok()?;
     let mapped_end = address.checked_add((pages as u64).checked_mul(PAGE_SIZE as u64)?)?;
-    (pages != 0 && mapped_end <= end).then_some((mapped_end, pages))
+    // Programs too large for the low window load in their own region above
+    // the mmap area; their pages are managed the same way.
+    let in_high_image = address >= LINUX_EXEC_HIGH_LOAD_BASE && mapped_end <= LINUX_EXEC_HIGH_LIMIT;
+    (pages != 0 && (mapped_end <= end || in_high_image)).then_some((mapped_end, pages))
 }
 
 fn linux_page_ceil(address: u64) -> Option<u64> {
@@ -23268,9 +23287,27 @@ fn linux_rootfs_execve_source(
     let overlay_bytes = overlay_image
         .as_mut()
         .map(|(image, size)| &image.bytes_mut()[..*size]);
-    let plan = match overlay_bytes {
-        Some(image) => crate::published_rootfs::process_plan_for_image(image),
-        None => crate::published_rootfs::process_plan(path),
+    let plan_at = |base| match overlay_bytes {
+        Some(image) => crate::published_rootfs::process_plan_for_image(image, base),
+        None => crate::published_rootfs::process_plan_at(path, base),
+    };
+    // A program loads low, below the heap, when it fits there. Larger
+    // position-independent programs such as cargo load high instead; a
+    // fixed-address one that does not fit is refused before anything about
+    // the process changes.
+    let plan = match plan_at(crate::published_rootfs::LOW_LOAD_BASE) {
+        Some(plan)
+            if linux_exec_plan_bounds(&plan)
+                .is_some_and(|(_, end)| end <= LINUX_EXEC_LOW_LIMIT) =>
+        {
+            Some(plan)
+        }
+        Some(_) => plan_at(LINUX_EXEC_HIGH_LOAD_BASE).filter(|plan| {
+            linux_exec_plan_bounds(plan).is_some_and(|(start, end)| {
+                start >= LINUX_EXEC_HIGH_LOAD_BASE && end <= LINUX_EXEC_HIGH_LIMIT
+            })
+        }),
+        None => None,
     };
     let Some(plan) = plan else {
         if overlay_bytes.is_some() {
@@ -23600,6 +23637,16 @@ fn linux_rootfs_execve_source(
         serial_write("ginux: Linux exec stack image failed\r\n");
         return LINUX_ENOMEM;
     }
+    // The new image runs on the primary stack, whatever thread or vfork
+    // stack the exec came from.
+    if let Some(slot) = current_linux_thread_slot() {
+        let low = ELF_PROBE_STACK_LOW.load(Ordering::SeqCst);
+        LINUX_THREAD_STACK_BASES[slot].store(low, Ordering::SeqCst);
+        LINUX_THREAD_STACK_SIZES[slot].store(
+            (stack_page + PAGE_SIZE as u64).saturating_sub(low),
+            Ordering::SeqCst,
+        );
+    }
     let process_name = path.rsplit(|byte| *byte == b'/').next().unwrap_or(path);
     if process_name.is_empty() {
         return LINUX_ENOEXEC;
@@ -23638,20 +23685,24 @@ fn linux_rootfs_execve_source(
     }
     let _ = set_current_linux_clear_child_tid(0);
     let _ = set_current_linux_robust_list(0);
-    if !address_space::release_current_linux_runtime_mappings_preserving(
-        LINUX_RUNTIME_DYNAMIC_MMAP_BASE,
-        |frame| {
-            crate::linux_file_cache::contains(frame)
-                || if prepared_frame_references {
-                    linux_process::prepared_live_frame_referenced_by_other_process(frame)
-                } else {
-                    linux_process::live_mapping_referenced_by_other_process(pid, frame)
-                }
-        },
-        |frame| replacements[..replacement_count].contains(&frame),
-    ) {
-        serial_write("ginux: Linux exec mmap release failed\r\n");
-        return LINUX_ENOMEM;
+    // Drop the old program's mmap area and, if it was loaded high, its
+    // image; the new image's own pages are kept.
+    for base in [LINUX_RUNTIME_DYNAMIC_MMAP_BASE, LINUX_EXEC_HIGH_LOAD_BASE] {
+        if !address_space::release_current_linux_runtime_mappings_preserving(
+            base,
+            |frame| {
+                crate::linux_file_cache::contains(frame)
+                    || if prepared_frame_references {
+                        linux_process::prepared_live_frame_referenced_by_other_process(frame)
+                    } else {
+                        linux_process::live_mapping_referenced_by_other_process(pid, frame)
+                    }
+            },
+            |frame| replacements[..replacement_count].contains(&frame),
+        ) {
+            serial_write("ginux: Linux exec mmap release failed\r\n");
+            return LINUX_ENOMEM;
+        }
     }
     ELF_PROBE_MMAP_NEXT.store(LINUX_RUNTIME_DYNAMIC_MMAP_BASE, Ordering::SeqCst);
     if !update_current_linux_tls(0) {
@@ -23695,6 +23746,19 @@ fn linux_exec_blocked_by_other_threads() -> bool {
         Some(slot) != current
             && LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) != LINUX_THREAD_FREE
             && (!runtime || LINUX_THREAD_OWNER_PIDS[slot].load(Ordering::SeqCst) == pid)
+    })
+}
+
+/// Returns the lowest and highest-plus-one addresses a plan maps.
+fn linux_exec_plan_bounds(
+    plan: &crate::linux_elf::RelocatableExecutablePlan<'_, '_>,
+) -> Option<(u64, u64)> {
+    (0..plan.segment_count()).try_fold((u64::MAX, 0_u64), |(start, end), index| {
+        let segment = plan.segment(index)?;
+        let segment_end = segment
+            .virtual_page
+            .checked_add((segment.page_count * PAGE_SIZE) as u64)?;
+        Some((start.min(segment.virtual_page), end.max(segment_end)))
     })
 }
 
@@ -35898,11 +35962,20 @@ fn linux_descriptor_fcntl(descriptor: u64, command: u64, argument: u64) -> u64 {
 }
 
 fn linux_flock(descriptor: u64, operation: u64) -> u64 {
+    const LOCK_SHARED: u64 = 1;
+    const LOCK_EXCLUSIVE: u64 = 2;
+    const LOCK_NONBLOCKING: u64 = 4;
+    const LOCK_UNLOCK: u64 = 8;
     let descriptor = u64::from(descriptor as u32);
     let operation = u64::from(operation as u32);
+    // Processes in a domain run one at a time, so the lock itself is not
+    // tracked yet; the operation still has to be valid.
     if !linux_descriptor_open(descriptor) {
         LINUX_EBADF
-    } else if operation <= 6 {
+    } else if matches!(
+        operation & !LOCK_NONBLOCKING,
+        LOCK_SHARED | LOCK_EXCLUSIVE | LOCK_UNLOCK
+    ) {
         0
     } else {
         LINUX_EINVAL
@@ -35932,9 +36005,8 @@ fn linux_descriptor_set_status_flags(
     argument: u64,
     supported: u64,
 ) -> u64 {
-    if argument & !(3 | supported) != 0 {
-        return LINUX_EINVAL;
-    }
+    // Linux changes only the flags F_SETFL supports and ignores the rest,
+    // so callers may pass back what F_GETFL returned.
     let current = flags.load(Ordering::SeqCst);
     flags.store(
         (current & !(supported as u32)) | (argument as u32 & supported as u32),
