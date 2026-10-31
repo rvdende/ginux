@@ -4766,14 +4766,7 @@ fn resume_failed_linux_fork_parent(parent_pid: u32, error: u64) -> bool {
     };
     let resumed = restore_linux_process_extended_state(parent_pid)
         && sync_live_linux_process_address_space(parent_pid)
-        && address_space::resume_live_linux_process(
-            parent.root,
-            parent.rip,
-            parent.rsp,
-            parent.fs_base,
-            parent.general,
-            parent.rflags,
-        );
+        && run_dispatched_linux_process(&parent);
     if resumed {
         save_current_linux_process_runtime_state(parent_pid);
     }
@@ -4812,15 +4805,8 @@ fn resume_linux_fork_parent_first(
     let Some(parent) = linux_process::dispatch_live_process(parent_pid) else {
         return false;
     };
-    let resumed = sync_live_linux_process_address_space(parent_pid)
-        && address_space::resume_live_linux_process(
-            parent.root,
-            parent.rip,
-            parent.rsp,
-            parent.fs_base,
-            parent.general,
-            parent.rflags,
-        );
+    let resumed =
+        sync_live_linux_process_address_space(parent_pid) && run_dispatched_linux_process(&parent);
     if resumed {
         save_current_linux_process_runtime_state(parent_pid);
     }
@@ -5092,14 +5078,7 @@ fn execute_deferred_live_fork() -> bool {
             && (!X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
                 || sync_live_linux_process_address_space(child.pid))
             && restore_linux_process_extended_state(child.pid)
-            && address_space::resume_live_linux_process(
-                child_dispatch.root,
-                child_dispatch.rip,
-                child_dispatch.rsp,
-                child_dispatch.fs_base,
-                child_dispatch.general,
-                child_dispatch.rflags,
-            )
+            && run_dispatched_linux_process(&child_dispatch)
     });
     while X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
         && !linux_child_exited(child.pid)
@@ -5119,14 +5098,7 @@ fn execute_deferred_live_fork() -> bool {
         child_resumed = sync_live_linux_process_address_space(child.pid)
             && restore_saved_linux_process_runtime_state(child.pid)
             && restore_linux_process_extended_state(child.pid)
-            && address_space::resume_live_linux_process(
-                runnable_child.root,
-                runnable_child.rip,
-                runnable_child.rsp,
-                runnable_child.fs_base,
-                runnable_child.general,
-                runnable_child.rflags,
-            );
+            && run_dispatched_linux_process(&runnable_child);
     }
     while X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
         && !X86_RUNTIME
@@ -5139,14 +5111,7 @@ fn execute_deferred_live_fork() -> bool {
         let Some(executed_child) = linux_process::dispatch_live_process(child.pid) else {
             return false;
         };
-        child_resumed = address_space::resume_live_linux_process(
-            executed_child.root,
-            executed_child.rip,
-            executed_child.rsp,
-            executed_child.fs_base,
-            executed_child.general,
-            executed_child.rflags,
-        );
+        child_resumed = run_dispatched_linux_process(&executed_child);
         while child_resumed
             && X86_RUNTIME.LINUX_FORK_REQUESTED.load(Ordering::SeqCst)
             && !linux_child_exited(child.pid)
@@ -5195,14 +5160,7 @@ fn execute_deferred_live_fork() -> bool {
             .LINUX_CURRENT_PROCESS_PID
             .store(parent_pid, Ordering::SeqCst);
         let parent_resumed = sync_live_linux_process_address_space(parent_pid)
-            && address_space::resume_live_linux_process(
-                parent.root,
-                parent.rip,
-                parent.rsp,
-                parent.fs_base,
-                parent.general,
-                parent.rflags,
-            );
+            && run_dispatched_linux_process(&parent);
         if parent_resumed {
             save_current_linux_process_runtime_state(parent_pid);
         }
@@ -5283,15 +5241,7 @@ fn execute_deferred_live_fork() -> bool {
     let profile_parent_started =
         cfg!(feature = "linux-boot-profile").then(timer::timestamp_counter);
     let parent_synced = sync_live_linux_process_address_space(parent_pid);
-    let parent_resumed = parent_synced
-        && address_space::resume_live_linux_process(
-            parent.root,
-            parent.rip,
-            parent.rsp,
-            parent.fs_base,
-            parent.general,
-            parent.rflags,
-        );
+    let parent_resumed = parent_synced && run_dispatched_linux_process(&parent);
     let parent_resumed = if parent_resumed
         && !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
         && X86_RUNTIME.ELF_PROBE_SYSTEM_INIT.load(Ordering::SeqCst)
@@ -5466,14 +5416,7 @@ fn resume_linux_system_supervisor_legacy() -> bool {
     X86_RUNTIME
         .LINUX_SYSTEM_SUPERVISOR_SHUTDOWN_COUNT
         .fetch_add(1, Ordering::SeqCst);
-    address_space::resume_live_linux_process(
-        process.root,
-        process.rip,
-        process.rsp,
-        process.fs_base,
-        process.general,
-        process.rflags,
-    )
+    run_dispatched_linux_process(&process)
 }
 
 fn shutdown_linux_system_supervisor(failed: bool) -> bool {
@@ -5522,14 +5465,7 @@ fn shutdown_linux_system_supervisor(failed: bool) -> bool {
     X86_RUNTIME
         .LINUX_SYSTEM_SUPERVISOR_SHUTDOWN_COUNT
         .fetch_add(1, Ordering::SeqCst);
-    let resumed = address_space::resume_live_linux_process(
-        process.root,
-        process.rip,
-        process.rsp,
-        process.fs_base,
-        process.general,
-        process.rflags,
-    );
+    let resumed = run_dispatched_linux_process(&process);
     if resumed {
         let Some(slot) = active_container_slot() else {
             return false;
@@ -13672,6 +13608,21 @@ fn write_linux_thread_live_return(
         entry_state.signal_r11 = general[10];
     }
     true
+}
+
+/// Enters `process` in user mode, as the registry dispatched it, until it
+/// returns to the kernel: by a system call that leaves it (an exit, a
+/// yield, a fork that runs the child), a fault or a preemption. Every
+/// process the kernel runs is entered here.
+fn run_dispatched_linux_process(process: &linux_process::LiveProcessDispatch) -> bool {
+    address_space::resume_live_linux_process(
+        process.root,
+        process.rip,
+        process.rsp,
+        process.fs_base,
+        process.general,
+        process.rflags,
+    )
 }
 
 fn restore_linux_process_live_return(output: *mut LinuxSyscallFrame, pid: u32) -> bool {
@@ -33941,14 +33892,7 @@ fn run_scheduled_linux_process(parent_pid: u32, target_pid: Option<u32>) -> bool
             .LINUX_PROCESS_SCHEDULER_NESTING
             .fetch_add(1, Ordering::SeqCst);
         let resumed = sync_live_linux_process_address_space(selected.pid)
-            && address_space::resume_live_linux_process(
-                selected.root,
-                selected.rip,
-                selected.rsp,
-                selected.fs_base,
-                selected.general,
-                selected.rflags,
-            );
+            && run_dispatched_linux_process(&selected);
         let nesting = X86_RUNTIME
             .LINUX_PROCESS_SCHEDULER_NESTING
             .load(Ordering::SeqCst);

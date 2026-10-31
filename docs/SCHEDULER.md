@@ -201,3 +201,31 @@ Order:
 6. Timer preemption: `swapgs` in the timer entry for user frames, a slice
    counter reset per dispatch, refresh the registry from the interrupted
    frame's exact registers, park without counting a wait.
+
+Progress on step 1: every dispatched process is entered through
+`run_dispatched_linux_process` (cpu.rs), the place the loop will own.
+
+### What waits look like until the loop exists (2026-11-01)
+
+A process other than init waits by yielding with its call set to restart,
+so anything a wait must remember lives outside the call and goes when the
+call completes, fails, is interrupted or the process exits:
+
+- semop, msgsnd/msgrcv: wait records with the SysV IPC instance
+  (`linux_sysv_ipc`), so GETNCNT/GETZCNT count waiters and a removed set or
+  queue is EIDRM; a semtimedop deadline is kept from the first attempt.
+- futex waits of single-threaded processes: records under
+  `LINUX_FUTEX_COORDINATION`, keyed by the futex word's physical address,
+  marked by FUTEX_WAKE from another process, with their deadline.
+- poll and nanosleep keep their deadline by return address
+  (`take_linux_restart_deadline`).
+- `Process.waiting` is set when a process yields with a restart and cleared
+  when it is woken or dispatched; /proc shows it as 'S'.
+- A WNOHANG wait that finds nothing while a child can run yields the CPU
+  once (a parent polling for its children would otherwise starve them).
+- Signals reach a process running user code from the timer tick, through
+  the same vDSO entry as preemption (`linux_signal_due_from_timer`), and a
+  call interrupted for an SA_RESTART handler restarts.
+
+The loop replaces the restarts with real blocking (step 5), and these
+records become the wait queues blocked tasks sit on.
