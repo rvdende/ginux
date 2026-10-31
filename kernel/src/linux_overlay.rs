@@ -113,12 +113,25 @@ struct MappingPage {
     mappings: [SharedMapping; MAPPING_COUNT],
 }
 
+/// How a file holds its data.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Data {
+    /// A chain of data pages.
+    Chain,
+    /// Whole frames indexed by page (`first_page` roots the index), which
+    /// shared mappings map directly: a file becomes paged when it is first
+    /// mapped shared.
+    Paged,
+    /// A memfd, always paged.
+    Memfd,
+}
+
 #[derive(Clone, Copy)]
 struct Node {
     active: bool,
     linked: bool,
     whiteout: bool,
-    memfd: bool,
+    data: Data,
     kind: NodeKind,
     path_length: u16,
     mode: u32,
@@ -139,11 +152,15 @@ struct Node {
 }
 
 impl Node {
+    fn paged(&self) -> bool {
+        self.data != Data::Chain
+    }
+
     const EMPTY: Self = Self {
         active: false,
         linked: false,
         whiteout: false,
-        memfd: false,
+        data: Data::Chain,
         kind: NodeKind::File,
         path_length: 0,
         mode: 0,
@@ -451,32 +468,77 @@ pub(crate) fn configure_memfd(handle: Handle, allow_sealing: bool) -> bool {
     if node.kind != NodeKind::File {
         return false;
     }
-    node.memfd = true;
+    if !make_node_paged(node) {
+        return false;
+    }
+    node.data = Data::Memfd;
     node.seals = if allow_sealing { 0 } else { 1 };
     true
 }
 
-/// Returns the frame that holds page `index` of a memfd, allocating a zeroed
-/// one if the page has never been written. Shared mappings map this frame
-/// directly; it lives until the overlay is torn down with its domain.
+/// Returns the frame that holds page `index` of a paged file (a memfd, or a
+/// file mapped shared), allocating a zeroed one if the page has never been
+/// written. Shared mappings map this frame directly; it lives until the
+/// overlay is torn down with its domain.
 pub(crate) fn memfd_frame(handle: Handle, index: usize) -> Option<FrameLease> {
     let node = node_mut(handle)?;
-    node.memfd.then_some(())?;
+    node.paged().then_some(())?;
     memfd_page(node, index, true)
 }
 
-pub(crate) fn is_memfd(handle: Handle) -> bool {
-    node(handle).is_some_and(|node| node.memfd)
+/// Moves a file's data into whole frames, so every process that maps it
+/// shared maps the same pages (as Linux maps the page cache), instead of a
+/// copy written back at munmap. Already paged files stay as they are.
+pub(crate) fn make_paged(handle: Handle) -> bool {
+    node_mut(handle).is_some_and(|node| node.kind == NodeKind::File && make_node_paged(node))
+}
+
+fn make_node_paged(node: &mut Node) -> bool {
+    if node.paged() {
+        return true;
+    }
+    // Build the frame index beside the data chain, then swap them.
+    let mut paged = Node {
+        first_page: FrameLease::EMPTY,
+        data: Data::Paged,
+        ..*node
+    };
+    let mut buffer = [0_u8; PAGE_SIZE];
+    for index in 0..node.size.div_ceil(PAGE_SIZE) {
+        let Some(length) = read_node(node, index * PAGE_SIZE, &mut buffer) else {
+            let _ = release_frame_index(paged.first_page);
+            return false;
+        };
+        let Some(address) =
+            memfd_page(&mut paged, index, true).and_then(FrameLease::direct_map_address)
+        else {
+            let _ = release_frame_index(paged.first_page);
+            return false;
+        };
+        unsafe { core::slice::from_raw_parts_mut(address as *mut u8, length) }
+            .copy_from_slice(&buffer[..length]);
+    }
+    if !release_data_pages(node.first_page) {
+        let _ = release_frame_index(paged.first_page);
+        return false;
+    }
+    node.first_page = paged.first_page;
+    node.last_page = FrameLease::EMPTY;
+    node.page_count = 0;
+    node.cached_page = FrameLease::EMPTY;
+    node.cached_page_index = 0;
+    node.data = Data::Paged;
+    true
 }
 
 pub(crate) fn file_seals(handle: Handle) -> Option<u32> {
     let node = node(handle)?;
-    node.memfd.then_some(node.seals)
+    (node.data == Data::Memfd).then_some(node.seals)
 }
 
 pub(crate) fn add_file_seals(handle: Handle, seals: u32) -> Option<bool> {
     let node = node_mut(handle)?;
-    if !node.memfd {
+    if node.data != Data::Memfd {
         return None;
     }
     let added = seals & !node.seals;
@@ -596,7 +658,7 @@ fn create(path: &[u8], kind: NodeKind, mode: u32, initial: &[u8]) -> Option<Hand
         active: true,
         linked: true,
         whiteout: false,
-        memfd: false,
+        data: Data::Chain,
         kind,
         path_length: path.len() as u16,
         mode: mode & 0o7777,
@@ -664,7 +726,7 @@ pub(crate) fn whiteout(path: &[u8]) -> bool {
         active: true,
         linked: true,
         whiteout: true,
-        memfd: false,
+        data: Data::Chain,
         kind: NodeKind::File,
         path_length: path.len() as u16,
         mode: 0,
@@ -693,9 +755,13 @@ pub(crate) fn read(handle: Handle, offset: usize, output: &mut [u8]) -> Option<u
     if matches!(node.kind, NodeKind::Directory | NodeKind::Fifo) {
         return None;
     }
+    read_node(node, offset, output)
+}
+
+fn read_node(node: &mut Node, offset: usize, output: &mut [u8]) -> Option<usize> {
     let start = offset.min(node.size);
     let end = start.saturating_add(output.len()).min(node.size);
-    if node.memfd {
+    if node.paged() {
         let mut position = start;
         while position < end {
             let within = position % PAGE_SIZE;
@@ -750,7 +816,7 @@ pub(crate) fn write(handle: Handle, offset: usize, input: &[u8]) -> Option<usize
     if matches!(node.kind, NodeKind::Directory | NodeKind::Fifo) {
         return None;
     }
-    if node.memfd {
+    if node.paged() {
         let mut position = offset;
         while position < end {
             let within = position % PAGE_SIZE;
@@ -800,8 +866,8 @@ pub(crate) fn truncate(handle: Handle, size: usize) -> bool {
     if node.kind != NodeKind::File {
         return false;
     }
-    if node.memfd {
-        // Frames stay allocated when a memfd shrinks, since other processes
+    if node.paged() {
+        // Frames stay allocated when a paged file shrinks, since processes
         // may still map them; the cut-off bytes are zeroed so the file reads
         // back as zeros if it grows again.
         let mut position = size;
@@ -1223,7 +1289,7 @@ fn memfd_page(node: &mut Node, index: usize, allocate: bool) -> Option<FrameLeas
 }
 
 fn release_node_data(node: &Node) -> bool {
-    if node.memfd {
+    if node.paged() {
         release_frame_index(node.first_page)
     } else {
         release_data_pages(node.first_page)

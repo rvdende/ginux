@@ -94,6 +94,12 @@ def parse_list(path, default_budget):
     return tests
 
 
+# A result line from the new LTP API ("file.c:12: TFAIL: ...") or the old
+# one ("name    1  TFAIL  :  ...").
+RESULT_PRINTED_TFAIL = re.compile(rb"(?m)(?:\.c:\d+: |^\S+\s+\d+\s+)TFAIL\b")
+RESULT_PRINTED_TBROK = re.compile(rb"(?m)(?:\.c:\d+: |^\S+\s+\d+\s+)TBROK\b")
+
+
 def classify(status, output, budget):
     """Maps the runner's END status and the test's output to a result."""
     if status == "timeout":
@@ -112,6 +118,15 @@ def classify(status, output, budget):
     if b"Test killed! (timeout?)" in output:
         return "HANG", f"ltp-timeout {status}"
     if code == 0:
+        # The LTP library counts results in a page it shares with the test
+        # process and derives the exit status from it. Under Ginux that page
+        # does not yet reach the library's process from the test, so the
+        # exit status can claim success after the test reported a failure:
+        # the results it printed decide.
+        if RESULT_PRINTED_TBROK.search(output):
+            return "TBROK", f"{status} (TBROK printed)"
+        if RESULT_PRINTED_TFAIL.search(output):
+            return "TFAIL", f"{status} (TFAIL printed)"
         return "TPASS", status
     if code in (126, 127):
         return "TBROK", f"{status} (could not execute)"

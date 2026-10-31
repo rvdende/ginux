@@ -21148,10 +21148,11 @@ fn linux_runtime_mmap(
                 0
             }
     };
-    let anonymous_fd = fd == u64::MAX || fd == u64::from(u32::MAX);
+    // Linux ignores the descriptor of an anonymous mapping (LTP passes 0)
+    // and only wants its offset page-aligned.
     if normalized != valid_flags
         || fixed && no_replace
-        || anonymous && (!anonymous_fd || offset != 0)
+        || anonymous && !offset.is_multiple_of(PAGE_SIZE as u64)
     {
         return LINUX_EINVAL;
     }
@@ -21254,7 +21255,9 @@ fn linux_runtime_mmap(
     let file_backed = !anonymous;
     let replace = fixed;
     if let Some((handle, start)) = overlay_file.filter(|(handle, _)| {
-        sharing == LINUX_MAP_SHARED && !secret && crate::linux_overlay::is_memfd(*handle)
+        // A shared mapping maps the file's own pages: a memfd's, or those of
+        // a file moved to paged storage on its first shared mapping.
+        sharing == LINUX_MAP_SHARED && !secret && crate::linux_overlay::make_paged(*handle)
     }) {
         return linux_map_shared_memfd(mapping, pages, handle, start, protection as u8, replace);
     }

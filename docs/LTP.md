@@ -10,11 +10,25 @@ QEMU, and reports one machine-parseable line per test plus failure clusters.
 
 | Ginux | Change | Tests run | TPASS | TFAIL | TBROK | TCONF | CRASH | HANG |
 |---|---|---|---|---|---|---|---|---|
-| `d1f41667` | baseline (below) | 1362 | 41 | 39 | 1181 | 75 | 11 | 9 |
-| `62dce194` | `/proc/PID/oom_score_adj` kept per process | 1362 | 1043 | 38 | 130 | 76 | 52 | 17 |
-| `de94acb9` | fork EAGAIN, orphan reparenting, EINTR waits, edge-triggered epoll, timer preemption, killed-by-signal status | 1362 | 1045 | 39 | 169 | 76 | 15 | 12 |
-| `76719aee` | a fault kills only its process, frame map counts, IPv4 loopback, `/proc/sys` node clash | 1362 | 1072 | 37 | 162 | 75 | 4 | 6 |
-| `778dd3d0` | blocking semop/msgsnd/msgrcv, cross-process futexes, sleeping state, pipe capacity, SA_RESTART, CPU time, signals on the timer tick | 1362 | 1146 | 36 | 88 | 76 | 0 | 14 |
+| `d1f41667` | baseline (below) | 1362 | 41* | 39 | 1181 | 75 | 11 | 9 |
+| `62dce194` | `/proc/PID/oom_score_adj` kept per process | 1362 | 1043* | 38 | 130 | 76 | 52 | 17 |
+| `de94acb9` | fork EAGAIN, orphan reparenting, EINTR waits, edge-triggered epoll, timer preemption, killed-by-signal status | 1362 | 466 | 233 | 554 | 76 | 15 | 12 |
+| `76719aee` | a fault kills only its process, frame map counts, IPv4 loopback, `/proc/sys` node clash | 1362 | 498 | 231 | 542 | 75 | 4 | 6 |
+| `778dd3d0` | blocking semop/msgsnd/msgrcv, cross-process futexes, sleeping state, pipe capacity, SA_RESTART, CPU time, signals on the timer tick | 1362 | 526 | 240 | 504 | 76 | 0 | 14 |
+
+\* Counted with the exit status alone, which overstated passes (below);
+the later rows are rescored from the saved logs.
+
+**Pass counts before 2026-11-01 were overstated by about 600.** The LTP
+library counts results in a MAP_SHARED page of a /dev/shm file and derives
+the test's exit status from it. Ginux gave each process its own copy of
+such a page, so results from the test process never reached the library's
+process, which then exited 0: in the `778dd3d0` run 204 tests that
+printed TFAIL and 416 that printed TBROK (60 of them an anonymous mmap
+with fd 0 refused, about 60 "Test haven't reported results" or "bad magic"
+from the lost page) were counted as passes. The driver now classifies by the printed results when
+the exit status claims success, and shared mappings of a file now map the
+file's own pages.
 
 A crash takes the whole domain down, so the run reboots for the next test:
 the `de94acb9` run needed 23 boots against 68 before, the `76719aee` run 6,
@@ -22,20 +36,8 @@ and the `778dd3d0` run went through in one. Its 14 hangs are LTP's own
 30-second timeouts (no guest wedges): epoll_wait01/08/11/12/16,
 pselect01/_64, select02 and select04 (select and epoll_pwait still return
 no events rather than waiting for a signal), poll02 and ppoll01 (fixed
-since), futex_wait03, futex_wake03 and rt_tgsigqueueinfo01.
-
-**Pass counts are optimistic for tests that fork twice.** LTP's main
-process counts results in a MAP_SHARED page of a /dev/shm file, and
-results reported by a grandchild (a test's own child) do not reach it:
-fcntl15 printed TFAIL and TBROK yet exited 0, so it was counted as a pass.
-Shared file mappings are not yet one page shared by every mapper. Its remaining crashes
-are access04, fchownat03, madvise10, madvise11, mq_open01, move_mount03,
-munmap01, readv01, sendmmsg01, shmat01, statmount03 and waitid05 to
-waitid08; its hangs are bind04 (flaky), epoll_wait01, epoll_wait12,
-io_setup02, pipeio_1/2/5/7, prot_hsymlinks, recvmmsg01, select04 and
-semctl01. Most hangs are a test looping on a value Ginux reports wrongly,
-not a scheduling stall. Results of a full run are kept in
-`target/ltp-baseline/` (not committed).
+since), futex_wait03, futex_wake03 and rt_tgsigqueueinfo01. Results of a
+full run are kept in `target/ltp-baseline/` (not committed).
 
 ## Baseline (2026-10-31)
 
