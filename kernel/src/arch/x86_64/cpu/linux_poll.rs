@@ -728,18 +728,6 @@ fn linux_poll_run_others_live_return(
     }
 }
 
-pub(super) fn restart_current_linux_process_syscall(
-    mut caller: LinuxUserContext,
-    syscall: u64,
-) -> bool {
-    let Some(instruction) = caller.rip.checked_sub(2) else {
-        return false;
-    };
-    caller.rip = instruction;
-    caller.rax = syscall;
-    yield_current_linux_process(caller, syscall)
-}
-
 pub(super) fn yield_current_linux_process_wait(caller: LinuxUserContext) -> bool {
     yield_current_linux_process(caller, LINUX_EINTR)
 }

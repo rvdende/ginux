@@ -13039,17 +13039,20 @@ fn linux_waitid_live(
     if result != LINUX_ENOSYS || options as u32 as u64 & LINUX_WNOHANG != 0 {
         return result;
     }
-    let parent = current_linux_process_pid();
-    let Some(child) = linux_process::live_running_child_pid(parent) else {
-        return LINUX_ECHILD;
-    };
-    if !refresh_live_linux_process_registry(caller)
-        || !run_scheduled_linux_process(parent, Some(child))
-        || !restore_linux_process_live_return(output, parent)
-    {
+    if linux_process::live_running_child_pid(current_linux_process_pid()).is_none() {
         return LINUX_ECHILD;
     }
-    linux_waitid(id_type, id, information, options, rusage)
+    loop {
+        match run_other_linux_processes(output, caller, LINUX_WAITID_SYSCALL) {
+            Some(LinuxBlockedWait::Recheck) => {}
+            Some(LinuxBlockedWait::Return(result)) => return result,
+            None => return LINUX_ECHILD,
+        }
+        let result = linux_waitid(id_type, id, information, options, rusage);
+        if result != LINUX_ENOSYS {
+            return result;
+        }
+    }
 }
 
 fn linux_wait4_live(
@@ -28977,23 +28980,16 @@ fn linux_socket_recvfrom(
         && live.is_some()
     {
         let (output, caller, syscall) = live.unwrap();
-        let parent_pid = current_linux_process_pid();
         loop {
             match crate::linux_socket::recv_message(slot, &mut bytes[..length], peek_only) {
+                // The peer, often a forked child on a socketpair, runs; the
+                // receive is retried, or the call restarts later.
                 Err(crate::linux_socket::Error::WouldBlock) => {
-                    if let Some(child) = linux_process::live_running_child_pid(parent_pid) {
-                        if !refresh_live_linux_process_registry(caller)
-                            || !run_scheduled_linux_process(parent_pid, Some(child))
-                            || !restore_linux_process_live_return(output, parent_pid)
-                        {
-                            break Err(crate::linux_socket::Error::WouldBlock);
-                        }
-                        continue;
+                    match run_other_linux_processes(output, caller, syscall) {
+                        Some(LinuxBlockedWait::Recheck) => continue,
+                        Some(LinuxBlockedWait::Return(result)) => return result,
+                        None => break Err(crate::linux_socket::Error::WouldBlock),
                     }
-                    if parent_pid != 1 && restart_current_linux_process_syscall(caller, syscall) {
-                        return LINUX_RETURN_TO_KERNEL;
-                    }
-                    break Err(crate::linux_socket::Error::WouldBlock);
                 }
                 result => break result,
             }
@@ -29397,23 +29393,16 @@ fn linux_socket_recvmsg(
         && live.is_some()
     {
         let (output, caller, syscall) = live.unwrap();
-        let parent_pid = current_linux_process_pid();
         loop {
             match crate::linux_socket::recv_message(slot, &mut bytes[..capacity], peek_only) {
+                // The peer, often a forked child on a socketpair, runs; the
+                // receive is retried, or the call restarts later.
                 Err(crate::linux_socket::Error::WouldBlock) => {
-                    if let Some(child) = linux_process::live_running_child_pid(parent_pid) {
-                        if !refresh_live_linux_process_registry(caller)
-                            || !run_scheduled_linux_process(parent_pid, Some(child))
-                            || !restore_linux_process_live_return(output, parent_pid)
-                        {
-                            break Err(crate::linux_socket::Error::WouldBlock);
-                        }
-                        continue;
+                    match run_other_linux_processes(output, caller, syscall) {
+                        Some(LinuxBlockedWait::Recheck) => continue,
+                        Some(LinuxBlockedWait::Return(result)) => return result,
+                        None => break Err(crate::linux_socket::Error::WouldBlock),
                     }
-                    if parent_pid != 1 && restart_current_linux_process_syscall(caller, syscall) {
-                        return LINUX_RETURN_TO_KERNEL;
-                    }
-                    break Err(crate::linux_socket::Error::WouldBlock);
                 }
                 result => break result,
             }
