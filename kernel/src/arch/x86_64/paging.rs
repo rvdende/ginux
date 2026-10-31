@@ -1661,6 +1661,12 @@ pub(crate) fn kernel_address_is_mapped(address: u64) -> bool {
     true
 }
 
+/// The physical address a direct-map address refers to.
+pub(crate) fn direct_map_physical(address: usize) -> Option<u64> {
+    let physical = address.checked_sub(DIRECT_MAP_BASE)?;
+    (physical < direct_map_limit()).then_some(physical as u64)
+}
+
 pub(crate) fn direct_map_address(physical: usize) -> Option<usize> {
     direct_map_range_address(physical as u64, 1)
 }

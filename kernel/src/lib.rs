@@ -1,5 +1,7 @@
 #![no_std]
 
+extern crate alloc;
+
 mod address_space;
 mod arch;
 mod bringup;
@@ -10,6 +12,7 @@ mod domain;
 mod drivers;
 mod executable;
 mod framebuffer;
+mod heap;
 mod image_store;
 mod initramfs;
 mod ipc;
@@ -1229,6 +1232,9 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     serial_write_u64(summary.loader_pages);
     if !verify_initial_frame_allocation(boot_info) {
         kernel_fail("ginux: physical frame allocation test failed\r\n");
+    }
+    if !heap::verify() {
+        kernel_fail("ginux: kernel heap test failed\r\n");
     }
     if !cfg!(feature = "verification-boot") {
         serial_write_raw(b"ginux: memory manager ready\r\n");

@@ -18,6 +18,9 @@ impl LockRank {
     pub(crate) const ARCHITECTURE: Self = Self(10);
     pub(crate) const CROSS_CPU_DISPATCH: Self = Self(15);
     pub(crate) const FUTEX_COORDINATION: Self = Self(18);
+    /// The kernel heap refills from the frame allocator while holding its
+    /// lock, so it ranks just below it.
+    pub(crate) const KERNEL_HEAP: Self = Self(19);
     pub(crate) const PHYSICAL_MEMORY: Self = Self(20);
     pub(crate) const ADDRESS_SPACE: Self = Self(30);
     pub(crate) const SCHEDULER: Self = Self(40);
