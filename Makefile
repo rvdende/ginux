@@ -17,7 +17,7 @@ SYSTEM_PROFILE := profiles/minimal-system-v0/profile.tsv
 
 .DEFAULT_GOAL := help
 
-.PHONY: help doctor manifest system-image test-alpine test-rocky-shell test-rocky-dnf test-multi-domain test-linux-abi test-linux-runtime test-storage test-oci-cache probe-rocky-systemd test-rocky-systemd test-rocky-detached test-domain-responsiveness benchmark-rocky-systemd benchmark-prepare-linux benchmark-prepare-ginux benchmark-linux-comparison benchmark-ginux-boot benchmark-boot-comparison benchmark-ginux-sysbench benchmark-compare profile-rocky-systemd rocky-image rocky-image-check linux-probe controller-runtime network-service protocol-service volume-service abi-conformance architecture-check linux-compat-check build build-verification build-linux-profile run reset-storage boot-media test-boot-media test-hardware-profile test-rust-workloads test-desktop test-rust-userland rust-rootfs userland userland-check test test-c1 test-c2 fmt gate clean
+.PHONY: help doctor manifest system-image test-alpine test-rocky-shell test-rocky-dnf test-multi-domain test-linux-abi test-linux-runtime test-storage test-oci-cache probe-rocky-systemd test-rocky-systemd test-rocky-detached test-domain-responsiveness benchmark-rocky-systemd benchmark-prepare-linux benchmark-prepare-ginux benchmark-linux-comparison benchmark-ginux-boot benchmark-boot-comparison benchmark-ginux-sysbench benchmark-compare profile-rocky-systemd rocky-image rocky-image-check linux-probe controller-runtime network-service protocol-service volume-service abi-conformance architecture-check linux-compat-check build build-verification build-linux-profile run reset-storage boot-media test-boot-media test-hardware-profile test-rust-workloads test-desktop test-rust-userland rust-rootfs userland userland-check ltp test-ltp test test-c1 test-c2 fmt gate clean
 
 help:
 	@echo "Ginux development targets"
@@ -32,6 +32,8 @@ help:
 	@echo "  make rust-rootfs         Build the all-Rust root filesystem embedded as image=builtin://rust"
 	@echo "  make test-rust-userland  Boot a builtin://rust domain and run its brush/uutils test"
 	@echo "  make test-desktop        Run the Wayland compositor and terminal on /dev/fb0, all-Rust userland"
+	@echo "  make ltp                 Build the LTP syscall tests statically for musl (Docker)"
+	@echo "  make test-ltp            Run the LTP syscall tests in an Alpine domain (docs/LTP.md)"
 	@echo "  make test-rocky-shell Download Rocky at runtime and verify its glibc shell in QEMU"
 	@echo "  make test-rocky-dnf   Download Rocky and verify a real dnf update in QEMU"
 	@echo "  make test-multi-domain Run concurrent Alpine and Rocky domains in QEMU"
@@ -241,6 +243,13 @@ userland-check:
 
 rust-rootfs:
 	@tools/images/build-rust-rootfs.sh
+
+ltp:
+	@tools/ltp/build.sh
+
+# LTP_TESTS="a b" or LTP_FILTER=REGEX select tests; see docs/LTP.md.
+test-ltp: build
+	@GINUX_ESP_DIR="$${GINUX_ESP_DIR:-$(abspath $(ESP_DIR))}" tests/qemu/ltp.sh
 
 test-rust-userland: rust-rootfs build
 	@tests/qemu/rust-userland.sh
