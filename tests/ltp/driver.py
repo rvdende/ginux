@@ -111,6 +111,11 @@ def classify(status, output, budget):
         return "TPASS", status
     if code in (126, 127):
         return "TBROK", f"{status} (could not execute)"
+    if code >= 128:
+        # Ginux reports a child killed by signal N as an exit with 128+N.
+        return "TBROK", f"{status} (signal {code - 128} reported as an exit status?)"
+    if code > 63:
+        return "TBROK", f"{status} (not an LTP result)"
     if code & 2:
         return "TBROK", status
     if code & 1:
@@ -119,7 +124,7 @@ def classify(status, output, budget):
         return "TWARN", status
     if code & 32:
         return "TCONF", status
-    return "TBROK", f"{status} (unexpected exit code)"
+    return "TBROK", f"{status} (no LTP result bits)"
 
 
 class QuietHandler(http.server.SimpleHTTPRequestHandler):
