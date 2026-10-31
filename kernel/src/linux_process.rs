@@ -2264,6 +2264,30 @@ fn finish_live_process_registry_with_refresh_floor(refresh_floor: u32) -> bool {
         crate::serial_write(" ");
         crate::serial_write_u64(table.processes.iter().flatten().count() as u64);
         crate::serial_write("\r\n");
+        for process in table.processes.iter().flatten() {
+            let state = match process.state {
+                ProcessState::Preparing => 0,
+                ProcessState::Running => 1,
+                ProcessState::Stopped { .. } => 2,
+                ProcessState::Exiting => 3,
+                ProcessState::Zombie { .. } => 4,
+            };
+            crate::serial_write(
+                "ginux: remaining process pid/state/parent/space/retiring/thread: ",
+            );
+            for value in [
+                u64::from(process.handle.pid),
+                state,
+                process.parent.map_or(0, |parent| u64::from(parent.pid)),
+                u64::from(process.address_space.is_some()),
+                u64::from(process.retiring_address_space.is_some()),
+                u64::from(process.scheduler_thread.is_some()),
+            ] {
+                crate::serial_write_u64(value);
+                crate::serial_write(" ");
+            }
+            crate::serial_write("\r\n");
+        }
         return false;
     }
     LIVE_PROCESS_TABLE_INITIALIZED[instance].store(false, Ordering::Release);
@@ -3299,6 +3323,39 @@ fn release_live_process_address_space(
 }
 
 #[inline(never)]
+/// Ends a process from another process's context: withdraws it from the
+/// run queue, frees its address space and leaves it a zombie for its
+/// parent. A domain's init uses this on exit for killed processes the
+/// scheduler can no longer switch to, so they cannot run their own exit.
+pub(crate) fn force_exit_live_process(pid: u32, status: u8) -> bool {
+    let Some(table) = live_process_table_mut() else {
+        return false;
+    };
+    let Some(handle) = table.handle_by_pid(pid) else {
+        return false;
+    };
+    let Some(process) = table.process(handle) else {
+        return false;
+    };
+    if process.state != ProcessState::Running {
+        return false;
+    }
+    let Some(space) = process.address_space else {
+        return false;
+    };
+    if process.scheduler_thread.is_some() {
+        let Some(run_queue) = scheduler::active_process_scheduler_workspace() else {
+            return false;
+        };
+        if !table.withdraw_from_scheduler(handle, run_queue) {
+            return false;
+        }
+    }
+    release_live_process_address_space(table, handle, space)
+        && crate::linux_sysv_ipc::drop_process_attachments(pid).is_ok()
+        && table.exit_after_current_address_space_retired(handle, status)
+}
+
 pub(crate) fn complete_live_child_exit(pid: u32, status: u8) -> Option<LiveProcessDispatch> {
     LIVE_FORK_EXECUTION_STAGE.store(15, Ordering::Release);
     let table = live_process_table_mut()?;

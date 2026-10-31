@@ -24,8 +24,20 @@ use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use wayland_server::Display;
 
 const USAGE: &str = "usage: ginux-wm [--headless WIDTHxHEIGHT] [--framebuffer PATH] \
-[--input DIR] [--socket NAME] [--terminal COMMAND] [--keymap FILE] [--spawn COMMAND]... \
+[--input DIR] [--socket NAME] [--terminal COMMAND] [--keymap FILE | --no-keymap] [--spawn COMMAND]... \
 [--screenshot SECONDS PATH]";
+
+/// The US layout compiled by `xkbcli compile-keymap --rules evdev --model
+/// pc105 --layout us`, so clients that use libxkbcommon can read keys.
+const US_KEYMAP: &[u8] = include_bytes!("us.xkb");
+
+/// Which XKB keymap keyboards are given.
+enum Keymap {
+    BuiltIn,
+    File(PathBuf),
+    /// Raw evdev key codes (wl_keyboard keymap format no_keymap).
+    None,
+}
 
 struct Options {
     headless: Option<(i32, i32)>,
@@ -33,7 +45,7 @@ struct Options {
     input: PathBuf,
     socket: String,
     terminal: String,
-    keymap: Option<PathBuf>,
+    keymap: Keymap,
     spawn: Vec<String>,
     screenshot: Option<(Duration, PathBuf)>,
 }
@@ -45,7 +57,7 @@ fn parse_options() -> Result<Options, String> {
         input: PathBuf::from("/dev/input"),
         socket: "wayland-0".into(),
         terminal: "ginux-term".into(),
-        keymap: None,
+        keymap: Keymap::BuiltIn,
         spawn: Vec::new(),
         screenshot: None,
     };
@@ -67,7 +79,8 @@ fn parse_options() -> Result<Options, String> {
             "--input" => options.input = value()?.into(),
             "--socket" => options.socket = value()?,
             "--terminal" => options.terminal = value()?,
-            "--keymap" => options.keymap = Some(value()?.into()),
+            "--keymap" => options.keymap = Keymap::File(value()?.into()),
+            "--no-keymap" => options.keymap = Keymap::None,
             "--spawn" => options.spawn.push(value()?),
             "--screenshot" => {
                 let seconds: f64 = value()?.parse().map_err(|_| "seconds must be a number")?;
@@ -139,11 +152,16 @@ fn run(options: Options) -> Result<(), String> {
     let mut display: Display<wm::State> = Display::new().map_err(|error| error.to_string())?;
     protocol::create_globals(&display.handle());
     let mut state = wm::State::new(width, height, options.terminal.clone());
-    if let Some(path) = &options.keymap {
-        let mut keymap =
-            std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    state.keymap = match &options.keymap {
+        Keymap::BuiltIn => Some(US_KEYMAP.to_vec()),
+        Keymap::File(path) => {
+            Some(std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?)
+        }
+        Keymap::None => None,
+    };
+    if let Some(keymap) = &mut state.keymap {
+        // wl_keyboard.keymap sizes include the terminating NUL.
         keymap.push(0);
-        state.keymap = Some(keymap);
     }
     let listener = listen(&options.socket)?;
     std::env::set_var("WAYLAND_DISPLAY", &options.socket);

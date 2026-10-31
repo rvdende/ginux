@@ -412,6 +412,16 @@ impl Terminal {
     }
 }
 
+impl Drop for Terminal {
+    /// Hangs up the shell's process group however the terminal exits,
+    /// including when the compositor goes away.
+    fn drop(&mut self) {
+        let group = rustix::process::Pid::from_child(&self.shell);
+        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::HUP);
+        let _ = self.shell.wait();
+    }
+}
+
 /// Maps an evdev key code to a character on a US keyboard.
 fn character(code: u32, shift: bool, caps_lock: bool) -> Option<char> {
     const ROWS: [(u32, &str, &str); 4] = [
@@ -739,9 +749,6 @@ fn run() -> Result<(), String> {
             }
         }
     }
-    let group = rustix::process::Pid::from_child(&terminal.shell);
-    let _ = rustix::process::kill_process_group(group, rustix::process::Signal::HUP);
-    let _ = terminal.shell.wait();
     Ok(())
 }
 

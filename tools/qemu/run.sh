@@ -62,6 +62,9 @@ if [[ "${GINUX_QEMU_USB_INPUT:-}" == "1" ]]; then
     )
 fi
 qemu_netdev="user,id=ginux-net,restrict=off"
+# GINUX_QEMU_DISPLAY selects a QEMU display such as gtk or sdl, to see the
+# framebuffer (and a Wayland desktop on /dev/fb0) in a window.
+display="${GINUX_QEMU_DISPLAY:-none}"
 # GINUX_QEMU_MONITOR names a Unix socket for the QEMU monitor, which tests
 # use to take screenshots (screendump) and inject input.
 monitor="none"
@@ -80,7 +83,7 @@ exec "$qemu" \
     -cpu "$cpu_model" \
     -smp 1 \
     -m "$memory" \
-    -display none \
+    -display "$display" \
     -monitor "$monitor" \
     -serial stdio \
     -no-reboot \

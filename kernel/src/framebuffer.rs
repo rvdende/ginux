@@ -207,6 +207,11 @@ pub(crate) fn write(bytes: &[u8]) {
     BUSY.store(false, Ordering::Release);
 }
 
+/// Whether a Linux program currently draws to the screen through /dev/fb0.
+pub(crate) fn owned() -> bool {
+    OWNED.load(Ordering::Acquire)
+}
+
 /// The framebuffer /dev/fb0 exposes, if the firmware left a usable one.
 pub(crate) fn display() -> Option<Display> {
     // SAFETY: DISPLAY is written once by init, before Linux programs run.

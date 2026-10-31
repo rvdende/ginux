@@ -793,7 +793,6 @@ const LINUX_PROC_PID2_ZOMBIE_STATUS: &[u8] =
     b"Name:\tinit\nState:\tZ (zombie)\nPid:\t2\nPPid:\t1\n";
 const LINUX_PROC_CPUINFO: &[u8] = b"processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 158\nmodel name\t: Ginux virtual x86-64 CPU\nstepping\t: 10\ncpu MHz\t\t: 1000.000\ncache size\t: 16384 KB\nphysical id\t: 0\nsiblings\t: 1\ncore id\t\t: 0\ncpu cores\t: 1\nfpu\t\t: yes\ncpuid level\t: 13\nflags\t\t: fpu tsc msr pae cx8 apic sep mtrr pge cmov pat clflush mmx fxsr sse sse2 syscall nx lm constant_tsc rep_good nopl xtopology cpuid tsc_known_freq pni ssse3 cx16 sse4_1 sse4_2 x2apic popcnt aes xsave avx rdrand hypervisor\nbogomips\t: 2000.00\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 46 bits physical, 48 bits virtual\n\n";
 const LINUX_PROC_STAT: &[u8] = b"cpu  1 0 1 100 0 0 0 0 0 0\ncpu0 1 0 1 100 0 0 0 0 0 0\nintr 0\nctxt 1\nbtime 0\nprocesses 1\nprocs_running 1\nprocs_blocked 0\nsoftirq 0 0 0 0 0 0 0 0 0 0 0\n";
-const LINUX_PROC_UPTIME: &[u8] = b"1.00 0.00\n";
 const LINUX_PROC_LOADAVG: &[u8] = b"0.00 0.00 0.00 1/1 1\n";
 const LINUX_PROC_FILESYSTEMS: &[u8] =
     b"nodev\tproc\nnodev\ttmpfs\nnodev\tdevtmpfs\n\text2\n\text3\n\text4\n\txfs\n";
@@ -1352,6 +1351,11 @@ static LINUX_PROCESS_CHILD_YIELD_PID: BankedAtomicU32 = BankedAtomicU32::new(0);
 /// The process that most recently yielded because it could not make
 /// progress; see run_other_linux_processes.
 static LINUX_PROCESS_LAST_BLOCKED_PID: BankedAtomicU32 = BankedAtomicU32::new(0);
+/// Times a domain's init exit has waited for the processes it killed.
+static LINUX_INIT_EXIT_KILL_ROUNDS: BankedAtomicU32 = BankedAtomicU32::new(0);
+const LINUX_INIT_EXIT_KILL_ROUND_LIMIT: u32 = 10_000;
+/// Rounds after which init's exit ends killed processes itself.
+const LINUX_INIT_EXIT_FORCE_ROUND: u32 = 100;
 static LINUX_PROCESS_RELEASE_PARENT_ON_EXEC: BankedAtomicBool = BankedAtomicBool::new(false);
 static LINUX_PROCESS_CHILD_STATUS: BankedAtomicU8 = BankedAtomicU8::new(0);
 static LINUX_CURRENT_PROCESS_PID: BankedAtomicU32 = BankedAtomicU32::new(1);
@@ -10674,6 +10678,11 @@ extern "sysv64" fn linux_syscall_handler(
         LINUX_EXIT_SYSCALL | LINUX_EXIT_GROUP_SYSCALL
             if LINUX_RUNTIME_MODE.load(Ordering::SeqCst) =>
         {
+            if let Some(result) =
+                linux_init_exit_kill_others_live_return(registers, syscall_return, number)
+            {
+                return result;
+            }
             LINUX_RUNTIME_EXIT_STATUS.store(first_argument, Ordering::SeqCst);
             if !linux_close_all_descriptors() {
                 return LINUX_EIO;
@@ -12147,6 +12156,57 @@ fn linux_schedule_new_thread(
     LINUX_YIELD_SWITCH_COUNT.fetch_add(1, Ordering::SeqCst);
     LINUX_LIVE_RETURN_VALIDATED.store(true, Ordering::SeqCst);
     child_context.rax
+}
+
+/// When a domain's init exits while other processes live, kills them as
+/// Linux does when a PID namespace's init exits, and lets them run their
+/// exits before init's exit runs again. Returns `None` once init is alone
+/// (or the processes did not go away), so its exit proceeds.
+fn linux_init_exit_kill_others_live_return(
+    output: *mut LinuxSyscallFrame,
+    caller: LinuxUserContext,
+    number: u64,
+) -> Option<u64> {
+    let living: ([u32; linux_process::PROCESS_LIMIT], usize) = match linux_signal_targets(-1) {
+        Ok((targets, count)) => {
+            let mut living = [0_u32; linux_process::PROCESS_LIMIT];
+            let mut found = 0;
+            for pid in targets[..count].iter().copied() {
+                if linux_process::live_process_status(pid)
+                    .is_some_and(|status| status.state != linux_process::LiveProcessState::Zombie)
+                {
+                    living[found] = pid;
+                    found += 1;
+                }
+            }
+            (living, found)
+        }
+        Err(_) => ([0; linux_process::PROCESS_LIMIT], 0),
+    };
+    let rounds = LINUX_INIT_EXIT_KILL_ROUNDS.fetch_add(1, Ordering::SeqCst);
+    if living.1 == 0 || rounds >= LINUX_INIT_EXIT_KILL_ROUND_LIMIT {
+        LINUX_INIT_EXIT_KILL_ROUNDS.store(0, Ordering::SeqCst);
+        return None;
+    }
+    for pid in living.0[..living.1].iter().copied() {
+        let _ = linux_queue_process_signal(pid, LINUX_SIGKILL, LINUX_SI_KERNEL, None);
+    }
+    let ran = run_other_linux_processes(output, caller, number);
+    if ran.is_none() && rounds >= LINUX_INIT_EXIT_FORCE_ROUND {
+        // The scheduler keeps failing to switch to the killed processes, so
+        // they cannot run their own exits; end them from here.
+        for pid in living.0[..living.1].iter().copied() {
+            if linux_process::force_exit_live_process(pid, 128 + LINUX_SIGKILL as u8) {
+                retire_linux_process_threads(pid);
+                let _ = linux_process::release_live_process_runtime_slot(pid);
+                crate::linux_overlay::remove_process_shared_mappings(pid);
+            }
+        }
+    }
+    Some(match ran {
+        Some(LinuxBlockedWait::Return(result)) => result,
+        _ => linux_restart_syscall_live_return(output, caller, number),
+    })
 }
 
 fn linux_exit_child_to_parent(output: *mut LinuxSyscallFrame, caller: LinuxUserContext) -> u64 {
@@ -35556,6 +35616,45 @@ fn linux_user_namespace_file(state: u16) -> Option<&'static [u8]> {
 }
 
 /// Renders /proc/meminfo from the frame allocator's counts.
+/// /proc/uptime: seconds since boot, and idle time, which Ginux does not
+/// account and reports as zero.
+fn linux_proc_uptime() -> &'static [u8] {
+    static mut UPTIME: [u8; 32] = [0; 32];
+    let centiseconds = linux_elapsed_nanoseconds().unwrap_or(0) / 10_000_000;
+    let mut digits = [0_u8; 20];
+    let mut value = centiseconds / 100;
+    let mut count = 0;
+    loop {
+        digits[count] = b'0' + (value % 10) as u8;
+        count += 1;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    // SAFETY: the kernel runs Linux syscalls on one CPU, and the bytes are
+    // copied out before the next call can rewrite them.
+    let buffer = unsafe { &mut *core::ptr::addr_of_mut!(UPTIME) };
+    let mut length = 0;
+    for digit in digits[..count].iter().rev() {
+        buffer[length] = *digit;
+        length += 1;
+    }
+    let fraction = centiseconds % 100;
+    for byte in [
+        b'.',
+        b'0' + (fraction / 10) as u8,
+        b'0' + (fraction % 10) as u8,
+    ]
+    .into_iter()
+    .chain(*b" 0.00\n")
+    {
+        buffer[length] = byte;
+        length += 1;
+    }
+    &buffer[..length]
+}
+
 fn linux_proc_meminfo() -> &'static [u8] {
     struct Buffer {
         bytes: [u8; 1024],
@@ -35635,7 +35734,7 @@ fn linux_regular_file(state: u16) -> Option<&'static [u8]> {
         LINUX_FILE_PROC_CPUINFO => return Some(LINUX_PROC_CPUINFO),
         LINUX_FILE_PROC_MEMINFO => return Some(linux_proc_meminfo()),
         LINUX_FILE_PROC_STAT => return Some(LINUX_PROC_STAT),
-        LINUX_FILE_PROC_UPTIME => return Some(LINUX_PROC_UPTIME),
+        LINUX_FILE_PROC_UPTIME => return Some(linux_proc_uptime()),
         LINUX_FILE_PROC_LOADAVG => return Some(LINUX_PROC_LOADAVG),
         LINUX_FILE_PROC_FILESYSTEMS => return Some(LINUX_PROC_FILESYSTEMS),
         LINUX_FILE_PROC_CMDLINE => return Some(LINUX_PROC_CMDLINE),

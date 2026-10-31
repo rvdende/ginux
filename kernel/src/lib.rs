@@ -4502,14 +4502,25 @@ fn serial_write_raw(bytes: &[u8]) {
     }
 }
 
+/// Reads a console byte from the serial port or, while no domain owns the
+/// screen, from a USB keyboard.
 pub(crate) fn serial_read_byte_blocking() -> u8 {
-    while !serial_input_ready() {
+    loop {
+        if serial_byte_waiting() {
+            return unsafe { inb(COM1) };
+        }
+        if let Some(byte) = linux_input::take_console_byte() {
+            return byte;
+        }
         core::hint::spin_loop();
     }
-    unsafe { inb(COM1) }
 }
 
 pub(crate) fn serial_input_ready() -> bool {
+    serial_byte_waiting() || linux_input::console_byte_ready()
+}
+
+fn serial_byte_waiting() -> bool {
     SERIAL_PRESENT.load(Ordering::Acquire) && (unsafe { inb(COM1 + 5) } & 0x01) != 0
 }
 

@@ -141,6 +141,7 @@ coverage, and a physical-hardware matrix remain future work.
 | Storage | Persistent configuration and verified OCI layer cache | Writable domain persistence and production recovery remain incomplete |
 | Networking | Host DHCP/DNS, virtual-link configuration, loopback, and tested lifecycle | Independent per-domain packet paths and leases remain unfinished |
 | Devices | QEMU virtio block/network, MSI-X, and VT-d paths | No GPU, NVMe, broad hardware, or stable third-party driver ABI |
+| Desktop | A Rust Wayland compositor and terminal run in an Alpine domain on the firmware framebuffer (`/dev/fb0`), with USB keyboard and tablet input through evdev | Software rendering at the firmware's mode; no XKB keymap, pseudo-terminals, clipboard or popups |
 | Performance | Narrow single-vCPU QEMU comparison using the same sysbench binary | Not a native, multicore, or general kernel benchmark |
 | Security | Capability and generation mechanisms exercised by tests | No independent audit or production security claim |
 
@@ -217,6 +218,37 @@ init-bearing image is `rockylinux/rockylinux:10-ubi-init`.
 root, execution, console, resource, image, and network state. OCI is only the
 transport and filesystem assembly format; it is not the runtime or security
 boundary.
+
+### Wayland desktop
+
+[`userland`](userland) is a Wayland desktop written in Rust that runs inside a
+domain: `ginux-wm`, a compositor and stacking window manager built on the
+pure-Rust `wayland-server` backend, and `ginux-term`, a terminal client;
+`ginux-fetch` prints a neofetch-style system summary. They are static
+`x86_64-unknown-linux-musl` binaries in their own Cargo workspace, so their
+crates.io dependencies stay out of the kernel build. The compositor
+draws in software onto `/dev/fb0`, the firmware framebuffer exposed through
+Linux fbdev, and reads keyboards and pointers from `/dev/input/eventN`, which
+the kernel feeds from USB keyboards, boot mice and QEMU's USB tablet. Clients
+share window buffers through memfd pools passed with `SCM_RIGHTS`; Ginux maps
+a memfd's own pages into every process that maps it.
+
+```sh
+make userland       # build ginux-wm and ginux-term
+make userland-check # format check, clippy and unit tests on the host
+make test-desktop   # run both in Alpine, type into the terminal, check a screendump
+```
+
+In a domain started with the binaries available (the test serves them over
+HTTP to `/tmp`), run `ginux-wm --terminal /tmp/ginux-term --spawn
+/tmp/ginux-term`. Windows get server-side title bars with close and maximize
+buttons; drag a window by its title bar or with Alt and the left button.
+Alt+Enter opens a terminal, Alt+Tab cycles focus, Alt+Q closes and Alt+M
+maximizes; Control+Alt+Backspace quits. To see and use it in a window, boot
+with `GINUX_QEMU_DISPLAY=gtk GINUX_QEMU_USB_INPUT=1 make run`. The terminal has no
+pseudo-terminal yet, so it runs the shell over pipes with its own line
+editing, and keys reach clients as raw evdev codes unless `--keymap` supplies
+an XKB keymap. There is no GPU acceleration, clipboard or popup placement.
 
 ### Boot media and physical machines
 
@@ -334,6 +366,9 @@ for the full target and environment-variable list.
   ring-3 controller.
 - [`services`](services) contains isolated native-service runtimes.
 - [`crates`](crates) contains shared `no_std` contracts and state machines.
+- [`userland`](userland) contains Linux programs for domains, built as static
+  musl binaries: the Rust Wayland compositor (`ginux-wm`), terminal
+  (`ginux-term`) and system summary (`ginux-fetch`).
 - [`specs`](specs) records versioned boot, kernel, ABI, domain, image, and
   service contracts.
 - [`tests`](tests) contains ABI, lifecycle, and end-to-end QEMU gates.

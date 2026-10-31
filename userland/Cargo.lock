@@ -57,6 +57,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ginux-fetch"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+]
+
+[[package]]
 name = "ginux-gfx"
 version = "0.1.0"
 dependencies = [

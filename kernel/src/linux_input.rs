@@ -5,10 +5,6 @@
 //! keeps a fixed ring of events, dropping the oldest when a reader falls
 //! behind, as the Linux evdev buffer does before it reports SYN_DROPPED.
 
-// The producer side (register, push, sync, set_pump) is used by the USB HID
-// input driver, which is being brought into the runtime separately.
-#![allow(dead_code)]
-
 use core::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) const DEVICE_LIMIT: usize = 4;
@@ -72,6 +68,97 @@ impl Device {
 }
 
 static mut DEVICES: [Device; DEVICE_LIMIT] = [const { Device::EMPTY }; DEVICE_LIMIT];
+static mut CONSOLE: Console = Console::EMPTY;
+
+/// Keyboard input translated for the text console (the controller prompt
+/// and attached domain shells), which otherwise reads only the serial port.
+struct Console {
+    bytes: [u8; 64],
+    head: usize,
+    length: usize,
+    shift: bool,
+    control: bool,
+    caps_lock: bool,
+}
+
+impl Console {
+    const EMPTY: Self = Self {
+        bytes: [0; 64],
+        head: 0,
+        length: 0,
+        shift: false,
+        control: false,
+        caps_lock: false,
+    };
+
+    fn push(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            if self.length == self.bytes.len() {
+                return;
+            }
+            self.bytes[(self.head + self.length) % self.bytes.len()] = *byte;
+            self.length += 1;
+        }
+    }
+
+    fn key(&mut self, code: u16, pressed: bool) {
+        match code {
+            42 | 54 => self.shift = pressed,
+            29 | 97 => self.control = pressed,
+            58 if pressed => self.caps_lock = !self.caps_lock,
+            _ if !pressed => {}
+            28 => self.push(b"\r"),
+            14 => self.push(&[0x7f]),
+            15 => self.push(b"\t"),
+            1 => self.push(&[0x1b]),
+            103 => self.push(b"\x1b[A"),
+            108 => self.push(b"\x1b[B"),
+            106 => self.push(b"\x1b[C"),
+            105 => self.push(b"\x1b[D"),
+            code => {
+                if let Some(character) = us_character(code, self.shift, self.caps_lock) {
+                    let byte = if self.control && character.is_ascii_alphabetic()
+                        || self.control && matches!(character, b'[' | b']' | b'\\')
+                    {
+                        character & 0x1f
+                    } else {
+                        character
+                    };
+                    self.push(&[byte]);
+                }
+            }
+        }
+    }
+}
+
+/// Maps an evdev key code to ASCII on a US keyboard.
+fn us_character(code: u16, shift: bool, caps_lock: bool) -> Option<u8> {
+    const ROWS: [(u16, &[u8], &[u8]); 4] = [
+        (2, b"1234567890-=", b"!@#$%^&*()_+"),
+        (16, b"qwertyuiop[]", b"QWERTYUIOP{}"),
+        (30, b"asdfghjkl;'`", b"ASDFGHJKL:\"~"),
+        (44, b"zxcvbnm,./", b"ZXCVBNM<>?"),
+    ];
+    match code {
+        43 => return Some(if shift { b'|' } else { b'\\' }),
+        57 => return Some(b' '),
+        _ => {}
+    }
+    ROWS.iter().find_map(|(first, plain, shifted)| {
+        let index = usize::from(code.checked_sub(*first)?);
+        let character = *plain.get(index)?;
+        let upper = if character.is_ascii_alphabetic() {
+            shift != caps_lock
+        } else {
+            shift
+        };
+        if upper {
+            shifted.get(index).copied()
+        } else {
+            Some(character)
+        }
+    })
+}
 static BUSY: AtomicBool = AtomicBool::new(false);
 /// Polls input hardware for new reports; set by the driver that registers
 /// devices, and called whenever a reader looks for events.
@@ -190,6 +277,58 @@ pub(crate) fn read(device: usize, output: &mut [u8]) -> usize {
         written
     })
     .unwrap_or(0)
+}
+
+/// Moves keyboard events into the console's byte queue while no domain owns
+/// the screen; once a compositor maps /dev/fb0 the keyboard is left to it.
+fn fill_console() {
+    if crate::framebuffer::owned() {
+        return;
+    }
+    pump();
+    let _ = with_devices(|devices| {
+        // SAFETY: BUSY, held by with_devices, also guards CONSOLE.
+        let console = unsafe { &mut *core::ptr::addr_of_mut!(CONSOLE) };
+        for device in devices
+            .iter_mut()
+            .filter(|device| device.kind == Some(DeviceKind::Keyboard))
+        {
+            while device.length != 0 {
+                let event = device.events[device.head];
+                device.head = (device.head + 1) % QUEUE_LENGTH;
+                device.length -= 1;
+                if event.kind == EV_KEY {
+                    console.key(event.code, event.value != 0);
+                }
+            }
+        }
+    });
+}
+
+/// Whether a typed byte is waiting for the text console.
+pub(crate) fn console_byte_ready() -> bool {
+    fill_console();
+    with_devices(|_| {
+        // SAFETY: BUSY, held by with_devices, also guards CONSOLE.
+        unsafe { (*core::ptr::addr_of!(CONSOLE)).length != 0 }
+    })
+    .unwrap_or(false)
+}
+
+/// Takes the next byte typed for the text console.
+pub(crate) fn take_console_byte() -> Option<u8> {
+    fill_console();
+    with_devices(|_| {
+        // SAFETY: BUSY, held by with_devices, also guards CONSOLE.
+        let console = unsafe { &mut *core::ptr::addr_of_mut!(CONSOLE) };
+        (console.length != 0).then(|| {
+            let byte = console.bytes[console.head];
+            console.head = (console.head + 1) % console.bytes.len();
+            console.length -= 1;
+            byte
+        })
+    })
+    .flatten()
 }
 
 /// Drops every queued event, for example when the domain reading them stops.

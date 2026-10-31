@@ -2,8 +2,10 @@
 # Boots Ginux, starts an Alpine domain, and runs the Rust Wayland desktop
 # from userland/ in it: ginux-wm composes onto /dev/fb0 and ginux-term
 # connects over a Wayland socket, sharing its window buffers through memfd
-# pools passed with SCM_RIGHTS. A QEMU screendump of the real framebuffer
-# must then show the compositor's title bar and the terminal's contents.
+# pools passed with SCM_RIGHTS. Keys typed on QEMU's USB keyboard travel
+# through xHCI, evdev and the compositor to the terminal's shell, which
+# must echo a marker to the serial console, and a QEMU screendump of the
+# real framebuffer must show the compositor's title bar and the terminal.
 # The guest downloads the static binaries from a host HTTP server at
 # 10.0.2.2.
 set -euo pipefail
@@ -66,6 +68,26 @@ monitor_command() {
     printf '%s\n' "$1" | socat - "UNIX-CONNECT:$monitor" >/dev/null
 }
 
+# Types text on the USB keyboard with the monitor's sendkey.
+type_text() {
+    local text=$1 index character key
+    for ((index = 0; index < ${#text}; index++)); do
+        character=${text:index:1}
+        case "$character" in
+            ' ') key=spc ;;
+            '>') key=shift-dot ;;
+            '/') key=slash ;;
+            '_') key=shift-minus ;;
+            '-') key=minus ;;
+            [A-Z]) key="shift-${character,,}" ;;
+            *) key=$character ;;
+        esac
+        monitor_command "sendkey $key"
+        sleep 0.1
+    done
+    monitor_command "sendkey ret"
+}
+
 (cd "$repo_root/userland" && cargo build --release --target x86_64-unknown-linux-musl)
 mkdir -p "$serve_dir"
 cp "$repo_root/userland/target/x86_64-unknown-linux-musl/release/ginux-wm" \
@@ -88,20 +110,26 @@ dd if=/dev/zero of="$volume_image" bs=1048576 count=1 2>/dev/null
     printf '%s\n' \
         "cd /tmp && $fetch/ginux-wm && $fetch/ginux-term && chmod +x ginux-wm ginux-term && echo FETCHED\"_OK\""
     wait_for '^FETCHED_OK' 120
-    printf '%s\n' \
-        "./ginux-wm --terminal /tmp/ginux-term --spawn '/tmp/ginux-term -e \"echo DESKTOP_TERMINAL_OK; uname -sm; sleep 600\"' &"
+    printf '%s\n' "./ginux-wm --terminal /tmp/ginux-term --spawn /tmp/ginux-term &"
     wait_for 'GINUX_WM_READY' 60
-    # Give the terminal time to connect, draw and be composed.
+    # Give the terminal time to connect, draw and take keyboard focus.
     sleep 15
+    type_text 'echo KEYBOARD_INPUT_OK >/dev/console'
+    wait_for 'KEYBOARD_INPUT_OK' 60
+    type_text 'uname -a'
+    sleep 5
     monitor_command "screendump $screenshot"
     sleep 2
     echo DESKTOP_SCREENDUMP_TAKEN >>"$output_file"
-    printf '%s\n' 'kill %1; exit 0'
+    # Leaving init with the desktop running must still shut the domain down
+    # cleanly: the kernel kills the remaining processes, as Linux does when
+    # a PID namespace's init exits.
+    printf '%s\n' 'exit 0'
     wait_for 'ginux: Linux init exited cleanly' 120
     sleep 2
     printf '%s\n' 'shutdown'
 } | GINUX_MEMORY=4G GINUX_VOLUME_IMAGE="$volume_image" GINUX_QEMU_PID_FILE="$qemu_pid_file" \
-    GINUX_QEMU_MONITOR="$monitor" "$repo_root/tools/qemu/run.sh" >>"$output_file" 2>&1 &
+    GINUX_QEMU_MONITOR="$monitor" GINUX_QEMU_USB_INPUT=1 "$repo_root/tools/qemu/run.sh" >>"$output_file" 2>&1 &
 qemu_pid=$!
 
 for _ in $(seq 1 1800); do
@@ -118,6 +146,16 @@ fi
 wait "$qemu_pid" || true
 qemu_pid=""
 
+if ! grep -aq 'KEYBOARD_INPUT_OK' "$output_file"; then
+    tail -n 60 "$output_file"
+    echo "Wayland desktop test failed: typed input did not reach the terminal's shell." >&2
+    exit 1
+fi
+if ! grep -aq 'ginux: Linux init exited cleanly' "$output_file"; then
+    tail -n 60 "$output_file"
+    echo "Wayland desktop test failed: the domain did not shut down cleanly." >&2
+    exit 1
+fi
 if [[ ! -s "$screenshot" ]]; then
     tail -n 60 "$output_file"
     echo "Wayland desktop test failed: no screendump." >&2

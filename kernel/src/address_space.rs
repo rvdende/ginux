@@ -6209,9 +6209,13 @@ pub(crate) fn retire_linux_child_address_space(root: memory::FrameLease) -> bool
             }
             if value & PRESENT != 0 {
                 let address = value & ADDRESS_MASK;
+                // Device memory such as the framebuffer has no frame lease;
+                // it is mapped shared and never forked, and is not freed.
+                let device = LINUX_RUNTIME_SHARED | LINUX_RUNTIME_DONTFORK;
                 if value & USER == 0
                     || !(memory::live_frame_lease(memory::FrameOwner::KERNEL, address).is_some()
-                        || memory::frame_address_is_runtime(address))
+                        || memory::frame_address_is_runtime(address)
+                        || value & device == device)
                 {
                     return false;
                 }
