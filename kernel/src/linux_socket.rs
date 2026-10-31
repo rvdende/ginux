@@ -191,6 +191,7 @@ static mut UNIX_PATH_LENGTHS: [u8; SLOT_COUNT] = [0; SLOT_COUNT];
 static mut UNIX_PATHS: [[u8; UNIX_PATH_CAPACITY]; SLOT_COUNT] =
     [[0; UNIX_PATH_CAPACITY]; SLOT_COUNT];
 static mut UNIX_INFLIGHT_RIGHTS: usize = 0;
+static mut FILE_RIGHTS: [(u8, FileRight); SLOT_COUNT] = [(0, FileRight::EMPTY); SLOT_COUNT];
 static mut SOCKET_STORAGE: [SocketStorage<'static>; SLOT_COUNT] =
     [SocketStorage::EMPTY; SLOT_COUNT];
 static mut TCP_RX: [[u8; TCP_BUFFER_SIZE]; SLOT_COUNT] = [[0; TCP_BUFFER_SIZE]; SLOT_COUNT];
@@ -636,6 +637,10 @@ pub(crate) fn open_loopback(socket_type: u8) -> Result<u8, Error> {
 }
 
 pub(crate) fn close(slot: u8) -> bool {
+    if let Some(references) = file_right_references(slot) {
+        *references -= 1;
+        return true;
+    }
     let index = usize::from(slot);
     let Some(state) = (unsafe { SLOTS.get_mut(index) }).filter(|slot| slot.occupied) else {
         return false;
@@ -760,6 +765,7 @@ pub(crate) fn shutdown() -> bool {
         index += 1;
     }
     unsafe { UNIX_INFLIGHT_RIGHTS = 0 };
+    unsafe { FILE_RIGHTS = [(0, FileRight::EMPTY); SLOT_COUNT] };
     if unsafe { RUNTIME.is_none() } {
         return true;
     }
@@ -767,6 +773,12 @@ pub(crate) fn shutdown() -> bool {
 }
 
 pub(crate) fn duplicate(slot: u8) -> bool {
+    if let Some(references) = file_right_references(slot) {
+        return references
+            .checked_add(1)
+            .map(|count| *references = count)
+            .is_some();
+    }
     unsafe { SLOTS.get_mut(usize::from(slot)) }
         .filter(|state| state.occupied)
         .and_then(|state| {
@@ -1834,6 +1846,49 @@ pub(crate) fn unix_peer_credentials(slot: u8) -> Option<(u32, u32, u32)> {
     unsafe { SLOTS.get(usize::from(slot)) }
         .filter(|state| state.occupied && state.kind == Kind::Unix)
         .and_then(|state| state.peer_credentials)
+}
+
+/// A file description travelling as SCM_RIGHTS: the descriptor state a
+/// receiver needs to open its own descriptor for the same file. Rights are
+/// queued as slot numbers, so file rights use the numbers from SLOT_COUNT
+/// up, and duplicate and close count references to them like sockets.
+#[derive(Clone, Copy)]
+pub(crate) struct FileRight {
+    pub(crate) device: u16,
+    pub(crate) rootfs: u16,
+    pub(crate) generation: u32,
+    pub(crate) flags: u32,
+    pub(crate) offset: u64,
+}
+
+impl FileRight {
+    const EMPTY: Self = Self {
+        device: 0,
+        rootfs: 0,
+        generation: 0,
+        flags: 0,
+        offset: 0,
+    };
+}
+
+pub(crate) fn queue_file_right(right: FileRight) -> Option<u8> {
+    let index = unsafe { FILE_RIGHTS.iter() }.position(|(references, _)| *references == 0)?;
+    unsafe { FILE_RIGHTS[index] = (1, right) };
+    u8::try_from(SLOT_COUNT + index).ok()
+}
+
+pub(crate) fn file_right(slot: u8) -> Option<FileRight> {
+    let index = usize::from(slot).checked_sub(SLOT_COUNT)?;
+    unsafe { FILE_RIGHTS.get(index) }
+        .filter(|(references, _)| *references != 0)
+        .map(|(_, right)| *right)
+}
+
+fn file_right_references(slot: u8) -> Option<&'static mut u8> {
+    let index = usize::from(slot).checked_sub(SLOT_COUNT)?;
+    unsafe { FILE_RIGHTS.get_mut(index) }
+        .map(|(references, _)| references)
+        .filter(|references| **references != 0)
 }
 
 pub(crate) fn queue_unix_rights(sender: u8, rights: &[(u8, u32)]) -> Result<(), Error> {

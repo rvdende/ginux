@@ -71,6 +71,22 @@ struct Console {
 
 static READY: AtomicBool = AtomicBool::new(false);
 static BUSY: AtomicBool = AtomicBool::new(false);
+/// Set while a domain draws to the framebuffer through /dev/fb0; the console
+/// keeps its text model but stops drawing until the screen is handed back.
+static OWNED: AtomicBool = AtomicBool::new(false);
+static mut DISPLAY: Option<Display> = None;
+
+/// The firmware framebuffer as /dev/fb0 describes it to Linux programs.
+#[derive(Clone, Copy)]
+pub(crate) struct Display {
+    pub(crate) physical: u64,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    /// Bytes per scan line.
+    pub(crate) line_length: u32,
+    pub(crate) length: usize,
+    pub(crate) bgrx: bool,
+}
 static mut CONSOLE: Console = Console {
     base: 0,
     width: 0,
@@ -125,6 +141,14 @@ pub(crate) unsafe fn init(info: &BootFramebuffer, virtual_base: usize) -> bool {
         return false;
     }
     let console = &mut *core::ptr::addr_of_mut!(CONSOLE);
+    DISPLAY = mapped_length(info).map(|length| Display {
+        physical: info.base,
+        width: info.width,
+        height: info.height,
+        line_length: info.stride * 4,
+        length,
+        bgrx: info.format == FRAMEBUFFER_FORMAT_BGRX,
+    });
     console.base = virtual_base;
     console.width = info.width as usize;
     console.height = info.height as usize;
@@ -170,12 +194,67 @@ pub(crate) fn write(bytes: &[u8]) {
     // SAFETY: BUSY grants exclusive access to CONSOLE, and READY guarantees
     // that init mapped the framebuffer it describes.
     let console = unsafe { &mut *core::ptr::addr_of_mut!(CONSOLE) };
-    console.hide_cursor();
+    let owned = OWNED.load(Ordering::Acquire);
+    if !owned {
+        console.hide_cursor();
+    }
     for byte in bytes.iter().copied() {
         console.byte(byte);
     }
+    if !owned {
+        console.show_cursor();
+    }
+    BUSY.store(false, Ordering::Release);
+}
+
+/// The framebuffer /dev/fb0 exposes, if the firmware left a usable one.
+pub(crate) fn display() -> Option<Display> {
+    // SAFETY: DISPLAY is written once by init, before Linux programs run.
+    unsafe { *core::ptr::addr_of!(DISPLAY) }
+}
+
+/// Hands the screen to a Linux program, or takes it back for the console,
+/// which then repaints everything the program drew over.
+pub(crate) fn set_owned(owned: bool) {
+    if OWNED.swap(owned, Ordering::AcqRel) == owned || owned {
+        return;
+    }
+    if !READY.load(Ordering::Acquire) || BUSY.swap(true, Ordering::Acquire) {
+        return;
+    }
+    // SAFETY: BUSY grants exclusive access to CONSOLE.
+    let console = unsafe { &mut *core::ptr::addr_of_mut!(CONSOLE) };
+    console.fill(0, 0, console.width, console.height, DEFAULT_BACKGROUND);
+    for row in 0..console.rows {
+        for column in 0..console.columns {
+            console.draw_cell(row, column);
+        }
+    }
     console.show_cursor();
     BUSY.store(false, Ordering::Release);
+}
+
+/// Copies between the framebuffer and `bytes` at a byte offset, for read(2)
+/// and write(2) on /dev/fb0. Returns the bytes copied.
+pub(crate) fn transfer(offset: usize, bytes: &mut [u8], write: bool) -> usize {
+    let Some(display) = display() else {
+        return 0;
+    };
+    if !READY.load(Ordering::Acquire) || offset >= display.length {
+        return 0;
+    }
+    let length = bytes.len().min(display.length - offset);
+    // SAFETY: CONSOLE.base maps display.length bytes of the framebuffer
+    // (checked by init), and offset + length stays inside them.
+    let base = unsafe { (*core::ptr::addr_of!(CONSOLE)).base } as *mut u8;
+    unsafe {
+        if write {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), base.add(offset), length);
+        } else {
+            core::ptr::copy_nonoverlapping(base.add(offset), bytes.as_mut_ptr(), length);
+        }
+    }
+    length
 }
 
 impl Console {
@@ -379,6 +458,9 @@ impl Console {
 
     fn draw_cell(&mut self, row: usize, column: usize) {
         let cell = self.cells[row][column];
+        if OWNED.load(Ordering::Acquire) {
+            return;
+        }
         self.drawn[row][column] = cell;
         let glyph = BASIC_LEGACY[usize::from(cell.glyph & 0x7f)];
         let foreground = self.pixel(cell.foreground);
@@ -426,6 +508,9 @@ impl Console {
     }
 
     fn fill_pixels(&mut self, x: usize, y: usize, width: usize, height: usize, pixel: u32) {
+        if OWNED.load(Ordering::Acquire) {
+            return;
+        }
         for row in y..(y + height).min(self.height) {
             let line = (self.base as *mut u32).wrapping_add(row * self.stride);
             for column in x..(x + width).min(self.width) {

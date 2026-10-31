@@ -18,6 +18,9 @@ members = [
     "services/volume",
     "tools/manifest-tool",
 ]
+# Linux programs for domains, with their own workspace and crates.io
+# dependencies; see userland/Cargo.toml.
+exclude = ["userland"]
 resolver = "2"
 
 [workspace.package]

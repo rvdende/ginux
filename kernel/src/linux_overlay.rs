@@ -9,6 +9,7 @@ pub(crate) const PATH_CAPACITY: usize = 256;
 const NODE_COUNT: usize = 10;
 const MAPPING_COUNT: usize = 100;
 const DATA_CAPACITY: usize = PAGE_SIZE - core::mem::size_of::<FrameLease>();
+const FRAME_INDEX_CAPACITY: usize = PAGE_SIZE / core::mem::size_of::<FrameLease>() - 1;
 const XATTR_NAME_CAPACITY: usize = 255;
 const HOST_INSTANCE: usize = control_abi::DOMAIN_LIMIT;
 const INSTANCE_LIMIT: usize = control_abi::DOMAIN_LIMIT + 1;
@@ -61,6 +62,16 @@ impl Child {
 struct DataPage {
     next: FrameLease,
     bytes: [u8; DATA_CAPACITY],
+}
+
+// memfd contents are kept one file page per frame, listed in a chain of
+// index pages that starts at the node's first_page, so MAP_SHARED can map
+// the frames themselves into every process instead of copying them in at
+// mmap time.
+#[repr(C)]
+struct FrameIndexPage {
+    next: FrameLease,
+    frames: [FrameLease; FRAME_INDEX_CAPACITY],
 }
 
 #[repr(C)]
@@ -178,6 +189,7 @@ struct NodePage {
 }
 
 const _: () = assert!(core::mem::size_of::<DataPage>() == PAGE_SIZE);
+const _: () = assert!(core::mem::size_of::<FrameIndexPage>() <= PAGE_SIZE);
 const _: () = assert!(core::mem::size_of::<XattrPage>() <= PAGE_SIZE);
 const _: () = assert!(core::mem::size_of::<NodePage>() <= PAGE_SIZE);
 const _: () = assert!(core::mem::size_of::<MappingPage>() <= PAGE_SIZE);
@@ -438,6 +450,19 @@ pub(crate) fn configure_memfd(handle: Handle, allow_sealing: bool) -> bool {
     true
 }
 
+/// Returns the frame that holds page `index` of a memfd, allocating a zeroed
+/// one if the page has never been written. Shared mappings map this frame
+/// directly; it lives until the overlay is torn down with its domain.
+pub(crate) fn memfd_frame(handle: Handle, index: usize) -> Option<FrameLease> {
+    let node = node_mut(handle)?;
+    node.memfd.then_some(())?;
+    memfd_page(node, index, true)
+}
+
+pub(crate) fn is_memfd(handle: Handle) -> bool {
+    node(handle).is_some_and(|node| node.memfd)
+}
+
 pub(crate) fn file_seals(handle: Handle) -> Option<u32> {
     let node = node(handle)?;
     node.memfd.then_some(node.seals)
@@ -664,6 +689,24 @@ pub(crate) fn read(handle: Handle, offset: usize, output: &mut [u8]) -> Option<u
     }
     let start = offset.min(node.size);
     let end = start.saturating_add(output.len()).min(node.size);
+    if node.memfd {
+        let mut position = start;
+        while position < end {
+            let within = position % PAGE_SIZE;
+            let length = (end - position).min(PAGE_SIZE - within);
+            let target = &mut output[position - start..position - start + length];
+            match memfd_page(node, position / PAGE_SIZE, false)
+                .and_then(FrameLease::direct_map_address)
+            {
+                Some(address) => target.copy_from_slice(unsafe {
+                    core::slice::from_raw_parts((address + within) as *const u8, length)
+                }),
+                None => target.fill(0),
+            }
+            position += length;
+        }
+        return Some(end - start);
+    }
     let target_page = start / DATA_CAPACITY;
     let (mut page, mut page_index) =
         if node.cached_page != FrameLease::EMPTY && node.cached_page_index <= target_page {
@@ -701,6 +744,19 @@ pub(crate) fn write(handle: Handle, offset: usize, input: &[u8]) -> Option<usize
     if matches!(node.kind, NodeKind::Directory | NodeKind::Fifo) {
         return None;
     }
+    if node.memfd {
+        let mut position = offset;
+        while position < end {
+            let within = position % PAGE_SIZE;
+            let length = (end - position).min(PAGE_SIZE - within);
+            let address = memfd_page(node, position / PAGE_SIZE, true)?.direct_map_address()?;
+            unsafe { core::slice::from_raw_parts_mut((address + within) as *mut u8, length) }
+                .copy_from_slice(&input[position - offset..position - offset + length]);
+            position += length;
+        }
+        node.size = node.size.max(end);
+        return Some(input.len());
+    }
     ensure_data_pages(node, end.div_ceil(DATA_CAPACITY))?;
     let target_page = offset / DATA_CAPACITY;
     let (mut page, mut page_index) =
@@ -737,6 +793,24 @@ pub(crate) fn truncate(handle: Handle, size: usize) -> bool {
     };
     if node.kind != NodeKind::File {
         return false;
+    }
+    if node.memfd {
+        // Frames stay allocated when a memfd shrinks, since other processes
+        // may still map them; the cut-off bytes are zeroed so the file reads
+        // back as zeros if it grows again.
+        let mut position = size;
+        while position < node.size {
+            let within = position % PAGE_SIZE;
+            let length = (node.size - position).min(PAGE_SIZE - within);
+            if let Some(address) = memfd_page(node, position / PAGE_SIZE, false)
+                .and_then(FrameLease::direct_map_address)
+            {
+                unsafe { core::ptr::write_bytes((address + within) as *mut u8, 0, length) };
+            }
+            position += length;
+        }
+        node.size = size;
+        return true;
     }
     if size > node.size {
         if ensure_data_pages(node, size.div_ceil(DATA_CAPACITY)).is_none() {
@@ -998,9 +1072,7 @@ pub(crate) fn teardown() -> bool {
         };
         let next = nodes.next;
         for node in &mut nodes.nodes {
-            if node.active
-                && (!release_data_pages(node.first_page) || !release_xattr_pages(node.xattr_first))
-            {
+            if node.active && (!release_node_data(node) || !release_xattr_pages(node.xattr_first)) {
                 return false;
             }
             *node = Node::EMPTY;
@@ -1106,6 +1178,73 @@ fn allocate_mapping_page() -> Option<FrameLease> {
         );
     }
     Some(page)
+}
+
+fn allocate_zeroed_frame() -> Option<FrameLease> {
+    let [page] = memory::allocate_frames::<1>(FrameOwner::KERNEL)?;
+    let address = page.direct_map_address()?;
+    unsafe { core::ptr::write_bytes(address as *mut u8, 0, PAGE_SIZE) };
+    Some(page)
+}
+
+fn frame_index_page_mut(page: FrameLease) -> Option<&'static mut FrameIndexPage> {
+    (page != FrameLease::EMPTY).then_some(())?;
+    let address = page.direct_map_address()?;
+    Some(unsafe { &mut *(address as *mut FrameIndexPage) })
+}
+
+// A zeroed frame is an index page whose entries are all FrameLease::EMPTY.
+fn memfd_page(node: &mut Node, index: usize, allocate: bool) -> Option<FrameLease> {
+    if node.first_page == FrameLease::EMPTY {
+        allocate.then_some(())?;
+        node.first_page = allocate_zeroed_frame()?;
+    }
+    let mut page = node.first_page;
+    for _ in 0..index / FRAME_INDEX_CAPACITY {
+        let entries = frame_index_page_mut(page)?;
+        if entries.next == FrameLease::EMPTY {
+            allocate.then_some(())?;
+            entries.next = allocate_zeroed_frame()?;
+        }
+        page = entries.next;
+    }
+    let entry = &mut frame_index_page_mut(page)?.frames[index % FRAME_INDEX_CAPACITY];
+    if *entry == FrameLease::EMPTY {
+        allocate.then_some(())?;
+        *entry = allocate_zeroed_frame()?;
+    }
+    Some(*entry)
+}
+
+fn release_node_data(node: &Node) -> bool {
+    if node.memfd {
+        release_frame_index(node.first_page)
+    } else {
+        release_data_pages(node.first_page)
+    }
+}
+
+fn release_frame_index(mut page: FrameLease) -> bool {
+    while page != FrameLease::EMPTY {
+        let Some(entries) = frame_index_page_mut(page) else {
+            return false;
+        };
+        let next = entries.next;
+        for frame in entries
+            .frames
+            .iter()
+            .filter(|frame| **frame != FrameLease::EMPTY)
+        {
+            if !memory::scrub_and_release_frames(FrameOwner::KERNEL, core::slice::from_ref(frame)) {
+                return false;
+            }
+        }
+        if !memory::scrub_and_release_frames(FrameOwner::KERNEL, core::slice::from_ref(&page)) {
+            return false;
+        }
+        page = next;
+    }
+    true
 }
 
 fn allocate_data_page() -> Option<FrameLease> {

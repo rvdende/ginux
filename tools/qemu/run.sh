@@ -52,6 +52,12 @@ if [[ -n "${GINUX_PCAP:-}" ]]; then
     network_capture=(-object "filter-dump,id=ginux-capture,netdev=ginux-net,file=$GINUX_PCAP")
 fi
 qemu_netdev="user,id=ginux-net,restrict=off"
+# GINUX_QEMU_MONITOR names a Unix socket for the QEMU monitor, which tests
+# use to take screenshots (screendump) and inject input.
+monitor="none"
+if [[ -n "${GINUX_QEMU_MONITOR:-}" ]]; then
+    monitor="unix:${GINUX_QEMU_MONITOR},server=on,wait=off"
+fi
 if [[ -n "${GINUX_QEMU_DNS:-}" ]]; then
     qemu_netdev+=",dns=${GINUX_QEMU_DNS}"
 fi
@@ -65,7 +71,7 @@ exec "$qemu" \
     -smp 1 \
     -m "$memory" \
     -display none \
-    -monitor none \
+    -monitor "$monitor" \
     -serial stdio \
     -no-reboot \
     -net none \

@@ -17,6 +17,7 @@ mod linux_aio;
 mod linux_elf;
 mod linux_exe;
 mod linux_file_cache;
+mod linux_input;
 mod linux_keyring;
 mod linux_mount;
 mod linux_overlay;

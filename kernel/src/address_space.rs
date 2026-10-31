@@ -4146,6 +4146,13 @@ pub(crate) fn complete_current_linux_process_snapshot(
                 continue;
             }
             let Some(frame) = live_mapping_frame(frame_address) else {
+                // Device memory such as the framebuffer belongs to no frame
+                // lease; it is shared and never forked, so the snapshot
+                // has nothing to record or restore for it.
+                let device = LINUX_RUNTIME_SHARED | LINUX_RUNTIME_DONTFORK;
+                if value & device == device {
+                    continue;
+                }
                 return false;
             };
             let Some(slot) = mappings.get_mut(*mapping_count) else {
@@ -5611,6 +5618,37 @@ pub(crate) fn install_current_linux_shared_page(
         asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
     }
     linux_runtime_page_from_value(unsafe { entry.read() }).shared
+}
+
+/// Maps a page of device memory, such as the framebuffer, that the frame
+/// allocator does not own. The page is shared, so unmapping it never frees
+/// the memory, and it is not copied into children on fork.
+pub(crate) fn install_current_linux_device_page(
+    address: u64,
+    physical: u64,
+    writable: bool,
+) -> bool {
+    if !physical.is_multiple_of(PAGE_SIZE as u64) || physical & !ADDRESS_MASK != 0 {
+        return false;
+    }
+    let Some(entry) = ensure_current_linux_leaf(address) else {
+        return false;
+    };
+    if linux_runtime_page_from_value(unsafe { entry.read() }).occupied {
+        return false;
+    }
+    let value = physical
+        | PRESENT
+        | USER
+        | NO_EXECUTE
+        | LINUX_RUNTIME_SHARED
+        | LINUX_RUNTIME_DONTFORK
+        | if writable { WRITABLE } else { 0 };
+    unsafe {
+        entry.write(value);
+        asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
+        entry.read() == value
+    }
 }
 
 pub(crate) fn mark_current_linux_runtime_page_secret(address: u64) -> bool {

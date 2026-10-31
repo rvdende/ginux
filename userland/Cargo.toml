@@ -1,0 +1,25 @@
+# Linux userland programs that run inside Ginux domains: a Wayland
+# compositor and its clients. They build for x86_64-unknown-linux-musl as
+# static binaries and stay out of the kernel workspace so their crates.io
+# dependency tree does not reach the kernel build.
+[workspace]
+members = ["compositor", "gfx", "term"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+font8x8 = { version = "0.3.1", default-features = false, features = ["unicode"] }
+ginux-gfx = { path = "gfx" }
+rustix = { version = "1.1", features = ["event", "fs", "mm", "process", "pipe", "time"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["unstable"] }
+wayland-server = "0.31"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+panic = "abort"
