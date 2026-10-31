@@ -240,6 +240,33 @@ fn report_audio() {
     });
 }
 
+/// Plays a one-second tone on every HD Audio codec with a connected output.
+fn play_test_tones() {
+    pci::for_each_function(|device| {
+        if !hda::is_supported(&device) {
+            return;
+        }
+        // SAFETY: as in report_audio.
+        let Ok(mut controller) = (unsafe { hda::Controller::open(device.address) }) else {
+            return;
+        };
+        let mut codecs = [const { None }; 15];
+        for (slot, codec) in codecs.iter_mut().zip(controller.codecs().flatten()) {
+            *slot = Some(codec);
+        }
+        for codec in codecs.iter().flatten() {
+            match controller.play_tone(codec, 1000) {
+                Ok(advanced) => say!(
+                    "ginux: codec {} played a 440 Hz tone; DMA moved {} bytes\n",
+                    codec.address,
+                    advanced
+                ),
+                Err(error) => say!("ginux: codec {}: {:?}\n", codec.address, error),
+            }
+        }
+    });
+}
+
 /// Broadcasts a DHCP discover on `nic` and reports the offer, which shows
 /// that the controller can send and receive.
 fn report_dhcp(nic: &mut impl Nic, transaction: u32) {
@@ -426,9 +453,10 @@ fn run_command(boot_info: &BootInfo, line: &[u8]) {
     let (command, argument) = text.split_once(' ').unwrap_or((text, ""));
     match command {
         "" => {}
-        "help" => {
-            say!("Commands: help, pci, acpi, mem, disks, net, clear, echo TEXT, reboot, poweroff\n")
-        }
+        "help" => say!(
+            "Commands: help, pci, acpi, mem, disks, net, beep, clear, echo TEXT, reboot, poweroff\n"
+        ),
+        "beep" => play_test_tones(),
         "pci" => report_pci(),
         "net" => report_network(),
         "acpi" => {

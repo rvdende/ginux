@@ -77,7 +77,7 @@ boot_profile() {
         -netdev user,id=net0,restrict=on \
         -device e1000e,netdev=net0 \
         -device amd-iommu,dma-remap=on \
-        -audiodev none,id=sound \
+        -audiodev "wav,id=sound,path=$work_dir/$label.wav" \
         -device intel-hda \
         -device hda-duplex,audiodev=sound \
         -device qemu-xhci,id=xhci \
@@ -141,6 +141,15 @@ for _ in $(seq 1 10); do
     grep -aq '^usbok' <(tr -d '\r' <"$work_dir/serial.log") && break
     sleep 1
 done
+# Play the HD Audio test tone into QEMU's WAV recorder.
+for key in b e e p ret; do
+    monitor_command "sendkey $key"
+    sleep 0.2
+done
+for _ in $(seq 1 15); do
+    grep -aq 'played a 440 Hz tone' "$work_dir/serial.log" && break
+    sleep 1
+done
 screenshot serial >/dev/null
 stop_qemu
 tr -d '\r' <"$work_dir/serial.log" | sed -n '/hardware bring-up mode/,$p' >"$output_dir/serial.log"
@@ -174,12 +183,29 @@ for expected in \
     'keyboard 0627:0001 on port 5.2' \
     'Ginux bring-up shell' \
     'bring-up> echo usbok' \
-    'usbok'; do
+    'usbok' \
+    'bring-up> beep' \
+    'codec 0 played a 440 Hz tone'; do
     if ! grep -Fq "$expected" "$output_dir/serial.log"; then
         echo "missing: $expected" >&2
         failed=1
     fi
 done
+# The recorded tone must contain samples well above silence.
+# QEMU fills in the WAV header's length only on a clean exit, so read the
+# 16-bit samples after the 44-byte header directly.
+loud=$(python3 -I - "$work_dir/serial.wav" <<'EOF'
+import struct, sys
+with open(sys.argv[1], "rb") as recording:
+    data = recording.read()[44:]
+samples = struct.unpack("<%dh" % (len(data) // 2), data[: len(data) // 2 * 2])
+print(sum(1 for sample in samples if abs(sample) > 1000))
+EOF
+)
+if ((loud < 10000)); then
+    echo "the HD Audio tone was not recorded ($loud loud samples)" >&2
+    failed=1
+fi
 keyboards=$(grep -c 'keyboard 0627:0001 on port' "$output_dir/serial.log" || true)
 if ((keyboards != 2)); then
     echo "expected keyboards on both xHCI controllers, found $keyboards" >&2
