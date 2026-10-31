@@ -1272,6 +1272,7 @@ pub(super) fn linux_terminate_by_default_signal(signal: u64) -> u64 {
         if !clear_current_linux_process_signal_queues() {
             return LINUX_EIO;
         }
+        let _ = linux_process::set_live_process_killed_by_signal(pid, signal.min(127) as u8);
         X86_RUNTIME
             .LINUX_PROCESS_CHILD_STATUS
             .store((128 + signal.min(127)) as u8, Ordering::SeqCst);

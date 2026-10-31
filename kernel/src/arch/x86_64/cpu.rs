@@ -12860,15 +12860,27 @@ fn linux_wait4(pid: u64, status_address: u64, options: u64, rusage: u64) -> u64 
     ) else {
         return LINUX_ECHILD;
     };
-    let (waited, encoded, reaped) = match state {
+    // Linux's wait status: the exit code in bits 8-15, or the terminating
+    // signal in bits 0-6, or 0x7f with the stop signal above it.
+    let (waited, encoded, exit_status, reaped) = match state {
         linux_process::ChildWaitState::Exited {
             pid: waited,
             status,
-        } => (waited, u32::from(status) << 8, true),
+            signal,
+        } => (
+            waited,
+            if signal != 0 {
+                u32::from(signal)
+            } else {
+                u32::from(status) << 8
+            },
+            status,
+            true,
+        ),
         linux_process::ChildWaitState::Stopped { pid, signal } => {
-            (pid, u32::from(signal) << 8 | 0x7f, false)
+            (pid, u32::from(signal) << 8 | 0x7f, 0, false)
         }
-        linux_process::ChildWaitState::Continued { pid } => (pid, 0xffff, false),
+        linux_process::ChildWaitState::Continued { pid } => (pid, 0xffff, 0, false),
         linux_process::ChildWaitState::Running => {
             return if options & LINUX_WNOHANG != 0 {
                 0
@@ -12884,8 +12896,7 @@ fn linux_wait4(pid: u64, status_address: u64, options: u64, rusage: u64) -> u64 
         return LINUX_EFAULT;
     }
     if reaped {
-        let status = (encoded >> 8) as u8;
-        if linux_process::wait_live_child(parent_pid, waited) != Some((waited, status)) {
+        if linux_process::wait_live_child(parent_pid, waited) != Some((waited, exit_status)) {
             return LINUX_ECHILD;
         }
     } else if !linux_process::consume_live_child_wait_event(parent_pid, waited) {
@@ -12987,14 +12998,23 @@ fn linux_waitid(id_type: u64, id: u64, information: u64, options: u64, rusage: u
         }
         return 0;
     };
-    let (pid, status, code, reaped) = match state {
-        linux_process::ChildWaitState::Exited { pid, status } => {
-            (pid, u32::from(status), LINUX_CLD_EXITED, true)
+    // si_code CLD_EXITED (si_status the exit code) or CLD_KILLED (the signal).
+    let (pid, status, exit_status, code, reaped) = match state {
+        linux_process::ChildWaitState::Exited {
+            pid,
+            status,
+            signal,
+        } => {
+            if signal != 0 {
+                (pid, u32::from(signal), status, LINUX_CLD_KILLED, true)
+            } else {
+                (pid, u32::from(status), status, LINUX_CLD_EXITED, true)
+            }
         }
         linux_process::ChildWaitState::Stopped { pid, signal } => {
-            (pid, u32::from(signal), 5, false)
+            (pid, u32::from(signal), 0, 5, false)
         }
-        linux_process::ChildWaitState::Continued { pid } => (pid, 18, 6, false),
+        linux_process::ChildWaitState::Continued { pid } => (pid, 18, 0, 6, false),
         linux_process::ChildWaitState::Running => unreachable!(),
     };
     let mut result = [0_u8; SIGNAL_INFORMATION_SIZE];
@@ -13014,7 +13034,7 @@ fn linux_waitid(id_type: u64, id: u64, information: u64, options: u64, rusage: u
     }
     if options & LINUX_WNOWAIT == 0 {
         if reaped {
-            if linux_process::wait_live_child(parent, pid) != Some((pid, status as u8)) {
+            if linux_process::wait_live_child(parent, pid) != Some((pid, exit_status)) {
                 return LINUX_ECHILD;
             }
         } else if !linux_process::consume_live_child_wait_event(parent, pid) {
@@ -38283,6 +38303,7 @@ fn verify_linux_cross_process_prlimit(pid: u32) -> bool {
         ) == Some(linux_process::ChildWaitState::Exited {
             pid,
             status: LINUX_PROBE_EXIT_STATUS as u8,
+            signal: 0,
         });
     let parent_group = linux_process::live_process_group(current_linux_process_pid());
     let group_wait = parent_group.is_some_and(|group| {

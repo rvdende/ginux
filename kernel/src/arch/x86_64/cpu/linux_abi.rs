@@ -501,6 +501,7 @@ pub(super) const LINUX_P_PID: u64 = 1;
 pub(super) const LINUX_P_PGID: u64 = 2;
 pub(super) const LINUX_P_PIDFD: u64 = 3;
 pub(super) const LINUX_CLD_EXITED: i32 = 1;
+pub(super) const LINUX_CLD_KILLED: i32 = 2;
 pub(super) const LINUX_RUSAGE_SIZE: usize = 144;
 pub(super) const LINUX_PROT_READ: u64 = 1;
 pub(super) const LINUX_PROT_WRITE: u64 = 2;

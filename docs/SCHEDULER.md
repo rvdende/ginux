@@ -93,6 +93,13 @@ calls act as the scheduler.
    page (a double fault) instead of corrupting memory. A process entered
    while an earlier activation of it is still inside a system call is
    reported ("re-entered during its own system call").
+Done out of order: timer preemption of processes (`linux_preempt_process_from_timer`
+in cpu.rs). A process other than init that runs 50 ms is sent through the
+vDSO's `__ginux_preempt` entry, whose internal system call yields it with its
+exact interrupted registers; it is resumed where the tick interrupted it.
+It applies whenever someone can take the yield (init's nested scheduling, or
+a fork transaction's exec'd child); the scheduler loop makes that everyone.
+
 3. Parent-first fork, Linux's default order (`LINUX_PARENT_FIRST_FORK` in
    cpu.rs, implemented but off): plain forks resume the parent with the
    child's pid and leave the child ready in the run queue; vfork, CLONE_VM,

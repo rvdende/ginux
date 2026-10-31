@@ -105,6 +105,10 @@ def classify(status, output, budget):
     if not status.startswith("exit="):
         return "TBROK", status
     code = int(status[5:])
+    # LTP's library also kills the test when a child reports TBROK; it then
+    # prints the same "Test killed!" line, but that is a break, not a hang.
+    if b"reported TBROK killing the test" in output:
+        return "TBROK", f"{status} (a child reported TBROK)"
     if b"Test killed! (timeout?)" in output:
         return "HANG", f"ltp-timeout {status}"
     if code == 0:
@@ -112,7 +116,8 @@ def classify(status, output, budget):
     if code in (126, 127):
         return "TBROK", f"{status} (could not execute)"
     if code >= 128:
-        # Ginux reports a child killed by signal N as an exit with 128+N.
+        # An exit status of 128+N from a test usually means a signal killed
+        # something it waited for.
         return "TBROK", f"{status} (signal {code - 128} reported as an exit status?)"
     if code > 63:
         return "TBROK", f"{status} (not an LTP result)"

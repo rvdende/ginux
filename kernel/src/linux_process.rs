@@ -476,6 +476,8 @@ struct Process {
     cpu_affinity: u64,
     /// `/proc/PID/oom_score_adj`: inherited across fork, kept across exec.
     oom_score_adj: i16,
+    /// The signal whose default action terminated the process, or 0.
+    killed_by_signal: u8,
     state: ProcessState,
     wait_event: Option<ProcessWaitEvent>,
     /// A child forked onto its parent's pages (CLONE_VM, or a vfork child
@@ -499,9 +501,20 @@ struct WaitResult {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ChildWaitState {
     Running,
-    Stopped { pid: u32, signal: u8 },
-    Continued { pid: u32 },
-    Exited { pid: u32, status: u8 },
+    Stopped {
+        pid: u32,
+        signal: u8,
+    },
+    Continued {
+        pid: u32,
+    },
+    /// `signal` is the signal that killed the process, or 0 if it exited
+    /// with `status`.
+    Exited {
+        pid: u32,
+        status: u8,
+        signal: u8,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -1304,6 +1317,7 @@ impl ProcessTable {
             ProcessState::Zombie { status } => Some(ChildWaitState::Exited {
                 pid: child.handle.pid,
                 status,
+                signal: child.killed_by_signal,
             }),
         }
     }
@@ -1485,6 +1499,7 @@ impl ProcessTable {
             scheduler_thread: None,
             cpu_affinity,
             oom_score_adj,
+            killed_by_signal: 0,
             state,
             wait_event: None,
             shares_parent_vm: false,
@@ -2166,11 +2181,13 @@ pub(crate) fn verify_lifecycle_contract() -> bool {
             != Some(ChildWaitState::Exited {
                 pid: first_child.pid,
                 status: child_exit_status,
+                signal: 0,
             })
         || table.child_group_wait_state(init, first_child.pid, false, false)
             != Some(ChildWaitState::Exited {
                 pid: first_child.pid,
                 status: child_exit_status,
+                signal: 0,
             })
         || table.wait(first_child, first_child.pid).is_some()
         || table.wait(init, first_child.pid)
@@ -2721,6 +2738,22 @@ pub(crate) fn live_process_oom_score_adj(pid: u32) -> Option<i16> {
         ProcessState::Running | ProcessState::Stopped { .. } | ProcessState::Zombie { .. }
     )
     .then_some(process.oom_score_adj)
+}
+
+/// Records that a signal's default action is terminating `pid`, so its
+/// parent's wait reports it as killed by that signal rather than as an exit.
+pub(crate) fn set_live_process_killed_by_signal(pid: u32, signal: u8) -> bool {
+    let Some(table) = live_process_table_mut() else {
+        return false;
+    };
+    let Some(process) = table
+        .handle_by_pid(pid)
+        .and_then(|handle| table.process_mut(handle))
+    else {
+        return false;
+    };
+    process.killed_by_signal = signal;
+    true
 }
 
 /// Sets `/proc/PID/oom_score_adj`; the caller has checked the Linux range
