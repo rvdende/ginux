@@ -9,6 +9,7 @@ members = [
     "crates/oci-cache",
     "crates/protocol-state",
     "crates/runtime-memory",
+    "crates/usb-audio",
     "crates/volume-format",
     "crates/volume-service",
     "kernel",

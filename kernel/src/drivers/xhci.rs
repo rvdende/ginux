@@ -1,14 +1,16 @@
-//! Polling xHCI driver for USB HID boot keyboards on root ports.
+//! Polling xHCI driver for USB HID boot keyboards and USB audio outputs.
 //!
 //! The driver takes each controller from firmware, resets it, and brings up
 //! the command and event rings without interrupts. It enumerates root ports
-//! and configures every device that exposes a HID boot keyboard interface,
-//! keeping one report transfer queued per keyboard. Each controller draws its
-//! DMA memory from a static pool, so several controllers can run at once; a
-//! controller without keyboards returns its pages. Hubs are not supported yet,
-//! so keyboards must be on root ports.
+//! and the hubs behind them, configures every device that exposes a HID boot
+//! keyboard interface, keeping one report transfer queued per keyboard, and
+//! configures the playback outputs of USB Audio Class 1 and 2 devices. Each
+//! controller draws its DMA memory from a static pool, so several controllers
+//! can run at once; a controller without devices returns its pages.
 
 use core::ptr::{addr_of, addr_of_mut};
+
+use ginux_usb_audio as usb_audio;
 
 use super::pci::Function;
 use super::{delay_ms, say, wait_until_ms, DmaPage, DmaRegion};
@@ -55,6 +57,8 @@ const TRB_ENABLE_SLOT: u32 = 9;
 const TRB_ADDRESS_DEVICE: u32 = 11;
 const TRB_CONFIGURE_ENDPOINT: u32 = 12;
 const TRB_EVALUATE_CONTEXT: u32 = 13;
+const TRB_RESET_ENDPOINT: u32 = 14;
+const TRB_SET_TR_DEQUEUE: u32 = 16;
 const TRB_TRANSFER_EVENT: u32 = 32;
 const TRB_COMMAND_COMPLETION: u32 = 33;
 const TRB_CYCLE: u32 = 1 << 0;
@@ -63,6 +67,7 @@ const TRB_INTERRUPT_ON_COMPLETION: u32 = 1 << 5;
 const TRB_IMMEDIATE_DATA: u32 = 1 << 6;
 const TRB_DIRECTION_IN: u32 = 1 << 16;
 const COMPLETION_SUCCESS: u32 = 1;
+const COMPLETION_STALL: u32 = 6;
 const COMPLETION_SHORT_PACKET: u32 = 13;
 const RING_TRBS: usize = 256;
 const MAX_SLOTS: u32 = 32;
@@ -73,16 +78,19 @@ const ENDPOINT_CONTROL: u32 = 4;
 const ENDPOINT_INTERRUPT_IN: u32 = 7;
 const ENDPOINT_ISOCH_OUT: u32 = 1;
 const REQUEST_SET_INTERFACE: u8 = 0x0b;
-const REQUEST_AUDIO_SET_CURRENT: u8 = 0x01;
+/// SET_CUR in USB Audio Class 1, and CUR in either direction in class 2.
+const REQUEST_AUDIO_CURRENT: u8 = 0x01;
 /// USB Audio Class 1 endpoint control selector for the sampling frequency.
 const AUDIO_SAMPLING_FREQUENCY: u16 = 0x0100;
-const CLASS_AUDIO: u8 = 1;
-const SUBCLASS_AUDIO_STREAMING: u8 = 2;
-const AUDIO_SAMPLE_RATE: u32 = 48_000;
-/// One millisecond of 16-bit stereo at 48 kHz.
-const AUDIO_PACKET: usize = 192;
+/// USB Audio Class 2 clock source control selector for the sampling frequency.
+const AUDIO_2_SAMPLING_FREQUENCY: u16 = 0x0100;
+/// USB Audio Class 2 clock selector control selector for its input pin.
+const AUDIO_2_CLOCK_SELECTOR: u16 = 0x0100;
 const AUDIO_AMPLITUDE: i16 = 6000;
+/// Packets per transfer event; two batches are queued while a tone plays.
 const AUDIO_BATCH: usize = 100;
+/// Audio outputs configured on one controller.
+pub(crate) const MAX_SPEAKERS: usize = usb_audio::MAX_OUTPUTS;
 const SPEED_FULL: u32 = 1;
 const SPEED_LOW: u32 = 2;
 const SPEED_HIGH: u32 = 3;
@@ -200,6 +208,12 @@ impl Ring {
         self.trbs as u64
     }
 
+    /// Where the next TRB goes, with the cycle state in bit 0, as a Set TR
+    /// Dequeue Pointer command takes it.
+    fn enqueue_pointer(&self) -> u64 {
+        self.trbs.wrapping_add(self.index * 4) as u64 | u64::from(self.cycle)
+    }
+
     /// Writes one TRB and returns its physical address.
     fn push(&mut self, parameter: u64, status: u32, control: u32) -> u64 {
         // SAFETY: index stays below the link TRB; the ring is a pool page.
@@ -299,16 +313,24 @@ struct DevicePages {
 }
 
 /// A configured USB audio output: an isochronous OUT endpoint on an audio
-/// streaming interface.
+/// streaming interface, playing 48 kHz PCM.
 pub(crate) struct Speaker {
     pub(crate) location: Location,
     pub(crate) vendor: u16,
     pub(crate) product: u16,
+    /// What the output is wired to, such as "headphones".
+    pub(crate) name: &'static str,
+    pub(crate) channels: u8,
+    pub(crate) bits: u8,
     slot: u32,
     endpoint: u32,
     ring: Ring,
-    /// Two packets of samples: the high and low halves of a square wave.
-    samples: *mut DmaPage,
+    /// Microseconds between packets.
+    period_us: u32,
+    packet_bytes: usize,
+    /// One period of the test tone, which whole packets tile.
+    tone: *mut DmaPage,
+    tone_bytes: usize,
 }
 
 /// A running controller with at least one configured keyboard or speaker.
@@ -323,7 +345,7 @@ pub(crate) struct Controller {
     event_index: usize,
     event_cycle: bool,
     keyboards: [Option<Keyboard>; MAX_KEYBOARDS],
-    speaker: Option<Speaker>,
+    speakers: [Option<Speaker>; MAX_SPEAKERS],
 }
 
 impl Controller {
@@ -420,7 +442,7 @@ impl Controller {
             event_index: 0,
             event_cycle: true,
             keyboards: [const { None }; MAX_KEYBOARDS],
-            speaker: None,
+            speakers: [const { None }; MAX_SPEAKERS],
         };
         if capability_1 & (1 << 3) != 0 {
             for port in 1..=ports {
@@ -448,7 +470,7 @@ impl Controller {
             }
         }
         let found = controller.keyboards().count();
-        if found == 0 && controller.speaker.is_none() {
+        if found == 0 && controller.speakers().next().is_none() {
             controller.stop();
             return Err(Error::NoKeyboard);
         }
@@ -458,57 +480,69 @@ impl Controller {
         Ok(controller)
     }
 
-    /// Returns the configured speaker, if any.
-    pub(crate) fn speaker(&self) -> Option<&Speaker> {
-        self.speaker.as_ref()
+    /// Returns the configured speakers.
+    pub(crate) fn speakers(&self) -> impl Iterator<Item = &Speaker> {
+        self.speakers.iter().flatten()
     }
 
-    /// Plays a 500 Hz square wave for `milliseconds` on the speaker, one
-    /// packet per frame, and returns how many packets the controller sent.
-    pub(crate) fn play_tone(&mut self, milliseconds: usize) -> Option<usize> {
-        let speaker = self.speaker.as_mut()?;
-        // SAFETY: the sample page belongs to this speaker and no transfer
-        // is queued while it is written.
-        let samples = unsafe {
-            core::slice::from_raw_parts_mut(
-                speaker.samples.cast::<i16>(),
-                AUDIO_PACKET, // two packets of i16 samples
-            )
-        };
-        let (high, low) = samples.split_at_mut(AUDIO_PACKET / 2);
-        high.fill(AUDIO_AMPLITUDE);
-        low.fill(-AUDIO_AMPLITUDE);
-        let (slot, endpoint) = (speaker.slot, speaker.endpoint);
+    /// Plays a 500 Hz square wave for `milliseconds` on speaker `index` of
+    /// `speakers`, one packet per service interval, and returns how many
+    /// packets the controller sent. A second batch of packets is queued
+    /// before waiting for the first, so the stream does not drain between
+    /// batches.
+    pub(crate) fn play_tone(&mut self, index: usize, milliseconds: usize) -> Option<usize> {
+        let speaker = self.speakers.get(index)?.as_ref()?;
+        let total = milliseconds * 1000 / speaker.period_us as usize;
+        let (slot, endpoint, period_us) = (speaker.slot, speaker.endpoint, speaker.period_us);
+        let mut queued = 0;
         let mut sent = 0;
-        while sent < milliseconds {
-            let batch = (milliseconds - sent).min(AUDIO_BATCH);
-            let mut last = 0;
-            for packet in 0..batch {
-                let speaker = self.speaker.as_mut()?;
-                let half = (sent + packet) % 2;
-                let interrupt = if packet + 1 == batch {
-                    TRB_INTERRUPT_ON_COMPLETION
-                } else {
-                    0
-                };
-                last = speaker.ring.push(
-                    speaker.samples as u64 + (half * AUDIO_PACKET) as u64,
-                    AUDIO_PACKET as u32,
-                    TRB_ISOCH << 10 | TRB_START_ISOCH_ASAP | interrupt,
-                );
-            }
-            self.ring(slot, endpoint);
-            let finished = wait_until_ms(batch as u64 * 2 + 100, || {
-                self.next_event().is_some_and(|event| {
-                    event.kind() == TRB_TRANSFER_EVENT && event.parameter == last
-                })
+        let mut in_flight: Option<(u64, usize)> = None;
+        loop {
+            let next = (queued < total).then(|| {
+                let speaker = self.speakers[index].as_mut()?;
+                let batch = (total - queued).min(AUDIO_BATCH);
+                let mut last = 0;
+                for packet in queued..queued + batch {
+                    let offset = packet * speaker.packet_bytes % speaker.tone_bytes;
+                    let interrupt = if packet + 1 == queued + batch {
+                        TRB_INTERRUPT_ON_COMPLETION
+                    } else {
+                        0
+                    };
+                    last = speaker.ring.push(
+                        speaker.tone as u64 + offset as u64,
+                        speaker.packet_bytes as u32,
+                        TRB_ISOCH << 10 | TRB_START_ISOCH_ASAP | interrupt,
+                    );
+                }
+                queued += batch;
+                Some((last, batch))
             });
-            if !finished {
+            let next = match next {
+                Some(Some(batch)) => {
+                    self.ring(slot, endpoint);
+                    Some(batch)
+                }
+                Some(None) => return None,
+                None => None,
+            };
+            if let Some((last, batch)) = in_flight {
+                let batch_ms = (batch as u64 * u64::from(period_us)).div_ceil(1000);
+                let finished = wait_until_ms(batch_ms * 2 + 100, || {
+                    self.next_event().is_some_and(|event| {
+                        event.kind() == TRB_TRANSFER_EVENT && event.parameter == last
+                    })
+                });
+                if !finished {
+                    return Some(sent);
+                }
+                sent += batch;
+            }
+            if next.is_none() {
                 return Some(sent);
             }
-            sent += batch;
+            in_flight = next;
         }
-        Some(sent)
     }
 
     /// Returns the configured keyboards.
@@ -617,9 +651,8 @@ impl Controller {
         };
         let (slot, endpoint) = match device.configure_keyboard(self) {
             Ok(configured) => configured,
-            Err(Error::NoKeyboard) if self.speaker.is_none() => {
-                if let Some(speaker) = device.configure_speaker(self, &identity)? {
-                    self.speaker = Some(speaker);
+            Err(Error::NoKeyboard) if self.speakers.iter().any(Option::is_none) => {
+                if device.configure_speakers(self, &identity)? != 0 {
                     return Ok(());
                 }
                 return Err(Error::NotBootKeyboard(identity.vendor, identity.product));
@@ -948,52 +981,23 @@ impl Device {
         Ok((self.slot, endpoint))
     }
 
-    /// Configures a USB Audio Class 1 output: selects the configuration and
-    /// the streaming interface's first setting with an isochronous OUT
-    /// endpoint, adds that endpoint, and asks for 48 kHz. Returns `None` for
-    /// a device without one.
-    fn configure_speaker(
+    /// Configures the playback outputs of a USB Audio Class 1 or 2 device:
+    /// selects the configuration, then for each output its streaming
+    /// setting, its isochronous OUT endpoint and a 48 kHz rate. Returns how
+    /// many outputs were added; an output that fails is reported and
+    /// skipped.
+    fn configure_speakers(
         &mut self,
         controller: &mut Controller,
         identity: &Identity,
-    ) -> Result<Option<Speaker>, Error> {
+    ) -> Result<usize, Error> {
         let total = self.read_configuration(controller)?;
-        let descriptors = self.buffer();
+        let descriptors = &self.buffer()[..usize::from(total)];
         let configuration = descriptors[5];
-        let mut streaming = None;
-        let mut output = None;
-        let mut offset = 0;
-        while offset + 2 <= usize::from(total) {
-            let length = usize::from(descriptors[offset]);
-            if length < 2 || offset + length > usize::from(total) {
-                break;
-            }
-            match descriptors[offset + 1] {
-                4 if length >= 9 => {
-                    let audio_streaming = descriptors[offset + 5] == CLASS_AUDIO
-                        && descriptors[offset + 6] == SUBCLASS_AUDIO_STREAMING
-                        && descriptors[offset + 3] != 0;
-                    streaming =
-                        audio_streaming.then(|| (descriptors[offset + 2], descriptors[offset + 3]));
-                }
-                5 if length >= 7 && output.is_none() => {
-                    let address = descriptors[offset + 2];
-                    if let Some(interface) = streaming
-                        .filter(|_| address & 0x80 == 0 && descriptors[offset + 3] & 3 == 1)
-                    {
-                        let packet =
-                            u16::from_le_bytes([descriptors[offset + 4], descriptors[offset + 5]])
-                                & 0x7ff;
-                        output = Some((interface, address & 0x0f, packet, descriptors[offset + 6]));
-                    }
-                }
-                _ => {}
-            }
-            offset += length;
+        let outputs = usb_audio::outputs(descriptors);
+        if outputs.iter().next().is_none() {
+            return Ok(0);
         }
-        let Some(((interface, alternate), number, packet, interval)) = output else {
-            return Ok(None);
-        };
         self.control_out(
             controller,
             0x00,
@@ -1001,29 +1005,95 @@ impl Device {
             u16::from(configuration),
             0,
         )?;
+        let mut added = 0;
+        let mut entries = 1;
+        for output in outputs.iter() {
+            let Some(free) = controller.speakers.iter().position(Option::is_none) else {
+                break;
+            };
+            match self.configure_output(controller, identity, output, &mut entries) {
+                Ok(Some(speaker)) => {
+                    controller.speakers[free] = Some(speaker);
+                    added += 1;
+                }
+                Ok(None) => say!(
+                    "ginux:     port {}: cannot play 48 kHz on the {} (interface {})\n",
+                    self.location,
+                    output.terminal_name(),
+                    output.interface
+                ),
+                Err(error) => say!(
+                    "ginux:     port {}: {} (interface {}) failed: {:?}\n",
+                    self.location,
+                    output.terminal_name(),
+                    output.interface,
+                    error
+                ),
+            }
+        }
+        Ok(added)
+    }
+
+    /// Selects `output`'s streaming setting, adds its endpoint, and sets it
+    /// to 48 kHz. Returns `None` when its packets cannot carry 48 kHz or the
+    /// device reports another rate. `entries` is the highest endpoint
+    /// context in use, which the slot context must cover.
+    fn configure_output(
+        &mut self,
+        controller: &mut Controller,
+        identity: &Identity,
+        output: &usb_audio::Output,
+        entries: &mut u32,
+    ) -> Result<Option<Speaker>, Error> {
+        let high_speed = self.speed >= SPEED_HIGH;
+        let (Some(packet_bytes), Some(exponent)) = (
+            output.packet_bytes(high_speed),
+            self.speaker_interval(output.interval),
+        ) else {
+            return Ok(None);
+        };
+        let tone = pool_pages(1).ok_or(Error::OutOfDmaMemory)?;
+        let ring_page = pool_pages(1).ok_or(Error::OutOfDmaMemory)?;
+        // SAFETY: the tone page is a fresh pool page that only this output
+        // uses, and no transfer reads it yet.
+        let tone_bytes = unsafe {
+            usb_audio::square_wave(
+                &mut (*tone).0,
+                output.channels,
+                output.subslot,
+                AUDIO_AMPLITUDE,
+            )
+        };
+        let Some(tone_bytes) = tone_bytes else {
+            return Ok(None);
+        };
         self.control_out(
             controller,
             0x01,
             REQUEST_SET_INTERFACE,
-            u16::from(alternate),
-            u16::from(interface),
+            u16::from(output.alternate),
+            u16::from(output.interface),
         )?;
-        let endpoint = u32::from(number) * 2;
-        let exponent = match self.speaker_interval(interval) {
-            Some(exponent) => exponent,
-            None => return Ok(None),
+        let endpoint = u32::from(output.endpoint) * 2;
+        *entries = (*entries).max(endpoint);
+        let ring = ring_page as u64 | 1;
+        let max_packet = u32::from(output.max_packet & 0x7ff);
+        // High-speed endpoints may move up to three packets per microframe.
+        let burst = if high_speed {
+            u32::from((output.max_packet >> 11) & 3)
+        } else {
+            0
         };
-        let ring = self.pages.interrupt as u64 | 1;
         self.clear_input();
         self.input(controller, 0, 1, 1 | 1 << endpoint);
-        self.slot_context(controller, endpoint, None);
+        self.slot_context(controller, *entries, None);
         let context = 1 + endpoint as usize;
         self.input(controller, context, 0, exponent << 16);
         self.input(
             controller,
             context,
             1,
-            ENDPOINT_ISOCH_OUT << 3 | u32::from(packet) << 16,
+            ENDPOINT_ISOCH_OUT << 3 | burst << 8 | max_packet << 16,
         );
         self.input(controller, context, 2, ring as u32);
         self.input(controller, context, 3, (ring >> 32) as u32);
@@ -1031,31 +1101,84 @@ impl Device {
             controller,
             context,
             4,
-            AUDIO_PACKET as u32 | u32::from(packet) << 16,
+            packet_bytes as u32 | (max_packet * (burst + 1)) << 16,
         );
         controller.command(
             self.pages.input as u64,
             TRB_CONFIGURE_ENDPOINT << 10 | self.slot << 24,
         )?;
-        // Fixed-rate devices may stall the sampling-frequency request.
-        let rate = AUDIO_SAMPLE_RATE.to_le_bytes();
-        let _ = self.control_out_data(
-            controller,
-            0x22,
-            REQUEST_AUDIO_SET_CURRENT,
-            AUDIO_SAMPLING_FREQUENCY,
-            u16::from(number),
-            &rate[..3],
-        );
+        if !self.set_rate(controller, output) {
+            return Ok(None);
+        }
         Ok(Some(Speaker {
             location: self.location,
             vendor: identity.vendor,
             product: identity.product,
+            name: output.terminal_name(),
+            channels: output.channels,
+            bits: output.bits,
             slot: self.slot,
             endpoint,
-            ring: Ring::new(self.pages.interrupt),
-            samples: self.pages.buffer,
+            ring: Ring::new(ring_page),
+            period_us: output.period_us(high_speed),
+            packet_bytes,
+            tone,
+            tone_bytes,
         }))
+    }
+
+    /// Asks for 48 kHz: from the endpoint in Audio Class 1, and from the
+    /// clock source in class 2, whose rate is read back. Returns whether the
+    /// device plays at 48 kHz, assuming so when it does not say. Devices may
+    /// stall requests they do not implement, such as a fixed-rate clock.
+    fn set_rate(&mut self, controller: &mut Controller, output: &usb_audio::Output) -> bool {
+        let rate = usb_audio::SAMPLE_RATE.to_le_bytes();
+        let Some(clock) = output.clock else {
+            if output.version == usb_audio::Version::One {
+                let _ = self.control_out_data(
+                    controller,
+                    0x22,
+                    REQUEST_AUDIO_CURRENT,
+                    AUDIO_SAMPLING_FREQUENCY,
+                    u16::from(output.endpoint),
+                    &rate[..3],
+                );
+            }
+            return true;
+        };
+        // Class 2 requests address an entity of the AudioControl interface.
+        let entity = |id: u8| u16::from(id) << 8 | u16::from(output.control_interface);
+        if let Some(selector) = clock.selector {
+            let _ = self.control_out_data(
+                controller,
+                0x21,
+                REQUEST_AUDIO_CURRENT,
+                AUDIO_2_CLOCK_SELECTOR,
+                entity(selector),
+                &[1],
+            );
+        }
+        if clock.programmable {
+            let _ = self.control_out_data(
+                controller,
+                0x21,
+                REQUEST_AUDIO_CURRENT,
+                AUDIO_2_SAMPLING_FREQUENCY,
+                entity(clock.source),
+                &rate,
+            );
+        }
+        match self.control_in(
+            controller,
+            0xa1,
+            REQUEST_AUDIO_CURRENT,
+            AUDIO_2_SAMPLING_FREQUENCY,
+            entity(clock.source),
+            4,
+        ) {
+            Ok(()) => self.buffer()[..4] == rate,
+            Err(_) => true,
+        }
     }
 
     /// Converts an isochronous bInterval into the endpoint context's
@@ -1370,6 +1493,17 @@ impl Device {
             }
             false
         });
+        // A STALL halts the default control pipe. Reset it and move its
+        // dequeue pointer past the failed transfer; the device clears its
+        // own stall at the next SETUP.
+        if matches!(result, Err(Error::TransferFailed(COMPLETION_STALL))) {
+            let target = 1 << 16 | self.slot << 24;
+            let _ = controller.command(0, TRB_RESET_ENDPOINT << 10 | target);
+            let _ = controller.command(
+                self.control.enqueue_pointer(),
+                TRB_SET_TR_DEQUEUE << 10 | target,
+            );
+        }
         result
     }
 }

@@ -254,8 +254,12 @@ every PCI device, and runs the physical-hardware drivers in `kernel/src/drivers`
 - An xHCI driver that runs USB boot keyboards on every controller, including
   keyboards behind USB hubs (up to five tiers, with transaction translators
   for low- and full-speed devices behind high-speed hubs), and plays the
-  `beep` test tone on a USB Audio Class 1 speaker through an isochronous
-  endpoint.
+  `beep` test tone on every playback output of USB Audio Class 1 and 2
+  devices (such as the speaker, headphone and S/PDIF outputs of a
+  motherboard's USB audio chip) through isochronous endpoints, setting
+  48 kHz on the endpoint or the class 2 clock source. Descriptor parsing
+  lives in `crates/usb-audio` and is tested against a real class 2 device's
+  descriptors; class 2 playback has not run on hardware yet.
 - An HD Audio driver for Intel-compatible controllers (including AMD HD Audio
   and GPU HDMI/DP audio) that resets each controller, lists its codecs and
   output pins, and plays a 440 Hz test tone on request (`beep`).

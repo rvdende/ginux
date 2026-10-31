@@ -441,6 +441,7 @@ dependencies = [
  "ginux-native-abi",
  "ginux-oci",
  "ginux-oci-cache",
+ "ginux-usb-audio",
  "ginux-volume-format",
  "ginux-volume-service",
  "miniz_oxide",
@@ -510,6 +511,10 @@ version = "0.1.0"
 
 [[package]]
 name = "ginux-runtime-memory"
+version = "0.1.0"
+
+[[package]]
+name = "ginux-usb-audio"
 version = "0.1.0"
 
 [[package]]
