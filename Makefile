@@ -17,7 +17,7 @@ SYSTEM_PROFILE := profiles/minimal-system-v0/profile.tsv
 
 .DEFAULT_GOAL := help
 
-.PHONY: help doctor manifest system-image test-alpine test-rocky-shell test-rocky-dnf test-multi-domain test-linux-abi test-linux-runtime test-storage test-oci-cache probe-rocky-systemd test-rocky-systemd test-rocky-detached test-domain-responsiveness benchmark-rocky-systemd benchmark-prepare-linux benchmark-prepare-ginux benchmark-linux-comparison benchmark-ginux-boot benchmark-boot-comparison benchmark-ginux-sysbench benchmark-compare profile-rocky-systemd rocky-image rocky-image-check linux-probe controller-runtime network-service protocol-service volume-service abi-conformance architecture-check linux-compat-check build build-verification build-linux-profile run reset-storage boot-media test-boot-media test-hardware-profile test test-c1 test-c2 fmt gate clean
+.PHONY: help doctor manifest system-image test-alpine test-rocky-shell test-rocky-dnf test-multi-domain test-linux-abi test-linux-runtime test-storage test-oci-cache probe-rocky-systemd test-rocky-systemd test-rocky-detached test-domain-responsiveness benchmark-rocky-systemd benchmark-prepare-linux benchmark-prepare-ginux benchmark-linux-comparison benchmark-ginux-boot benchmark-boot-comparison benchmark-ginux-sysbench benchmark-compare profile-rocky-systemd rocky-image rocky-image-check linux-probe controller-runtime network-service protocol-service volume-service abi-conformance architecture-check linux-compat-check build build-verification build-linux-profile run reset-storage boot-media test-boot-media test-hardware-profile test-rust-workloads test test-c1 test-c2 fmt gate clean
 
 help:
 	@echo "Ginux development targets"
@@ -26,6 +26,7 @@ help:
 	@echo "  make manifest Regenerate the signed development boot inputs"
 	@echo "  make system-image Build the pinned minimal system-container candidate"
 	@echo "  make test-alpine Download Alpine at runtime and verify its real shell in QEMU"
+	@echo "  make test-rust-workloads Build and run Rust stress programs and a serde cargo build in rust:alpine"
 	@echo "  make test-rocky-shell Download Rocky at runtime and verify its glibc shell in QEMU"
 	@echo "  make test-rocky-dnf   Download Rocky and verify a real dnf update in QEMU"
 	@echo "  make test-multi-domain Run concurrent Alpine and Rocky domains in QEMU"
@@ -221,6 +222,9 @@ test-boot-media: boot-media
 
 test-hardware-profile: build
 	@tests/qemu/hardware-profile.sh
+
+test-rust-workloads: build
+	@tests/qemu/rust-workloads.sh
 
 test-storage: build
 	@tests/qemu/persistent-storage.sh

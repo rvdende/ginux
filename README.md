@@ -297,8 +297,14 @@ make test-rocky-shell      # Rocky glibc shell and process/file behavior
 make test-multi-domain     # concurrent domain lifecycle
 make test-rocky-systemd    # cold and cached Rocky systemd boot
 make test-storage          # volume initialization, recovery, and reset
+make test-rust-workloads   # rust:alpine compiles and runs stress programs, cargo builds serde
 make check                 # architecture, ABI, format, lint, and unit checks
 ```
+
+`make test-rust-workloads` compiles the programs in `tests/linux-workloads`
+with the image's own rustc and runs them inside the domain: allocator, thread
+churn, mmap/munmap/mremap, file I/O, and malloc-metadata stress, each checking
+every byte it wrote. It needs an 8 GiB guest and takes about half an hour.
 
 The evaluated checkpoint does **not** have a fully passing aggregate `make
 test`: a post-`execve()` system-supervisor lifecycle probe remains a recorded

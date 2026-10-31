@@ -883,6 +883,12 @@ pub(crate) fn timeout_option(slot: u8, option: TimeoutOption) -> Result<u64, Err
     })
 }
 
+/// Whether a timeout (SO_RCVTIMEO or SO_SNDTIMEO) bounds blocking calls on
+/// the socket in `slot`.
+pub(crate) fn has_timeout(slot: u8, option: TimeoutOption) -> bool {
+    timeout_poll_limit(slot, option).is_some()
+}
+
 fn timeout_poll_limit(slot: u8, option: TimeoutOption) -> Option<usize> {
     timeout_option(slot, option)
         .ok()

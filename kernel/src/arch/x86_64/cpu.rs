@@ -9419,6 +9419,28 @@ extern "sysv64" fn linux_syscall_handler(
                 false,
             )
         }
+        // A blocking receive waits by yielding, as read does; MSG_DONTWAIT
+        // never waits and MSG_WAITALL keeps collecting until it is full.
+        LINUX_RECVFROM_SYSCALL
+            if register(0) & 0x140 == 0 && linux_blocking_socket_yields(first_argument, false) =>
+        {
+            linux_local_socket_io_live_return(
+                registers,
+                syscall_return,
+                number,
+                first_argument,
+                || {
+                    linux_socket_recvfrom(
+                        first_argument,
+                        buffer,
+                        count,
+                        register(0),
+                        register(2),
+                        register(1),
+                    )
+                },
+            )
+        }
         LINUX_RECVFROM_SYSCALL => linux_socket_recvfrom(
             first_argument,
             buffer,
@@ -9436,6 +9458,17 @@ extern "sysv64" fn linux_syscall_handler(
                 result,
                 count,
                 false,
+            )
+        }
+        LINUX_RECVMSG_SYSCALL
+            if count & 0x140 == 0 && linux_blocking_socket_yields(first_argument, false) =>
+        {
+            linux_local_socket_io_live_return(
+                registers,
+                syscall_return,
+                number,
+                first_argument,
+                || linux_socket_recvmsg(first_argument, buffer, count),
             )
         }
         LINUX_RECVMSG_SYSCALL => linux_socket_recvmsg(first_argument, buffer, count),
@@ -31258,7 +31291,7 @@ fn linux_descriptor_read_live_return(
     address: u64,
     count: u64,
 ) -> u64 {
-    if linux_blocking_local_socket(descriptor) {
+    if linux_blocking_socket_yields(descriptor, false) {
         return linux_local_socket_io_live_return(
             output,
             caller,
@@ -31338,7 +31371,7 @@ fn linux_descriptor_readv_live_return(
     vectors: u64,
     count: u64,
 ) -> u64 {
-    if linux_blocking_local_socket(descriptor) {
+    if linux_blocking_socket_yields(descriptor, false) {
         return linux_local_socket_io_live_return(
             output,
             caller,
@@ -31392,7 +31425,7 @@ fn linux_descriptor_write_live_return(
     address: u64,
     count: u64,
 ) -> u64 {
-    if linux_blocking_local_socket(descriptor) {
+    if linux_blocking_socket_yields(descriptor, true) {
         return linux_local_socket_io_live_return(
             output,
             caller,
@@ -31465,7 +31498,7 @@ fn linux_descriptor_writev_live_return(
     vectors: u64,
     count: u64,
 ) -> u64 {
-    if linux_blocking_local_socket(descriptor) {
+    if linux_blocking_socket_yields(descriptor, true) {
         return linux_local_socket_io_live_return(
             output,
             caller,
@@ -31647,18 +31680,27 @@ fn linux_blocking_descriptor_io_live_return(
     selected.rax
 }
 
-/// Whether `descriptor` is a Unix socket in blocking mode, such as a pipe
-/// between processes. Its peer may be another process, which cannot run
-/// while a blocking call spins in the kernel.
-fn linux_blocking_local_socket(descriptor: u64) -> bool {
+/// Whether a blocking call on the socket `descriptor` waits by yielding: a
+/// socket in blocking mode without a timeout for this direction (`write`),
+/// such as a pipe between processes or a TCP connection. Its peer may be
+/// another process, which cannot run while the call spins in the kernel, and
+/// a spin bounded only by an iteration count gave up on slow servers with
+/// EAGAIN, which Linux never returns from a blocking call.
+fn linux_blocking_socket_yields(descriptor: u64, write: bool) -> bool {
+    let option = if write {
+        crate::linux_socket::TimeoutOption::Send
+    } else {
+        crate::linux_socket::TimeoutOption::Receive
+    };
     LINUX_RUNTIME_MODE.load(Ordering::Acquire)
         && linux_socket_slot(descriptor).is_some_and(|slot| {
             crate::linux_socket::kind(slot) == Some(crate::linux_socket::Kind::Unix)
+                || !crate::linux_socket::has_timeout(slot, option)
         })
         && !linux_socket_nonblocking(descriptor)
 }
 
-/// Runs `operation`, system call `number` on the blocking local socket
+/// Runs `operation`, system call `number` on the blocking socket
 /// `descriptor`, once without waiting. If it would block, the rest of the
 /// domain runs and the call starts again. A write to a pipe whose reader is
 /// gone raises SIGPIPE.
