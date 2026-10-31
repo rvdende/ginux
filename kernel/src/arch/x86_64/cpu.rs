@@ -9162,6 +9162,22 @@ extern "sysv64" fn linux_syscall_handler(
                 serial_write(" ");
                 serial_write_u64(value);
             }
+            let slot = current_linux_thread_slot();
+            serial_write(" pid/tid/slot/stack-base/stack-size: ");
+            for value in [
+                u64::from(current_linux_process_pid()),
+                current_linux_tid().map_or(0, u64::from),
+                slot.map_or(u64::MAX, |slot| slot as u64),
+                slot.map_or(0, |slot| {
+                    LINUX_THREAD_STACK_BASES[slot].load(Ordering::SeqCst)
+                }),
+                slot.map_or(0, |slot| {
+                    LINUX_THREAD_STACK_SIZES[slot].load(Ordering::SeqCst)
+                }),
+            ] {
+                serial_write_u64(value);
+                serial_write(" ");
+            }
             serial_write("\r\n");
         }
         ELF_PROBE_ACTIVE.store(false, Ordering::SeqCst);
