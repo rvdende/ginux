@@ -78,6 +78,38 @@ impl Function {
         (address != 0).then_some(address)
     }
 
+    /// Returns the size of memory BAR `index`, found by writing ones to it
+    /// with memory decoding off and reading back which address bits stick.
+    pub(crate) fn memory_bar_size(self, index: u8) -> Option<u64> {
+        let offset = 0x10 + index * 4;
+        let low = self.read_u32(offset);
+        if low & 1 != 0 {
+            return None;
+        }
+        let wide = (low >> 1) & 3 == 2;
+        let command = self.read_u32(COMMAND) & 0xffff;
+        self.write_u32(COMMAND, command & !u32::from(COMMAND_MEMORY));
+        let sized = |offset: u8| {
+            let original = self.read_u32(offset);
+            self.write_u32(offset, u32::MAX);
+            let mask = self.read_u32(offset);
+            self.write_u32(offset, original);
+            mask
+        };
+        let mask_low = sized(offset) & !0xf;
+        let mask_high = if wide { sized(offset + 4) } else { u32::MAX };
+        self.write_u32(COMMAND, command);
+        // An unimplemented BAR keeps no address bits; sizes of 4 GiB and up
+        // are not register ranges these drivers map.
+        (mask_low != 0).then(|| (!(u64::from(mask_high) << 32 | u64::from(mask_low))) + 1)
+    }
+
+    /// Turns bus mastering off, so the function can no longer reach memory.
+    pub(crate) fn disable_bus_master(self) {
+        let command = self.read_u32(COMMAND) & 0xffff;
+        self.write_u32(COMMAND, command & !u32::from(COMMAND_BUS_MASTER));
+    }
+
     /// Enables memory decoding only, for drivers that just read registers.
     pub(crate) fn enable_memory(self) {
         let command = self.read_u32(COMMAND);
@@ -180,6 +212,49 @@ pub(crate) fn for_each_function(mut visit: impl FnMut(Identity)) {
                     }) {
                         visit(identity);
                     }
+                }
+            }
+        }
+    }
+}
+
+/// Calls `visit` for every present PCI function on bus 0 and on the buses
+/// behind its PCI-to-PCI bridges, which is far fewer configuration reads
+/// than probing all 256 buses.
+pub(crate) fn for_each_reachable_function(mut visit: impl FnMut(Identity)) {
+    let mut buses = [0_u8; 32];
+    let mut count = 1;
+    let mut next = 0;
+    while next < count {
+        let bus = buses[next];
+        next += 1;
+        for device in 0..32_u8 {
+            for function in 0..8_u8 {
+                let address = Function {
+                    bus,
+                    device,
+                    function,
+                };
+                let Some(identity) = Identity::read(address) else {
+                    if function == 0 {
+                        break;
+                    }
+                    continue;
+                };
+                let header = address.read_u32(0x0c) >> 16;
+                if header & 0x7f == 1 {
+                    let secondary = (address.read_u32(0x18) >> 8) as u8;
+                    if secondary > bus
+                        && count < buses.len()
+                        && !buses[..count].contains(&secondary)
+                    {
+                        buses[count] = secondary;
+                        count += 1;
+                    }
+                }
+                visit(identity);
+                if function == 0 && header & 0x80 == 0 {
+                    break;
                 }
             }
         }

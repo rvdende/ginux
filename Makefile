@@ -284,6 +284,8 @@ check: manifest architecture-check linux-compat-check
 	@cargo test --package ginux-runtime-memory
 	@cargo clippy --package ginux-usb-audio --all-targets -- -D warnings
 	@cargo test --package ginux-usb-audio
+	@cargo clippy --package ginux-usb-hid --all-targets -- -D warnings
+	@cargo test --package ginux-usb-hid
 	@cargo clippy --package ginux-controller-runtime --target x86_64-unknown-none -- -D warnings
 	@cargo clippy --package ginux-protocol-state -- -D warnings
 	@cargo test --package ginux-protocol-state

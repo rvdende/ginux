@@ -10,6 +10,7 @@ members = [
     "crates/protocol-state",
     "crates/runtime-memory",
     "crates/usb-audio",
+    "crates/usb-hid",
     "crates/volume-format",
     "crates/volume-service",
     "kernel",

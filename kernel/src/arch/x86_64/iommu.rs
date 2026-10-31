@@ -60,6 +60,58 @@ const READ_WRITE: u64 = 3;
 const ADDRESS_MASK_48: u64 = 0x0000_ffff_ffff_f000;
 const CONTEXT_ADDRESS_WIDTH_48: u64 = 2;
 const DOMAIN_ID: u16 = 1;
+/// The domain of the standing devices' shared second-level table.
+const STANDING_DOMAIN_ID: u16 = 2;
+/// Functions that may hold a standing admission.
+const STANDING_DEVICE_LIMIT: usize = 4;
+/// Second-level table frames for the standing devices' DMA regions.
+const STANDING_TABLE_LIMIT: usize = 16;
+/// Root or context words a translation adds for the standing devices.
+const STANDING_WORD_LIMIT: usize = 2 * STANDING_DEVICE_LIMIT;
+
+/// Devices outside any one driver's translation that every translation
+/// still admits, because they do DMA whenever they like: USB host
+/// controllers, for instance, complete input transfers while a network or
+/// volume translation is active. They share one second-level table that
+/// maps only their DMA regions, at their physical addresses.
+struct StandingDevices {
+    /// Bus and device-function number of each admitted function.
+    functions: [Option<(u8, usize)>; STANDING_DEVICE_LIMIT],
+    /// One context table per bus with admitted functions, used by
+    /// translations for devices on other buses.
+    contexts: [Option<(u8, FrameLease)>; STANDING_DEVICE_LIMIT],
+    /// The second-level table: its root first, then lower levels.
+    tables: [FrameLease; STANDING_TABLE_LIMIT],
+    table_count: usize,
+}
+
+/// Set once, while translation is off, and read by every later translation.
+static mut STANDING: Option<StandingDevices> = None;
+
+/// Table words that a translation adds for the standing devices.
+#[derive(Clone, Copy)]
+struct StandingWords {
+    words: [(usize, u64); STANDING_WORD_LIMIT],
+    count: usize,
+}
+
+impl StandingWords {
+    const EMPTY: Self = Self {
+        words: [(0, 0); STANDING_WORD_LIMIT],
+        count: 0,
+    };
+
+    fn push(&mut self, index: usize, value: u64) {
+        if let Some(word) = self.words.get_mut(self.count) {
+            *word = (index, value);
+            self.count += 1;
+        }
+    }
+
+    fn as_slice(&self) -> &[(usize, u64)] {
+        &self.words[..self.count]
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct Capabilities {
@@ -224,40 +276,47 @@ impl InactiveTranslation {
         }
         let devfn = usize::from(self.device) * 8 + usize::from(self.function);
         let indices = translation_indices(self.dma_page);
-        frame_words_are_exact(
-            self.frames[ROOT_FRAME],
-            &[(
-                usize::from(self.bus) * 2,
-                self.frames[CONTEXT_FRAME].address() | PRESENT,
-            )],
-        ) && frame_words_are_exact(
-            self.frames[CONTEXT_FRAME],
-            &[
-                (devfn * 2, self.frames[PML4_FRAME].address() | PRESENT),
-                (
-                    devfn * 2 + 1,
-                    (u64::from(DOMAIN_ID) << 8) | CONTEXT_ADDRESS_WIDTH_48,
-                ),
-            ],
-        ) && frame_words_are_exact(
-            self.frames[PML4_FRAME],
-            &[(indices[0], self.frames[PDPT_FRAME].address() | READ_WRITE)],
-        ) && frame_words_are_exact(
-            self.frames[PDPT_FRAME],
-            &[(
-                indices[1],
-                self.frames[PAGE_DIRECTORY_FRAME].address() | READ_WRITE,
-            )],
-        ) && frame_words_are_exact(
-            self.frames[PAGE_DIRECTORY_FRAME],
-            &[(
-                indices[2],
-                self.frames[PAGE_TABLE_FRAME].address() | READ_WRITE,
-            )],
-        ) && frame_words_are_exact(
-            self.frames[PAGE_TABLE_FRAME],
-            &[(indices[3], self.dma_page | READ_WRITE)],
-        )
+        let (standing_root, standing_context) = standing_words(self.bus, devfn);
+        let mut root = [(0, 0); 1 + STANDING_WORD_LIMIT];
+        root[0] = (
+            usize::from(self.bus) * 2,
+            self.frames[CONTEXT_FRAME].address() | PRESENT,
+        );
+        root[1..1 + standing_root.count].copy_from_slice(standing_root.as_slice());
+        let mut context = [(0, 0); 2 + STANDING_WORD_LIMIT];
+        context[0] = (devfn * 2, self.frames[PML4_FRAME].address() | PRESENT);
+        context[1] = (
+            devfn * 2 + 1,
+            (u64::from(DOMAIN_ID) << 8) | CONTEXT_ADDRESS_WIDTH_48,
+        );
+        context[2..2 + standing_context.count].copy_from_slice(standing_context.as_slice());
+        frame_words_are_exact(self.frames[ROOT_FRAME], &root[..1 + standing_root.count])
+            && frame_words_are_exact(
+                self.frames[CONTEXT_FRAME],
+                &context[..2 + standing_context.count],
+            )
+            && frame_words_are_exact(
+                self.frames[PML4_FRAME],
+                &[(indices[0], self.frames[PDPT_FRAME].address() | READ_WRITE)],
+            )
+            && frame_words_are_exact(
+                self.frames[PDPT_FRAME],
+                &[(
+                    indices[1],
+                    self.frames[PAGE_DIRECTORY_FRAME].address() | READ_WRITE,
+                )],
+            )
+            && frame_words_are_exact(
+                self.frames[PAGE_DIRECTORY_FRAME],
+                &[(
+                    indices[2],
+                    self.frames[PAGE_TABLE_FRAME].address() | READ_WRITE,
+                )],
+            )
+            && frame_words_are_exact(
+                self.frames[PAGE_TABLE_FRAME],
+                &[(indices[3], self.dma_page | READ_WRITE)],
+            )
     }
 
     pub(crate) fn evidence(&self, dma_frame: FrameLease) -> Option<TranslationEvidence> {
@@ -466,6 +525,16 @@ pub(crate) fn build_inactive_translation(
         indices[3],
         dma_frame.address() | READ_WRITE,
     );
+    let (root_words, context_words) = standing_words(bus, devfn);
+    let initialized = initialized
+        && root_words
+            .as_slice()
+            .iter()
+            .all(|(index, value)| write_word(frames[ROOT_FRAME], *index, *value))
+        && context_words
+            .as_slice()
+            .iter()
+            .all(|(index, value)| write_word(frames[CONTEXT_FRAME], *index, *value));
     if !initialized || !translation.is_exact(dma_frame) {
         let _ = translation.retire();
         return None;
@@ -550,6 +619,182 @@ pub(crate) fn verify_inactive_translation_rejections(
         && build_inactive_translation(capabilities, 0, 2, 8, dma_frame).is_none()
 }
 
+/// Admits `functions` (bus, device, function) to every translation built
+/// from now on, each reaching exactly the pages of `regions` (start, length)
+/// at their physical addresses. Translation must be off, and admission
+/// happens once; on failure nothing is admitted.
+pub(crate) fn admit_standing_devices(
+    register_base: u64,
+    mapping: MmioMapping,
+    capabilities: Capabilities,
+    functions: &[(u8, u8, u8)],
+    regions: &[(u64, u64)],
+) -> bool {
+    // SAFETY: bootstrap is single-processor and translation is checked to
+    // be off below, so no translation reads STANDING while it changes.
+    let standing = unsafe { &mut *core::ptr::addr_of_mut!(STANDING) };
+    if standing.is_some()
+        || functions.is_empty()
+        || functions.len() > STANDING_DEVICE_LIMIT
+        || functions
+            .iter()
+            .any(|(_, device, function)| *device >= 32 || *function >= 8)
+        || capabilities.capability >> SUPPORTED_ADDRESS_WIDTHS_SHIFT
+            & SUPPORTED_ADDRESS_WIDTHS_MASK
+            & SUPPORTED_48_BIT_WIDTH
+            == 0
+        || !probe(register_base, mapping).is_some_and(|current| {
+            current.capability == capabilities.capability
+                && current.extended_capability == capabilities.extended_capability
+        })
+    {
+        return false;
+    }
+    let mut devices = StandingDevices {
+        functions: [None; STANDING_DEVICE_LIMIT],
+        contexts: [None; STANDING_DEVICE_LIMIT],
+        tables: [FrameLease::EMPTY; STANDING_TABLE_LIMIT],
+        table_count: 0,
+    };
+    if !build_standing_devices(&mut devices, functions, regions) {
+        for (_, frame) in devices.contexts.iter().flatten() {
+            let _ = memory::scrub_and_release_frames(FrameOwner::KERNEL, &[*frame]);
+        }
+        if devices.table_count != 0 {
+            let _ = memory::scrub_and_release_frames(
+                FrameOwner::KERNEL,
+                &devices.tables[..devices.table_count],
+            );
+        }
+        return false;
+    }
+    *standing = Some(devices);
+    true
+}
+
+fn build_standing_devices(
+    devices: &mut StandingDevices,
+    functions: &[(u8, u8, u8)],
+    regions: &[(u64, u64)],
+) -> bool {
+    let Some(root) = standing_table(devices) else {
+        return false;
+    };
+    for &(start, length) in regions {
+        let Some(end) = start.checked_add(length).filter(|_| length != 0) else {
+            return false;
+        };
+        let mut page = start & !(PAGE_SIZE - 1);
+        while page < end {
+            if !page_fits_48_bits(page) || !map_standing_page(devices, root, page) {
+                return false;
+            }
+            page += PAGE_SIZE;
+        }
+    }
+    let [low, high] = standing_context_entry(root);
+    for (slot, &(bus, device, function)) in functions.iter().enumerate() {
+        let devfn = usize::from(device) * 8 + usize::from(function);
+        if devices.functions[..slot].contains(&Some((bus, devfn))) {
+            return false;
+        }
+        devices.functions[slot] = Some((bus, devfn));
+        let existing = devices
+            .contexts
+            .iter()
+            .flatten()
+            .find(|(other, _)| *other == bus)
+            .map(|(_, frame)| *frame);
+        let context = match existing {
+            Some(frame) => frame,
+            None => {
+                let Some(free) = devices.contexts.iter().position(Option::is_none) else {
+                    return false;
+                };
+                let Some([frame]) = memory::allocate_frames::<1>(FrameOwner::KERNEL) else {
+                    return false;
+                };
+                devices.contexts[free] = Some((bus, frame));
+                if !page_fits_48_bits(frame.address()) {
+                    return false;
+                }
+                frame
+            }
+        };
+        if !write_word(context, devfn * 2, low) || !write_word(context, devfn * 2 + 1, high) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The context entry that points a function at the standing devices' table.
+fn standing_context_entry(root: FrameLease) -> [u64; 2] {
+    [
+        root.address() | PRESENT,
+        (u64::from(STANDING_DOMAIN_ID) << 8) | CONTEXT_ADDRESS_WIDTH_48,
+    ]
+}
+
+/// Takes a zeroed frame for the standing devices' second-level table.
+fn standing_table(devices: &mut StandingDevices) -> Option<FrameLease> {
+    let slot = devices.tables.get_mut(devices.table_count)?;
+    let [frame] = memory::allocate_frames::<1>(FrameOwner::KERNEL)?;
+    *slot = frame;
+    devices.table_count += 1;
+    page_fits_48_bits(frame.address()).then_some(frame)
+}
+
+/// Maps `page` to itself in the standing devices' table under `root`.
+fn map_standing_page(devices: &mut StandingDevices, root: FrameLease, page: u64) -> bool {
+    let indices = translation_indices(page);
+    let mut table = root;
+    for index in &indices[..3] {
+        let Some(entry) = read_word(table, *index) else {
+            return false;
+        };
+        let next = if entry & PRESENT != 0 {
+            devices.tables[..devices.table_count]
+                .iter()
+                .copied()
+                .find(|frame| frame.address() == entry & ADDRESS_MASK_48)
+        } else {
+            standing_table(devices)
+                .filter(|next| write_word(table, *index, next.address() | READ_WRITE))
+        };
+        let Some(next) = next else {
+            return false;
+        };
+        table = next;
+    }
+    write_word(table, indices[3], page | READ_WRITE)
+}
+
+/// The root-table and context-table words that admit the standing devices
+/// into a translation for the function at `bus` and `devfn`: a root entry
+/// for each other bus with standing functions, and the context entries of
+/// the standing functions on the translation's own bus.
+fn standing_words(bus: u8, devfn: usize) -> (StandingWords, StandingWords) {
+    let (mut root, mut context) = (StandingWords::EMPTY, StandingWords::EMPTY);
+    // SAFETY: STANDING changes only once, while no translation exists.
+    let Some(standing) = (unsafe { (*core::ptr::addr_of!(STANDING)).as_ref() }) else {
+        return (root, context);
+    };
+    for (other, table) in standing.contexts.iter().flatten() {
+        if *other != bus {
+            root.push(usize::from(*other) * 2, table.address() | PRESENT);
+        }
+    }
+    let [low, high] = standing_context_entry(standing.tables[0]);
+    for (other, other_devfn) in standing.functions.iter().flatten() {
+        if *other == bus && *other_devfn != devfn {
+            context.push(other_devfn * 2, low);
+            context.push(other_devfn * 2 + 1, high);
+        }
+    }
+    (root, context)
+}
+
 fn translation_indices(address: u64) -> [usize; 4] {
     [
         ((address >> 39) & 0x1ff) as usize,
@@ -577,6 +822,12 @@ fn write_word(frame: FrameLease, index: usize, value: u64) -> bool {
         (address as *mut u64).add(index).write(value.to_le());
     }
     true
+}
+
+fn read_word(frame: FrameLease, index: usize) -> Option<u64> {
+    let address = frame.direct_map_address()?;
+    (index < TABLE_ENTRIES)
+        .then(|| u64::from_le(unsafe { (address as *const u64).add(index).read() }))
 }
 
 fn frame_words_are_exact(frame: FrameLease, expected: &[(usize, u64)]) -> bool {

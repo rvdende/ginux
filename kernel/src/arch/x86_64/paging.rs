@@ -27,6 +27,11 @@ const MMIO_PDPT_INDEX: usize = ENTRY_COUNT - 1;
 const MMIO_WINDOW_BASE: usize = DIRECT_MAP_BASE + MMIO_PDPT_INDEX * (1 << 30);
 const FRAMEBUFFER_PDPT_INDEX: usize = ENTRY_COUNT - 2;
 const FRAMEBUFFER_WINDOW_BASE: usize = DIRECT_MAP_BASE + FRAMEBUFFER_PDPT_INDEX * (1 << 30);
+const DEVICE_PDPT_INDEX: usize = ENTRY_COUNT - 3;
+const DEVICE_WINDOW_BASE: usize = DIRECT_MAP_BASE + DEVICE_PDPT_INDEX * (1 << 30);
+/// Register ranges the device window maps for drivers beyond the reference
+/// devices, such as USB host controllers.
+pub(crate) const MAX_DEVICE_REGIONS: usize = 4;
 const GIBIBYTE: u64 = 1 << 30;
 const CPUID_EXTENDED_FEATURES: u32 = 0x8000_0001;
 const CPUID_PAGE_1GB: u32 = 1 << 26;
@@ -56,6 +61,8 @@ pub(crate) struct InitialMmioMappings {
     pub(crate) network_msix: MmioMapping,
     /// Write-combining alias of the firmware framebuffer, when one was requested.
     pub(crate) framebuffer: Option<usize>,
+    /// Uncached mappings of the requested device register ranges, in order.
+    pub(crate) devices: [Option<MmioMapping>; MAX_DEVICE_REGIONS],
 }
 
 impl MmioMapping {
@@ -450,6 +457,8 @@ static mut FINE_PAGE_TABLES: [PageTable; MAX_FINE_TABLES] =
 static mut MMIO_DIRECTORY: PageTable = PageTable([0; ENTRY_COUNT]);
 static mut MMIO_TABLE: PageTable = PageTable([0; ENTRY_COUNT]);
 static mut FRAMEBUFFER_DIRECTORY: PageTable = PageTable([0; ENTRY_COUNT]);
+static mut DEVICE_DIRECTORY: PageTable = PageTable([0; ENTRY_COUNT]);
+static mut DEVICE_TABLE: PageTable = PageTable([0; ENTRY_COUNT]);
 /// End of the physical range reachable through the direct map.
 static DIRECT_MAP_LIMIT: AtomicUsize = AtomicUsize::new(INITIAL_IDENTITY_LIMIT);
 
@@ -491,6 +500,10 @@ pub(crate) enum PagingError {
 
 /// Installs a transitional 4 GiB identity map backed by 2 MiB pages.
 ///
+/// `device_regions` are further register ranges, at most
+/// [`MAX_DEVICE_REGIONS`], mapped uncached in a window of their own; like the
+/// reference devices' ranges they lose any identity alias.
+///
 /// # Safety
 ///
 /// The caller must ensure interrupts are disabled and that the current x86-64
@@ -502,6 +515,7 @@ pub(crate) unsafe fn install_initial_identity_map(
     required_addresses: &[usize],
     guard_pages: &[usize],
     mmio_regions: [(u64, usize); 7],
+    device_regions: &[(u64, usize)],
     framebuffer: Option<(u64, usize)>,
 ) -> Result<InitialMmioMappings, PagingError> {
     let [mmio, auxiliary_mmio, platform_mmio, device_mmio, device_config_mmio, device_notification_mmio, device_msix_mmio] =
@@ -587,8 +601,8 @@ pub(crate) unsafe fn install_initial_identity_map(
     }
 
     // RAM above 4 GiB joins the direct map as 1 GiB pages, below the
-    // framebuffer and MMIO windows at the top of the slot.
-    let gibibytes = (ram_end(boot_info).div_ceil(GIBIBYTE) as usize).min(FRAMEBUFFER_PDPT_INDEX);
+    // device, framebuffer and MMIO windows at the top of the slot.
+    let gibibytes = (ram_end(boot_info).div_ceil(GIBIBYTE) as usize).min(DEVICE_PDPT_INDEX);
     if gibibytes > DIRECTORY_COUNT
         && core::arch::x86_64::__cpuid(CPUID_EXTENDED_FEATURES).edx & CPUID_PAGE_1GB != 0
     {
@@ -1041,6 +1055,16 @@ pub(crate) unsafe fn install_initial_identity_map(
         mapped_length: device_msix_mmio_pages * PAGE_SIZE,
         writable: true,
     };
+    let reference_mmio = [
+        mmio_mapping,
+        auxiliary_mmio_mapping,
+        platform_mmio_mapping,
+        device_mmio_mapping,
+        device_config_mmio_mapping,
+        device_notification_mmio_mapping,
+        device_msix_mmio_mapping,
+    ];
+    let devices = map_device_window(direct_pdpt, device_regions, &reference_mmio)?;
 
     let fine_tables = core::ptr::addr_of_mut!(FINE_PAGE_TABLES).cast::<PageTable>();
     let mut fine_regions = [usize::MAX; MAX_FINE_TABLES];
@@ -1183,6 +1207,29 @@ pub(crate) unsafe fn install_initial_identity_map(
             entries.add(page).write(0);
         }
     }
+    for device in devices.iter().flatten() {
+        let device_end = device.physical_page + device.mapped_length as u64;
+        if device.physical_page >= INITIAL_IDENTITY_LIMIT as u64 {
+            continue;
+        }
+        if device_end > INITIAL_IDENTITY_LIMIT as u64 {
+            return Err(PagingError::MmioMapInvalid);
+        }
+        for physical in (device.physical_page..device_end).step_by(PAGE_SIZE) {
+            let physical = usize::try_from(physical).map_err(|_| PagingError::MmioMapInvalid)?;
+            let region = physical / LARGE_PAGE_SIZE as usize;
+            let fine_index = ensure_fine_region(
+                region,
+                &mut fine_regions,
+                &mut fine_count,
+                fine_tables,
+                directories,
+            )?;
+            let page = (physical % LARGE_PAGE_SIZE as usize) / PAGE_SIZE;
+            let entries = core::ptr::addr_of_mut!((*fine_tables.add(fine_index)).0).cast::<u64>();
+            entries.add(page).write(0);
+        }
+    }
     if device_msix_mmio_page < INITIAL_IDENTITY_LIMIT as u64 {
         let msix_end = device_msix_mmio_mapped_end.ok_or(PagingError::MmioMapInvalid)?;
         if msix_end > INITIAL_IDENTITY_LIMIT as u64 {
@@ -1238,9 +1285,11 @@ pub(crate) unsafe fn install_initial_identity_map(
         }
     }
 
-    const TABLE_PAGE_COUNT: usize = 6 + DIRECTORY_COUNT + MAX_FINE_TABLES;
+    const TABLE_PAGE_COUNT: usize = 8 + DIRECTORY_COUNT + MAX_FINE_TABLES;
     let mut table_pages = [0_usize; TABLE_PAGE_COUNT];
     table_pages[TABLE_PAGE_COUNT - 1] = core::ptr::addr_of!(FRAMEBUFFER_DIRECTORY) as usize;
+    table_pages[TABLE_PAGE_COUNT - 2] = core::ptr::addr_of!(DEVICE_DIRECTORY) as usize;
+    table_pages[TABLE_PAGE_COUNT - 3] = core::ptr::addr_of!(DEVICE_TABLE) as usize;
     table_pages[0] = pml4_address;
     table_pages[1] = pdpt_address;
     table_pages[2] = direct_pdpt_address;
@@ -1356,7 +1405,85 @@ pub(crate) unsafe fn install_initial_identity_map(
         network_notification: device_notification_mmio_mapping,
         network_msix: device_msix_mmio_mapping,
         framebuffer,
+        devices,
     })
+}
+
+/// Maps `regions` uncached, one after another, into the direct-map slot
+/// reserved for device registers. Each region must stay clear of the others
+/// and of the reference devices' ranges in `reference`.
+unsafe fn map_device_window(
+    direct_pdpt: *mut u64,
+    regions: &[(u64, usize)],
+    reference: &[MmioMapping],
+) -> Result<[Option<MmioMapping>; MAX_DEVICE_REGIONS], PagingError> {
+    let directory = core::ptr::addr_of_mut!(DEVICE_DIRECTORY.0).cast::<u64>();
+    let table = core::ptr::addr_of_mut!(DEVICE_TABLE.0).cast::<u64>();
+    zero_entries(directory);
+    zero_entries(table);
+    let mut mappings = [None; MAX_DEVICE_REGIONS];
+    if regions.is_empty() {
+        return Ok(mappings);
+    }
+    if regions.len() > MAX_DEVICE_REGIONS {
+        return Err(PagingError::MmioMapInvalid);
+    }
+    let mut next = 0_usize;
+    for (slot, &(physical, length)) in regions.iter().enumerate() {
+        let page = physical & !(PAGE_SIZE as u64 - 1);
+        let pages = usize::try_from(physical - page)
+            .ok()
+            .and_then(|offset| offset.checked_add(length))
+            .and_then(|span| span.checked_add(PAGE_SIZE - 1))
+            .map(|span| span / PAGE_SIZE)
+            .ok_or(PagingError::MmioMapInvalid)?;
+        let end = page
+            .checked_add((pages * PAGE_SIZE) as u64)
+            .ok_or(PagingError::MmioMapInvalid)?;
+        let overlaps = |other: &MmioMapping| {
+            ranges_overlap_u64(
+                (page, end),
+                (
+                    other.physical_page,
+                    other.physical_page + other.mapped_length as u64,
+                ),
+            )
+        };
+        if length == 0
+            || next
+                .checked_add(pages)
+                .is_none_or(|last| last > ENTRY_COUNT)
+            || page & !(ADDRESS_MASK as u64) != 0
+            || end > ADDRESS_MASK as u64 + PAGE_SIZE as u64
+            || reference.iter().any(overlaps)
+            || mappings.iter().flatten().any(overlaps)
+        {
+            return Err(PagingError::MmioMapInvalid);
+        }
+        for index in 0..pages {
+            table.add(next + index).write(
+                (page + (index * PAGE_SIZE) as u64)
+                    | PRESENT
+                    | WRITABLE
+                    | CACHE_DISABLE
+                    | NO_EXECUTE,
+            );
+        }
+        mappings[slot] = Some(MmioMapping {
+            physical_page: page,
+            physical_start: physical,
+            virtual_page: DEVICE_WINDOW_BASE + next * PAGE_SIZE,
+            length,
+            mapped_length: pages * PAGE_SIZE,
+            writable: true,
+        });
+        next += pages;
+    }
+    directory.write(table as u64 | PRESENT | WRITABLE);
+    direct_pdpt
+        .add(DEVICE_PDPT_INDEX)
+        .write(directory as u64 | PRESENT | WRITABLE);
+    Ok(mappings)
 }
 
 /// Maps a framebuffer write-combining into the direct-map slot reserved for it
@@ -1463,7 +1590,7 @@ pub(crate) fn direct_map_address(physical: usize) -> Option<usize> {
 
 pub(crate) fn direct_map_translation_is_bounded() -> bool {
     let limit = direct_map_limit();
-    (INITIAL_IDENTITY_LIMIT..=FRAMEBUFFER_PDPT_INDEX << 30).contains(&limit)
+    (INITIAL_IDENTITY_LIMIT..=DEVICE_PDPT_INDEX << 30).contains(&limit)
         && direct_map_range_address(0, 1) == Some(DIRECT_MAP_BASE)
         && direct_map_range_address((limit - 1) as u64, 1) == Some(DIRECT_MAP_BASE + limit - 1)
         && direct_map_range_address(0, 0).is_none()
@@ -1663,9 +1790,11 @@ pub(crate) fn mmio_translation_is_bounded(
 }
 
 pub(crate) fn static_page_tables_are_read_only() -> bool {
-    const TABLE_PAGE_COUNT: usize = 6 + DIRECTORY_COUNT + MAX_FINE_TABLES;
+    const TABLE_PAGE_COUNT: usize = 8 + DIRECTORY_COUNT + MAX_FINE_TABLES;
     let mut table_pages = [0_usize; TABLE_PAGE_COUNT];
     table_pages[TABLE_PAGE_COUNT - 1] = core::ptr::addr_of!(FRAMEBUFFER_DIRECTORY) as usize;
+    table_pages[TABLE_PAGE_COUNT - 2] = core::ptr::addr_of!(DEVICE_DIRECTORY) as usize;
+    table_pages[TABLE_PAGE_COUNT - 3] = core::ptr::addr_of!(DEVICE_TABLE) as usize;
     table_pages[0] = core::ptr::addr_of!(PML4) as usize;
     table_pages[1] = core::ptr::addr_of!(PDPT) as usize;
     table_pages[2] = core::ptr::addr_of!(DIRECT_PDPT) as usize;
@@ -1869,6 +1998,8 @@ fn is_static_table_page(address: usize) -> bool {
         || address == core::ptr::addr_of!(MMIO_DIRECTORY) as usize
         || address == core::ptr::addr_of!(MMIO_TABLE) as usize
         || address == core::ptr::addr_of!(FRAMEBUFFER_DIRECTORY) as usize
+        || address == core::ptr::addr_of!(DEVICE_DIRECTORY) as usize
+        || address == core::ptr::addr_of!(DEVICE_TABLE) as usize
     {
         return true;
     }

@@ -16,6 +16,7 @@ pub(crate) mod net;
 pub(crate) mod nvme;
 pub(crate) mod pci;
 pub(crate) mod realtek;
+pub(crate) mod usb_input;
 pub(crate) mod xhci;
 
 use core::fmt::Write;

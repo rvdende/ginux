@@ -447,6 +447,10 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     if !arch::x86_64::cpu::enable_execute_disable() {
         kernel_fail("ginux: execute-disable unavailable or inactive\r\n");
     }
+    // USB host controllers for input are found now so that their registers
+    // join the device window of the kernel page tables.
+    let usb_hosts = drivers::usb_input::discover();
+    let usb_regions = usb_hosts.regions();
 
     // SAFETY: The entry trampoline disabled interrupts. The required live
     // addresses and the page-table objects are checked against the complete
@@ -466,6 +470,7 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
                 (virtio_network_notify_physical, virtio_network_notify_length),
                 (virtio_network_msix_physical, virtio_network_msix_length),
             ],
+            &usb_regions[..usb_hosts.len()],
             framebuffer::mapped_length(&boot_info.framebuffer)
                 .map(|length| (boot_info.framebuffer.base, length)),
         )
@@ -479,6 +484,7 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         network_notification: virtio_network_notify_mmio,
         network_msix: virtio_network_msix_mmio,
         framebuffer: framebuffer_window,
+        devices: usb_mappings,
     }) = result
     else {
         if let Err(error) = result {
@@ -3868,6 +3874,32 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
             kernel_fail("\r\nginux: persistent local configuration invalid\r\n");
         }
     }
+    let usb_registers: [Option<usize>; drivers::usb_input::MAX_CONTROLLERS] =
+        core::array::from_fn(|index| {
+            let (physical, length) = usb_regions[index];
+            usb_mappings
+                .get(index)
+                .copied()
+                .flatten()
+                .filter(|mapping| {
+                    arch::x86_64::paging::mmio_translation_is_bounded(*mapping, physical, length)
+                        && arch::x86_64::paging::mmio_identity_alias_is_absent(*mapping)
+                })
+                .and_then(|mapping| mapping.address(physical, length))
+        });
+    // No DMA translation is active here, so the controllers can be admitted
+    // to every later one. A controller behind a bridge may be covered by a
+    // DMAR sub-hierarchy scope, which the platform summary does not record;
+    // an admission into a unit that does not translate it is inert.
+    drivers::usb_input::start(&usb_hosts, &usb_registers, |functions, regions| {
+        arch::x86_64::iommu::admit_standing_devices(
+            platform.first_iommu_register_base,
+            iommu_mmio,
+            iommu_capabilities,
+            functions,
+            regions,
+        )
+    });
     OPERATOR_CONSOLE_READY.store(true, Ordering::Release);
     serial_write_raw(b"ginux: platform, security, devices, and runtime ready\r\n");
     serial_write("ginux: persistent storage ");

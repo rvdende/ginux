@@ -56,7 +56,10 @@ pub(crate) fn run(boot_info: &BootInfo) -> ! {
     report_disks(&mut remapping);
     let keyboards = open_keyboards();
 
-    if keyboards.iter().all(Option::is_none)
+    if keyboards
+        .iter()
+        .flatten()
+        .all(|controller| controller.keyboards().next().is_none())
         && !crate::SERIAL_PRESENT.load(core::sync::atomic::Ordering::Acquire)
     {
         say!("ginux: no keyboard or serial input; halted\n");
@@ -352,7 +355,7 @@ fn report_disks(remapping: &mut Remapping) {
     }
 }
 
-/// Every USB controller with at least one boot keyboard.
+/// Every USB controller with at least one input device or speaker.
 type UsbKeyboards = [Option<xhci::Controller>; MAX_CONTROLLERS];
 
 fn open_keyboards() -> UsbKeyboards {
@@ -368,9 +371,10 @@ fn open_keyboards() -> UsbKeyboards {
             function.device,
             function.function
         );
+        let registers = function.memory_bar(0).unwrap_or(0) as usize;
         // SAFETY: bring-up mode is the only driver of these controllers, and
         // the firmware identity map covers their registers and the DMA pool.
-        match unsafe { xhci::Controller::open(*function) } {
+        match unsafe { xhci::Controller::open(*function, registers, true) } {
             Ok(controller) => {
                 for speaker in controller.speakers() {
                     say!(
@@ -383,12 +387,17 @@ fn open_keyboards() -> UsbKeyboards {
                         speaker.bits
                     );
                 }
-                for keyboard in controller.keyboards() {
+                for input in controller.inputs() {
                     say!(
-                        "ginux:   keyboard {:04x}:{:04x} on port {}\n",
-                        keyboard.vendor,
-                        keyboard.product,
-                        keyboard.location
+                        "ginux:   {} {:04x}:{:04x} on port {}\n",
+                        match input.kind {
+                            xhci::InputKind::Keyboard => "keyboard",
+                            xhci::InputKind::Mouse => "mouse",
+                            xhci::InputKind::Tablet => "tablet",
+                        },
+                        input.vendor,
+                        input.product,
+                        input.location
                     );
                 }
                 opened[slot] = Some(controller);
@@ -401,7 +410,7 @@ fn open_keyboards() -> UsbKeyboards {
 
 fn shell(boot_info: &BootInfo, mut usb: UsbKeyboards) -> ! {
     say!("\nGinux bring-up shell. Type 'help' for commands.\n");
-    let mut decoders: [[keyboard::Keyboard; xhci::MAX_KEYBOARDS]; MAX_CONTROLLERS] =
+    let mut decoders: [[keyboard::Keyboard; xhci::MAX_INPUTS]; MAX_CONTROLLERS] =
         core::array::from_fn(|_| core::array::from_fn(|_| keyboard::Keyboard::new()));
     let mut line = [0_u8; LINE_CAPACITY];
     let mut length = 0;
@@ -410,10 +419,13 @@ fn shell(boot_info: &BootInfo, mut usb: UsbKeyboards) -> ! {
         let mut pressed = [0_u8; 16];
         let mut count = 0;
         for (controller, decoders) in usb.iter_mut().zip(decoders.iter_mut()) {
-            let Some((index, report)) = controller.as_mut().and_then(xhci::Controller::poll) else {
+            let Some(report) = controller.as_mut().and_then(xhci::Controller::poll) else {
                 continue;
             };
-            decoders[index].report(&report, |bytes| {
+            if report.kind != xhci::InputKind::Keyboard {
+                continue;
+            }
+            decoders[report.input].report(&report.bytes, |bytes| {
                 for byte in bytes {
                     if count < pressed.len() {
                         pressed[count] = *byte;

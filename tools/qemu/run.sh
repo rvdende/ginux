@@ -51,6 +51,16 @@ network_capture=()
 if [[ -n "${GINUX_PCAP:-}" ]]; then
     network_capture=(-object "filter-dump,id=ginux-capture,netdev=ginux-net,file=$GINUX_PCAP")
 fi
+# GINUX_QEMU_USB_INPUT=1 adds a USB keyboard and tablet on an xHCI
+# controller, which Ginux offers to domains as /dev/input/eventN.
+usb_input=()
+if [[ "${GINUX_QEMU_USB_INPUT:-}" == "1" ]]; then
+    usb_input=(
+        -device "qemu-xhci,id=xhci"
+        -device "usb-kbd,bus=xhci.0"
+        -device "usb-tablet,bus=xhci.0"
+    )
+fi
 qemu_netdev="user,id=ginux-net,restrict=off"
 # GINUX_QEMU_MONITOR names a Unix socket for the QEMU monitor, which tests
 # use to take screenshots (screendump) and inject input.
@@ -80,6 +90,7 @@ exec "$qemu" \
     -netdev "$qemu_netdev" \
     ${network_capture[@]+"${network_capture[@]}"} \
     -device "virtio-net-pci,netdev=ginux-net,disable-legacy=on,iommu_platform=on,mac=52:54:00:12:34:56,addr=0x3" \
+    ${usb_input[@]+"${usb_input[@]}"} \
     -drive "if=none,id=ginux-volume,format=raw,file=$volume_image" \
     -drive "if=pflash,format=raw,readonly=on,file=$ovmf_code" \
     -drive "if=pflash,format=raw,file=$ovmf_vars" \

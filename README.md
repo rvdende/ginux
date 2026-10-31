@@ -258,15 +258,20 @@ every PCI device, and runs the physical-hardware drivers in `kernel/src/drivers`
   (`80769f29-5413-45a3-abab-5b44b6125922`), and only on the disk whose
   partition table defines them; the table's header and entry array must pass
   their CRCs and the partition may overlap no other. AHCI is read-only.
-- An xHCI driver that runs USB boot keyboards on every controller, including
-  keyboards behind USB hubs (up to five tiers, with transaction translators
-  for low- and full-speed devices behind high-speed hubs), and plays the
+- An xHCI driver that runs USB boot keyboards, boot mice and QEMU's USB
+  tablet on every controller, including devices behind USB hubs (up to five
+  tiers, with transaction translators for low- and full-speed devices behind
+  high-speed hubs), and plays the
   `beep` test tone on every playback output of USB Audio Class 1 and 2
   devices (such as the speaker, headphone and S/PDIF outputs of a
   motherboard's USB audio chip) through isochronous endpoints, setting
   48 kHz on the endpoint or the class 2 clock source. Descriptor parsing
   lives in `crates/usb-audio` and is tested against a real class 2 device's
-  descriptors; class 2 playback has not run on hardware yet.
+  descriptors; class 2 playback has not run on hardware yet. On the QEMU
+  reference machine the same driver hands USB keyboards and pointers to
+  domains as Linux evdev devices (`/dev/input/eventN`), with the report
+  decoding in `crates/usb-hid`; `GINUX_QEMU_USB_INPUT=1 make run` adds a USB
+  keyboard and tablet.
 - An HD Audio driver for Intel-compatible controllers (including AMD HD Audio
   and GPU HDMI/DP audio) that resets each controller, lists its codecs and
   output pins, and plays a 440 Hz test tone on request (`beep`).

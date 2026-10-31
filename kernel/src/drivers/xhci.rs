@@ -1,12 +1,13 @@
-//! Polling xHCI driver for USB HID boot keyboards and USB audio outputs.
+//! Polling xHCI driver for USB HID input devices and USB audio outputs.
 //!
 //! The driver takes each controller from firmware, resets it, and brings up
 //! the command and event rings without interrupts. It enumerates root ports
-//! and the hubs behind them, configures every device that exposes a HID boot
-//! keyboard interface, keeping one report transfer queued per keyboard, and
-//! configures the playback outputs of USB Audio Class 1 and 2 devices. Each
-//! controller draws its DMA memory from a static pool, so several controllers
-//! can run at once; a controller without devices returns its pages.
+//! and the hubs behind them, configures every HID boot keyboard, HID boot
+//! mouse and QEMU USB tablet interface, keeping several report transfers
+//! queued per interface, and configures the playback outputs of USB Audio
+//! Class 1 and 2 devices. Each controller draws its DMA memory from a static
+//! pool, so several controllers can run at once; a controller without
+//! devices returns its pages.
 
 use core::ptr::{addr_of, addr_of_mut};
 
@@ -72,8 +73,22 @@ const COMPLETION_SHORT_PACKET: u32 = 13;
 const RING_TRBS: usize = 256;
 const MAX_SLOTS: u32 = 32;
 const MAX_SCRATCHPADS: usize = 256;
-/// Keyboards configured on one controller.
-pub(crate) const MAX_KEYBOARDS: usize = 4;
+/// HID input interfaces configured on one controller.
+pub(crate) const MAX_INPUTS: usize = 4;
+/// Report transfers kept queued per input interface.
+const REPORT_SLOTS: u64 = 16;
+/// The longest report the driver keeps; boot reports and QEMU's tablet
+/// reports fit.
+pub(crate) const REPORT_BYTES: usize = 8;
+/// QEMU's emulated USB keyboard, mouse and tablet share this vendor and
+/// product; only the tablet has no boot interface.
+const QEMU_HID: (u16, u16) = (0x0627, 0x0001);
+const CLASS_HID: u8 = 3;
+const HID_SUBCLASS_BOOT: u8 = 1;
+const HID_PROTOCOL_KEYBOARD: u8 = 1;
+const HID_PROTOCOL_MOUSE: u8 = 2;
+/// The SET_PROTOCOL value that selects the boot protocol.
+const HID_BOOT_PROTOCOL: u16 = 0;
 const ENDPOINT_CONTROL: u32 = 4;
 const ENDPOINT_INTERRUPT_IN: u32 = 7;
 const ENDPOINT_ISOCH_OUT: u32 = 1;
@@ -174,8 +189,10 @@ pub(crate) enum Error {
     TransferFailed(u32),
     NotConnected,
     PortResetFailed,
-    NotBootKeyboard(u16, u16),
-    NoKeyboard,
+    /// A device with neither a supported input interface nor audio
+    /// outputs, by vendor and product.
+    NotInputDevice(u16, u16),
+    NoDevices,
     HubTooDeep,
 }
 
@@ -212,6 +229,19 @@ impl Ring {
     /// Dequeue Pointer command takes it.
     fn enqueue_pointer(&self) -> u64 {
         self.trbs.wrapping_add(self.index * 4) as u64 | u64::from(self.cycle)
+    }
+
+    /// The parameter of the TRB at `address`, if it lies in this ring.
+    fn parameter_at(&self, address: u64) -> Option<u64> {
+        let offset = address.checked_sub(self.address())?;
+        if offset >= (RING_TRBS * 16) as u64 || offset % 16 != 0 {
+            return None;
+        }
+        // SAFETY: the offset selects a whole TRB inside the ring page.
+        unsafe {
+            let trb = self.trbs.add(offset as usize / 4);
+            Some(u64::from(trb.read_volatile()) | u64::from(trb.add(1).read_volatile()) << 32)
+        }
     }
 
     /// Writes one TRB and returns its physical address.
@@ -257,6 +287,16 @@ impl Event {
     fn slot(&self) -> u32 {
         self.control >> 24
     }
+
+    /// The endpoint context index of a transfer event.
+    fn endpoint(&self) -> u32 {
+        (self.control >> 16) & 0x1f
+    }
+
+    /// The bytes a transfer event says were not transferred.
+    fn residue(&self) -> u32 {
+        self.status & 0x00ff_ffff
+    }
 }
 
 /// Where a device sits: a root port and the hub ports below it.
@@ -292,15 +332,82 @@ impl core::fmt::Display for Location {
     }
 }
 
-/// A configured boot keyboard.
-pub(crate) struct Keyboard {
+/// What a HID input interface reports.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InputKind {
+    /// A keyboard in the boot protocol: modifiers, a reserved byte and six
+    /// key usages.
+    Keyboard,
+    /// A mouse in the boot protocol: buttons, X and Y movement, and on most
+    /// mice a wheel byte.
+    Mouse,
+    /// QEMU's USB tablet in its report protocol: buttons, absolute X and Y,
+    /// and a wheel byte.
+    Tablet,
+}
+
+/// A configured HID input interface with its interrupt-IN endpoint.
+pub(crate) struct Input {
     pub(crate) location: Location,
     pub(crate) vendor: u16,
     pub(crate) product: u16,
+    pub(crate) kind: InputKind,
     slot: u32,
     endpoint: u32,
     interrupt: Ring,
+    /// The page whose slots receive reports, one slot per queued transfer.
     report: *mut DmaPage,
+    /// Bytes each report transfer asks for: the endpoint's packet size.
+    report_length: u32,
+}
+
+impl Input {
+    /// The bytes between report slots in the report page.
+    fn slot_stride(&self) -> u64 {
+        u64::from(self.report_length.next_multiple_of(64))
+    }
+
+    /// The addresses of the report slots, each the buffer of one queued
+    /// transfer.
+    fn report_slots(&self) -> impl Iterator<Item = u64> {
+        let stride = self.slot_stride();
+        let slots = (4096 / stride).clamp(1, REPORT_SLOTS);
+        let page = self.report as u64;
+        (0..slots).map(move |slot| page + slot * stride)
+    }
+
+    /// The report slot of the completed transfer TRB at `trb`, if the TRB
+    /// is on this input's ring and points into its report page.
+    fn completed_buffer(&self, trb: u64) -> Option<u64> {
+        let buffer = self.interrupt.parameter_at(trb)?;
+        let page = self.report as u64;
+        (buffer >= page && buffer + self.slot_stride() <= page + 4096).then_some(buffer)
+    }
+}
+
+/// One report from an input interface.
+pub(crate) struct Report {
+    /// The interface's index among the controller's inputs.
+    pub(crate) input: usize,
+    pub(crate) kind: InputKind,
+    /// The report's first bytes, zero past `length`.
+    pub(crate) bytes: [u8; REPORT_BYTES],
+    pub(crate) length: usize,
+}
+
+impl Report {
+    pub(crate) fn data(&self) -> &[u8] {
+        &self.bytes[..self.length]
+    }
+}
+
+/// An input interface found in a configuration descriptor, with its
+/// interface number and interrupt-IN endpoint.
+#[derive(Clone, Copy)]
+struct InputInterface {
+    kind: InputKind,
+    interface: u8,
+    endpoint: (u8, u16, u8),
 }
 
 /// Per-device DMA pages used while addressing and configuring a device.
@@ -333,7 +440,7 @@ pub(crate) struct Speaker {
     tone_bytes: usize,
 }
 
-/// A running controller with at least one configured keyboard or speaker.
+/// A running controller with at least one configured input or speaker.
 pub(crate) struct Controller {
     operational: usize,
     runtime: usize,
@@ -344,30 +451,41 @@ pub(crate) struct Controller {
     events: *mut u32,
     event_index: usize,
     event_cycle: bool,
-    keyboards: [Option<Keyboard>; MAX_KEYBOARDS],
+    inputs: [Option<Input>; MAX_INPUTS],
     speakers: [Option<Speaker>; MAX_SPEAKERS],
+    /// Whether enumeration reports every device and hub, not only errors.
+    verbose: bool,
 }
 
 impl Controller {
-    /// Takes over `function`, resets it, and configures every boot keyboard
-    /// on its root ports. On failure the controller is halted and its DMA
-    /// pages are returned to the pool.
+    /// Takes over `function`, whose registers (BAR 0) are mapped uncached at
+    /// `registers`, resets it, and configures every input interface and
+    /// audio output on its ports, reporting each device when `verbose`. On
+    /// failure the controller is halted and its DMA pages are returned to
+    /// the pool.
     ///
     /// # Safety
     ///
-    /// `function` must be an xHCI controller that no other code drives, and
-    /// its registers and the DMA pool must be identity mapped.
-    pub(crate) unsafe fn open(function: Function) -> Result<Self, Error> {
+    /// `function` must be an xHCI controller that no other code drives,
+    /// `registers` must map all of its BAR 0 (or be 0 when it has none), and
+    /// the DMA pool must be identity mapped.
+    pub(crate) unsafe fn open(
+        function: Function,
+        registers: usize,
+        verbose: bool,
+    ) -> Result<Self, Error> {
         let mark = pool_mark();
-        let result = Self::open_inner(function);
+        let result = Self::open_inner(function, registers, verbose);
         if result.is_err() {
             pool_release_to(mark);
         }
         result
     }
 
-    unsafe fn open_inner(function: Function) -> Result<Self, Error> {
-        let base = function.memory_bar(0).ok_or(Error::NoMemoryBar)? as usize;
+    unsafe fn open_inner(function: Function, base: usize, verbose: bool) -> Result<Self, Error> {
+        if base == 0 {
+            return Err(Error::NoMemoryBar);
+        }
         function.enable_memory_and_bus_master();
         take_from_firmware(base);
 
@@ -441,8 +559,9 @@ impl Controller {
             events,
             event_index: 0,
             event_cycle: true,
-            keyboards: [const { None }; MAX_KEYBOARDS],
+            inputs: [const { None }; MAX_INPUTS],
             speakers: [const { None }; MAX_SPEAKERS],
+            verbose,
         };
         if capability_1 & (1 << 3) != 0 {
             for port in 1..=ports {
@@ -469,13 +588,21 @@ impl Controller {
                 Err(error) => say!("ginux:     port {}: {:?}\n", port, error),
             }
         }
-        let found = controller.keyboards().count();
-        if found == 0 && controller.speakers().next().is_none() {
+        if controller.inputs().next().is_none() && controller.speakers().next().is_none() {
             controller.stop();
-            return Err(Error::NoKeyboard);
+            return Err(Error::NoDevices);
         }
-        for index in 0..found {
-            controller.queue_report(index);
+        // Several transfers stay queued per input, so reports that arrive
+        // between polls wait in the event ring instead of being merged by
+        // the device. At most MAX_INPUTS * REPORT_SLOTS transfers are
+        // outstanding, fewer than the event ring holds.
+        for index in 0..MAX_INPUTS {
+            let Some(input) = controller.inputs[index].as_ref() else {
+                continue;
+            };
+            for buffer in input.report_slots() {
+                controller.queue_report(index, buffer);
+            }
         }
         Ok(controller)
     }
@@ -545,36 +672,67 @@ impl Controller {
         }
     }
 
-    /// Returns the configured keyboards.
-    pub(crate) fn keyboards(&self) -> impl Iterator<Item = &Keyboard> {
-        self.keyboards.iter().flatten()
+    /// Returns the configured input interfaces, in index order.
+    pub(crate) fn inputs(&self) -> impl Iterator<Item = &Input> {
+        self.inputs.iter().flatten()
     }
 
-    /// Returns the next keyboard report and the index of the keyboard that
-    /// sent it, if one has arrived.
-    pub(crate) fn poll(&mut self) -> Option<(usize, [u8; 8])> {
-        let event = self.next_event()?;
-        if event.kind() != TRB_TRANSFER_EVENT {
-            return None;
+    /// Returns the configured keyboards.
+    pub(crate) fn keyboards(&self) -> impl Iterator<Item = &Input> {
+        self.inputs()
+            .filter(|input| input.kind == InputKind::Keyboard)
+    }
+
+    /// Returns the next input report, if one has arrived, and queues its
+    /// transfer again. Costs one memory read when no event is waiting.
+    pub(crate) fn poll(&mut self) -> Option<Report> {
+        // Skip events that carry no report, such as failed transfers.
+        for _ in 0..RING_TRBS {
+            let event = self.next_event()?;
+            if event.kind() != TRB_TRANSFER_EVENT {
+                continue;
+            }
+            let Some(index) = self.inputs.iter().position(|input| {
+                input.as_ref().is_some_and(|input| {
+                    input.slot == event.slot() && input.endpoint == event.endpoint()
+                })
+            }) else {
+                continue;
+            };
+            let Some(input) = self.inputs[index].as_ref() else {
+                continue;
+            };
+            // The event names the TRB it completed, which still holds the
+            // address of the slot the report went to.
+            let Some(buffer) = input.completed_buffer(event.parameter) else {
+                continue;
+            };
+            let completed = matches!(
+                event.completion(),
+                COMPLETION_SUCCESS | COMPLETION_SHORT_PACKET
+            );
+            let length =
+                (input.report_length.saturating_sub(event.residue()) as usize).min(REPORT_BYTES);
+            let mut bytes = [0; REPORT_BYTES];
+            if completed {
+                // SAFETY: the controller completed the transfer into this
+                // slot of the report page, which is queued again only below.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(buffer as *const u8, bytes.as_mut_ptr(), length)
+                };
+            }
+            let kind = input.kind;
+            self.queue_report(index, buffer);
+            if completed {
+                return Some(Report {
+                    input: index,
+                    kind,
+                    bytes,
+                    length,
+                });
+            }
         }
-        let index = self.keyboards.iter().position(|keyboard| {
-            keyboard
-                .as_ref()
-                .is_some_and(|keyboard| keyboard.slot == event.slot())
-        })?;
-        let keyboard = self.keyboards[index].as_ref()?;
-        let report = if matches!(
-            event.completion(),
-            COMPLETION_SUCCESS | COMPLETION_SHORT_PACKET
-        ) {
-            // SAFETY: the controller completed the transfer into the report page.
-            let page = unsafe { &*keyboard.report };
-            page.0[..8].try_into().ok()
-        } else {
-            None
-        };
-        self.queue_report(index);
-        report.map(|report| (index, report))
+        None
     }
 
     /// Halts the controller.
@@ -618,8 +776,9 @@ impl Controller {
         self.attach(Location::root(port), (status >> 10) & 0xf)
     }
 
-    /// Addresses the device at `location`, then configures it as a boot
-    /// keyboard or, for a hub, enumerates the devices behind it.
+    /// Addresses the device at `location`, then configures its input
+    /// interfaces or audio outputs or, for a hub, enumerates the devices
+    /// behind it.
     fn attach(&mut self, location: Location, speed: u32) -> Result<(), Error> {
         let pages = DevicePages {
             output: pool_pages(1).ok_or(Error::OutOfDmaMemory)?,
@@ -636,42 +795,27 @@ impl Controller {
             speed,
         };
         let identity = device.address(self)?;
-        say!(
-            "ginux:     port {}: device {:04x}:{:04x} at speed {}\n",
-            location,
-            identity.vendor,
-            identity.product,
-            speed
-        );
+        if self.verbose {
+            say!(
+                "ginux:     port {}: device {:04x}:{:04x} at speed {}\n",
+                location,
+                identity.vendor,
+                identity.product,
+                speed
+            );
+        }
         if identity.class == CLASS_HUB {
             return self.enumerate_hub(device, identity.protocol);
         }
-        let Some(index) = self.keyboards.iter().position(Option::is_none) else {
+        if device.configure_inputs(self, &identity)? != 0 {
             return Ok(());
-        };
-        let (slot, endpoint) = match device.configure_keyboard(self) {
-            Ok(configured) => configured,
-            Err(Error::NoKeyboard) if self.speakers.iter().any(Option::is_none) => {
-                if device.configure_speakers(self, &identity)? != 0 {
-                    return Ok(());
-                }
-                return Err(Error::NotBootKeyboard(identity.vendor, identity.product));
-            }
-            Err(Error::NoKeyboard) => {
-                return Err(Error::NotBootKeyboard(identity.vendor, identity.product))
-            }
-            Err(other) => return Err(other),
-        };
-        self.keyboards[index] = Some(Keyboard {
-            location,
-            vendor: identity.vendor,
-            product: identity.product,
-            slot,
-            endpoint,
-            interrupt: Ring::new(device.pages.interrupt),
-            report: device.pages.buffer,
-        });
-        Ok(())
+        }
+        if self.speakers.iter().any(Option::is_none)
+            && device.configure_speakers(self, &identity)? != 0
+        {
+            return Ok(());
+        }
+        Err(Error::NotInputDevice(identity.vendor, identity.product))
     }
 
     /// Configures `hub`, powers and resets each downstream port, and attaches
@@ -682,11 +826,13 @@ impl Controller {
             return Err(Error::HubTooDeep);
         }
         let ports = hub.configure_hub(self, protocol)?;
-        say!(
-            "ginux:     port {}: hub with {} ports\n",
-            hub.location,
-            ports
-        );
+        if self.verbose {
+            say!(
+                "ginux:     port {}: hub with {} ports\n",
+                hub.location,
+                ports
+            );
+        }
         for port in 1..=ports {
             match self.try_hub_port(&mut hub, port, protocol) {
                 Ok(()) | Err(Error::NotConnected) => {}
@@ -747,16 +893,18 @@ impl Controller {
         self.attach(location, speed)
     }
 
-    fn queue_report(&mut self, index: usize) {
-        let Some(keyboard) = self.keyboards[index].as_mut() else {
+    /// Queues a report transfer for input `index` into `buffer`, one of its
+    /// report slots.
+    fn queue_report(&mut self, index: usize, buffer: u64) {
+        let Some(input) = self.inputs.get_mut(index).and_then(Option::as_mut) else {
             return;
         };
-        keyboard.interrupt.push(
-            keyboard.report as u64,
-            8,
+        input.interrupt.push(
+            buffer,
+            input.report_length,
             TRB_NORMAL << 10 | TRB_INTERRUPT_ON_COMPLETION,
         );
-        let (slot, endpoint) = (keyboard.slot, keyboard.endpoint);
+        let (slot, endpoint) = (input.slot, input.endpoint);
         self.ring(slot, endpoint);
     }
 
@@ -923,37 +1071,63 @@ impl Device {
         Ok(total)
     }
 
-    /// Selects the boot keyboard interface, configures its interrupt-IN
-    /// endpoint, and returns the slot and endpoint context index.
-    fn configure_keyboard(&mut self, controller: &mut Controller) -> Result<(u32, u32), Error> {
-        let total = self.read_configuration(controller)?;
+    /// Configures the device's HID boot keyboard, boot mouse and QEMU tablet
+    /// interfaces, as many as the controller has room for, each with its
+    /// own interrupt-IN transfer ring and report page. Returns how many were
+    /// added; none when the device has no such interface.
+    fn configure_inputs(
+        &mut self,
+        controller: &mut Controller,
+        identity: &Identity,
+    ) -> Result<usize, Error> {
+        let free = controller
+            .inputs
+            .iter()
+            .filter(|input| input.is_none())
+            .count();
+        if free == 0 {
+            return Ok(0);
+        }
+        let total = usize::from(self.read_configuration(controller)?);
         let descriptors = self.buffer();
         let configuration = descriptors[5];
-        let (mut interface, mut keyboard) = (None, None);
+        let mut found = [None; MAX_INPUTS];
+        let mut count = 0;
+        let mut interface = None;
         let mut offset = 0;
-        while offset + 2 <= usize::from(total) {
+        while offset + 2 <= total && count < free {
             let length = usize::from(descriptors[offset]);
-            if length < 2 || offset + length > usize::from(total) {
+            if length < 2 || offset + length > total {
                 break;
             }
-            match descriptors[offset + 1] {
-                4 => {
-                    let boot_keyboard = descriptors[offset + 5] == 3
-                        && descriptors[offset + 6] == 1
-                        && descriptors[offset + 7] == 1;
-                    interface = boot_keyboard.then_some(descriptors[offset + 2]);
+            let descriptor = &descriptors[offset..offset + length];
+            match descriptor {
+                // Only the default alternate setting of each interface.
+                [_, 4, number, 0, _, class, subclass, protocol, ..] => {
+                    interface = input_kind(identity, *class, *subclass, *protocol)
+                        .map(|kind| (kind, *number));
                 }
-                5 if interface.is_some() && keyboard.is_none() => {
-                    let endpoint = interrupt_in_endpoint(&descriptors[offset..offset + length]);
-                    keyboard = endpoint.map(|endpoint| (interface.unwrap_or(0), endpoint));
+                [_, 4, ..] => interface = None,
+                [_, 5, ..] => {
+                    if let (Some((kind, number)), Some(endpoint)) =
+                        (interface, interrupt_in_endpoint(descriptor))
+                    {
+                        found[count] = Some(InputInterface {
+                            kind,
+                            interface: number,
+                            endpoint,
+                        });
+                        count += 1;
+                        interface = None;
+                    }
                 }
                 _ => {}
             }
             offset += length;
         }
-        let Some((interface, (number, packet, interval))) = keyboard else {
-            return Err(Error::NoKeyboard);
-        };
+        if count == 0 {
+            return Ok(0);
+        }
 
         self.control_out(
             controller,
@@ -962,23 +1136,65 @@ impl Device {
             u16::from(configuration),
             0,
         )?;
-        self.control_out(
-            controller,
-            0x21,
-            REQUEST_HID_SET_PROTOCOL,
-            0,
-            u16::from(interface),
-        )?;
-        // SET_IDLE is optional; some keyboards stall it.
-        let _ = self.control_out(
-            controller,
-            0x21,
-            REQUEST_HID_SET_IDLE,
-            0,
-            u16::from(interface),
-        );
-        let endpoint = self.configure_interrupt_in(controller, number, packet, interval, None)?;
-        Ok((self.slot, endpoint))
+        let mut entries = 1;
+        let mut added = 0;
+        for found in found.iter().flatten() {
+            let Some(index) = controller.inputs.iter().position(Option::is_none) else {
+                break;
+            };
+            let interface = u16::from(found.interface);
+            if found.kind != InputKind::Tablet {
+                if let Err(error) = self.control_out(
+                    controller,
+                    0x21,
+                    REQUEST_HID_SET_PROTOCOL,
+                    HID_BOOT_PROTOCOL,
+                    interface,
+                ) {
+                    say!(
+                        "ginux:     port {}: interface {} refused the boot protocol: {:?}\n",
+                        self.location,
+                        interface,
+                        error
+                    );
+                    continue;
+                }
+            }
+            // SET_IDLE asks for reports only on change. It is optional; some
+            // devices stall it.
+            let _ = self.control_out(controller, 0x21, REQUEST_HID_SET_IDLE, 0, interface);
+            // The first interface uses the device's own pages; the transfer
+            // buffer is free once configuration is done.
+            let (ring, report) = if added == 0 {
+                (self.pages.interrupt, self.pages.buffer)
+            } else {
+                (
+                    pool_pages(1).ok_or(Error::OutOfDmaMemory)?,
+                    pool_pages(1).ok_or(Error::OutOfDmaMemory)?,
+                )
+            };
+            let (number, packet, interval) = found.endpoint;
+            let endpoint = self.configure_interrupt_in(
+                controller,
+                (number, packet, interval),
+                ring,
+                &mut entries,
+                None,
+            )?;
+            controller.inputs[index] = Some(Input {
+                location: self.location,
+                vendor: identity.vendor,
+                product: identity.product,
+                kind: found.kind,
+                slot: self.slot,
+                endpoint,
+                interrupt: Ring::new(ring),
+                report,
+                report_length: u32::from(packet.max(1)),
+            });
+            added += 1;
+        }
+        Ok(added)
     }
 
     /// Configures the playback outputs of a USB Audio Class 1 or 2 device:
@@ -1248,8 +1464,9 @@ impl Device {
             multi_translator: protocol == 2,
             think_time,
         };
-        let (number, packet, interval) = status_endpoint.unwrap_or((1, 2, 12));
-        self.configure_interrupt_in(controller, number, packet, interval, Some(hub_fields))?;
+        let status_endpoint = status_endpoint.unwrap_or((1, 2, 12));
+        let ring = self.pages.interrupt;
+        self.configure_interrupt_in(controller, status_endpoint, ring, &mut 1, Some(hub_fields))?;
         for port in 1..=ports {
             self.control_out(
                 controller,
@@ -1273,17 +1490,20 @@ impl Device {
         ]))
     }
 
-    /// Adds interrupt-IN endpoint `number` and, for a hub, the hub fields of
-    /// the slot context. Returns the endpoint context index.
+    /// Adds the interrupt-IN endpoint `(number, packet, interval)` with its
+    /// transfer ring in `ring` and, for a hub, the hub fields of the slot
+    /// context. `entries` is the highest endpoint context in use, which the
+    /// slot context must cover. Returns the endpoint context index.
     fn configure_interrupt_in(
         &mut self,
         controller: &mut Controller,
-        number: u8,
-        packet: u16,
-        interval: u8,
+        (number, packet, interval): (u8, u16, u8),
+        ring: *mut DmaPage,
+        entries: &mut u32,
         hub: Option<HubFields>,
     ) -> Result<u32, Error> {
         let endpoint = u32::from(number) * 2 + 1;
+        *entries = (*entries).max(endpoint);
         let exponent = match self.speed {
             SPEED_LOW | SPEED_FULL => {
                 // Frames of 1 ms, expressed as 2^n microframes of 125 us.
@@ -1292,10 +1512,10 @@ impl Device {
             }
             _ => u32::from(interval.clamp(1, 16)) - 1,
         };
-        let ring = self.pages.interrupt as u64 | 1;
+        let ring = ring as u64 | 1;
         self.clear_input();
         self.input(controller, 0, 1, 1 | 1 << endpoint);
-        self.slot_context(controller, endpoint, hub);
+        self.slot_context(controller, *entries, hub);
         let context = 1 + endpoint as usize;
         self.input(controller, context, 0, exponent << 16);
         self.input(
@@ -1514,6 +1734,19 @@ struct HubFields {
     ports: u32,
     multi_translator: bool,
     think_time: u32,
+}
+
+/// What an interface of the device `identity` with this class, subclass and
+/// protocol reports, if the driver handles it.
+fn input_kind(identity: &Identity, class: u8, subclass: u8, protocol: u8) -> Option<InputKind> {
+    match (class, subclass, protocol) {
+        (CLASS_HID, HID_SUBCLASS_BOOT, HID_PROTOCOL_KEYBOARD) => Some(InputKind::Keyboard),
+        (CLASS_HID, HID_SUBCLASS_BOOT, HID_PROTOCOL_MOUSE) => Some(InputKind::Mouse),
+        (CLASS_HID, 0, _) if (identity.vendor, identity.product) == QEMU_HID => {
+            Some(InputKind::Tablet)
+        }
+        _ => None,
+    }
 }
 
 /// Parses an endpoint descriptor and returns the number, maximum packet size

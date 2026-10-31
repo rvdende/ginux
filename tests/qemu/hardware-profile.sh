@@ -182,7 +182,7 @@ for expected in \
     'MiB Ginux volume "ginux-volume"' \
     'QEMU HARDDISK (serial GINUXSATA01), 131072 sectors of 512 bytes (64 MiB)' \
     'MiB Linux filesystem "sata-data"' \
-    'NotBootKeyboard(' \
+    'tablet 0627:0001 on port' \
     'by firmware, status' \
     'Intel 82574, MAC 52:54:00:12:34:56, link up' \
     'DHCP offer 10.0.2.15 from 10.0.2.2' \
