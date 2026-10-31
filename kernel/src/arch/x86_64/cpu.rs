@@ -44454,7 +44454,7 @@ extern "sysv64" fn user_fault_handler(frame: *mut UserFaultFrame) -> u64 {
             let runtime_page = address_space::current_linux_runtime_page(page);
             let process_mapping =
                 linux_process::live_process_mapping(current_linux_process_pid(), page as usize);
-            serial_write("ginux: Linux fault pid/page/stack-low/stack-top/brk-limit/occupied/frame/file/protection/registry-frame: ");
+            serial_write("ginux: Linux fault pid/page/stack-low/stack-top/brk-limit/occupied/frame/file/protection/registry-frame/cow-frame: ");
             for value in [
                 u64::from(current_linux_process_pid()),
                 page,
@@ -44466,6 +44466,7 @@ extern "sysv64" fn user_fault_handler(frame: *mut UserFaultFrame) -> u64 {
                 u64::from(runtime_page.file),
                 u64::from(runtime_page.protection),
                 process_mapping.map_or(0, |mapping| mapping.frame.address()),
+                address_space::current_linux_cow_page(page).map_or(0, |frame| frame.address()),
             ] {
                 serial_write_u64(value);
                 serial_write(" ");
@@ -44590,6 +44591,9 @@ extern "sysv64" fn user_fault_handler(frame: *mut UserFaultFrame) -> u64 {
         write_linux_runtime_syscall_trace();
         if deliver_linux_sigsegv(frame, fault_metadata) {
             return 0;
+        }
+        if terminate_linux_process_for_fault(fault_metadata) {
+            return u64::MAX;
         }
         abort_linux_signal();
         X86_RUNTIME.ELF_PROBE_ACTIVE.store(false, Ordering::SeqCst);

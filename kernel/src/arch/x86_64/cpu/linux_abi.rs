@@ -86,6 +86,9 @@ pub(super) const LINUX_CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
 pub(super) const LINUX_CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
 pub(super) const LINUX_SIGCHLD: u64 = 17;
 pub(super) const LINUX_SIGILL: u64 = 4;
+pub(super) const LINUX_SIGTRAP: u64 = 5;
+pub(super) const LINUX_SIGBUS: u64 = 7;
+pub(super) const LINUX_SIGFPE: u64 = 8;
 pub(super) const LINUX_SIGKILL: u64 = 9;
 pub(super) const LINUX_BOUNDED_THREAD_CLONE_FLAGS: u64 = LINUX_CLONE_VM
     | LINUX_CLONE_FS

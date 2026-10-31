@@ -2350,6 +2350,28 @@ pub(super) fn linux_deliver_pending_signal(
     result
 }
 
+/// The signal Linux sends for a user-mode CPU exception, by vector.
+pub(super) const fn linux_fault_signal(vector: u64) -> u64 {
+    match vector {
+        0 | 16 | 19 => LINUX_SIGFPE,
+        1 | 3 => LINUX_SIGTRAP,
+        6 => LINUX_SIGILL,
+        17 => LINUX_SIGBUS,
+        _ => LINUX_SIGSEGV,
+    }
+}
+
+/// Kills the faulting process, not its domain, when a user fault in a
+/// process other than init cannot be delivered to a handler: Linux's
+/// default action for a forced fault signal.
+pub(super) fn terminate_linux_process_for_fault(fault: domain::FaultMetadata) -> bool {
+    if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) || current_linux_process_pid() == 1 {
+        return false;
+    }
+    abort_linux_signal();
+    linux_terminate_by_default_signal(linux_fault_signal(fault.vector)) == LINUX_RETURN_TO_KERNEL
+}
+
 pub(super) fn deliver_linux_sigsegv(
     frame: &mut UserFaultFrame,
     fault: domain::FaultMetadata,

@@ -12,11 +12,17 @@ QEMU, and reports one machine-parseable line per test plus failure clusters.
 |---|---|---|---|---|---|---|---|---|
 | `d1f41667` | baseline (below) | 1362 | 41 | 39 | 1181 | 75 | 11 | 9 |
 | `62dce194` | `/proc/PID/oom_score_adj` kept per process | 1362 | 1043 | 38 | 130 | 76 | 52 | 17 |
+| `de94acb9` | fork EAGAIN, orphan reparenting, EINTR waits, edge-triggered epoll, timer preemption, killed-by-signal status | 1362 | 1045 | 39 | 169 | 76 | 15 | 12 |
 
-Later fixes, measured on the clone/fork/kill/wait slice only so far: fork
-fails with EAGAIN instead of failing the domain (`3cdb1dcd`); orphans are
-reparented to init and signals interrupt waits (`991be9d2`). Results of a
-full run are kept in `target/ltp-baseline/` (not committed).
+A crash takes the whole domain down, so the run reboots for the next test:
+the `de94acb9` run needed 23 boots against 68 before. Its remaining crashes
+are access04, fchownat03, madvise10, madvise11, mq_open01, move_mount03,
+munmap01, readv01, sendmmsg01, shmat01, statmount03 and waitid05 to
+waitid08; its hangs are bind04 (flaky), epoll_wait01, epoll_wait12,
+io_setup02, pipeio_1/2/5/7, prot_hsymlinks, recvmmsg01, select04 and
+semctl01. Most hangs are a test looping on a value Ginux reports wrongly,
+not a scheduling stall. Results of a full run are kept in
+`target/ltp-baseline/` (not committed).
 
 ## Baseline (2026-10-31)
 

@@ -4285,6 +4285,11 @@ pub(crate) fn complete_current_linux_process_snapshot(
                 if value & device == device {
                     continue;
                 }
+                crate::serial_write_bytes(b"ginux: snapshot page without a frame address/entry: ");
+                crate::serial_write_u64(address);
+                crate::serial_write_bytes(b" ");
+                crate::serial_write_u64(value);
+                crate::serial_write_bytes(b"\r\n");
                 return false;
             };
             let Some(slot) = mappings.get_mut(*mapping_count) else {
