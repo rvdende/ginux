@@ -73,19 +73,21 @@ dd if=/dev/zero of="$volume_image" bs=1048576 count=1 2>/dev/null
     sleep 5
     printf '%s\n' \
         "export PATH=$toolchain:\$PATH CARGO_HOME=/tmp/cargo; cd /tmp" \
-        "for p in memstress threadstress mmapstress iostress metastress; do $fetch/\$p.rs -O \$p.rs && rustc --edition 2021 -O \$p.rs -o \$p || echo BUILD_FAILED \$p; done; echo SOURCES\"_BUILT\""
+        "for p in memstress threadstress mmapstress iostress metastress preempt; do $fetch/\$p.rs -O \$p.rs && rustc --edition 2021 -O \$p.rs -o \$p || echo BUILD_FAILED \$p; done; echo SOURCES\"_BUILT\""
     wait_for 'SOURCES_BUILT' 900
     printf '%s\n' \
         "./memstress 8 20000 && echo MEMSTRESS\"_OK\"" \
         "./threadstress 200 && echo THREADSTRESS\"_OK\"" \
         "./mmapstress 20000 && echo MMAPSTRESS\"_OK\"" \
         "./iostress 4 300 /tmp/io && echo IOSTRESS\"_OK\"" \
-        "./metastress 300000 && echo METASTRESS\"_OK\""
+        "./metastress 300000 && echo METASTRESS\"_OK\"" \
+        "./preempt && echo PREEMPT\"_OK\""
     wait_for 'MEMSTRESS_OK' 600
     wait_for 'THREADSTRESS_OK' 600
     wait_for 'MMAPSTRESS_OK' 600
     wait_for 'IOSTRESS_OK' 900
     wait_for 'METASTRESS_OK' 600
+    wait_for 'PREEMPT_OK' 120
     printf '%s\n' \
         "cargo new --vcs none --offline sd >/dev/null 2>&1; cd sd" \
         "printf 'serde = { version = \"1\", features = [\"derive\"] }\\n' >> Cargo.toml" \
@@ -114,7 +116,7 @@ fi
 wait "$qemu_pid" || true
 qemu_pid=""
 
-for marker in MEMSTRESS_OK THREADSTRESS_OK MMAPSTRESS_OK IOSTRESS_OK METASTRESS_OK SERDE_DERIVE_OK; do
+for marker in MEMSTRESS_OK THREADSTRESS_OK MMAPSTRESS_OK IOSTRESS_OK METASTRESS_OK PREEMPT_OK SERDE_DERIVE_OK; do
     if ! grep -Eq "^${marker}" "$output_file"; then
         tail -n 80 "$output_file"
         echo "Rust workload test failed: missing ${marker}." >&2

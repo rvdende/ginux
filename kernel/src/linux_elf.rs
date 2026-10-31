@@ -921,6 +921,19 @@ pub(crate) fn vdso_image() -> &'static [u8] {
     LINUX_VDSO
 }
 
+/// The bytes of the vDSO's preemption entry (`__ginux_preempt` in
+/// linux-vdso.S): `mov eax, 0x4750; syscall; ud2`.
+const VDSO_PREEMPT_ENTRY: [u8; 9] = [0xb8, 0x50, 0x47, 0x00, 0x00, 0x0f, 0x05, 0x0f, 0x0b];
+
+/// The user address of the vDSO's preemption entry. The vDSO image is copied
+/// into its page as it is, so its file offsets are its address offsets.
+pub(crate) fn vdso_preempt_entry() -> Option<u64> {
+    let offset = LINUX_VDSO
+        .windows(VDSO_PREEMPT_ENTRY.len())
+        .position(|window| window == VDSO_PREEMPT_ENTRY)?;
+    VDSO_ADDRESS.checked_add(u64::try_from(offset).ok()?)
+}
+
 pub(crate) fn parse(bytes: &[u8]) -> Option<Image<'_>> {
     if bytes.len() < ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE * MIN_LOAD_SEGMENT_COUNT
         || bytes.get(0..4)? != b"\x7fELF"

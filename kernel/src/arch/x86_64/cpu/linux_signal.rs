@@ -999,6 +999,9 @@ pub(crate) fn expire_linux_waits_from_timer(frame: &mut UserInterruptFrame) {
         false
     };
     if descriptor_wakes == 0 && expired == 0 && !runtime_quantum {
+        // No thread of this process to switch to: other processes may need
+        // the CPU instead.
+        linux_preempt_process_from_timer(frame);
         return;
     }
     X86_RUNTIME
