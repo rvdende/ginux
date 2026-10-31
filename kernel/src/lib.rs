@@ -531,6 +531,28 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     // join the device window of the kernel page tables.
     let usb_hosts = drivers::usb_input::discover();
     let usb_regions = usb_hosts.regions();
+    // So is a virtio-gpu, which becomes the display; its registers follow
+    // the USB controllers' in the window when they fit.
+    let usb_count = usb_hosts.len();
+    let mut device_regions = [(0_u64, 0_usize); arch::x86_64::paging::MAX_DEVICE_REGIONS];
+    device_regions[..usb_count].copy_from_slice(&usb_regions[..usb_count]);
+    let gpu_probe = drivers::virtio_gpu::discover().filter(|probe| {
+        // The window is one page table: 512 pages.
+        let pages = |&(physical, length): &(u64, usize)| {
+            ((physical & 0xfff) as usize + length).div_ceil(PAGE_SIZE)
+        };
+        usb_count < device_regions.len()
+            && device_regions[..usb_count].iter().map(pages).sum::<usize>()
+                + pages(&probe.registers)
+                <= 512
+    });
+    let device_count = match gpu_probe {
+        Some(probe) => {
+            device_regions[usb_count] = probe.registers;
+            usb_count + 1
+        }
+        None => usb_count,
+    };
 
     // SAFETY: The entry trampoline disabled interrupts. The required live
     // addresses and the page-table objects are checked against the complete
@@ -550,7 +572,7 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
                 (virtio_network_notify_physical, virtio_network_notify_length),
                 (virtio_network_msix_physical, virtio_network_msix_length),
             ],
-            &usb_regions[..usb_hosts.len()],
+            &device_regions[..device_count],
             framebuffer::mapped_length(&boot_info.framebuffer)
                 .map(|length| (boot_info.framebuffer.base, length)),
         )
@@ -564,7 +586,7 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         network_notification: virtio_network_notify_mmio,
         network_msix: virtio_network_msix_mmio,
         framebuffer: framebuffer_window,
-        devices: usb_mappings,
+        devices: device_mappings,
     }) = result
     else {
         if let Err(error) = result {
@@ -3987,10 +4009,10 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
             kernel_fail("\r\nginux: persistent local configuration invalid\r\n");
         }
     }
-    let usb_registers: [Option<usize>; drivers::usb_input::MAX_CONTROLLERS] =
+    let device_registers: [Option<usize>; arch::x86_64::paging::MAX_DEVICE_REGIONS] =
         core::array::from_fn(|index| {
-            let (physical, length) = usb_regions[index];
-            usb_mappings
+            let (physical, length) = device_regions[index];
+            device_mappings
                 .get(index)
                 .copied()
                 .flatten()
@@ -4000,11 +4022,19 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
                 })
                 .and_then(|mapping| mapping.address(physical, length))
         });
-    // No DMA translation is active here, so the controllers can be admitted
-    // to every later one. A controller behind a bridge may be covered by a
-    // DMAR sub-hierarchy scope, which the platform summary does not record;
-    // an admission into a unit that does not translate it is inert.
-    drivers::usb_input::start(&usb_hosts, &usb_registers, |functions, regions| {
+    let usb_registers = &device_registers[..drivers::usb_input::MAX_CONTROLLERS];
+    // The virtio-gpu opens first, because the DMA it needs depends on the
+    // display mode the host reports; with translation still off, it can run
+    // its setup commands before it is admitted.
+    let mut gpu = gpu_probe
+        .zip(device_registers[usb_count])
+        .and_then(|(probe, registers)| {
+            // SAFETY: registers maps the probe's register span uncached in
+            // the device window (checked above) for the kernel's life, and
+            // no other driver touches the device.
+            unsafe { drivers::virtio_gpu::prepare(&probe, registers) }
+        });
+    let admit = |functions: &[(u8, u8, u8)], regions: &[(u64, u64)]| {
         arch::x86_64::iommu::admit_standing_devices(
             platform.first_iommu_register_base,
             iommu_mmio,
@@ -4012,7 +4042,26 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
             functions,
             regions,
         )
+    };
+    // No DMA translation is active here, so the controllers can be admitted
+    // to every later one. A controller behind a bridge may be covered by a
+    // DMAR sub-hierarchy scope, which the platform summary does not record;
+    // an admission into a unit that does not translate it is inert. The
+    // admission happens once, so the GPU joins the USB controllers'.
+    let mut usb_admission_requested = false;
+    drivers::usb_input::start(&usb_hosts, usb_registers, |functions, regions| {
+        usb_admission_requested = true;
+        match gpu.as_mut() {
+            Some(gpu) => gpu.admit_alongside(functions, regions, &admit),
+            None => admit(functions, regions),
+        }
     });
+    if let Some(mut gpu) = gpu {
+        if !usb_admission_requested {
+            gpu.admit_alone(&admit);
+        }
+        drivers::virtio_gpu::activate(gpu);
+    }
     HOST_CONTROL
         .operator_console_ready
         .store(true, Ordering::Release);

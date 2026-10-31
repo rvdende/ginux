@@ -68,6 +68,35 @@ if [[ "${GINUX_QEMU_USB_INPUT:-}" == "1" ]]; then
         -device "usb-tablet,bus=xhci.0"
     )
 fi
+# GINUX_QEMU_GPU selects the display adapter. Unset or "std" keeps QEMU's
+# standard VGA, whose firmware framebuffer is the display. "virtio" replaces
+# it with a virtio-gpu (virtio-gpu-pci, no VGA at all), which Ginux drives
+# as the display; "virtio-vga" is a virtio-gpu that also has a VGA
+# framebuffer for the firmware, which Ginux leaves for the virtio-gpu.
+# GINUX_QEMU_GPU_SIZE=WIDTHxHEIGHT sets the mode a virtio-gpu reports.
+gpu=()
+case "${GINUX_QEMU_GPU:-std}" in
+    std) ;;
+    virtio | virtio-vga)
+        gpu_device="virtio-gpu-pci"
+        if [[ "$GINUX_QEMU_GPU" == "virtio-vga" ]]; then
+            gpu_device="virtio-vga"
+        fi
+        gpu_device+=",disable-legacy=on,iommu_platform=on"
+        if [[ -n "${GINUX_QEMU_GPU_SIZE:-}" ]]; then
+            if [[ ! "$GINUX_QEMU_GPU_SIZE" =~ ^([0-9]+)x([0-9]+)$ ]]; then
+                echo "GINUX_QEMU_GPU_SIZE must be WIDTHxHEIGHT" >&2
+                exit 2
+            fi
+            gpu_device+=",xres=${BASH_REMATCH[1]},yres=${BASH_REMATCH[2]}"
+        fi
+        gpu=(-vga none -device "$gpu_device")
+        ;;
+    *)
+        echo "GINUX_QEMU_GPU must be std, virtio or virtio-vga" >&2
+        exit 2
+        ;;
+esac
 # GINUX_QEMU_DEBUG_LOG names a file for QEMU debug output selected by
 # GINUX_QEMU_DEBUG_FLAGS (default: int).
 qemu_debug=()
@@ -123,6 +152,7 @@ exec "$qemu" \
     ${qemu_debug[@]+"${qemu_debug[@]}"} \
     -device "virtio-net-pci,netdev=ginux-net,disable-legacy=on,iommu_platform=on,mac=52:54:00:12:34:56,addr=0x3" \
     ${usb_input[@]+"${usb_input[@]}"} \
+    ${gpu[@]+"${gpu[@]}"} \
     -drive "if=none,id=ginux-volume,format=raw,file=$volume_image" \
     -drive "if=pflash,format=raw,readonly=on,file=$ovmf_code" \
     -drive "if=pflash,format=raw,file=$ovmf_vars" \

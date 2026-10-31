@@ -5,9 +5,14 @@
 //! buffers, and access registers through the identity map, so they work both
 //! in hardware bring-up mode (on the firmware page tables) and later from the
 //! main kernel.
+//!
+//! The virtio drivers (`virtio`, `virtio_gpu`) run only in the main kernel:
+//! they reach registers through the kernel's device window and take DMA
+//! memory from the frame allocator, behind the handles in `device_memory`.
 
 pub(crate) mod ahci;
 pub(crate) mod amd_iommu;
+pub(crate) mod device_memory;
 pub(crate) mod e1000e;
 pub(crate) mod gpt;
 pub(crate) mod hda;
@@ -17,6 +22,8 @@ pub(crate) mod nvme;
 pub(crate) mod pci;
 pub(crate) mod realtek;
 pub(crate) mod usb_input;
+pub(crate) mod virtio;
+pub(crate) mod virtio_gpu;
 pub(crate) mod xhci;
 
 use core::fmt::Write;

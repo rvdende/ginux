@@ -757,6 +757,8 @@ extern "sysv64" fn timer_interrupt_handler(frame: *mut UserInterruptFrame) {
         return;
     }
     if TIMER.linux_wait_armed.load(Ordering::SeqCst) {
+        // A virtio-gpu display flushes what domains draw on this tick.
+        crate::framebuffer::refresh();
         if let Some(frame) = unsafe { frame.as_mut() } {
             cpu::expire_linux_waits_from_timer(frame);
         }
