@@ -465,7 +465,7 @@ fn run_command(boot_info: &BootInfo, usb: &mut UsbKeyboards, line: &[u8]) {
     match command {
         "" => {}
         "help" => say!(
-            "Commands: help, pci, acpi, mem, disks, net, beep, clear, echo TEXT, reboot, poweroff\n"
+            "Commands: help, pci, acpi, mem, disks, disktest, net, beep, clear, echo TEXT, reboot, poweroff\n"
         ),
         "beep" => {
             play_test_tones();
@@ -497,6 +497,7 @@ fn run_command(boot_info: &BootInfo, usb: &mut UsbKeyboards, line: &[u8]) {
         }
         "mem" => report_memory(boot_info),
         "disks" => report_disks(&mut [const { None }; MAX_IOMMUS]),
+        "disktest" => test_disk_writes(),
         "clear" => say!("\x1b[2J\x1b[H"),
         "echo" => say!("{}\n", argument),
         "reboot" => reset(boot_info, EFI_RESET_COLD),
@@ -815,6 +816,91 @@ unsafe fn report_mcfg(table: u64) {
 
 unsafe fn read_bytes<const N: usize>(address: u64) -> [u8; N] {
     read_unaligned(address as *const [u8; N])
+}
+
+/// Checks NVMe writes on every Ginux volume partition without changing it:
+/// saves the partition's last block, writes a pattern, reads it back,
+/// restores the block and reads that back, and checks that a write one block
+/// past the partition is refused. Disks without such a partition are not
+/// written at all.
+fn test_disk_writes() {
+    let (controllers, _) = functions(pci::Identity::is_nvme);
+    for function in controllers.iter().flatten() {
+        // SAFETY: bring-up mode is the only user of this controller, and the
+        // firmware identity map covers its registers and the static DMA pages.
+        let mut controller = match unsafe { nvme::Controller::open(*function) } {
+            Ok((controller, _)) => controller,
+            Err(error) => {
+                say!(
+                    "ginux: NVMe {:02x}:{:02x}.{}: {:?}\n",
+                    function.bus,
+                    function.device,
+                    function.function,
+                    error
+                );
+                continue;
+            }
+        };
+        let extents = gpt::writable_extents(&mut controller);
+        if extents.iter().all(Option::is_none) {
+            say!(
+                "ginux: NVMe {:02x}:{:02x}.{}: no Ginux volume partition; nothing written\n",
+                function.bus,
+                function.device,
+                function.function
+            );
+        }
+        for extent in extents.iter().flatten() {
+            say!(
+                "ginux: NVMe {:02x}:{:02x}.{}: Ginux volume blocks {}-{}: {}\n",
+                function.bus,
+                function.device,
+                function.function,
+                extent.first_lba(),
+                extent.last_lba(),
+                check_extent_writes(&mut controller, extent)
+            );
+        }
+    }
+}
+
+fn check_extent_writes(
+    controller: &mut nvme::Controller,
+    extent: &gpt::WritableExtent,
+) -> &'static str {
+    let block = extent.last_lba();
+    let size = controller.block_size as usize;
+    if size > 4096 {
+        return "block size unsupported";
+    }
+    let mut original = [0_u8; 4096];
+    let mut pattern = [0_u8; 4096];
+    match controller.read(block, 1) {
+        Ok(data) => original[..size].copy_from_slice(data),
+        Err(_) => return "reading the block failed",
+    }
+    for (index, byte) in pattern[..size].iter_mut().enumerate() {
+        *byte = (index as u8) ^ 0x5a;
+    }
+    pattern[..8].copy_from_slice(b"GINUXWR1");
+    if controller.write(extent, block, &pattern[..size]).is_err()
+        || controller.read(block, 1).ok() != Some(&pattern[..size])
+    {
+        let _ = controller.write(extent, block, &original[..size]);
+        return "write or read-back failed";
+    }
+    if controller.write(extent, block, &original[..size]).is_err()
+        || controller.read(block, 1).ok() != Some(&original[..size])
+    {
+        return "restoring the block failed";
+    }
+    if controller
+        .write(extent, block + 1, &pattern[..size])
+        .is_ok()
+    {
+        return "a write past the partition was accepted";
+    }
+    "write verified, restored, and bounded"
 }
 
 fn probe_nvme(function: pci::Function, remapping: &mut Remapping) {

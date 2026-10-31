@@ -1,6 +1,14 @@
-//! GUID partition table parsing.
+//! GUID partition table parsing, and the only route to writing a disk.
+//!
+//! A [`WritableExtent`] names the blocks of one partition of the Ginux volume
+//! type, and drivers write only inside one. It can be made only from a table
+//! whose header and entry array both pass their CRCs, for a partition that
+//! lies in the disk's usable area and overlaps no other, so Ginux cannot
+//! write to another operating system's data on a shared disk.
 
 use core::fmt;
+
+use super::BlockDevice;
 
 pub(crate) const HEADER_LBA: u64 = 1;
 const SIGNATURE: &[u8; 8] = b"EFI PART";
@@ -10,7 +18,7 @@ const NAME_OFFSET: usize = 56;
 const NAME_UNITS: usize = 36;
 
 /// A GUID in its on-disk (mixed-endian) byte order.
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Guid(pub(crate) [u8; 16]);
 
 impl Guid {
@@ -141,6 +149,9 @@ pub(crate) struct Header {
     pub(crate) entry_count: u32,
     pub(crate) entry_size: u32,
     pub(crate) disk: Guid,
+    first_usable_lba: u64,
+    last_usable_lba: u64,
+    entries_crc: u32,
 }
 
 /// Validates the signature, size, and CRC32 of a GPT header block.
@@ -169,6 +180,9 @@ pub(crate) fn parse_header(block: &[u8]) -> Option<Header> {
         entry_count: read_u32(block, 80)?,
         entry_size,
         disk: Guid(block.get(56..72)?.try_into().ok()?),
+        first_usable_lba: read_u64(block, 40)?,
+        last_usable_lba: read_u64(block, 48)?,
+        entries_crc: read_u32(block, 88)?,
     })
 }
 
@@ -214,7 +228,11 @@ pub(crate) fn parse_entry(entry: &[u8]) -> Option<Partition> {
 }
 
 fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = !0_u32;
+    !crc32_update(!0, bytes)
+}
+
+/// Feeds `bytes` into a CRC32 whose running (inverted) state is `crc`.
+fn crc32_update(mut crc: u32, bytes: &[u8]) -> u32 {
     for byte in bytes {
         crc ^= u32::from(*byte);
         for _ in 0..8 {
@@ -225,7 +243,114 @@ fn crc32(bytes: &[u8]) -> u32 {
             };
         }
     }
-    !crc
+    crc
+}
+
+/// The blocks of one partition of the Ginux volume type: the only blocks a
+/// Ginux driver writes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WritableExtent {
+    disk: Guid,
+    first_lba: u64,
+    last_lba: u64,
+}
+
+impl WritableExtent {
+    /// The GUID of the disk whose table defines this extent; a driver
+    /// checks it against the disk it writes.
+    pub(crate) fn disk(&self) -> Guid {
+        self.disk
+    }
+
+    pub(crate) fn first_lba(&self) -> u64 {
+        self.first_lba
+    }
+
+    pub(crate) fn last_lba(&self) -> u64 {
+        self.last_lba
+    }
+
+    /// Whether the `count` blocks starting at `block` lie inside the extent.
+    pub(crate) fn contains(&self, block: u64, count: u64) -> bool {
+        count != 0
+            && block >= self.first_lba
+            && block
+                .checked_add(count - 1)
+                .is_some_and(|end| end <= self.last_lba)
+    }
+}
+
+/// Ginux volume partitions found on one disk.
+pub(crate) const MAX_WRITABLE_EXTENTS: usize = 4;
+/// Partition entries examined; tables with more are not trusted for writes.
+const MAX_WRITE_CHECKED_ENTRIES: usize = 256;
+
+/// Finds the Ginux volume partitions on `disk`. Nothing is returned unless
+/// the header and the whole entry array pass their CRCs; a partition counts
+/// only if it lies inside the usable area and overlaps no other partition.
+pub(crate) fn writable_extents(
+    disk: &mut impl BlockDevice,
+) -> [Option<WritableExtent>; MAX_WRITABLE_EXTENTS] {
+    let mut found = [None; MAX_WRITABLE_EXTENTS];
+    let Some(header) = disk.read_blocks(HEADER_LBA, 1).and_then(parse_header) else {
+        return found;
+    };
+    let block_size = disk.block_size() as usize;
+    let entry_size = header.entry_size as usize;
+    let entry_count = header.entry_count as usize;
+    if entry_count > MAX_WRITE_CHECKED_ENTRIES
+        || entry_size > 4096
+        || block_size == 0
+        || !block_size.is_multiple_of(entry_size)
+    {
+        return found;
+    }
+    // Every used entry's extent and type, read once while checking the CRC.
+    let mut extents = [(Guid([0; 16]), 0_u64, 0_u64); MAX_WRITE_CHECKED_ENTRIES];
+    let mut used = 0;
+    let mut crc = !0_u32;
+    let entries_per_block = block_size / entry_size;
+    for block_index in 0..entry_count.div_ceil(entries_per_block) {
+        let Some(data) = disk.read_blocks(header.entries_lba + block_index as u64, 1) else {
+            return found;
+        };
+        let in_block = entries_per_block.min(entry_count - block_index * entries_per_block);
+        crc = crc32_update(crc, &data[..in_block * entry_size]);
+        for entry in data[..in_block * entry_size].chunks_exact(entry_size) {
+            if let Some(partition) = parse_entry(entry) {
+                extents[used] = (partition.kind, partition.first_lba, partition.last_lba);
+                used += 1;
+            }
+        }
+    }
+    if !crc != header.entries_crc {
+        return found;
+    }
+    let extents = &extents[..used];
+    let mut count = 0;
+    for (index, &(kind, first, last)) in extents.iter().enumerate() {
+        let alone = extents
+            .iter()
+            .enumerate()
+            .all(|(other, &(_, other_first, other_last))| {
+                other == index || last < other_first || first > other_last
+            });
+        if kind == GINUX_VOLUME
+            && first <= last
+            && first >= header.first_usable_lba
+            && last <= header.last_usable_lba
+            && alone
+            && count < MAX_WRITABLE_EXTENTS
+        {
+            found[count] = Some(WritableExtent {
+                disk: header.disk,
+                first_lba: first,
+                last_lba: last,
+            });
+            count += 1;
+        }
+    }
+    found
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {

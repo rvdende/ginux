@@ -127,6 +127,7 @@ monitor_command() {
     printf '%s\n' "$1" | socat - "UNIX-CONNECT:$work_dir/serial.monitor" >/dev/null
 }
 
+disk_before=$(sha256sum "$disk" | cut -d' ' -f1)
 boot_profile serial "file:$work_dir/serial.log"
 for _ in $(seq 1 "$timeout_seconds"); do
     grep -aq 'bring-up> ' "$work_dir/serial.log" && break
@@ -150,6 +151,15 @@ for key in b e e p ret; do
 done
 for _ in $(seq 1 15); do
     grep -aq 'played a 440 Hz tone' "$work_dir/serial.log" && break
+    sleep 1
+done
+# Write, read back and restore a block of the Ginux volume partition.
+for key in d i s k t e s t ret; do
+    monitor_command "sendkey $key"
+    sleep 0.2
+done
+for _ in $(seq 1 15); do
+    grep -aq 'Ginux volume blocks' "$work_dir/serial.log" && break
     sleep 1
 done
 screenshot serial >/dev/null
@@ -189,7 +199,9 @@ for expected in \
     'bring-up> beep' \
     'codec 0 played a 440 Hz tone' \
     'USB speaker 46f4:0002 on port' \
-    'USB speaker 46f4:0002 played a 500 Hz tone (1000 packets)'; do
+    'USB speaker 46f4:0002 played a 500 Hz tone (1000 packets)' \
+    'bring-up> disktest' \
+    ': write verified, restored, and bounded'; do
     if ! grep -Fq "$expected" "$output_dir/serial.log"; then
         echo "missing: $expected" >&2
         failed=1
@@ -225,6 +237,11 @@ fi
 keyboards=$(grep -c 'keyboard 0627:0001 on port' "$output_dir/serial.log" || true)
 if ((keyboards != 2)); then
     echo "expected keyboards on both xHCI controllers, found $keyboards" >&2
+    failed=1
+fi
+# The write test restores what it wrote, so the disk must be unchanged.
+if [[ "$(sha256sum "$disk" | cut -d' ' -f1)" != "$disk_before" ]]; then
+    echo "the NVMe disk changed during the write test" >&2
     failed=1
 fi
 if ((failed)); then

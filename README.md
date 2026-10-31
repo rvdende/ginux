@@ -253,7 +253,11 @@ every PCI device, and runs the physical-hardware drivers in `kernel/src/drivers`
   buffers, display controllers keep untranslated access for the firmware
   framebuffer, and every other device is blocked. A self-test asks the NVMe
   controller to write outside its buffers and checks that the write is stopped.
-- Read-only NVMe and AHCI (SATA) drivers that list GPT partitions.
+- NVMe and AHCI (SATA) drivers that list GPT partitions. The NVMe driver
+  writes only inside partitions of the Ginux volume type
+  (`80769f29-5413-45a3-abab-5b44b6125922`), and only on the disk whose
+  partition table defines them; the table's header and entry array must pass
+  their CRCs and the partition may overlap no other. AHCI is read-only.
 - An xHCI driver that runs USB boot keyboards on every controller, including
   keyboards behind USB hubs (up to five tiers, with transaction translators
   for low- and full-speed devices behind high-speed hubs), and plays the
@@ -271,13 +275,15 @@ every PCI device, and runs the physical-hardware drivers in `kernel/src/drivers`
   follows Linux's r8169 register layout and has not run on hardware yet.
 
 With a keyboard or serial port it then offers a small bring-up shell (`help`,
-`pci`, `acpi`, `mem`, `disks`, `net`, `beep`, `reboot`, `poweroff`). Nothing in bring-up
-mode writes to storage. `make test-hardware-profile` boots a QEMU machine with an
+`pci`, `acpi`, `mem`, `disks`, `disktest`, `net`, `beep`, `reboot`, `poweroff`). Only
+`disktest` writes to storage: on each Ginux volume partition it writes a block,
+reads it back, restores it, and checks that a write past the partition is
+refused; disks without one are not written. `make test-hardware-profile` boots a QEMU machine with an
 AMD IOMMU, an e1000e on a DHCP network, an HD Audio codec, a USB audio device,
 NVMe, AHCI, two xHCI controllers (one keyboard behind a hub), and a SATA disk
 without virtio, types a command on an
 emulated USB keyboard, records the test tones from HD Audio and USB audio through QEMU's WAV output,
-and
+runs `disktest` on the NVMe disk and checks the disk image is unchanged afterwards, and
 checks the framebuffer console with no serial port.
 
 Bringing up a specific machine starts with `sudo tools/hardware/probe.sh`, run

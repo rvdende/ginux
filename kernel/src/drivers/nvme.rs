@@ -1,12 +1,13 @@
-//! Read-only polling NVMe driver.
+//! Polling NVMe driver.
 //!
-//! This driver issues only Identify and Read commands. It never writes to the
-//! medium, so it is safe to run against a disk that holds another operating
-//! system. It uses one admin queue pair and one I/O queue pair without
-//! interrupts.
+//! This driver reads anywhere but writes only inside a Ginux volume
+//! partition, given as a [`WritableExtent`] for the same disk, so it is safe
+//! to run against a disk that holds another operating system. It uses one
+//! admin queue pair and one I/O queue pair without interrupts.
 
 use core::ptr::{addr_of, addr_of_mut};
 
+use super::gpt::{self, WritableExtent};
 use super::pci::Function;
 use super::{wait_until, BlockDevice, DmaPage, DmaRegion};
 
@@ -28,6 +29,8 @@ const OPCODE_CREATE_IO_SUBMISSION_QUEUE: u8 = 0x01;
 const OPCODE_CREATE_IO_COMPLETION_QUEUE: u8 = 0x05;
 const OPCODE_IDENTIFY: u8 = 0x06;
 const OPCODE_READ: u8 = 0x02;
+const OPCODE_WRITE: u8 = 0x01;
+const OPCODE_FLUSH: u8 = 0x00;
 const IDENTIFY_NAMESPACE: u32 = 0x00;
 const IDENTIFY_CONTROLLER: u32 = 0x01;
 const IDENTIFY_ACTIVE_NAMESPACES: u32 = 0x02;
@@ -53,6 +56,8 @@ pub(crate) enum Error {
     NoNamespace,
     UnsupportedBlockSize(u32),
     OutOfRange,
+    /// The extent belongs to another disk's partition table.
+    WrongDisk,
 }
 
 struct Queue {
@@ -190,6 +195,49 @@ impl Controller {
         // SAFETY: the controller finished writing the page before completing.
         let page = unsafe { &*addr_of!(DATA) };
         Ok(&page.0[..bytes as usize])
+    }
+
+    /// Writes `data`, whole blocks and at most one page, starting at `block`,
+    /// then flushes the controller's write cache. Every block must lie inside
+    /// `extent`, and the extent must come from this disk's partition table.
+    pub(crate) fn write(
+        &mut self,
+        extent: &WritableExtent,
+        block: u64,
+        data: &[u8],
+    ) -> Result<(), Error> {
+        let block_size = self.block_size as usize;
+        if data.is_empty() || data.len() > 4096 || !data.len().is_multiple_of(block_size) {
+            return Err(Error::OutOfRange);
+        }
+        let count = (data.len() / block_size) as u32;
+        if !extent.contains(block, u64::from(count))
+            || block
+                .checked_add(u64::from(count))
+                .is_none_or(|end| end > self.block_count)
+        {
+            return Err(Error::OutOfRange);
+        }
+        let header = self.read(gpt::HEADER_LBA, 1).map(gpt::parse_header)?;
+        if header.is_none_or(|header| header.disk != extent.disk()) {
+            return Err(Error::WrongDisk);
+        }
+        // SAFETY: no transfer is using the data page while it is filled.
+        unsafe {
+            let page = &mut *addr_of_mut!(DATA);
+            page.0[..data.len()].copy_from_slice(data);
+        }
+        let mut command = [0_u32; 16];
+        command[1] = self.namespace;
+        command[6] = data_address() as u32;
+        command[7] = (data_address() >> 32) as u32;
+        command[10] = block as u32;
+        command[11] = (block >> 32) as u32;
+        command[12] = count - 1;
+        self.submit(false, OPCODE_WRITE, command)?;
+        let mut flush = [0_u32; 16];
+        flush[1] = self.namespace;
+        self.submit(false, OPCODE_FLUSH, flush)
     }
 
     /// Asks the controller to read `block` into the page at physical
