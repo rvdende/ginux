@@ -39,8 +39,11 @@ through a Linux ABI personality. It is not a rewrite of Linux:
    another, on any CPU, as Linux does.
 3. **A real task and memory model:** per-process memory-area tracking (VMAs),
    a shared page cache, and dynamically sized tables in place of the fixed
-   arrays (32 threads, 16 processes, 64 sockets per domain). Move large
-   structures off the kernel stack.
+   arrays (32 threads and 64 sockets per domain; the process table already
+   grows on demand). Pages have a map count in the frame allocator
+   (`memory::share_frames`): every address space that maps another's frame
+   takes a count, and releasing drops one. Move large structures off the
+   kernel stack.
 4. **Compatibility driven by the Linux Test Project (LTP)** rather than by
    finding bugs one program at a time: `just test-ltp` (docs/LTP.md has the
    baseline and failure clusters).

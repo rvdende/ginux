@@ -1,7 +1,7 @@
 //! Physical frame allocator.
 //!
 //! Every page of usable RAM has an 8-byte metadata word (generation, owner
-//! slot, and a live flag) and a bit in a free bitmap. Both tables are sized to
+//! slot, a live flag and a sharer count) and a bit in a free bitmap. Both tables are sized to
 //! the installed memory and carved from it at boot, so lookups are O(1) and no
 //! compile-time table limits how much memory can be in use.
 //!
@@ -25,6 +25,14 @@ const DOMAIN_FRAME_LIMIT: usize = 192;
 const OWNER_SLOTS: usize = 255;
 const META_OWNER: u64 = 0xff;
 const META_LIVE: u64 = 1 << 8;
+/// How many address spaces besides the first map a frame. Fork shares a
+/// private page copy-on-write instead of copying it; releasing a shared frame
+/// drops one mapping instead of freeing the page, so a page is freed only
+/// when its last mapping goes, as Linux's page map count does.
+const META_SHARERS_SHIFT: u32 = 9;
+const META_SHARER: u64 = 1 << META_SHARERS_SHIFT;
+const META_SHARERS_MAX: u64 = (1 << 23) - 1;
+const META_SHARERS: u64 = META_SHARERS_MAX << META_SHARERS_SHIFT;
 const META_GENERATION_SHIFT: u32 = 32;
 
 struct PhysicalMemoryOwner {
@@ -452,12 +460,42 @@ impl FrameAllocator {
             })
     }
 
+    fn sharers(&self, index: usize) -> u64 {
+        (self.metadata(index) & META_SHARERS) >> META_SHARERS_SHIFT
+    }
+
+    /// Whether another address space also maps the live `frame`.
+    fn is_shared(&self, frame: FrameLease) -> bool {
+        self.lease_matches(frame, None)
+            && self
+                .index(frame.address)
+                .is_some_and(|index| self.sharers(index) != 0)
+    }
+
+    /// Records one more mapping of each of `frames`, all or none.
+    fn share_slice(&mut self, owner: FrameOwner, frames: &[FrameLease]) -> bool {
+        if !self.can_release(owner, frames)
+            || frames.iter().any(|frame| {
+                self.index(frame.address)
+                    .is_none_or(|index| self.sharers(index) == META_SHARERS_MAX)
+            })
+        {
+            return false;
+        }
+        for frame in frames {
+            if let Some(index) = self.index(frame.address) {
+                self.set_metadata(index, self.metadata(index) + META_SHARER);
+            }
+        }
+        true
+    }
+
     /// Ends a live frame's lease. A frame whose generation is exhausted is
     /// never handed out again.
     fn retire(&mut self, index: usize) {
         let metadata = self.metadata(index);
         let slot = (metadata & META_OWNER) as usize;
-        self.set_metadata(index, metadata & !(META_LIVE | META_OWNER));
+        self.set_metadata(index, metadata & !(META_LIVE | META_OWNER | META_SHARERS));
         self.owner_counts[slot] -= 1;
         if slot != 0 && self.owner_counts[slot] == 0 {
             self.owners[slot - 1] = 0;
@@ -477,7 +515,11 @@ impl FrameAllocator {
         }
         for frame in frames {
             if let Some(index) = self.index(frame.address) {
-                self.retire(index);
+                if self.sharers(index) == 0 {
+                    self.retire(index);
+                } else {
+                    self.set_metadata(index, self.metadata(index) - META_SHARER);
+                }
             }
         }
         true
@@ -920,6 +962,10 @@ pub(crate) fn scrub_and_release_frames(owner: FrameOwner, frames: &[FrameLease])
             return false;
         }
         for frame in frames {
+            // A frame another address space still maps keeps its contents.
+            if allocator.is_shared(*frame) {
+                continue;
+            }
             let Some(address) = frame.direct_map_address() else {
                 return false;
             };
@@ -927,6 +973,27 @@ pub(crate) fn scrub_and_release_frames(owner: FrameOwner, frames: &[FrameLease])
         }
         allocator.release_slice(owner, frames)
     }
+}
+
+/// Records that one more address space maps each of `frames`, so releasing
+/// them drops that mapping instead of freeing the pages. All or none.
+pub(crate) fn share_frames(owner: FrameOwner, frames: &[FrameLease]) -> bool {
+    if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) || frames.is_empty() {
+        return false;
+    }
+    let mut storage = PHYSICAL_MEMORY.allocator.lock();
+    // SAFETY: as for allocate_frames.
+    unsafe { storage.assume_init_mut().share_slice(owner, frames) }
+}
+
+/// Whether another address space also maps `frame`.
+pub(crate) fn frame_is_shared(frame: FrameLease) -> bool {
+    if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) {
+        return false;
+    }
+    let storage = PHYSICAL_MEMORY.allocator.lock();
+    // SAFETY: as for allocate_frames.
+    unsafe { storage.assume_init_ref().is_shared(frame) }
 }
 
 pub(crate) fn transfer_frame_owner(from: FrameOwner, to: FrameOwner) -> Option<usize> {
@@ -1063,6 +1130,13 @@ pub(crate) fn verify_reservation_invariants() -> bool {
         }],
     ) && allocator.allocated_frames == 3;
     let wrong_owner_rejected = !allocator.release(other_owner, first);
+    let shared_release_kept = allocator.share_slice(owner, &first[..1])
+        && allocator.is_shared(first[0])
+        && !allocator.share_slice(other_owner, &first[..1])
+        && allocator.release(owner, [first[0]])
+        && !allocator.is_shared(first[0])
+        && allocator.owns(owner, &first)
+        && allocator.allocated_frames == 3;
     let released = allocator.release(owner, first);
     let duplicate_rejected = !allocator.release(owner, first);
     let reused = allocator.reserve::<2>(other_owner);
@@ -1127,6 +1201,7 @@ pub(crate) fn verify_reservation_invariants() -> bool {
         && last.map(FrameLease::address) == [0x20_0000]
         && forged_release_rejected
         && wrong_owner_rejected
+        && shared_release_kept
         && released
         && duplicate_rejected
         && reuse_bumped_generation

@@ -22008,14 +22008,16 @@ fn linux_runtime_mprotect(address: u64, length: u64, protection: u64) -> u64 {
             LINUX_ENOMEM
         };
     }
+    // A private page that the file cache or another address space also
+    // holds gets its own copy before it becomes writable.
     if protection & LINUX_PROT_WRITE != 0 {
         for page in 0..pages {
             let page_address = address + (page * PAGE_SIZE) as u64;
             let state = address_space::current_linux_runtime_page(page_address);
-            let Some(source) = state
-                .frame
-                .filter(|frame| crate::linux_file_cache::contains(*frame))
-            else {
+            let Some(source) = state.frame.filter(|frame| {
+                crate::linux_file_cache::contains(*frame)
+                    || !state.shared && memory::frame_is_shared(*frame)
+            }) else {
                 continue;
             };
             let Some([replacement]) = memory::allocate_frames::<1>(memory::FrameOwner::KERNEL)
@@ -22031,6 +22033,9 @@ fn linux_runtime_mprotect(address: u64, length: u64, protection: u64) -> u64 {
             {
                 let _ =
                     memory::scrub_and_release_frames(memory::FrameOwner::KERNEL, &[replacement]);
+                return LINUX_ENOMEM;
+            }
+            if !address_space::release_linux_private_page(source) {
                 return LINUX_ENOMEM;
             }
         }
@@ -22109,6 +22114,11 @@ fn linux_runtime_madvise(address: u64, length: u64, advice: u64) -> u64 {
         }
         if state.sealed {
             return LINUX_EPERM;
+        }
+        // A shared mapping's page keeps its contents for the other mappings
+        // and is read back unchanged, as Linux rereads it from the object.
+        if state.shared {
+            continue;
         }
         if state.frame.is_some() {
             let removed = address_space::remove_current_linux_runtime_page(page_address);
@@ -24524,10 +24534,6 @@ fn linux_rootfs_execve_source(
     };
     let mut replacement_index = 0;
     let pid = current_linux_process_pid();
-    let release_parent_on_exec = X86_RUNTIME
-        .LINUX_PROCESS_RELEASE_PARENT_ON_EXEC
-        .load(Ordering::SeqCst);
-    let prepared_frame_references = linux_process::prepare_live_other_process_frame_references(pid);
     for segment_index in 0..plan.segment_count() {
         let Some(segment) = plan.segment(segment_index) else {
             return LINUX_ENOEXEC;
@@ -24635,20 +24641,8 @@ fn linux_rootfs_execve_source(
                 );
             }
             if let Some(mapping) = mapping {
-                let referenced = release_parent_on_exec
-                    || if prepared_frame_references {
-                        linux_process::prepared_live_frame_referenced_by_other_process(
-                            mapping.frame,
-                        )
-                    } else {
-                        linux_process::live_mapping_referenced_by_other_process(pid, mapping.frame)
-                    };
-                if !referenced
-                    && memory::frame_leases_releasable(memory::FrameOwner::KERNEL, &[mapping.frame])
-                    && !memory::scrub_and_release_frames(
-                        memory::FrameOwner::KERNEL,
-                        &[mapping.frame],
-                    )
+                if memory::frame_leases_releasable(memory::FrameOwner::KERNEL, &[mapping.frame])
+                    && !address_space::release_linux_private_page(mapping.frame)
                 {
                     return LINUX_ENOMEM;
                 }
@@ -24796,22 +24790,12 @@ fn linux_rootfs_execve_source(
     let _ = set_current_linux_robust_list(0);
     // Drop the old program's mmap area; the new image's own pages are kept.
     // The high image window is left alone: releasing it from a vfork child
-    // of a high-loaded program unmapped that program's own code. A vfork
-    // child's pages are all its parent's, so it frees none of them, even
-    // ones the parent's registry no longer lists.
-    let shares_parent_vm = linux_process::live_process_shares_parent_vm(pid);
+    // of a high-loaded program unmapped that program's own code. Each
+    // private page loses this mapping; a vfork child's pages, all its
+    // parent's, stay with the parent.
     if !address_space::release_current_linux_runtime_mappings_preserving(
         LINUX_RUNTIME_DYNAMIC_MMAP_BASE,
-        |frame| {
-            release_parent_on_exec
-                || shares_parent_vm
-                || crate::linux_file_cache::contains(frame)
-                || if prepared_frame_references {
-                    linux_process::prepared_live_frame_referenced_by_other_process(frame)
-                } else {
-                    linux_process::live_mapping_referenced_by_other_process(pid, frame)
-                }
-        },
+        |frame| !address_space::linux_private_page_counted(frame),
         |frame| replacements[..replacement_count].contains(&frame),
     ) {
         serial_write("ginux: Linux exec mmap release failed\r\n");
@@ -44818,6 +44802,11 @@ fn materialize_linux_cow_address(address: u64) -> bool {
     else {
         return false;
     };
+    // The last mapping of a page writes it in place, as Linux reuses a page
+    // whose map count has dropped to one.
+    if address_space::linux_private_page_counted(source) && !memory::frame_is_shared(source) {
+        return address_space::promote_current_linux_cow_page(address, source, mapping.executable);
+    }
     let Some([replacement]) = memory::allocate_frames::<1>(memory::FrameOwner::KERNEL) else {
         return false;
     };
@@ -44852,13 +44841,7 @@ fn materialize_linux_cow_address(address: u64) -> bool {
         let _ = memory::scrub_and_release_frames(memory::FrameOwner::KERNEL, &[replacement]);
         return false;
     }
-    if !linux_process::live_mapping_referenced_by_other_process(pid, source)
-        && !memory::frame_lease_is_runtime(source)
-        && !memory::scrub_and_release_frames(memory::FrameOwner::KERNEL, &[source])
-    {
-        return false;
-    }
-    true
+    address_space::release_linux_private_page(source)
 }
 
 fn materialize_linux_runtime_mapping(fault: domain::FaultMetadata) -> bool {

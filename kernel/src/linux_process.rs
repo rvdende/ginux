@@ -27,10 +27,6 @@ const PROCESS_RAX_INDEX: usize = 0;
 const HOST_PROCESS_INSTANCE: usize = control_abi::DOMAIN_LIMIT;
 const PROCESS_INSTANCE_LIMIT: usize = control_abi::DOMAIN_LIMIT + 1;
 const PROCESS_INSTANCE_NONE: u8 = u8::MAX;
-// Keep the open-addressed reference set below a 50% load for one maximally
-// populated peer address space.  The set stores distinct physical frames, so
-// fork siblings do not multiply its occupancy.
-const LIVE_FRAME_REFERENCE_SET_CAPACITY: usize = 131_072;
 
 struct LiveForkScratch {
     child_mappings: [cpu::LinuxActiveImageMapping; PROCESS_PRIVATE_PAGE_LIMIT],
@@ -62,7 +58,6 @@ struct ProcessRuntimeState {
 /// address space each, tens of megabytes in all, so they live apart from the
 /// runtime owner: initialized to zero, they take no space in the kernel image.
 struct ProcessScratchState {
-    frame_reference_set: UnsafeCell<[u64; LIVE_FRAME_REFERENCE_SET_CAPACITY]>,
     fork_scratch: UnsafeCell<LiveForkScratch>,
     fork_allocation_scratch: UnsafeCell<[memory::FrameLease; PROCESS_PRIVATE_COPY_LIMIT]>,
     fork_hierarchy_allocation_scratch: UnsafeCell<[memory::FrameLease; PROCESS_HIERARCHY_LIMIT]>,
@@ -74,7 +69,6 @@ unsafe impl Sync for ProcessScratchOwner {}
 
 static PROCESS_SCRATCH: ProcessScratchOwner =
     ProcessScratchOwner(UnsafeCell::new(ProcessScratchState {
-        frame_reference_set: UnsafeCell::new([0; LIVE_FRAME_REFERENCE_SET_CAPACITY]),
         fork_scratch: UnsafeCell::new(LiveForkScratch {
             child_mappings: [cpu::LinuxActiveImageMapping::EMPTY; PROCESS_PRIVATE_PAGE_LIMIT],
             parent_pages: [memory::FrameLease::EMPTY; PROCESS_PRIVATE_PAGE_LIMIT],
@@ -611,64 +605,6 @@ impl ProcessTable {
         }
     }
 
-    fn frame_referenced_by_other_process(
-        &self,
-        excluded: ProcessHandle,
-        frame: memory::FrameLease,
-    ) -> bool {
-        self.processes.iter().flatten().any(|process| {
-            process.handle != excluded
-                && process.address_space.is_some_and(|space| {
-                    space
-                        .mappings()
-                        .iter()
-                        .any(|mapping| mapping.frame == frame)
-                })
-        })
-    }
-
-    fn promote_exclusive_cow_reference(
-        &self,
-        excluded: ProcessHandle,
-        frame: memory::FrameLease,
-    ) -> bool {
-        let mut reference = None;
-        for process in self.processes.iter().flatten() {
-            if process.handle == excluded {
-                continue;
-            }
-            let Some(space) = process.address_space else {
-                continue;
-            };
-            for mapping in space
-                .mappings()
-                .iter()
-                .filter(|mapping| mapping.frame == frame)
-            {
-                if reference.is_some() {
-                    return true;
-                }
-                reference = Some((space.root(), *mapping));
-            }
-        }
-        let Some((root, mapping)) = reference else {
-            return true;
-        };
-        if !mapping.writable || mapping.shared {
-            return true;
-        }
-        match address_space::linux_cow_page_in_root(root, mapping.address as u64) {
-            Some(candidate) if candidate == frame => address_space::promote_linux_cow_page_in_root(
-                root,
-                mapping.address as u64,
-                frame,
-                mapping.executable,
-            ),
-            None => true,
-            Some(_) => false,
-        }
-    }
-
     fn free_runtime_slot(&self) -> Option<usize> {
         (0..PROCESS_RUNTIME_LIMIT).find(|slot| {
             self.processes
@@ -972,6 +908,9 @@ impl ProcessTable {
                 .fork_execution_stage
                 .store(11361, Ordering::Release);
             let Some(storage_slot) = self.free_runtime_slot() else {
+                if child_pages.is_empty() {
+                    let _ = address_space::release_linux_leaf_pages(child_hierarchy[0]);
+                }
                 let _ = scrub_candidate_resources(child_hierarchy, child_pages);
                 let _ = self.abort_fork(handle);
                 return false;
@@ -1034,6 +973,9 @@ impl ProcessTable {
             if attachments_inherited {
                 let _ = crate::linux_sysv_ipc::drop_process_attachments(handle.pid);
             }
+        }
+        if published && child_pages.is_empty() {
+            let _ = address_space::release_linux_leaf_pages(child_hierarchy[0]);
         }
         let _ = scrub_candidate_resources(child_hierarchy, child_pages);
         let _ = self.abort_fork(handle);
@@ -1195,12 +1137,6 @@ impl ProcessTable {
                 .hierarchy()
                 .iter()
                 .any(|frame| memory::frames_owned_by(memory::FrameOwner::KERNEL, &[*frame]))
-            || expected_space.mappings().iter().any(|mapping| {
-                !mapping.shared
-                    && !memory::frame_lease_is_runtime(mapping.frame)
-                    && memory::frames_owned_by(memory::FrameOwner::KERNEL, &[mapping.frame])
-                    && !self.frame_referenced_by_other_process(handle, mapping.frame)
-            })
         {
             return false;
         }
@@ -2551,12 +2487,12 @@ pub(crate) fn force_stop_runtime_process_registry() -> bool {
             continue;
         }
         if let Some(space) = process.address_space {
-            if !release_live_process_address_space(table, process.handle, space) {
+            if !release_live_process_address_space(space) {
                 return false;
             }
         }
         if let Some(space) = process.retiring_address_space {
-            if !release_live_process_address_space(table, process.handle, space) {
+            if !release_live_process_address_space(space) {
                 return false;
             }
         }
@@ -3035,33 +2971,6 @@ pub(crate) fn live_process_shares_parent_vm(pid: u32) -> bool {
     })
 }
 
-pub(crate) fn live_mapping_referenced_by_other_process(
-    pid: u32,
-    frame: memory::FrameLease,
-) -> bool {
-    let Some(table) = live_process_table_mut() else {
-        return true;
-    };
-    let Some(excluded) = table.handle_by_pid(pid) else {
-        return true;
-    };
-    table.frame_referenced_by_other_process(excluded, frame)
-}
-
-pub(crate) fn prepare_live_other_process_frame_references(pid: u32) -> bool {
-    let Some(table) = live_process_table_mut() else {
-        return false;
-    };
-    let Some(excluded) = table.handle_by_pid(pid) else {
-        return false;
-    };
-    build_live_frame_reference_set(table, excluded)
-}
-
-pub(crate) fn prepared_live_frame_referenced_by_other_process(frame: memory::FrameLease) -> bool {
-    live_frame_reference_set_contains(frame)
-}
-
 pub(crate) fn replace_live_process_mapping(
     pid: u32,
     address: usize,
@@ -3351,13 +3260,7 @@ pub(crate) fn prepare_live_process_write(pid: u32, address: usize) -> bool {
         let _ = memory::scrub_and_release_frames(memory::FrameOwner::KERNEL, &[replacement]);
         return false;
     }
-    if !live_mapping_referenced_by_other_process(pid, mapping.frame)
-        && !memory::frame_lease_is_runtime(mapping.frame)
-        && !memory::scrub_and_release_frames(memory::FrameOwner::KERNEL, &[mapping.frame])
-    {
-        return false;
-    }
-    true
+    address_space::release_linux_private_page(mapping.frame)
 }
 
 pub(crate) fn live_process_root(pid: u32) -> Option<memory::FrameLease> {
@@ -3772,7 +3675,7 @@ fn discard_live_fork(
         return false;
     };
     return_restored
-        && release_live_process_address_space(table, child_handle, retiring)
+        && release_live_process_address_space(retiring)
         && crate::linux_sysv_ipc::drop_process_attachments(child_handle.pid).is_ok()
         && table.exit_after_retiring_address_space_released(child_handle, retiring, 0)
         && table.wait(parent_handle, child_handle.pid)
@@ -3782,157 +3685,27 @@ fn discard_live_fork(
             })
 }
 
-fn live_frame_reference_set_slot(address: u64) -> usize {
-    ((address >> 12).wrapping_mul(0x9e37_79b9_7f4a_7c15) as usize)
-        & (LIVE_FRAME_REFERENCE_SET_CAPACITY - 1)
-}
-
-fn build_live_frame_reference_set(table: &ProcessTable, excluded: ProcessHandle) -> bool {
-    let set = process_scratch().frame_reference_set.get().cast::<u64>();
-    for index in 0..LIVE_FRAME_REFERENCE_SET_CAPACITY {
-        unsafe { set.add(index).write(0) };
-    }
-    for process in &table.processes {
-        let Some(process) = process
-            .as_ref()
-            .filter(|process| process.handle != excluded)
-        else {
-            continue;
-        };
-        let Some(address_space) = process.address_space else {
-            continue;
-        };
-        for mapping in address_space.mappings() {
-            let address = mapping.frame.address();
-            let mut slot = live_frame_reference_set_slot(address);
-            let mut inserted = false;
-            for _ in 0..LIVE_FRAME_REFERENCE_SET_CAPACITY {
-                let entry = unsafe { set.add(slot).read() };
-                if entry == address {
-                    inserted = true;
-                    break;
-                }
-                if entry == 0 {
-                    unsafe { set.add(slot).write(address) };
-                    inserted = true;
-                    break;
-                }
-                slot = (slot + 1) & (LIVE_FRAME_REFERENCE_SET_CAPACITY - 1);
-            }
-            if !inserted {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-fn live_frame_reference_set_contains(frame: memory::FrameLease) -> bool {
-    let set = process_scratch().frame_reference_set.get().cast::<u64>();
-    let address = frame.address();
-    let mut slot = live_frame_reference_set_slot(address);
-    for _ in 0..LIVE_FRAME_REFERENCE_SET_CAPACITY {
-        let entry = unsafe { set.add(slot).read() };
-        if entry == address {
-            return true;
-        }
-        if entry == 0 {
-            return false;
-        }
-        slot = (slot + 1) & (LIVE_FRAME_REFERENCE_SET_CAPACITY - 1);
-    }
-    false
-}
-
-fn release_live_process_address_space(
-    table: &ProcessTable,
-    excluded: ProcessHandle,
-    space: ProcessAddressSpace,
-) -> bool {
+fn release_live_process_address_space(space: ProcessAddressSpace) -> bool {
     const RELEASE_BATCH_SIZE: usize = 64;
     let page_table_started = crate::arch::x86_64::timer::timestamp_counter();
+    // Retiring the page tables releases each private page they map: pages no
+    // other address space maps are freed, shared ones lose this mapping. The
+    // tables are the record of what the process maps; its registry may be a
+    // stale snapshot (a process killed by a signal has no final refresh).
     if !address_space::retire_linux_child_address_space(space.root()) {
         return false;
     }
-    // Retiring the live tree freed its page tables. A stale snapshot's lists
-    // may name frames already freed and handed to other processes, and
-    // freeing those again would corrupt them, so its private pages leak.
-    // A child sharing its parent's pages that never executed (posix_spawn
-    // whose exec failed) maps only those pages, which the parent goes on
-    // using although its registry may not list them all yet, so none of
-    // them is freed.
-    if space.stale
-        || table
-            .process(excluded)
-            .is_some_and(|process| process.shares_parent_vm)
-    {
+    // A stale snapshot's hierarchy list may name tables already freed and
+    // handed out again; the live tree's tables are freed already.
+    if space.stale {
         return true;
     }
     if cfg!(feature = "linux-boot-profile") {
         crate::arch::x86_64::cpu::linux_boot_profile_record_lifecycle_phase(7, page_table_started);
     }
     let frame_release_started = crate::arch::x86_64::timer::timestamp_counter();
-    let reference_set_ready = build_live_frame_reference_set(table, excluded);
     let mut release_batch = [memory::FrameLease::EMPTY; RELEASE_BATCH_SIZE];
     let mut release_count = 0;
-    for mapping in space.mappings() {
-        if !mapping.shared {
-            let reference_started = crate::arch::x86_64::timer::timestamp_counter();
-            let referenced = if reference_set_ready {
-                live_frame_reference_set_contains(mapping.frame)
-            } else {
-                table.frame_referenced_by_other_process(excluded, mapping.frame)
-            };
-            if cfg!(feature = "linux-boot-profile") {
-                crate::arch::x86_64::cpu::linux_boot_profile_record_lifecycle_phase(
-                    9,
-                    reference_started,
-                );
-            }
-            if referenced {
-                if crate::linux_file_cache::contains(mapping.frame) {
-                    continue;
-                }
-                if !table.promote_exclusive_cow_reference(excluded, mapping.frame) {
-                    return false;
-                }
-            } else if crate::linux_file_cache::contains(mapping.frame) {
-                continue;
-            } else {
-                let ownership_started = crate::arch::x86_64::timer::timestamp_counter();
-                let owned = memory::frames_owned_by(
-                    memory::FrameOwner::KERNEL,
-                    core::slice::from_ref(&mapping.frame),
-                );
-                if cfg!(feature = "linux-boot-profile") {
-                    crate::arch::x86_64::cpu::linux_boot_profile_record_lifecycle_phase(
-                        10,
-                        ownership_started,
-                    );
-                }
-                if owned && !release_batch[..release_count].contains(&mapping.frame) {
-                    release_batch[release_count] = mapping.frame;
-                    release_count += 1;
-                    if release_count == release_batch.len() {
-                        let scrub_started = crate::arch::x86_64::timer::timestamp_counter();
-                        if !memory::scrub_and_release_frames(
-                            memory::FrameOwner::KERNEL,
-                            &release_batch,
-                        ) {
-                            return false;
-                        }
-                        if cfg!(feature = "linux-boot-profile") {
-                            crate::arch::x86_64::cpu::linux_boot_profile_record_lifecycle_phase(
-                                11,
-                                scrub_started,
-                            );
-                        }
-                        release_count = 0;
-                    }
-                }
-            }
-        }
-    }
     for frame in space.hierarchy() {
         let ownership_started = crate::arch::x86_64::timer::timestamp_counter();
         let owned = memory::frames_owned_by(memory::FrameOwner::KERNEL, &[*frame]);
@@ -4007,7 +3780,7 @@ pub(crate) fn force_exit_live_process(pid: u32, status: u8) -> bool {
             return false;
         }
     }
-    release_live_process_address_space(table, handle, space)
+    release_live_process_address_space(space)
         && crate::linux_sysv_ipc::drop_process_attachments(pid).is_ok()
         && table.exit_after_current_address_space_retired(handle, status)
 }
@@ -4073,7 +3846,7 @@ pub(crate) fn complete_live_child_exit(pid: u32, status: u8) -> Option<LiveProce
     process_runtime()
         .fork_execution_stage
         .store(161, Ordering::Release);
-    if !release_live_process_address_space(table, child_handle, child_space) {
+    if !release_live_process_address_space(child_space) {
         process_runtime()
             .fork_execution_stage
             .store(162, Ordering::Release);

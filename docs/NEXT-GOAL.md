@@ -66,10 +66,11 @@ Delivered in this checkpoint:
 - Multiple admitted processes remain runnable, and nice values now influence
   ready-process priority selection. Cleanup, process-limit, round-robin, and
   priority-selection invariants are covered by the verification boot.
-- Linux personality forks temporarily use eager private copies. Rocky's repeated
-  fork/exec/exit path found incomplete COW re-fork bookkeeping; COW remains in
-  the process layer but must not return to the runtime path until that sequence
-  has its own passing regression gate.
+- Runtime forks share private pages copy-on-write. The registry-based
+  "referenced by another process" checks that decided when a page could be
+  freed missed pages after munmap, mprotect and signal kills; they are
+  replaced by a per-frame map count in the frame allocator (2026-10-31), and
+  exit releases what the page tables map.
 
 Remaining before Stage 2 is complete:
 

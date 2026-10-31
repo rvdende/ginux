@@ -61,7 +61,11 @@ Counts are tests, from the baseline (B) and the variant (V); the logs are
    tst_memutils.c:176: TBROK: oom_score_adj = 0, but expect -1000.
    ```
 2. **A fault or failed fork in one process takes the whole domain down**
-   (all CRASH results: B 11, V 53). The kernel cannot complete or
+   (all CRASH results: B 11, V 53). *Status:* a fault now kills only the
+   faulting process (`643d714b`), and pages have a map count, so munmap,
+   copy-on-write, exec and exit no longer free a page another process still
+   maps (the cause of the "snapshot failed at stage 8" and "completion failed
+   at stage 162" crashes). The memory/fork/wait slice runs without a crash. The kernel cannot complete or
    unwind the child ("runtime fork preparation failed at stage 13/11",
    "runtime child completion failed at stage 14/17/162", "live registry
    refresh snapshot failed at stage 8"), resumes the parent in the wrong

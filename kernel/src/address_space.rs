@@ -3920,7 +3920,8 @@ fn clone_shared_linux_hierarchy(
             }
         }
     }
-    true
+    // The copied tables map every private page of the old address space.
+    share_linux_leaf_pages(new_hierarchy[0].address())
 }
 
 pub(crate) fn clone_linux_process_hierarchy(
@@ -4082,6 +4083,80 @@ fn clone_linux_process_hierarchy_inner(
             || install_linux_fork_cow(parent_mappings, parent_hierarchy[0], child_hierarchy[0]))
 }
 
+/// Whether the frame allocator counts a private page's mappings. Pages of a
+/// domain's runtime image and of the file cache belong to those and are
+/// never freed through a mapping.
+pub(crate) fn linux_private_page_counted(frame: memory::FrameLease) -> bool {
+    !memory::frame_lease_is_runtime(frame) && !crate::linux_file_cache::contains(frame)
+}
+
+/// Drops one address space's mapping of a private page, freeing the page
+/// with its last mapping.
+pub(crate) fn release_linux_private_page(frame: memory::FrameLease) -> bool {
+    !linux_private_page_counted(frame)
+        || memory::scrub_and_release_frames(memory::FrameOwner::KERNEL, &[frame])
+}
+
+/// The counted private page a user leaf maps, or keeps while it is
+/// inaccessible (a PROT_NONE page keeps its frame).
+fn linux_leaf_private_page(value: u64) -> Option<memory::FrameLease> {
+    if value & USER == 0
+        || value & (PRESENT | LINUX_RUNTIME_RESERVED) == 0
+        || value & LINUX_RUNTIME_SHARED != 0
+    {
+        return None;
+    }
+    memory::live_frame_lease(memory::FrameOwner::KERNEL, value & ADDRESS_MASK)
+        .filter(|frame| linux_private_page_counted(*frame))
+}
+
+/// Calls `visit` with each counted private page the user half of `root`
+/// maps, stopping at the first refusal.
+fn visit_linux_leaf_pages(root: u64, visit: &mut impl FnMut(memory::FrameLease) -> bool) -> bool {
+    fn walk(
+        table_address: u64,
+        level: usize,
+        visit: &mut impl FnMut(memory::FrameLease) -> bool,
+    ) -> bool {
+        let Some(table) = mapped_frame::<u64>(table_address) else {
+            return false;
+        };
+        let end = if level == 0 { 256 } else { ENTRY_COUNT };
+        (0..end).all(|index| {
+            let value = unsafe { table.add(index).read() };
+            if level < 3 {
+                value & (PRESENT | USER | LARGE_PAGE) != PRESENT | USER
+                    || walk(value & ADDRESS_MASK, level + 1, visit)
+            } else {
+                linux_leaf_private_page(value).is_none_or(&mut *visit)
+            }
+        })
+    }
+    walk(root, 0, visit)
+}
+
+/// Counts one more mapping of every private page the user half of `root`
+/// maps, for an address space that copied another's page tables.
+fn share_linux_leaf_pages(root: u64) -> bool {
+    let mut batch = [memory::FrameLease::EMPTY; 64];
+    let mut count = 0;
+    visit_linux_leaf_pages(root, &mut |frame| {
+        batch[count] = frame;
+        count += 1;
+        if count < batch.len() {
+            return true;
+        }
+        count = 0;
+        memory::share_frames(memory::FrameOwner::KERNEL, &batch)
+    }) && (count == 0 || memory::share_frames(memory::FrameOwner::KERNEL, &batch[..count]))
+}
+
+/// Drops the mappings of an abandoned child's page tables, which took a
+/// count of each private page when they were built from its parent's.
+pub(crate) fn release_linux_leaf_pages(root: memory::FrameLease) -> bool {
+    visit_linux_leaf_pages(root.address(), &mut release_linux_private_page)
+}
+
 fn install_linux_fork_cow(
     mappings: &[cpu::LinuxActiveImageMapping],
     parent_root: memory::FrameLease,
@@ -4109,6 +4184,25 @@ fn install_linux_fork_cow(
             parent.write((parent_value & !WRITABLE) | LINUX_RUNTIME_COW);
             child.write((child_value & !WRITABLE) | LINUX_RUNTIME_COW);
         }
+    }
+    // The child maps every private page the parent does. Count its mappings
+    // so each page lives until both have released it.
+    let mut shared = [memory::FrameLease::EMPTY; 64];
+    let mut count = 0;
+    for mapping in mappings.iter().filter(|mapping| {
+        !mapping.dontfork && !mapping.shared && linux_private_page_counted(mapping.frame)
+    }) {
+        shared[count] = mapping.frame;
+        count += 1;
+        if count == shared.len() {
+            if !memory::share_frames(memory::FrameOwner::KERNEL, &shared) {
+                return false;
+            }
+            count = 0;
+        }
+    }
+    if count != 0 && !memory::share_frames(memory::FrameOwner::KERNEL, &shared[..count]) {
+        return false;
     }
     // The parent's pages are now read-only, but if its address space is the
     // loaded one this CPU may still hold writable translations for them, and
@@ -4972,6 +5066,8 @@ pub(crate) fn verify_linux_process_hierarchy_clone() -> bool {
         let parent_value = unsafe { parent_leaf.read() };
         let child_value = unsafe { child_leaf.read() };
         let shared_cow = cloned
+            && memory::frame_is_shared(parent_pages[0])
+            && memory::frame_is_shared(parent_pages[1])
             && parent_value & (ADDRESS_MASK | PRESENT | USER | WRITABLE | LINUX_RUNTIME_COW)
                 == parent_pages[1].address() | PRESENT | USER | LINUX_RUNTIME_COW
             && child_value & (ADDRESS_MASK | PRESENT | USER | WRITABLE | LINUX_RUNTIME_COW)
@@ -4991,6 +5087,16 @@ pub(crate) fn verify_linux_process_hierarchy_clone() -> bool {
         let isolated = split
             && unsafe { (parent_pages[1].direct_map_address()? as *const u8).read() } == 0x32
             && unsafe { (cow[4].direct_map_address()? as *const u8).read() } == 0x7e;
+        // The child drops its mappings of the parent's pages (its copy of
+        // the written one and its exit, in a real fork); the pages stay with
+        // their contents and become the parent's alone.
+        let unshared = cloned
+            && release_linux_private_page(parent_pages[0])
+            && release_linux_private_page(parent_pages[1])
+            && !memory::frame_is_shared(parent_pages[0])
+            && !memory::frame_is_shared(parent_pages[1])
+            && memory::frames_owned_by(memory::FrameOwner::KERNEL, &parent_pages[..2])
+            && unsafe { (parent_pages[1].direct_map_address()? as *const u8).read() } == 0x32;
         unsafe {
             parent_leaf.write(parent_pages[1].address() | PRESENT | WRITABLE | USER | NO_EXECUTE)
         };
@@ -4998,7 +5104,7 @@ pub(crate) fn verify_linux_process_hierarchy_clone() -> bool {
             & (ADDRESS_MASK | PRESENT | WRITABLE | USER | NO_EXECUTE | LINUX_RUNTIME_COW)
             == parent_pages[1].address() | PRESENT | WRITABLE | USER | NO_EXECUTE;
         let released = memory::scrub_and_release_frames(memory::FrameOwner::KERNEL, &cow);
-        Some(isolated && restored && released)
+        Some(isolated && unshared && restored && released)
     })()
     .unwrap_or(false);
 
@@ -5464,8 +5570,18 @@ pub(crate) fn replace_linux_cow_page_in_root(
     }
 }
 
-pub(crate) fn promote_linux_cow_page_in_root(
-    root: memory::FrameLease,
+/// Makes the current address space's copy-on-write mapping of `expected`
+/// writable in place, for the last mapping of the page.
+pub(crate) fn promote_current_linux_cow_page(
+    address: u64,
+    expected: memory::FrameLease,
+    executable: bool,
+) -> bool {
+    promote_linux_cow_page_in_root_address(current_root(), address, expected, executable)
+}
+
+fn promote_linux_cow_page_in_root_address(
+    root: u64,
     address: u64,
     expected: memory::FrameLease,
     executable: bool,
@@ -5477,7 +5593,7 @@ pub(crate) fn promote_linux_cow_page_in_root(
     {
         return false;
     }
-    let Some(entry) = linux_leaf_in_root(root.address(), address) else {
+    let Some(entry) = linux_leaf_in_root(root, address) else {
         return false;
     };
     let value = unsafe { entry.read() };
@@ -5489,7 +5605,7 @@ pub(crate) fn promote_linux_cow_page_in_root(
     let flags = PRESENT | USER | WRITABLE | if executable { 0 } else { NO_EXECUTE };
     unsafe {
         entry.write(expected.address() | flags);
-        if root.address() == current_root() {
+        if root == current_root() {
             asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
         }
         entry.read() & (ADDRESS_MASK | PRESENT | USER | WRITABLE | NO_EXECUTE | LINUX_RUNTIME_COW)
@@ -6507,7 +6623,7 @@ pub(crate) fn release_current_linux_runtime_mappings_preserving(
 }
 
 pub(crate) fn retire_linux_child_address_space(root: memory::FrameLease) -> bool {
-    fn validate(table_address: u64, level: usize) -> bool {
+    fn validate(table_address: u64, level: usize, prefix: u64) -> bool {
         if level > 3
             || memory::live_frame_lease(memory::FrameOwner::KERNEL, table_address).is_none()
         {
@@ -6525,24 +6641,32 @@ pub(crate) fn retire_linux_child_address_space(root: memory::FrameLease) -> bool
             if value & USER == 0 {
                 continue;
             }
+            let address = prefix | (index as u64) << [39_u32, 30, 21, 12][level];
             if level < 3 {
                 if value & (PRESENT | LARGE_PAGE) != PRESENT
-                    || !validate(value & ADDRESS_MASK, level + 1)
+                    || !validate(value & ADDRESS_MASK, level + 1, address)
                 {
                     return false;
                 }
                 continue;
             }
             if value & PRESENT != 0 {
-                let address = value & ADDRESS_MASK;
+                let frame = value & ADDRESS_MASK;
                 // Device memory such as the framebuffer has no frame lease;
                 // it is mapped shared and never forked, and is not freed.
                 let device = LINUX_RUNTIME_SHARED | LINUX_RUNTIME_DONTFORK;
                 if value & USER == 0
-                    || !(memory::live_frame_lease(memory::FrameOwner::KERNEL, address).is_some()
-                        || memory::frame_address_is_runtime(address)
+                    || !(memory::live_frame_lease(memory::FrameOwner::KERNEL, frame).is_some()
+                        || memory::frame_address_is_runtime(frame)
                         || value & device == device)
                 {
+                    crate::serial_write_bytes(
+                        b"ginux: retiring page without a frame address/entry: ",
+                    );
+                    crate::serial_write_u64(address);
+                    crate::serial_write_bytes(b" ");
+                    crate::serial_write_u64(value);
+                    crate::serial_write_bytes(b"\r\n");
                     return false;
                 }
             } else if value & (LINUX_RUNTIME_RESERVED | USER) != LINUX_RUNTIME_RESERVED | USER {
@@ -6586,18 +6710,29 @@ pub(crate) fn retire_linux_child_address_space(root: memory::FrameLease) -> bool
                 continue;
             }
             unsafe { entry.write(0) };
-            // Leaf-frame ownership is process-table metadata, not a page-table
-            // property. The caller releases each unreferenced private mapping
-            // after this hierarchy is detached; doing it here would free COW
-            // frames that are still mapped by the parent.
+            // Each private page loses this mapping; the allocator frees the
+            // pages no other address space still maps.
+            if linux_leaf_private_page(value)
+                .is_some_and(|frame| !release_linux_private_page(frame))
+            {
+                return false;
+            }
         }
         true
     }
 
     if root.address() == current_root()
         || !memory::frames_owned_by(memory::FrameOwner::KERNEL, &[root])
-        || !validate(root.address(), 0)
+        || !validate(root.address(), 0, 0)
     {
+        crate::serial_write_bytes(b"ginux: address space retirement refused current/owned: ");
+        crate::serial_write_u64(u64::from(root.address() == current_root()));
+        crate::serial_write_bytes(b" ");
+        crate::serial_write_u64(u64::from(memory::frames_owned_by(
+            memory::FrameOwner::KERNEL,
+            &[root],
+        )));
+        crate::serial_write_bytes(b"\r\n");
         return false;
     }
     if !release_children(root.address(), 0) {
