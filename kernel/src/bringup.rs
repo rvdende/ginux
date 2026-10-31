@@ -11,7 +11,7 @@ use core::ptr::read_unaligned;
 
 use crate::drivers::net::{self, Nic};
 use crate::drivers::{
-    ahci, amd_iommu, e1000e, gpt, keyboard, nvme, pci, realtek, say, xhci, BlockDevice,
+    ahci, amd_iommu, e1000e, gpt, hda, keyboard, nvme, pci, realtek, say, xhci, BlockDevice,
 };
 use crate::{BootInfo, UefiMemoryDescriptor, EFI_BOOT_SERVICES_CODE, EFI_BOOT_SERVICES_DATA};
 
@@ -52,6 +52,7 @@ pub(crate) fn run(boot_info: &BootInfo) -> ! {
     report_pci();
     let mut remapping = enable_dma_remapping(&iommus);
     report_network();
+    report_audio();
     report_disks(&mut remapping);
     let keyboards = open_keyboards();
 
@@ -178,6 +179,63 @@ fn report_network() {
                 report_dhcp(&mut nic, transaction);
             }
             None => say!("ginux:   reset failed\n"),
+        }
+    });
+}
+
+/// Resets each HD Audio controller and lists its codecs and output pins.
+fn report_audio() {
+    pci::for_each_function(|device| {
+        if !hda::is_supported(&device) {
+            return;
+        }
+        let address = device.address;
+        say!(
+            "ginux: audio {:02x}:{:02x}.{}: {:04x}:{:04x} HD Audio",
+            address.bus,
+            address.device,
+            address.function,
+            device.vendor,
+            device.device
+        );
+        // SAFETY: bring-up is the only driver of this controller, and the
+        // firmware identity map covers its registers and DMA pages.
+        let mut controller = match unsafe { hda::Controller::open(address) } {
+            Ok(controller) => controller,
+            Err(error) => {
+                say!(", {:?}\n", error);
+                return;
+            }
+        };
+        say!("\n");
+        for codec in controller.codecs() {
+            let codec = match codec {
+                Ok(codec) => codec,
+                Err(error) => {
+                    say!("ginux:   codec: {:?}\n", error);
+                    continue;
+                }
+            };
+            say!(
+                "ginux:   codec {}: {:04x}:{:04x}, {} output converters, outputs:",
+                codec.address,
+                codec.vendor,
+                codec.device,
+                codec.converters
+            );
+            let mut outputs = codec
+                .pins
+                .iter()
+                .flatten()
+                .filter(|pin| pin.is_output() && pin.connected())
+                .peekable();
+            if outputs.peek().is_none() {
+                say!(" none");
+            }
+            for pin in outputs {
+                say!(" {} (node {})", pin.device_name(), pin.node);
+            }
+            say!("\n");
         }
     });
 }
@@ -507,7 +565,11 @@ fn enable_dma_remapping(iommus: &[u64; MAX_IOMMUS]) -> Remapping {
         nvme::dma_regions(),
         ahci::dma_regions(),
     );
-    let (intel, realtek) = (e1000e::dma_regions(), realtek::dma_regions());
+    let (intel, realtek, audio) = (
+        e1000e::dma_regions(),
+        realtek::dma_regions(),
+        hda::dma_regions(),
+    );
     // SAFETY: no unit is enabled yet, and bring-up runs on one CPU.
     let mut table = unsafe { amd_iommu::DeviceTableBuilder::new() };
     let (mut confined, mut passthrough, mut blocked) = (0, 0, 0);
@@ -523,6 +585,8 @@ fn enable_dma_remapping(iommus: &[u64; MAX_IOMMUS]) -> Remapping {
             amd_iommu::Access::Regions(&intel)
         } else if realtek::can_transfer(&device) {
             amd_iommu::Access::Regions(&realtek)
+        } else if hda::is_supported(&device) {
+            amd_iommu::Access::Regions(&audio)
         } else if device.class == 0x03 {
             amd_iommu::Access::Passthrough
         } else {

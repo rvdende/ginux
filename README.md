@@ -254,6 +254,9 @@ every PCI device, and runs the physical-hardware drivers in `kernel/src/drivers`
 - An xHCI driver that runs USB boot keyboards on every controller, including
   keyboards behind USB hubs (up to five tiers, with transaction translators
   for low- and full-speed devices behind high-speed hubs).
+- An HD Audio driver for Intel-compatible controllers (including AMD HD Audio
+  and GPU HDMI/DP audio) that resets each controller and lists its codecs and
+  output pins. Playback is not implemented yet.
 - Polled Ethernet for the Intel 82574 and the Realtek RTL8125/RTL8126, checked
   by broadcasting a DHCP discover and reporting the offer. The Realtek path
   follows Linux's r8169 register layout and has not run on hardware yet.
@@ -261,8 +264,8 @@ every PCI device, and runs the physical-hardware drivers in `kernel/src/drivers`
 With a keyboard or serial port it then offers a small bring-up shell (`help`,
 `pci`, `acpi`, `mem`, `disks`, `net`, `reboot`, `poweroff`). Nothing in bring-up
 mode writes to storage. `make test-hardware-profile` boots a QEMU machine with an
-AMD IOMMU, an e1000e on a DHCP network, NVMe, AHCI, two xHCI controllers (one
-keyboard behind a hub), and a SATA disk without virtio, types a command on an
+AMD IOMMU, an e1000e on a DHCP network, an HD Audio codec, NVMe, AHCI, two xHCI
+controllers (one keyboard behind a hub), and a SATA disk without virtio, types a command on an
 emulated USB keyboard, and checks the framebuffer console with no serial port.
 
 Bringing up a specific machine starts with `sudo tools/hardware/probe.sh`, run

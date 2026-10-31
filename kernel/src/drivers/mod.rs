@@ -10,6 +10,7 @@ pub(crate) mod ahci;
 pub(crate) mod amd_iommu;
 pub(crate) mod e1000e;
 pub(crate) mod gpt;
+pub(crate) mod hda;
 pub(crate) mod keyboard;
 pub(crate) mod net;
 pub(crate) mod nvme;

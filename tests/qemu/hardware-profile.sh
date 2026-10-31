@@ -77,6 +77,9 @@ boot_profile() {
         -netdev user,id=net0,restrict=on \
         -device e1000e,netdev=net0 \
         -device amd-iommu,dma-remap=on \
+        -audiodev none,id=sound \
+        -device intel-hda \
+        -device hda-duplex,audiodev=sound \
         -device qemu-xhci,id=xhci \
         -device usb-tablet,bus=xhci.0 \
         -device usb-kbd,bus=xhci.0 \
@@ -162,7 +165,9 @@ for expected in \
     'by firmware, status' \
     'Intel 82574, MAC 52:54:00:12:34:56, link up' \
     'DHCP offer 10.0.2.15 from 10.0.2.2' \
-    'DMA remapping on; 5 devices confined' \
+    '8086:2668 HD Audio' \
+    'codec 0: 1af4:0022, 1 output converters, outputs: line out' \
+    'devices confined to their' \
     'AMD-Vi blocked a stray DMA from this controller' \
     'keyboard 0627:0001 on port' \
     'hub with 8 ports' \
