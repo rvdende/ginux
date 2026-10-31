@@ -41,6 +41,10 @@ const TX_BUFFER_OFFSET: usize = 0xa00;
 const RX_DESCRIPTOR_LENGTH: usize = 0x5ff;
 const VIRTIO_HEADER_LENGTH: usize = 12;
 const BLOCKING_POLL_LIMIT: usize = 20_000;
+/// Frames the interface sends to one of its own addresses (127.0.0.0/8 or
+/// its configured address) come back to it instead of going to the wire.
+const LOOPBACK_FRAME_COUNT: usize = 16;
+const LOOPBACK_FRAME_SIZE: usize = 1514;
 const PAGE_SIZE: usize = 4096;
 const LOCAL_DATA_CAPACITY: usize =
     PAGE_SIZE - core::mem::size_of::<memory::FrameLease>() - core::mem::size_of::<u32>();
@@ -53,6 +57,65 @@ struct LocalDataPage {
 }
 
 const _: () = assert!(core::mem::size_of::<LocalDataPage>() == PAGE_SIZE);
+
+struct LoopbackFrames {
+    frames: [[u8; LOOPBACK_FRAME_SIZE]; LOOPBACK_FRAME_COUNT],
+    lengths: [u16; LOOPBACK_FRAME_COUNT],
+    head: usize,
+    count: usize,
+}
+
+impl LoopbackFrames {
+    const EMPTY: Self = Self {
+        frames: [[0; LOOPBACK_FRAME_SIZE]; LOOPBACK_FRAME_COUNT],
+        lengths: [0; LOOPBACK_FRAME_COUNT],
+        head: 0,
+        count: 0,
+    };
+
+    /// Queues a copy of `frame`; a full queue drops it, as a busy wire would.
+    fn push(&mut self, frame: &[u8]) {
+        if self.count == LOOPBACK_FRAME_COUNT || frame.len() > LOOPBACK_FRAME_SIZE {
+            return;
+        }
+        let index = (self.head + self.count) % LOOPBACK_FRAME_COUNT;
+        self.frames[index][..frame.len()].copy_from_slice(frame);
+        self.lengths[index] = frame.len() as u16;
+        self.count += 1;
+    }
+
+    fn front(&self) -> &[u8] {
+        if self.count == 0 {
+            return &[];
+        }
+        &self.frames[self.head][..usize::from(self.lengths[self.head])]
+    }
+
+    fn pop(&mut self) {
+        if self.count != 0 {
+            self.head = (self.head + 1) % LOOPBACK_FRAME_COUNT;
+            self.count -= 1;
+        }
+    }
+}
+
+/// Whether an Ethernet frame is addressed to one of the interface's own
+/// IPv4 addresses: an IPv4 packet's destination or an ARP request's target.
+fn frame_loops_back(frame: &[u8], local_address: u32) -> bool {
+    let target = match frame.get(12..14) {
+        Some([0x08, 0x00]) => frame.get(30..34),
+        Some([0x08, 0x06]) => frame.get(38..42),
+        _ => None,
+    };
+    target
+        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+        .is_some_and(|octets| octets[0] == 127 || u32::from_be_bytes(octets) == local_address)
+}
+
+/// Whether `address` (host order) is one of the interface's own.
+fn is_local_address(runtime: &Runtime, address: u32) -> bool {
+    address >> 24 == 127 || address == runtime.local_address
+}
 
 #[derive(Clone, Copy)]
 struct Platform {
@@ -202,6 +265,7 @@ struct SocketRuntimeOwner {
     udp_tx: UnsafeCell<[[u8; UDP_BUFFER_SIZE]; SLOT_COUNT]>,
     udp_rx_meta: UnsafeCell<[[udp::PacketMetadata; UDP_PACKET_COUNT]; SLOT_COUNT]>,
     udp_tx_meta: UnsafeCell<[[udp::PacketMetadata; UDP_PACKET_COUNT]; SLOT_COUNT]>,
+    loopback: UnsafeCell<LoopbackFrames>,
 }
 
 unsafe impl Sync for SocketRuntimeOwner {}
@@ -222,6 +286,7 @@ static SOCKET_RUNTIME_OWNER: SocketRuntimeOwner = SocketRuntimeOwner {
     udp_tx: UnsafeCell::new([[0; UDP_BUFFER_SIZE]; SLOT_COUNT]),
     udp_rx_meta: UnsafeCell::new([[udp::PacketMetadata::EMPTY; UDP_PACKET_COUNT]; SLOT_COUNT]),
     udp_tx_meta: UnsafeCell::new([[udp::PacketMetadata::EMPTY; UDP_PACKET_COUNT]; SLOT_COUNT]),
+    loopback: UnsafeCell::new(LoopbackFrames::EMPTY),
 };
 
 fn current_owner() -> u8 {
@@ -270,6 +335,7 @@ owner_field!(
     udp_tx_meta,
     [[udp::PacketMetadata; UDP_PACKET_COUNT]; SLOT_COUNT]
 );
+owner_field!(loopback_frames, loopback, LoopbackFrames);
 
 fn free_tcp_buffer() -> Option<usize> {
     (0..SLOT_COUNT).find(|candidate| unsafe {
@@ -1010,7 +1076,7 @@ pub(crate) fn bind(slot: u8, address: u32, requested_port: u16) -> Result<u16, E
     if state.kind == Kind::Unix || state.local_port != 0 || state.remote.is_some() {
         return Err(Error::Invalid);
     }
-    if address != 0 && address != runtime.local_address {
+    if address != 0 && !is_local_address(runtime, address) {
         return Err(Error::AddressNotAvailable);
     }
     let port = if requested_port == 0 {
@@ -1273,6 +1339,9 @@ fn teardown() -> bool {
     let Some(runtime) = (unsafe { socket_runtime_state().take() }) else {
         return false;
     };
+    let loopback = unsafe { loopback_frames() };
+    loopback.head = 0;
+    loopback.count = 0;
     pci::quiesce_isolated_network(platform.device, platform.common)
         && runtime._translation.finish()
         && memory::scrub_and_release_frames(memory::FrameOwner::KERNEL, &[runtime._dma])
@@ -1295,10 +1364,8 @@ pub(crate) fn connect(slot: u8, remote: IpEndpoint) -> Result<(), Error> {
         state.local_port
     };
     if state.kind == Kind::Tcp
-        && remote.addr
-            == IpAddress::Ipv4(Ipv4Address::from_octets(
-                runtime.local_address.to_be_bytes(),
-            ))
+        && matches!(remote.addr, IpAddress::Ipv4(address)
+            if is_local_address(runtime, u32::from_be_bytes(address.octets())))
     {
         let listener = unsafe {
             socket_slots().iter().position(|candidate| {
@@ -2209,12 +2276,19 @@ fn poll() {
     let Some(runtime) = runtime_existing() else {
         return;
     };
-    runtime.tick = runtime.tick.wrapping_add(1);
-    let _ = runtime.interface.poll(
-        Instant::from_millis(runtime.tick),
-        &mut runtime.device,
-        &mut runtime.sockets,
-    );
+    // Frames sent to the interface's own addresses are received on the next
+    // pass, so a loopback exchange completes within one poll.
+    for _ in 0..LOOPBACK_FRAME_COUNT {
+        runtime.tick = runtime.tick.wrapping_add(1);
+        let _ = runtime.interface.poll(
+            Instant::from_millis(runtime.tick),
+            &mut runtime.device,
+            &mut runtime.sockets,
+        );
+        if unsafe { loopback_frames() }.count == 0 {
+            break;
+        }
+    }
     drain_shutdown_tcp_receivers(runtime);
 }
 
@@ -2282,7 +2356,7 @@ fn runtime() -> Result<&'static mut Runtime, Error> {
         let _ = memory::scrub_and_release_frames(memory::FrameOwner::KERNEL, &[dma]);
         return Err(Error::Unavailable);
     }
-    let mut device = unsafe { VirtioNet::new(dma_virtual, dma.address(), receive, transmit) };
+    let mut device = unsafe { VirtioNet::new(dma_virtual, dma.address(), receive, transmit, ipv4) };
     let mut config = InterfaceConfig::new(EthernetAddress(platform.initialization.mac).into());
     config.random_seed = u64::from(ipv4) << 32 | u64::from(gateway);
     let mut interface = Interface::new(config, &mut device, Instant::from_millis(0));
@@ -2290,6 +2364,10 @@ fn runtime() -> Result<&'static mut Runtime, Error> {
         let _ = addresses.push(IpCidr::new(
             IpAddress::Ipv4(Ipv4Address::from_octets(ipv4.to_be_bytes())),
             prefix,
+        ));
+        let _ = addresses.push(IpCidr::new(
+            IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)),
+            8,
         ));
     });
     if interface
@@ -2329,6 +2407,7 @@ struct VirtioNet {
     dma_device: u64,
     rx_notify: usize,
     tx_notify: usize,
+    local_address: u32,
     rx_avail: u16,
     rx_used: u16,
     tx_avail: u16,
@@ -2336,12 +2415,19 @@ struct VirtioNet {
 }
 
 impl VirtioNet {
-    unsafe fn new(dma: usize, dma_device: u64, rx_notify: usize, tx_notify: usize) -> Self {
+    unsafe fn new(
+        dma: usize,
+        dma_device: u64,
+        rx_notify: usize,
+        tx_notify: usize,
+        local_address: u32,
+    ) -> Self {
         let mut device = Self {
             dma,
             dma_device,
             rx_notify,
             tx_notify,
+            local_address,
             rx_avail: 0,
             rx_used: 0,
             tx_avail: 0,
@@ -2370,19 +2456,28 @@ impl VirtioNet {
     }
 }
 
-struct VirtioRxToken(*mut VirtioNet, usize);
+enum NetworkRxToken {
+    Virtio(*mut VirtioNet, usize),
+    Loopback,
+}
 struct VirtioTxToken(*mut VirtioNet);
 
-impl RxToken for VirtioRxToken {
+impl RxToken for NetworkRxToken {
     fn consume<R, F>(self, callback: F) -> R
     where
         F: FnOnce(&[u8]) -> R,
     {
+        let Self::Virtio(device, length) = self else {
+            let frames = unsafe { loopback_frames() };
+            let result = callback(frames.front());
+            frames.pop();
+            return result;
+        };
         unsafe {
-            let device = &mut *self.0;
+            let device = &mut *device;
             let bytes = core::slice::from_raw_parts(
                 (device.dma + RX_BUFFER_OFFSET + VIRTIO_HEADER_LENGTH) as *const u8,
-                self.1,
+                length,
             );
             let result = callback(bytes);
             device.rx_used = device.rx_used.wrapping_add(1);
@@ -2413,6 +2508,10 @@ impl TxToken for VirtioTxToken {
                 length,
             );
             let result = callback(bytes);
+            if frame_loops_back(bytes, device.local_address) {
+                loopback_frames().push(bytes);
+                return result;
+            }
             write_u64(
                 device.dma + TX_DESC_OFFSET,
                 device.dma_device + TX_BUFFER_OFFSET as u64,
@@ -2438,7 +2537,7 @@ impl TxToken for VirtioTxToken {
 
 impl Device for VirtioNet {
     type RxToken<'a>
-        = VirtioRxToken
+        = NetworkRxToken
     where
         Self: 'a;
     type TxToken<'a>
@@ -2447,6 +2546,9 @@ impl Device for VirtioNet {
         Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        if unsafe { loopback_frames() }.count != 0 {
+            return Some((NetworkRxToken::Loopback, VirtioTxToken(self as *mut Self)));
+        }
         let used = unsafe { read_u16(self.dma + RX_USED_OFFSET + 2) };
         if used == self.rx_used {
             return None;
@@ -2454,7 +2556,10 @@ impl Device for VirtioNet {
         let element = self.dma + RX_USED_OFFSET + 4 + usize::from(self.rx_used % QUEUE_SIZE) * 8;
         let length = unsafe { read_u32(element + 4) as usize }.checked_sub(VIRTIO_HEADER_LENGTH)?;
         let pointer = self as *mut Self;
-        Some((VirtioRxToken(pointer, length), VirtioTxToken(pointer)))
+        Some((
+            NetworkRxToken::Virtio(pointer, length),
+            VirtioTxToken(pointer),
+        ))
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
