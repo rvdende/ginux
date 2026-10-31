@@ -9184,6 +9184,10 @@ extern "sysv64" fn linux_syscall_handler(
         return LINUX_RETURN_TO_KERNEL;
     }
     let runtime_mode = LINUX_RUNTIME_MODE.load(Ordering::SeqCst);
+    // A blocking call may return into another thread. Signals raised on the
+    // way out belong to the thread that made the call, whose context is
+    // `syscall_return`; they wait for its next call in that case.
+    let calling_thread = current_linux_thread_handle();
     let _profile = LinuxBootSyscallProfile::start(number, runtime_mode);
     let trace_index = if !matches!(
         number,
@@ -10526,12 +10530,17 @@ extern "sysv64" fn linux_syscall_handler(
     } else {
         result
     };
-    let result = if real_timer_expired {
+    let same_thread = current_linux_thread_handle() == calling_thread;
+    let result = if real_timer_expired && same_thread {
         linux_real_timer_signal(registers, syscall_return, (user_rip, user_rflags), result)
     } else {
+        if real_timer_expired {
+            ELF_PROBE_PENDING_SIGNALS.fetch_or(1 << (LINUX_SIGALRM - 1), Ordering::SeqCst);
+        }
         result
     };
     let result = if runtime_mode
+        && same_thread
         && result != LINUX_RETURN_TO_KERNEL
         && result != LINUX_RETURN_FROM_SIGNAL
         && number != LINUX_RT_SIGRETURN_SYSCALL
