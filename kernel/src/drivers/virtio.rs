@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Modern (1.x) virtio over PCI for drivers in the kernel, polled.
 //!
 //! [`probe`] reads a function's virtio capabilities from configuration space

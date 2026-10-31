@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 const ELF_HEADER_SIZE: usize = 64;
 const PROGRAM_HEADER_SIZE: usize = 56;
 const DYNAMIC_ENTRY_SIZE: usize = 16;

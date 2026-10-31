@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 pub(super) const LINUX_READ_SYSCALL: u64 = 0;
 pub(super) const LINUX_WRITE_SYSCALL: u64 = 1;
 pub(super) const LINUX_OPEN_SYSCALL: u64 = 2;

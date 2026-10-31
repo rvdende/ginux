@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! USB Audio Class 1 and 2 playback descriptors: which streaming interface
 //! settings carry PCM to a device, the clock that sets their rate, what they
 //! are wired to, and how 48 kHz samples split into isochronous packets.

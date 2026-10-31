@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! GUID partition table parsing, and the only route to writing a disk.
 //!
 //! A [`WritableExtent`] names the blocks of one partition of the Ginux volume

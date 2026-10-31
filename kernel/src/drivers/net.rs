@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! What bring-up needs from a network controller, and a DHCP probe that
 //! shows a controller can send and receive on a real network.
 //!

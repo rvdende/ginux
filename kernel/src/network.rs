@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, Ordering};
 
 pub(crate) const NETWORK_NAME_SIZE: usize = 16;

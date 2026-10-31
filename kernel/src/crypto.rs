@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 const INITIAL_STATE: [u32; 8] = [
     0x6a09_e667,
     0xbb67_ae85,

@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 const MAGIC: &[u8; 8] = b"GINXBIN\0";
 const VERSION: u16 = 2;
 const HEADER_SIZE: usize = 40;

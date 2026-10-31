@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! The virtio-gpu 2D command protocol (virtio 1.2, section 5.7), as bytes.
 //!
 //! The kernel driver owns the device, its queues and their DMA memory; this

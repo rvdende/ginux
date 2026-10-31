@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 #![no_std]
 
 use sha2::{Digest, Sha256};

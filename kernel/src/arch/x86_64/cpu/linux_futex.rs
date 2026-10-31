@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 use super::*;
 
 static LINUX_PROFILE_FIRST_FUTEX_OPERATION: AtomicU64 = AtomicU64::new(u64::MAX);

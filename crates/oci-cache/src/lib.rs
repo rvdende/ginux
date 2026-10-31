@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 #![no_std]
 
 pub const ENTRY_LIMIT: usize = 32;

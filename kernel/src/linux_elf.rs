@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 use core::num::NonZeroU64;
 
 const ELF_HEADER_SIZE: usize = 64;

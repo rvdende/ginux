@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 const MAX_CAPABILITIES: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

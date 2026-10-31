@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 #![no_std]
 
 pub const ETHERNET_ARP_FRAME_SIZE: usize = 42;

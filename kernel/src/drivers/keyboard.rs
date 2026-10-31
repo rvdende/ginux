@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Translation of USB HID boot-protocol keyboard reports into console bytes
 //! for a US layout.
 

@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 #![no_std]
 
 use ginux_volume_format::{

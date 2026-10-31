@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 #![no_std]
 
 pub const NATIVE_SERVICE_BOOT_MAGIC: u64 = 0x3042_5358_554e_4947;

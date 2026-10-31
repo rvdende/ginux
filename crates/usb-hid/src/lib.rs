@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! USB HID input reports as Linux input events: boot-protocol keyboards and
 //! mice, and QEMU's USB tablet.
 //!
