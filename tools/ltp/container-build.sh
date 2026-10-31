@@ -1,0 +1,132 @@
+#!/bin/sh
+# Runs inside the Alpine builder container started by tools/ltp/build.sh.
+#   /cache    the verified LTP release tarball (read-only)
+#   /scripts  tools/ltp (read-only)
+#   /work     the persistent build tree (target/ltp-build[-VARIANT] on the host)
+#   /out      the published tree and tarballs (build/ltp[-VARIANT] on the host)
+set -eu
+
+# Files written here are owned by root; hand them back to the host user.
+fix_owner() { chown -R "$HOST_UID:$HOST_GID" /work /out 2>/dev/null || true; }
+trap fix_owner EXIT
+
+apk add --no-cache --quiet \
+    build-base linux-headers autoconf automake bash perl pkgconf \
+    tar gzip xz findutils libaio-dev libcap-dev libcap-static
+
+# The guest-side runner that tests/qemu/ltp.sh starts in the domain.
+gcc -static-pie -fPIE -O2 -Wall -Wextra -Werror -o /out/ltp-runner.new /scripts/ltp-runner.c
+strip --strip-all /out/ltp-runner.new
+mv /out/ltp-runner.new /out/ltp-runner
+if [ "${RUNNER_ONLY:-0}" = 1 ]; then
+    exit 0
+fi
+
+src="/work/ltp-full-$LTP_VERSION"
+# Changing these options rebuilds from a fresh source tree.
+#
+# Static position-independent executables (static-pie): Ginux loads a file
+# written at runtime only if it is position independent; its fixed-address
+# (ET_EXEC) loader takes only tiny programs (5 code pages, 8 in all).
+cflags="-O2 -pipe -fPIE"
+ldflags="-static-pie"
+case "${VARIANT:-}" in
+    "") ;;
+    no-oom-protection)
+        # See tools/ltp/no-oom-protection.c: a diagnostic build only.
+        gcc -c -O2 -fPIE -Wall -Wextra -Werror -o /work/no-oom-protection.o \
+            /scripts/no-oom-protection.c
+        ldflags="$ldflags -Wl,-z,muldefs /work/no-oom-protection.o"
+        ;;
+    *) echo "unknown variant $VARIANT" >&2; exit 2 ;;
+esac
+configure_args="--prefix=/opt/ltp CFLAGS=$cflags LDFLAGS=$ldflags"
+stamp="$src/.ginux-configured"
+
+if [ ! -f "$stamp" ] || [ "$(cat "$stamp")" != "$configure_args" ]; then
+    echo "Configuring LTP $LTP_VERSION"
+    rm -rf "$src"
+    tar -xJf "/cache/ltp-full-$LTP_VERSION.tar.xz" -C /work
+    cd "$src"
+    ./configure --prefix=/opt/ltp CFLAGS="$cflags" LDFLAGS="$ldflags" >/work/configure.log 2>&1 ||
+        { tail -n 40 /work/configure.log; exit 1; }
+    printf '%s\n' "$configure_args" >"$stamp"
+fi
+cd "$src"
+
+echo "Compiling with $JOBS jobs (log: make.log in the build tree)"
+# libltp.a must build; the helper libraries are built up front so parallel
+# test directories do not race to build them.
+make -j"$JOBS" -C lib >/work/make-lib.log 2>&1 ||
+    { tail -n 40 /work/make-lib.log; exit 1; }
+make -j"$JOBS" -k -C libs >/work/make-libs.log 2>&1 || true
+make -j"$JOBS" -k -C testcases/lib >/work/make-testcases-lib.log 2>&1 || true
+
+# LTP's directory loop stops at the first directory that fails, so every
+# leaf directory is built on its own, in parallel, with -k: a test that does
+# not build under musl is skipped, not patched.
+#
+# runtest/syscalls also names a few tests that live elsewhere (dirtyc0w,
+# msgstress01, pipeio, ...); their directories are built too.
+{
+    find testcases/kernel/syscalls -mindepth 2 -name Makefile | sed 's,/Makefile$,,'
+    awk '!/^#/ && NF { print $2 ".c" }' runtest/syscalls >/work/runtest-sources.txt
+    find testcases/kernel -path testcases/kernel/syscalls -prune -o -name '*.c' -print |
+        awk -F/ 'NR == FNR { want[$0]; next } ($NF in want) { sub("/[^/]*$", ""); print }' \
+            /work/runtest-sources.txt -
+} | LC_ALL=C sort -u >/work/leaf-dirs.txt
+xargs -P "$JOBS" -I{} sh -c 'make -k -C "$1" >"$1/.ginux-make.log" 2>&1 || true' sh {} \
+    </work/leaf-dirs.txt
+while IFS= read -r dir; do cat "$dir/.ginux-make.log"; done </work/leaf-dirs.txt >/work/make.log
+
+echo "Installing"
+rm -rf /work/install
+xargs -I{} sh -c 'make -k -C "$1" install DESTDIR=/work/install || true' sh {} \
+    </work/leaf-dirs.txt >/work/install.log 2>&1
+make -k -C testcases/lib install DESTDIR=/work/install >>/work/install.log 2>&1 || true
+root=/work/install/opt/ltp
+
+# Map each test binary to its syscall directory, for grouping results.
+while IFS= read -r dir; do
+    for file in "$dir"/*; do
+        if [ -f "$file" ] && [ -x "$file" ] &&
+            [ "$(od -An -tx1 -N4 "$file" | tr -d ' ')" = 7f454c46 ]; then
+            printf '%s\t%s\n' "${file##*/}" "${dir#testcases/kernel/}"
+        fi
+    done
+done </work/leaf-dirs.txt | LC_ALL=C sort >/work/test-dirs.txt
+mkdir -p "$root/runtest"
+cp runtest/syscalls "$root/runtest/syscalls"
+cp VERSION "$root/VERSION"
+
+# Strip every ELF file; shell helpers are left alone.
+find "$root" -type f | while IFS= read -r file; do
+    if [ "$(od -An -tx1 -N4 "$file" | tr -d ' ')" = 7f454c46 ]; then
+        strip --strip-all "$file"
+    fi
+done
+
+rm -rf /out/ltp /out/ltp.tar.gz /out/ltp.tar.xz
+cp -a "$root" /out/ltp
+cp /work/test-dirs.txt /out/test-dirs.txt
+find /out/ltp/testcases/bin -maxdepth 1 -type f |
+    while IFS= read -r file; do
+        if [ "$(od -An -tx1 -N4 "$file" | tr -d ' ')" = 7f454c46 ]; then
+            basename "$file"
+        fi
+    done | LC_ALL=C sort >/out/binaries.txt
+
+# Each failed make target appears as "*** [rule: TARGET] Error N".
+grep -o '\*\*\* \[[^]]*\] Error [0-9]*' /work/make.log |
+    sed 's/^\*\*\* \[.*: \([^]]*\)\] Error [0-9]*$/\1/' |
+    LC_ALL=C sort -u >/out/build-failures.txt || true
+
+# Reproducible tarballs: fixed order, owner and timestamps (the release
+# date). The static binaries share most of their code, which gzip's 32 KiB
+# window cannot see but xz's dictionary can: the .tar.xz is about a tenth of
+# the .tar.gz, so the QEMU test downloads that one into the domain.
+tar --sort=name --mtime=@1790726400 --owner=0 --group=0 --numeric-owner \
+    -C /out -cf /work/ltp.tar ltp
+gzip -n -9 -c /work/ltp.tar >/out/ltp.tar.gz
+xz -9 -T1 -c /work/ltp.tar >/out/ltp.tar.xz
+rm -f /work/ltp.tar

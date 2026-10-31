@@ -1,0 +1,35 @@
+#!/bin/sh
+# Runs in the domain's init shell (busybox ash): fetches the LTP tree, the
+# runner and the run list from the host's HTTP server, then execs the runner
+# as the domain's init. Used by tests/ltp/driver.py.
+#
+#   sh setup.sh BASE_URL FIRST_INDEX
+base=$1
+first=$2
+
+fail() {
+    echo "@@LTP SETUP_FAILED $*"
+    exit 1
+}
+
+mkdir -p /opt /tmp/ltp || fail mkdir
+if [ ! -f /opt/ltp/runtest/syscalls ]; then
+    wget -q -O - "$base/ltp.tar.xz" | xzcat | tar -xf - -C /opt
+    [ -f /opt/ltp/runtest/syscalls ] || fail "LTP tree download or extraction"
+fi
+wget -q -O /opt/ltp/ltp-runner "$base/ltp-runner" || fail "runner download"
+chmod +x /opt/ltp/ltp-runner || fail chmod
+wget -q -O /opt/ltp/runlist.txt "$base/runlist.txt" || fail "run list download"
+
+export LTPROOT=/opt/ltp
+export PATH=/opt/ltp/testcases/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export TMPDIR=/tmp/ltp
+export LTP_COLORIZE_OUTPUT=0
+# Tests that loop for a runtime (races, stress) run a tenth of it; the run
+# list's budgets (tools/ltp/make-list.py) assume this.
+export LTP_RUNTIME_MUL=0.1
+# Ginux has no kernel .config (/proc/config.gz); without this, every test
+# that checks a CONFIG_ option stops with "TBROK: Cannot parse kernel
+# .config". LTP's switch treats the options as present, so they run.
+export KCONFIG_SKIP_CHECK=1
+exec /opt/ltp/ltp-runner /opt/ltp/runlist.txt "$first"
