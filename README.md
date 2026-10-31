@@ -245,13 +245,25 @@ the QEMU virtio devices and an Intel VT-d IOMMU. On any other machine Ginux
 enters **hardware bring-up mode**: it shows its console on the UEFI framebuffer
 (no serial port needed), reports memory, ACPI tables, CPUs, the IOMMU type, and
 every PCI device, and runs the physical-hardware drivers in `kernel/src/drivers`:
-read-only NVMe and AHCI (SATA) drivers that list GPT partitions, and an xHCI
-driver that runs USB boot keyboards on the root ports of every controller. With a keyboard or serial port it then offers a
-small bring-up shell (`help`, `pci`, `acpi`, `mem`, `disks`, `reboot`,
-`poweroff`). Nothing in bring-up mode writes to storage. `make
-test-hardware-profile` boots an AMD IOMMU, NVMe, AHCI, and xHCI QEMU machine
-and a SATA disk without virtio, types a command on one of two emulated USB
-keyboards, and checks the framebuffer console with no serial port.
+
+- AMD-Vi DMA remapping: each device Ginux drives can reach only its driver's
+  buffers, display controllers keep untranslated access for the firmware
+  framebuffer, and every other device is blocked. A self-test asks the NVMe
+  controller to write outside its buffers and checks that the write is stopped.
+- Read-only NVMe and AHCI (SATA) drivers that list GPT partitions.
+- An xHCI driver that runs USB boot keyboards on every controller, including
+  keyboards behind USB hubs (up to five tiers, with transaction translators
+  for low- and full-speed devices behind high-speed hubs).
+- Polled Ethernet for the Intel 82574 and the Realtek RTL8125/RTL8126, checked
+  by broadcasting a DHCP discover and reporting the offer. The Realtek path
+  follows Linux's r8169 register layout and has not run on hardware yet.
+
+With a keyboard or serial port it then offers a small bring-up shell (`help`,
+`pci`, `acpi`, `mem`, `disks`, `net`, `reboot`, `poweroff`). Nothing in bring-up
+mode writes to storage. `make test-hardware-profile` boots a QEMU machine with an
+AMD IOMMU, an e1000e on a DHCP network, NVMe, AHCI, two xHCI controllers (one
+keyboard behind a hub), and a SATA disk without virtio, types a command on an
+emulated USB keyboard, and checks the framebuffer console with no serial port.
 
 Bringing up a specific machine starts with `sudo tools/hardware/probe.sh`, run
 under an existing Linux installation on that machine, which archives the

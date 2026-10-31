@@ -8,8 +8,10 @@
 
 pub(crate) mod ahci;
 pub(crate) mod amd_iommu;
+pub(crate) mod e1000e;
 pub(crate) mod gpt;
 pub(crate) mod keyboard;
+pub(crate) mod net;
 pub(crate) mod nvme;
 pub(crate) mod pci;
 pub(crate) mod realtek;
@@ -51,6 +53,23 @@ pub(crate) trait BlockDevice {
 
     /// Reads `count` blocks starting at `block`, at most one 4 KiB page.
     fn read_blocks(&mut self, block: u64, count: u32) -> Option<&[u8]>;
+}
+
+/// Memory a driver lets its device reach by DMA, which the I/O MMU maps for
+/// that device and no other.
+#[derive(Clone, Copy)]
+pub(crate) struct DmaRegion {
+    pub(crate) start: u64,
+    pub(crate) length: u64,
+}
+
+impl DmaRegion {
+    fn of<T>(object: *const T) -> Self {
+        Self {
+            start: object as u64,
+            length: core::mem::size_of::<T>() as u64,
+        }
+    }
 }
 
 /// A 4 KiB page usable as a DMA buffer: the kernel image is identity mapped,

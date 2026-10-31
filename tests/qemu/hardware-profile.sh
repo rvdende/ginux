@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Boot Ginux on a QEMU machine shaped like a physical AMD desktop instead of the
-# virtio reference profile: AMD IOMMU, an NVMe SSD with a GPT disk, AHCI,
+# virtio reference profile: AMD IOMMU with DMA remapping, an e1000e NIC on a
+# network with a DHCP server, an NVMe SSD with a GPT disk, AHCI,
 # xHCI with USB keyboards (one behind a hub), a VGA framebuffer, and no virtio
 # devices.
 #
@@ -75,7 +76,7 @@ boot_profile() {
         -no-reboot \
         -netdev user,id=net0,restrict=on \
         -device e1000e,netdev=net0 \
-        -device amd-iommu \
+        -device amd-iommu,dma-remap=on \
         -device qemu-xhci,id=xhci \
         -device usb-tablet,bus=xhci.0 \
         -device usb-kbd,bus=xhci.0 \
@@ -159,7 +160,10 @@ for expected in \
     'MiB Linux filesystem "sata-data"' \
     'NotBootKeyboard(' \
     'by firmware, status' \
-    '8086:10d3 has no driver yet' \
+    'Intel 82574, MAC 52:54:00:12:34:56, link up' \
+    'DHCP offer 10.0.2.15 from 10.0.2.2' \
+    'DMA remapping on; 5 devices confined' \
+    'AMD-Vi blocked a stray DMA from this controller' \
     'keyboard 0627:0001 on port' \
     'hub with 8 ports' \
     'keyboard 0627:0001 on port 5.2' \

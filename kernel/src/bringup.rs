@@ -9,7 +9,10 @@
 
 use core::ptr::read_unaligned;
 
-use crate::drivers::{ahci, amd_iommu, gpt, keyboard, nvme, pci, realtek, say, xhci, BlockDevice};
+use crate::drivers::net::{self, Nic};
+use crate::drivers::{
+    ahci, amd_iommu, e1000e, gpt, keyboard, nvme, pci, realtek, say, xhci, BlockDevice,
+};
 use crate::{BootInfo, UefiMemoryDescriptor, EFI_BOOT_SERVICES_CODE, EFI_BOOT_SERVICES_DATA};
 
 const EFI_LOADER_CODE: u32 = 1;
@@ -45,10 +48,11 @@ pub(crate) fn run(boot_info: &BootInfo) -> ! {
         );
     }
     report_memory(boot_info);
-    report_acpi(boot_info.acpi_rsdp as u64);
+    let iommus = report_acpi(boot_info.acpi_rsdp as u64);
     report_pci();
+    let mut remapping = enable_dma_remapping(&iommus);
     report_network();
-    report_disks();
+    report_disks(&mut remapping);
     let keyboards = open_keyboards();
 
     if keyboards.iter().all(Option::is_none)
@@ -101,6 +105,8 @@ fn report_pci() {
 }
 
 fn report_network() {
+    // One probe per boot is enough to tell offers apart.
+    static mut TRANSACTION: u32 = 0x6769_6e00;
     pci::for_each_function(|device| {
         if device.class != 0x02 {
             return;
@@ -112,6 +118,26 @@ fn report_network() {
             address.device,
             address.function
         );
+        // SAFETY: bring-up runs on one CPU and only here uses the counter.
+        let transaction = unsafe {
+            TRANSACTION = TRANSACTION.wrapping_add(1);
+            TRANSACTION
+        };
+        if e1000e::is_supported(&device) {
+            // SAFETY: bring-up is the only driver of this controller, and the
+            // firmware identity map covers its registers and DMA pages.
+            let Some(mut nic) = (unsafe { e1000e::Controller::open(address) }) else {
+                say!("Intel 82574 reset failed\n");
+                return;
+            };
+            say!(
+                "Intel 82574, MAC {}, {}\n",
+                net::Mac(nic.mac()),
+                if nic.link_up() { "link up" } else { "no link" }
+            );
+            report_dhcp(&mut nic, transaction);
+            return;
+        }
         if !realtek::is_supported(&device) {
             say!(
                 "{:04x}:{:04x} has no driver yet\n",
@@ -126,17 +152,11 @@ fn report_network() {
             say!("Realtek {:04x} registers unavailable\n", device.device);
             return;
         };
-        let mac = report.mac;
         say!(
-            "Realtek {:04x} chip {:#x}, MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, ",
+            "Realtek {:04x} chip {:#x}, MAC {}, ",
             device.device,
             report.chip,
-            mac[0],
-            mac[1],
-            mac[2],
-            mac[3],
-            mac[4],
-            mac[5]
+            net::Mac(report.mac)
         );
         match report.speed {
             Some(speed) => say!(
@@ -146,13 +166,51 @@ fn report_network() {
             ),
             None => say!("no link\n"),
         }
+        if !realtek::can_transfer(&device) || report.speed.is_none() {
+            return;
+        }
+        // SAFETY: as for the 82574 above.
+        match unsafe { realtek::Controller::open(address) } {
+            Some(mut nic) => {
+                if nic.link_speed().is_none() {
+                    say!("ginux:   link did not return after reset\n");
+                }
+                report_dhcp(&mut nic, transaction);
+            }
+            None => say!("ginux:   reset failed\n"),
+        }
     });
 }
 
-fn report_disks() {
+/// Broadcasts a DHCP discover on `nic` and reports the offer, which shows
+/// that the controller can send and receive.
+fn report_dhcp(nic: &mut impl Nic, transaction: u32) {
+    match net::dhcp_discover(nic, transaction) {
+        Some(offer) => {
+            say!(
+                "ginux:   DHCP offer {} from {}",
+                net::Ipv4(offer.address),
+                net::Ipv4(offer.server)
+            );
+            if let Some(subnet) = offer.subnet {
+                say!(", netmask {}", net::Ipv4(subnet));
+            }
+            if let Some(router) = offer.router {
+                say!(", router {}", net::Ipv4(router));
+            }
+            if let Some(dns) = offer.dns {
+                say!(", DNS {}", net::Ipv4(dns));
+            }
+            say!("\n");
+        }
+        None => say!("ginux:   no DHCP offer\n"),
+    }
+}
+
+fn report_disks(remapping: &mut Remapping) {
     let (controllers, _) = functions(pci::Identity::is_nvme);
     for function in controllers.iter().flatten() {
-        probe_nvme(*function);
+        probe_nvme(*function, remapping);
     }
     let (controllers, _) = functions(pci::Identity::is_ahci);
     let mut slot = 0;
@@ -315,9 +373,11 @@ fn run_command(boot_info: &BootInfo, line: &[u8]) {
         }
         "pci" => report_pci(),
         "net" => report_network(),
-        "acpi" => report_acpi(boot_info.acpi_rsdp as u64),
+        "acpi" => {
+            report_acpi(boot_info.acpi_rsdp as u64);
+        }
         "mem" => report_memory(boot_info),
-        "disks" => report_disks(),
+        "disks" => report_disks(&mut [const { None }; MAX_IOMMUS]),
         "clear" => say!("\x1b[2J\x1b[H"),
         "echo" => say!("{}\n", argument),
         "reboot" => reset(boot_info, EFI_RESET_COLD),
@@ -369,13 +429,15 @@ fn report_memory(boot_info: &BootInfo) {
     );
 }
 
-fn report_acpi(rsdp: u64) {
+/// Reports the ACPI tables and returns the AMD-Vi units IVRS lists.
+fn report_acpi(rsdp: u64) -> [u64; MAX_IOMMUS] {
+    let mut iommus = [0_u64; MAX_IOMMUS];
     // SAFETY: the firmware identity map covers its ACPI tables; every read is
     // bounded by the table lengths the firmware recorded.
     unsafe {
         if rsdp == 0 || read_bytes::<8>(rsdp) != *b"RSD PTR " {
             say!("ginux: ACPI root pointer missing\n");
-            return;
+            return iommus;
         }
         let revision = read_unaligned((rsdp + 15) as *const u8);
         let (root, entry_size) = if revision >= 2 {
@@ -384,7 +446,6 @@ fn report_acpi(rsdp: u64) {
             (u64::from(read_unaligned((rsdp + 16) as *const u32)), 4)
         };
         let length = u64::from(read_unaligned((root + 4) as *const u32));
-        let mut iommus = [0_u64; MAX_IOMMUS];
         say!("ginux: ACPI tables:");
         let mut offset = 36;
         while offset + entry_size <= length {
@@ -409,7 +470,7 @@ fn report_acpi(rsdp: u64) {
             }
         }
         say!("\n");
-        for base in iommus.into_iter().filter(|base| *base != 0) {
+        for base in iommus.iter().copied().filter(|base| *base != 0) {
             // SAFETY: the base comes from IVRS and the firmware identity map
             // covers it; the registers read have no side effects.
             let report = amd_iommu::probe(base);
@@ -426,6 +487,136 @@ fn report_acpi(rsdp: u64) {
             let _ = report.write_features(&mut crate::drivers::Console);
             say!("\n");
         }
+    }
+    iommus
+}
+
+/// The AMD-Vi units with remapping on.
+type Remapping = [Option<amd_iommu::Remapping>; MAX_IOMMUS];
+
+/// Turns on DMA remapping on every AMD-Vi unit. Devices Ginux drives reach
+/// only their driver's buffers, display controllers keep untranslated access
+/// for the firmware framebuffer, and every other device is blocked.
+fn enable_dma_remapping(iommus: &[u64; MAX_IOMMUS]) -> Remapping {
+    let mut units = [const { None }; MAX_IOMMUS];
+    if iommus.iter().all(|base| *base == 0) {
+        return units;
+    }
+    let (xhci, nvme, ahci) = (
+        xhci::dma_regions(),
+        nvme::dma_regions(),
+        ahci::dma_regions(),
+    );
+    let (intel, realtek) = (e1000e::dma_regions(), realtek::dma_regions());
+    // SAFETY: no unit is enabled yet, and bring-up runs on one CPU.
+    let mut table = unsafe { amd_iommu::DeviceTableBuilder::new() };
+    let (mut confined, mut passthrough, mut blocked) = (0, 0, 0);
+    let mut failure = None;
+    pci::for_each_function(|device| {
+        let access = if device.is_xhci() {
+            amd_iommu::Access::Regions(&xhci)
+        } else if device.is_nvme() {
+            amd_iommu::Access::Regions(&nvme)
+        } else if device.is_ahci() {
+            amd_iommu::Access::Regions(&ahci)
+        } else if e1000e::is_supported(&device) {
+            amd_iommu::Access::Regions(&intel)
+        } else if realtek::can_transfer(&device) {
+            amd_iommu::Access::Regions(&realtek)
+        } else if device.class == 0x03 {
+            amd_iommu::Access::Passthrough
+        } else {
+            amd_iommu::Access::Blocked
+        };
+        match access {
+            amd_iommu::Access::Regions(_) => confined += 1,
+            amd_iommu::Access::Passthrough => passthrough += 1,
+            amd_iommu::Access::Blocked => blocked += 1,
+        }
+        if let Err(error) = table.assign(device.address.requester_id(), access) {
+            failure = Some(error);
+        }
+    });
+    if let Some(error) = failure {
+        say!("ginux: AMD-Vi remapping not enabled: {:?}\n", error);
+        return units;
+    }
+    for (slot, base) in iommus.iter().enumerate() {
+        if *base == 0 {
+            continue;
+        }
+        // SAFETY: the base comes from IVRS, the firmware identity map covers
+        // it, and bring-up is the only code driving the unit.
+        match unsafe { amd_iommu::Remapping::enable(*base, &table) } {
+            Ok(unit) => {
+                say!(
+                    "ginux: AMD-Vi {:#x}: DMA remapping on; {} devices confined to their \
+                     driver's buffers, {} displays passed through, {} blocked\n",
+                    base,
+                    confined,
+                    passthrough,
+                    blocked
+                );
+                units[slot] = Some(unit);
+            }
+            Err(error) => say!("ginux: AMD-Vi {:#x}: remapping failed: {:?}\n", base, error),
+        }
+    }
+    units
+}
+
+/// Checks that remapping stops `controller` from writing outside its own
+/// buffers, by asking it to read a block into a page it was not given.
+fn verify_dma_confinement(
+    controller: &mut nvme::Controller,
+    function: pci::Function,
+    remapping: &mut Remapping,
+) {
+    static mut PROBE: crate::drivers::DmaPage = crate::drivers::DmaPage::ZERO;
+    let probe = core::ptr::addr_of_mut!(PROBE);
+    // SAFETY: only this check uses the probe page.
+    unsafe { (*probe).0.fill(0x5a) };
+    let result = controller.read_block_to(0, probe as u64);
+    // SAFETY: as above; a successful stray DMA would have changed it.
+    let untouched = unsafe { (*probe).0.iter().all(|byte| *byte == 0x5a) };
+    // Emulated units may log faults with nonstandard encodings, so any
+    // event from the controller counts as evidence; the page is the test.
+    let mut fault = None;
+    for unit in remapping.iter_mut().flatten() {
+        while let Some(event) = unit.next_fault() {
+            if event.device == function.requester_id() {
+                fault.get_or_insert(event);
+            }
+        }
+    }
+    if untouched {
+        say!(
+            "ginux:   AMD-Vi blocked a stray DMA from this controller to {:#x}",
+            probe as u64
+        );
+        match fault {
+            Some(fault) => say!(
+                " (event {:#x} at {:#x}{})\n",
+                fault.code,
+                fault.address,
+                if fault.is_page_fault() {
+                    ", I/O page fault"
+                } else {
+                    ""
+                }
+            ),
+            None => say!(" (no event logged)\n"),
+        }
+    } else {
+        say!(
+            "ginux:   WARNING: AMD-Vi did not stop a stray DMA to {:#x} (command {})\n",
+            probe as u64,
+            if result.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            }
+        );
     }
 }
 
@@ -501,7 +692,7 @@ unsafe fn read_bytes<const N: usize>(address: u64) -> [u8; N] {
     read_unaligned(address as *const [u8; N])
 }
 
-fn probe_nvme(function: pci::Function) {
+fn probe_nvme(function: pci::Function, remapping: &mut Remapping) {
     say!(
         "ginux: NVMe {:02x}:{:02x}.{}: ",
         function.bus,
@@ -542,6 +733,9 @@ fn probe_nvme(function: pci::Function) {
         unit
     );
     list_partitions(&mut controller);
+    if remapping.iter().any(Option::is_some) {
+        verify_dma_confinement(&mut controller, function, remapping);
+    }
 }
 
 fn list_partitions(disk: &mut impl BlockDevice) {

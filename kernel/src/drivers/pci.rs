@@ -30,6 +30,11 @@ pub(crate) struct Identity {
 }
 
 impl Function {
+    /// The 16-bit requester ID the function's DMA carries.
+    pub(crate) fn requester_id(self) -> u16 {
+        u16::from(self.bus) << 8 | u16::from(self.device) << 3 | u16::from(self.function)
+    }
+
     pub(crate) fn read_u32(self, offset: u8) -> u32 {
         let address = 0x8000_0000
             | u32::from(self.bus) << 16

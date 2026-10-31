@@ -8,10 +8,10 @@
 //! controller without keyboards returns its pages. Hubs are not supported yet,
 //! so keyboards must be on root ports.
 
-use core::ptr::addr_of_mut;
+use core::ptr::{addr_of, addr_of_mut};
 
 use super::pci::Function;
-use super::{delay_ms, say, wait_until_ms, DmaPage};
+use super::{delay_ms, say, wait_until_ms, DmaPage, DmaRegion};
 
 const CAP_LENGTH: usize = 0x00;
 const CAP_STRUCTURAL_1: usize = 0x04;
@@ -107,6 +107,11 @@ const POOL_PAGES: usize = 1536;
 
 static mut POOL: [DmaPage; POOL_PAGES] = [DmaPage::ZERO; POOL_PAGES];
 static mut POOL_NEXT: usize = 0;
+
+/// The memory xHCI controllers may reach by DMA.
+pub(crate) fn dma_regions() -> [DmaRegion; 1] {
+    [DmaRegion::of(addr_of!(POOL))]
+}
 
 /// Takes `count` zeroed, contiguous pages from the DMA pool.
 fn pool_pages(count: usize) -> Option<*mut DmaPage> {

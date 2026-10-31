@@ -7,7 +7,7 @@
 use core::ptr::{addr_of, addr_of_mut};
 
 use super::pci::Function;
-use super::{wait_until_ms, BlockDevice, DmaPage};
+use super::{wait_until_ms, BlockDevice, DmaPage, DmaRegion};
 
 const HBA_GLOBAL_CONTROL: usize = 0x04;
 const HBA_PORTS_IMPLEMENTED: usize = 0x0c;
@@ -50,6 +50,15 @@ pub(crate) const MAX_PORTS: usize = 8;
 static mut COMMAND_LISTS: [DmaPage; MAX_PORTS] = [DmaPage::ZERO; MAX_PORTS];
 static mut COMMAND_TABLES: [DmaPage; MAX_PORTS] = [DmaPage::ZERO; MAX_PORTS];
 static mut BUFFERS: [DmaPage; MAX_PORTS] = [DmaPage::ZERO; MAX_PORTS];
+
+/// The memory AHCI controllers may reach by DMA.
+pub(crate) fn dma_regions() -> [DmaRegion; 3] {
+    [
+        DmaRegion::of(addr_of!(COMMAND_LISTS)),
+        DmaRegion::of(addr_of!(COMMAND_TABLES)),
+        DmaRegion::of(addr_of!(BUFFERS)),
+    ]
+}
 
 // The fields are reported through Debug, which dead-code analysis ignores.
 #[allow(dead_code)]

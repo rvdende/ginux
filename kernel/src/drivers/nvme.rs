@@ -8,7 +8,7 @@
 use core::ptr::{addr_of, addr_of_mut};
 
 use super::pci::Function;
-use super::{wait_until, BlockDevice, DmaPage};
+use super::{wait_until, BlockDevice, DmaPage, DmaRegion};
 
 const REGISTER_CAPABILITIES: usize = 0x00;
 const REGISTER_VERSION: usize = 0x08;
@@ -192,6 +192,22 @@ impl Controller {
         Ok(&page.0[..bytes as usize])
     }
 
+    /// Asks the controller to read `block` into the page at physical
+    /// `address`, which this driver does not own. Only the DMA-protection
+    /// self-test uses this: with remapping on, the transfer must fail.
+    pub(crate) fn read_block_to(&mut self, block: u64, address: u64) -> Result<(), Error> {
+        if self.block_size > 4096 || block >= self.block_count {
+            return Err(Error::OutOfRange);
+        }
+        let mut command = [0_u32; 16];
+        command[1] = self.namespace;
+        command[6] = address as u32;
+        command[7] = (address >> 32) as u32;
+        command[10] = block as u32;
+        command[11] = (block >> 32) as u32;
+        self.submit(false, OPCODE_READ, command)
+    }
+
     fn identify_controller(&mut self) -> Result<ControllerIdentity, Error> {
         let mut command = [0_u32; 16];
         command[6] = data_address() as u32;
@@ -323,6 +339,17 @@ impl Queue {
             completion_doorbell,
         }
     }
+}
+
+/// The memory NVMe controllers may reach by DMA.
+pub(crate) fn dma_regions() -> [DmaRegion; 5] {
+    [
+        DmaRegion::of(addr_of!(ADMIN_SUBMISSION)),
+        DmaRegion::of(addr_of!(ADMIN_COMPLETION)),
+        DmaRegion::of(addr_of!(IO_SUBMISSION)),
+        DmaRegion::of(addr_of!(IO_COMPLETION)),
+        DmaRegion::of(addr_of!(DATA)),
+    ]
 }
 
 fn data_address() -> u64 {
