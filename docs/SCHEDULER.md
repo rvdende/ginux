@@ -115,3 +115,82 @@ calls act as the scheduler.
    splitting `kernel_entry_lock` into per-subsystem locks so CPUs run kernel
    code in parallel (lock ranks from
    `docs/feedback-hardening/SYNCHRONIZATION.md`).
+
+## Step 4 in detail: the scheduler loop
+
+Measured on 2026-10-31 with parent-first fork switched on under today's
+init-driven scheduling: LTP's wait/kill/clone tests regress (children forked
+parent-first wait, ready, until init's descendant walk happens to pick them,
+and the 64-slot process table fills with them), and `cargo build | grep`
+hangs. Parent-first fork therefore lands together with the loop, which picks
+every ready process in turn.
+
+Global state a switch moves today (what the loop must save and restore,
+lazily: only when switching away from the loaded process, so timer-driven
+wakeups between dispatches are not lost):
+
+| State | Saved by | Restored by |
+|---|---|---|
+| Runtime globals (descriptors, mmap, cwd, rlimits, signal handlers/pending, thread table, current thread slot, mount namespace) | `save_current_linux_process_runtime_state(pid)`; finds the thread table via `current_linux_process_pid()`, so that must still name the process | `restore_saved_linux_process_runtime_state(pid)` (also switches the mount namespace, signal mask, wait hints) |
+| XSAVE state | `save_linux_process_extended_state` | `restore_linux_process_extended_state` |
+| `LINUX_CURRENT_PROCESS_PID` | | stored explicitly |
+| Address-space globals | | `sync_live_linux_process_address_space(pid)` before every entry |
+| CR3, FS base | | `address_space::resume_live_linux_process` (skips the CR3 load when the root is already active) |
+| Registry context | `refresh_live_linux_process_registry` on every return to kernel | `dispatch_live_process` |
+| `LINUX_FORK_*` requests, `LINUX_PROCESS_CHILD_{EXITED,EXECUTED,YIELDED}` with pids/status | single global slots: consume before any other process runs | |
+
+Hazards found in the code:
+
+- Domain exec (`execute_deferred_live_fork`'s domain-exec loop) re-runs only
+  the injected process; forks inside it must stay child-first (done:
+  `LinuxDomainExecGuard`), or the loop must own it.
+- CLONE_NEWNS children retire their namespace only inside the fork
+  transaction; a parent-first child that exits would leak it (kept
+  child-first).
+- `begin_live_fork` writes the child's pid into the parent's registry rax;
+  for a domain-exec parent suspended mid-call this clobbers its result.
+- Background resume of a process other than init does not restore its
+  runtime state today; the loop must.
+- `schedule_next` prefers higher priority and honours affinity; in the
+  restart model a waiter stays ready, so the loop must pick round-robin and
+  ignore priority/affinity until per-CPU scheduling.
+- The run queue keeps its own copy of each context; registry writes for a
+  process that is not running (`set_live_process_return_value`) make them
+  differ, so the loop treats the registry as the source of truth.
+- Background suspension is only checked at the end of a syscall returning a
+  normal result; the loop must check `LINUX_RUNTIME_BACKGROUND_YIELD_REQUESTED`.
+- The APIC timer entry has no `swapgs`; preempting from user mode needs it,
+  and `process_general(rax, rip, rflags)` is wrong for a context interrupted
+  mid-instruction (rcx/r11 are live there).
+- Releasing `kernel_entry_lock` while user code runs lets threads on other
+  CPUs enter the kernel concurrently: run the rocky-smp tests.
+
+Order:
+
+1. Refactor without behaviour change: split `run_scheduled_linux_process`
+   into switch-in (restore runtime + extended state, current pid, address
+   space, pending-SIGKILL check) and settle (fork loop, save, exit block:
+   signal queues, SIGCHLD, cgroup, runtime state, extended state, slot
+   release, descriptor wakeups); route waitid/recvfrom/recvmsg's direct child
+   runs through `run_other_linux_processes`.
+2. The loop owns the run queue: claim the workspace and make init current at
+   runtime start/resume; stop `complete_live_child_exit` from releasing it in
+   runtime mode; release it before `finish_runtime_process_registry`.
+3. New `ProcessScheduler` operations: park current (Running→Ready, current =
+   None), select a given thread, next round-robin, has-ready; registry
+   wrappers replace `switch_live_process`/`yield_live_process`.
+4. `run_linux_process_loop` at the runtime entry: pick next, lazily switch
+   state, enter (SIGKILL pending → terminate), then settle in this order:
+   forks, suspension (restore init's globals before returning), init
+   completion, exit, park; halt when every ready process has yielded waiting
+   since the last progress. Everyone, init included, waits by returning to
+   the kernel; `run_other_linux_processes` keeps only the sibling-thread
+   switch, delivers pending signals (EINTR) and yields; the init branch, the
+   descendant walk, `run_scheduled_linux_process` and the nesting counter go.
+5. Then vfork in the loop (parent blocked, child preferred, unblocked at
+   exec/exit via a registry `vfork_parent`), release-on-exec from the
+   registry's `shares_parent_vm` instead of the global flag, domain exec run
+   from the loop, parent-first fork on.
+6. Timer preemption: `swapgs` in the timer entry for user frames, a slice
+   counter reset per dispatch, refresh the registry from the interrupted
+   frame's exact registers, park without counting a wait.
