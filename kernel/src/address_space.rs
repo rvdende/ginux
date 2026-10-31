@@ -608,7 +608,25 @@ pub(crate) fn run_linux_init(init: &[u8]) -> LinuxProcessOutcome {
         crate::serial_write_u64(u64::from(stage));
         crate::serial_write_bytes(b"\r\n");
     }
-    if valid && runtime_scrubbed && memory::release_frames(memory::FrameOwner::KERNEL, frames) {
+    // The initial heap, stack, vvar and vDSO pages can pass to a forked
+    // child, which releases them at exec once the parent has its own copy,
+    // so only the leases init still holds are released here.
+    let frames_released = valid
+        && runtime_scrubbed
+        && memory::release_frames(
+            memory::FrameOwner::KERNEL,
+            [
+                frames[0], frames[1], frames[2], frames[3], frames[4], frames[5],
+            ],
+        )
+        && frames[HIERARCHY_FRAMES..]
+            .iter()
+            .filter(|frame| memory::frames_owned_by(memory::FrameOwner::KERNEL, &[**frame]))
+            .all(|frame| memory::scrub_and_release_frames(memory::FrameOwner::KERNEL, &[*frame]));
+    if valid && !frames_released {
+        crate::serial_write_bytes(b"ginux: Linux init frame release failed\r\n");
+    }
+    if frames_released {
         let (status, syscall) = cpu::linux_runtime_diagnostics();
         if status.is_some_and(|status| status != 0) || syscall.is_some() {
             crate::serial_write_bytes(b"ginux: Linux init diagnostics: exit=");
@@ -659,6 +677,11 @@ fn resume_linux_init(slot: usize, mmap: u64) -> LinuxProcessOutcome {
     if result.valid && released {
         LinuxProcessOutcome::Exited(cpu::linux_runtime_diagnostics().0.unwrap_or(u8::MAX))
     } else {
+        crate::serial_write_bytes(b"ginux: resumed Linux init teardown failed (runtime/frames): ");
+        crate::serial_write_u64(u64::from(result.valid));
+        crate::serial_write_bytes(b"/");
+        crate::serial_write_u64(u64::from(released));
+        crate::serial_write_bytes(b"\r\n");
         LinuxProcessOutcome::Failed
     }
 }

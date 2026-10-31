@@ -34213,6 +34213,14 @@ fn linux_socket_readv(descriptor: u64, vectors: u64, count: u64) -> Option<u64> 
 
 fn container_console_read_byte() -> Option<u8> {
     let slot = active_container_slot()?;
+    // An init waiting for console input has finished booting, whether or not
+    // the console stays attached.
+    let _ = CONTAINER_CONTROL_STATES[slot].compare_exchange(
+        control_abi::DOMAIN_STATE_BOOTING as u8,
+        control_abi::DOMAIN_STATE_RUNNING as u8,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
     if !CONTAINER_CONSOLE_ATTACHED[slot].load(Ordering::Acquire) {
         CONTAINER_CONTROL_STATES[slot]
             .store(control_abi::DOMAIN_STATE_RUNNING as u8, Ordering::Release);

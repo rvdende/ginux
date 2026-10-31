@@ -46,7 +46,8 @@ wait_for() {
 wait_for_line() {
     local marker=$1
     for _ in {1..60}; do
-        grep -Eq "^${marker}\\r?$" "$output_file" && return 0
+        # Controller lines end in CR LF; ERE has no \r escape, so use a real CR.
+        grep -Eq "^${marker}"$'\r'"?\$" "$output_file" && return 0
         if grep -Eq '^GINUX_(BOOT|KERNEL)_PANIC' "$output_file"; then
             break
         fi
