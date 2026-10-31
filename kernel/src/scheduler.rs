@@ -1,7 +1,7 @@
 use crate::domain;
 use crate::owned_state::OwnedState;
 
-const MAX_THREADS: usize = 8;
+const MAX_THREADS: usize = 64;
 const PROCESS_CPU_LIMIT: usize = 4;
 const PROCESS_WORKSPACE_LIMIT: usize = crate::control_abi::DOMAIN_LIMIT + 1;
 pub(crate) const IPC_PEER_CLOSED: u64 = u64::MAX - 4;

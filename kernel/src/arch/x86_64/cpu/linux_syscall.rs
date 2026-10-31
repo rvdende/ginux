@@ -1609,7 +1609,10 @@ pub(super) extern "sysv64" fn linux_syscall_handler(
         result
     };
     let same_thread = current_linux_thread_handle() == calling_thread;
-    let result = if real_timer_expired && same_thread {
+    // A call that went back to the kernel to wait has no result yet to
+    // interrupt; its wait sees the signal pending and is interrupted there.
+    let returns_to_user = result != LINUX_RETURN_TO_KERNEL && result != LINUX_RETURN_FROM_IRET;
+    let result = if real_timer_expired && same_thread && returns_to_user {
         linux_real_timer_signal(registers, syscall_return, (user_rip, user_rflags), result)
     } else {
         if real_timer_expired {

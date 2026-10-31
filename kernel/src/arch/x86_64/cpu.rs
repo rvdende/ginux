@@ -3409,6 +3409,14 @@ pub(crate) fn resume_live_linux_process(
     if entry == 0 || entry >= 1 << 47 || stack == 0 || stack >= 1 << 47 || fs_base >= 1 << 47 {
         return false;
     }
+    if general[0] == LINUX_RETURN_TO_KERNEL {
+        serial_write("ginux: resuming pid ");
+        serial_write_u64(u64::from(current_linux_process_pid()));
+        serial_write(" at rip ");
+        serial_write_u64(entry as u64);
+        serial_write(" with the kernel's return-to-kernel marker as its result\r\n");
+        write_linux_runtime_syscall_trace();
+    }
     let saved_fs = active_fs_base();
     unsafe { write_msr(FS_BASE_MSR, fs_base) };
     if active_fs_base() != fs_base {
@@ -13066,6 +13074,20 @@ fn run_other_linux_processes(
     }
     let pid = current_linux_process_pid();
     if pid != 1 {
+        // A signal that arrived while this call waited interrupts it (EINTR,
+        // or a restart after an SA_RESTART handler), as in Linux, instead of
+        // the call waiting again.
+        let signal_was_active = X86_RUNTIME.LINUX_SIGNAL_ACTIVE.load(Ordering::SeqCst);
+        let mut interrupted = caller;
+        interrupted.rax = LINUX_EINTR;
+        let delivered =
+            linux_deliver_pending_signal(output, interrupted, (caller.rip, caller.rflags));
+        if delivered != 0 {
+            return Some(LinuxBlockedWait::Return(delivered));
+        }
+        if !signal_was_active && X86_RUNTIME.LINUX_SIGNAL_ACTIVE.load(Ordering::SeqCst) {
+            return Some(LinuxBlockedWait::Return(0));
+        }
         let mut restart = caller;
         restart.rip = caller.rip.wrapping_sub(LINUX_SYSCALL_INSTRUCTION_SIZE);
         return yield_current_linux_process(restart, number)

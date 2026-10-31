@@ -6,7 +6,7 @@ use core::{
 
 use crate::{address_space, arch::x86_64::cpu, control_abi, linux_user, memory, scheduler};
 
-pub(crate) const PROCESS_LIMIT: usize = 16;
+pub(crate) const PROCESS_LIMIT: usize = 64;
 pub(crate) const PROCESS_RUNTIME_LIMIT: usize = PROCESS_LIMIT;
 const PROCESS_HIERARCHY_LIMIT: usize = cpu::LINUX_PROCESS_HIERARCHY_LIMIT;
 const PROCESS_PRIVATE_PAGE_LIMIT: usize = cpu::LINUX_PROCESS_MAPPING_LIMIT;
@@ -1110,7 +1110,30 @@ impl ProcessTable {
         process.retiring_address_space = None;
         process.wait_event = None;
         process.state = ProcessState::Zombie { status };
+        self.reparent_children_to_init(handle);
         true
+    }
+
+    /// Hands the children of an exiting process, running or already zombies,
+    /// to the domain's init, as Linux does, so that their exit status can
+    /// still be collected and their slots reused.
+    fn reparent_children_to_init(&mut self, handle: ProcessHandle) {
+        let Some(init) = self.handle_by_pid(1).filter(|init| {
+            *init != handle
+                && self.process(*init).is_some_and(|init| {
+                    matches!(
+                        init.state,
+                        ProcessState::Running | ProcessState::Stopped { .. }
+                    )
+                })
+        }) else {
+            return;
+        };
+        for process in self.processes.iter_mut().flatten() {
+            if process.parent == Some(handle) {
+                process.parent = Some(init);
+            }
+        }
     }
 
     fn exit_after_current_address_space_retired(
@@ -1129,6 +1152,7 @@ impl ProcessTable {
         process.context = None;
         process.wait_event = None;
         process.state = ProcessState::Zombie { status };
+        self.reparent_children_to_init(handle);
         true
     }
 
@@ -1165,6 +1189,7 @@ impl ProcessTable {
         process.retiring_address_space = None;
         process.wait_event = None;
         process.state = ProcessState::Zombie { status };
+        self.reparent_children_to_init(handle);
         true
     }
 
@@ -3366,6 +3391,44 @@ pub(crate) fn yield_live_process(pid: u32) -> Option<LiveProcessDispatch> {
 }
 
 #[inline(never)]
+/// Says why `prepare_fork` refused: the parent's registry state, or a full
+/// process table.
+fn report_fork_preparation_failure(table: &ProcessTable, parent: ProcessHandle) {
+    let used = table.processes.iter().flatten().count();
+    let zombies = table
+        .processes
+        .iter()
+        .flatten()
+        .filter(|process| matches!(process.state, ProcessState::Zombie { .. }))
+        .count();
+    crate::serial_write("ginux: fork refused; parent pid/state/space/context/credentials: ");
+    crate::serial_write_u64(u64::from(parent.pid));
+    if let Some(process) = table.process(parent) {
+        let state = match process.state {
+            ProcessState::Preparing => 1,
+            ProcessState::Running => 2,
+            ProcessState::Stopped { .. } => 3,
+            ProcessState::Exiting => 4,
+            ProcessState::Zombie { .. } => 5,
+        };
+        for value in [
+            state,
+            u64::from(process.address_space.is_some()),
+            u64::from(process.context.is_some()),
+            u64::from(linux_user::credentials(process.user_namespace).is_some()),
+        ] {
+            crate::serial_write(" ");
+            crate::serial_write_u64(value);
+        }
+    }
+    crate::serial_write("; processes used/zombie/limit: ");
+    for value in [used, zombies, PROCESS_LIMIT] {
+        crate::serial_write_u64(value as u64);
+        crate::serial_write(" ");
+    }
+    crate::serial_write("\r\n");
+}
+
 pub(crate) fn begin_live_fork(
     parent_pid: u32,
     eager_private_copy: bool,
@@ -3452,7 +3515,10 @@ pub(crate) fn begin_live_fork(
     process_runtime()
         .fork_execution_stage
         .store(11, Ordering::Release);
-    let child_handle = table.prepare_fork(parent_handle)?;
+    let Some(child_handle) = table.prepare_fork(parent_handle) else {
+        report_fork_preparation_failure(table, parent_handle);
+        return None;
+    };
     process_runtime()
         .fork_execution_stage
         .store(111, Ordering::Release);
