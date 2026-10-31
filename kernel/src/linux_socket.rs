@@ -41,6 +41,12 @@ const TX_BUFFER_OFFSET: usize = 0xa00;
 const RX_DESCRIPTOR_LENGTH: usize = 0x5ff;
 const VIRTIO_HEADER_LENGTH: usize = 12;
 const BLOCKING_POLL_LIMIT: usize = 20_000;
+/// Bytes a local stream (a pipe or a socketpair) queues for a writer that
+/// must not block: Linux's default pipe capacity. A blocking writer is not
+/// held to it yet, because it cannot wait for its reader to run.
+const LOCAL_QUEUE_CAPACITY: usize = 64 * 1024;
+/// Writes up to this size go into a local queue whole or not at all.
+const LOCAL_ATOMIC_WRITE: usize = 4096;
 /// Frames the interface sends to one of its own addresses (127.0.0.0/8 or
 /// its configured address) come back to it instead of going to the wire.
 const LOOPBACK_FRAME_COUNT: usize = 16;
@@ -369,6 +375,63 @@ fn release_local_pages(mut page: memory::FrameLease) -> bool {
         page = next;
     }
     true
+}
+
+/// Queues `input` on a local stream's receive queue: into the room left in
+/// its last page, then in new pages. With `capacity`, queues only what fits
+/// (EAGAIN when nothing does, or when a small write does not fit whole).
+fn append_local_data(
+    state: &mut Slot,
+    input: &[u8],
+    capacity: Option<usize>,
+) -> Result<usize, Error> {
+    let room = capacity.map_or(input.len(), |capacity| {
+        capacity.saturating_sub(state.local_length)
+    });
+    if room == 0 || input.len() <= LOCAL_ATOMIC_WRITE && input.len() > room {
+        return Err(Error::WouldBlock);
+    }
+    let input = &input[..input.len().min(room)];
+    let new_length = state
+        .local_length
+        .checked_add(input.len())
+        .ok_or(Error::Exhausted)?;
+    let mut rest = input;
+    // An empty queue has no last page (and the empty lease must not be
+    // dereferenced: it names physical page 0).
+    if let Some(tail) = (state.local_last != memory::FrameLease::EMPTY)
+        .then(|| local_page_mut(state.local_last))
+        .flatten()
+    {
+        let used = tail.used as usize;
+        let fits = rest.len().min(LOCAL_DATA_CAPACITY - used);
+        tail.bytes[used..used + fits].copy_from_slice(&rest[..fits]);
+        tail.used += fits as u32;
+        rest = &rest[fits..];
+    }
+    if !rest.is_empty() {
+        let Some((first, last)) = allocate_local_pages(rest) else {
+            // What went into the last page stays queued.
+            let queued = input.len() - rest.len();
+            state.local_length += queued;
+            return if queued == 0 {
+                Err(Error::Exhausted)
+            } else {
+                Ok(queued)
+            };
+        };
+        if state.local_last == memory::FrameLease::EMPTY {
+            state.local_first = first;
+        } else if let Some(tail) = local_page_mut(state.local_last) {
+            tail.next = first;
+        } else {
+            let _ = release_local_pages(first);
+            return Err(Error::Invalid);
+        }
+        state.local_last = last;
+    }
+    state.local_length = new_length;
+    Ok(input.len())
 }
 
 fn allocate_local_pages(input: &[u8]) -> Option<(memory::FrameLease, memory::FrameLease)> {
@@ -1422,7 +1485,17 @@ pub(crate) fn connect(slot: u8, remote: IpEndpoint) -> Result<(), Error> {
     }
 }
 
+/// Sends without blocking: a full local queue is `WouldBlock`.
 pub(crate) fn send(slot: u8, input: &[u8], remote: Option<IpEndpoint>) -> Result<usize, Error> {
+    send_queued(slot, input, remote, Some(LOCAL_QUEUE_CAPACITY))
+}
+
+fn send_queued(
+    slot: u8,
+    input: &[u8],
+    remote: Option<IpEndpoint>,
+    local_capacity: Option<usize>,
+) -> Result<usize, Error> {
     poll();
     let index = usize::from(slot);
     let loopback = unsafe { socket_slots().get(index) }
@@ -1439,22 +1512,7 @@ pub(crate) fn send(slot: u8, input: &[u8], remote: Option<IpEndpoint>) -> Result
         if input.is_empty() {
             return Ok(0);
         }
-        let new_length = state
-            .local_length
-            .checked_add(input.len())
-            .ok_or(Error::Exhausted)?;
-        let (first, last) = allocate_local_pages(input).ok_or(Error::Exhausted)?;
-        if state.local_last == memory::FrameLease::EMPTY {
-            state.local_first = first;
-        } else if let Some(tail) = local_page_mut(state.local_last) {
-            tail.next = first;
-        } else {
-            let _ = release_local_pages(first);
-            return Err(Error::Invalid);
-        }
-        state.local_last = last;
-        state.local_length = new_length;
-        return Ok(input.len());
+        return append_local_data(state, input, local_capacity);
     }
     let state = unsafe { socket_slots().get(usize::from(slot)) }
         .filter(|slot| slot.occupied)
@@ -1493,22 +1551,7 @@ pub(crate) fn send(slot: u8, input: &[u8], remote: Option<IpEndpoint>) -> Result
         if input.is_empty() {
             return Ok(0);
         }
-        let new_length = peer_state
-            .local_length
-            .checked_add(input.len())
-            .ok_or(Error::Exhausted)?;
-        let (first, last) = allocate_local_pages(input).ok_or(Error::Exhausted)?;
-        if peer_state.local_last == memory::FrameLease::EMPTY {
-            peer_state.local_first = first;
-        } else if let Some(tail) = local_page_mut(peer_state.local_last) {
-            tail.next = first;
-        } else {
-            let _ = release_local_pages(first);
-            return Err(Error::Invalid);
-        }
-        peer_state.local_last = last;
-        peer_state.local_length = new_length;
-        return Ok(input.len());
+        return append_local_data(peer_state, input, local_capacity);
     }
     let runtime = runtime()?;
     let handle = state.handle.ok_or(Error::Invalid)?;
@@ -1543,7 +1586,7 @@ pub(crate) fn send_blocking(
 ) -> Result<usize, Error> {
     let limit = timeout_poll_limit(slot, TimeoutOption::Send).unwrap_or(BLOCKING_POLL_LIMIT);
     for _ in 0..limit {
-        match send(slot, input, remote) {
+        match send_queued(slot, input, remote, None) {
             Err(Error::WouldBlock | Error::InProgress) => core::hint::spin_loop(),
             result => return result,
         }
