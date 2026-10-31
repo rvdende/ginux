@@ -78,20 +78,33 @@ idle task, which halts when nothing is runnable.
 Each step keeps `make check`, the Alpine, Rust-workload, all-Rust userland and
 desktop suites passing.
 
-1. A kernel heap (`alloc`): a slab allocator for small objects over the frame
-   allocator, plus page-granular allocations. Tasks, stacks and the dynamic
-   tables in step 3 of the roadmap need it.
-2. Tasks with their own stacks and `switch_to`, with the scheduler choice
-   still emulating today's order: a task that returns to kernel switches back
-   to the task that started it. Behaviour is unchanged, but each stack only
-   holds its own frames.
-3. User registers saved on the task stack; per-process globals become task or
-   process fields, so `switch_to` no longer swaps them.
-4. Real scheduling: a task parked in the kernel is resumed only by switching
-   to it, never by re-entering its user context; waits block in place;
-   `run_other_linux_processes` and the nesting counter disappear; fork/clone
-   queue tasks.
-5. Preemption from the timer on return to ring 3.
-6. Per-CPU run queues with load balancing and wakeups by IPI, then splitting
-   `kernel_entry_lock` into per-subsystem locks so CPUs run kernel code in
-   parallel (lock ranks from `docs/feedback-hardening/SYNCHRONIZATION.md`).
+Since the upstream merge only init (pid 1) runs other processes from inside
+its blocking calls; every other process waits by returning to the kernel
+with its call set to restart. So the nesting is shallow, and init's system
+calls act as the scheduler.
+
+1. Done: a kernel heap (`kernel/src/heap.rs`): slab size classes over the
+   frame allocator plus frame runs for large objects.
+2. Done: activation stacks (`cpu/activation.rs`). Every entry into a Linux
+   process on the boot CPU runs it, and its system calls, on a kernel stack
+   of its own (256 KiB, red zone checked when the activation ends), in
+   today's order. A process entered while an earlier activation of it is
+   still inside a system call is reported ("re-entered during its own
+   system call").
+3. A kernel scheduler loop replaces init's role: the runtime's entry frame
+   picks the next runnable process from the run queue and enters it; every
+   process, init included, waits by returning to the kernel; exit and fork
+   are handled by the loop. Processes can then be preempted by the timer
+   (save the user context, return to the loop), which LTP's spinning tests
+   need.
+4. Real blocking: an activation that must wait parks (switches to the loop)
+   instead of returning to the kernel with a restart, and the loop resumes
+   parked activations by switching to them; threads get activations of their
+   own; per-process globals become task fields so a switch no longer copies
+   them in and out.
+5. Per-CPU scheduler loops with load balancing and wakeups by IPI, then
+   splitting `kernel_entry_lock` into per-subsystem locks so CPUs run kernel
+   code in parallel (lock ranks from
+   `docs/feedback-hardening/SYNCHRONIZATION.md`).
+6. Guard pages: map activation stacks in a kernel virtual region with an
+   unmapped page below each, instead of the red-zone check.

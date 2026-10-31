@@ -17,6 +17,9 @@ impl LockRank {
     pub(crate) const PRIMITIVE_TEST_HIGH: Self = Self(2);
     pub(crate) const ARCHITECTURE: Self = Self(10);
     pub(crate) const CROSS_CPU_DISPATCH: Self = Self(15);
+    /// The pool of Linux activation stacks; ranks below the heap so the
+    /// pool may grow while held.
+    pub(crate) const KERNEL_STACKS: Self = Self(17);
     pub(crate) const FUTEX_COORDINATION: Self = Self(18);
     /// The kernel heap refills from the frame allocator while holding its
     /// lock, so it ranks just below it.

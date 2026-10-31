@@ -8,6 +8,7 @@ use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, 
 
 use super::{paging, timer};
 
+mod activation;
 mod architecture;
 mod execution;
 mod linux_abi;
@@ -2927,6 +2928,33 @@ unsafe fn enter_linux_process(entry: usize, stack: usize, general: *const u64, r
     (*entry_state).return_stack = previous_return_stack;
 }
 
+/// Enters the current Linux runtime process. On the boot CPU its activation
+/// gets a kernel stack of its own (see `activation`); a thread dispatched to
+/// another CPU, and any entry when no stack can be allocated, runs below the
+/// caller's frames as before.
+unsafe fn enter_linux_runtime_process(
+    entry: usize,
+    stack: usize,
+    general: *const u64,
+    rflags: u64,
+) {
+    let entry_state = current_entry_state();
+    let previous_return_stack = (*entry_state).return_stack;
+    let entered = X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
+        && current_linux_runtime_cpu_index() == 0
+        && activation::enter_on_own_stack(
+            current_linux_process_pid(),
+            entry,
+            stack,
+            general,
+            rflags,
+        );
+    if !entered {
+        ginux_process_user_enter(entry, stack, general, rflags);
+    }
+    (*entry_state).return_stack = previous_return_stack;
+}
+
 #[allow(clippy::too_many_arguments)]
 unsafe fn enter_user(
     entry: usize,
@@ -3189,7 +3217,7 @@ pub(crate) fn execute_linux_process_child(
     // validates that frame and returns to ring 3. A subsequent Linux exit(2)
     // trap captures its status and returns to the saved kernel stack because no
     // global native scheduler runtime is active.
-    unsafe { enter_linux_process(entry, stack, general.as_ptr(), 0x202) };
+    unsafe { enter_linux_runtime_process(entry, stack, general.as_ptr(), 0x202) };
     let child_fs_preserved = active_fs_base() == fs_base;
     let probe_state = X86_RUNTIME
         .PROCESS_CHILD_PROBE_STATE
@@ -3391,7 +3419,7 @@ pub(crate) fn resume_live_linux_process(
     // validated this complete return context against its private mappings.
     // A terminating or deferred Linux syscall returns through the saved kernel
     // stack installed by this entry stub.
-    unsafe { enter_linux_process(entry, stack, general.as_ptr(), rflags) };
+    unsafe { enter_linux_runtime_process(entry, stack, general.as_ptr(), rflags) };
     let returned_fs = active_fs_base();
     let scheduled_thread_fs = current_linux_thread_handle()
         .and_then(linux_thread_context)
