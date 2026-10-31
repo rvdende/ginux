@@ -25,6 +25,7 @@ mod linux_keyring;
 mod linux_mount;
 mod linux_overlay;
 mod linux_process;
+mod linux_record_lock;
 mod linux_signal;
 mod linux_socket;
 mod linux_sysv_ipc;

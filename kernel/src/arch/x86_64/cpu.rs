@@ -37088,6 +37088,21 @@ fn linux_close_range(first: u64, last: u64, flags: u64) -> u64 {
 }
 
 fn linux_descriptor_close_with_wake(descriptor: u64, wake_waiters: bool) -> u64 {
+    // Closing any descriptor of a file drops the process's record locks on
+    // it, and closing a description's descriptor drops its OFD locks.
+    let owners = [
+        Some(crate::linux_record_lock::Owner::Process(
+            current_linux_process_pid(),
+        )),
+        linux_descriptor_open_file_id(descriptor).map(crate::linux_record_lock::Owner::Description),
+    ];
+    for owner in owners.into_iter().flatten() {
+        if crate::linux_record_lock::holds_any(owner) {
+            if let Some(file) = linux_record_lock_file(descriptor) {
+                crate::linux_record_lock::release(owner, file);
+            }
+        }
+    }
     let result = linux_descriptor_close_with_wake_inner(descriptor, wake_waiters);
     if result == 0 {
         if let Some(cell) = linux_descriptor_open_file_id_cell(descriptor) {
@@ -37785,10 +37800,8 @@ fn linux_descriptor_fcntl(descriptor: u64, command: u64, argument: u64) -> u64 {
         LINUX_F_GETFD | LINUX_F_SETFD => {
             linux_fcntl_descriptor_flags(descriptor, command, argument)
         }
-        LINUX_F_GETLK | LINUX_F_OFD_GETLK => linux_fcntl_lock(command, argument),
-        LINUX_F_SETLK | LINUX_F_SETLKW | LINUX_F_OFD_SETLK | LINUX_F_OFD_SETLKW => {
-            linux_fcntl_lock(command, argument)
-        }
+        LINUX_F_GETLK | LINUX_F_OFD_GETLK | LINUX_F_SETLK | LINUX_F_SETLKW | LINUX_F_OFD_SETLK
+        | LINUX_F_OFD_SETLKW => linux_fcntl_lock(descriptor, command, argument),
         LINUX_F_ADD_SEALS | LINUX_F_GET_SEALS => linux_memfd_fcntl(descriptor, command, argument),
         LINUX_F_GETFL => {
             u64::from((state & 3) - 1)
@@ -37830,18 +37843,149 @@ fn linux_flock(descriptor: u64, operation: u64) -> u64 {
     }
 }
 
-fn linux_fcntl_lock(command: u64, address: u64) -> u64 {
-    let mut lock = [0_u8; 32];
-    if address == 0 || !copy_from_linux_user(address, &mut lock) {
+/// The file a descriptor's record locks apply to: its device and inode.
+fn linux_record_lock_file(descriptor: u64) -> Option<crate::linux_record_lock::File> {
+    let stat = linux_descriptor_stat(descriptor)?;
+    Some((
+        u64::from_ne_bytes(stat[..8].try_into().ok()?),
+        u64::from_ne_bytes(stat[8..16].try_into().ok()?),
+    ))
+}
+
+/// Record locks with `struct flock` at `address` (fcntl F_GETLK, F_SETLK,
+/// F_SETLKW and the F_OFD_ forms). One attempt: F_SETLKW's wait is
+/// `linux_fcntl_setlkw_live_return`.
+fn linux_fcntl_lock(descriptor: u64, command: u64, address: u64) -> u64 {
+    use crate::linux_record_lock::{Kind, Owner};
+    const F_RDLCK: i16 = 0;
+    const F_WRLCK: i16 = 1;
+    const F_UNLCK: i16 = 2;
+    let mut flock = [0_u8; 32];
+    if address == 0 || !copy_from_linux_user(address, &mut flock) {
         return LINUX_EFAULT;
     }
+    let lock_type = i16::from_ne_bytes([flock[0], flock[1]]);
+    let whence = i16::from_ne_bytes([flock[2], flock[3]]);
+    let offset = i64::from_ne_bytes(flock[8..16].try_into().unwrap());
+    let length = i64::from_ne_bytes(flock[16..24].try_into().unwrap());
+    let description = matches!(
+        command,
+        LINUX_F_OFD_GETLK | LINUX_F_OFD_SETLK | LINUX_F_OFD_SETLKW
+    );
+    // OFD locks have no process: l_pid must be 0.
+    if description && flock[24..28] != [0; 4] {
+        return LINUX_EINVAL;
+    }
+    let Some(stat) = linux_descriptor_stat(descriptor) else {
+        return LINUX_EBADF;
+    };
+    let file = (
+        u64::from_ne_bytes(stat[..8].try_into().unwrap()),
+        u64::from_ne_bytes(stat[8..16].try_into().unwrap()),
+    );
+    let base = match whence {
+        0 => 0,
+        1 => linux_descriptor_offset(descriptor).load(Ordering::SeqCst) as i64,
+        2 => i64::from_ne_bytes(stat[48..56].try_into().unwrap()),
+        _ => return LINUX_EINVAL,
+    };
+    // A negative length locks the bytes before the start.
+    let Some((start, end)) = base.checked_add(offset).and_then(|start| match length {
+        0 => Some((start, None)),
+        length if length > 0 => start.checked_add(length).map(|end| (start, Some(end))),
+        length => start.checked_add(length).map(|first| (first, Some(start))),
+    }) else {
+        return LINUX_EINVAL;
+    };
+    if start < 0 {
+        return LINUX_EINVAL;
+    }
+    let (start, end) = (start as u64, end.map_or(u64::MAX, |end| end as u64));
+    let pid = current_linux_process_pid();
+    let owner = if description {
+        match linux_descriptor_open_file_id(descriptor) {
+            Some(id) => Owner::Description(id),
+            None => return LINUX_EBADF,
+        }
+    } else {
+        Owner::Process(pid)
+    };
+    let alive = |pid: u32| {
+        linux_process::live_process_status(pid).is_some_and(|status| status.state.is_running())
+    };
+    let kind = match lock_type {
+        F_RDLCK => Some(Kind::Read),
+        F_WRLCK => Some(Kind::Write),
+        F_UNLCK => None,
+        _ => return LINUX_EINVAL,
+    };
     if matches!(command, LINUX_F_GETLK | LINUX_F_OFD_GETLK) {
-        lock[..2].copy_from_slice(&2_i16.to_ne_bytes());
-        if !copy_to_linux_user(address, &lock) {
-            return LINUX_EFAULT;
+        let Some(kind) = kind else {
+            return LINUX_EINVAL;
+        };
+        match crate::linux_record_lock::conflict(file, owner, (kind, start, end), alive) {
+            Some(blocking) => {
+                let blocking_type = match blocking.kind {
+                    Kind::Read => F_RDLCK,
+                    Kind::Write => F_WRLCK,
+                };
+                let blocking_length = if blocking.end == u64::MAX {
+                    0
+                } else {
+                    blocking.end - blocking.start
+                };
+                let blocking_pid = match blocking.owner {
+                    Owner::Process(pid) => pid as i32,
+                    Owner::Description(_) => -1,
+                };
+                flock[..2].copy_from_slice(&blocking_type.to_ne_bytes());
+                flock[2..4].copy_from_slice(&0_i16.to_ne_bytes());
+                flock[8..16].copy_from_slice(&blocking.start.to_ne_bytes());
+                flock[16..24].copy_from_slice(&blocking_length.to_ne_bytes());
+                flock[24..28].copy_from_slice(&blocking_pid.to_ne_bytes());
+            }
+            None => flock[..2].copy_from_slice(&F_UNLCK.to_ne_bytes()),
+        }
+        return if copy_to_linux_user(address, &flock) {
+            0
+        } else {
+            LINUX_EFAULT
+        };
+    }
+    // A read lock needs the descriptor open for reading, a write lock for
+    // writing.
+    let access = linux_device_descriptor(descriptor) & 3;
+    if kind == Some(Kind::Read) && !matches!(access, LINUX_DESCRIPTOR_INPUT | 3)
+        || kind == Some(Kind::Write) && !matches!(access, LINUX_DESCRIPTOR_OUTPUT | 3)
+    {
+        return LINUX_EBADF;
+    }
+    match crate::linux_record_lock::set(file, owner, pid, (kind, start, end), alive) {
+        Ok(()) => 0,
+        Err(crate::linux_record_lock::Error::Conflict(_)) => LINUX_EAGAIN,
+        Err(crate::linux_record_lock::Error::NoMemory) => LINUX_ENOLCK,
+    }
+}
+
+/// fcntl F_SETLKW and F_OFD_SETLKW: waits while another owner's lock is in
+/// the way, letting other processes run, until it is released or a signal
+/// arrives.
+fn linux_fcntl_setlkw_live_return(
+    output: *mut LinuxSyscallFrame,
+    caller: LinuxUserContext,
+    (descriptor, command, address): (u64, u64, u64),
+) -> u64 {
+    loop {
+        let result = linux_descriptor_fcntl(descriptor, command, address);
+        if result != LINUX_EAGAIN {
+            return result;
+        }
+        match run_other_linux_processes(output, caller, LINUX_FCNTL_SYSCALL) {
+            Some(LinuxBlockedWait::Recheck) => {}
+            Some(LinuxBlockedWait::Return(result)) => return result,
+            None => return LINUX_EINTR,
         }
     }
-    0
 }
 
 fn linux_descriptor_set_nonblocking(flags: &BankedAtomicU32, argument: u64) -> u64 {

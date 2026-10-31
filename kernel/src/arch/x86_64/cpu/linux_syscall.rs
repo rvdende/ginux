@@ -674,6 +674,18 @@ pub(super) extern "sysv64" fn linux_syscall_handler(
             register(0),
         ),
         LINUX_EPOLL_CTL_SYSCALL => linux_epoll_ctl(first_argument, buffer, count, register(0)),
+        LINUX_FCNTL_SYSCALL
+            if matches!(
+                u64::from(buffer as u32),
+                LINUX_F_SETLKW | LINUX_F_OFD_SETLKW
+            ) =>
+        {
+            linux_fcntl_setlkw_live_return(
+                registers,
+                syscall_return,
+                (first_argument, buffer, count),
+            )
+        }
         LINUX_FCNTL_SYSCALL => linux_descriptor_fcntl(first_argument, buffer, count),
         LINUX_FLOCK_SYSCALL => linux_flock(first_argument, buffer),
         LINUX_FSYNC_SYSCALL | LINUX_FDATASYNC_SYSCALL => linux_fsync(first_argument),

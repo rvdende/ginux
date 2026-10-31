@@ -22,7 +22,13 @@ and the `778dd3d0` run went through in one. Its 14 hangs are LTP's own
 30-second timeouts (no guest wedges): epoll_wait01/08/11/12/16,
 pselect01/_64, select02 and select04 (select and epoll_pwait still return
 no events rather than waiting for a signal), poll02 and ppoll01 (fixed
-since), futex_wait03, futex_wake03 and rt_tgsigqueueinfo01. Its remaining crashes
+since), futex_wait03, futex_wake03 and rt_tgsigqueueinfo01.
+
+**Pass counts are optimistic for tests that fork twice.** LTP's main
+process counts results in a MAP_SHARED page of a /dev/shm file, and
+results reported by a grandchild (a test's own child) do not reach it:
+fcntl15 printed TFAIL and TBROK yet exited 0, so it was counted as a pass.
+Shared file mappings are not yet one page shared by every mapper. Its remaining crashes
 are access04, fchownat03, madvise10, madvise11, mq_open01, move_mount03,
 munmap01, readv01, sendmmsg01, shmat01, statmount03 and waitid05 to
 waitid08; its hangs are bind04 (flaky), epoll_wait01, epoll_wait12,
