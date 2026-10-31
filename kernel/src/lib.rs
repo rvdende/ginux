@@ -31,37 +31,54 @@ mod manifest;
 mod memory;
 mod native_elf;
 mod network;
+mod owned_state;
 mod packet;
 mod pe;
 mod published_rootfs;
 mod scheduler;
+mod sync;
 mod volume;
 
 use core::arch::{asm, global_asm};
+use core::cell::UnsafeCell;
 use core::ffi::c_void;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const COM1: u16 = 0x3f8;
-static OPERATOR_CONSOLE_READY: AtomicBool = AtomicBool::new(false);
-/// Where the loaded kernel image lies, so crash reports can name code
-/// addresses relative to it.
-static KERNEL_IMAGE_BASE: AtomicU64 = AtomicU64::new(0);
-static KERNEL_IMAGE_SIZE: AtomicU64 = AtomicU64::new(0);
+struct HostControlOwner {
+    operator_console_ready: AtomicBool,
+    background_domain_output: AtomicBool,
+    linux_realtime_epoch_seconds: AtomicU64,
+    linux_realtime_epoch_tsc: AtomicU64,
+    oci_pull_started: AtomicU64,
+    persisted_oci_catalog: UnsafeCell<[u8; ginux_oci_cache::ENCODED_SIZE]>,
+    /// Where the loaded kernel image lies, so crash reports can name code
+    /// addresses relative to it.
+    kernel_image_base: AtomicU64,
+    kernel_image_size: AtomicU64,
+}
+
+unsafe impl Sync for HostControlOwner {}
+
+static HOST_CONTROL: HostControlOwner = HostControlOwner {
+    operator_console_ready: AtomicBool::new(false),
+    background_domain_output: AtomicBool::new(false),
+    linux_realtime_epoch_seconds: AtomicU64::new(0),
+    linux_realtime_epoch_tsc: AtomicU64::new(0),
+    oci_pull_started: AtomicU64::new(0),
+    persisted_oci_catalog: UnsafeCell::new([0; ginux_oci_cache::ENCODED_SIZE]),
+    kernel_image_base: AtomicU64::new(0),
+    kernel_image_size: AtomicU64::new(0),
+};
 
 /// The loaded kernel image's base address and size.
 pub(crate) fn kernel_image_range() -> (u64, u64) {
     (
-        KERNEL_IMAGE_BASE.load(Ordering::Relaxed),
-        KERNEL_IMAGE_SIZE.load(Ordering::Relaxed),
+        HOST_CONTROL.kernel_image_base.load(Ordering::Relaxed),
+        HOST_CONTROL.kernel_image_size.load(Ordering::Relaxed),
     )
 }
-static BACKGROUND_DOMAIN_OUTPUT: AtomicBool = AtomicBool::new(false);
-static LINUX_REALTIME_EPOCH_SECONDS: AtomicU64 = AtomicU64::new(0);
-static LINUX_REALTIME_EPOCH_TSC: AtomicU64 = AtomicU64::new(0);
-static OCI_PULL_STARTED: AtomicU64 = AtomicU64::new(0);
-static mut PERSISTED_OCI_CATALOG: [u8; ginux_oci_cache::ENCODED_SIZE] =
-    [0; ginux_oci_cache::ENCODED_SIZE];
 const EFI_RESET_SHUTDOWN: u32 = 2;
 const EFI_SUCCESS: usize = 0;
 pub(crate) const EFI_LOADER_CODE: u32 = 1;
@@ -95,22 +112,29 @@ fn initialize_linux_realtime(unix_time: u64, timestamp_counter: u64) -> bool {
     if unix_time < 1_577_836_800 || timestamp_counter == 0 {
         return false;
     }
-    LINUX_REALTIME_EPOCH_TSC.store(timestamp_counter, Ordering::Release);
-    LINUX_REALTIME_EPOCH_SECONDS
+    HOST_CONTROL
+        .linux_realtime_epoch_tsc
+        .store(timestamp_counter, Ordering::Release);
+    HOST_CONTROL
+        .linux_realtime_epoch_seconds
         .compare_exchange(0, unix_time, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
 }
 
 pub(crate) fn linux_realtime_epoch() -> Option<(u64, u64)> {
-    let seconds = LINUX_REALTIME_EPOCH_SECONDS.load(Ordering::Acquire);
-    let timestamp_counter = LINUX_REALTIME_EPOCH_TSC.load(Ordering::Acquire);
+    let seconds = HOST_CONTROL
+        .linux_realtime_epoch_seconds
+        .load(Ordering::Acquire);
+    let timestamp_counter = HOST_CONTROL
+        .linux_realtime_epoch_tsc
+        .load(Ordering::Acquire);
     (seconds != 0 && timestamp_counter != 0).then_some((seconds, timestamp_counter))
 }
 
 #[repr(C, align(4096))]
-struct KernelStack([u8; KERNEL_STACK_STORAGE_SIZE]);
+struct KernelStackOwner([u8; KERNEL_STACK_STORAGE_SIZE]);
 
-static mut KERNEL_STACK: KernelStack = KernelStack([0; KERNEL_STACK_STORAGE_SIZE]);
+static mut KERNEL_STACK: KernelStackOwner = KernelStackOwner([0; KERNEL_STACK_STORAGE_SIZE]);
 
 global_asm!(
     r#"
@@ -217,6 +241,11 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     serial_write_raw(b"ginux: booting\r\n");
     serial_write("ginux: kernel entered after ExitBootServices\r\n");
 
+    if !sync::verify_primitives() {
+        kernel_fail("ginux: synchronization primitive verification failed\r\n");
+    }
+    serial_write("ginux: ranked synchronization primitives ready\r\n");
+
     if !kernel_stack_is_active() {
         kernel_fail("ginux: kernel stack transition failed\r\n");
     }
@@ -233,8 +262,12 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     {
         kernel_fail("ginux: incompatible boot information\r\n");
     }
-    KERNEL_IMAGE_BASE.store(boot_info.image_base as u64, Ordering::Relaxed);
-    KERNEL_IMAGE_SIZE.store(boot_info.image_size as u64, Ordering::Relaxed);
+    HOST_CONTROL
+        .kernel_image_base
+        .store(boot_info.image_base as u64, Ordering::Relaxed);
+    HOST_CONTROL
+        .kernel_image_size
+        .store(boot_info.image_size as u64, Ordering::Relaxed);
     // Crash addresses are symbolized relative to this base
     // (tools/debug/symbolize.sh).
     serial_write_raw(b"ginux: kernel image base ");
@@ -445,9 +478,9 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     let kernel_stack_start = stack_start + PAGE_SIZE;
     let kernel_stack_upper_guard = stack_start + KERNEL_STACK_TOP_OFFSET;
     let double_fault_guard = arch::x86_64::cpu::double_fault_guard_page();
-    let double_fault_upper_guard = arch::x86_64::cpu::double_fault_upper_guard_page();
+    let nmi_guard = arch::x86_64::cpu::nmi_guard_page();
+    let machine_check_guard = arch::x86_64::cpu::machine_check_guard_page();
     let privilege_stack_guard = arch::x86_64::cpu::privilege_stack_guard_page();
-    let privilege_stack_upper_guard = arch::x86_64::cpu::privilege_stack_upper_guard_page();
     let required_addresses = [
         kernel_main as *const () as usize,
         boot_info as *const BootInfo as usize,
@@ -472,16 +505,21 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         arch::x86_64::cpu::privilege_stack_top() - 1,
         double_fault_guard + PAGE_SIZE,
         arch::x86_64::cpu::double_fault_stack_top() - 1,
+        nmi_guard + PAGE_SIZE,
+        arch::x86_64::cpu::nmi_stack_top() - 1,
+        machine_check_guard + PAGE_SIZE,
+        arch::x86_64::cpu::machine_check_stack_top() - 1,
     ];
-    let guard_pages = [
-        0,
-        kernel_stack_guard,
-        kernel_stack_upper_guard,
-        privilege_stack_guard,
-        privilege_stack_upper_guard,
-        double_fault_guard,
-        double_fault_upper_guard,
-    ];
+    let cpu_guard_pages = arch::x86_64::cpu::stack_guard_pages();
+    let mut guard_pages = [0; 3 + 4 * 10];
+    guard_pages[0] = 0;
+    guard_pages[1] = kernel_stack_guard;
+    guard_pages[2] = kernel_stack_upper_guard;
+    guard_pages[3..].copy_from_slice(&cpu_guard_pages);
+
+    if !arch::x86_64::smp::prepare_trampoline() {
+        kernel_fail("ginux: application-processor trampoline preparation failed\r\n");
+    }
 
     if !arch::x86_64::cpu::enable_execute_disable() {
         kernel_fail("ginux: execute-disable unavailable or inactive\r\n");
@@ -609,6 +647,11 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     };
     serial_write("ginux: ACPI MADT validated\r\nginux: enabled processors: ");
     serial_write_usize(platform.enabled_processors);
+    serial_write("\r\nginux: processor APIC IDs:");
+    for apic_id in &platform.processor_apic_ids[..platform.enabled_processors] {
+        serial_write(" ");
+        serial_write_u64(u64::from(*apic_id));
+    }
     serial_write("\r\nginux: I/O APICs: ");
     serial_write_usize(platform.io_apics);
     serial_write("\r\nginux: MADT local APIC address: ");
@@ -724,6 +767,18 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     serial_write_u64(local_apic.physical_base);
     serial_write("\r\n");
     serial_write("ginux: local APIC uses higher-half direct map\r\n");
+
+    if !arch::x86_64::smp::start_application_processors(platform, &local_apic) {
+        kernel_fail("ginux: application-processor startup failed\r\n");
+    }
+    serial_write("ginux: online processors: ");
+    serial_write_usize(arch::x86_64::smp::online_count());
+    serial_write("\r\n");
+    if !arch::x86_64::smp::verify_cross_cpu_mechanisms() {
+        kernel_fail("ginux: cross-CPU interrupt mechanisms failed\r\n");
+    }
+    serial_write("ginux: cross-CPU interrupts and invalidation verified\r\n");
+    serial_write("ginux: concurrent processor execution verified\r\n");
 
     let timers = arch::x86_64::timer::discover();
     serial_write("ginux: timer capabilities discovered\r\nginux: invariant TSC: ");
@@ -1341,7 +1396,7 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     let mut persisted_local_configuration = [0_u8; PERSISTENT_LOCAL_CONFIG_SIZE];
     let mut persisted_local_record = None;
     let mut persisted_local_configuration_valid = true;
-    let persisted_oci_catalog = &mut *core::ptr::addr_of_mut!(PERSISTED_OCI_CATALOG);
+    let persisted_oci_catalog = &mut *HOST_CONTROL.persisted_oci_catalog.get();
     let mut persisted_oci_catalog_valid = false;
     let mut persisted_oci_catalog_corrupt = false;
     let disk_volume = (|| {
@@ -1886,6 +1941,14 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         if !linux_process::verify_lifecycle_contract() {
             kernel_fail("ginux: bounded Linux process lifecycle contract invalid\r\n");
         }
+        if !address_space::verify_linux_runtime_translation_permissions() {
+            kernel_fail("ginux: Linux translation recovery permissions invalid\r\n");
+        }
+        serial_write("ginux: Linux translation recovery permissions validated\r\n");
+        if !arch::x86_64::cpu::verify_cross_cpu_linux_runtime_mechanisms() {
+            kernel_fail("ginux: cross-CPU Linux runtime mechanisms invalid\r\n");
+        }
+        serial_write("ginux: cross-CPU Linux signals, futexes, pipes, and sockets validated\r\n");
         serial_write("ginux: bounded Linux process lifecycle contract validated\r\n");
         serial_write("ginux: Linux stopped and continued child wait states validated\r\n");
         serial_write("ginux: generation-bound Linux process roots validated\r\n");
@@ -3944,7 +4007,9 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
             regions,
         )
     });
-    OPERATOR_CONSOLE_READY.store(true, Ordering::Release);
+    HOST_CONTROL
+        .operator_console_ready
+        .store(true, Ordering::Release);
     serial_write_raw(b"ginux: platform, security, devices, and runtime ready\r\n");
     serial_write("ginux: persistent storage ");
     serial_write(match host_volume.disposition {
@@ -3974,13 +4039,15 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     let mut controller_recovery_attempts = 0_u8;
     let mut controller_launch_announced = false;
     'managed: loop {
-        BACKGROUND_DOMAIN_OUTPUT.store(false, Ordering::Release);
+        HOST_CONTROL
+            .background_domain_output
+            .store(false, Ordering::Release);
         if !controller_launch_announced {
             serial_write("\r\nginux: launching embedded controller in ring 3\r\n");
             controller_launch_announced = true;
         }
         let controller_completed = address_space::run_installed_interactive_controller();
-        BACKGROUND_DOMAIN_OUTPUT.store(
+        HOST_CONTROL.background_domain_output.store(
             arch::x86_64::cpu::detached_container_lifecycle_pending(),
             Ordering::Release,
         );
@@ -4048,7 +4115,9 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         }
         if arch::x86_64::cpu::take_container_pull_request() {
             let pull_started = arch::x86_64::timer::timestamp_counter();
-            OCI_PULL_STARTED.store(pull_started, Ordering::Release);
+            HOST_CONTROL
+                .oci_pull_started
+                .store(pull_started, Ordering::Release);
             if !image_store::begin_layer_pull() {
                 serial_write("ginux: OCI image staging reset failed\r\n");
                 arch::x86_64::cpu::complete_container_pull(false);
@@ -4075,13 +4144,28 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
                 serial_write("\r\n");
                 let catalog_contains_image = persisted_oci_catalog_valid
                     && oci_catalog_contains(persisted_oci_catalog, &image[..image_size]);
-                match if catalog_contains_image {
+                let configured_slot = arch::x86_64::cpu::configured_container_slot();
+                let shared_rootfs = configured_slot.and_then(|target| {
+                    (0..control_abi::DOMAIN_LIMIT)
+                        .find(|source| {
+                            *source != target
+                                && published_rootfs::is_installed(*source)
+                                && arch::x86_64::cpu::container_image_matches(
+                                    *source,
+                                    &image[..image_size],
+                                )
+                        })
+                        .filter(|source| image_store::share_installed_rootfs(*source, target))
+                });
+                match if shared_rootfs.is_some() {
+                    OciCacheRestore::RootfsHit
+                } else if catalog_contains_image {
                     restore_cached_oci_layers(
                         virtio_block,
                         virtio_mmio,
                         virtio_iommu_profile,
                         &image[..image_size],
-                        arch::x86_64::cpu::configured_container_slot(),
+                        configured_slot,
                     )
                 } else {
                     OciCacheRestore::Miss
@@ -4214,7 +4298,7 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
                     serial_write(" bytes)\r\n");
                 }
             }
-            let pull_started = OCI_PULL_STARTED.swap(0, Ordering::AcqRel);
+            let pull_started = HOST_CONTROL.oci_pull_started.swap(0, Ordering::AcqRel);
             if pull_started != 0 {
                 serial_write_elapsed("ginux: timing OCI total: ", pull_started);
             }
@@ -4531,10 +4615,14 @@ fn serial_write(message: &str) {
 }
 
 pub(crate) fn serial_write_bytes(bytes: &[u8]) {
-    if !cfg!(feature = "verification-boot") && !OPERATOR_CONSOLE_READY.load(Ordering::Acquire) {
+    if !cfg!(feature = "verification-boot")
+        && !HOST_CONTROL.operator_console_ready.load(Ordering::Acquire)
+    {
         return;
     }
-    if BACKGROUND_DOMAIN_OUTPUT.load(Ordering::Acquire)
+    if HOST_CONTROL
+        .background_domain_output
+        .load(Ordering::Acquire)
         && arch::x86_64::cpu::buffer_configured_container_console(bytes)
     {
         return;
@@ -4685,6 +4773,18 @@ fn restore_cached_oci_layers(
             let Ok(length) = usize::try_from(rootfs.length) else {
                 return Some(OciCacheRestore::Invalid);
             };
+            if let Some(source) = (0..control_abi::DOMAIN_LIMIT).find(|source| {
+                *source != slot
+                    && image_store::installed_rootfs(*source).is_some_and(|bytes| {
+                        bytes.len() == length && crypto::sha256(bytes) == rootfs.digest
+                    })
+            }) {
+                return Some(if image_store::share_installed_rootfs(source, slot) {
+                    OciCacheRestore::RootfsHit
+                } else {
+                    OciCacheRestore::Invalid
+                });
+            }
             let page_count = length.div_ceil(4096);
             let Some((first_frame, allocated)) =
                 memory::allocate_contiguous_extent(memory::FrameOwner::KERNEL, page_count)

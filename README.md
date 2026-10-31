@@ -142,7 +142,7 @@ coverage, and a physical-hardware matrix remain future work.
 | Networking | Host DHCP/DNS, virtual-link configuration, loopback, and tested lifecycle | Independent per-domain packet paths and leases remain unfinished |
 | Devices | QEMU virtio block/network, MSI-X, and VT-d paths | No GPU, NVMe, broad hardware, or stable third-party driver ABI |
 | Desktop | A Rust Wayland compositor and terminal run in an Alpine domain on the firmware framebuffer (`/dev/fb0`), with USB keyboard and tablet input through evdev | Software rendering at the firmware's mode; no XKB keymap, pseudo-terminals, clipboard or popups |
-| Performance | Narrow single-vCPU QEMU comparison using the same sysbench binary | Not a native, multicore, or general kernel benchmark |
+| Performance | Matched 1/2/4-vCPU QEMU comparison using the same Rocky userspace and sysbench binary | Not a native-hardware or general kernel benchmark; four-thread scheduling remains weak |
 | Security | Capability and generation mechanisms exercised by tests | No independent audit or production security claim |
 
 The validated development target is QEMU's x86-64 Q35 machine with OVMF,
@@ -385,11 +385,84 @@ for the full target and environment-variable list.
   service contracts.
 - [`tests`](tests) contains ABI, lifecycle, and end-to-end QEMU gates.
 - [`tools`](tools) contains image, manifest, architecture, and QEMU tooling.
+- [`skills`](skills) contains portable HDAE development and scheduled PR/issue
+  review Agent Skills shared by Codex and Claude Code.
+
+## Using the agent skills
+
+The canonical skills live under [`skills/`](skills). Git-tracked relative
+symlinks expose the same files to Codex under `.agents/skills/` and to Claude
+Code under `.claude/skills/`. Start a new agent session from this repository
+after checking out the branch that contains those links so the agent discovers
+them at startup.
+
+### HDAE development
+
+Use this skill when starting or restructuring substantial work. It begins with
+focused Q&A, helps the human establish product intent and architecture, creates
+milestones with executable gates, and gives the agent autonomy to iterate
+inside each approved gate. It stops at gate boundaries for human direction.
+
+In Codex, start with:
+
+```text
+Use $hdae-development to help me develop this project.
+```
+
+In Claude Code, use the same request with the Claude skill command:
+
+```text
+/hdae-development Help me develop this project.
+```
+
+The user may begin with only an idea. The agent is responsible for eliciting the
+structured project brief through focused follow-up questions, confirming it,
+and writing it into durable project state before implementation. The skill also
+requires the agent to propose complete gates, ask what is missing, wait for
+approval, and update the persisted status at every stopping point. After
+approving a gate, tell the agent to implement that named gate using the same
+skill.
+
+### Recurring PR and issue review
+
+Use this skill to establish read-only reviews of new or updated GitHub issues
+and pull requests. The agent discovers the repository, checks for a connected
+GitHub account or authenticated `gh` CLI, guides installation or interactive
+login when needed, and asks for the frequency, time/day anchor, timezone,
+scope, report destination, and notification preference. It validates access
+with a review before creating the schedule.
+
+In Codex, start with:
+
+```text
+Use $pr-issue-review to set up recurring, read-only reviews of new or updated
+issues and pull requests for this repository. Discover and validate the GitHub
+repository and authentication, then ask me how often and when the review should
+run. Preview one review before creating the schedule. Do not post, label, close,
+approve, merge, commit, or push anything.
+```
+
+In Claude Code, use:
+
+```text
+/pr-issue-review Set up recurring, read-only reviews of new or updated issues
+and pull requests for this repository. Discover and validate the GitHub
+repository and authentication, then ask me how often and when the review should
+run. Preview one review before creating the schedule. Do not post, label, close,
+approve, merge, commit, or push anything.
+```
+
+Codex can use its native recurring automation when available. Claude Code uses
+an available native scheduler or proposes an explicit repository workflow or
+host scheduler for approval. In either environment, the skill verifies that
+the unattended runtime can access the repository before creating the task; it
+never asks for a token to be pasted into the conversation.
 
 ## Design and evidence
 
 - [Architecture](ARCHITECTURE.md)
 - [Verification roadmap](docs/ROADMAP.md)
+- [Feedback-driven hardening research](docs/FEEDBACK-HARDENING-RESEARCH.md)
 - [Linux compatibility matrix](docs/LINUX-COMPATIBILITY.md)
 - [Linux runtime compatibility](docs/LINUX-RUNTIME-COMPATIBILITY.md)
 - [Runtime use cases](docs/USE-CASES.md)

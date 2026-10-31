@@ -10,6 +10,7 @@
 //! as OCI layer staging and unpacked image filesystems, are taken
 //! highest-first so they do not exhaust low memory.
 
+use crate::sync::{IrqSpinLock, LockRank};
 use crate::{
     arch::x86_64::paging, BootInfo, UefiMemoryDescriptor, EFI_BOOT_SERVICES_CODE,
     EFI_BOOT_SERVICES_DATA, EFI_CONVENTIONAL_MEMORY,
@@ -26,12 +27,19 @@ const META_OWNER: u64 = 0xff;
 const META_LIVE: u64 = 1 << 8;
 const META_GENERATION_SHIFT: u32 = 32;
 
-static INITIALIZED: AtomicBool = AtomicBool::new(false);
-static RUNTIME_EXTENT_STARTS: [AtomicU64; crate::control_abi::DOMAIN_LIMIT] =
-    [const { AtomicU64::new(0) }; crate::control_abi::DOMAIN_LIMIT];
-static RUNTIME_EXTENT_COUNTS: [AtomicUsize; crate::control_abi::DOMAIN_LIMIT] =
-    [const { AtomicUsize::new(0) }; crate::control_abi::DOMAIN_LIMIT];
-static mut GLOBAL_ALLOCATOR: MaybeUninit<FrameAllocator> = MaybeUninit::uninit();
+struct PhysicalMemoryOwner {
+    initialized: AtomicBool,
+    runtime_extent_starts: [AtomicU64; crate::control_abi::DOMAIN_LIMIT],
+    runtime_extent_counts: [AtomicUsize; crate::control_abi::DOMAIN_LIMIT],
+    allocator: IrqSpinLock<MaybeUninit<FrameAllocator>>,
+}
+
+static PHYSICAL_MEMORY: PhysicalMemoryOwner = PhysicalMemoryOwner {
+    initialized: AtomicBool::new(false),
+    runtime_extent_starts: [const { AtomicU64::new(0) }; crate::control_abi::DOMAIN_LIMIT],
+    runtime_extent_counts: [const { AtomicUsize::new(0) }; crate::control_abi::DOMAIN_LIMIT],
+    allocator: IrqSpinLock::new(LockRank::PHYSICAL_MEMORY, MaybeUninit::uninit()),
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 // Process snapshots contain many leases. Keep the wire-like lease record
@@ -108,6 +116,10 @@ pub(crate) struct FrameAllocator {
     owners: [u64; OWNER_SLOTS],
     owner_counts: [usize; OWNER_SLOTS + 1],
 }
+
+// SAFETY: the table pointers address boot-carved RAM that the allocator owns
+// for the kernel's lifetime; the PHYSICAL_MEMORY lock serializes all access.
+unsafe impl Send for FrameAllocator {}
 
 impl FrameAllocator {
     /// Creates an empty allocator over caller-provided tables.
@@ -374,13 +386,35 @@ impl FrameAllocator {
         start: FrameLease,
         count: usize,
     ) -> bool {
+        if !self.can_release_contiguous_extent(owner, start, count) {
+            return false;
+        }
         let Some(first) = self.index(start.address) else {
             return false;
         };
-        if count == 0
-            || start.generation == 0
-            || first.checked_add(count).is_none_or(|end| end > self.frames)
-            || !(0..count).all(|offset| {
+        for index in first..first + count {
+            self.retire(index);
+        }
+        true
+    }
+
+    /// Returns whether `count` frames from `start` are live leases of one
+    /// generation held by `owner`, so the extent may be released.
+    fn can_release_contiguous_extent(
+        &self,
+        owner: FrameOwner,
+        start: FrameLease,
+        count: usize,
+    ) -> bool {
+        let Some(first) = self.index(start.address) else {
+            return false;
+        };
+        count != 0
+            && start.generation != 0
+            && first
+                .checked_add(count)
+                .is_some_and(|end| end <= self.frames)
+            && (0..count).all(|offset| {
                 self.lease_matches(
                     FrameLease {
                         address: start.address + offset as u64 * PAGE_SIZE,
@@ -389,13 +423,6 @@ impl FrameAllocator {
                     Some(owner),
                 )
             })
-        {
-            return false;
-        }
-        for index in first..first + count {
-            self.retire(index);
-        }
-        true
     }
 
     /// Returns whether `frame` is live with its generation and, when given,
@@ -572,7 +599,7 @@ fn descriptor_end(descriptor: &UefiMemoryDescriptor) -> Option<u64> {
 /// Builds the allocator over usable memory below `ceiling`, the end of the
 /// kernel's direct map.
 pub(crate) fn initialize(boot_info: &BootInfo, ceiling: u64) -> bool {
-    if INITIALIZED.load(Ordering::Acquire) {
+    if PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) {
         return false;
     }
     let (mut highest, mut largest) = (0_u64, (0_u64, 0_u64));
@@ -613,10 +640,11 @@ pub(crate) fn initialize(boot_info: &BootInfo, ceiling: u64) -> bool {
     let Some(tables) = paging::direct_map_range_address(tables_start, tables_size as usize) else {
         return false;
     };
+    // The IRQ-safe lock makes initialization publication exclusive with
+    // later allocator access.
+    let mut storage = PHYSICAL_MEMORY.allocator.lock();
     // SAFETY: the tables lie in usable RAM inside the direct map and are
     // removed from the free pool below before anything can allocate them.
-    // Bootstrap initialization is single-processor and interrupts do not
-    // access the allocator.
     unsafe {
         core::ptr::write_bytes(tables as *mut u8, 0, tables_size as usize);
         let metadata = tables as *mut u64;
@@ -641,31 +669,25 @@ pub(crate) fn initialize(boot_info: &BootInfo, ceiling: u64) -> bool {
         if allocator.free_frames == 0 {
             return false;
         }
-        core::ptr::addr_of_mut!(GLOBAL_ALLOCATOR)
-            .cast::<FrameAllocator>()
-            .write(allocator);
+        storage.write(allocator);
     }
-    INITIALIZED.store(true, Ordering::Release);
+    PHYSICAL_MEMORY.initialized.store(true, Ordering::Release);
     true
 }
 
-fn allocator() -> *mut FrameAllocator {
-    core::ptr::addr_of_mut!(GLOBAL_ALLOCATOR).cast::<FrameAllocator>()
-}
-
 pub(crate) fn allocate_frames<const N: usize>(owner: FrameOwner) -> Option<[FrameLease; N]> {
-    if !INITIALIZED.load(Ordering::Acquire) {
+    if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) {
         return None;
     }
-    // SAFETY: Initialization published a valid allocator. Bootstrap is
-    // single-processor and callers keep interrupts disabled, so access is
-    // serialized until an SMP-safe allocator replaces this path.
+    let mut storage = PHYSICAL_MEMORY.allocator.lock();
+    // SAFETY: initialized is published only after the locked storage contains
+    // a valid FrameAllocator.
     unsafe {
-        let allocator = allocator();
-        let frames = (*allocator).reserve::<N>(owner)?;
+        let allocator = storage.assume_init_mut();
+        let frames = allocator.reserve::<N>(owner)?;
         for frame in &frames {
             let Some(address) = frame.direct_map_address() else {
-                let _ = (*allocator).release(owner, frames);
+                let _ = allocator.release(owner, frames);
                 return None;
             };
             core::ptr::write_bytes(address as *mut u8, 0, PAGE_SIZE as usize);
@@ -679,23 +701,23 @@ pub(crate) fn allocate_frame_prefix_into(
     output: &mut [FrameLease],
     count: usize,
 ) -> bool {
-    if !INITIALIZED.load(Ordering::Acquire) || count == 0 || count > output.len() {
+    if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) || count == 0 || count > output.len() {
         return false;
     }
     output.fill(FrameLease::EMPTY);
-    // SAFETY: As with `allocate_frames`, bootstrap and syscall execution keep
-    // allocator access serialized. A partial reservation is rolled back
-    // atomically before returning failure.
+    let mut storage = PHYSICAL_MEMORY.allocator.lock();
+    // SAFETY: initialized publishes a valid allocator; the lock serializes the
+    // partial reservation and rollback transaction.
     unsafe {
-        let allocator = allocator();
+        let allocator = storage.assume_init_mut();
         for index in 0..count {
-            let frame = (*allocator).allocate_one(owner);
+            let frame = allocator.allocate_one(owner);
             let address = frame.and_then(FrameLease::direct_map_address);
             let (Some(frame), Some(address)) = (frame, address) else {
                 if let Some(frame) = frame {
-                    let _ = (*allocator).release_slice(owner, core::slice::from_ref(&frame));
+                    let _ = allocator.release_slice(owner, core::slice::from_ref(&frame));
                 }
-                let _ = (*allocator).release_slice(owner, &output[..index]);
+                let _ = allocator.release_slice(owner, &output[..index]);
                 output[..index].fill(FrameLease::EMPTY);
                 return false;
             };
@@ -709,17 +731,18 @@ pub(crate) fn allocate_frame_prefix_into(
 pub(crate) fn allocate_contiguous_frames<const N: usize>(
     owner: FrameOwner,
 ) -> Option<[FrameLease; N]> {
-    if !INITIALIZED.load(Ordering::Acquire) {
+    if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) {
         return None;
     }
-    // SAFETY: Initialization published a valid allocator. Bootstrap is
-    // single-processor and callers keep interrupts disabled.
+    let mut storage = PHYSICAL_MEMORY.allocator.lock();
+    // SAFETY: initialized publishes a valid allocator and the lock serializes
+    // the contiguous reservation.
     unsafe {
-        let allocator = allocator();
-        let frames = (*allocator).reserve_contiguous::<N>(owner)?;
+        let allocator = storage.assume_init_mut();
+        let frames = allocator.reserve_contiguous::<N>(owner)?;
         for frame in &frames {
             let Some(address) = frame.direct_map_address() else {
-                let _ = (*allocator).release(owner, frames);
+                let _ = allocator.release(owner, frames);
                 return None;
             };
             core::ptr::write_bytes(address as *mut u8, 0, PAGE_SIZE as usize);
@@ -732,16 +755,17 @@ pub(crate) fn allocate_contiguous_extent(
     owner: FrameOwner,
     count: usize,
 ) -> Option<(FrameLease, usize)> {
-    if !INITIALIZED.load(Ordering::Acquire) || count == 0 {
+    if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) || count == 0 {
         return None;
     }
+    let mut storage = PHYSICAL_MEMORY.allocator.lock();
     // SAFETY: as for allocate_frames.
     unsafe {
-        let allocator = allocator();
-        let first = (*allocator).reserve_contiguous_extent(owner, count)?;
+        let allocator = storage.assume_init_mut();
+        let first = allocator.reserve_contiguous_extent(owner, count)?;
         let length = count.checked_mul(PAGE_SIZE as usize)?;
         let Some(address) = paging::direct_map_range_address(first.address, length) else {
-            let _ = (*allocator).release_contiguous_extent(owner, first, count);
+            let _ = allocator.release_contiguous_extent(owner, first, count);
             return None;
         };
         core::ptr::write_bytes(address as *mut u8, 0, length);
@@ -754,7 +778,7 @@ pub(crate) fn scrub_and_release_contiguous_extent(
     first: FrameLease,
     count: usize,
 ) -> bool {
-    if !INITIALIZED.load(Ordering::Acquire) || count == 0 {
+    if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) || count == 0 {
         return false;
     }
     let Some(length) = count.checked_mul(PAGE_SIZE as usize) else {
@@ -763,40 +787,36 @@ pub(crate) fn scrub_and_release_contiguous_extent(
     let Some(address) = paging::direct_map_range_address(first.address, length) else {
         return false;
     };
+    let mut storage = PHYSICAL_MEMORY.allocator.lock();
     // SAFETY: as for allocate_frames. Ownership is checked before scrubbing so
-    // a stale lease cannot destroy a newer allocation's contents.
+    // a stale lease cannot destroy a newer allocation's contents, and the
+    // allocator lock prevents another CPU from recycling this extent until
+    // both the security scrub and metadata release are complete.
     unsafe {
-        let allocator = allocator();
-        if !(0..count).all(|offset| {
-            (*allocator).lease_matches(
-                FrameLease {
-                    address: first.address + offset as u64 * PAGE_SIZE,
-                    generation: first.generation,
-                },
-                Some(owner),
-            )
-        }) {
+        let allocator = storage.assume_init_mut();
+        if !allocator.can_release_contiguous_extent(owner, first, count) {
             return false;
         }
         core::ptr::write_bytes(address as *mut u8, 0, length);
-        (*allocator).release_contiguous_extent(owner, first, count)
+        allocator.release_contiguous_extent(owner, first, count)
     }
 }
 
 pub(crate) fn allocate_runtime_extent<const N: usize>() -> Option<[FrameLease; N]> {
-    if !INITIALIZED.load(Ordering::Acquire) || N == 0 {
+    if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) || N == 0 {
         return None;
     }
     let slot = crate::arch::x86_64::cpu::current_container_slot()?;
-    let existing = RUNTIME_EXTENT_STARTS[slot].load(Ordering::Acquire);
-    let count = RUNTIME_EXTENT_COUNTS[slot].load(Ordering::Acquire);
+    let existing = PHYSICAL_MEMORY.runtime_extent_starts[slot].load(Ordering::Acquire);
+    let count = PHYSICAL_MEMORY.runtime_extent_counts[slot].load(Ordering::Acquire);
     let start = if existing != 0 {
         (count == N).then_some(existing)?
     } else {
+        let mut storage = PHYSICAL_MEMORY.allocator.lock();
         // SAFETY: as for allocate_frames.
-        let start = unsafe { (*allocator()).carve(N)? };
-        RUNTIME_EXTENT_COUNTS[slot].store(N, Ordering::Release);
-        RUNTIME_EXTENT_STARTS[slot].store(start, Ordering::Release);
+        let start = unsafe { storage.assume_init_mut().carve(N)? };
+        PHYSICAL_MEMORY.runtime_extent_counts[slot].store(N, Ordering::Release);
+        PHYSICAL_MEMORY.runtime_extent_starts[slot].store(start, Ordering::Release);
         start
     };
     let frames = core::array::from_fn(|index| FrameLease {
@@ -824,9 +844,10 @@ pub(crate) fn scrub_runtime_extent<const N: usize>(frames: [FrameLease; N]) -> b
 
 fn runtime_extent_owns(frames: &[FrameLease]) -> bool {
     !frames.is_empty()
-        && RUNTIME_EXTENT_STARTS
+        && PHYSICAL_MEMORY
+            .runtime_extent_starts
             .iter()
-            .zip(&RUNTIME_EXTENT_COUNTS)
+            .zip(&PHYSICAL_MEMORY.runtime_extent_counts)
             .any(|(start, count)| {
                 let start = start.load(Ordering::Acquire);
                 let count = count.load(Ordering::Acquire);
@@ -850,20 +871,22 @@ pub(crate) fn frame_address_is_runtime(address: u64) -> bool {
 }
 
 pub(crate) fn release_frames<const N: usize>(owner: FrameOwner, frames: [FrameLease; N]) -> bool {
-    if !INITIALIZED.load(Ordering::Acquire) {
+    if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) {
         return false;
     }
+    let mut storage = PHYSICAL_MEMORY.allocator.lock();
     // SAFETY: as for allocate_frames.
-    unsafe { (*allocator()).release(owner, frames) }
+    unsafe { storage.assume_init_mut().release(owner, frames) }
 }
 
 pub(crate) fn frame_leases_releasable(owner: FrameOwner, frames: &[FrameLease]) -> bool {
-    if !INITIALIZED.load(Ordering::Acquire) || frames.is_empty() {
+    if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) || frames.is_empty() {
         return false;
     }
+    let mut storage = PHYSICAL_MEMORY.allocator.lock();
     // SAFETY: as for allocate_frames.
     unsafe {
-        (*allocator()).can_release(owner, frames)
+        storage.assume_init_mut().can_release(owner, frames)
             && frames
                 .iter()
                 .all(|frame| frame.direct_map_address().is_some())
@@ -871,24 +894,25 @@ pub(crate) fn frame_leases_releasable(owner: FrameOwner, frames: &[FrameLease]) 
 }
 
 pub(crate) fn live_frame_lease(owner: FrameOwner, address: u64) -> Option<FrameLease> {
-    if !INITIALIZED.load(Ordering::Acquire) {
+    if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) {
         return None;
     }
+    let mut storage = PHYSICAL_MEMORY.allocator.lock();
     // SAFETY: as for allocate_frames.
-    unsafe { (*allocator()).live_lease(owner, address) }
+    unsafe { storage.assume_init_mut().live_lease(owner, address) }
 }
 
 pub(crate) fn scrub_and_release_frames(owner: FrameOwner, frames: &[FrameLease]) -> bool {
-    if !INITIALIZED.load(Ordering::Acquire) || frames.is_empty() {
+    if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) || frames.is_empty() {
         return false;
     }
-    // SAFETY: The allocator and direct map are serialized by the same
-    // single-processor bootstrap contract as allocation. All ownership and
-    // release preconditions are checked before any payload is destroyed, so a
-    // stale or duplicate lease cannot scrub a newer allocation.
+    // The allocator lock keeps ownership validation, payload scrubbing, and
+    // release one transaction, so a stale lease cannot scrub a newer use.
+    let mut storage = PHYSICAL_MEMORY.allocator.lock();
+    // SAFETY: as for allocate_frames.
     unsafe {
-        let allocator = allocator();
-        if !(*allocator).can_release(owner, frames)
+        let allocator = storage.assume_init_mut();
+        if !allocator.can_release(owner, frames)
             || frames
                 .iter()
                 .any(|frame| frame.direct_map_address().is_none())
@@ -901,48 +925,54 @@ pub(crate) fn scrub_and_release_frames(owner: FrameOwner, frames: &[FrameLease])
             };
             core::ptr::write_bytes(address as *mut u8, 0, PAGE_SIZE as usize);
         }
-        (*allocator).release_slice(owner, frames)
+        allocator.release_slice(owner, frames)
     }
 }
 
 pub(crate) fn transfer_frame_owner(from: FrameOwner, to: FrameOwner) -> Option<usize> {
-    if !INITIALIZED.load(Ordering::Acquire) {
+    if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) {
         return None;
     }
+    let mut storage = PHYSICAL_MEMORY.allocator.lock();
     // SAFETY: as for allocate_frames.
-    unsafe { (*allocator()).transfer_owner(from, to) }
+    unsafe { storage.assume_init_mut().transfer_owner(from, to) }
 }
 
 pub(crate) fn frames_owned_by(owner: FrameOwner, frames: &[FrameLease]) -> bool {
-    if !INITIALIZED.load(Ordering::Acquire) {
+    if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) {
         return false;
     }
+    let mut storage = PHYSICAL_MEMORY.allocator.lock();
     // SAFETY: as for allocate_frames.
     unsafe {
-        (*allocator()).owns(owner, frames) || owner.is_kernel() && runtime_extent_owns(frames)
+        storage.assume_init_mut().owns(owner, frames)
+            || owner.is_kernel() && runtime_extent_owns(frames)
     }
 }
 
 pub(crate) fn any_frame_lease_live(frames: &[FrameLease]) -> bool {
-    if !INITIALIZED.load(Ordering::Acquire) {
+    if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) {
         return false;
     }
+    let mut storage = PHYSICAL_MEMORY.allocator.lock();
     // SAFETY: as for allocate_frames.
-    unsafe { (*allocator()).tracks_any(frames) }
+    unsafe { storage.assume_init_mut().tracks_any(frames) }
 }
 
 pub(crate) fn frame_addresses_owned_by(owner: FrameOwner, addresses: &[u64]) -> bool {
-    if !INITIALIZED.load(Ordering::Acquire) {
+    if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) {
         return false;
     }
+    let mut storage = PHYSICAL_MEMORY.allocator.lock();
     // SAFETY: as for allocate_frames.
     unsafe {
-        (*allocator()).owns_addresses(owner, addresses)
+        storage.assume_init_mut().owns_addresses(owner, addresses)
             || owner.is_kernel()
                 && !addresses.is_empty()
-                && RUNTIME_EXTENT_STARTS
+                && PHYSICAL_MEMORY
+                    .runtime_extent_starts
                     .iter()
-                    .zip(&RUNTIME_EXTENT_COUNTS)
+                    .zip(&PHYSICAL_MEMORY.runtime_extent_counts)
                     .any(|(start, count)| {
                         let start = start.load(Ordering::Acquire);
                         let count = count.load(Ordering::Acquire);
@@ -957,35 +987,38 @@ pub(crate) fn frame_addresses_owned_by(owner: FrameOwner, addresses: &[u64]) -> 
 }
 
 pub(crate) fn owner_live_frame_count(owner: FrameOwner) -> Option<usize> {
-    if !INITIALIZED.load(Ordering::Acquire) {
+    if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) {
         return None;
     }
+    let mut storage = PHYSICAL_MEMORY.allocator.lock();
     // SAFETY: as for allocate_frames.
-    unsafe { Some((*allocator()).owner_live_count(owner)) }
+    unsafe { Some(storage.assume_init_mut().owner_live_count(owner)) }
 }
 
 /// Returns the total and currently free frame counts.
 pub(crate) fn frame_counts() -> Option<(u64, u64)> {
-    if !INITIALIZED.load(Ordering::Acquire) {
+    if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) {
         return None;
     }
+    let mut storage = PHYSICAL_MEMORY.allocator.lock();
     // SAFETY: as for allocate_frames.
     unsafe {
-        let allocator = allocator();
-        let available = (*allocator).free_frames;
+        let allocator = storage.assume_init_mut();
+        let available = allocator.free_frames;
         Some((
-            available.checked_add((*allocator).allocated_frames)?,
+            available.checked_add(allocator.allocated_frames)?,
             available,
         ))
     }
 }
 
 pub(crate) fn reclaimed_boot_service_frame_count() -> Option<u64> {
-    if !INITIALIZED.load(Ordering::Acquire) {
+    if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) {
         return None;
     }
+    let mut storage = PHYSICAL_MEMORY.allocator.lock();
     // SAFETY: as for allocate_frames.
-    unsafe { Some((*allocator()).reclaimed_boot_service_frames) }
+    unsafe { Some(storage.assume_init_mut().reclaimed_boot_service_frames) }
 }
 
 /// Exercises reservation, release, ownership, budget, and contiguity rules on
