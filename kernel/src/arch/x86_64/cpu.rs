@@ -23685,24 +23685,23 @@ fn linux_rootfs_execve_source(
     }
     let _ = set_current_linux_clear_child_tid(0);
     let _ = set_current_linux_robust_list(0);
-    // Drop the old program's mmap area and, if it was loaded high, its
-    // image; the new image's own pages are kept.
-    for base in [LINUX_RUNTIME_DYNAMIC_MMAP_BASE, LINUX_EXEC_HIGH_LOAD_BASE] {
-        if !address_space::release_current_linux_runtime_mappings_preserving(
-            base,
-            |frame| {
-                crate::linux_file_cache::contains(frame)
-                    || if prepared_frame_references {
-                        linux_process::prepared_live_frame_referenced_by_other_process(frame)
-                    } else {
-                        linux_process::live_mapping_referenced_by_other_process(pid, frame)
-                    }
-            },
-            |frame| replacements[..replacement_count].contains(&frame),
-        ) {
-            serial_write("ginux: Linux exec mmap release failed\r\n");
-            return LINUX_ENOMEM;
-        }
+    // Drop the old program's mmap area; the new image's own pages are kept.
+    // The high image window is left alone: releasing it from a vfork child
+    // of a high-loaded program unmapped that program's own code.
+    if !address_space::release_current_linux_runtime_mappings_preserving(
+        LINUX_RUNTIME_DYNAMIC_MMAP_BASE,
+        |frame| {
+            crate::linux_file_cache::contains(frame)
+                || if prepared_frame_references {
+                    linux_process::prepared_live_frame_referenced_by_other_process(frame)
+                } else {
+                    linux_process::live_mapping_referenced_by_other_process(pid, frame)
+                }
+        },
+        |frame| replacements[..replacement_count].contains(&frame),
+    ) {
+        serial_write("ginux: Linux exec mmap release failed\r\n");
+        return LINUX_ENOMEM;
     }
     ELF_PROBE_MMAP_NEXT.store(LINUX_RUNTIME_DYNAMIC_MMAP_BASE, Ordering::SeqCst);
     if !update_current_linux_tls(0) {
