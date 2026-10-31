@@ -234,6 +234,7 @@ share window buffers through memfd pools passed with `SCM_RIGHTS`; Ginux maps
 a memfd's own pages into every process that maps it.
 
 ```sh
+just desktop        # build, boot in a QEMU window and start the desktop in Alpine
 make userland       # build ginux-wm and ginux-term
 make userland-check # format check, clippy and unit tests on the host
 make test-desktop   # run both in Alpine, type into the terminal, check a screendump
