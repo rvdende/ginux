@@ -2682,6 +2682,80 @@ fn restore_linux_process_extended_state(pid: u32) -> bool {
     true
 }
 
+// The extended (x87/SSE/AVX) state of each thread that is not running. A
+// timer can preempt a thread with live vector registers, so a sibling must
+// not run on them. Each domain instance's table is allocated on first use.
+static mut LINUX_THREAD_EXTENDED_STATES: [*mut ExtendedState; LINUX_RUNTIME_INSTANCE_LIMIT] =
+    [core::ptr::null_mut(); LINUX_RUNTIME_INSTANCE_LIMIT];
+static LINUX_THREAD_EXTENDED_STATE_VALID: [BankedAtomicBool; LINUX_THREAD_LIMIT] =
+    [const { BankedAtomicBool::new(false) }; LINUX_THREAD_LIMIT];
+
+fn linux_thread_extended_state(slot: usize) -> Option<*mut ExtendedState> {
+    if slot >= LINUX_THREAD_LIMIT {
+        return None;
+    }
+    // SAFETY: the kernel is single-processor; the table is only touched here.
+    let table = unsafe { &mut *core::ptr::addr_of_mut!(LINUX_THREAD_EXTENDED_STATES) };
+    let entry = &mut table[linux_execution_instance()];
+    if entry.is_null() {
+        let length = size_of::<ExtendedState>() * LINUX_THREAD_LIMIT;
+        let (first, _) = memory::allocate_contiguous_extent(
+            memory::FrameOwner::KERNEL,
+            length.div_ceil(PAGE_SIZE),
+        )?;
+        *entry = paging::direct_map_range_address(first.address(), length)? as *mut ExtendedState;
+    }
+    // SAFETY: the page-aligned table holds LINUX_THREAD_LIMIT states.
+    Some(unsafe { entry.add(slot) })
+}
+
+/// Saves the live extended state as thread `slot`'s, which stops running.
+fn save_linux_thread_extended_state(slot: usize) {
+    if !EXTENDED_USER_STATE_ENABLED.load(Ordering::Acquire) {
+        return;
+    }
+    let Some(state) = linux_thread_extended_state(slot) else {
+        return;
+    };
+    // SAFETY: the state is a 64-byte aligned save area of EXTENDED_STATE_SIZE
+    // bytes, enough for the x87, SSE and AVX components saved here.
+    unsafe {
+        asm!(
+            "xsave64 [{}]",
+            in(reg) state,
+            in("eax") 7_u32,
+            in("edx") 0_u32,
+            options(nostack)
+        );
+    }
+    LINUX_THREAD_EXTENDED_STATE_VALID[slot].store(true, Ordering::SeqCst);
+}
+
+/// Loads thread `slot`'s saved extended state as it starts running. A thread
+/// without one, such as a new thread, keeps the live state, as a clone
+/// inherits its creator's.
+fn restore_linux_thread_extended_state(slot: usize) {
+    if !EXTENDED_USER_STATE_ENABLED.load(Ordering::Acquire)
+        || slot >= LINUX_THREAD_LIMIT
+        || !LINUX_THREAD_EXTENDED_STATE_VALID[slot].swap(false, Ordering::SeqCst)
+    {
+        return;
+    }
+    let Some(state) = linux_thread_extended_state(slot) else {
+        return;
+    };
+    // SAFETY: the state was written by xsave64 for this slot.
+    unsafe {
+        asm!(
+            "xrstor64 [{}]",
+            in(reg) state,
+            in("eax") 7_u32,
+            in("edx") 0_u32,
+            options(nostack)
+        );
+    }
+}
+
 fn clone_linux_process_extended_state(parent: u32, child: u32) -> bool {
     let (Some((parent_instance, parent_slot)), Some((child_instance, child_slot))) = (
         linux_process_extended_state_index(parent),
@@ -5319,7 +5393,11 @@ fn reserve_linux_thread(
     let generation = LINUX_THREAD_GENERATIONS[slot]
         .load(Ordering::SeqCst)
         .checked_add(1)?;
-    let tid = LINUX_NEXT_TID.load(Ordering::SeqCst);
+    let tid = if LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
+        linux_process::allocate_live_thread_id()?
+    } else {
+        LINUX_NEXT_TID.load(Ordering::SeqCst)
+    };
     let next_tid = tid.checked_add(1)?;
     let inherited_signal_mask = current_linux_thread_slot().map_or_else(
         || ELF_PROBE_SIGNAL_MASK.load(Ordering::SeqCst),
@@ -5578,7 +5656,9 @@ fn switch_linux_thread(handle: LinuxThreadHandle) -> bool {
             Ordering::SeqCst,
         );
         LINUX_THREAD_STATES[prior].store(LINUX_THREAD_READY, Ordering::SeqCst);
+        save_linux_thread_extended_state(prior);
     }
+    restore_linux_thread_extended_state(slot);
     ELF_PROBE_SIGNAL_MASK.store(
         LINUX_THREAD_SIGNAL_MASKS[slot].load(Ordering::SeqCst),
         Ordering::SeqCst,
@@ -5655,6 +5735,7 @@ fn clear_linux_thread_slot(slot: usize) {
     LINUX_THREAD_RSEQ_LENGTHS[slot].store(0, Ordering::SeqCst);
     LINUX_THREAD_RSEQ_SIGNATURES[slot].store(0, Ordering::SeqCst);
     LINUX_THREAD_SIGNAL_MASKS[slot].store(0, Ordering::SeqCst);
+    LINUX_THREAD_EXTENDED_STATE_VALID[slot].store(false, Ordering::SeqCst);
     LINUX_THREAD_WAIT_KINDS[slot].store(LINUX_THREAD_WAIT_NONE, Ordering::SeqCst);
     LINUX_THREAD_WAIT_KEYS[slot].store(0, Ordering::SeqCst);
     LINUX_THREAD_WAIT_OUTPUTS[slot].store(0, Ordering::SeqCst);
@@ -5774,6 +5855,25 @@ fn linux_thread_handle_by_tid(tid: u64) -> Option<LinuxThreadHandle> {
     })
 }
 
+/// Thread `tid` of the current process. A thread ID can equal the process ID
+/// of another process's main thread, so lookups that name the calling
+/// process (tgkill, such as a jobserver waking its exited helper thread)
+/// must not reach outside it.
+fn current_process_thread_handle_by_tid(tid: u64) -> Option<LinuxThreadHandle> {
+    let tid = u32::try_from(tid).ok()?;
+    (0..LINUX_THREAD_LIMIT).find_map(|slot| {
+        (LINUX_THREAD_TIDS[slot].load(Ordering::SeqCst) == tid
+            && linux_thread_slot_in_current_process(slot))
+        .then(|| linux_thread_handle(slot))
+        .flatten()
+    })
+}
+
+/// Thread `tid`, preferring the current process's.
+fn preferred_thread_handle_by_tid(tid: u64) -> Option<LinuxThreadHandle> {
+    current_process_thread_handle_by_tid(tid).or_else(|| linux_thread_handle_by_tid(tid))
+}
+
 /// Retires every thread that `pid` cloned except the calling one, as
 /// exit_group must and as a process exit implies.
 fn retire_linux_process_threads(pid: u32) {
@@ -5871,6 +5971,7 @@ fn block_current_linux_thread(kind: u8, key: u64, output: u64, deadline: u64) ->
     ) {
         LINUX_DESCRIPTOR_WAITS_ACTIVE.store(true, Ordering::Release);
     }
+    save_linux_thread_extended_state(slot);
     LINUX_CURRENT_THREAD_SLOT.store(LINUX_THREAD_SLOT_NONE, Ordering::SeqCst);
     true
 }
@@ -10594,7 +10695,11 @@ extern "sysv64" fn linux_syscall_handler(
             LINUX_RUNTIME_EINVAL_SYSCALLS[word].fetch_or(bit, Ordering::SeqCst);
         }
     }
+    let switched_thread = runtime_mode && current_linux_thread_handle() != calling_thread;
+    // Suspending saves the calling thread's context, so it waits for a
+    // return into that thread.
     if runtime_mode
+        && !switched_thread
         && result != LINUX_RETURN_TO_KERNEL
         && result != LINUX_RETURN_FROM_SIGNAL
         && !LINUX_SIGNAL_ACTIVE.load(Ordering::Acquire)
@@ -10604,6 +10709,23 @@ extern "sysv64" fn linux_syscall_handler(
         context.rax = result;
         if save_suspended_linux_runtime(context, 0, 0, true) {
             return LINUX_RETURN_TO_KERNEL;
+        }
+    }
+    // A thread switch returns into another thread's saved context. A timer
+    // may have preempted that thread mid-instruction, and SYSRET would
+    // replace its RCX and R11 with the return address and flags, so return
+    // through the IRETQ epilogue with the values saved for its slot. (A
+    // thread saved at a system call holds exactly those values anyway.)
+    if switched_thread && result != LINUX_RETURN_TO_KERNEL && result != LINUX_RETURN_FROM_SIGNAL {
+        if let Some(slot) = current_linux_thread_slot() {
+            // SAFETY: the IRETQ epilogue consumes these values before this
+            // serialized syscall entry can be reused.
+            unsafe {
+                LINUX_SIGNAL_RAX = result;
+                LINUX_SIGNAL_RCX = LINUX_THREAD_RCXS[slot].load(Ordering::SeqCst);
+                LINUX_SIGNAL_R11 = LINUX_THREAD_R11S[slot].load(Ordering::SeqCst);
+            }
+            return LINUX_RETURN_FROM_SIGNAL;
         }
     }
     result
@@ -14197,11 +14319,14 @@ impl LinuxProcessRuntimeState {
     };
 }
 
-static mut LINUX_PROCESS_RUNTIME_STATES: [[LinuxProcessRuntimeState;
-    linux_process::PROCESS_RUNTIME_LIMIT];
-    LINUX_PROCESS_RUNTIME_INSTANCE_LIMIT] = [[LinuxProcessRuntimeState::EMPTY;
-    linux_process::PROCESS_RUNTIME_LIMIT];
-    LINUX_PROCESS_RUNTIME_INSTANCE_LIMIT];
+const LINUX_PROCESS_RUNTIME_STATE_COUNT: usize =
+    LINUX_PROCESS_RUNTIME_INSTANCE_LIMIT * linux_process::PROCESS_RUNTIME_LIMIT;
+
+// Each state is about 50 KiB, so it is allocated from the frame allocator the
+// first time a process occupies its slot instead of being reserved in the
+// kernel image for every slot of every domain.
+static mut LINUX_PROCESS_RUNTIME_STATES: [*mut LinuxProcessRuntimeState;
+    LINUX_PROCESS_RUNTIME_STATE_COUNT] = [core::ptr::null_mut(); LINUX_PROCESS_RUNTIME_STATE_COUNT];
 
 fn linux_process_runtime_state(pid: u32) -> Option<&'static mut LinuxProcessRuntimeState> {
     let instance = current_container_slot().unwrap_or(control_abi::DOMAIN_LIMIT);
@@ -14211,11 +14336,45 @@ fn linux_process_runtime_state(pid: u32) -> Option<&'static mut LinuxProcessRunt
     {
         return None;
     }
-    Some(unsafe {
-        &mut *core::ptr::addr_of_mut!(LINUX_PROCESS_RUNTIME_STATES)
-            .cast::<LinuxProcessRuntimeState>()
-            .add(instance * linux_process::PROCESS_RUNTIME_LIMIT + slot)
-    })
+    // SAFETY: the kernel is single-processor and the table is only touched
+    // through these accessors.
+    let table = unsafe { &mut *core::ptr::addr_of_mut!(LINUX_PROCESS_RUNTIME_STATES) };
+    let entry = &mut table[instance * linux_process::PROCESS_RUNTIME_LIMIT + slot];
+    if entry.is_null() {
+        let length = size_of::<LinuxProcessRuntimeState>();
+        let (first, _) = memory::allocate_contiguous_extent(
+            memory::FrameOwner::KERNEL,
+            length.div_ceil(PAGE_SIZE),
+        )?;
+        let state = paging::direct_map_range_address(first.address(), length)?
+            as *mut LinuxProcessRuntimeState;
+        // SAFETY: the extent is a fresh kernel-owned allocation sized for
+        // one state, and nothing else refers to it yet.
+        unsafe { state.write(LinuxProcessRuntimeState::EMPTY) };
+        *entry = state;
+    }
+    // SAFETY: the pointer addresses a live, kernel-owned state, and callers
+    // do not hold two references to one slot.
+    Some(unsafe { &mut **entry })
+}
+
+/// The states allocated for the current domain instance's process slots.
+fn allocated_linux_process_runtime_states(
+) -> impl Iterator<Item = &'static mut LinuxProcessRuntimeState> {
+    let instance = current_container_slot().unwrap_or(control_abi::DOMAIN_LIMIT);
+    let range = if instance < LINUX_PROCESS_RUNTIME_INSTANCE_LIMIT {
+        instance * linux_process::PROCESS_RUNTIME_LIMIT
+            ..(instance + 1) * linux_process::PROCESS_RUNTIME_LIMIT
+    } else {
+        0..0
+    };
+    // SAFETY: as in linux_process_runtime_state; every non-null entry is a
+    // live state.
+    let table = unsafe { &*core::ptr::addr_of!(LINUX_PROCESS_RUNTIME_STATES) };
+    table[range]
+        .iter()
+        .filter(|state| !state.is_null())
+        .map(|state| unsafe { &mut **state })
 }
 
 struct LinuxForkParentRuntime {
@@ -22357,7 +22516,7 @@ fn linux_thread_robust_list(tid: u64) -> Result<u64, u64> {
     let handle = if tid == 0 {
         current_linux_thread_handle()
     } else if tid > 0 {
-        linux_thread_handle_by_tid(tid as u64)
+        preferred_thread_handle_by_tid(tid as u64)
     } else {
         None
     }
@@ -27468,7 +27627,14 @@ fn linux_socket_descriptor_index(descriptor: u64) -> Option<usize> {
     (index < LINUX_DEVICE_DESCRIPTOR_COUNT).then_some(index)
 }
 
+/// Set while a blocking call on a local socket makes its single attempt, so
+/// the socket layer reports EAGAIN instead of spinning.
+static LINUX_SOCKET_SINGLE_ATTEMPT: AtomicBool = AtomicBool::new(false);
+
 fn linux_socket_nonblocking(descriptor: u64) -> bool {
+    if LINUX_SOCKET_SINGLE_ATTEMPT.load(Ordering::SeqCst) {
+        return true;
+    }
     let descriptor = u64::from(descriptor as u32);
     if let Some(flags) = usize::try_from(descriptor)
         .ok()
@@ -31027,6 +31193,15 @@ fn linux_descriptor_read_live_return(
     address: u64,
     count: u64,
 ) -> u64 {
+    if linux_blocking_local_socket(descriptor) {
+        return linux_local_socket_io_live_return(
+            output,
+            caller,
+            LINUX_READ_SYSCALL,
+            descriptor,
+            || linux_descriptor_read(descriptor, address, count),
+        );
+    }
     let immediate = linux_descriptor_read(descriptor, address, count);
     if LINUX_RUNTIME_MODE.load(Ordering::Acquire)
         && (u16::from(linux_console_descriptor(descriptor)) & LINUX_DESCRIPTOR_INPUT != 0
@@ -31076,6 +31251,7 @@ fn linux_descriptor_read_live_return(
     linux_blocking_descriptor_io_live_return(
         output,
         caller,
+        LINUX_READ_SYSCALL,
         kind,
         address,
         wait_output,
@@ -31097,6 +31273,15 @@ fn linux_descriptor_readv_live_return(
     vectors: u64,
     count: u64,
 ) -> u64 {
+    if linux_blocking_local_socket(descriptor) {
+        return linux_local_socket_io_live_return(
+            output,
+            caller,
+            LINUX_READV_SYSCALL,
+            descriptor,
+            || linux_descriptor_readv(descriptor, vectors, count),
+        );
+    }
     let immediate = linux_descriptor_readv(descriptor, vectors, count);
     if LINUX_RUNTIME_MODE.load(Ordering::Acquire)
         && (u16::from(linux_console_descriptor(descriptor)) & LINUX_DESCRIPTOR_INPUT != 0
@@ -31126,6 +31311,7 @@ fn linux_descriptor_readv_live_return(
     linux_blocking_descriptor_io_live_return(
         output,
         caller,
+        LINUX_READV_SYSCALL,
         LINUX_THREAD_WAIT_PIPE_READ,
         vectors,
         LINUX_PIPE_READV_WAIT_FLAG | (vector_count as u64) << 8 | descriptor,
@@ -31141,6 +31327,15 @@ fn linux_descriptor_write_live_return(
     address: u64,
     count: u64,
 ) -> u64 {
+    if linux_blocking_local_socket(descriptor) {
+        return linux_local_socket_io_live_return(
+            output,
+            caller,
+            LINUX_WRITE_SYSCALL,
+            descriptor,
+            || linux_descriptor_write(descriptor, address, count),
+        );
+    }
     let immediate = linux_descriptor_write(descriptor, address, count);
     if immediate == LINUX_EPIPE && linux_pipe_write_descriptor(descriptor) {
         return linux_broken_pipe_live_return(output, caller);
@@ -31165,6 +31360,7 @@ fn linux_descriptor_write_live_return(
         return linux_blocking_descriptor_io_live_return(
             output,
             caller,
+            LINUX_WRITE_SYSCALL,
             LINUX_THREAD_WAIT_EVENTFD_WRITE,
             increment,
             descriptor,
@@ -31188,6 +31384,7 @@ fn linux_descriptor_write_live_return(
     linux_blocking_descriptor_io_live_return(
         output,
         caller,
+        LINUX_WRITE_SYSCALL,
         LINUX_THREAD_WAIT_PIPE_WRITE,
         address,
         count << 8 | descriptor,
@@ -31203,6 +31400,15 @@ fn linux_descriptor_writev_live_return(
     vectors: u64,
     count: u64,
 ) -> u64 {
+    if linux_blocking_local_socket(descriptor) {
+        return linux_local_socket_io_live_return(
+            output,
+            caller,
+            LINUX_WRITEV_SYSCALL,
+            descriptor,
+            || linux_descriptor_writev(descriptor, vectors, count),
+        );
+    }
     let immediate = linux_descriptor_writev(descriptor, vectors, count);
     if immediate == LINUX_EPIPE && linux_pipe_write_descriptor(descriptor) {
         return linux_broken_pipe_live_return(output, caller);
@@ -31217,6 +31423,7 @@ fn linux_descriptor_writev_live_return(
     linux_blocking_descriptor_io_live_return(
         output,
         caller,
+        LINUX_WRITEV_SYSCALL,
         LINUX_THREAD_WAIT_PIPE_WRITE,
         vectors,
         LINUX_PIPE_WRITEV_WAIT_FLAG | (vector_count as u64) << 8 | descriptor,
@@ -31287,9 +31494,14 @@ fn linux_real_timer_signal(
     }
 }
 
+/// Blocks the calling thread on a descriptor and runs a ready sibling. With
+/// none, other processes run instead, such as the other end of a pipe, and
+/// the call (system call `number`) starts again.
+#[allow(clippy::too_many_arguments)]
 fn linux_blocking_descriptor_io_live_return(
     output: *mut LinuxSyscallFrame,
     caller: LinuxUserContext,
+    number: u64,
     kind: u8,
     wait_key: u64,
     wait_output: u64,
@@ -31300,7 +31512,10 @@ fn linux_blocking_descriptor_io_live_return(
         return LINUX_ESRCH;
     };
     let Some(target) = ready_linux_thread_handle() else {
-        return LINUX_ENOSYS;
+        return match run_other_linux_processes(output, caller, number) {
+            Some(LinuxBlockedWait::Return(result)) => result,
+            _ => linux_restart_syscall_live_return(output, caller, number),
+        };
     };
     let Some(tls) = linux_thread_context(current) else {
         return LINUX_ESRCH;
@@ -31365,6 +31580,107 @@ fn linux_blocking_descriptor_io_live_return(
         LINUX_EVENTFD_READ_BLOCK_COUNT.fetch_add(1, Ordering::SeqCst);
     }
     selected.rax
+}
+
+/// Whether `descriptor` is a Unix socket in blocking mode, such as a pipe
+/// between processes. Its peer may be another process, which cannot run
+/// while a blocking call spins in the kernel.
+fn linux_blocking_local_socket(descriptor: u64) -> bool {
+    LINUX_RUNTIME_MODE.load(Ordering::Acquire)
+        && linux_socket_slot(descriptor).is_some_and(|slot| {
+            crate::linux_socket::kind(slot) == Some(crate::linux_socket::Kind::Unix)
+        })
+        && !linux_socket_nonblocking(descriptor)
+}
+
+/// Runs `operation`, system call `number` on the blocking local socket
+/// `descriptor`, once without waiting. If it would block, the rest of the
+/// domain runs and the call starts again. A write to a pipe whose reader is
+/// gone raises SIGPIPE.
+fn linux_local_socket_io_live_return(
+    output: *mut LinuxSyscallFrame,
+    caller: LinuxUserContext,
+    number: u64,
+    descriptor: u64,
+    operation: impl FnOnce() -> u64,
+) -> u64 {
+    LINUX_SOCKET_SINGLE_ATTEMPT.store(true, Ordering::SeqCst);
+    let result = operation();
+    LINUX_SOCKET_SINGLE_ATTEMPT.store(false, Ordering::SeqCst);
+    let write = matches!(number, LINUX_WRITE_SYSCALL | LINUX_WRITEV_SYSCALL);
+    match result {
+        LINUX_EAGAIN => linux_retry_later_live_return(output, caller, number),
+        LINUX_EPIPE | LINUX_ENOTCONN
+            if write && linux_device_descriptor(descriptor) & LINUX_DEVICE_PIPE != 0 =>
+        {
+            linux_broken_pipe_live_return(output, caller)
+        }
+        result => result,
+    }
+}
+
+/// Lets the rest of the domain run before system call `number` starts again:
+/// a ready sibling thread first, and otherwise other processes.
+fn linux_retry_later_live_return(
+    output: *mut LinuxSyscallFrame,
+    caller: LinuxUserContext,
+    number: u64,
+) -> u64 {
+    let mut restart = caller;
+    restart.rip = caller.rip.wrapping_sub(LINUX_SYSCALL_INSTRUCTION_SIZE);
+    restart.rax = number;
+    if let (Some(current), Some(target)) = (
+        current_linux_thread_handle(),
+        yield_ready_linux_thread_handle(),
+    ) {
+        let mut registers = LinuxSyscallFrame::ZERO;
+        let (mut rip, mut rsp, mut rflags, mut rax) = (0, 0, 0, 0);
+        if save_linux_thread_return_context(current, restart)
+            && install_linux_thread_return(
+                target,
+                &mut registers,
+                &mut rip,
+                &mut rsp,
+                &mut rflags,
+                &mut rax,
+            )
+        {
+            let selected = LinuxUserContext {
+                registers,
+                rip,
+                rsp,
+                rflags,
+                rax,
+                fs_base: active_fs_base(),
+            };
+            if !write_linux_live_return(output, selected) {
+                return LINUX_EINVAL;
+            }
+            LINUX_LIVE_RETURN_VALIDATED.store(true, Ordering::SeqCst);
+            return selected.rax;
+        }
+    }
+    match run_other_linux_processes(output, caller, number) {
+        Some(LinuxBlockedWait::Return(result)) => result,
+        _ => linux_restart_syscall_live_return(output, caller, number),
+    }
+}
+
+/// Returns to the caller's system call instruction, so system call `number`
+/// runs again with the same arguments.
+fn linux_restart_syscall_live_return(
+    output: *mut LinuxSyscallFrame,
+    caller: LinuxUserContext,
+    number: u64,
+) -> u64 {
+    let mut restart = caller;
+    restart.rip = caller.rip.wrapping_sub(LINUX_SYSCALL_INSTRUCTION_SIZE);
+    restart.rax = number;
+    if !write_linux_live_return(output, restart) {
+        return LINUX_EINVAL;
+    }
+    LINUX_LIVE_RETURN_VALIDATED.store(true, Ordering::SeqCst);
+    number
 }
 
 fn linux_eventfd_write(descriptor: u64, address: u64, count: u64) -> Option<u64> {
@@ -35346,16 +35662,7 @@ impl LinuxDescriptorOffset {
 }
 
 fn sync_saved_linux_open_file_offset(id: u64, value: u64) {
-    let instance = current_container_slot().unwrap_or(control_abi::DOMAIN_LIMIT);
-    if instance >= LINUX_PROCESS_RUNTIME_INSTANCE_LIMIT {
-        return;
-    }
-    for process in 0..linux_process::PROCESS_RUNTIME_LIMIT {
-        let state = unsafe {
-            &mut *core::ptr::addr_of_mut!(LINUX_PROCESS_RUNTIME_STATES)
-                .cast::<LinuxProcessRuntimeState>()
-                .add(instance * linux_process::PROCESS_RUNTIME_LIMIT + process)
-        };
+    for state in allocated_linux_process_runtime_states() {
         if !state.valid {
             continue;
         }
@@ -36722,7 +37029,9 @@ fn linux_default_resource_limit(resource: u64, runtime: bool) -> Option<[u64; 2]
         LINUX_RLIMIT_STACK => PAGE_SIZE as u64,
         LINUX_RLIMIT_NOFILE if runtime => LINUX_DESCRIPTOR_TABLE_LIMIT,
         LINUX_RLIMIT_NOFILE => LINUX_AUX_DESCRIPTOR_LIMIT,
-        LINUX_RLIMIT_NPROC => linux_process::PROCESS_LIMIT as u64,
+        // Linux counts every task; the process table and thread slots bound
+        // the real capacity.
+        LINUX_RLIMIT_NPROC => (linux_process::PROCESS_LIMIT + LINUX_THREAD_LIMIT) as u64,
         11 => LINUX_SIGNAL_COUNT as u64,
         13 | 14 => 0,
         resource if resource < LINUX_RLIMIT_NLIMITS => u64::MAX,
@@ -41168,7 +41477,7 @@ fn linux_tgkill_identity(thread_group: u64, thread: u64) -> Result<LinuxThreadHa
     if thread_group as u32 != current_linux_process_pid() {
         return Err(LINUX_ESRCH);
     }
-    linux_thread_handle_by_tid(thread as u64).ok_or(LINUX_ESRCH)
+    current_process_thread_handle_by_tid(thread as u64).ok_or(LINUX_ESRCH)
 }
 
 fn linux_tkill_identity(thread: u64) -> Result<LinuxThreadHandle, u64> {
@@ -41176,7 +41485,7 @@ fn linux_tkill_identity(thread: u64) -> Result<LinuxThreadHandle, u64> {
     if thread <= 0 {
         return Err(LINUX_EINVAL);
     }
-    linux_thread_handle_by_tid(thread as u64).ok_or(LINUX_ESRCH)
+    preferred_thread_handle_by_tid(thread as u64).ok_or(LINUX_ESRCH)
 }
 
 fn linux_saved_thread_target(pid: u32, tid: u32) -> Option<LinuxThreadSignalTarget> {
@@ -41207,7 +41516,7 @@ fn linux_tgkill_target(thread_group: u64, thread: u64) -> Result<LinuxThreadSign
     let pid = thread_group as u32;
     let tid = thread as u32;
     if pid == current_linux_process_pid() {
-        return linux_thread_handle_by_tid(u64::from(tid))
+        return current_process_thread_handle_by_tid(u64::from(tid))
             .map(LinuxThreadSignalTarget::Active)
             .ok_or(LINUX_ESRCH);
     }
@@ -41220,7 +41529,7 @@ fn linux_tkill_target(thread: u64) -> Result<LinuxThreadSignalTarget, u64> {
         return Err(LINUX_EINVAL);
     }
     let tid = thread as u32;
-    if let Some(target) = linux_thread_handle_by_tid(u64::from(tid)) {
+    if let Some(target) = preferred_thread_handle_by_tid(u64::from(tid)) {
         return Ok(LinuxThreadSignalTarget::Active(target));
     }
     (0..linux_process::PROCESS_LIMIT)

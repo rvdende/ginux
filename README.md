@@ -137,7 +137,7 @@ coverage, and a physical-hardware matrix remain future work.
 | Boot | Unified x86-64 UEFI image under Q35/OVMF | No production signing, recovery, or physical-hardware profile |
 | Controller | Embedded static ring-3 administration process | No production remote management plane |
 | Domains | Multiple domain objects with distinct process, address-space, root, mount, capability, and lifecycle state | Resource and device isolation remain incomplete in several paths |
-| Linux userspace | Selected Alpine and Rocky programs; Rocky systemd reaches `multi-user.target` | No distribution-wide compatibility claim |
+| Linux userspace | Selected Alpine and Rocky programs; Rocky systemd reaches `multi-user.target`; in the official `rust:alpine` image, cargo downloads crates from crates.io and builds a project using `serde` with derive (build scripts, proc macros, rustc linking through `cc`) | No distribution-wide compatibility claim |
 | Storage | Persistent configuration and verified OCI layer cache | Writable domain persistence and production recovery remain incomplete |
 | Networking | Host DHCP/DNS, virtual-link configuration, loopback, and tested lifecycle | Independent per-domain packet paths and leases remain unfinished |
 | Devices | QEMU virtio block/network, MSI-X, and VT-d paths | No GPU, NVMe, broad hardware, or stable third-party driver ABI |
@@ -159,7 +159,10 @@ device behavior is implemented only to the extent recorded in the
 
 The project uses real workloads as compound integration tests. Alpine exercises
 the musl/BusyBox path. Rocky exercises glibc, dynamic linking, fork/exec, systemd,
-services, procfs, terminals, and related kernel interfaces. A successful tested
+services, procfs, terminals, and related kernel interfaces. The `rust:alpine`
+image exercises a multithreaded toolchain: cargo's TLS downloads, rustc's
+worker threads and dynamically loaded proc macros, and process trees six deep
+(cargo, rustc, cc, collect2, ld) joined by pipes. A successful tested
 workflow is evidence for that workflow only; it is not a guarantee that an
 arbitrary Linux binary or distribution will run.
 

@@ -7,7 +7,7 @@ use core::{
 use crate::{address_space, arch::x86_64::cpu, control_abi, linux_user, memory, scheduler};
 
 pub(crate) const PROCESS_LIMIT: usize = 16;
-pub(crate) const PROCESS_RUNTIME_LIMIT: usize = 6;
+pub(crate) const PROCESS_RUNTIME_LIMIT: usize = PROCESS_LIMIT;
 const PROCESS_HIERARCHY_LIMIT: usize = cpu::LINUX_PROCESS_HIERARCHY_LIMIT;
 const PROCESS_PRIVATE_PAGE_LIMIT: usize = cpu::LINUX_PROCESS_MAPPING_LIMIT;
 const PROCESS_PRIVATE_COPY_LIMIT: usize = cpu::LINUX_PROCESS_MAPPING_LIMIT;
@@ -2474,6 +2474,15 @@ pub(crate) fn live_process_mapping(
         .iter()
         .copied()
         .find(|mapping| mapping.address == address)
+}
+
+/// Takes the next process ID for a new thread, so thread and process IDs
+/// never repeat each other, as in Linux's shared PID space.
+pub(crate) fn allocate_live_thread_id() -> Option<u32> {
+    let table = live_process_table_mut()?;
+    let tid = table.next_pid;
+    table.next_pid = tid.checked_add(1)?;
+    Some(tid)
 }
 
 pub(crate) fn live_mapping_referenced_by_other_process(
