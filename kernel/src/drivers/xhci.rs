@@ -44,6 +44,9 @@ const LEGACY_DISABLE_SMI: u32 = (0x7 << 1) | (0xff << 5) | (0x7 << 17);
 const LEGACY_SMI_EVENTS: u32 = 0x7 << 29;
 
 const TRB_NORMAL: u32 = 1;
+const TRB_ISOCH: u32 = 5;
+/// Start an isochronous transfer in the next possible frame.
+const TRB_START_ISOCH_ASAP: u32 = 1 << 31;
 const TRB_SETUP: u32 = 2;
 const TRB_DATA: u32 = 3;
 const TRB_STATUS: u32 = 4;
@@ -68,6 +71,18 @@ const MAX_SCRATCHPADS: usize = 256;
 pub(crate) const MAX_KEYBOARDS: usize = 4;
 const ENDPOINT_CONTROL: u32 = 4;
 const ENDPOINT_INTERRUPT_IN: u32 = 7;
+const ENDPOINT_ISOCH_OUT: u32 = 1;
+const REQUEST_SET_INTERFACE: u8 = 0x0b;
+const REQUEST_AUDIO_SET_CURRENT: u8 = 0x01;
+/// USB Audio Class 1 endpoint control selector for the sampling frequency.
+const AUDIO_SAMPLING_FREQUENCY: u16 = 0x0100;
+const CLASS_AUDIO: u8 = 1;
+const SUBCLASS_AUDIO_STREAMING: u8 = 2;
+const AUDIO_SAMPLE_RATE: u32 = 48_000;
+/// One millisecond of 16-bit stereo at 48 kHz.
+const AUDIO_PACKET: usize = 192;
+const AUDIO_AMPLITUDE: i16 = 6000;
+const AUDIO_BATCH: usize = 100;
 const SPEED_FULL: u32 = 1;
 const SPEED_LOW: u32 = 2;
 const SPEED_HIGH: u32 = 3;
@@ -283,7 +298,20 @@ struct DevicePages {
     buffer: *mut DmaPage,
 }
 
-/// A running controller with at least one configured keyboard.
+/// A configured USB audio output: an isochronous OUT endpoint on an audio
+/// streaming interface.
+pub(crate) struct Speaker {
+    pub(crate) location: Location,
+    pub(crate) vendor: u16,
+    pub(crate) product: u16,
+    slot: u32,
+    endpoint: u32,
+    ring: Ring,
+    /// Two packets of samples: the high and low halves of a square wave.
+    samples: *mut DmaPage,
+}
+
+/// A running controller with at least one configured keyboard or speaker.
 pub(crate) struct Controller {
     operational: usize,
     runtime: usize,
@@ -295,6 +323,7 @@ pub(crate) struct Controller {
     event_index: usize,
     event_cycle: bool,
     keyboards: [Option<Keyboard>; MAX_KEYBOARDS],
+    speaker: Option<Speaker>,
 }
 
 impl Controller {
@@ -391,6 +420,7 @@ impl Controller {
             event_index: 0,
             event_cycle: true,
             keyboards: [const { None }; MAX_KEYBOARDS],
+            speaker: None,
         };
         if capability_1 & (1 << 3) != 0 {
             for port in 1..=ports {
@@ -418,7 +448,7 @@ impl Controller {
             }
         }
         let found = controller.keyboards().count();
-        if found == 0 {
+        if found == 0 && controller.speaker.is_none() {
             controller.stop();
             return Err(Error::NoKeyboard);
         }
@@ -426,6 +456,59 @@ impl Controller {
             controller.queue_report(index);
         }
         Ok(controller)
+    }
+
+    /// Returns the configured speaker, if any.
+    pub(crate) fn speaker(&self) -> Option<&Speaker> {
+        self.speaker.as_ref()
+    }
+
+    /// Plays a 500 Hz square wave for `milliseconds` on the speaker, one
+    /// packet per frame, and returns how many packets the controller sent.
+    pub(crate) fn play_tone(&mut self, milliseconds: usize) -> Option<usize> {
+        let speaker = self.speaker.as_mut()?;
+        // SAFETY: the sample page belongs to this speaker and no transfer
+        // is queued while it is written.
+        let samples = unsafe {
+            core::slice::from_raw_parts_mut(
+                speaker.samples.cast::<i16>(),
+                AUDIO_PACKET, // two packets of i16 samples
+            )
+        };
+        let (high, low) = samples.split_at_mut(AUDIO_PACKET / 2);
+        high.fill(AUDIO_AMPLITUDE);
+        low.fill(-AUDIO_AMPLITUDE);
+        let (slot, endpoint) = (speaker.slot, speaker.endpoint);
+        let mut sent = 0;
+        while sent < milliseconds {
+            let batch = (milliseconds - sent).min(AUDIO_BATCH);
+            let mut last = 0;
+            for packet in 0..batch {
+                let speaker = self.speaker.as_mut()?;
+                let half = (sent + packet) % 2;
+                let interrupt = if packet + 1 == batch {
+                    TRB_INTERRUPT_ON_COMPLETION
+                } else {
+                    0
+                };
+                last = speaker.ring.push(
+                    speaker.samples as u64 + (half * AUDIO_PACKET) as u64,
+                    AUDIO_PACKET as u32,
+                    TRB_ISOCH << 10 | TRB_START_ISOCH_ASAP | interrupt,
+                );
+            }
+            self.ring(slot, endpoint);
+            let finished = wait_until_ms(batch as u64 * 2 + 100, || {
+                self.next_event().is_some_and(|event| {
+                    event.kind() == TRB_TRANSFER_EVENT && event.parameter == last
+                })
+            });
+            if !finished {
+                return Some(sent);
+            }
+            sent += batch;
+        }
+        Some(sent)
     }
 
     /// Returns the configured keyboards.
@@ -532,12 +615,20 @@ impl Controller {
         let Some(index) = self.keyboards.iter().position(Option::is_none) else {
             return Ok(());
         };
-        let (slot, endpoint) = device
-            .configure_keyboard(self)
-            .map_err(|error| match error {
-                Error::NoKeyboard => Error::NotBootKeyboard(identity.vendor, identity.product),
-                other => other,
-            })?;
+        let (slot, endpoint) = match device.configure_keyboard(self) {
+            Ok(configured) => configured,
+            Err(Error::NoKeyboard) if self.speaker.is_none() => {
+                if let Some(speaker) = device.configure_speaker(self, &identity)? {
+                    self.speaker = Some(speaker);
+                    return Ok(());
+                }
+                return Err(Error::NotBootKeyboard(identity.vendor, identity.product));
+            }
+            Err(Error::NoKeyboard) => {
+                return Err(Error::NotBootKeyboard(identity.vendor, identity.product))
+            }
+            Err(other) => return Err(other),
+        };
         self.keyboards[index] = Some(Keyboard {
             location,
             vendor: identity.vendor,
@@ -857,6 +948,128 @@ impl Device {
         Ok((self.slot, endpoint))
     }
 
+    /// Configures a USB Audio Class 1 output: selects the configuration and
+    /// the streaming interface's first setting with an isochronous OUT
+    /// endpoint, adds that endpoint, and asks for 48 kHz. Returns `None` for
+    /// a device without one.
+    fn configure_speaker(
+        &mut self,
+        controller: &mut Controller,
+        identity: &Identity,
+    ) -> Result<Option<Speaker>, Error> {
+        let total = self.read_configuration(controller)?;
+        let descriptors = self.buffer();
+        let configuration = descriptors[5];
+        let mut streaming = None;
+        let mut output = None;
+        let mut offset = 0;
+        while offset + 2 <= usize::from(total) {
+            let length = usize::from(descriptors[offset]);
+            if length < 2 || offset + length > usize::from(total) {
+                break;
+            }
+            match descriptors[offset + 1] {
+                4 if length >= 9 => {
+                    let audio_streaming = descriptors[offset + 5] == CLASS_AUDIO
+                        && descriptors[offset + 6] == SUBCLASS_AUDIO_STREAMING
+                        && descriptors[offset + 3] != 0;
+                    streaming =
+                        audio_streaming.then(|| (descriptors[offset + 2], descriptors[offset + 3]));
+                }
+                5 if length >= 7 && output.is_none() => {
+                    let address = descriptors[offset + 2];
+                    if let Some(interface) = streaming
+                        .filter(|_| address & 0x80 == 0 && descriptors[offset + 3] & 3 == 1)
+                    {
+                        let packet =
+                            u16::from_le_bytes([descriptors[offset + 4], descriptors[offset + 5]])
+                                & 0x7ff;
+                        output = Some((interface, address & 0x0f, packet, descriptors[offset + 6]));
+                    }
+                }
+                _ => {}
+            }
+            offset += length;
+        }
+        let Some(((interface, alternate), number, packet, interval)) = output else {
+            return Ok(None);
+        };
+        self.control_out(
+            controller,
+            0x00,
+            REQUEST_SET_CONFIGURATION,
+            u16::from(configuration),
+            0,
+        )?;
+        self.control_out(
+            controller,
+            0x01,
+            REQUEST_SET_INTERFACE,
+            u16::from(alternate),
+            u16::from(interface),
+        )?;
+        let endpoint = u32::from(number) * 2;
+        let exponent = match self.speaker_interval(interval) {
+            Some(exponent) => exponent,
+            None => return Ok(None),
+        };
+        let ring = self.pages.interrupt as u64 | 1;
+        self.clear_input();
+        self.input(controller, 0, 1, 1 | 1 << endpoint);
+        self.slot_context(controller, endpoint, None);
+        let context = 1 + endpoint as usize;
+        self.input(controller, context, 0, exponent << 16);
+        self.input(
+            controller,
+            context,
+            1,
+            ENDPOINT_ISOCH_OUT << 3 | u32::from(packet) << 16,
+        );
+        self.input(controller, context, 2, ring as u32);
+        self.input(controller, context, 3, (ring >> 32) as u32);
+        self.input(
+            controller,
+            context,
+            4,
+            AUDIO_PACKET as u32 | u32::from(packet) << 16,
+        );
+        controller.command(
+            self.pages.input as u64,
+            TRB_CONFIGURE_ENDPOINT << 10 | self.slot << 24,
+        )?;
+        // Fixed-rate devices may stall the sampling-frequency request.
+        let rate = AUDIO_SAMPLE_RATE.to_le_bytes();
+        let _ = self.control_out_data(
+            controller,
+            0x22,
+            REQUEST_AUDIO_SET_CURRENT,
+            AUDIO_SAMPLING_FREQUENCY,
+            u16::from(number),
+            &rate[..3],
+        );
+        Ok(Some(Speaker {
+            location: self.location,
+            vendor: identity.vendor,
+            product: identity.product,
+            slot: self.slot,
+            endpoint,
+            ring: Ring::new(self.pages.interrupt),
+            samples: self.pages.buffer,
+        }))
+    }
+
+    /// Converts an isochronous bInterval into the endpoint context's
+    /// exponent of 125 us microframes.
+    fn speaker_interval(&self, interval: u8) -> Option<u32> {
+        let interval = u32::from(interval.clamp(1, 16)) - 1;
+        Some(match self.speed {
+            // Full-speed periods count 1 ms frames: eight microframes each.
+            SPEED_FULL => interval + 3,
+            SPEED_HIGH | SPEED_SUPER => interval,
+            _ => return None,
+        })
+    }
+
     /// Configures a hub: selects its configuration, reads its hub descriptor,
     /// tells the controller it is a hub, and powers its ports. Returns the
     /// number of downstream ports.
@@ -1089,6 +1302,41 @@ impl Device {
             | u64::from(index) << 32;
         self.control
             .push(setup, 8, TRB_SETUP << 10 | TRB_IMMEDIATE_DATA);
+        let status = self.control.push(
+            0,
+            0,
+            TRB_STATUS << 10 | TRB_INTERRUPT_ON_COMPLETION | TRB_DIRECTION_IN,
+        );
+        self.transfer(controller, status)
+    }
+
+    /// A control transfer with a short OUT data stage, such as a class
+    /// request that sets a value.
+    fn control_out_data(
+        &mut self,
+        controller: &mut Controller,
+        request_type: u8,
+        request: u8,
+        value: u16,
+        index: u16,
+        data: &[u8],
+    ) -> Result<(), Error> {
+        let length = data.len().min(64) as u16;
+        // SAFETY: the buffer page belongs to this device and no transfer
+        // is using it.
+        unsafe {
+            let buffer = &mut (*self.pages.buffer).0;
+            buffer[..usize::from(length)].copy_from_slice(&data[..usize::from(length)]);
+        }
+        let setup = u64::from(request_type)
+            | u64::from(request) << 8
+            | u64::from(value) << 16
+            | u64::from(index) << 32
+            | u64::from(length) << 48;
+        self.control
+            .push(setup, 8, TRB_SETUP << 10 | TRB_IMMEDIATE_DATA | 2 << 16);
+        self.control
+            .push(self.pages.buffer as u64, u32::from(length), TRB_DATA << 10);
         let status = self.control.push(
             0,
             0,

@@ -372,6 +372,14 @@ fn open_keyboards() -> UsbKeyboards {
         // the firmware identity map covers their registers and the DMA pool.
         match unsafe { xhci::Controller::open(*function) } {
             Ok(controller) => {
+                if let Some(speaker) = controller.speaker() {
+                    say!(
+                        "ginux:   USB speaker {:04x}:{:04x} on port {}\n",
+                        speaker.vendor,
+                        speaker.product,
+                        speaker.location
+                    );
+                }
                 for keyboard in controller.keyboards() {
                     say!(
                         "ginux:   keyboard {:04x}:{:04x} on port {}\n",
@@ -419,7 +427,7 @@ fn shell(boot_info: &BootInfo, mut usb: UsbKeyboards) -> ! {
             match byte {
                 b'\r' | b'\n' => {
                     say!("\n");
-                    run_command(boot_info, &line[..length]);
+                    run_command(boot_info, &mut usb, &line[..length]);
                     length = 0;
                     say!("bring-up> ");
                 }
@@ -448,7 +456,7 @@ fn shell(boot_info: &BootInfo, mut usb: UsbKeyboards) -> ! {
     }
 }
 
-fn run_command(boot_info: &BootInfo, line: &[u8]) {
+fn run_command(boot_info: &BootInfo, usb: &mut UsbKeyboards, line: &[u8]) {
     let text = core::str::from_utf8(line).unwrap_or("").trim();
     let (command, argument) = text.split_once(' ').unwrap_or((text, ""));
     match command {
@@ -456,7 +464,23 @@ fn run_command(boot_info: &BootInfo, line: &[u8]) {
         "help" => say!(
             "Commands: help, pci, acpi, mem, disks, net, beep, clear, echo TEXT, reboot, poweroff\n"
         ),
-        "beep" => play_test_tones(),
+        "beep" => {
+            play_test_tones();
+            for controller in usb.iter_mut().flatten() {
+                let Some(speaker) = controller.speaker() else {
+                    continue;
+                };
+                let (vendor, product) = (speaker.vendor, speaker.product);
+                if let Some(sent) = controller.play_tone(1000) {
+                    say!(
+                        "ginux: USB speaker {:04x}:{:04x} played a 500 Hz tone ({} packets)\n",
+                        vendor,
+                        product,
+                        sent
+                    );
+                }
+            }
+        }
         "pci" => report_pci(),
         "net" => report_network(),
         "acpi" => {

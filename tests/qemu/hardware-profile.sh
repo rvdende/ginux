@@ -82,6 +82,8 @@ boot_profile() {
         -device hda-duplex,audiodev=sound \
         -device qemu-xhci,id=xhci \
         -device usb-tablet,bus=xhci.0 \
+        -audiodev "wav,id=usbsound,path=$work_dir/$label-usb.wav" \
+        -device usb-audio,audiodev=usbsound,bus=xhci.0 \
         -device usb-kbd,bus=xhci.0 \
         -device qemu-xhci,id=xhci2 \
         -device usb-hub,bus=xhci2.0,port=1 \
@@ -185,7 +187,9 @@ for expected in \
     'bring-up> echo usbok' \
     'usbok' \
     'bring-up> beep' \
-    'codec 0 played a 440 Hz tone'; do
+    'codec 0 played a 440 Hz tone' \
+    'USB speaker 46f4:0002 on port' \
+    'USB speaker 46f4:0002 played a 500 Hz tone (1000 packets)'; do
     if ! grep -Fq "$expected" "$output_dir/serial.log"; then
         echo "missing: $expected" >&2
         failed=1
@@ -204,6 +208,18 @@ EOF
 )
 if ((loud < 10000)); then
     echo "the HD Audio tone was not recorded ($loud loud samples)" >&2
+    failed=1
+fi
+loud_usb=$(python3 -I - "$work_dir/serial-usb.wav" <<'EOF'
+import struct, sys
+with open(sys.argv[1], "rb") as recording:
+    data = recording.read()[44:]
+samples = struct.unpack("<%dh" % (len(data) // 2), data[: len(data) // 2 * 2])
+print(sum(1 for sample in samples if abs(sample) > 1000))
+EOF
+)
+if ((loud_usb < 10000)); then
+    echo "the USB audio tone was not recorded ($loud_usb loud samples)" >&2
     failed=1
 fi
 keyboards=$(grep -c 'keyboard 0627:0001 on port' "$output_dir/serial.log" || true)

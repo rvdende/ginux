@@ -253,7 +253,9 @@ every PCI device, and runs the physical-hardware drivers in `kernel/src/drivers`
 - Read-only NVMe and AHCI (SATA) drivers that list GPT partitions.
 - An xHCI driver that runs USB boot keyboards on every controller, including
   keyboards behind USB hubs (up to five tiers, with transaction translators
-  for low- and full-speed devices behind high-speed hubs).
+  for low- and full-speed devices behind high-speed hubs), and plays the
+  `beep` test tone on a USB Audio Class 1 speaker through an isochronous
+  endpoint.
 - An HD Audio driver for Intel-compatible controllers (including AMD HD Audio
   and GPU HDMI/DP audio) that resets each controller, lists its codecs and
   output pins, and plays a 440 Hz test tone on request (`beep`).
@@ -264,9 +266,11 @@ every PCI device, and runs the physical-hardware drivers in `kernel/src/drivers`
 With a keyboard or serial port it then offers a small bring-up shell (`help`,
 `pci`, `acpi`, `mem`, `disks`, `net`, `beep`, `reboot`, `poweroff`). Nothing in bring-up
 mode writes to storage. `make test-hardware-profile` boots a QEMU machine with an
-AMD IOMMU, an e1000e on a DHCP network, an HD Audio codec, NVMe, AHCI, two xHCI
-controllers (one keyboard behind a hub), and a SATA disk without virtio, types a command on an
-emulated USB keyboard, records the test tone through QEMU's WAV output, and
+AMD IOMMU, an e1000e on a DHCP network, an HD Audio codec, a USB audio device,
+NVMe, AHCI, two xHCI controllers (one keyboard behind a hub), and a SATA disk
+without virtio, types a command on an
+emulated USB keyboard, records the test tones from HD Audio and USB audio through QEMU's WAV output,
+and
 checks the framebuffer console with no serial port.
 
 Bringing up a specific machine starts with `sudo tools/hardware/probe.sh`, run
