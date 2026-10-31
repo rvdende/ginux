@@ -14,9 +14,15 @@ QEMU, and reports one machine-parseable line per test plus failure clusters.
 | `62dce194` | `/proc/PID/oom_score_adj` kept per process | 1362 | 1043 | 38 | 130 | 76 | 52 | 17 |
 | `de94acb9` | fork EAGAIN, orphan reparenting, EINTR waits, edge-triggered epoll, timer preemption, killed-by-signal status | 1362 | 1045 | 39 | 169 | 76 | 15 | 12 |
 | `76719aee` | a fault kills only its process, frame map counts, IPv4 loopback, `/proc/sys` node clash | 1362 | 1072 | 37 | 162 | 75 | 4 | 6 |
+| `778dd3d0` | blocking semop/msgsnd/msgrcv, cross-process futexes, sleeping state, pipe capacity, SA_RESTART, CPU time, signals on the timer tick | 1362 | 1146 | 36 | 88 | 76 | 0 | 14 |
 
 A crash takes the whole domain down, so the run reboots for the next test:
-the `de94acb9` run needed 23 boots against 68 before, the `76719aee` run 6. Its remaining crashes
+the `de94acb9` run needed 23 boots against 68 before, the `76719aee` run 6,
+and the `778dd3d0` run went through in one. Its 14 hangs are LTP's own
+30-second timeouts (no guest wedges): epoll_wait01/08/11/12/16,
+pselect01/_64, select02 and select04 (select and epoll_pwait still return
+no events rather than waiting for a signal), poll02 and ppoll01 (fixed
+since), futex_wait03, futex_wake03 and rt_tgsigqueueinfo01. Its remaining crashes
 are access04, fchownat03, madvise10, madvise11, mq_open01, move_mount03,
 munmap01, readv01, sendmmsg01, shmat01, statmount03 and waitid05 to
 waitid08; its hangs are bind04 (flaky), epoll_wait01, epoll_wait12,

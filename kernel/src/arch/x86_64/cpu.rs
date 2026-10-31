@@ -34049,6 +34049,29 @@ fn linux_epoll_wait_duration_live_return(
                 != 0
                 || current_linux_process_pid() != 1
             {
+                // epoll_wait waits as poll does: other processes run, the
+                // call restarts with its deadline, and a signal interrupts
+                // it (EINTR). epoll_pwait's temporary mask is not carried
+                // across a restart, so it still returns no events instead.
+                if temporary_signal_mask.is_none() {
+                    let deadline = take_linux_restart_deadline(caller.rip).or_else(|| {
+                        duration.and_then(|duration| {
+                            linux_elapsed_nanoseconds().and_then(|now| now.checked_add(duration))
+                        })
+                    });
+                    if deadline.is_some_and(|deadline| {
+                        linux_elapsed_nanoseconds().is_some_and(|now| now >= deadline)
+                    }) {
+                        return 0;
+                    }
+                    return linux_timed_wait_run_others(
+                        output,
+                        caller,
+                        LINUX_EPOLL_WAIT_SYSCALL,
+                        deadline,
+                    )
+                    .unwrap_or(0);
+                }
                 return if yield_current_linux_process(caller, 0) {
                     LINUX_RETURN_TO_KERNEL
                 } else {
