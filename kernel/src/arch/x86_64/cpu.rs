@@ -4740,6 +4740,31 @@ fn sync_live_linux_process_address_space(pid: u32) -> bool {
     true
 }
 
+/// Resumes a parent whose fork could not be carried out, with `error` as the
+/// fork's result.
+fn resume_failed_linux_fork_parent(parent_pid: u32, error: u64) -> bool {
+    if !linux_process::set_live_process_return_value(parent_pid, error) {
+        return false;
+    }
+    let Some(parent) = linux_process::dispatch_live_process(parent_pid) else {
+        return false;
+    };
+    let resumed = restore_linux_process_extended_state(parent_pid)
+        && sync_live_linux_process_address_space(parent_pid)
+        && address_space::resume_live_linux_process(
+            parent.root,
+            parent.rip,
+            parent.rsp,
+            parent.fs_base,
+            parent.general,
+            parent.rflags,
+        );
+    if resumed {
+        save_current_linux_process_runtime_state(parent_pid);
+    }
+    resumed
+}
+
 #[inline(never)]
 fn execute_deferred_live_fork() -> bool {
     if !X86_RUNTIME
@@ -4803,6 +4828,9 @@ fn execute_deferred_live_fork() -> bool {
             serial_write("ginux: runtime fork preparation failed at stage ");
             serial_write_u64(u64::from(linux_process::live_fork_execution_stage()));
             serial_write("\r\n");
+            // Linux fails fork with EAGAIN when it runs out of processes or
+            // memory; the parent carries on.
+            return resume_failed_linux_fork_parent(parent_pid, LINUX_EAGAIN);
         }
         return false;
     };

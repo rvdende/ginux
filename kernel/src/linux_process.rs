@@ -3324,6 +3324,16 @@ pub(crate) fn dispatch_live_init_with_return(value: u64) -> Option<LiveProcessDi
     table.dispatch(init)
 }
 
+/// Sets the value a running process's interrupted system call returns.
+pub(crate) fn set_live_process_return_value(pid: u32, value: u64) -> bool {
+    let Some(table) = live_process_table_mut() else {
+        return false;
+    };
+    table
+        .handle_by_pid(pid)
+        .is_some_and(|handle| table.set_return_value(handle, value))
+}
+
 pub(crate) fn dispatch_live_process(pid: u32) -> Option<LiveProcessDispatch> {
     let table = live_process_table_mut()?;
     let handle = table.handle_by_pid(pid)?;
