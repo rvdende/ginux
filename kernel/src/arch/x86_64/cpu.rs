@@ -12303,7 +12303,13 @@ fn run_other_linux_processes(
     caller: LinuxUserContext,
     number: u64,
 ) -> Option<LinuxBlockedWait> {
-    if !LINUX_RUNTIME_MODE.load(Ordering::SeqCst) || ready_linux_thread_handle().is_some() {
+    if !LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
+        return None;
+    }
+    // Descriptor waits made ready while another process ran complete here,
+    // in this process's address space; a woken sibling thread runs instead.
+    let _ = wake_linux_descriptor_waits();
+    if ready_linux_thread_handle().is_some() {
         return None;
     }
     let pid = current_linux_process_pid();
@@ -29677,6 +29683,12 @@ fn complete_linux_poll_wait(slot: usize, timed_out: bool) -> bool {
 fn wake_linux_poll_waits() -> u32 {
     let mut woken = 0;
     for slot in 0..LINUX_THREAD_LIMIT {
+        // Completing a wait writes into the waiting thread's memory, so
+        // only the current process's threads complete here; the others
+        // complete at their own process's next system call.
+        if !linux_thread_slot_in_current_process(slot) {
+            continue;
+        }
         woken += u32::from(complete_linux_poll_wait(slot, false));
     }
     woken
@@ -30043,6 +30055,12 @@ fn complete_linux_select_wait(slot: usize, timed_out: bool) -> bool {
 fn wake_linux_select_waits() -> u32 {
     let mut woken = 0;
     for slot in 0..LINUX_THREAD_LIMIT {
+        // Completing a wait writes into the waiting thread's memory, so
+        // only the current process's threads complete here; the others
+        // complete at their own process's next system call.
+        if !linux_thread_slot_in_current_process(slot) {
+            continue;
+        }
         woken += u32::from(complete_linux_select_wait(slot, false));
     }
     woken
@@ -30696,6 +30714,12 @@ fn complete_linux_eventfd_read_wait(slot: usize) -> bool {
 fn wake_linux_eventfd_read_waits() -> u32 {
     let mut woken = 0;
     for slot in 0..LINUX_THREAD_LIMIT {
+        // Completing a wait writes into the waiting thread's memory, so
+        // only the current process's threads complete here; the others
+        // complete at their own process's next system call.
+        if !linux_thread_slot_in_current_process(slot) {
+            continue;
+        }
         woken += u32::from(complete_linux_eventfd_read_wait(slot));
     }
     woken
@@ -30728,6 +30752,12 @@ fn complete_linux_eventfd_write_wait(slot: usize) -> bool {
 fn wake_linux_eventfd_write_waits() -> u32 {
     let mut woken = 0;
     for slot in 0..LINUX_THREAD_LIMIT {
+        // Completing a wait writes into the waiting thread's memory, so
+        // only the current process's threads complete here; the others
+        // complete at their own process's next system call.
+        if !linux_thread_slot_in_current_process(slot) {
+            continue;
+        }
         woken += u32::from(complete_linux_eventfd_write_wait(slot));
     }
     woken
@@ -30784,6 +30814,12 @@ fn complete_linux_pipe_read_wait(slot: usize) -> bool {
 fn wake_linux_pipe_read_waits() -> u32 {
     let mut woken = 0;
     for slot in 0..LINUX_THREAD_LIMIT {
+        // Completing a wait writes into the waiting thread's memory, so
+        // only the current process's threads complete here; the others
+        // complete at their own process's next system call.
+        if !linux_thread_slot_in_current_process(slot) {
+            continue;
+        }
         woken += u32::from(complete_linux_pipe_read_wait(slot));
     }
     woken
@@ -30840,6 +30876,12 @@ fn complete_linux_pipe_write_wait(slot: usize) -> bool {
 fn wake_linux_pipe_write_waits() -> u32 {
     let mut woken = 0;
     for slot in 0..LINUX_THREAD_LIMIT {
+        // Completing a wait writes into the waiting thread's memory, so
+        // only the current process's threads complete here; the others
+        // complete at their own process's next system call.
+        if !linux_thread_slot_in_current_process(slot) {
+            continue;
+        }
         woken += u32::from(complete_linux_pipe_write_wait(slot));
     }
     woken
@@ -30889,6 +30931,12 @@ fn complete_linux_timerfd_read_wait(slot: usize) -> bool {
 fn wake_linux_timerfd_read_waits() -> u32 {
     let mut woken = 0;
     for slot in 0..LINUX_THREAD_LIMIT {
+        // Completing a wait writes into the waiting thread's memory, so
+        // only the current process's threads complete here; the others
+        // complete at their own process's next system call.
+        if !linux_thread_slot_in_current_process(slot) {
+            continue;
+        }
         woken += u32::from(complete_linux_timerfd_read_wait(slot));
     }
     woken
@@ -32361,6 +32409,12 @@ fn complete_linux_epoll_wait(slot: usize, timed_out: bool) -> bool {
 fn wake_linux_epoll_waits() -> u32 {
     let mut woken = 0;
     for slot in 0..LINUX_THREAD_LIMIT {
+        // Completing a wait writes into the waiting thread's memory, so
+        // only the current process's threads complete here; the others
+        // complete at their own process's next system call.
+        if !linux_thread_slot_in_current_process(slot) {
+            continue;
+        }
         woken += u32::from(complete_linux_epoll_wait(slot, false));
     }
     woken
