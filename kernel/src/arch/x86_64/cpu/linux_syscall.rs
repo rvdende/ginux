@@ -74,6 +74,9 @@ pub(super) extern "sysv64" fn linux_syscall_handler(
     let count = register(3);
     let buffer = register(4);
     let first_argument = register(5);
+    if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::Relaxed) {
+        linux_epoll_rearm_for_syscall(number, saved_registers.rdi, saved_registers.rsi);
+    }
     let code_start = X86_RUNTIME.ELF_PROBE_CODE_BASE.load(Ordering::SeqCst);
     let code_end =
         code_start.saturating_add(X86_RUNTIME.ELF_PROBE_CODE_SIZE.load(Ordering::SeqCst));

@@ -2644,30 +2644,7 @@ fn finish_live_process_registry_with_refresh_floor(refresh_floor: u32) -> bool {
         crate::serial_write(" ");
         crate::serial_write_u64(table.processes.iter().flatten().count() as u64);
         crate::serial_write("\r\n");
-        for process in table.processes.iter().flatten() {
-            let state = match process.state {
-                ProcessState::Preparing => 0,
-                ProcessState::Running => 1,
-                ProcessState::Stopped { .. } => 2,
-                ProcessState::Exiting => 3,
-                ProcessState::Zombie { .. } => 4,
-            };
-            crate::serial_write(
-                "ginux: remaining process pid/state/parent/space/retiring/thread: ",
-            );
-            for value in [
-                u64::from(process.handle.pid),
-                state,
-                process.parent.map_or(0, |parent| u64::from(parent.pid)),
-                u64::from(process.address_space.is_some()),
-                u64::from(process.retiring_address_space.is_some()),
-                u64::from(process.scheduler_thread.is_some()),
-            ] {
-                crate::serial_write_u64(value);
-                crate::serial_write(" ");
-            }
-            crate::serial_write("\r\n");
-        }
+        write_process_table(table);
         return false;
     }
     process_runtime().table_initialized[instance].store(false, Ordering::Release);
@@ -3429,11 +3406,44 @@ fn report_fork_preparation_failure(table: &ProcessTable, parent: ProcessHandle) 
     crate::serial_write("\r\n");
 }
 
+/// One line per process: pid, state (0 preparing, 1 running, 2 stopped,
+/// 3 exiting, 4 zombie), parent, and whether it has an address space, a
+/// retiring one and a run-queue thread.
+fn write_process_table(table: &ProcessTable) {
+    for process in table.processes.iter().flatten() {
+        let state = match process.state {
+            ProcessState::Preparing => 0,
+            ProcessState::Running => 1,
+            ProcessState::Stopped { .. } => 2,
+            ProcessState::Exiting => 3,
+            ProcessState::Zombie { .. } => 4,
+        };
+        crate::serial_write("ginux: process pid/state/parent/space/retiring/thread: ");
+        for value in [
+            u64::from(process.handle.pid),
+            state,
+            process.parent.map_or(0, |parent| u64::from(parent.pid)),
+            u64::from(process.address_space.is_some()),
+            u64::from(process.retiring_address_space.is_some()),
+            u64::from(process.scheduler_thread.is_some()),
+        ] {
+            crate::serial_write_u64(value);
+            crate::serial_write(" ");
+        }
+        crate::serial_write("\r\n");
+    }
+}
+
+/// Creates a forked child of `parent_pid`. With `child_first` the run queue
+/// switches to the child, which the caller runs before resuming the parent;
+/// otherwise the parent stays current and the child waits, ready, for its
+/// turn.
 pub(crate) fn begin_live_fork(
     parent_pid: u32,
     eager_private_copy: bool,
     share_vm: bool,
     child_stack: Option<u64>,
+    child_first: bool,
 ) -> Option<LiveProcessDispatch> {
     process_runtime()
         .fork_execution_stage
@@ -3667,16 +3677,17 @@ pub(crate) fn begin_live_fork(
     let scheduled = (|| {
         let parent_thread = table.process(parent_handle)?.scheduler_thread?;
         let child_thread = table.process(child_handle)?.scheduler_thread?;
-        let selected = if nested {
-            run_queue.switch_current(parent_thread, parent_scheduler_context, child_thread)?
-        } else {
+        if !nested {
             let initial = run_queue.schedule_next()?;
-            (initial.handle() == parent_thread && initial.context() == parent_scheduler_context)
-                .then(|| {
-                    run_queue.switch_current(parent_thread, parent_scheduler_context, child_thread)
-                })
-                .flatten()?
-        };
+            if initial.handle() != parent_thread || initial.context() != parent_scheduler_context {
+                return None;
+            }
+        }
+        if !child_first {
+            return Some(());
+        }
+        let selected =
+            run_queue.switch_current(parent_thread, parent_scheduler_context, child_thread)?;
         (selected.handle() == child_thread && selected.context() == child_scheduler_context)
             .then_some(())
     })()

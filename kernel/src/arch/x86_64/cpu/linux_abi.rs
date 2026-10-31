@@ -589,6 +589,7 @@ pub(super) const LINUX_EPOLL_SUPPORTED_EVENTS: u32 =
         | 0x2000_0000
         | 0x4000_0000
         | 0x8000_0000;
+pub(super) const LINUX_EPOLLET: u32 = 0x8000_0000;
 pub(super) const LINUX_EFD_SEMAPHORE: u64 = 1;
 pub(super) const LINUX_EFD_NONBLOCK: u64 = 0x800;
 pub(super) const LINUX_TFD_TIMER_ABSTIME: u64 = 1;

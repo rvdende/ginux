@@ -91,20 +91,27 @@ calls act as the scheduler.
    today's order. A process entered while an earlier activation of it is
    still inside a system call is reported ("re-entered during its own
    system call").
-3. A kernel scheduler loop replaces init's role: the runtime's entry frame
+3. Parent-first fork, Linux's default order (`LINUX_PARENT_FIRST_FORK` in
+   cpu.rs, implemented but off): plain forks resume the parent with the
+   child's pid and leave the child ready in the run queue; vfork, CLONE_VM,
+   child-stack, new-mount-namespace and domain-exec forks stay child-first.
+   Turning it on needed edge-triggered epoll (tokio waits on a pidfd) and a
+   sched_yield that lets other processes run (the rustup proxy spins on it),
+   both now in; `cargo build | grep` inside a domain still hangs with it on.
+4. A kernel scheduler loop replaces init's role: the runtime's entry frame
    picks the next runnable process from the run queue and enters it; every
    process, init included, waits by returning to the kernel; exit and fork
    are handled by the loop. Processes can then be preempted by the timer
    (save the user context, return to the loop), which LTP's spinning tests
    need.
-4. Real blocking: an activation that must wait parks (switches to the loop)
+5. Real blocking: an activation that must wait parks (switches to the loop)
    instead of returning to the kernel with a restart, and the loop resumes
    parked activations by switching to them; threads get activations of their
    own; per-process globals become task fields so a switch no longer copies
    them in and out.
-5. Per-CPU scheduler loops with load balancing and wakeups by IPI, then
+6. Per-CPU scheduler loops with load balancing and wakeups by IPI, then
    splitting `kernel_entry_lock` into per-subsystem locks so CPUs run kernel
    code in parallel (lock ranks from
    `docs/feedback-hardening/SYNCHRONIZATION.md`).
-6. Guard pages: map activation stacks in a kernel virtual region with an
+7. Guard pages: map activation stacks in a kernel virtual region with an
    unmapped page below each, instead of the red-zone check.

@@ -6,6 +6,18 @@ chasing bugs one program at a time. This harness builds LTP statically for
 musl, runs each test of `runtest/syscalls` in an Alpine domain on Ginux under
 QEMU, and reports one machine-parseable line per test plus failure clusters.
 
+## Progress
+
+| Ginux | Change | Tests run | TPASS | TFAIL | TBROK | TCONF | CRASH | HANG |
+|---|---|---|---|---|---|---|---|---|
+| `d1f41667` | baseline (below) | 1362 | 41 | 39 | 1181 | 75 | 11 | 9 |
+| `62dce194` | `/proc/PID/oom_score_adj` kept per process | 1362 | 1043 | 38 | 130 | 76 | 52 | 17 |
+
+Later fixes, measured on the clone/fork/kill/wait slice only so far: fork
+fails with EAGAIN instead of failing the domain (`3cdb1dcd`); orphans are
+reparented to init and signals interrupt waits (`991be9d2`). Results of a
+full run are kept in `target/ltp-baseline/` (not committed).
+
 ## Baseline (2026-10-31)
 
 Ginux at `d1f41667` (no kernel change since), LTP 20260930,

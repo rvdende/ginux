@@ -4110,6 +4110,14 @@ fn install_linux_fork_cow(
             child.write((child_value & !WRITABLE) | LINUX_RUNTIME_COW);
         }
     }
+    // The parent's pages are now read-only, but if its address space is the
+    // loaded one this CPU may still hold writable translations for them, and
+    // a parent that runs before its child would write through them into
+    // frames the child shares. Reloading CR3 drops them (there is no PCID).
+    if parent_root.address() == current_root() {
+        // SAFETY: reloading the active root changes no mapping.
+        unsafe { activate(parent_root.address()) };
+    }
     true
 }
 

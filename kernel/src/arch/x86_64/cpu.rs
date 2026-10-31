@@ -455,6 +455,7 @@ struct X86RuntimeOwner {
     LINUX_PROCESS_CHILD_YIELDED: RuntimeRef<BankedAtomicBool>,
     LINUX_PROCESS_CHILD_YIELD_PID: RuntimeRef<BankedAtomicU32>,
     LINUX_PROCESS_LAST_BLOCKED_PID: RuntimeRef<BankedAtomicU32>,
+    LINUX_DOMAIN_EXEC_DEPTH: RuntimeRef<BankedAtomicU32>,
     LINUX_PROCESS_RELEASE_PARENT_ON_EXEC: RuntimeRef<BankedAtomicBool>,
     LINUX_PROCESS_SCHEDULER_NESTING: RuntimeRef<BankedAtomicU32>,
     LINUX_PROCESS_SNAPSHOT_SCRATCH: RuntimeRef<LinuxProcessSnapshotScratch>,
@@ -984,6 +985,7 @@ static X86_RUNTIME: X86RuntimeOwner = X86RuntimeOwner {
     LINUX_PROCESS_CHILD_YIELDED: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_PROCESS_CHILD_YIELDED),
     LINUX_PROCESS_CHILD_YIELD_PID: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_PROCESS_CHILD_YIELD_PID),
     LINUX_PROCESS_LAST_BLOCKED_PID: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_PROCESS_LAST_BLOCKED_PID),
+    LINUX_DOMAIN_EXEC_DEPTH: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_DOMAIN_EXEC_DEPTH),
     LINUX_PROCESS_RELEASE_PARENT_ON_EXEC: RuntimeRef(
         &X86_RUNTIME_BACKING_LINUX_PROCESS_RELEASE_PARENT_ON_EXEC,
     ),
@@ -1607,6 +1609,9 @@ const LINUX_INIT_EXIT_FORCE_ROUND: u32 = 100;
 /// progress; see run_other_linux_processes.
 static X86_RUNTIME_BACKING_LINUX_PROCESS_LAST_BLOCKED_PID: BankedAtomicU32 =
     BankedAtomicU32::new(0);
+/// How many domain-exec fork transactions are running; see
+/// LinuxDomainExecGuard.
+static X86_RUNTIME_BACKING_LINUX_DOMAIN_EXEC_DEPTH: BankedAtomicU32 = BankedAtomicU32::new(0);
 static X86_RUNTIME_BACKING_LINUX_PROCESS_RELEASE_PARENT_ON_EXEC: BankedAtomicBool =
     BankedAtomicBool::new(false);
 static X86_RUNTIME_BACKING_LINUX_PROCESS_CHILD_STATUS: BankedAtomicU8 = BankedAtomicU8::new(0);
@@ -4773,6 +4778,53 @@ fn resume_failed_linux_fork_parent(parent_pid: u32, error: u64) -> bool {
     resumed
 }
 
+/// Whether plain forks run the parent first, as Linux does by default. Off:
+/// with it on, `cargo build` inside a domain still hangs (a pipeline child
+/// waits for something its parent-first sibling never provides), which has
+/// to be found before the scheduler loop of docs/SCHEDULER.md step 3.
+const LINUX_PARENT_FIRST_FORK: bool = false;
+
+/// Finishes a parent-first fork: keeps the child's prepared state for when it
+/// is scheduled, and resumes the parent with the child's pid as the result
+/// (written by `begin_live_fork`). Kept out of line so the process-state
+/// copies it makes do not enlarge the recursive fork executor's frame.
+#[inline(never)]
+fn resume_linux_fork_parent_first(
+    parent_pid: u32,
+    child_pid: u32,
+    parent_stack: Option<(usize, u64, u64)>,
+) -> bool {
+    save_current_linux_process_runtime_state(child_pid);
+    X86_RUNTIME
+        .LINUX_CURRENT_PROCESS_PID
+        .store(parent_pid, Ordering::SeqCst);
+    if !restore_saved_linux_process_runtime_state(parent_pid)
+        || !restore_linux_process_extended_state(parent_pid)
+    {
+        return false;
+    }
+    if let Some((slot, base, size)) = parent_stack {
+        X86_RUNTIME.LINUX_THREAD_STACK_BASES[slot].store(base, Ordering::SeqCst);
+        X86_RUNTIME.LINUX_THREAD_STACK_SIZES[slot].store(size, Ordering::SeqCst);
+    }
+    let Some(parent) = linux_process::dispatch_live_process(parent_pid) else {
+        return false;
+    };
+    let resumed = sync_live_linux_process_address_space(parent_pid)
+        && address_space::resume_live_linux_process(
+            parent.root,
+            parent.rip,
+            parent.rsp,
+            parent.fs_base,
+            parent.general,
+            parent.rflags,
+        );
+    if resumed {
+        save_current_linux_process_runtime_state(parent_pid);
+    }
+    resumed
+}
+
 #[inline(never)]
 fn execute_deferred_live_fork() -> bool {
     if !X86_RUNTIME
@@ -4816,11 +4868,24 @@ fn execute_deferred_live_fork() -> bool {
     // maps its parent's pages rather than copies of them even without
     // CLONE_VM: it only runs until exec or exit, and exec frees none of
     // them. Only a CLONE_VM child releases its parent at exec.
+    let _domain_exec_guard = domain_exec.then(LinuxDomainExecGuard::enter);
+    // Linux runs a forked child after its parent by default. A child that
+    // borrows its parent's memory or stack (vfork, CLONE_VM, posix_spawn) or
+    // gets a new mount namespace, and any fork inside a domain exec, still
+    // runs first, inside this transaction.
+    let parent_first = LINUX_PARENT_FIRST_FORK
+        && X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
+        && !domain_exec
+        && !share_vm
+        && child_stack == 0
+        && !new_mount_namespace
+        && X86_RUNTIME.LINUX_DOMAIN_EXEC_DEPTH.load(Ordering::SeqCst) == 0;
     let Some(child) = linux_process::begin_live_fork(
         parent_pid,
         false,
         share_vm || child_stack != 0,
         (child_stack != 0).then_some(child_stack),
+        !parent_first,
     ) else {
         release_staged_linux_fork_descriptors(parent_pid);
         X86_RUNTIME
@@ -4915,30 +4980,32 @@ fn execute_deferred_live_fork() -> bool {
     {
         return false;
     }
-    X86_RUNTIME
-        .LINUX_PROCESS_CHILD_EXITED
-        .store(false, Ordering::SeqCst);
-    X86_RUNTIME
-        .LINUX_PROCESS_CHILD_EXECUTED
-        .store(false, Ordering::SeqCst);
-    X86_RUNTIME
-        .LINUX_PROCESS_CHILD_YIELDED
-        .store(false, Ordering::SeqCst);
-    X86_RUNTIME
-        .LINUX_PROCESS_CHILD_EXIT_PID
-        .store(child.pid, Ordering::SeqCst);
-    X86_RUNTIME
-        .LINUX_PROCESS_CHILD_EXEC_PID
-        .store(child.pid, Ordering::SeqCst);
-    X86_RUNTIME
-        .LINUX_PROCESS_CHILD_YIELD_PID
-        .store(child.pid, Ordering::SeqCst);
-    X86_RUNTIME
-        .LINUX_PROCESS_RELEASE_PARENT_ON_EXEC
-        .store(share_vm, Ordering::SeqCst);
-    X86_RUNTIME
-        .LINUX_PROCESS_CHILD_STATUS
-        .store(0, Ordering::SeqCst);
+    if !parent_first {
+        X86_RUNTIME
+            .LINUX_PROCESS_CHILD_EXITED
+            .store(false, Ordering::SeqCst);
+        X86_RUNTIME
+            .LINUX_PROCESS_CHILD_EXECUTED
+            .store(false, Ordering::SeqCst);
+        X86_RUNTIME
+            .LINUX_PROCESS_CHILD_YIELDED
+            .store(false, Ordering::SeqCst);
+        X86_RUNTIME
+            .LINUX_PROCESS_CHILD_EXIT_PID
+            .store(child.pid, Ordering::SeqCst);
+        X86_RUNTIME
+            .LINUX_PROCESS_CHILD_EXEC_PID
+            .store(child.pid, Ordering::SeqCst);
+        X86_RUNTIME
+            .LINUX_PROCESS_CHILD_YIELD_PID
+            .store(child.pid, Ordering::SeqCst);
+        X86_RUNTIME
+            .LINUX_PROCESS_RELEASE_PARENT_ON_EXEC
+            .store(share_vm, Ordering::SeqCst);
+        X86_RUNTIME
+            .LINUX_PROCESS_CHILD_STATUS
+            .store(0, Ordering::SeqCst);
+    }
     X86_RUNTIME
         .LINUX_CURRENT_PROCESS_PID
         .store(child.pid, Ordering::SeqCst);
@@ -4977,6 +5044,10 @@ fn execute_deferred_live_fork() -> bool {
         .swap(0, Ordering::SeqCst);
     let child_tid_ready = child_tid_address == 0
         || linux_process::write_live_process_u32(child.pid, child_tid_address, child.pid);
+    if parent_first {
+        return child_tid_ready
+            && resume_linux_fork_parent_first(parent_pid, child.pid, parent_runtime.stack);
+    }
     linux_boot_profile_lifecycle_phase(0, profile_started);
     let profile_run_started = cfg!(feature = "linux-boot-profile").then(timer::timestamp_counter);
     let mut child_executed = false;
@@ -13148,25 +13219,32 @@ fn linux_sched_yield_live_return(
         return LINUX_ESRCH;
     };
     let target = yield_ready_linux_thread_handle().unwrap_or(current);
-    // Linux makes sched_yield() a scheduling hint. If this is the only
-    // runnable thread, returning directly is equivalent to selecting it
-    // again and avoids serializing and restoring an unchanged user context.
-    if target == current {
-        X86_RUNTIME
-            .LINUX_LIVE_RETURN_VALIDATED
-            .store(true, Ordering::Relaxed);
-        return 0;
-    }
-    let Some(tls) = linux_thread_context(current) else {
-        return LINUX_ESRCH;
-    };
-    let caller = LinuxUserContext {
+    let caller = linux_thread_context(current).map(|tls| LinuxUserContext {
         registers,
         rip: user_rip,
         rsp: user_stack,
         rflags: user_rflags,
         rax: 0,
         fs_base: tls.thread_pointer as u64,
+    });
+    if target == current {
+        // With no other thread of this process ready, other processes get
+        // the CPU, as in Linux: a process spinning on sched_yield while it
+        // waits for another one would otherwise never let that one run. The
+        // call returns 0 when this process is next scheduled. Init, which
+        // runs the others from its own waits, just returns.
+        if current_linux_runtime_cpu_index() == 0
+            && caller.is_some_and(|caller| yield_current_linux_process(caller, 0))
+        {
+            return LINUX_RETURN_TO_KERNEL;
+        }
+        X86_RUNTIME
+            .LINUX_LIVE_RETURN_VALIDATED
+            .store(true, Ordering::Relaxed);
+        return 0;
+    }
+    let Some(caller) = caller else {
+        return LINUX_ESRCH;
     };
     if !save_linux_thread_return_context(current, caller) {
         return LINUX_EINVAL;
@@ -14296,6 +14374,29 @@ struct LinuxForkParentRuntime {
 
 struct LinuxForkExecFlagGuard {
     previous: bool,
+}
+
+/// Marks a domain-exec fork transaction as running. It re-runs only the
+/// injected process until that exits, so forks made inside it keep running
+/// the child first: a child left waiting in the run queue would never run.
+struct LinuxDomainExecGuard;
+
+impl LinuxDomainExecGuard {
+    fn enter() -> Self {
+        X86_RUNTIME
+            .LINUX_DOMAIN_EXEC_DEPTH
+            .fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for LinuxDomainExecGuard {
+    fn drop(&mut self) {
+        let depth = X86_RUNTIME.LINUX_DOMAIN_EXEC_DEPTH.load(Ordering::SeqCst);
+        X86_RUNTIME
+            .LINUX_DOMAIN_EXEC_DEPTH
+            .store(depth.saturating_sub(1), Ordering::SeqCst);
+    }
 }
 
 impl LinuxForkExecFlagGuard {
@@ -32953,6 +33054,33 @@ fn linux_epoll_ctl(epoll: u64, operation: u64, descriptor: u64, event_address: u
     0
 }
 
+/// What kind of object a descriptor refers to, for diagnostics.
+pub(super) fn linux_descriptor_kind_name(descriptor: u64) -> &'static str {
+    if !linux_descriptor_open(descriptor) {
+        "closed"
+    } else if linux_pipe_descriptor(descriptor) {
+        "pipe"
+    } else if linux_socket_slot(descriptor).is_some() {
+        "socket"
+    } else if linux_eventfd_descriptor(descriptor) {
+        "eventfd"
+    } else if linux_pidfd_descriptor(descriptor) {
+        "pidfd"
+    } else if linux_signalfd_descriptor(descriptor) {
+        "signalfd"
+    } else if linux_timerfd_descriptor(descriptor) {
+        "timerfd"
+    } else if linux_epoll_descriptor(descriptor) {
+        "epoll"
+    } else if linux_console_descriptor_open(descriptor)
+        || linux_device_descriptor(descriptor) & LINUX_DEVICE_CONSOLE != 0
+    {
+        "console"
+    } else {
+        "file"
+    }
+}
+
 fn linux_descriptor_epollable(descriptor: u64) -> bool {
     let device = linux_device_descriptor(descriptor);
     linux_console_descriptor_open(descriptor)
@@ -32969,7 +33097,67 @@ fn linux_descriptor_epollable(descriptor: u64) -> bool {
         || linux_pipe_descriptor(descriptor)
 }
 
-fn linux_epoll_event(epoll: u64) -> Result<Option<[u8; 12]>, u64> {
+/// Bits of a watch's stored events word that hold the readiness last reported
+/// for an edge-triggered (EPOLLET) watch; Linux defines no epoll flags there.
+const LINUX_EPOLL_REPORTED_SHIFT: u32 = 16;
+const LINUX_EPOLL_REPORTED_MASK: u32 = 0x1f << LINUX_EPOLL_REPORTED_SHIFT;
+
+/// Re-arms the edge-triggered watches on the descriptor a system call is
+/// about to read, write, accept on or reap (a pidfd for waitid), so that
+/// readiness after the call is reported again. Linux reports an edge for
+/// each new event; consumers such as mio read until EAGAIN, so re-arming on
+/// use reports every new event and at most adds a spurious one.
+pub(super) fn linux_epoll_rearm_for_syscall(number: u64, first: u64, second: u64) {
+    let descriptor = match number {
+        LINUX_READ_SYSCALL
+        | LINUX_WRITE_SYSCALL
+        | LINUX_PREAD64_SYSCALL
+        | LINUX_PWRITE64_SYSCALL
+        | LINUX_READV_SYSCALL
+        | LINUX_WRITEV_SYSCALL
+        | LINUX_PREADV_SYSCALL
+        | LINUX_PWRITEV_SYSCALL
+        | LINUX_PREADV2_SYSCALL
+        | LINUX_PWRITEV2_SYSCALL
+        | LINUX_SENDTO_SYSCALL
+        | LINUX_RECVFROM_SYSCALL
+        | LINUX_SENDMSG_SYSCALL
+        | LINUX_RECVMSG_SYSCALL
+        | LINUX_SENDMMSG_SYSCALL
+        | LINUX_RECVMMSG_SYSCALL
+        | LINUX_ACCEPT_SYSCALL
+        | LINUX_ACCEPT4_SYSCALL => first,
+        LINUX_WAITID_SYSCALL if first == LINUX_P_PIDFD => second,
+        _ => return,
+    };
+    // Regular files, the bulk of a compiler's reads, cannot be watched.
+    if !linux_descriptor_epollable(descriptor) {
+        return;
+    }
+    let Some(target) = u16::try_from(descriptor)
+        .ok()
+        .and_then(|descriptor| descriptor.checked_add(1))
+    else {
+        return;
+    };
+    for slot in 0..LINUX_DESCRIPTOR_TABLE_LIMIT as usize {
+        if X86_RUNTIME.LINUX_RUNTIME_EPOLL_WATCH_TARGET[slot].load(Ordering::SeqCst) != target {
+            continue;
+        }
+        let events = X86_RUNTIME.ELF_PROBE_EPOLL_EVENTS[slot].load(Ordering::SeqCst);
+        if events & LINUX_EPOLL_REPORTED_MASK != 0 {
+            X86_RUNTIME.ELF_PROBE_EPOLL_EVENTS[slot]
+                .store(events & !LINUX_EPOLL_REPORTED_MASK, Ordering::SeqCst);
+        }
+    }
+}
+
+/// The next event of an epoll instance. A caller that delivers the event
+/// `consume`s it, so an edge-triggered watch waits for its next edge; a
+/// readiness check leaves the watch armed. EPOLLONESHOT is accepted but not
+/// yet honoured (the watch stays armed): some paths that take an event can
+/// still drop it, which would leave a one-shot watch disarmed for good.
+fn linux_epoll_event(epoll: u64, consume: bool) -> Result<Option<[u8; 12]>, u64> {
     if !linux_epoll_descriptor(epoll) {
         return Err(LINUX_EBADF);
     }
@@ -32990,12 +33178,27 @@ fn linux_epoll_event(epoll: u64) -> Result<Option<[u8; 12]>, u64> {
         } else {
             slot
         };
-        let requested = X86_RUNTIME.ELF_PROBE_EPOLL_EVENTS[slot].load(Ordering::SeqCst) as u16;
+        let stored = X86_RUNTIME.ELF_PROBE_EPOLL_EVENTS[slot].load(Ordering::SeqCst);
+        let requested = stored as u16;
         if requested == 0 {
             continue;
         }
         let ready = linux_descriptor_poll_events(target as i32, requested)
             & (LINUX_POLLIN | LINUX_POLLOUT | LINUX_POLLERR | LINUX_POLLHUP);
+        if stored & LINUX_EPOLLET != 0 {
+            // Edge-triggered: report only readiness not reported since the
+            // descriptor was last used (linux_epoll_rearm_for_syscall) or
+            // seen not ready.
+            let reported = (stored & LINUX_EPOLL_REPORTED_MASK) >> LINUX_EPOLL_REPORTED_SHIFT;
+            let now = (stored & !LINUX_EPOLL_REPORTED_MASK)
+                | (u32::from(ready) << LINUX_EPOLL_REPORTED_SHIFT);
+            if consume && now != stored {
+                X86_RUNTIME.ELF_PROBE_EPOLL_EVENTS[slot].store(now, Ordering::SeqCst);
+            }
+            if u32::from(ready) & !reported == 0 {
+                continue;
+            }
+        }
         if ready != 0 {
             X86_RUNTIME
                 .LINUX_EPOLL_LAST_READY_DESCRIPTOR
@@ -33119,7 +33322,7 @@ fn complete_linux_epoll_wait(slot: usize, timed_out: bool) -> bool {
         return false;
     }
     let epoll = X86_RUNTIME.LINUX_THREAD_WAIT_OUTPUTS[slot].load(Ordering::SeqCst);
-    let event = linux_epoll_event(epoll);
+    let event = linux_epoll_event(epoll, true);
     if matches!(event, Ok(None)) && !timed_out {
         return false;
     }
@@ -33391,7 +33594,7 @@ fn linux_epoll_wait_duration_live_return(
         maximum: maximum as u64,
         ..input
     };
-    match linux_epoll_event(input.epoll) {
+    match linux_epoll_event(input.epoll, true) {
         Ok(Some(event)) => {
             return if copy_to_linux_user(input.address, &event) {
                 1
@@ -33435,7 +33638,7 @@ fn linux_epoll_wait_duration_live_return(
                 if X86_RUNTIME.LINUX_RUNTIME_SUSPENDED.load(Ordering::Acquire) {
                     return LINUX_RETURN_TO_KERNEL;
                 }
-                let result = match linux_epoll_event(input.epoll) {
+                let result = match linux_epoll_event(input.epoll, true) {
                     Ok(Some(event)) => {
                         if copy_to_linux_user(input.address, &event) {
                             1
@@ -33449,8 +33652,12 @@ fn linux_epoll_wait_duration_live_return(
                 if !restore_linux_process_live_return(output, parent_pid) {
                     return LINUX_EINVAL;
                 }
+                // An event already taken from the instance is the call's
+                // result even if a signal arrived meanwhile; Linux returns it
+                // and runs the handler on the way out. Only an empty wait is
+                // interrupted (EINTR).
                 let mut interrupted = caller;
-                interrupted.rax = LINUX_EINTR;
+                interrupted.rax = if result == 0 { LINUX_EINTR } else { result };
                 let delivered =
                     linux_deliver_pending_signal(output, interrupted, (caller.rip, caller.rflags));
                 return if delivered != 0 {
@@ -34686,7 +34893,11 @@ fn linux_descriptor_poll_events(descriptor: i32, requested: u16) -> u16 {
         return readable | writable;
     }
     if linux_epoll_descriptor(descriptor) {
-        return if linux_epoll_event(descriptor).ok().flatten().is_some() {
+        return if linux_epoll_event(descriptor, false)
+            .ok()
+            .flatten()
+            .is_some()
+        {
             requested & LINUX_POLLIN
         } else {
             0

@@ -889,7 +889,13 @@ pub(crate) fn expire_linux_waits_from_timer(frame: &mut UserInterruptFrame) {
                 .LINUX_EPOLL_LAST_READY_EVENTS
                 .load(Ordering::SeqCst),
         );
-        serial_write(" name=");
+        serial_write(" (");
+        serial_write(linux_descriptor_kind_name(
+            X86_RUNTIME
+                .LINUX_EPOLL_LAST_READY_DESCRIPTOR
+                .load(Ordering::SeqCst),
+        ));
+        serial_write(") name=");
         let mut name = [0_u8; 16];
         name[..8].copy_from_slice(
             &X86_RUNTIME

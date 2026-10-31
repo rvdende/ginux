@@ -372,9 +372,10 @@ pub(super) fn linux_futex_live_return(
         // Another process may be the one to change the futex word.
         return match run_other_linux_processes(output, caller, LINUX_FUTEX_SYSCALL) {
             Some(LinuxBlockedWait::Return(result)) => result,
-            // Callers recheck their condition after any wakeup.
-            Some(LinuxBlockedWait::Recheck) => 0,
-            None => LINUX_ENOSYS,
+            // Callers recheck their condition after any wakeup, spurious ones
+            // included; that also covers a sibling thread made ready meanwhile,
+            // which the next wait switches to.
+            Some(LinuxBlockedWait::Recheck) | None => 0,
         };
     }
     if command == FUTEX_WAIT_BITSET
@@ -541,9 +542,9 @@ pub(super) fn linux_futex_wait_live_return(
         // Another process may be the one to change the futex word.
         return match run_other_linux_processes(output, caller, number) {
             Some(LinuxBlockedWait::Return(result)) => result,
-            // Callers recheck their condition after any wakeup.
-            Some(LinuxBlockedWait::Recheck) => 0,
-            None => LINUX_ENOSYS,
+            // Callers recheck their condition after any wakeup, spurious ones
+            // included.
+            Some(LinuxBlockedWait::Recheck) | None => 0,
         };
     };
     let Some(tls) = linux_thread_context(current) else {
