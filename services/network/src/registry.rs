@@ -37,6 +37,10 @@ use crate::{
 const QUEUE_SIZE: u16 = 8;
 const TCP_BUFFER_SIZE: usize = 16 * 1024;
 const NETWORK_POLL_LIMIT: usize = 25_000_000;
+/// Polls a read waits for data: about a minute. A content delivery network
+/// can take many seconds to send the first byte of a layer it fetches from
+/// its origin, which the shorter limit treated as a failed transfer.
+const NETWORK_READ_POLL_LIMIT: usize = 12 * NETWORK_POLL_LIMIT;
 const POLLS_PER_MILLISECOND: usize = 1024;
 const TLS_RECORD_SIZE: usize = 16_640;
 const CERTIFICATE_SIZE: usize = 4096;
@@ -1436,7 +1440,7 @@ impl Read for TcpStream<'_> {
         if output.is_empty() {
             return Ok(0);
         }
-        for _ in 0..NETWORK_POLL_LIMIT {
+        for _ in 0..NETWORK_READ_POLL_LIMIT {
             self.poll();
             let socket = self.sockets.get_mut::<tcp::Socket>(self.handle);
             if socket.can_recv() {
