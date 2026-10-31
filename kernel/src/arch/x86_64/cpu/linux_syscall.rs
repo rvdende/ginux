@@ -86,6 +86,13 @@ pub(super) extern "sysv64" fn linux_syscall_handler(
         return linux_clock_gettime(saved_registers.rdi, saved_registers.rsi);
     }
     let _kernel_entry = crate::sync::kernel_entry_lock();
+    // Before the usual context checks: the timer, not the program, chose
+    // this call and saved the context it stands for.
+    if number == LINUX_PREEMPT_SYSCALL {
+        if let Some(result) = linux_complete_timer_preemption(registers, user_rip) {
+            return result;
+        }
+    }
     if let Some(result) =
         linux_controller_syscall(number, saved_registers, user_stack, user_rip, user_rflags)
     {

@@ -138,4 +138,16 @@ __vdso_clock_gettime:
 .globl clock_gettime
 .set clock_gettime, __vdso_clock_gettime
 
+# Where the kernel sends a process it preempts on a timer tick: the call
+# reports the preemption, and the kernel resumes the process later exactly
+# where the tick interrupted it, so the instructions after it never run. The
+# kernel finds this sequence by its bytes (linux_elf::vdso_preempt_entry).
+.p2align 4
+.type __ginux_preempt,@function
+__ginux_preempt:
+    movl $0x4750, %eax
+    syscall
+    ud2
+.size __ginux_preempt, .-__ginux_preempt
+
 .section .note.GNU-stack,"",@progbits

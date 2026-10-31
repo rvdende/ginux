@@ -2945,6 +2945,7 @@ unsafe fn enter_linux_runtime_process(
 ) {
     let entry_state = current_entry_state();
     let previous_return_stack = (*entry_state).return_stack;
+    LINUX_PROCESS_SLICE.store(0, Ordering::SeqCst);
     let entered = X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
         && current_linux_runtime_cpu_index() == 0
         && activation::enter_on_own_stack(
@@ -13313,6 +13314,199 @@ fn write_linux_live_return(output: *mut LinuxSyscallFrame, context: LinuxUserCon
             && entry_state.user_rip == context.rip
             && entry_state.user_rflags == context.rflags
     }
+}
+
+/// The Ginux-internal system call the vDSO's preemption entry makes; above
+/// every Linux system call number.
+const LINUX_PREEMPT_SYSCALL: u64 = 0x4750;
+/// Timer ticks a process other than init runs before it is preempted so
+/// that others get the CPU.
+const LINUX_PROCESS_SLICE_TICKS: u32 = 50;
+
+/// A process the timer preempted: its exact registers at the interrupted
+/// instruction (rax..r15 in `process_general` order), kept until it reaches
+/// the preemption entry and reports in.
+#[derive(Clone, Copy)]
+struct LinuxPreemptedContext {
+    pid: u32,
+    general: [u64; 15],
+    rip: u64,
+    rsp: u64,
+    rflags: u64,
+}
+
+static LINUX_PREEMPTED_CONTEXT: crate::sync::IrqSpinLock<Option<LinuxPreemptedContext>> =
+    crate::sync::IrqSpinLock::new(crate::sync::LockRank::SCHEDULER, None);
+/// Timer ticks the current process has run since it was last entered.
+static LINUX_PROCESS_SLICE: AtomicU32 = AtomicU32::new(0);
+
+/// Called on a timer tick that interrupted user mode: when a process other
+/// than init has used its slice and was entered by the scheduler (so a
+/// return to the kernel goes back to it), saves the exact interrupted
+/// registers and sends the process to the vDSO's preemption entry, whose
+/// system call yields it (`linux_complete_timer_preemption`). Linux
+/// preempts at the tick itself; doing it through a system call reuses the
+/// normal return-to-kernel path.
+fn linux_preempt_process_from_timer(frame: &mut UserInterruptFrame) {
+    if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
+        || current_linux_runtime_cpu_index() != 0
+    {
+        return;
+    }
+    let Some(mut context) = frame.user_context(USER_CODE_SELECTOR, USER_DATA_SELECTOR) else {
+        return;
+    };
+    if LINUX_PROCESS_SLICE.fetch_add(1, Ordering::SeqCst) + 1 < LINUX_PROCESS_SLICE_TICKS {
+        return;
+    }
+    let pid = current_linux_process_pid();
+    let Some(entry) = crate::linux_elf::vdso_preempt_entry() else {
+        return;
+    };
+    let nesting = X86_RUNTIME
+        .LINUX_PROCESS_SCHEDULER_NESTING
+        .load(Ordering::SeqCst);
+    let remote = linux_remote_thread_running();
+    let signal = X86_RUNTIME.LINUX_SIGNAL_ACTIVE.load(Ordering::SeqCst);
+    // Someone takes the yield: the scheduler that entered the process, or the
+    // fork transaction running it as its child (once it has its own memory).
+    let transaction_child = X86_RUNTIME
+        .LINUX_PROCESS_CHILD_YIELD_PID
+        .load(Ordering::SeqCst)
+        == pid;
+    let yieldable =
+        (nesting != 0 || transaction_child) && !linux_process::live_process_shares_parent_vm(pid);
+    if pid == 1 || !yieldable || remote || signal || (entry..entry + 9).contains(&context.rip) {
+        return;
+    }
+    let preempted = LinuxPreemptedContext {
+        pid,
+        general: [
+            context.rax,
+            context.rbx,
+            context.rcx,
+            context.rdx,
+            context.rsi,
+            context.rdi,
+            context.rbp,
+            context.r8,
+            context.r9,
+            context.r10,
+            context.r11,
+            context.r12,
+            context.r13,
+            context.r14,
+            context.r15,
+        ],
+        rip: context.rip,
+        rsp: context.rsp,
+        rflags: context.rflags,
+    };
+    context.rip = entry;
+    if frame.restore_user_context(context, USER_CODE_SELECTOR, USER_DATA_SELECTOR) {
+        *LINUX_PREEMPTED_CONTEXT.lock() = Some(preempted);
+        LINUX_PROCESS_SLICE.store(0, Ordering::SeqCst);
+    }
+}
+
+/// The preemption entry's system call (`user_rip` just after it): records
+/// the context the timer saved as the process's own and yields it, so the
+/// scheduler resumes it later at the interrupted instruction. None if no
+/// preemption is pending for this process there.
+fn linux_complete_timer_preemption(output: *mut LinuxSyscallFrame, user_rip: u64) -> Option<u64> {
+    let entry = crate::linux_elf::vdso_preempt_entry()?;
+    if user_rip != entry + 7 {
+        return None;
+    }
+    let pid = current_linux_process_pid();
+    let preempted = {
+        let mut pending = LINUX_PREEMPTED_CONTEXT.lock();
+        pending.filter(|preempted| preempted.pid == pid)?;
+        pending.take()?
+    };
+    let recorded = live_runtime_linux_process_address_space_snapshot().is_some_and(|snapshot| {
+        linux_process::refresh_validated_runtime_process_registry(
+            pid,
+            snapshot,
+            preempted.general,
+            preempted.rip,
+            preempted.rsp,
+            preempted.rflags,
+            active_fs_base(),
+        )
+    });
+    if !recorded {
+        // Carry on where the tick interrupted the process instead.
+        return Some(
+            if write_linux_exact_live_return(
+                output,
+                preempted.general,
+                preempted.rip,
+                preempted.rsp,
+                preempted.rflags,
+            ) {
+                LINUX_RETURN_FROM_IRET
+            } else {
+                LINUX_EINVAL
+            },
+        );
+    }
+    X86_RUNTIME
+        .LINUX_PROCESS_CHILD_YIELD_PID
+        .store(pid, Ordering::SeqCst);
+    X86_RUNTIME
+        .LINUX_PROCESS_CHILD_YIELDED
+        .store(true, Ordering::SeqCst);
+    // Others go first next time, as after a yield.
+    X86_RUNTIME
+        .LINUX_PROCESS_LAST_BLOCKED_PID
+        .store(pid, Ordering::SeqCst);
+    Some(LINUX_RETURN_TO_KERNEL)
+}
+
+/// Returns from the current system call to `rip` with exactly the registers
+/// in `general` (`process_general` order), through the IRETQ epilogue.
+fn write_linux_exact_live_return(
+    output: *mut LinuxSyscallFrame,
+    general: [u64; 15],
+    rip: u64,
+    rsp: u64,
+    rflags: u64,
+) -> bool {
+    let registers = LinuxSyscallFrame {
+        r15: general[14],
+        r14: general[13],
+        r13: general[12],
+        r12: general[11],
+        rbp: general[6],
+        rbx: general[1],
+        r10: general[9],
+        r9: general[8],
+        r8: general[7],
+        rdx: general[3],
+        rsi: general[4],
+        rdi: general[5],
+    };
+    let context = LinuxUserContext {
+        registers,
+        rip,
+        rsp,
+        rflags,
+        rax: general[0],
+        fs_base: active_fs_base(),
+    };
+    if !write_linux_live_return(output, context) {
+        return false;
+    }
+    // SAFETY: the serialized syscall entry owns this per-CPU state until the
+    // assembly epilogue consumes it.
+    unsafe {
+        let entry_state = &mut *current_entry_state();
+        entry_state.signal_rax = general[0];
+        entry_state.signal_rcx = general[2];
+        entry_state.signal_r11 = general[10];
+    }
+    true
 }
 
 fn write_linux_thread_live_return(
