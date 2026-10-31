@@ -424,6 +424,12 @@ const LINUX_MEMBARRIER_SYSCALL: u64 = 324;
 const LINUX_MLOCK2_SYSCALL: u64 = 325;
 const LINUX_PREADV2_SYSCALL: u64 = 327;
 const LINUX_PWRITEV2_SYSCALL: u64 = 328;
+const LINUX_RWF_HIPRI: u64 = 0x01;
+const LINUX_RWF_DSYNC: u64 = 0x02;
+const LINUX_RWF_SYNC: u64 = 0x04;
+const LINUX_RWF_NOWAIT: u64 = 0x08;
+const LINUX_RWF_APPEND: u64 = 0x10;
+const LINUX_RWF_NOAPPEND: u64 = 0x20;
 const LINUX_EXECVEAT_SYSCALL: u64 = 322;
 const LINUX_MEMFD_CREATE_SYSCALL: u64 = 319;
 const LINUX_MEMFD_SECRET_SYSCALL: u64 = 447;
@@ -9522,39 +9528,40 @@ extern "sysv64" fn linux_syscall_handler(
             buffer,
             count,
         ),
-        LINUX_PREADV_SYSCALL => linux_positioned_iov(
+        LINUX_PREADV_SYSCALL => {
+            linux_positioned_iov(first_argument, buffer, count, register(0), 0, false)
+        }
+        LINUX_PWRITEV_SYSCALL => {
+            linux_positioned_iov(first_argument, buffer, count, register(0), 0, true)
+        }
+        // An offset of -1 reads or writes at the file position.
+        LINUX_PREADV2_SYSCALL if register(0) == u64::MAX => linux_descriptor_readv_live_return(
+            registers,
+            syscall_return,
             first_argument,
             buffer,
             count,
-            register(0),
-            register(2),
-            0,
-            false,
-        ),
-        LINUX_PWRITEV_SYSCALL => linux_positioned_iov(
-            first_argument,
-            buffer,
-            count,
-            register(0),
-            register(2),
-            0,
-            true,
         ),
         LINUX_PREADV2_SYSCALL => linux_positioned_iov(
             first_argument,
             buffer,
             count,
             register(0),
-            register(2),
             register(1),
             false,
+        ),
+        LINUX_PWRITEV2_SYSCALL if register(0) == u64::MAX => linux_descriptor_writev_live_return(
+            registers,
+            syscall_return,
+            first_argument,
+            buffer,
+            count,
         ),
         LINUX_PWRITEV2_SYSCALL => linux_positioned_iov(
             first_argument,
             buffer,
             count,
             register(0),
-            register(2),
             register(1),
             true,
         ),
@@ -10400,13 +10407,13 @@ extern "sysv64" fn linux_syscall_handler(
             if LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
                 && current_linux_tid() != Some(current_linux_process_pid()) =>
         {
-            linux_exit_child_to_parent(registers)
+            linux_exit_child_to_parent(registers, syscall_return)
         }
         LINUX_EXIT_SYSCALL
             if current_linux_process_pid() != 1
                 && current_linux_tid().is_some_and(|tid| tid != current_linux_process_pid()) =>
         {
-            linux_exit_child_to_parent(registers)
+            linux_exit_child_to_parent(registers, syscall_return)
         }
         LINUX_EXIT_SYSCALL | LINUX_EXIT_GROUP_SYSCALL if current_linux_process_pid() != 1 => {
             retire_linux_process_threads(current_linux_process_pid());
@@ -10457,7 +10464,7 @@ extern "sysv64" fn linux_syscall_handler(
             LINUX_RETURN_TO_KERNEL
         }
         LINUX_EXIT_SYSCALL if current_linux_tid() != Some(1) => {
-            linux_exit_child_to_parent(registers)
+            linux_exit_child_to_parent(registers, syscall_return)
         }
         LINUX_EXIT_SYSCALL | LINUX_EXIT_GROUP_SYSCALL => {
             ELF_PROBE_EXIT_STATUS.store(first_argument, Ordering::SeqCst);
@@ -11898,7 +11905,7 @@ fn linux_schedule_new_thread(
     child_context.rax
 }
 
-fn linux_exit_child_to_parent(output: *mut LinuxSyscallFrame) -> u64 {
+fn linux_exit_child_to_parent(output: *mut LinuxSyscallFrame, caller: LinuxUserContext) -> u64 {
     let clear_child_tid = current_linux_clear_child_tid().unwrap_or(0);
     let robust_list = current_linux_robust_list().unwrap_or(0);
     let tid = current_linux_tid().unwrap_or(0);
@@ -11907,10 +11914,23 @@ fn linux_exit_child_to_parent(output: *mut LinuxSyscallFrame) -> u64 {
     }
     let woken = wake_linux_futex(clear_child_tid, 1);
     exit_linux_robust_list(tid, robust_list);
-    if !set_current_linux_clear_child_tid(0)
-        || !set_current_linux_robust_list(0)
-        || !retire_current_linux_thread()
-    {
+    if !set_current_linux_clear_child_tid(0) || !set_current_linux_robust_list(0) {
+        return LINUX_ESRCH;
+    }
+    // Another thread of this process takes over the CPU. While all of them
+    // wait, such as a main thread polling a child's pipes, this thread stays
+    // current and other processes run. A yield restarts this exit, which has
+    // nothing left to undo.
+    while ready_linux_thread_handle().is_none() {
+        let _ = expire_linux_waits();
+        if let Some(LinuxBlockedWait::Return(result)) =
+            run_other_linux_processes(output, caller, LINUX_EXIT_SYSCALL)
+        {
+            return result;
+        }
+        core::hint::spin_loop();
+    }
+    if !retire_current_linux_thread() {
         return LINUX_ESRCH;
     }
     let Some(parent) = ready_linux_thread_handle() else {
@@ -30151,6 +30171,64 @@ fn linux_select_live_return(
             copy_to_linux_user,
         );
     }
+    // With no other thread of this process to switch to, wait here and let
+    // other processes run; one of them, or the network, may make a
+    // descriptor ready.
+    if ready_linux_thread_handle().is_none() {
+        let deadline = parsed.duration.and_then(|duration| {
+            linux_elapsed_nanoseconds().and_then(|now| now.checked_add(duration))
+        });
+        let number = if pselect {
+            LINUX_PSELECT6_SYSCALL
+        } else {
+            LINUX_SELECT_SYSCALL
+        };
+        loop {
+            let (ready_read, ready_write, ready) = match linux_select_ready(parsed.snapshot) {
+                Ok(ready) => ready,
+                Err(error) => return error,
+            };
+            let timed_out = deadline.is_some_and(|deadline| {
+                linux_elapsed_nanoseconds().is_some_and(|now| now >= deadline)
+            });
+            if ready != 0 || timed_out {
+                let result = linux_select_copy_result(
+                    parsed.snapshot,
+                    ready_read,
+                    ready_write,
+                    copy_to_linux_user,
+                );
+                return match deadline {
+                    Some(deadline)
+                        if result != LINUX_EFAULT
+                            && !pselect
+                            && !linux_select_write_remaining(parsed.snapshot, deadline) =>
+                    {
+                        LINUX_EFAULT
+                    }
+                    _ => result,
+                };
+            }
+            if ready_linux_thread_handle().is_some() {
+                break;
+            }
+            // A yield restarts the call; select restarts with the time it
+            // has left.
+            if !pselect
+                && deadline.is_some_and(|deadline| {
+                    !linux_select_write_remaining(parsed.snapshot, deadline)
+                })
+            {
+                return LINUX_EFAULT;
+            }
+            if let Some(LinuxBlockedWait::Return(result)) =
+                run_other_linux_processes(output, caller, number)
+            {
+                return result;
+            }
+            core::hint::spin_loop();
+        }
+    }
     let Some(current) = current_linux_thread_handle() else {
         return LINUX_ESRCH;
     };
@@ -34066,23 +34144,42 @@ fn linux_descriptor_readv(descriptor: u64, vectors: u64, count: u64) -> u64 {
     total as u64
 }
 
+/// preadv/pwritev and their v2 forms. x86-64 passes the whole offset in the
+/// low word and Linux ignores the high one. Regular files never block and are
+/// written through, so the priority, sync and no-wait flags change nothing,
+/// and a positioned write already ignores O_APPEND, as RWF_NOAPPEND (which
+/// Rust's `write_at` passes) asks.
 fn linux_positioned_iov(
     descriptor: u64,
     vectors: u64,
     count: u64,
-    offset_low: u64,
-    offset_high: u64,
+    offset: u64,
     flags: u64,
     write: bool,
 ) -> u64 {
-    if offset_high != 0 || flags != 0 {
+    if flags
+        & !(LINUX_RWF_HIPRI
+            | LINUX_RWF_DSYNC
+            | LINUX_RWF_SYNC
+            | LINUX_RWF_NOWAIT
+            | LINUX_RWF_APPEND
+            | LINUX_RWF_NOAPPEND)
+        != 0
+    {
         return LINUX_EOPNOTSUPP;
     }
     let (ranges, vector_count) = match linux_socket_iov_ranges(vectors, count, !write) {
         Ok(ranges) => ranges,
         Err(error) => return error,
     };
-    let mut offset = offset_low;
+    let mut offset = if write && flags & LINUX_RWF_APPEND != 0 {
+        match linux_descriptor_stat(descriptor) {
+            Some(stat) => u64::from_ne_bytes(stat[48..56].try_into().unwrap()),
+            None => return LINUX_EBADF,
+        }
+    } else {
+        offset
+    };
     let mut total = 0_u64;
     for (address, length) in ranges[..vector_count].iter().copied() {
         let result = if write {
@@ -39899,6 +39996,23 @@ fn expire_linux_waits() -> u32 {
         {
             continue;
         }
+        // Completing a descriptor wait writes its results into the waiting
+        // thread's memory, so only the current process's waits complete
+        // here; the others expire at their own process's next system call.
+        if !linux_thread_slot_in_current_process(slot)
+            && matches!(
+                LINUX_THREAD_WAIT_KINDS[slot].load(Ordering::SeqCst),
+                LINUX_THREAD_WAIT_POLL
+                    | LINUX_THREAD_WAIT_PPOLL
+                    | LINUX_THREAD_WAIT_EPOLL
+                    | LINUX_THREAD_WAIT_EPOLL_PWAIT
+                    | LINUX_THREAD_WAIT_SELECT
+                    | LINUX_THREAD_WAIT_PSELECT
+                    | LINUX_THREAD_WAIT_TIMERFD_READ
+            )
+        {
+            continue;
+        }
         if matches!(
             LINUX_THREAD_WAIT_KINDS[slot].load(Ordering::SeqCst),
             LINUX_THREAD_WAIT_POLL | LINUX_THREAD_WAIT_PPOLL
@@ -44611,6 +44725,35 @@ extern "sysv64" fn user_fault_handler(frame: *mut UserFaultFrame) -> u64 {
         ] {
             serial_write(" ");
             serial_write_u64(value);
+        }
+        serial_write("\r\n");
+        // Which thread ran with which TLS, and the faulting instruction, so
+        // a fault can be disassembled from the log.
+        serial_write("ginux: Linux user fault pid/tid/slot/slot-owner/fs:");
+        let slot = LINUX_CURRENT_THREAD_SLOT.load(Ordering::SeqCst);
+        for value in [
+            u64::from(current_linux_process_pid()),
+            current_linux_tid().map_or(0, u64::from),
+            u64::from(slot),
+            LINUX_THREAD_OWNER_PIDS
+                .get(usize::from(slot))
+                .map_or(0, |owner| u64::from(owner.load(Ordering::SeqCst))),
+            active_fs_base(),
+        ] {
+            serial_write(" ");
+            serial_write_u64(value);
+        }
+        let mut code = [0_u8; 16];
+        if copy_from_linux_user(fault_metadata.instruction, &mut code) {
+            serial_write(" code:");
+            for byte in code {
+                let digits = [
+                    b"0123456789abcdef"[usize::from(byte >> 4)],
+                    b"0123456789abcdef"[usize::from(byte & 15)],
+                ];
+                serial_write(" ");
+                serial_write(core::str::from_utf8(&digits).unwrap_or("??"));
+            }
         }
         serial_write("\r\n");
         write_linux_runtime_syscall_trace();
