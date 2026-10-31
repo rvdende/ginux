@@ -71,12 +71,37 @@ const ENDPOINT_INTERRUPT_IN: u32 = 7;
 const SPEED_FULL: u32 = 1;
 const SPEED_LOW: u32 = 2;
 const SPEED_HIGH: u32 = 3;
+const REQUEST_GET_STATUS: u8 = 0;
+const REQUEST_CLEAR_FEATURE: u8 = 1;
+const REQUEST_SET_FEATURE: u8 = 3;
 const REQUEST_GET_DESCRIPTOR: u8 = 6;
 const REQUEST_SET_CONFIGURATION: u8 = 9;
 const REQUEST_HID_SET_IDLE: u8 = 0x0a;
 const REQUEST_HID_SET_PROTOCOL: u8 = 0x0b;
 const DESCRIPTOR_DEVICE: u16 = 1;
 const DESCRIPTOR_CONFIGURATION: u16 = 2;
+const DESCRIPTOR_HUB: u16 = 0x29;
+const DESCRIPTOR_SUPERSPEED_HUB: u16 = 0x2a;
+const CLASS_HUB: u8 = 9;
+/// Hub class requests address a downstream port as the "other" recipient.
+const HUB_PORT_OUT: u8 = 0x23;
+const HUB_PORT_IN: u8 = 0xa3;
+const HUB_DEVICE_IN: u8 = 0xa0;
+const HUB_FEATURE_PORT_RESET: u16 = 4;
+const HUB_FEATURE_PORT_POWER: u16 = 8;
+const HUB_FEATURE_C_PORT_CONNECTION: u16 = 16;
+const HUB_FEATURE_C_PORT_RESET: u16 = 20;
+const HUB_PORT_CONNECTION: u32 = 1 << 0;
+const HUB_PORT_ENABLE: u32 = 1 << 1;
+const HUB_PORT_RESETTING: u32 = 1 << 4;
+const HUB_PORT_LOW_SPEED: u32 = 1 << 9;
+const HUB_PORT_HIGH_SPEED: u32 = 1 << 10;
+const HUB_PORT_RESET_CHANGE: u32 = 1 << 20;
+/// The xHCI speed ID of a SuperSpeed device.
+const SPEED_SUPER: u32 = 4;
+/// USB allows five tiers of hubs below the root hub.
+const MAX_HUB_DEPTH: u32 = 5;
+const HUB_PORT_LIMIT: u16 = 15;
 const COMMAND_TIMEOUT_MS: u64 = 1000;
 const POOL_PAGES: usize = 1536;
 
@@ -123,6 +148,7 @@ pub(crate) enum Error {
     PortResetFailed,
     NotBootKeyboard(u16, u16),
     NoKeyboard,
+    HubTooDeep,
 }
 
 struct Ring {
@@ -199,9 +225,42 @@ impl Event {
     }
 }
 
+/// Where a device sits: a root port and the hub ports below it.
+#[derive(Clone, Copy)]
+pub(crate) struct Location {
+    root_port: u32,
+    /// The xHCI route string: one hub port number per tier, in 4-bit fields.
+    route: u32,
+    depth: u32,
+    /// The slot and port of the high-speed hub whose transaction translator
+    /// serves a low- or full-speed device, and whether it has one per port.
+    translator: Option<(u32, u32, bool)>,
+}
+
+impl Location {
+    fn root(port: u32) -> Self {
+        Self {
+            root_port: port,
+            route: 0,
+            depth: 0,
+            translator: None,
+        }
+    }
+}
+
+impl core::fmt::Display for Location {
+    fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(output, "{}", self.root_port)?;
+        for tier in 0..self.depth {
+            write!(output, ".{}", (self.route >> (4 * tier)) & 0xf)?;
+        }
+        Ok(())
+    }
+}
+
 /// A configured boot keyboard.
 pub(crate) struct Keyboard {
-    pub(crate) port: u32,
+    pub(crate) location: Location,
     pub(crate) vendor: u16,
     pub(crate) product: u16,
     slot: u32,
@@ -345,25 +404,15 @@ impl Controller {
         if wait_until_ms(1000, || connected(&controller)) {
             delay_ms(100);
         }
-        let mut found = 0;
         for port in 1..=ports {
-            if found == MAX_KEYBOARDS {
-                break;
-            }
             // A device that fails after its slot is enabled keeps its pages:
             // the controller may still write to its contexts.
-            match controller.try_port(port) {
-                Ok(keyboard) => {
-                    controller.keyboards[found] = Some(keyboard);
-                    found += 1;
-                }
-                Err(error) => {
-                    if !matches!(error, Error::NotConnected) {
-                        say!("ginux:     port {}: {:?}\n", port, error);
-                    }
-                }
+            match controller.try_root_port(port) {
+                Ok(()) | Err(Error::NotConnected) => {}
+                Err(error) => say!("ginux:     port {}: {:?}\n", port, error),
             }
         }
+        let found = controller.keyboards().count();
         if found == 0 {
             controller.stop();
             return Err(Error::NoKeyboard);
@@ -422,7 +471,7 @@ impl Controller {
         self.operational + OP_PORTS + 0x10 * (port as usize - 1)
     }
 
-    fn try_port(&mut self, port: u32) -> Result<Keyboard, Error> {
+    fn try_root_port(&mut self, port: u32) -> Result<(), Error> {
         let register = self.port_register(port);
         let status = read32(register, 0);
         if status & PORT_CONNECTED == 0 {
@@ -444,7 +493,12 @@ impl Controller {
         if status & PORT_ENABLED == 0 {
             return Err(Error::PortResetFailed);
         }
-        let speed = (status >> 10) & 0xf;
+        self.attach(Location::root(port), (status >> 10) & 0xf)
+    }
+
+    /// Addresses the device at `location`, then configures it as a boot
+    /// keyboard or, for a hub, enumerates the devices behind it.
+    fn attach(&mut self, location: Location, speed: u32) -> Result<(), Error> {
         let pages = DevicePages {
             output: pool_pages(1).ok_or(Error::OutOfDmaMemory)?,
             input: pool_pages(1).ok_or(Error::OutOfDmaMemory)?,
@@ -452,35 +506,116 @@ impl Controller {
             interrupt: pool_pages(1).ok_or(Error::OutOfDmaMemory)?,
             buffer: pool_pages(1).ok_or(Error::OutOfDmaMemory)?,
         };
-        let mut device = DeviceSetup {
-            controller: self,
-            pages: &pages,
+        let mut device = Device {
             control: Ring::new(pages.control),
+            pages,
             slot: 0,
-            port,
+            location,
             speed,
         };
-        let (vendor, product) = device.address()?;
+        let identity = device.address(self)?;
         say!(
             "ginux:     port {}: device {:04x}:{:04x} at speed {}\n",
-            port,
-            vendor,
-            product,
+            location,
+            identity.vendor,
+            identity.product,
             speed
         );
-        let (slot, endpoint) = device.configure_keyboard().map_err(|error| match error {
-            Error::NoKeyboard => Error::NotBootKeyboard(vendor, product),
-            other => other,
-        })?;
-        Ok(Keyboard {
-            port,
-            vendor,
-            product,
+        if identity.class == CLASS_HUB {
+            return self.enumerate_hub(device, identity.protocol);
+        }
+        let Some(index) = self.keyboards.iter().position(Option::is_none) else {
+            return Ok(());
+        };
+        let (slot, endpoint) = device
+            .configure_keyboard(self)
+            .map_err(|error| match error {
+                Error::NoKeyboard => Error::NotBootKeyboard(identity.vendor, identity.product),
+                other => other,
+            })?;
+        self.keyboards[index] = Some(Keyboard {
+            location,
+            vendor: identity.vendor,
+            product: identity.product,
             slot,
             endpoint,
-            interrupt: Ring::new(pages.interrupt),
-            report: pages.buffer,
-        })
+            interrupt: Ring::new(device.pages.interrupt),
+            report: device.pages.buffer,
+        });
+        Ok(())
+    }
+
+    /// Configures `hub`, powers and resets each downstream port, and attaches
+    /// what is connected there. `protocol` is the hub's device protocol: 1 or
+    /// 2 for a high-speed hub with one or per-port transaction translators.
+    fn enumerate_hub(&mut self, mut hub: Device, protocol: u8) -> Result<(), Error> {
+        if hub.location.depth >= MAX_HUB_DEPTH {
+            return Err(Error::HubTooDeep);
+        }
+        let ports = hub.configure_hub(self, protocol)?;
+        say!(
+            "ginux:     port {}: hub with {} ports\n",
+            hub.location,
+            ports
+        );
+        for port in 1..=ports {
+            match self.try_hub_port(&mut hub, port, protocol) {
+                Ok(()) | Err(Error::NotConnected) => {}
+                Err(error) => say!("ginux:     port {}.{}: {:?}\n", hub.location, port, error),
+            }
+        }
+        Ok(())
+    }
+
+    fn try_hub_port(&mut self, hub: &mut Device, port: u16, protocol: u8) -> Result<(), Error> {
+        let status = hub.port_status(self, port)?;
+        if status & HUB_PORT_CONNECTION == 0 {
+            return Err(Error::NotConnected);
+        }
+        hub.control_out(
+            self,
+            HUB_PORT_OUT,
+            REQUEST_SET_FEATURE,
+            HUB_FEATURE_PORT_RESET,
+            port,
+        )?;
+        let mut status = 0;
+        let reset = wait_until_ms(500, || {
+            status = hub.port_status(self, port).unwrap_or(0);
+            status & HUB_PORT_RESET_CHANGE != 0 && status & HUB_PORT_RESETTING == 0
+        });
+        for feature in [HUB_FEATURE_C_PORT_RESET, HUB_FEATURE_C_PORT_CONNECTION] {
+            hub.control_out(self, HUB_PORT_OUT, REQUEST_CLEAR_FEATURE, feature, port)?;
+        }
+        if !reset || status & HUB_PORT_ENABLE == 0 {
+            return Err(Error::PortResetFailed);
+        }
+        // USB 2.0 section 7.1.7.5: allow 10 ms of reset recovery.
+        delay_ms(10);
+        let speed = if hub.speed == SPEED_SUPER {
+            SPEED_SUPER
+        } else if status & HUB_PORT_LOW_SPEED != 0 {
+            SPEED_LOW
+        } else if status & HUB_PORT_HIGH_SPEED != 0 {
+            SPEED_HIGH
+        } else {
+            SPEED_FULL
+        };
+        let parent = hub.location;
+        // A low- or full-speed device below a high-speed hub talks through
+        // that hub's transaction translator; deeper hubs pass it on.
+        let translator = if hub.speed == SPEED_HIGH && matches!(speed, SPEED_LOW | SPEED_FULL) {
+            Some((hub.slot, u32::from(port), protocol == 2))
+        } else {
+            parent.translator
+        };
+        let location = Location {
+            root_port: parent.root_port,
+            route: parent.route | u32::from(port.min(HUB_PORT_LIMIT)) << (4 * parent.depth),
+            depth: parent.depth + 1,
+            translator,
+        };
+        self.attach(location, speed)
     }
 
     fn queue_report(&mut self, index: usize) {
@@ -550,25 +685,32 @@ impl Controller {
     }
 }
 
-/// State for addressing and configuring one device.
-struct DeviceSetup<'a> {
-    controller: &'a mut Controller,
-    pages: &'a DevicePages,
+/// What a device descriptor says about a device.
+struct Identity {
+    vendor: u16,
+    product: u16,
+    class: u8,
+    protocol: u8,
+}
+
+/// One device being addressed and configured, with its default control pipe.
+/// A hub keeps this while the devices behind it are enumerated.
+struct Device {
+    pages: DevicePages,
     control: Ring,
     slot: u32,
-    port: u32,
+    location: Location,
     speed: u32,
 }
 
-impl DeviceSetup<'_> {
-    /// Enables a slot, addresses the device, and returns its vendor and
-    /// product IDs.
-    fn address(&mut self) -> Result<(u16, u16), Error> {
-        let completion = self.controller.command(0, TRB_ENABLE_SLOT << 10)?;
+impl Device {
+    /// Enables a slot, addresses the device, and reads its device descriptor.
+    fn address(&mut self, controller: &mut Controller) -> Result<Identity, Error> {
+        let completion = controller.command(0, TRB_ENABLE_SLOT << 10)?;
         self.slot = completion.slot();
         // SAFETY: the device-context array holds MAX_SLOTS + 1 entries.
         unsafe {
-            self.controller
+            controller
                 .device_contexts
                 .add(self.slot as usize)
                 .write(self.pages.output as u64);
@@ -579,17 +721,23 @@ impl DeviceSetup<'_> {
             _ => 512,
         };
         self.clear_input();
-        self.input(0, 1, 0b11);
-        self.input(1, 0, self.speed << 20 | 1 << 27);
-        self.input(1, 1, self.port << 16);
-        self.write_endpoint0(packet);
-        self.controller.command(
+        self.input(controller, 0, 1, 0b11);
+        self.slot_context(controller, 1, None);
+        self.write_endpoint0(controller, packet);
+        controller.command(
             self.pages.input as u64,
             TRB_ADDRESS_DEVICE << 10 | self.slot << 24,
         )?;
 
         // Read the first eight bytes to learn the real default-pipe packet size.
-        self.control_in(REQUEST_GET_DESCRIPTOR, DESCRIPTOR_DEVICE << 8, 0, 8)?;
+        self.control_in(
+            controller,
+            0x80,
+            REQUEST_GET_DESCRIPTOR,
+            DESCRIPTOR_DEVICE << 8,
+            0,
+            8,
+        )?;
         let reported = u32::from(self.buffer()[7]);
         // USB 3 devices report the default-pipe packet size as a power of two.
         let actual = if self.speed > SPEED_HIGH {
@@ -599,32 +747,57 @@ impl DeviceSetup<'_> {
         };
         if actual != packet && actual != 0 {
             self.clear_input();
-            self.input(0, 1, 0b10);
-            self.write_endpoint0(actual);
-            self.controller.command(
+            self.input(controller, 0, 1, 0b10);
+            self.write_endpoint0(controller, actual);
+            controller.command(
                 self.pages.input as u64,
                 TRB_EVALUATE_CONTEXT << 10 | self.slot << 24,
             )?;
         }
-        self.control_in(REQUEST_GET_DESCRIPTOR, DESCRIPTOR_DEVICE << 8, 0, 18)?;
+        self.control_in(
+            controller,
+            0x80,
+            REQUEST_GET_DESCRIPTOR,
+            DESCRIPTOR_DEVICE << 8,
+            0,
+            18,
+        )?;
         let device = self.buffer();
-        Ok((
-            u16::from_le_bytes([device[8], device[9]]),
-            u16::from_le_bytes([device[10], device[11]]),
-        ))
+        Ok(Identity {
+            vendor: u16::from_le_bytes([device[8], device[9]]),
+            product: u16::from_le_bytes([device[10], device[11]]),
+            class: device[4],
+            protocol: device[6],
+        })
     }
 
-    /// Selects the boot keyboard interface, configures its interrupt-IN
-    /// endpoint, and returns the slot and endpoint context index.
-    fn configure_keyboard(&mut self) -> Result<(u32, u32), Error> {
-        self.control_in(REQUEST_GET_DESCRIPTOR, DESCRIPTOR_CONFIGURATION << 8, 0, 9)?;
+    /// Reads the configuration descriptors into the buffer and returns their
+    /// total length.
+    fn read_configuration(&mut self, controller: &mut Controller) -> Result<u16, Error> {
+        self.control_in(
+            controller,
+            0x80,
+            REQUEST_GET_DESCRIPTOR,
+            DESCRIPTOR_CONFIGURATION << 8,
+            0,
+            9,
+        )?;
         let total = u16::from_le_bytes([self.buffer()[2], self.buffer()[3]]).min(4096);
         self.control_in(
+            controller,
+            0x80,
             REQUEST_GET_DESCRIPTOR,
             DESCRIPTOR_CONFIGURATION << 8,
             0,
             total,
         )?;
+        Ok(total)
+    }
+
+    /// Selects the boot keyboard interface, configures its interrupt-IN
+    /// endpoint, and returns the slot and endpoint context index.
+    fn configure_keyboard(&mut self, controller: &mut Controller) -> Result<(u32, u32), Error> {
+        let total = self.read_configuration(controller)?;
         let descriptors = self.buffer();
         let configuration = descriptors[5];
         let (mut interface, mut keyboard) = (None, None);
@@ -642,31 +815,133 @@ impl DeviceSetup<'_> {
                     interface = boot_keyboard.then_some(descriptors[offset + 2]);
                 }
                 5 if interface.is_some() && keyboard.is_none() => {
-                    let address = descriptors[offset + 2];
-                    if address & 0x80 != 0 && descriptors[offset + 3] & 3 == 3 {
-                        let packet =
-                            u16::from_le_bytes([descriptors[offset + 4], descriptors[offset + 5]]);
-                        keyboard = Some((
-                            interface.unwrap_or(0),
-                            address & 0x0f,
-                            packet & 0x7ff,
-                            descriptors[offset + 6],
-                        ));
-                    }
+                    let endpoint = interrupt_in_endpoint(&descriptors[offset..offset + length]);
+                    keyboard = endpoint.map(|endpoint| (interface.unwrap_or(0), endpoint));
                 }
                 _ => {}
             }
             offset += length;
         }
-        let Some((interface, number, packet, interval)) = keyboard else {
+        let Some((interface, (number, packet, interval))) = keyboard else {
             return Err(Error::NoKeyboard);
         };
 
-        self.control_out(0x00, REQUEST_SET_CONFIGURATION, u16::from(configuration), 0)?;
-        self.control_out(0x21, REQUEST_HID_SET_PROTOCOL, 0, u16::from(interface))?;
+        self.control_out(
+            controller,
+            0x00,
+            REQUEST_SET_CONFIGURATION,
+            u16::from(configuration),
+            0,
+        )?;
+        self.control_out(
+            controller,
+            0x21,
+            REQUEST_HID_SET_PROTOCOL,
+            0,
+            u16::from(interface),
+        )?;
         // SET_IDLE is optional; some keyboards stall it.
-        let _ = self.control_out(0x21, REQUEST_HID_SET_IDLE, 0, u16::from(interface));
+        let _ = self.control_out(
+            controller,
+            0x21,
+            REQUEST_HID_SET_IDLE,
+            0,
+            u16::from(interface),
+        );
+        let endpoint = self.configure_interrupt_in(controller, number, packet, interval, None)?;
+        Ok((self.slot, endpoint))
+    }
 
+    /// Configures a hub: selects its configuration, reads its hub descriptor,
+    /// tells the controller it is a hub, and powers its ports. Returns the
+    /// number of downstream ports.
+    fn configure_hub(&mut self, controller: &mut Controller, protocol: u8) -> Result<u16, Error> {
+        let total = self.read_configuration(controller)?;
+        let descriptors = self.buffer();
+        let configuration = descriptors[5];
+        let mut status_endpoint = None;
+        let mut offset = 0;
+        while offset + 2 <= usize::from(total) {
+            let length = usize::from(descriptors[offset]);
+            if length < 2 || offset + length > usize::from(total) {
+                break;
+            }
+            if descriptors[offset + 1] == 5 && status_endpoint.is_none() {
+                status_endpoint = interrupt_in_endpoint(&descriptors[offset..offset + length]);
+            }
+            offset += length;
+        }
+        self.control_out(
+            controller,
+            0x00,
+            REQUEST_SET_CONFIGURATION,
+            u16::from(configuration),
+            0,
+        )?;
+        let descriptor = if self.speed == SPEED_SUPER {
+            DESCRIPTOR_SUPERSPEED_HUB
+        } else {
+            DESCRIPTOR_HUB
+        };
+        self.control_in(
+            controller,
+            HUB_DEVICE_IN,
+            REQUEST_GET_DESCRIPTOR,
+            descriptor << 8,
+            0,
+            9,
+        )?;
+        let hub = self.buffer();
+        let ports = u16::from(hub[2]).min(HUB_PORT_LIMIT);
+        let characteristics = u16::from_le_bytes([hub[3], hub[4]]);
+        let power_good_ms = u64::from(hub[5]) * 2;
+        // Bits 6:5 of wHubCharacteristics give a high-speed hub's TT think
+        // time; other hubs have no transaction translator.
+        let think_time = if self.speed == SPEED_HIGH {
+            u32::from(characteristics >> 5) & 3
+        } else {
+            0
+        };
+        let hub_fields = HubFields {
+            ports: u32::from(ports),
+            multi_translator: protocol == 2,
+            think_time,
+        };
+        let (number, packet, interval) = status_endpoint.unwrap_or((1, 2, 12));
+        self.configure_interrupt_in(controller, number, packet, interval, Some(hub_fields))?;
+        for port in 1..=ports {
+            self.control_out(
+                controller,
+                HUB_PORT_OUT,
+                REQUEST_SET_FEATURE,
+                HUB_FEATURE_PORT_POWER,
+                port,
+            )?;
+        }
+        delay_ms(power_good_ms.max(100));
+        Ok(ports)
+    }
+
+    /// Returns a hub port's status in the low half and its change bits in
+    /// the high half.
+    fn port_status(&mut self, controller: &mut Controller, port: u16) -> Result<u32, Error> {
+        self.control_in(controller, HUB_PORT_IN, REQUEST_GET_STATUS, 0, port, 4)?;
+        let status = self.buffer();
+        Ok(u32::from_le_bytes([
+            status[0], status[1], status[2], status[3],
+        ]))
+    }
+
+    /// Adds interrupt-IN endpoint `number` and, for a hub, the hub fields of
+    /// the slot context. Returns the endpoint context index.
+    fn configure_interrupt_in(
+        &mut self,
+        controller: &mut Controller,
+        number: u8,
+        packet: u16,
+        interval: u8,
+        hub: Option<HubFields>,
+    ) -> Result<u32, Error> {
         let endpoint = u32::from(number) * 2 + 1;
         let exponent = match self.speed {
             SPEED_LOW | SPEED_FULL => {
@@ -678,43 +953,77 @@ impl DeviceSetup<'_> {
         };
         let ring = self.pages.interrupt as u64 | 1;
         self.clear_input();
-        self.input(0, 1, 1 | 1 << endpoint);
-        self.input(1, 0, self.speed << 20 | endpoint << 27);
-        self.input(1, 1, self.port << 16);
+        self.input(controller, 0, 1, 1 | 1 << endpoint);
+        self.slot_context(controller, endpoint, hub);
         let context = 1 + endpoint as usize;
-        self.input(context, 0, exponent << 16);
+        self.input(controller, context, 0, exponent << 16);
         self.input(
+            controller,
             context,
             1,
             3 << 1 | ENDPOINT_INTERRUPT_IN << 3 | u32::from(packet) << 16,
         );
-        self.input(context, 2, ring as u32);
-        self.input(context, 3, (ring >> 32) as u32);
-        self.input(context, 4, 8 | u32::from(packet) << 16);
-        self.controller.command(
+        self.input(controller, context, 2, ring as u32);
+        self.input(controller, context, 3, (ring >> 32) as u32);
+        self.input(controller, context, 4, 8 | u32::from(packet) << 16);
+        controller.command(
             self.pages.input as u64,
             TRB_CONFIGURE_ENDPOINT << 10 | self.slot << 24,
         )?;
-        Ok((self.slot, endpoint))
+        Ok(endpoint)
     }
 
-    fn write_endpoint0(&mut self, packet: u32) {
+    /// Writes the input slot context: route, speed and the last valid
+    /// endpoint context, the root port, any transaction translator, and for
+    /// a hub its port count and translator settings.
+    fn slot_context(&mut self, controller: &Controller, entries: u32, hub: Option<HubFields>) {
+        let location = self.location;
+        let (translator_slot, translator_port, multi_translator) =
+            location.translator.unwrap_or((0, 0, false));
+        let hub_flags = hub.map_or(0, |hub| 1 << 26 | u32::from(hub.multi_translator) << 25);
+        let multi = u32::from(hub.is_none() && multi_translator) << 25;
+        self.input(
+            controller,
+            1,
+            0,
+            location.route | self.speed << 20 | multi | hub_flags | entries << 27,
+        );
+        self.input(
+            controller,
+            1,
+            1,
+            location.root_port << 16 | hub.map_or(0, |hub| hub.ports << 24),
+        );
+        self.input(
+            controller,
+            1,
+            2,
+            translator_slot | translator_port << 8 | hub.map_or(0, |hub| hub.think_time << 16),
+        );
+    }
+
+    fn write_endpoint0(&mut self, controller: &Controller, packet: u32) {
         let ring = self.control.address() | 1;
-        self.input(2, 1, 3 << 1 | ENDPOINT_CONTROL << 3 | packet << 16);
-        self.input(2, 2, ring as u32);
-        self.input(2, 3, (ring >> 32) as u32);
-        self.input(2, 4, 8);
+        self.input(
+            controller,
+            2,
+            1,
+            3 << 1 | ENDPOINT_CONTROL << 3 | packet << 16,
+        );
+        self.input(controller, 2, 2, ring as u32);
+        self.input(controller, 2, 3, (ring >> 32) as u32);
+        self.input(controller, 2, 4, 8);
     }
 
     fn clear_input(&mut self) {
-        // SAFETY: the input context page belongs to this device setup.
+        // SAFETY: the input context page belongs to this device.
         unsafe { (*self.pages.input).0.fill(0) };
     }
 
     /// Writes dword `word` of input context entry `index` (0 is the input
     /// control context, 1 the slot, 2 endpoint 0, and so on).
-    fn input(&mut self, index: usize, word: usize, value: u32) {
-        let offset = index * self.controller.context_size + word * 4;
+    fn input(&mut self, controller: &Controller, index: usize, word: usize, value: u32) {
+        let offset = index * controller.context_size + word * 4;
         // SAFETY: offset stays within the 4 KiB input context page for the
         // entries this driver writes (at most 32 contexts of 64 bytes).
         unsafe {
@@ -736,12 +1045,14 @@ impl DeviceSetup<'_> {
 
     fn control_in(
         &mut self,
+        controller: &mut Controller,
+        request_type: u8,
         request: u8,
         value: u16,
         index: u16,
         length: u16,
     ) -> Result<(), Error> {
-        let setup = 0x80
+        let setup = u64::from(request_type)
             | u64::from(request) << 8
             | u64::from(value) << 16
             | u64::from(index) << 32
@@ -756,11 +1067,12 @@ impl DeviceSetup<'_> {
         let status = self
             .control
             .push(0, 0, TRB_STATUS << 10 | TRB_INTERRUPT_ON_COMPLETION);
-        self.transfer(status)
+        self.transfer(controller, status)
     }
 
     fn control_out(
         &mut self,
+        controller: &mut Controller,
         request_type: u8,
         request: u8,
         value: u16,
@@ -777,16 +1089,16 @@ impl DeviceSetup<'_> {
             0,
             TRB_STATUS << 10 | TRB_INTERRUPT_ON_COMPLETION | TRB_DIRECTION_IN,
         );
-        self.transfer(status)
+        self.transfer(controller, status)
     }
 
     /// Rings endpoint 0 and waits for the transfer event of the TRB at
     /// `last`. An error on any earlier TRB of the transfer ends the wait.
-    fn transfer(&mut self, last: u64) -> Result<(), Error> {
-        self.controller.ring(self.slot, 1);
+    fn transfer(&mut self, controller: &mut Controller, last: u64) -> Result<(), Error> {
+        controller.ring(self.slot, 1);
         let mut result = Err(Error::TransferTimedOut);
         wait_until_ms(COMMAND_TIMEOUT_MS, || {
-            let Some(event) = self.controller.next_event() else {
+            let Some(event) = controller.next_event() else {
                 return false;
             };
             if event.kind() != TRB_TRANSFER_EVENT {
@@ -807,6 +1119,29 @@ impl DeviceSetup<'_> {
         });
         result
     }
+}
+
+/// The slot-context fields that describe a hub.
+#[derive(Clone, Copy)]
+struct HubFields {
+    ports: u32,
+    multi_translator: bool,
+    think_time: u32,
+}
+
+/// Parses an endpoint descriptor and returns the number, maximum packet size
+/// and interval of an interrupt-IN endpoint.
+fn interrupt_in_endpoint(descriptor: &[u8]) -> Option<(u8, u16, u8)> {
+    let [_, _, address, attributes, low, high, interval, ..] = *descriptor else {
+        return None;
+    };
+    (address & 0x80 != 0 && attributes & 3 == 3).then(|| {
+        (
+            address & 0x0f,
+            u16::from_le_bytes([low, high]) & 0x7ff,
+            interval,
+        )
+    })
 }
 
 /// Performs the USB legacy-support handoff so firmware stops driving the

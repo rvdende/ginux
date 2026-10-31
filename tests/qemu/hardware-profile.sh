@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Boot Ginux on a QEMU machine shaped like a physical AMD desktop instead of the
 # virtio reference profile: AMD IOMMU, an NVMe SSD with a GPT disk, AHCI,
-# xHCI with a USB keyboard, a VGA framebuffer, and no virtio devices.
+# xHCI with USB keyboards (one behind a hub), a VGA framebuffer, and no virtio
+# devices.
 #
 # The first boot keeps a serial port, checks the bring-up report, and types a
 # command on the USB keyboard through the QEMU monitor. The second removes the
@@ -79,7 +80,8 @@ boot_profile() {
         -device usb-tablet,bus=xhci.0 \
         -device usb-kbd,bus=xhci.0 \
         -device qemu-xhci,id=xhci2 \
-        -device usb-kbd,bus=xhci2.0 \
+        -device usb-hub,bus=xhci2.0,port=1 \
+        -device usb-kbd,bus=xhci2.0,port=1.2 \
         -drive "if=none,id=nvm,format=raw,file=$disk" \
         -device "nvme,drive=nvm,serial=GINUXNVME01" \
         -drive "if=pflash,format=raw,readonly=on,file=$ovmf_code" \
@@ -159,6 +161,8 @@ for expected in \
     'by firmware, status' \
     '8086:10d3 has no driver yet' \
     'keyboard 0627:0001 on port' \
+    'hub with 8 ports' \
+    'keyboard 0627:0001 on port 5.2' \
     'Ginux bring-up shell' \
     'bring-up> echo usbok' \
     'usbok'; do

@@ -234,7 +234,7 @@ fn open_keyboards() -> UsbKeyboards {
                         "ginux:   keyboard {:04x}:{:04x} on port {}\n",
                         keyboard.vendor,
                         keyboard.product,
-                        keyboard.port
+                        keyboard.location
                     );
                 }
                 opened[slot] = Some(controller);
