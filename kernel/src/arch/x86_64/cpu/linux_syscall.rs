@@ -275,9 +275,11 @@ pub(super) extern "sysv64" fn linux_syscall_handler(
             )
         }
         // A blocking receive waits by yielding, as read does; MSG_DONTWAIT
-        // never waits and MSG_WAITALL keeps collecting until it is full.
+        // never waits, MSG_WAITALL keeps collecting until it is full, and
+        // MSG_ERRQUEUE reads the (always empty) error queue without waiting.
         LINUX_RECVFROM_SYSCALL
-            if register(0) & 0x140 == 0 && linux_blocking_socket_yields(first_argument, false) =>
+            if register(0) & (0x140 | LINUX_MSG_ERRQUEUE) == 0
+                && linux_blocking_socket_yields(first_argument, false) =>
         {
             linux_local_socket_io_live_return(
                 registers,
@@ -318,7 +320,8 @@ pub(super) extern "sysv64" fn linux_syscall_handler(
             )
         }
         LINUX_RECVMSG_SYSCALL
-            if count & 0x140 == 0 && linux_blocking_socket_yields(first_argument, false) =>
+            if count & (0x140 | LINUX_MSG_ERRQUEUE) == 0
+                && linux_blocking_socket_yields(first_argument, false) =>
         {
             linux_local_socket_io_live_return(
                 registers,

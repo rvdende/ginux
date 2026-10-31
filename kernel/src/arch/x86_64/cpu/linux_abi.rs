@@ -500,6 +500,7 @@ pub(super) const LINUX_P_ALL: u64 = 0;
 pub(super) const LINUX_P_PID: u64 = 1;
 pub(super) const LINUX_P_PGID: u64 = 2;
 pub(super) const LINUX_P_PIDFD: u64 = 3;
+pub(super) const LINUX_MSG_ERRQUEUE: u64 = 0x2000;
 pub(super) const LINUX_CLD_EXITED: i32 = 1;
 pub(super) const LINUX_CLD_KILLED: i32 = 2;
 pub(super) const LINUX_RUSAGE_SIZE: usize = 144;
@@ -656,6 +657,18 @@ pub(super) const LINUX_PROC_FD_DIRECTORY: u16 =
     LINUX_DEVICE_DIRECTORY | LINUX_FILE_PROC_STATUS | LINUX_PROC_FD_DIRECTORY_NODE;
 pub(super) const LINUX_PROC_PID2_STATUS_NODE: u16 = 0xf900;
 pub(super) const LINUX_FILE_PROC_PID2_STATUS: u16 = LINUX_FILE_MASK | LINUX_PROC_PID2_STATUS_NODE;
+pub(super) const LINUX_PROC_MOUNTS_NODE: u16 = 0xdd00;
+pub(super) const LINUX_FILE_PROC_MOUNTS: u16 = LINUX_FILE_MASK | LINUX_PROC_MOUNTS_NODE;
+/// Read-only `/proc/sys` values: node, path under `/proc`, contents. Values
+/// match what Ginux implements (four user namespaces). Leave out values that
+/// tests save and restore (io_uring_disabled): LTP skips a test when such a
+/// file exists but cannot be written, and runs it when the file is absent.
+pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 4] = [
+    (0xdc00, b"sys/kernel/pid_max", b"4194304\n"),
+    (0xdb00, b"sys/kernel/tainted", b"0\n"),
+    (0xda00, b"sys/user/max_user_namespaces", b"3\n"),
+    (0xd900, b"sys/fs/pipe-max-size", b"1048576\n"),
+];
 pub(super) const LINUX_PROC_CPUINFO_NODE: u16 = 0xf800;
 pub(super) const LINUX_FILE_PROC_CPUINFO: u16 = LINUX_FILE_MASK | LINUX_PROC_CPUINFO_NODE;
 pub(super) const LINUX_PROC_MEMINFO_NODE: u16 = 0xf700;

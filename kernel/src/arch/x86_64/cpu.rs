@@ -23666,8 +23666,20 @@ fn linux_runtime_file_kind(path: &[u8]) -> Option<u16> {
     Some(kind | (u16::from(node) << LINUX_ROOT_NODE_SHIFT))
 }
 
+/// The contents of a read-only `/proc/sys` value file (`LINUX_PROC_SYSCTLS`).
+fn linux_proc_sysctl(state: u16) -> Option<&'static [u8]> {
+    LINUX_PROC_SYSCTLS
+        .iter()
+        .find(|(node, ..)| state & !3 == LINUX_FILE_MASK | node)
+        .map(|(.., contents)| *contents)
+}
+
 fn linux_proc_root_file_kind(name: &[u8]) -> Option<u16> {
+    if let Some((node, ..)) = LINUX_PROC_SYSCTLS.iter().find(|(_, path, _)| *path == name) {
+        return Some(LINUX_FILE_MASK | node);
+    }
     match name {
+        b"mounts" => Some(LINUX_FILE_PROC_MOUNTS),
         b"cpuinfo" => Some(LINUX_FILE_PROC_CPUINFO),
         b"meminfo" => Some(LINUX_FILE_PROC_MEMINFO),
         b"stat" => Some(LINUX_FILE_PROC_STAT),
@@ -23723,6 +23735,7 @@ fn linux_proc_pid_file_kind(pid: u32, name: &[u8]) -> Option<u16> {
         (pid, b"fd") if pid == current_linux_process_pid() => Some(LINUX_PROC_FD_DIRECTORY),
         (_, b"cgroup") => Some(LINUX_FILE_PROC_CGROUP),
         (_, b"oom_score_adj") => Some(LINUX_FILE_PROC_OOM_SCORE_ADJ),
+        (_, b"mounts") => Some(LINUX_FILE_PROC_MOUNTS),
         (1, b"cmdline") if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) => {
             Some(LINUX_FILE_PROC_PROCESS_CMDLINE)
         }
@@ -28973,9 +28986,19 @@ fn linux_unix_socket_path(address: u64, length: u64, output: &mut [u8; 108]) -> 
     Ok(path_length)
 }
 
+/// The error for a socket call on `descriptor` that is not a socket: ENOTSOCK
+/// when it is an open descriptor of another kind, EBADF when it is not open.
+fn linux_not_socket_error(descriptor: u64) -> u64 {
+    if linux_descriptor_open(u64::from(descriptor as u32)) {
+        LINUX_ENOTSOCK
+    } else {
+        LINUX_EBADF
+    }
+}
+
 fn linux_socket_bind(descriptor: u64, address: u64, length: u64) -> u64 {
     let Some(slot) = linux_socket_slot(descriptor) else {
-        return LINUX_EBADF;
+        return linux_not_socket_error(descriptor);
     };
     if crate::linux_socket::kind(slot) == Some(crate::linux_socket::Kind::Unix) {
         let mut path = [0_u8; 108];
@@ -28995,7 +29018,7 @@ fn linux_socket_bind(descriptor: u64, address: u64, length: u64) -> u64 {
 
 fn linux_socket_listen(descriptor: u64, backlog: u64) -> u64 {
     let Some(slot) = linux_socket_slot(descriptor) else {
-        return LINUX_EBADF;
+        return linux_not_socket_error(descriptor);
     };
     // Linux reads the backlog as an unsigned int capped at somaxconn, so a
     // negative backlog, which Rust's standard library passes, means the
@@ -29031,7 +29054,7 @@ fn linux_socket_accept(descriptor: u64, address: u64, length: u64, flags: u64) -
         return LINUX_EINVAL;
     }
     let Some(listener_slot) = linux_socket_slot(descriptor) else {
-        return LINUX_EBADF;
+        return linux_not_socket_error(descriptor);
     };
     let Some(accepted_descriptor) = (LINUX_AUX_DESCRIPTOR_FIRST..LINUX_AUX_DESCRIPTOR_LIMIT)
         .find(|descriptor| linux_aux_descriptor_free(*descriptor))
@@ -29072,7 +29095,7 @@ fn linux_socket_accept(descriptor: u64, address: u64, length: u64, flags: u64) -
 
 fn linux_socket_connect(descriptor: u64, address: u64, length: u64) -> u64 {
     let Some(slot) = linux_socket_slot(descriptor) else {
-        return LINUX_EBADF;
+        return linux_not_socket_error(descriptor);
     };
     if crate::linux_socket::kind(slot) == Some(crate::linux_socket::Kind::Unix) {
         let mut path = [0_u8; 108];
@@ -29107,7 +29130,7 @@ fn linux_socket_sendto(
     const SUPPORTED_FLAGS: u64 = 0x40 | 0x4000;
     let flags = u64::from(flags as u32);
     let Some(slot) = linux_socket_slot(descriptor) else {
-        return LINUX_EBADF;
+        return linux_not_socket_error(descriptor);
     };
     if flags & !SUPPORTED_FLAGS != 0 {
         return LINUX_EINVAL;
@@ -29177,8 +29200,12 @@ fn linux_socket_recvfrom(
     const SUPPORTED_FLAGS: u64 = MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT | MSG_WAITALL;
     let flags = u64::from(flags as u32);
     let Some(slot) = linux_socket_slot(descriptor) else {
-        return LINUX_EBADF;
+        return linux_not_socket_error(descriptor);
     };
+    // Ginux keeps no socket error queues, so reading one finds it empty.
+    if flags & LINUX_MSG_ERRQUEUE != 0 {
+        return LINUX_EAGAIN;
+    }
     if flags & !SUPPORTED_FLAGS != 0 {
         return LINUX_EINVAL;
     }
@@ -29245,7 +29272,7 @@ fn linux_socket_sendmsg(descriptor: u64, message: u64, flags: u64) -> u64 {
     const SUPPORTED_FLAGS: u64 = 0x40 | 0x4000;
     let flags = u64::from(flags as u32);
     let Some(slot) = linux_socket_slot(descriptor) else {
-        return LINUX_EBADF;
+        return linux_not_socket_error(descriptor);
     };
     if flags & !SUPPORTED_FLAGS != 0 {
         return LINUX_EINVAL;
@@ -29539,8 +29566,12 @@ fn linux_socket_recvmsg(
         MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT | MSG_WAITALL | MSG_CMSG_CLOEXEC;
     let flags = u64::from(flags as u32);
     let Some(slot) = linux_socket_slot(descriptor) else {
-        return LINUX_EBADF;
+        return linux_not_socket_error(descriptor);
     };
+    // Ginux keeps no socket error queues, so reading one finds it empty.
+    if flags & LINUX_MSG_ERRQUEUE != 0 {
+        return LINUX_EAGAIN;
+    }
     if flags & !SUPPORTED_FLAGS != 0 {
         return LINUX_EINVAL;
     }
@@ -30030,7 +30061,7 @@ fn linux_socket_setsockopt(
     let option = u64::from(option as u32);
     let length = u64::from(length as u32);
     let Some(slot) = linux_socket_slot(descriptor) else {
-        return LINUX_EBADF;
+        return linux_not_socket_error(descriptor);
     };
     if level == 1 && matches!(option, 20 | 21) {
         if length < 16 {
@@ -30102,7 +30133,7 @@ fn linux_socket_getsockopt(
     let level = u64::from(level as u32);
     let option = u64::from(option as u32);
     let Some(slot) = linux_socket_slot(descriptor) else {
-        return LINUX_EBADF;
+        return linux_not_socket_error(descriptor);
     };
     if level == 1 && option == 17 {
         if crate::linux_socket::kind(slot) != Some(crate::linux_socket::Kind::Unix) {
@@ -36088,7 +36119,8 @@ fn linux_proc_file(state: u16) -> bool {
             | LINUX_FILE_PROC_DYNAMIC_STAT
             | LINUX_FILE_PROC_DYNAMIC_STATUS
             | LINUX_FILE_PROC_DYNAMIC_STATM
-    )
+            | LINUX_FILE_PROC_MOUNTS
+    ) || linux_proc_sysctl(state).is_some()
 }
 
 fn linux_mountinfo_file(state: u16) -> bool {
@@ -36215,6 +36247,12 @@ fn linux_regular_file(state: u16) -> Option<&'static [u8]> {
     if linux_mountinfo_file(state) {
         return linux_mount::current_mountinfo();
     }
+    if state & !3 == LINUX_FILE_PROC_MOUNTS {
+        return linux_mount::current_mounts();
+    }
+    if let Some(contents) = linux_proc_sysctl(state) {
+        return Some(contents);
+    }
     if let Some(file) = linux_user_namespace_file(state) {
         return Some(file);
     }
@@ -36280,6 +36318,15 @@ fn linux_regular_file(state: u16) -> Option<&'static [u8]> {
 fn linux_regular_file_inode(state: u16) -> Option<u64> {
     if state & LINUX_DEVICE_DIRECTORY != 0 {
         return None;
+    }
+    if state & !3 == LINUX_FILE_PROC_MOUNTS {
+        return Some(60);
+    }
+    if let Some(index) = LINUX_PROC_SYSCTLS
+        .iter()
+        .position(|(node, ..)| state & !3 == LINUX_FILE_MASK | node)
+    {
+        return Some(61 + index as u64);
     }
     if state & !3 == LINUX_FILE_RESOLV_CONF {
         return Some(36);

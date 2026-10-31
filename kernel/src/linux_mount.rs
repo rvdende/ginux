@@ -17,6 +17,8 @@ pub(crate) const ROOT_READ_ONLY: u32 = 1 << 0;
 pub(crate) const ROOT_NOSUID: u32 = 1 << 1;
 pub(crate) const ROOT_NODEV: u32 = 1 << 2;
 const ROOT_FLAGS: u32 = ROOT_READ_ONLY | ROOT_NOSUID | ROOT_NODEV;
+/// `/proc/mounts`: the mounts of MOUNTINFO in the fstab-like format.
+pub(crate) const MOUNTS: &[u8] = b"rootfs / ginux-root ro,nosuid,nodev 0 0\nproc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\ncgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime 0 0\n";
 pub(crate) const MOUNTINFO: &[u8] = b"1 0 0:1 / / ro,nosuid,nodev - ginux-root rootfs ro\n2 1 0:2 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n3 1 0:3 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup2 rw\n";
 
 struct MountRuntimeOwner {
@@ -336,6 +338,10 @@ pub(crate) fn retire(handle: MountNamespaceHandle) -> bool {
 
 pub(crate) fn current_mountinfo() -> Option<&'static [u8]> {
     current_root_is_read_only().then_some(MOUNTINFO)
+}
+
+pub(crate) fn current_mounts() -> Option<&'static [u8]> {
+    current_root_is_read_only().then_some(MOUNTS)
 }
 
 pub(crate) fn current_namespace_id() -> Option<u64> {
