@@ -667,10 +667,10 @@ pub(super) const LINUX_FILE_PROC_MOUNTS: u16 = LINUX_FILE_MASK | LINUX_PROC_MOUN
 /// tests save and restore (io_uring_disabled): LTP skips a test when such a
 /// file exists but cannot be written, and runs it when the file is absent.
 pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 4] = [
-    (0xdc00, b"sys/kernel/pid_max", b"4194304\n"),
-    (0xdb00, b"sys/kernel/tainted", b"0\n"),
-    (0xda00, b"sys/user/max_user_namespaces", b"3\n"),
-    (0xd900, b"sys/fs/pipe-max-size", b"1048576\n"),
+    (0xd700, b"sys/kernel/pid_max", b"4194304\n"),
+    (0xd600, b"sys/kernel/tainted", b"0\n"),
+    (0xd500, b"sys/user/max_user_namespaces", b"3\n"),
+    (0xd400, b"sys/fs/pipe-max-size", b"1048576\n"),
 ];
 pub(super) const LINUX_PROC_CPUINFO_NODE: u16 = 0xf800;
 pub(super) const LINUX_FILE_PROC_CPUINFO: u16 = LINUX_FILE_MASK | LINUX_PROC_CPUINFO_NODE;
@@ -678,7 +678,7 @@ pub(super) const LINUX_PROC_MEMINFO_NODE: u16 = 0xf700;
 pub(super) const LINUX_FILE_PROC_MEMINFO: u16 = LINUX_FILE_MASK | LINUX_PROC_MEMINFO_NODE;
 pub(super) const LINUX_RESOLV_CONF_NODE: u16 = 0xf600;
 pub(super) const LINUX_FILE_RESOLV_CONF: u16 = LINUX_FILE_MASK | LINUX_RESOLV_CONF_NODE;
-pub(super) const LINUX_PROC_STAT_NODE: u16 = 0xde00;
+pub(super) const LINUX_PROC_STAT_NODE: u16 = 0xd300;
 pub(super) const LINUX_FILE_PROC_STAT: u16 = LINUX_FILE_MASK | LINUX_PROC_STAT_NODE;
 pub(super) const LINUX_PROC_UPTIME_NODE: u16 = 0xf500;
 pub(super) const LINUX_FILE_PROC_UPTIME: u16 = LINUX_FILE_MASK | LINUX_PROC_UPTIME_NODE;
@@ -923,3 +923,65 @@ pub(super) const LINUX_CLOCK_TICKS_PER_SECOND: u64 = 100;
 // runnable. Only the fifteen calls that transfer execution are switches.
 pub(super) const LINUX_VERIFICATION_YIELD_SWITCHES: u32 = 15;
 use super::{LINUX_RUNTIME_INSTANCE_LIMIT, PAGE_SIZE};
+
+/// The fixed file nodes and the `/proc/sys` nodes are distinct and clear of
+/// the `/dev/input/eventN` range, so no file is taken for another.
+const _: () = {
+    const NODES: [u16; 36] = [
+        LINUX_PROC_PID2_DIRECTORY_NODE,
+        LINUX_PROC_FD_DIRECTORY_NODE,
+        LINUX_PROC_PID2_STATUS_NODE,
+        LINUX_PROC_MOUNTS_NODE,
+        LINUX_PROC_CPUINFO_NODE,
+        LINUX_PROC_MEMINFO_NODE,
+        LINUX_RESOLV_CONF_NODE,
+        LINUX_PROC_STAT_NODE,
+        LINUX_PROC_UPTIME_NODE,
+        LINUX_PROC_LOADAVG_NODE,
+        LINUX_PROC_FILESYSTEMS_NODE,
+        LINUX_PROC_CMDLINE_NODE,
+        LINUX_PROC_PID1_STAT_NODE,
+        LINUX_PROC_PID1_STATM_NODE,
+        LINUX_PROC_PID2_STAT_NODE,
+        LINUX_PROC_PID2_STATM_NODE,
+        LINUX_PROC_CGROUP_NODE,
+        LINUX_PROC_PROCESS_CMDLINE_NODE,
+        LINUX_PROC_PROCESS_ENVIRON_NODE,
+        LINUX_PROC_FILE_MAX_NODE,
+        LINUX_PROC_NR_OPEN_NODE,
+        LINUX_PROC_OOM_SCORE_ADJ_NODE,
+        LINUX_PROC_USER_NAMESPACE_NODE,
+        LINUX_PROC_FDINFO_NODE,
+        LINUX_PROC_HOSTNAME_NODE,
+        LINUX_PROC_BOOT_ID_NODE,
+        LINUX_PROC_DYNAMIC_STAT_NODE,
+        LINUX_PROC_DYNAMIC_STATUS_NODE,
+        LINUX_PROC_DYNAMIC_STATM_NODE,
+        LINUX_CGROUP_DIRECTORY_NODE,
+        LINUX_MOUNTINFO_FILE_NODE,
+        LINUX_UID_MAP_FILE_NODE,
+        LINUX_GID_MAP_FILE_NODE,
+        LINUX_SETGROUPS_FILE_NODE,
+        LINUX_TMP_FILE_NODE,
+        LINUX_FRAMEBUFFER_NODE,
+    ];
+    const fn node(index: usize) -> u16 {
+        if index < NODES.len() {
+            NODES[index]
+        } else {
+            LINUX_PROC_SYSCTLS[index - NODES.len()].0
+        }
+    }
+    let input_end = LINUX_INPUT_NODE_FIRST + ((crate::linux_input::DEVICE_LIMIT as u16) << 8);
+    let total = NODES.len() + LINUX_PROC_SYSCTLS.len();
+    let mut index = 0;
+    while index < total {
+        assert!(node(index) < LINUX_INPUT_NODE_FIRST || node(index) >= input_end);
+        let mut other = index + 1;
+        while other < total {
+            assert!(node(index) != node(other));
+            other += 1;
+        }
+        index += 1;
+    }
+};
