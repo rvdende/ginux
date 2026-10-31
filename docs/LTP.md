@@ -13,9 +13,10 @@ QEMU, and reports one machine-parseable line per test plus failure clusters.
 | `d1f41667` | baseline (below) | 1362 | 41 | 39 | 1181 | 75 | 11 | 9 |
 | `62dce194` | `/proc/PID/oom_score_adj` kept per process | 1362 | 1043 | 38 | 130 | 76 | 52 | 17 |
 | `de94acb9` | fork EAGAIN, orphan reparenting, EINTR waits, edge-triggered epoll, timer preemption, killed-by-signal status | 1362 | 1045 | 39 | 169 | 76 | 15 | 12 |
+| `76719aee` | a fault kills only its process, frame map counts, IPv4 loopback, `/proc/sys` node clash | 1362 | 1072 | 37 | 162 | 75 | 4 | 6 |
 
 A crash takes the whole domain down, so the run reboots for the next test:
-the `de94acb9` run needed 23 boots against 68 before. Its remaining crashes
+the `de94acb9` run needed 23 boots against 68 before, the `76719aee` run 6. Its remaining crashes
 are access04, fchownat03, madvise10, madvise11, mq_open01, move_mount03,
 munmap01, readv01, sendmmsg01, shmat01, statmount03 and waitid05 to
 waitid08; its hangs are bind04 (flaky), epoll_wait01, epoll_wait12,

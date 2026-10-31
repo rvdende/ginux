@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use core::arch::{
     asm, global_asm,
     x86_64::{__cpuid, __cpuid_count},
@@ -1862,8 +1863,8 @@ static X86_RUNTIME_BACKING_LINUX_THREAD_WAIT_DEADLINES: [BankedAtomicU64; LINUX_
     [const { BankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
 static X86_RUNTIME_BACKING_LINUX_THREAD_WAIT_PRIOR_SIGNAL_MASKS: [BankedAtomicU64;
     LINUX_THREAD_LIMIT] = [const { BankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
-static LINUX_FUTEX_COORDINATION: crate::sync::SpinLock<()> =
-    crate::sync::SpinLock::new(crate::sync::LockRank::FUTEX_COORDINATION, ());
+static LINUX_FUTEX_COORDINATION: crate::sync::SpinLock<Vec<LinuxProcessFutexWait>> =
+    crate::sync::SpinLock::new(crate::sync::LockRank::FUTEX_COORDINATION, Vec::new());
 static X86_RUNTIME_BACKING_LINUX_THREAD_POLL_DESCRIPTORS: [[BankedAtomicU32; LINUX_POLLFD_LIMIT];
     LINUX_THREAD_LIMIT] =
     [const { [const { BankedAtomicU32::new(0) }; LINUX_POLLFD_LIMIT] }; LINUX_THREAD_LIMIT];
@@ -13057,7 +13058,10 @@ fn linux_waitid_live(
     caller: LinuxUserContext,
 ) -> u64 {
     let result = linux_waitid(id_type, id, information, options, rusage);
-    if result != LINUX_ENOSYS || options as u32 as u64 & LINUX_WNOHANG != 0 {
+    if options as u32 as u64 & LINUX_WNOHANG != 0 {
+        return linux_wait_nohang_live_return(result, caller);
+    }
+    if result != LINUX_ENOSYS {
         return result;
     }
     if linux_process::live_running_child_pid(current_linux_process_pid()).is_none() {
@@ -13086,7 +13090,10 @@ fn linux_wait4_live(
 ) -> u64 {
     loop {
         let result = linux_wait4(pid, status_address, options, rusage);
-        if result != LINUX_ENOSYS || options as u32 as u64 & LINUX_WNOHANG != 0 {
+        if options as u32 as u64 & LINUX_WNOHANG != 0 {
+            return linux_wait_nohang_live_return(result, caller);
+        }
+        if result != LINUX_ENOSYS {
             return result;
         }
         match run_other_linux_processes(output, caller, LINUX_WAIT4_SYSCALL) {
@@ -13095,6 +13102,22 @@ fn linux_wait4_live(
             None => return LINUX_ECHILD,
         }
     }
+}
+
+/// A `WNOHANG` wait that found no child to report while a child can run
+/// gives the CPU to other processes before returning 0, as Linux's scheduler
+/// would preempt a caller polling in a loop: without it the children it
+/// polls for never run. Children all waiting in system calls gain nothing
+/// from it.
+fn linux_wait_nohang_live_return(result: u64, caller: LinuxUserContext) -> u64 {
+    if result == 0
+        && current_linux_runtime_cpu_index() == 0
+        && linux_process::live_runnable_child_exists(current_linux_process_pid())
+        && yield_current_linux_process(caller, 0)
+    {
+        return LINUX_RETURN_TO_KERNEL;
+    }
+    result
 }
 
 /// Whether a thread of the current process runs on an application processor
@@ -13185,8 +13208,12 @@ fn run_other_linux_processes(
         }
         let mut restart = caller;
         restart.rip = caller.rip.wrapping_sub(LINUX_SYSCALL_INSTRUCTION_SIZE);
-        return yield_current_linux_process(restart, number)
-            .then_some(LinuxBlockedWait::Return(LINUX_RETURN_TO_KERNEL));
+        if !yield_current_linux_process(restart, number) {
+            return None;
+        }
+        // Waiting in the call: /proc shows it sleeping until dispatched.
+        linux_process::set_live_process_waiting(pid, true);
+        return Some(LinuxBlockedWait::Return(LINUX_RETURN_TO_KERNEL));
     }
     // The deepest running descendant is most likely what this process waits
     // for, such as a linker under a compiler driver; failing that, take the
@@ -15931,37 +15958,110 @@ fn linux_semaphore_operation(
     })
 }
 
-fn linux_semop(id: u64, operations: u64, count: u64, timeout: u64) -> u64 {
-    const LINUX_SEMOPM: usize = 500;
-    let id = id as i32;
-    if id < 0 {
-        return LINUX_EINVAL;
-    }
-    let Ok(count) = usize::try_from(count) else {
-        return LINUX_E2BIG;
-    };
-    if count == 0 || count > LINUX_SEMOPM {
-        return if count > LINUX_SEMOPM {
-            LINUX_E2BIG
-        } else {
-            LINUX_EINVAL
-        };
-    }
-    if timeout != 0 {
+/// `semop` and `semtimedop`: applies the operations, or waits until they
+/// can be applied, the timeout passes, a signal arrives or the set is
+/// removed (EIDRM). The wait outlives the call's restarts (a process other
+/// than init yields by restarting the call), so `GETNCNT`/`GETZCNT` see it
+/// and a timeout counts from the first attempt.
+fn linux_semop_live(
+    output: *mut LinuxSyscallFrame,
+    caller: LinuxUserContext,
+    number: u64,
+    (id, operations, count, timeout): (u64, u64, u64, u64),
+) -> u64 {
+    let timeout = if timeout == 0 {
+        None
+    } else {
         let mut bytes = [0_u8; 16];
         if !copy_from_linux_user(timeout, &mut bytes) {
             return LINUX_EFAULT;
         }
-        let seconds = i64::from_ne_bytes(bytes[..8].try_into().unwrap());
-        let nanoseconds = i64::from_ne_bytes(bytes[8..].try_into().unwrap());
-        if seconds < 0 || !(0..1_000_000_000).contains(&nanoseconds) {
+        let Some(timeout) = linux_timespec_nanoseconds(&bytes) else {
             return LINUX_EINVAL;
+        };
+        Some(timeout)
+    };
+    let pid = current_linux_process_pid();
+    loop {
+        let earlier = crate::linux_sysv_ipc::semaphore_wait(pid)
+            .filter(|wait| u64::from(wait.id) == id as u32 as u64);
+        let block = match linux_semop(id, operations, count) {
+            Ok(None) => {
+                crate::linux_sysv_ipc::end_semaphore_wait(pid);
+                return 0;
+            }
+            Err(error) => {
+                crate::linux_sysv_ipc::end_semaphore_wait(pid);
+                return if error == LINUX_EINVAL && earlier.is_some() {
+                    LINUX_EIDRM
+                } else {
+                    error
+                };
+            }
+            Ok(Some(block)) => block,
+        };
+        let now = linux_elapsed_nanoseconds().unwrap_or(0);
+        let deadline = earlier.map_or_else(
+            || timeout.map(|timeout| now.saturating_add(timeout)),
+            |wait| wait.deadline,
+        );
+        if deadline.is_some_and(|deadline| now >= deadline) {
+            crate::linux_sysv_ipc::end_semaphore_wait(pid);
+            return LINUX_EAGAIN;
         }
+        let wait = crate::linux_sysv_ipc::SemaphoreWait {
+            pid,
+            id: id as u32,
+            block,
+            deadline,
+        };
+        if crate::linux_sysv_ipc::begin_semaphore_wait(wait).is_err() {
+            return LINUX_ENOMEM;
+        }
+        match run_other_linux_processes(output, caller, number) {
+            Some(LinuxBlockedWait::Recheck) => {}
+            // Yielded: the call starts again and finds its wait.
+            Some(LinuxBlockedWait::Return(LINUX_RETURN_TO_KERNEL)) => {
+                return LINUX_RETURN_TO_KERNEL;
+            }
+            Some(LinuxBlockedWait::Return(result)) => {
+                crate::linux_sysv_ipc::end_semaphore_wait(pid);
+                return result;
+            }
+            None => {
+                crate::linux_sysv_ipc::end_semaphore_wait(pid);
+                return LINUX_EINTR;
+            }
+        }
+    }
+}
+
+/// Applies `semop`'s operations once: `Ok(None)` when applied,
+/// `Ok(Some(block))` when the call has to wait.
+fn linux_semop(
+    id: u64,
+    operations: u64,
+    count: u64,
+) -> Result<Option<crate::linux_sysv_ipc::SemaphoreBlock>, u64> {
+    const LINUX_SEMOPM: usize = 500;
+    let id = id as i32;
+    if id < 0 {
+        return Err(LINUX_EINVAL);
+    }
+    let Ok(count) = usize::try_from(count) else {
+        return Err(LINUX_E2BIG);
+    };
+    if count == 0 || count > LINUX_SEMOPM {
+        return Err(if count > LINUX_SEMOPM {
+            LINUX_E2BIG
+        } else {
+            LINUX_EINVAL
+        });
     }
     crate::linux_sysv_ipc::semaphore_apply(id as u32, count, current_linux_process_pid(), |index| {
         linux_semaphore_operation(operations, index)
     })
-    .map_or_else(linux_sysv_ipc_error, |()| 0)
+    .map_err(linux_sysv_ipc_error)
 }
 
 fn linux_semctl(id: u64, number: u64, command: u64, argument: u64) -> u64 {
@@ -16554,11 +16654,18 @@ fn linux_aio_error(error: crate::linux_aio::Error) -> u64 {
 }
 
 fn linux_io_setup(events: u64, output: u64) -> u64 {
+    // nr_events is a 32-bit unsigned count: zero and counts whose event ring
+    // would pass 256 MiB are invalid, and more than aio-max-nr is EAGAIN.
+    const LINUX_AIO_EVENTS_LIMIT: u64 = 0x1000_0000 / 32;
+    let events = u64::from(events as u32);
     if events == 0
-        || events > u64::from(u32::MAX)
+        || events > LINUX_AIO_EVENTS_LIMIT
         || !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
     {
         return LINUX_EINVAL;
+    }
+    if events > LINUX_AIO_MAX_NR {
+        return LINUX_EAGAIN;
     }
     let mut old = [0_u8; 8];
     if !copy_from_linux_user(output, &mut old) {
@@ -20754,14 +20861,16 @@ fn verify_linux_sysv_semaphore_syscalls() -> bool {
     let operations_written = copy_to_linux_user(mapping, &operations);
     let applied = initialized
         && operations_written
-        && linux_semop(id, mapping, 2, 0) == 0
+        && linux_semop(id, mapping, 2) == Ok(None)
         && linux_semctl(id, 0, GETVAL, 0) == 1
         && linux_semctl(id, 1, GETVAL, 0) == 3;
     let zero_operation = [0_u8, 0, 0, 0, 0, 0];
-    let timeout = [0_u8; 16];
     let blocking_checked = copy_to_linux_user(mapping + 32, &zero_operation)
-        && copy_to_linux_user(mapping + 64, &timeout)
-        && linux_semop(id, mapping + 32, 1, mapping + 64) == LINUX_EAGAIN;
+        && linux_semop(id, mapping + 32, 1)
+            == Ok(Some(crate::linux_sysv_ipc::SemaphoreBlock {
+                number: 0,
+                zero: true,
+            }));
     let stat_address = mapping + 128;
     let stat_valid = linux_semctl(id, 0, IPC_STAT, stat_address) == 0 && {
         let mut stat = [0_u8; 104];
@@ -21552,7 +21661,7 @@ fn linux_process_vm_iov(
         let Some(status) = linux_process::live_process_status(pid) else {
             return LINUX_ESRCH;
         };
-        if status.state != linux_process::LiveProcessState::Running {
+        if !status.state.is_running() {
             return LINUX_ESRCH;
         }
         if !linux_ptrace_access_permitted(pid) {
@@ -27327,7 +27436,7 @@ fn linux_release_process_cgroup(pid: u32) {
         };
         if other_pid == pid
             || linux_process::live_process_status(other_pid)
-                .is_none_or(|status| status.state != linux_process::LiveProcessState::Running)
+                .is_none_or(|status| !status.state.is_running())
         {
             return false;
         }
@@ -30495,6 +30604,7 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
         };
         let state_letter = match status.state {
             linux_process::LiveProcessState::Running => b'R',
+            linux_process::LiveProcessState::Sleeping => b'S',
             linux_process::LiveProcessState::Stopped => b'T',
             linux_process::LiveProcessState::Zombie => b'Z',
         };
@@ -30509,6 +30619,7 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
                         &mut used,
                         match status.state {
                             linux_process::LiveProcessState::Running => b" (running)\n",
+                            linux_process::LiveProcessState::Sleeping => b" (sleeping)\n",
                             linux_process::LiveProcessState::Stopped => b" (stopped)\n",
                             linux_process::LiveProcessState::Zombie => b" (zombie)\n",
                         },
@@ -34883,9 +34994,7 @@ fn linux_pidfd_getfd(pid_descriptor: u64, target: u64, flags: u64) -> u64 {
     if process == current_linux_process_pid() {
         return linux_console_dup(target);
     }
-    if linux_process::live_process_status(process)
-        .is_none_or(|status| status.state != linux_process::LiveProcessState::Running)
-    {
+    if linux_process::live_process_status(process).is_none_or(|status| !status.state.is_running()) {
         return LINUX_ESRCH;
     }
     if !linux_ptrace_access_permitted(process) {
@@ -36249,7 +36358,8 @@ fn linux_regular_file(state: u16) -> Option<&'static [u8]> {
             return None;
         }
         return match status.state {
-            linux_process::LiveProcessState::Running => Some(LINUX_PROC_PID2_RUNNING_STATUS),
+            linux_process::LiveProcessState::Running
+            | linux_process::LiveProcessState::Sleeping => Some(LINUX_PROC_PID2_RUNNING_STATUS),
             linux_process::LiveProcessState::Stopped => Some(LINUX_PROC_PID2_STOPPED_STATUS),
             linux_process::LiveProcessState::Zombie => Some(LINUX_PROC_PID2_ZOMBIE_STATUS),
         };
@@ -36282,7 +36392,8 @@ fn linux_regular_file(state: u16) -> Option<&'static [u8]> {
         LINUX_FILE_PROC_PID2_STAT => {
             let status = linux_process::live_process_status(2)?;
             return match status.state {
-                linux_process::LiveProcessState::Running => Some(LINUX_PROC_PID2_RUNNING_STAT),
+                linux_process::LiveProcessState::Running
+                | linux_process::LiveProcessState::Sleeping => Some(LINUX_PROC_PID2_RUNNING_STAT),
                 linux_process::LiveProcessState::Stopped => Some(LINUX_PROC_PID2_STOPPED_STAT),
                 linux_process::LiveProcessState::Zombie => Some(LINUX_PROC_PID2_ZOMBIE_STAT),
             };
@@ -44797,18 +44908,28 @@ fn materialize_linux_cow_address(address: u64) -> bool {
         return false;
     };
     let pid = current_linux_process_pid();
+    let failed = |step: u64| {
+        serial_write("ginux: copy-on-write fault failed address/pid/step: ");
+        for value in [address, u64::from(pid), step] {
+            serial_write_u64(value);
+            serial_write(" ");
+        }
+        serial_write("\r\n");
+        false
+    };
     let Some(mapping) = linux_process::live_process_mapping(pid, address as usize)
         .filter(|mapping| mapping.frame == source && mapping.writable && !mapping.shared)
     else {
-        return false;
+        return failed(1);
     };
     // The last mapping of a page writes it in place, as Linux reuses a page
     // whose map count has dropped to one.
     if address_space::linux_private_page_counted(source) && !memory::frame_is_shared(source) {
-        return address_space::promote_current_linux_cow_page(address, source, mapping.executable);
+        return address_space::promote_current_linux_cow_page(address, source, mapping.executable)
+            || failed(2);
     }
     let Some([replacement]) = memory::allocate_frames::<1>(memory::FrameOwner::KERNEL) else {
-        return false;
+        return failed(3);
     };
     let copied = address_space::copy_linux_frame(source, replacement);
     let mapping_replaced = copied
@@ -44839,9 +44960,9 @@ fn materialize_linux_cow_address(address: u64) -> bool {
             );
         }
         let _ = memory::scrub_and_release_frames(memory::FrameOwner::KERNEL, &[replacement]);
-        return false;
+        return failed(4 + u64::from(copied) + u64::from(mapping_replaced));
     }
-    address_space::release_linux_private_page(source)
+    address_space::release_linux_private_page(source) || failed(7)
 }
 
 fn materialize_linux_runtime_mapping(fault: domain::FaultMetadata) -> bool {

@@ -2052,8 +2052,7 @@ pub(super) fn linux_tkill_identity(thread: u64) -> Result<LinuxThreadHandle, u64
 
 pub(super) fn linux_saved_thread_target(pid: u32, tid: u32) -> Option<LinuxThreadSignalTarget> {
     if pid == current_linux_process_pid()
-        || linux_process::live_process_status(pid)?.state
-            != linux_process::LiveProcessState::Running
+        || !linux_process::live_process_status(pid)?.state.is_running()
     {
         return None;
     }

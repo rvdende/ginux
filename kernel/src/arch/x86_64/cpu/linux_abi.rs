@@ -456,6 +456,7 @@ pub(super) const LINUX_EINVAL: u64 = u64::MAX - 21;
 pub(super) const LINUX_ENOTTY: u64 = u64::MAX - 24;
 pub(super) const LINUX_ERANGE: u64 = u64::MAX - 33;
 pub(super) const LINUX_EDOM: u64 = u64::MAX - 32;
+pub(super) const LINUX_EIDRM: u64 = u64::MAX - 42;
 pub(super) const LINUX_EOVERFLOW: u64 = u64::MAX - 74;
 pub(super) const LINUX_ELOOP: u64 = u64::MAX - 39;
 pub(super) const LINUX_ESTALE: u64 = u64::MAX - 115;
@@ -666,11 +667,14 @@ pub(super) const LINUX_FILE_PROC_MOUNTS: u16 = LINUX_FILE_MASK | LINUX_PROC_MOUN
 /// match what Ginux implements (four user namespaces). Leave out values that
 /// tests save and restore (io_uring_disabled): LTP skips a test when such a
 /// file exists but cannot be written, and runs it when the file is absent.
-pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 4] = [
+/// `/proc/sys/fs/aio-max-nr`: the most events one io_setup context may hold.
+pub(super) const LINUX_AIO_MAX_NR: u64 = 65_536;
+pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 5] = [
     (0xd700, b"sys/kernel/pid_max", b"4194304\n"),
     (0xd600, b"sys/kernel/tainted", b"0\n"),
     (0xd500, b"sys/user/max_user_namespaces", b"3\n"),
     (0xd400, b"sys/fs/pipe-max-size", b"1048576\n"),
+    (0xd200, b"sys/fs/aio-max-nr", b"65536\n"),
 ];
 pub(super) const LINUX_PROC_CPUINFO_NODE: u16 = 0xf800;
 pub(super) const LINUX_FILE_PROC_CPUINFO: u16 = LINUX_FILE_MASK | LINUX_PROC_CPUINFO_NODE;

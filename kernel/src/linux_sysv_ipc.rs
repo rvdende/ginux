@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::{control_abi, linux_process, memory};
@@ -23,6 +25,52 @@ struct SysvIpcRuntimeOwner {
     message_root_addresses: [AtomicU64; INSTANCE_LIMIT],
     message_root_generations: [AtomicU32; INSTANCE_LIMIT],
     next_message_ids: [AtomicU32; INSTANCE_LIMIT],
+    semaphore_processes: [UnsafeCell<SemaphoreProcesses>; INSTANCE_LIMIT],
+}
+
+// SAFETY: an instance's `semaphore_processes` is only reached through a
+// `Guard` holding that instance's lock.
+unsafe impl Sync for SysvIpcRuntimeOwner {}
+
+/// Which semaphore value a blocked `semop` waits on: to rise far enough for
+/// a decrement, or (`zero`) to reach zero.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SemaphoreBlock {
+    pub(crate) number: u16,
+    pub(crate) zero: bool,
+}
+
+/// A process waiting in `semop`. The record outlives the call's restarts and
+/// goes when the call completes, fails, times out or is interrupted, or the
+/// process exits.
+#[derive(Clone, Copy)]
+pub(crate) struct SemaphoreWait {
+    pub(crate) pid: u32,
+    pub(crate) id: u32,
+    pub(crate) block: SemaphoreBlock,
+    /// Elapsed nanoseconds after which `semtimedop` gives up.
+    pub(crate) deadline: Option<u64>,
+}
+
+/// A process's `SEM_UNDO` adjustment of one value, applied when it exits.
+#[derive(Clone, Copy)]
+struct SemaphoreUndo {
+    pid: u32,
+    id: u32,
+    number: u16,
+    adjustment: i32,
+}
+
+struct SemaphoreProcesses {
+    waits: Vec<SemaphoreWait>,
+    undo: Vec<SemaphoreUndo>,
+}
+
+impl SemaphoreProcesses {
+    const EMPTY: Self = Self {
+        waits: Vec::new(),
+        undo: Vec::new(),
+    };
 }
 
 static SYSV_IPC_RUNTIME: SysvIpcRuntimeOwner = SysvIpcRuntimeOwner {
@@ -38,6 +86,7 @@ static SYSV_IPC_RUNTIME: SysvIpcRuntimeOwner = SysvIpcRuntimeOwner {
     message_root_addresses: [const { AtomicU64::new(0) }; INSTANCE_LIMIT],
     message_root_generations: [const { AtomicU32::new(0) }; INSTANCE_LIMIT],
     next_message_ids: [const { AtomicU32::new(1) }; INSTANCE_LIMIT],
+    semaphore_processes: [const { UnsafeCell::new(SemaphoreProcesses::EMPTY) }; INSTANCE_LIMIT],
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -203,6 +252,14 @@ impl Guard {
             core::hint::spin_loop();
         }
         Some(Self { instance })
+    }
+}
+
+impl Guard {
+    fn semaphore_processes(&mut self) -> &mut SemaphoreProcesses {
+        // SAFETY: the guard holds this instance's lock, which serializes all
+        // access to its semaphore process state.
+        unsafe { &mut *SYSV_IPC_RUNTIME.semaphore_processes[self.instance].get() }
     }
 }
 
@@ -667,14 +724,71 @@ pub(crate) fn inherit_process_attachments(parent: u32, child: u32) -> Result<(),
 }
 
 pub(crate) fn drop_process_attachments(pid: u32) -> Result<(), Error> {
-    let guard = Guard::acquire().ok_or(Error::Invalid)?;
+    let mut guard = Guard::acquire().ok_or(Error::Invalid)?;
+    undo_process_semaphores(&mut guard, pid);
     detach_matching(guard.instance, pid, None).map(|_| ())
 }
 
+/// Ends an exiting process's semaphore wait and applies its `SEM_UNDO`
+/// adjustments, clamped to the value's range as Linux does.
+fn undo_process_semaphores(guard: &mut Guard, pid: u32) {
+    let instance = guard.instance;
+    let processes = guard.semaphore_processes();
+    processes.waits.retain(|wait| wait.pid != pid);
+    processes.undo.retain(|undo| {
+        if undo.pid != pid {
+            return true;
+        }
+        let value = find_semaphore_set(instance, undo.id)
+            .and_then(|(first, _)| semaphore_value_frame(first, usize::from(undo.number)))
+            .and_then(|(frame, slot)| Some(&mut semaphore_page_mut(frame)?.values[slot]));
+        if let Some(value) = value {
+            value.value = (i32::from(value.value) + undo.adjustment)
+                .clamp(0, i32::from(SEM_VALUE_MAX)) as u16;
+            value.last_pid = pid;
+        }
+        false
+    });
+}
+
+/// The wait `pid` recorded in an earlier, restarted `semop`.
+pub(crate) fn semaphore_wait(pid: u32) -> Option<SemaphoreWait> {
+    let mut guard = Guard::acquire()?;
+    guard
+        .semaphore_processes()
+        .waits
+        .iter()
+        .find(|wait| wait.pid == pid)
+        .copied()
+}
+
+/// Records that a process waits in `semop`, replacing its earlier record.
+pub(crate) fn begin_semaphore_wait(wait: SemaphoreWait) -> Result<(), Error> {
+    let mut guard = Guard::acquire().ok_or(Error::Invalid)?;
+    let waits = &mut guard.semaphore_processes().waits;
+    if let Some(existing) = waits.iter_mut().find(|existing| existing.pid == wait.pid) {
+        *existing = wait;
+        return Ok(());
+    }
+    waits.try_reserve(1).map_err(|_| Error::NoMemory)?;
+    waits.push(wait);
+    Ok(())
+}
+
+pub(crate) fn end_semaphore_wait(pid: u32) {
+    if let Some(mut guard) = Guard::acquire() {
+        guard
+            .semaphore_processes()
+            .waits
+            .retain(|wait| wait.pid != pid);
+    }
+}
+
 pub(crate) fn teardown() -> bool {
-    let Some(guard) = Guard::acquire() else {
+    let Some(mut guard) = Guard::acquire() else {
         return false;
     };
+    *guard.semaphore_processes() = SemaphoreProcesses::EMPTY;
     let mut attachments = root(
         &SYSV_IPC_RUNTIME.attachment_root_addresses,
         &SYSV_IPC_RUNTIME.attachment_root_generations,
@@ -965,16 +1079,23 @@ pub(crate) fn semaphore_set(id: u32) -> Result<SemaphoreSetInfo, Error> {
 }
 
 pub(crate) fn semaphore_get(id: u32, number: usize) -> Result<(u16, u32, u32, u32), Error> {
-    let guard = Guard::acquire().ok_or(Error::Invalid)?;
+    let mut guard = Guard::acquire().ok_or(Error::Invalid)?;
     let (first, _) = find_semaphore_set(guard.instance, id).ok_or(Error::Invalid)?;
     let (frame, slot) = semaphore_value_frame(first, number).ok_or(Error::Range)?;
     let value = semaphore_page(frame).ok_or(Error::Invalid)?.values[slot];
-    Ok((
-        value.value,
-        value.last_pid,
-        value.waiting_increase,
-        value.waiting_zero,
-    ))
+    let (waiting_increase, waiting_zero) = guard
+        .semaphore_processes()
+        .waits
+        .iter()
+        .filter(|wait| wait.id == id && usize::from(wait.block.number) == number)
+        .fold((0, 0), |(increase, zero), wait| {
+            if wait.block.zero {
+                (increase, zero + 1)
+            } else {
+                (increase + 1, zero)
+            }
+        });
+    Ok((value.value, value.last_pid, waiting_increase, waiting_zero))
 }
 
 pub(crate) fn semaphore_set_value(
@@ -986,9 +1107,13 @@ pub(crate) fn semaphore_set_value(
     if value > SEM_VALUE_MAX {
         return Err(Error::Range);
     }
-    let guard = Guard::acquire().ok_or(Error::Invalid)?;
+    let mut guard = Guard::acquire().ok_or(Error::Invalid)?;
     let (first, _) = find_semaphore_set(guard.instance, id).ok_or(Error::Invalid)?;
     let (frame, slot) = semaphore_value_frame(first, number).ok_or(Error::Range)?;
+    guard
+        .semaphore_processes()
+        .undo
+        .retain(|undo| undo.id != id || usize::from(undo.number) != number);
     let semaphore = &mut semaphore_page_mut(frame).ok_or(Error::Invalid)?.values[slot];
     semaphore.value = value;
     semaphore.last_pid = pid;
@@ -1001,20 +1126,22 @@ pub(crate) fn semaphore_apply<F>(
     operation_count: usize,
     pid: u32,
     mut operation: F,
-) -> Result<(), Error>
+) -> Result<Option<SemaphoreBlock>, Error>
 where
     F: FnMut(usize) -> Option<SemaphoreOperation>,
 {
     const IPC_NOWAIT: u16 = 0o4000;
+    const SEM_UNDO: u16 = 0x1000;
     if operation_count == 0 {
         return Err(Error::Invalid);
     }
-    let guard = Guard::acquire().ok_or(Error::Invalid)?;
+    let mut guard = Guard::acquire().ok_or(Error::Invalid)?;
     let (first, _) = find_semaphore_set(guard.instance, id).ok_or(Error::Invalid)?;
     let set_count = semaphore_page(first).ok_or(Error::Invalid)?.count as usize;
     for index in 0..operation_count {
         let current = operation(index).ok_or(Error::Invalid)?;
-        if current.flags & !IPC_NOWAIT != 0 || usize::from(current.number) >= set_count {
+        if current.flags & !(IPC_NOWAIT | SEM_UNDO) != 0 || usize::from(current.number) >= set_count
+        {
             return Err(Error::Invalid);
         }
         let (frame, slot) =
@@ -1029,7 +1156,7 @@ where
                     .ok_or(Error::Range)?;
             }
         }
-        match current.operation.cmp(&0) {
+        let blocks = match current.operation.cmp(&0) {
             core::cmp::Ordering::Greater => {
                 if simulated
                     .checked_add(i32::from(current.operation))
@@ -1037,14 +1164,66 @@ where
                 {
                     return Err(Error::Range);
                 }
+                false
             }
-            core::cmp::Ordering::Less if simulated < -i32::from(current.operation) => {
-                return Err(Error::WouldBlock);
-            }
-            core::cmp::Ordering::Equal if simulated != 0 => return Err(Error::WouldBlock),
-            _ => {}
+            core::cmp::Ordering::Less => simulated < -i32::from(current.operation),
+            core::cmp::Ordering::Equal => simulated != 0,
+        };
+        if !blocks {
+            continue;
+        }
+        if current.flags & IPC_NOWAIT != 0 {
+            return Err(Error::WouldBlock);
+        }
+        return Ok(Some(SemaphoreBlock {
+            number: current.number,
+            zero: current.operation == 0,
+        }));
+    }
+    // SEM_UNDO keeps the opposite of each change, to apply at exit; an
+    // adjustment out of the value's range fails the call (ERANGE).
+    let undo = &mut guard.semaphore_processes().undo;
+    let mut new_entries = 0;
+    for index in 0..operation_count {
+        let current = operation(index).ok_or(Error::Invalid)?;
+        if current.flags & SEM_UNDO == 0 || current.operation == 0 {
+            continue;
+        }
+        let existing = undo
+            .iter()
+            .find(|entry| entry.pid == pid && entry.id == id && entry.number == current.number)
+            .map(|entry| entry.adjustment);
+        let earlier: i32 = (0..index)
+            .filter_map(&mut operation)
+            .filter(|prior| prior.flags & SEM_UNDO != 0 && prior.number == current.number)
+            .map(|prior| -i32::from(prior.operation))
+            .sum();
+        let adjustment = existing.unwrap_or(0) + earlier - i32::from(current.operation);
+        if adjustment.abs() > i32::from(SEM_VALUE_MAX) {
+            return Err(Error::Range);
+        }
+        new_entries += usize::from(existing.is_none());
+    }
+    undo.try_reserve(new_entries).map_err(|_| Error::NoMemory)?;
+    for index in 0..operation_count {
+        let current = operation(index).ok_or(Error::Invalid)?;
+        if current.flags & SEM_UNDO == 0 || current.operation == 0 {
+            continue;
+        }
+        match undo
+            .iter_mut()
+            .find(|entry| entry.pid == pid && entry.id == id && entry.number == current.number)
+        {
+            Some(entry) => entry.adjustment -= i32::from(current.operation),
+            None => undo.push(SemaphoreUndo {
+                pid,
+                id,
+                number: current.number,
+                adjustment: -i32::from(current.operation),
+            }),
         }
     }
+    undo.retain(|entry| entry.adjustment != 0);
     for index in 0..operation_count {
         let current = operation(index).ok_or(Error::Invalid)?;
         let (frame, slot) =
@@ -1058,16 +1237,21 @@ where
         semaphore.last_pid = pid;
     }
     semaphore_page_mut(first).ok_or(Error::Invalid)?.last_pid = pid;
-    Ok(())
+    Ok(None)
 }
 
 pub(crate) fn semaphore_set_all<F>(id: u32, pid: u32, mut value: F) -> Result<(), Error>
 where
     F: FnMut(usize) -> Option<u16>,
 {
-    let guard = Guard::acquire().ok_or(Error::Invalid)?;
+    let mut guard = Guard::acquire().ok_or(Error::Invalid)?;
     let (first, _) = find_semaphore_set(guard.instance, id).ok_or(Error::Invalid)?;
     let count = semaphore_page(first).ok_or(Error::Invalid)?.count as usize;
+    // Setting values clears every process's adjustments to them.
+    guard
+        .semaphore_processes()
+        .undo
+        .retain(|undo| undo.id != id);
     for index in 0..count {
         if value(index)
             .filter(|value| *value <= SEM_VALUE_MAX)
@@ -1096,8 +1280,12 @@ pub(crate) fn semaphore_set_mode(id: u32, mode: u16, pid: u32) -> Result<(), Err
 }
 
 pub(crate) fn semaphore_remove(id: u32) -> Result<(), Error> {
-    let guard = Guard::acquire().ok_or(Error::Invalid)?;
+    let mut guard = Guard::acquire().ok_or(Error::Invalid)?;
     let (frame, previous) = find_semaphore_set(guard.instance, id).ok_or(Error::Invalid)?;
+    guard
+        .semaphore_processes()
+        .undo
+        .retain(|undo| undo.id != id);
     let next = {
         let page = semaphore_page(frame).ok_or(Error::Invalid)?;
         (page.next_set != memory::FrameLease::EMPTY).then_some(page.next_set)
@@ -1783,12 +1971,14 @@ pub(crate) fn verify_semaphore_lifecycle() -> bool {
     let verified = semaphore_set_value(id, 0, 2, 1).is_ok()
         && semaphore_apply(id, operations.len(), 1, |index| {
             operations.get(index).copied()
-        })
-        .is_ok()
+        }) == Ok(None)
         && semaphore_get(id, 0).is_ok_and(|value| value.0 == 0 && value.1 == 1)
         && semaphore_get(id, 1).is_ok_and(|value| value.0 == 3 && value.1 == 1)
         && semaphore_apply(id, blocked.len(), 2, |index| blocked.get(index).copied())
-            == Err(Error::WouldBlock)
+            == Ok(Some(SemaphoreBlock {
+                number: 0,
+                zero: false,
+            }))
         && semaphore_get(id, 1).is_ok_and(|value| value.0 == 3)
         && semaphore_set_all(id, 3, |index| Some((index % 101) as u16)).is_ok()
         && semaphore_get(id, SEMAPHORE_CAPACITY + 6)

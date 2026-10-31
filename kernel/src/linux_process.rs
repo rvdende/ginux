@@ -483,6 +483,9 @@ struct Process {
     /// with its own stack) that has not executed yet: every page it maps is
     /// its parent's.
     shares_parent_vm: bool,
+    /// Gave up the CPU in a blocking system call and has not been dispatched
+    /// since: Linux's interruptible sleep ('S').
+    waiting: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -530,8 +533,17 @@ pub(crate) struct LiveProcessDispatch {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LiveProcessState {
     Running,
+    /// Waiting in a blocking system call.
+    Sleeping,
     Stopped,
     Zombie,
+}
+
+impl LiveProcessState {
+    /// Running or waiting in a system call: neither stopped nor exited.
+    pub(crate) const fn is_running(self) -> bool {
+        matches!(self, Self::Running | Self::Sleeping)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1383,7 +1395,8 @@ impl ProcessTable {
         true
     }
 
-    fn dispatch(&self, handle: ProcessHandle) -> Option<LiveProcessDispatch> {
+    fn dispatch(&mut self, handle: ProcessHandle) -> Option<LiveProcessDispatch> {
+        self.process_mut(handle)?.waiting = false;
         let process = self.process(handle)?;
         let address_space = process.address_space.as_ref()?;
         let context = process.context?;
@@ -1457,6 +1470,7 @@ impl ProcessTable {
             state,
             wait_event: None,
             shares_parent_vm: false,
+            waiting: false,
         });
         Some(handle)
     }
@@ -2659,6 +2673,7 @@ pub(crate) fn live_process_status(pid: u32) -> Option<LiveProcessStatus> {
     let handle = table.handle_by_pid(pid)?;
     let process = table.process(handle)?;
     let state = match process.state {
+        ProcessState::Running if process.waiting => LiveProcessState::Sleeping,
         ProcessState::Running => LiveProcessState::Running,
         ProcessState::Stopped { .. } => LiveProcessState::Stopped,
         ProcessState::Zombie { .. } => LiveProcessState::Zombie,
@@ -2669,6 +2684,19 @@ pub(crate) fn live_process_status(pid: u32) -> Option<LiveProcessStatus> {
         parent_pid: process.parent.map_or(0, |parent| parent.pid),
         state,
     })
+}
+
+/// Records whether a process waits in a blocking system call: set when it
+/// gives up the CPU there, cleared when it is woken or next dispatched.
+pub(crate) fn set_live_process_waiting(pid: u32, waiting: bool) {
+    if let Some(table) = live_process_table_mut() {
+        if let Some(process) = table
+            .handle_by_pid(pid)
+            .and_then(|handle| table.process_mut(handle))
+        {
+            process.waiting = waiting;
+        }
+    }
 }
 
 pub(crate) fn live_process_cpu_affinity(pid: u32) -> Option<u64> {
@@ -2799,6 +2827,20 @@ pub(crate) fn live_running_child_pid(parent_pid: u32) -> Option<u32> {
         .flatten()
         .find(|process| process.parent == Some(parent) && process.state == ProcessState::Running)
         .map(|process| process.handle.pid)
+}
+
+/// Whether a child of `parent_pid` can run: running and not waiting in a
+/// system call.
+pub(crate) fn live_runnable_child_exists(parent_pid: u32) -> bool {
+    live_process_table_mut().is_some_and(|table| {
+        table.handle_by_pid(parent_pid).is_some_and(|parent| {
+            table.processes.iter().flatten().any(|process| {
+                process.parent == Some(parent)
+                    && process.state == ProcessState::Running
+                    && !process.waiting
+            })
+        })
+    })
 }
 
 pub(crate) fn live_process_group(pid: u32) -> Option<u32> {

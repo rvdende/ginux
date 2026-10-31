@@ -462,7 +462,12 @@ pub(super) extern "sysv64" fn linux_syscall_handler(
         LINUX_SHMAT_SYSCALL => linux_shmat(first_argument, buffer, count),
         LINUX_SHMCTL_SYSCALL => linux_shmctl(first_argument, buffer, count),
         LINUX_SEMGET_SYSCALL => linux_semget(first_argument, buffer, count),
-        LINUX_SEMOP_SYSCALL => linux_semop(first_argument, buffer, count, 0),
+        LINUX_SEMOP_SYSCALL => linux_semop_live(
+            registers,
+            syscall_return,
+            number,
+            (first_argument, buffer, count, 0),
+        ),
         LINUX_SEMCTL_SYSCALL => linux_semctl(first_argument, buffer, count, register(0)),
         LINUX_SHMDT_SYSCALL => linux_shmdt(first_argument),
         LINUX_MSGGET_SYSCALL => linux_msgget(first_argument, buffer),
@@ -505,7 +510,12 @@ pub(super) extern "sysv64" fn linux_syscall_handler(
         LINUX_LSM_LIST_MODULES_SYSCALL => linux_lsm_list_modules(first_argument, buffer, count),
         LINUX_STATMOUNT_SYSCALL => linux_statmount(first_argument, buffer, count, register(0)),
         LINUX_LISTMOUNT_SYSCALL => linux_listmount(first_argument, buffer, count, register(0)),
-        LINUX_SEMTIMEDOP_SYSCALL => linux_semop(first_argument, buffer, count, register(0)),
+        LINUX_SEMTIMEDOP_SYSCALL => linux_semop_live(
+            registers,
+            syscall_return,
+            number,
+            (first_argument, buffer, count, register(0)),
+        ),
         LINUX_MREMAP_SYSCALL => {
             linux_mremap(first_argument, buffer, count, register(0), register(2))
         }

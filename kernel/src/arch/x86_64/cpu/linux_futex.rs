@@ -5,6 +5,63 @@ static LINUX_PROFILE_FIRST_FUTEX_OPERATION: AtomicU64 = AtomicU64::new(u64::MAX)
 static LINUX_PROFILE_FUTEX_FAST_MISS_CPUS: AtomicU64 = AtomicU64::new(0);
 static LINUX_PROFILE_FUTEX_OPERATION_COUNTS: [AtomicU64; 512] = [const { AtomicU64::new(0) }; 512];
 
+/// A process waiting on a futex word while other processes run. A process
+/// other than init waits by restarting the call, so the record outlives the
+/// restarts: a wake from another process finds and marks it, and a timeout
+/// counts from the first attempt.
+#[derive(Clone, Copy)]
+pub(super) struct LinuxProcessFutexWait {
+    pid: u32,
+    key: u64,
+    mask: u32,
+    /// Elapsed nanoseconds when the wait times out, or 0.
+    deadline: u64,
+    woken: bool,
+}
+
+/// Identifies a futex word across processes by the page it is on, so
+/// processes sharing the page (MAP_SHARED, or not yet copied after fork)
+/// meet on it.
+fn linux_futex_key(address: u64) -> u64 {
+    let page = address & !(PAGE_SIZE as u64 - 1);
+    address_space::current_linux_runtime_page(page)
+        .frame
+        .map_or(address | 1 << 63, |frame| {
+            frame.address() + (address - page)
+        })
+}
+
+/// Ends `pid`'s process futex wait, returning it.
+fn take_linux_process_futex_wait(
+    waits: &mut Vec<LinuxProcessFutexWait>,
+    pid: u32,
+) -> Option<LinuxProcessFutexWait> {
+    let index = waits.iter().position(|wait| wait.pid == pid)?;
+    Some(waits.swap_remove(index))
+}
+
+/// Marks up to `limit` processes waiting on `key` woken, dropping records of
+/// processes that are gone.
+fn wake_linux_process_futex_waits(key: u64, mask: u32, limit: u32) -> u32 {
+    let mut waits = LINUX_FUTEX_COORDINATION.lock();
+    waits.retain(|wait| {
+        linux_process::live_process_status(wait.pid).is_some_and(|status| status.state.is_running())
+    });
+    let mut woken = 0;
+    for wait in waits
+        .iter_mut()
+        .filter(|wait| !wait.woken && wait.key == key && wait.mask & mask != 0)
+    {
+        if woken == limit {
+            break;
+        }
+        wait.woken = true;
+        linux_process::set_live_process_waiting(wait.pid, false);
+        woken += 1;
+    }
+    woken
+}
+
 fn profile_linux_futex_operation(operation: u64) {
     if !cfg!(feature = "linux-boot-profile") {
         return;
@@ -289,8 +346,10 @@ pub(super) fn linux_futex_live_return(
         } else {
             u32::MAX
         };
-        let woken =
-            wake_linux_futex_masked(address, mask, u32::try_from(value).unwrap_or(u32::MAX));
+        let limit = u32::try_from(value).unwrap_or(u32::MAX);
+        let threads = wake_linux_futex_masked(address, mask, limit);
+        let woken = threads
+            + wake_linux_process_futex_waits(linux_futex_key(address), mask, limit - threads);
         if woken != 0 {
             X86_RUNTIME
                 .LINUX_FUTEX_EXPLICIT_WAKE_COUNT
@@ -302,6 +361,13 @@ pub(super) fn linux_futex_live_return(
         || command == FUTEX_WAIT_BITSET && bitset == 0
     {
         return LINUX_EINVAL;
+    }
+    // A wait this call began before it restarted ends here: woken by
+    // another process, or kept for its deadline if it waits again.
+    let pid = current_linux_process_pid();
+    let earlier = take_linux_process_futex_wait(&mut LINUX_FUTEX_COORDINATION.lock(), pid);
+    if earlier.is_some_and(|wait| wait.woken) {
+        return 0;
     }
     // musl passes the expected value as a sign-extended int; Linux compares
     // only the 32-bit futex word.
@@ -370,14 +436,41 @@ pub(super) fn linux_futex_live_return(
         if crate::arch::x86_64::smp::linux_runtime_thread_slot().is_some() {
             return 0;
         }
-        // Another process may be the one to change the futex word.
-        return match run_other_linux_processes(output, caller, LINUX_FUTEX_SYSCALL) {
+        // Another process may be the one to change the futex word, or to
+        // wake it.
+        let key = linux_futex_key(address);
+        let deadline = earlier
+            .filter(|wait| wait.key == key)
+            .map_or(deadline, |wait| wait.deadline);
+        if deadline != 0 && linux_elapsed_nanoseconds().is_some_and(|now| now >= deadline) {
+            return LINUX_ETIMEDOUT;
+        }
+        {
+            let mut waits = LINUX_FUTEX_COORDINATION.lock();
+            if waits.try_reserve(1).is_err() {
+                return LINUX_ENOMEM;
+            }
+            waits.push(LinuxProcessFutexWait {
+                pid,
+                key,
+                mask: wait_mask as u32,
+                deadline,
+                woken: false,
+            });
+        }
+        let result = match run_other_linux_processes(output, caller, LINUX_FUTEX_SYSCALL) {
+            // Yielded: the call starts again and finds its wait.
+            Some(LinuxBlockedWait::Return(LINUX_RETURN_TO_KERNEL)) => {
+                return LINUX_RETURN_TO_KERNEL;
+            }
             Some(LinuxBlockedWait::Return(result)) => result,
             // Callers recheck their condition after any wakeup, spurious ones
             // included; that also covers a sibling thread made ready meanwhile,
             // which the next wait switches to.
             Some(LinuxBlockedWait::Recheck) | None => 0,
         };
+        let _ = take_linux_process_futex_wait(&mut LINUX_FUTEX_COORDINATION.lock(), pid);
+        return result;
     }
     if command == FUTEX_WAIT_BITSET
         && current_linux_runtime_cpu_index() == 0
