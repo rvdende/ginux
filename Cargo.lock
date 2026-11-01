@@ -474,6 +474,7 @@ dependencies = [
  "font8x8",
  "ginux-credentials",
  "ginux-image-store",
+ "ginux-keyrings",
  "ginux-memory-areas",
  "ginux-native-abi",
  "ginux-oci",
@@ -486,6 +487,10 @@ dependencies = [
  "miniz_oxide",
  "smoltcp",
 ]
+
+[[package]]
+name = "ginux-keyrings"
+version = "0.1.0"
 
 [[package]]
 name = "ginux-manifest-tool"

@@ -457,7 +457,7 @@ pub(super) fn linux_futex_live_return(
     let Some(current) = current_linux_thread_handle() else {
         return LINUX_ESRCH;
     };
-    let target = ready_linux_thread_handle();
+    let mut target = ready_linux_thread_handle();
     let Some(tls) = linux_thread_context(current) else {
         return LINUX_ESRCH;
     };
@@ -512,13 +512,18 @@ pub(super) fn linux_futex_live_return(
     } else {
         u64::from(u32::MAX)
     };
+    let mut deadline = deadline;
+    // Set once this call has waited at the process level and goes on as a
+    // thread wait: the futex word was compared when the wait began.
+    let mut compared = false;
     if target.is_none() && current_linux_runtime_cpu_index() == 0 {
         if crate::arch::x86_64::smp::linux_runtime_thread_slot().is_some() {
             return 0;
         }
         // Another process may be the one to change the futex word, or to
         // wake it.
-        let (key, deadline) = earlier.map_or((linux_futex_key(address), deadline), |wait| {
+        let key;
+        (key, deadline) = earlier.map_or((linux_futex_key(address), deadline), |wait| {
             (wait.key, wait.deadline)
         });
         if deadline != 0 && linux_elapsed_nanoseconds().is_some_and(|now| now >= deadline) {
@@ -544,11 +549,10 @@ pub(super) fn linux_futex_live_return(
                 Some(LinuxBlockedWait::Return(LINUX_RETURN_TO_KERNEL)) => {
                     return LINUX_RETURN_TO_KERNEL;
                 }
-                Some(LinuxBlockedWait::Return(result)) => break result,
-                // Nothing else could run, or a sibling thread was made ready,
-                // which the next wait switches to: a spurious wakeup, which
-                // callers allow for by checking their condition again.
-                None => break 0,
+                Some(LinuxBlockedWait::Return(result)) => break Some(result),
+                // Nothing else could run, or a sibling thread was made ready
+                // (its sleep ended while this process waited).
+                None => break None,
                 // Waited in the call (parked): done when FUTEX_WAKE marked the
                 // wait or its deadline passed, else wait again.
                 Some(LinuxBlockedWait::Recheck) => {
@@ -557,18 +561,28 @@ pub(super) fn linux_futex_live_return(
                         .iter()
                         .any(|wait| wait.pid == pid && wait.woken);
                     if woken {
-                        break 0;
+                        break Some(0);
                     }
                     if deadline != 0
                         && linux_elapsed_nanoseconds().is_some_and(|now| now >= deadline)
                     {
-                        break LINUX_ETIMEDOUT;
+                        break Some(LINUX_ETIMEDOUT);
                     }
                 }
             }
         };
-        let _ = take_linux_process_futex_wait(&mut LINUX_FUTEX_COORDINATION.lock(), pid);
-        return result;
+        let wait = take_linux_process_futex_wait(&mut LINUX_FUTEX_COORDINATION.lock(), pid);
+        if let Some(result) = result {
+            return result;
+        }
+        // A sibling thread is ready: this thread goes on waiting as a
+        // thread wait while it runs, unless the wait already ended. With
+        // nothing to run, it wakes spuriously, which callers allow for.
+        target = ready_linux_thread_handle();
+        if wait.is_some_and(|wait| wait.woken) || target.is_none() {
+            return 0;
+        }
+        compared = true;
     }
     if command == FUTEX_WAIT_BITSET
         && current_linux_runtime_cpu_index() == 0
@@ -582,11 +596,13 @@ pub(super) fn linux_futex_live_return(
         return 0;
     }
     let coordination = LINUX_FUTEX_COORDINATION.lock();
-    if !copy_from_linux_user(address, &mut bytes) {
-        return LINUX_EFAULT;
-    }
-    if u32::from_ne_bytes(bytes) != value as u32 {
-        return LINUX_EAGAIN;
+    if !compared {
+        if !copy_from_linux_user(address, &mut bytes) {
+            return LINUX_EFAULT;
+        }
+        if u32::from_ne_bytes(bytes) != value as u32 {
+            return LINUX_EAGAIN;
+        }
     }
     if !save_linux_thread_return_context(current, caller)
         || !block_current_linux_thread(LINUX_THREAD_WAIT_FUTEX, address, wait_mask, deadline)

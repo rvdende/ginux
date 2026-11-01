@@ -15,6 +15,7 @@ path = "src/lib.rs"
 
 [dependencies]
 ginux-credentials = { path = "../crates/credentials" }
+ginux-keyrings = { path = "../crates/keyrings" }
 ginux-image-store = { path = "../crates/image-store" }
 ginux-memory-areas = { path = "../crates/memory-areas" }
 ginux-oci = { path = "../crates/oci" }

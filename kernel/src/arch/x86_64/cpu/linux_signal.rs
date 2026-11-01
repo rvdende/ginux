@@ -1709,7 +1709,8 @@ pub(super) fn linux_deliver_signal_to_blocked_wait(
         || X86_RUNTIME.LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) != LINUX_THREAD_BLOCKED
         || !matches!(
             wait_kind,
-            LINUX_THREAD_WAIT_SIGNAL
+            LINUX_THREAD_WAIT_FUTEX
+                | LINUX_THREAD_WAIT_SIGNAL
                 | LINUX_THREAD_WAIT_SLEEP
                 | LINUX_THREAD_WAIT_POLL
                 | LINUX_THREAD_WAIT_EPOLL

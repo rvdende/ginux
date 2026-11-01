@@ -634,18 +634,25 @@ fn linux_sleep_live_return(
     let Some(current) = current_linux_thread_handle() else {
         return LINUX_ESRCH;
     };
-    let Some(target) = ready_linux_thread_handle() else {
+    let target = 'target: {
+        if let Some(target) = ready_linux_thread_handle() {
+            break 'target target;
+        }
         // With no runnable thread here, other processes (such as a child this
         // one waits for) get the CPU; failing that, sleep in the kernel until
         // the deadline. Device/timer interrupts still wake the CPU and are
-        // handled normally between checks.
+        // handled normally between checks. Once a sibling thread is ready,
+        // this thread sleeps as a thread wait while it runs.
         while linux_elapsed_nanoseconds().is_some_and(|now| now < deadline) {
             if let Some(result) =
                 linux_timed_wait_run_others(output, caller, number, Some(deadline))
             {
                 return result;
             }
-            unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) };
+            if let Some(target) = ready_linux_thread_handle() {
+                break 'target target;
+            }
+            linux_wait_for_interrupt();
         }
         return 0;
     };

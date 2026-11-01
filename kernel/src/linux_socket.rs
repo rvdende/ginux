@@ -225,6 +225,9 @@ struct Slot {
     /// The other end of a local stream: itself for a loopback socket, the
     /// listener for a local TCP connection not yet accepted.
     peer: Option<SlotId>,
+    /// A local stream's peer closed: it reads end-of-file, where a socket
+    /// that never had a peer cannot read at all (EINVAL).
+    peer_closed: bool,
     read_shutdown: bool,
     write_shutdown: bool,
     options: Options,
@@ -257,6 +260,7 @@ impl Slot {
             backlog: 0,
             pending: VecDeque::new(),
             peer: None,
+            peer_closed: false,
             read_shutdown: false,
             write_shutdown: false,
             options: Options::default(),
@@ -757,6 +761,7 @@ impl Sockets {
             for other in self.slots.iter_mut().flatten() {
                 if other.peer == Some(id) {
                     other.peer = None;
+                    other.peer_closed = true;
                 }
                 other.pending.retain(|pending| *pending != id);
             }
@@ -1323,6 +1328,18 @@ impl Sockets {
     }
 
     /// A pipe's capacity (F_GETPIPE_SZ).
+    /// The bytes a write to the pipe end `id` can still queue: the room
+    /// left in its reader's queue (its own, for a FIFO's loopback slot).
+    fn pipe_room(&self, id: SlotId) -> Option<usize> {
+        let reader = self.slot(self.slot(id)?.peer?)?;
+        let capacity = if reader.local_capacity == 0 {
+            LOCAL_QUEUE_CAPACITY
+        } else {
+            reader.local_capacity as usize
+        };
+        Some(capacity.saturating_sub(reader.local.len()))
+    }
+
     fn local_capacity(&self, id: SlotId) -> Result<usize, Error> {
         self.unix(id)
             .map(|state| {
@@ -1907,6 +1924,36 @@ pub(crate) fn local_capacity(id: SlotId) -> Result<usize, Error> {
 /// Sets a pipe's capacity (F_SETPIPE_SZ); see `Sockets::set_local_capacity`.
 pub(crate) fn set_local_capacity(id: SlotId, requested: usize) -> Result<usize, Error> {
     SOCKETS.lock().set_local_capacity(id, requested)
+}
+
+/// Whether a page still fits in the pipe that `id` writes to: Linux reports
+/// a pipe writable (POLLOUT) while one of its buffer slots is free.
+pub(crate) fn pipe_writable(id: SlotId) -> bool {
+    SOCKETS
+        .lock()
+        .pipe_room(id)
+        .is_some_and(|room| room >= LOCAL_ATOMIC_WRITE)
+}
+
+/// The bytes a write to the pipe end `id` can still queue, or `None` once
+/// its reader is gone.
+pub(crate) fn pipe_room(id: SlotId) -> Option<usize> {
+    SOCKETS.lock().pipe_room(id)
+}
+
+/// Whether `id` is a Unix stream socket that was never connected, which
+/// Linux refuses to read from (EINVAL).
+pub(crate) fn unix_stream_unconnected(id: SlotId) -> bool {
+    SOCKETS.lock().unix(id).is_some_and(|state| {
+        state.unix_type == 1 && !state.listening && state.peer.is_none() && !state.peer_closed
+    })
+}
+
+/// Whether `first` and `second` are ends of the same pipe.
+pub(crate) fn same_pipe(first: SlotId, second: SlotId) -> bool {
+    let sockets = SOCKETS.lock();
+    let peer = |id| sockets.slot(id).and_then(|state| state.peer);
+    first == second || peer(first) == Some(second) || peer(second) == Some(first)
 }
 
 /// The bytes in a pipe, read from either end.

@@ -685,7 +685,8 @@ pub(super) fn yield_current_linux_process(mut caller: LinuxUserContext, result: 
 /// Waits in poll(2) for a process with no other runnable thread: other
 /// processes run until a descriptor is ready or the deadline passes, and
 /// with nothing else to run the CPU halts until the next interrupt (or spins,
-/// in the boot probe).
+/// in the boot probe). Once a sibling thread is ready, the wait stops here
+/// with that thread and the wait's deadline, to go on as a thread wait.
 fn linux_poll_run_others_live_return(
     output: *mut LinuxSyscallFrame,
     caller: LinuxUserContext,
@@ -693,7 +694,7 @@ fn linux_poll_run_others_live_return(
     active: &mut [u8],
     duration: Option<u64>,
     number: u64,
-) -> u64 {
+) -> Result<u64, (LinuxThreadHandle, Option<u64>)> {
     let deadline = take_linux_restart_deadline(caller.rip).or_else(|| {
         duration.and_then(|duration| {
             linux_elapsed_nanoseconds().and_then(|now| now.checked_add(duration))
@@ -711,17 +712,22 @@ fn linux_poll_run_others_live_return(
         let expired = deadline
             .is_some_and(|deadline| linux_elapsed_nanoseconds().is_some_and(|now| now >= deadline));
         if ready != 0 || expired {
-            return if active.is_empty() || copy_to_linux_user(address, active) {
-                ready
-            } else {
-                LINUX_EFAULT
-            };
+            return Ok(
+                if active.is_empty() || copy_to_linux_user(address, active) {
+                    ready
+                } else {
+                    LINUX_EFAULT
+                },
+            );
         }
         if let Some(result) = linux_timed_wait_run_others(output, caller, number, deadline) {
-            return result;
+            return Ok(result);
+        }
+        if let Some(target) = ready_linux_thread_handle() {
+            return Err((target, deadline));
         }
         if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
-            unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) };
+            linux_wait_for_interrupt();
         } else {
             core::hint::spin_loop();
         }
@@ -856,7 +862,13 @@ pub(super) fn linux_poll_wait_live_return(
     let Some(current) = current_linux_thread_handle() else {
         return LINUX_ESRCH;
     };
-    let Some(target) = ready_linux_thread_handle() else {
+    // The deadline of a wait that began below, if it goes on as a thread
+    // wait because a sibling thread became ready meanwhile.
+    let mut continued_deadline = None;
+    let target = 'target: {
+        if let Some(target) = ready_linux_thread_handle() {
+            break 'target target;
+        }
         if waits_for_parent_unix_peer
             && X86_RUNTIME
                 .LINUX_PROCESS_SCHEDULER_NESTING
@@ -865,6 +877,25 @@ pub(super) fn linux_poll_wait_live_return(
             && yield_current_linux_process(caller, 0)
         {
             return LINUX_RETURN_TO_KERNEL;
+        }
+        // pause waits in the call, as a timed wait with no deadline, until
+        // a signal ends it: resumed for anything else, it waits again, as a
+        // thread wait once a sibling thread is ready.
+        if wait_kind == LINUX_THREAD_WAIT_PAUSE
+            && X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
+            && current_linux_process_pid() != 1
+        {
+            loop {
+                if let Some(result) =
+                    linux_timed_wait_run_others(output, caller, LINUX_PAUSE_SYSCALL, None)
+                {
+                    return result;
+                }
+                if let Some(target) = ready_linux_thread_handle() {
+                    break 'target target;
+                }
+                linux_wait_for_interrupt();
+            }
         }
         if matches!(
             wait_kind,
@@ -878,21 +909,29 @@ pub(super) fn linux_poll_wait_live_return(
         // deadline, instead of leaking the scheduler's lack of a target as
         // ENOSYS to userspace.
         if matches!(wait_kind, LINUX_THREAD_WAIT_POLL | LINUX_THREAD_WAIT_PPOLL) {
-            return linux_poll_run_others_live_return(
+            match linux_poll_run_others_live_return(
                 output,
                 caller,
                 address,
                 active,
                 duration,
                 poll_syscall,
-            );
+            ) {
+                Ok(result) => return result,
+                Err((target, deadline)) => {
+                    continued_deadline = Some(deadline.unwrap_or(0));
+                    break 'target target;
+                }
+            }
         }
         return LINUX_ENOSYS;
     };
     let Some(tls) = linux_thread_context(current) else {
         return LINUX_ESRCH;
     };
-    let deadline = if let Some(duration) = duration {
+    let deadline = if let Some(deadline) = continued_deadline {
+        deadline
+    } else if let Some(duration) = duration {
         let Some(deadline) = linux_elapsed_nanoseconds().and_then(|now| now.checked_add(duration))
         else {
             return LINUX_EINVAL;

@@ -847,6 +847,8 @@ pub(super) const LINUX_CLOSE_RANGE_UNSHARE: u64 = 1 << 1;
 pub(super) const LINUX_O_CLOEXEC: u64 = 0x80000;
 pub(super) const LINUX_O_NOCTTY: u64 = 0x100;
 pub(super) const LINUX_O_DIRECTORY: u64 = 0x10000;
+/// O_DIRECT; on a pipe from pipe2(2), packet mode.
+pub(super) const LINUX_O_DIRECT: u64 = 0x4000;
 pub(super) const LINUX_O_CREAT: u64 = 0x40;
 pub(super) const LINUX_O_EXCL: u64 = 0x80;
 pub(super) const LINUX_O_TRUNC: u64 = 0x200;

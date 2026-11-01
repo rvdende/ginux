@@ -5,6 +5,7 @@ members = [
     "crates/command",
     "crates/credentials",
     "crates/image-store",
+    "crates/keyrings",
     "crates/memory-areas",
     "crates/native-abi",
     "crates/oci",

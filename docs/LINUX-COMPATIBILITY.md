@@ -246,7 +246,24 @@ Pipe and zero-copy boundaries convert `pipe2`, `splice`, `tee`, `vmsplice`, and
 `copy_file_range` descriptors and flag words from their Linux 32-bit types.
 Boot verification creates a close-on-exec pipe and exercises zero-length
 `tee`/`vmsplice` operations with dirty upper register bits before closing both
-ends.
+ends. `splice` moves data between two pipes, from a pipe into a socket or
+regular file, and from a socket or regular file into a pipe, with an
+explicit offset on the file side or its file position; `tee` copies between
+two different pipes; `vmsplice` writes a pipe opened for writing or reads one
+opened only for reading. All three check access before file kinds (EBADF,
+then EINVAL or ESPIPE as Linux orders them), and wait as a blocking pipe read
+or write does unless `SPLICE_F_NONBLOCK` or `O_NONBLOCK` makes them fail
+with EAGAIN; filling a pipe with no reader raises SIGPIPE. Splicing from a
+directory or an unconnected Unix socket is EINVAL.
+Keys (`add_key`, `request_key`, `keyctl`) live in the host-tested
+`ginux-keyrings` crate, one set per domain: "user", "logon" and "keyring"
+keys with owners, permission masks, possession, quotas, timeouts,
+revocation and invalidation; the thread, process, session, user and
+user-session keyrings, shared at fork and thread creation and dropped at
+exec; links, moves, restrictions, searches and negative keys from
+`request_key` with callout data. There are no upcalls, so instantiation is
+EPERM, and Diffie-Hellman, public-key and persistent-keyring operations are
+EOPNOTSUPP. `/proc/keys` and the key quota sysctls are not served yet.
 Socket descriptor lookup and descriptor-local status flags now convert the
 Linux `int` descriptor from its low 32 register bits for the complete socket
 operation family. The live system-init TCP/AF_UNIX lifecycle includes dirty

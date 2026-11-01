@@ -4930,6 +4930,12 @@ fn execute_deferred_live_fork() -> bool {
         return false;
     }
     crate::linux_areas::fork(linux_execution_instance(), parent_pid, child.pid);
+    // The child shares the forking thread's session keyring; what an exited
+    // process left under a reused id goes first.
+    let _ = linux_with_keys(|keys, caller| {
+        keys.exit_process(child.pid);
+        keys.fork(caller, child.pid)
+    });
     if !linux_assign_process_cgroup(child.pid, cgroup_generation) {
         return false;
     }
@@ -12312,6 +12318,9 @@ fn linux_clone_thread_request(
             };
         }
     };
+    // The new thread shares its creator's session keyring; a failure here
+    // does not fail the clone, as in Linux.
+    let _ = linux_with_keys(|keys, caller| keys.spawn_thread(caller, child.tid));
     let dispatch_index = X86_RUNTIME
         .LINUX_CLONE_DISPATCH_COUNT
         .fetch_add(1, Ordering::SeqCst);
@@ -12732,6 +12741,15 @@ fn take_linux_child_yield(pid: u32) -> bool {
         .LINUX_PROCESS_CHILD_YIELD_PID
         .store(0, Ordering::SeqCst);
     true
+}
+
+/// Lets interrupts in and halts until the next one (a timer tick or a
+/// device), then turns them off again.
+pub(super) fn linux_wait_for_interrupt() {
+    // SAFETY: interrupts are enabled only around the halt; their handlers
+    // save and restore the state they touch, and `cli` ends the window
+    // before this returns, so the caller's interrupt-off invariants hold.
+    unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) };
 }
 
 fn current_linux_user_namespace() -> Option<linux_user::UserNamespaceHandle> {
@@ -14274,7 +14292,7 @@ fn run_linux_runtime_loop() -> bool {
         {
             // SAFETY: interrupts wake the CPU for the timer and devices; the
             // kernel-entry lock serializes the work they start.
-            unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) };
+            linux_wait_for_interrupt();
         }
         if !resume_parked_linux_process(1) {
             return false;
@@ -14963,6 +14981,39 @@ fn linux_current_process_record(pid: u32) -> Option<&'static mut LinuxProcessRec
 
 fn linux_process_runtime_state(pid: u32) -> Option<&'static mut LinuxProcessRuntimeState> {
     linux_current_process_record(pid).map(|record| &mut record.runtime)
+}
+
+/// How many threads process `pid`, which is not the current process, has:
+/// those its saved thread table holds, or one without a table.
+fn linux_process_thread_count(pid: u32) -> usize {
+    let saved = linux_process_runtime_state(pid).is_some_and(|state| state.valid);
+    linux_process_thread_runtime_state(pid)
+        .filter(|_| saved)
+        .map_or(1, |threads| {
+            threads
+                .iter()
+                .filter(|thread| thread.state != LINUX_THREAD_FREE)
+                .count()
+                .max(1)
+        })
+}
+
+/// Whether `pid`'s main thread is blocked in a wait. Linux's
+/// `/proc/PID/stat` shows the thread-group leader's state, so a process
+/// whose other threads run still reads as sleeping there.
+fn linux_leader_thread_blocked(pid: u32) -> bool {
+    if pid == current_linux_process_pid() {
+        return linux_thread_handle_by_tid(u64::from(pid)).is_some_and(|leader| {
+            X86_RUNTIME.LINUX_THREAD_STATES[usize::from(leader.slot)].load(Ordering::SeqCst)
+                == LINUX_THREAD_BLOCKED
+        });
+    }
+    linux_process_runtime_state(pid).is_some_and(|state| state.valid)
+        && linux_process_thread_runtime_state(pid).is_some_and(|threads| {
+            threads
+                .iter()
+                .any(|thread| thread.tid == pid && thread.state == LINUX_THREAD_BLOCKED)
+        })
 }
 
 fn linux_process_thread_runtime_state(
@@ -18937,12 +18988,30 @@ fn verify_linux_fadvise64_syscall() -> bool {
     } else {
         [LINUX_AUX_DESCRIPTOR_LIMIT; 2]
     };
+    // Neither call here waits, so neither needs a caller to return to.
+    let no_caller = LinuxUserContext {
+        registers: LinuxSyscallFrame::ZERO,
+        rip: 0,
+        rsp: 0,
+        rflags: 0,
+        rax: 0,
+        fs_base: 0,
+    };
     let pipe_rejected = pipe[0] < LINUX_AUX_DESCRIPTOR_LIMIT
         && pipe[1] < LINUX_AUX_DESCRIPTOR_LIMIT
         && linux_descriptor_close_on_exec(pipe[0])
         && linux_descriptor_close_on_exec(pipe[1])
-        && linux_vmsplice((1_u64 << 32) | pipe[1], 0, 0, 1_u64 << 32) == 0
+        && linux_vmsplice_live_return(
+            core::ptr::null_mut(),
+            no_caller,
+            (1_u64 << 32) | pipe[1],
+            0,
+            0,
+            (1_u64 << 32) | LINUX_SPLICE_F_NONBLOCK,
+        ) == 0
         && linux_tee(
+            core::ptr::null_mut(),
+            no_caller,
             (1_u64 << 32) | pipe[0],
             (1_u64 << 32) | pipe[1],
             0,
@@ -19557,7 +19626,7 @@ fn verify_linux_keyring_syscalls() -> bool {
     } else {
         LINUX_EINVAL
     };
-    let added = (100..i32::MAX as u64).contains(&serial)
+    let added = (1..i32::MAX as u64).contains(&serial)
         && linux_request_key(mapping, mapping + 64, 0, 0) == serial;
     let read = added && linux_keyctl(11, serial, mapping + 256, 16, 0) == 5 && {
         let mut payload = [0_u8; 5];
@@ -19573,7 +19642,7 @@ fn verify_linux_keyring_syscalls() -> bool {
     let described = updated && linux_keyctl(6, serial, mapping + 320, 64, 0) == 28 && {
         let mut description = [0_u8; 28];
         copy_from_linux_user(mapping + 320, &mut description)
-            && description == *b"user;0;0;3f3f0000;ginux-key\0"
+            && description == *b"user;0;0;3f010000;ginux-key\0"
     };
     let revoked = described
         && linux_keyctl(3, serial, 0, 0, 0) == 0
@@ -19583,11 +19652,11 @@ fn verify_linux_keyring_syscalls() -> bool {
             mapping,
             mapping + 64,
             mapping + 128,
-            crate::linux_keyring::PAYLOAD_CAPACITY as u64 + 1,
+            ginux_keyrings::PAYLOAD_LIMIT as u64 + 1,
             (-2_i64) as u64,
-        ) == LINUX_E2BIG
+        ) == LINUX_EINVAL
         && linux_request_key(mapping, mapping + 64, 0, 0) == LINUX_ENOKEY;
-    let cleared = crate::linux_keyring::clear();
+    let cleared = crate::linux_keyring::teardown();
     let unmapped = linux_runtime_munmap(mapping, PAGE_SIZE as u64) == 0;
     rejected && cleared && unmapped
 }
@@ -21089,7 +21158,7 @@ fn verify_linux_event_argument_widths() -> bool {
                 maximum: UPPER_REGISTER_BITS | 1,
             },
             Some(0),
-            LINUX_THREAD_WAIT_EPOLL,
+            LINUX_EPOLL_WAIT_SYSCALL,
             None,
         ) == 1
         && linux_epoll_ctl(
@@ -25679,6 +25748,12 @@ fn linux_rootfs_execve_source(
     release_linux_process_shared_mappings(current_linux_process_pid());
     linux_record_exec_image(&plan, path);
     linux_apply_exec_credentials(exec_file);
+    // The new program starts without thread and process keyrings.
+    let (pid, tid) = (current_linux_process_pid(), current_linux_tid());
+    let _ = linux_with_keys(|keys, _| {
+        keys.exec(pid, tid.unwrap_or(pid));
+        Ok(())
+    });
     X86_RUNTIME
         .ELF_PROBE_MMAP_NEXT
         .store(LINUX_RUNTIME_DYNAMIC_MMAP_BASE, Ordering::SeqCst);
@@ -32058,7 +32133,32 @@ fn linux_descriptor_read(descriptor: u64, address: u64, count: u64) -> u64 {
         if device & LINUX_DEVICE_PIPE != 0 && device & 3 & LINUX_DESCRIPTOR_INPUT == 0 {
             return LINUX_EBADF;
         }
-        return linux_socket_recvfrom(None, descriptor, address, count, 0, 0, 0);
+        let first = linux_socket_recvfrom(None, descriptor, address, count, 0, 0, 0);
+        let packets = linux_socket_flags(descriptor)
+            .is_some_and(|flags| u64::from(flags) & LINUX_O_DIRECT != 0);
+        if device & LINUX_DEVICE_PIPE == 0 || packets {
+            return first;
+        }
+        // A pipe read returns everything queued up to `count`, as Linux's
+        // does; only the first part may wait.
+        const MSG_DONTWAIT: u64 = 0x40;
+        let mut total = first;
+        while total >= PAGE_SIZE as u64 && total < count && total.is_multiple_of(PAGE_SIZE as u64) {
+            let more = linux_socket_recvfrom(
+                None,
+                descriptor,
+                address + total,
+                count - total,
+                MSG_DONTWAIT,
+                0,
+                0,
+            );
+            if more == 0 || more >= LINUX_RETURN_TO_KERNEL {
+                break;
+            }
+            total += more;
+        }
+        return total;
     }
     if let Some(result) = linux_eventfd_read(descriptor, address, count) {
         return result;
@@ -32317,6 +32417,7 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
             return LINUX_ENOENT;
         };
         let state_letter = match status.state {
+            linux_process::LiveProcessState::Running if linux_leader_thread_blocked(pid) => b'S',
             linux_process::LiveProcessState::Running => b'R',
             linux_process::LiveProcessState::Sleeping => b'S',
             linux_process::LiveProcessState::Stopped => b'T',
@@ -32936,11 +33037,13 @@ fn linux_sendfile(output: u64, input: u64, offset_pointer: u64, count: u64) -> u
     if output_socket.is_none() && !output_is_regular {
         return LINUX_EINVAL;
     }
-    if output_is_regular && linux_descriptors_same_file(input, output, input_state, output_state) {
-        return LINUX_EINVAL;
-    }
+    // Linux checks that the output is open for writing before anything else
+    // about it.
     if output_is_regular && !matches!(output_state & 3, LINUX_DESCRIPTOR_OUTPUT | 3) {
         return LINUX_EBADF;
+    }
+    if output_is_regular && linux_descriptors_same_file(input, output, input_state, output_state) {
+        return LINUX_EINVAL;
     }
     if output_is_regular
         && linux_socket_flags(output).is_some_and(|flags| flags & LINUX_O_APPEND as u32 != 0)
@@ -34564,88 +34667,473 @@ fn linux_open_named_fifo(flags: u64, handle: crate::linux_overlay::Handle) -> u6
     descriptor
 }
 
-fn linux_vmsplice(descriptor: u64, vectors: u64, count: u64, flags: u64) -> u64 {
-    const SPLICE_F_MORE: u64 = 4;
-    const SPLICE_F_GIFT: u64 = 8;
+/// vmsplice(2): writes the vectors into a pipe opened for writing, or reads
+/// a pipe opened only for reading into them; SPLICE_F_NONBLOCK makes one
+/// attempt (EAGAIN), and otherwise the call waits as writev or readv does.
+fn linux_vmsplice_live_return(
+    output: *mut LinuxSyscallFrame,
+    caller: LinuxUserContext,
+    descriptor: u64,
+    vectors: u64,
+    count: u64,
+    flags: u64,
+) -> u64 {
     let descriptor = u64::from(descriptor as u32);
     let flags = u64::from(flags as u32);
-    if flags & !(SPLICE_F_MORE | SPLICE_F_GIFT) != 0 {
+    if flags & !LINUX_SPLICE_FLAGS != 0 {
         return LINUX_EINVAL;
     }
-    if !linux_pipe_write_descriptor(descriptor) {
+    let writes = linux_pipe_write_descriptor(descriptor);
+    if !writes && !linux_pipe_read_descriptor(descriptor) {
         return LINUX_EBADF;
     }
-    linux_descriptor_writev(descriptor, vectors, count)
+    if flags & LINUX_SPLICE_F_NONBLOCK == 0 {
+        return if writes {
+            linux_descriptor_writev_live_return(output, caller, descriptor, vectors, count)
+        } else {
+            linux_descriptor_readv_live_return(output, caller, descriptor, vectors, count)
+        };
+    }
+    X86_RUNTIME
+        .LINUX_SOCKET_SINGLE_ATTEMPT
+        .store(true, Ordering::SeqCst);
+    let result = if writes {
+        linux_descriptor_writev(descriptor, vectors, count)
+    } else {
+        linux_descriptor_readv(descriptor, vectors, count)
+    };
+    X86_RUNTIME
+        .LINUX_SOCKET_SINGLE_ATTEMPT
+        .store(false, Ordering::SeqCst);
+    if result == LINUX_EPIPE && writes {
+        linux_broken_pipe_live_return(output, caller)
+    } else {
+        result
+    }
 }
 
+const LINUX_SPLICE_F_MOVE: u64 = 1;
+const LINUX_SPLICE_F_NONBLOCK: u64 = 2;
+const LINUX_SPLICE_F_MORE: u64 = 4;
+const LINUX_SPLICE_F_GIFT: u64 = 8;
+const LINUX_SPLICE_FLAGS: u64 =
+    LINUX_SPLICE_F_MOVE | LINUX_SPLICE_F_NONBLOCK | LINUX_SPLICE_F_MORE | LINUX_SPLICE_F_GIFT;
+
+/// What one side of splice(2) or tee(2) is; only these move data.
+#[derive(Clone, Copy)]
+enum LinuxSpliceEnd {
+    Pipe(crate::linux_socket::SlotId),
+    Socket(crate::linux_socket::SlotId),
+    File,
+    Other,
+}
+
+impl LinuxSpliceEnd {
+    fn of(descriptor: u64) -> Self {
+        let state = linux_device_descriptor(descriptor);
+        match linux_socket_slot(descriptor) {
+            Some(slot) if state & LINUX_DEVICE_PIPE != 0 => Self::Pipe(slot),
+            Some(slot) => Self::Socket(slot),
+            None if linux_overlay_descriptor_handle(descriptor).is_some()
+                || linux_rootfs_descriptor(descriptor) != 0
+                || linux_tmp_descriptor_handle(descriptor, state).is_some() =>
+            {
+                Self::File
+            }
+            None => Self::Other,
+        }
+    }
+}
+
+/// How a splice(2) or tee(2) step ended: with the call's result, or unable
+/// to start because the pipe or socket it reads is empty, or the one it
+/// fills is full.
+enum LinuxSpliceStep {
+    Done(u64),
+    Blocked,
+}
+
+/// A step that cannot go on: blocked if nothing moved yet, and otherwise
+/// done with what moved.
+fn linux_splice_blocked(moved: usize) -> LinuxSpliceStep {
+    if moved == 0 {
+        LinuxSpliceStep::Blocked
+    } else {
+        LinuxSpliceStep::Done(moved as u64)
+    }
+}
+
+/// A step that ended after `moved` bytes, with `failure` if it stopped on an
+/// error: the bytes already moved are the result, as with a short write.
+fn linux_splice_moved(moved: usize, failure: Option<u64>) -> LinuxSpliceStep {
+    LinuxSpliceStep::Done(match failure {
+        Some(error) if moved == 0 => error,
+        _ => moved as u64,
+    })
+}
+
+/// The system call's result for `step`. A blocked call fails with EAGAIN
+/// when nonblocking; otherwise the rest of the domain runs and the call
+/// starts again, as a blocking pipe read does. Filling a pipe or socket with
+/// no reader raises SIGPIPE.
+fn linux_splice_live_return(
+    output: *mut LinuxSyscallFrame,
+    caller: LinuxUserContext,
+    number: u64,
+    nonblocking: bool,
+    step: LinuxSpliceStep,
+) -> u64 {
+    match step {
+        LinuxSpliceStep::Done(LINUX_EPIPE) => linux_broken_pipe_live_return(output, caller),
+        LinuxSpliceStep::Done(result) => result,
+        LinuxSpliceStep::Blocked
+            if nonblocking
+                || !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::Acquire)
+                || current_linux_runtime_cpu_index() != 0 =>
+        {
+            LINUX_EAGAIN
+        }
+        LinuxSpliceStep::Blocked => linux_retry_later_live_return(output, caller, number),
+    }
+}
+
+/// splice(2) and tee(2) need `source` open for reading and `sink` for
+/// writing (EBADF), checked before what kind of files they are.
+fn linux_splice_access(source: u64, sink: u64) -> Result<(), u64> {
+    if !linux_descriptor_open(source)
+        || !linux_descriptor_open(sink)
+        || !matches!(
+            linux_device_descriptor(source) & 3,
+            LINUX_DESCRIPTOR_INPUT | 3
+        )
+        || !matches!(
+            linux_device_descriptor(sink) & 3,
+            LINUX_DESCRIPTOR_OUTPUT | 3
+        )
+    {
+        return Err(LINUX_EBADF);
+    }
+    Ok(())
+}
+
+/// Whether a splice(2) or tee(2) between `ends` waits: not with
+/// SPLICE_F_NONBLOCK or a pipe or socket end opened O_NONBLOCK.
+fn linux_splice_nonblocking(flags: u64, ends: [(u64, LinuxSpliceEnd); 2]) -> bool {
+    flags & LINUX_SPLICE_F_NONBLOCK != 0
+        || ends.iter().any(|(descriptor, end)| {
+            matches!(end, LinuxSpliceEnd::Pipe(_) | LinuxSpliceEnd::Socket(_))
+                && linux_socket_nonblocking(*descriptor)
+        })
+}
+
+/// splice(2): moves up to `length` bytes between `source` and `sink`, one
+/// of which is a pipe; the other may be a pipe, a socket or a regular file,
+/// whose offset is the pointed-to value if given (left as it was in the
+/// file) or else the file position.
 fn linux_splice(
-    input: u64,
-    input_offset: u64,
-    output: u64,
-    output_offset: u64,
+    output: *mut LinuxSyscallFrame,
+    caller: LinuxUserContext,
+    (source, source_offset): (u64, u64),
+    (sink, sink_offset): (u64, u64),
     length: u64,
     flags: u64,
 ) -> u64 {
-    let input = u64::from(input as u32);
-    let output = u64::from(output as u32);
+    let source = u64::from(source as u32);
+    let sink = u64::from(sink as u32);
     let flags = u64::from(flags as u32);
-    if input_offset != 0 || output_offset != 0 {
-        return LINUX_ESPIPE;
+    if length == 0 {
+        return 0;
     }
-    linux_splice_pipes(input, output, length, flags, true)
-}
-
-fn linux_tee(input: u64, output: u64, length: u64, flags: u64) -> u64 {
-    linux_splice_pipes(
-        u64::from(input as u32),
-        u64::from(output as u32),
-        length,
-        u64::from(flags as u32),
-        false,
-    )
-}
-
-fn linux_splice_pipes(input: u64, output: u64, length: u64, flags: u64, consume: bool) -> u64 {
-    const SPLICE_F_MOVE: u64 = 1;
-    const SPLICE_F_NONBLOCK: u64 = 2;
-    const SPLICE_F_MORE: u64 = 4;
-    if flags & !(SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE) != 0 {
+    if flags & !LINUX_SPLICE_FLAGS != 0 {
         return LINUX_EINVAL;
     }
-    if input == output || !linux_pipe_read_descriptor(input) || !linux_pipe_write_descriptor(output)
-    {
-        return LINUX_EBADF;
+    if let Err(error) = linux_splice_access(source, sink) {
+        return error;
+    }
+    let (from, to) = (LinuxSpliceEnd::of(source), LinuxSpliceEnd::of(sink));
+    let nonblocking = linux_splice_nonblocking(flags, [(source, from), (sink, to)]);
+    let step = match (from, to) {
+        (LinuxSpliceEnd::Pipe(from), LinuxSpliceEnd::Pipe(to)) => {
+            if source_offset != 0 || sink_offset != 0 {
+                return LINUX_ESPIPE;
+            }
+            if crate::linux_socket::same_pipe(from, to) {
+                return LINUX_EINVAL;
+            }
+            linux_splice_between_pipes(from, to, length, true)
+        }
+        (LinuxSpliceEnd::Pipe(from), to) => {
+            if source_offset != 0 {
+                return LINUX_ESPIPE;
+            }
+            linux_splice_from_pipe(from, (sink, sink_offset), to, length)
+        }
+        (from, LinuxSpliceEnd::Pipe(to)) => {
+            if sink_offset != 0 {
+                return LINUX_ESPIPE;
+            }
+            linux_splice_to_pipe((source, source_offset), from, to, length)
+        }
+        _ => return LINUX_EINVAL,
+    };
+    linux_splice_live_return(output, caller, LINUX_SPLICE_SYSCALL, nonblocking, step)
+}
+
+/// tee(2): copies up to `length` bytes from one pipe to another without
+/// consuming them.
+fn linux_tee(
+    output: *mut LinuxSyscallFrame,
+    caller: LinuxUserContext,
+    source: u64,
+    sink: u64,
+    length: u64,
+    flags: u64,
+) -> u64 {
+    let source = u64::from(source as u32);
+    let sink = u64::from(sink as u32);
+    let flags = u64::from(flags as u32);
+    if flags & !LINUX_SPLICE_FLAGS != 0 {
+        return LINUX_EINVAL;
     }
     if length == 0 {
         return 0;
     }
-    let Some(input_slot) = linux_socket_slot(input) else {
-        return LINUX_ENOSYS;
-    };
-    let Some(output_slot) = linux_socket_slot(output) else {
-        return LINUX_ENOSYS;
-    };
-    let requested = usize::try_from(length).unwrap_or(usize::MAX).min(PAGE_SIZE);
-    let mut bytes = [0_u8; PAGE_SIZE];
-    let available = match crate::linux_socket::peek_local(input_slot, &mut bytes[..requested]) {
-        Ok(available) => available,
-        Err(error) => return linux_socket_error(error),
-    };
-    if available == 0 {
-        return 0;
+    if let Err(error) = linux_splice_access(source, sink) {
+        return error;
     }
-    let sent = match crate::linux_socket::send(output_slot, &bytes[..available], None) {
-        Ok(sent) => sent,
-        Err(error) => return linux_socket_error(error),
+    let (from, to) = (LinuxSpliceEnd::of(source), LinuxSpliceEnd::of(sink));
+    let (LinuxSpliceEnd::Pipe(from_slot), LinuxSpliceEnd::Pipe(to_slot)) = (from, to) else {
+        return LINUX_EINVAL;
     };
-    if consume && sent != 0 {
-        let mut discarded = [0_u8; PAGE_SIZE];
-        match crate::linux_socket::recv(input_slot, &mut discarded[..sent]) {
-            Ok((received, _)) if received == sent => {}
-            _ => return LINUX_EIO,
+    if crate::linux_socket::same_pipe(from_slot, to_slot) {
+        return LINUX_EINVAL;
+    }
+    let nonblocking = linux_splice_nonblocking(flags, [(source, from), (sink, to)]);
+    let step = linux_splice_between_pipes(from_slot, to_slot, length, false);
+    linux_splice_live_return(output, caller, LINUX_TEE_SYSCALL, nonblocking, step)
+}
+
+/// Moves (or, for tee, copies: `consume` false) bytes from one pipe to
+/// another, as many as are queued and fit, up to `length`.
+fn linux_splice_between_pipes(
+    from: crate::linux_socket::SlotId,
+    to: crate::linux_socket::SlotId,
+    length: u64,
+    consume: bool,
+) -> LinuxSpliceStep {
+    let requested = usize::try_from(length).unwrap_or(usize::MAX);
+    let mut buffer = [0_u8; PAGE_SIZE];
+    let mut moved = 0_usize;
+    while moved < requested {
+        let Some(room) = crate::linux_socket::pipe_room(to) else {
+            return linux_splice_moved(moved, Some(LINUX_EPIPE));
+        };
+        let chunk = (requested - moved).min(buffer.len()).min(room);
+        if chunk == 0 {
+            return linux_splice_blocked(moved);
+        }
+        let available = match crate::linux_socket::peek_local(from, &mut buffer[..chunk]) {
+            Ok(0) => break,
+            Ok(available) => available,
+            Err(crate::linux_socket::Error::WouldBlock) => return linux_splice_blocked(moved),
+            Err(error) => return linux_splice_moved(moved, Some(linux_socket_error(error))),
+        };
+        let sent = match crate::linux_socket::send(to, &buffer[..available], None) {
+            Ok(sent) => sent,
+            Err(crate::linux_socket::Error::WouldBlock) => return linux_splice_blocked(moved),
+            Err(error) => return linux_splice_moved(moved, Some(linux_socket_error(error))),
+        };
+        if consume
+            && !matches!(
+                crate::linux_socket::recv(from, &mut buffer[..sent]),
+                Ok((received, _)) if received == sent
+            )
+        {
+            return linux_splice_moved(moved, Some(LINUX_EIO));
+        }
+        moved += sent;
+        // tee copies what the pipe holds once: another pass would see the
+        // same bytes again.
+        if !consume || sent < available {
+            break;
         }
     }
-    sent as u64
+    LinuxSpliceStep::Done(moved as u64)
+}
+
+/// Moves bytes from pipe `from` into a socket or regular file `sink`.
+fn linux_splice_from_pipe(
+    from: crate::linux_socket::SlotId,
+    (sink, sink_offset): (u64, u64),
+    to: LinuxSpliceEnd,
+    length: u64,
+) -> LinuxSpliceStep {
+    let (mut offset, explicit) = match to {
+        LinuxSpliceEnd::File => {
+            if linux_socket_flags(sink).is_some_and(|flags| flags & LINUX_O_APPEND as u32 != 0) {
+                return LinuxSpliceStep::Done(LINUX_EINVAL);
+            }
+            match linux_file_range_offset(sink_offset, sink) {
+                Ok(offset) => offset,
+                Err(error) => return LinuxSpliceStep::Done(error),
+            }
+        }
+        LinuxSpliceEnd::Socket(_) if sink_offset == 0 => (0, false),
+        _ => return LinuxSpliceStep::Done(LINUX_EINVAL),
+    };
+    let requested = usize::try_from(length).unwrap_or(usize::MAX);
+    let mut buffer = [0_u8; PAGE_SIZE];
+    let mut moved = 0_usize;
+    let mut failure = None;
+    while moved < requested {
+        let chunk = (requested - moved).min(buffer.len());
+        let available = match crate::linux_socket::peek_local(from, &mut buffer[..chunk]) {
+            Ok(0) => break,
+            Ok(available) => available,
+            Err(crate::linux_socket::Error::WouldBlock) if moved == 0 => {
+                return LinuxSpliceStep::Blocked;
+            }
+            Err(crate::linux_socket::Error::WouldBlock) => break,
+            Err(error) => {
+                failure = Some(linux_socket_error(error));
+                break;
+            }
+        };
+        let written = match to {
+            LinuxSpliceEnd::Socket(slot) => {
+                match crate::linux_socket::send(slot, &buffer[..available], None) {
+                    Ok(written) => written,
+                    Err(crate::linux_socket::Error::WouldBlock) if moved == 0 => {
+                        return LinuxSpliceStep::Blocked;
+                    }
+                    Err(crate::linux_socket::Error::WouldBlock) => break,
+                    Err(error) => {
+                        failure = Some(linux_socket_error(error));
+                        break;
+                    }
+                }
+            }
+            _ => match linux_regular_file_write_kernel(sink, offset, &buffer[..available]) {
+                Ok(written) => written,
+                Err(error) => {
+                    failure = Some(if error == LINUX_EISDIR {
+                        LINUX_EINVAL
+                    } else {
+                        error
+                    });
+                    break;
+                }
+            },
+        };
+        if written == 0 {
+            break;
+        }
+        if !matches!(
+            crate::linux_socket::recv(from, &mut buffer[..written]),
+            Ok((received, _)) if received == written
+        ) {
+            failure = Some(LINUX_EIO);
+            break;
+        }
+        offset = offset.saturating_add(written);
+        moved += written;
+        if written < available {
+            break;
+        }
+    }
+    if matches!(to, LinuxSpliceEnd::File)
+        && linux_commit_file_range_offset(sink_offset, sink, explicit, offset).is_err()
+    {
+        failure = Some(LINUX_EFAULT);
+    }
+    linux_splice_moved(moved, failure)
+}
+
+/// Moves bytes from a socket or regular file `source` into pipe `to`, no
+/// more than fit, so nothing read is lost.
+fn linux_splice_to_pipe(
+    (source, source_offset): (u64, u64),
+    from: LinuxSpliceEnd,
+    to: crate::linux_socket::SlotId,
+    length: u64,
+) -> LinuxSpliceStep {
+    let (mut offset, explicit) = match from {
+        LinuxSpliceEnd::File => match linux_file_range_offset(source_offset, source) {
+            Ok(offset) => offset,
+            Err(error) => return LinuxSpliceStep::Done(error),
+        },
+        LinuxSpliceEnd::Socket(slot)
+            if source_offset == 0 && !crate::linux_socket::unix_stream_unconnected(slot) =>
+        {
+            (0, false)
+        }
+        _ => return LinuxSpliceStep::Done(LINUX_EINVAL),
+    };
+    let requested = usize::try_from(length).unwrap_or(usize::MAX);
+    let mut buffer = [0_u8; PAGE_SIZE];
+    let mut moved = 0_usize;
+    let mut failure = None;
+    while moved < requested {
+        let Some(room) = crate::linux_socket::pipe_room(to) else {
+            failure = Some(LINUX_EPIPE);
+            break;
+        };
+        let chunk = (requested - moved).min(buffer.len()).min(room);
+        if chunk == 0 {
+            if moved == 0 {
+                return LinuxSpliceStep::Blocked;
+            }
+            break;
+        }
+        let read = match from {
+            LinuxSpliceEnd::Socket(slot) => {
+                match crate::linux_socket::recv(slot, &mut buffer[..chunk]) {
+                    Ok((read, _)) => read,
+                    Err(crate::linux_socket::Error::WouldBlock) if moved == 0 => {
+                        return LinuxSpliceStep::Blocked;
+                    }
+                    Err(crate::linux_socket::Error::WouldBlock) => break,
+                    Err(error) => {
+                        failure = Some(linux_socket_error(error));
+                        break;
+                    }
+                }
+            }
+            // A directory has nothing to splice (EINVAL), as in Linux.
+            _ => match linux_regular_file_read_kernel(source, offset, &mut buffer[..chunk]) {
+                Ok(read) => read,
+                Err(error) => {
+                    failure = Some(if error == LINUX_EISDIR {
+                        LINUX_EINVAL
+                    } else {
+                        error
+                    });
+                    break;
+                }
+            },
+        };
+        if read == 0 {
+            break;
+        }
+        let sent = match crate::linux_socket::send(to, &buffer[..read], None) {
+            Ok(sent) => sent,
+            Err(error) => {
+                failure = Some(linux_socket_error(error));
+                break;
+            }
+        };
+        offset = offset.saturating_add(sent);
+        moved += sent;
+        if sent < read {
+            break;
+        }
+    }
+    if matches!(from, LinuxSpliceEnd::File)
+        && linux_commit_file_range_offset(source_offset, source, explicit, offset).is_err()
+    {
+        failure = Some(LINUX_EFAULT);
+    }
+    linux_splice_moved(moved, failure)
 }
 
 fn linux_runtime_pipe(address: u64, flags: u64) -> u64 {
@@ -34663,7 +35151,7 @@ fn linux_socket_pipe(
     first_descriptor: u64,
     copy: impl FnOnce(u64, &[u8]) -> bool,
 ) -> u64 {
-    if flags & !(LINUX_O_NONBLOCK | LINUX_O_CLOEXEC) != 0 {
+    if flags & !(LINUX_O_NONBLOCK | LINUX_O_CLOEXEC | LINUX_O_DIRECT) != 0 {
         return LINUX_EINVAL;
     }
     let mut descriptors = [0_u64; 2];
@@ -34680,7 +35168,11 @@ fn linux_socket_pipe(
     if found != descriptors.len() {
         return LINUX_EMFILE;
     }
-    let (reader, writer) = match crate::linux_socket::open_pair(1) {
+    // A packet-mode (O_DIRECT) pipe keeps each write as one packet, which a
+    // read returns on its own: a sequenced-packet pair, where a plain pipe
+    // is a byte stream.
+    let socket_type = if flags & LINUX_O_DIRECT != 0 { 5 } else { 1 };
+    let (reader, writer) = match crate::linux_socket::open_pair(socket_type) {
         Ok(pair) => pair,
         Err(error) => return linux_socket_error(error),
     };
@@ -34698,8 +35190,10 @@ fn linux_socket_pipe(
     ] {
         let index = (descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
         X86_RUNTIME.ELF_PROBE_SOCKET_SLOTS[index].store(slot + 1, Ordering::SeqCst);
-        X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index]
-            .store((flags & LINUX_O_NONBLOCK) as u32, Ordering::SeqCst);
+        X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index].store(
+            (flags & (LINUX_O_NONBLOCK | LINUX_O_DIRECT)) as u32,
+            Ordering::SeqCst,
+        );
         X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index].store(
             LINUX_DEVICE_SOCKET | LINUX_DEVICE_PIPE | access,
             Ordering::SeqCst,
@@ -35646,19 +36140,27 @@ fn linux_epoll_wait_live_return(
         caller,
         input,
         duration,
-        LINUX_THREAD_WAIT_EPOLL,
+        LINUX_EPOLL_WAIT_SYSCALL,
         None,
     )
 }
 
+/// Waits in epoll_wait, epoll_pwait or epoll_pwait2 (system call `number`,
+/// which a yield restarts). `temporary_signal_mask` is the mask an
+/// epoll_pwait call gave; without one the call waits as epoll_wait does.
 fn linux_epoll_wait_duration_live_return(
     output: *mut LinuxSyscallFrame,
     caller: LinuxUserContext,
     input: LinuxEpollWaitInput,
     duration: Option<u64>,
-    wait_kind: u8,
+    number: u64,
     temporary_signal_mask: Option<u64>,
 ) -> u64 {
+    let wait_kind = if temporary_signal_mask.is_some() {
+        LINUX_THREAD_WAIT_EPOLL_PWAIT
+    } else {
+        LINUX_THREAD_WAIT_EPOLL
+    };
     let maximum = input.maximum as u32 as i32;
     if maximum <= 0 {
         return LINUX_EINVAL;
@@ -35686,7 +36188,13 @@ fn linux_epoll_wait_duration_live_return(
     let Some(current) = current_linux_thread_handle() else {
         return LINUX_ESRCH;
     };
-    let Some(target) = ready_linux_thread_handle() else {
+    // The deadline of a wait that began below, if it goes on as a thread
+    // wait because a sibling thread became ready meanwhile.
+    let mut continued_deadline = None;
+    let target = 'target: {
+        if let Some(target) = ready_linux_thread_handle() {
+            break 'target target;
+        }
         if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
             // Only init runs other processes from its own waits, as in
             // run_other_linux_processes. Any other process yields to whatever
@@ -35709,18 +36217,37 @@ fn linux_epoll_wait_duration_live_return(
                             linux_elapsed_nanoseconds().and_then(|now| now.checked_add(duration))
                         })
                     });
-                    if deadline.is_some_and(|deadline| {
-                        linux_elapsed_nanoseconds().is_some_and(|now| now >= deadline)
-                    }) {
-                        return 0;
+                    // Resumed after a park with no signal, the call looks
+                    // at the instance and its deadline again. Once a sibling
+                    // thread is ready, this thread waits as a thread wait
+                    // while it runs.
+                    loop {
+                        if deadline.is_some_and(|deadline| {
+                            linux_elapsed_nanoseconds().is_some_and(|now| now >= deadline)
+                        }) {
+                            return 0;
+                        }
+                        if let Some(result) =
+                            linux_timed_wait_run_others(output, caller, number, deadline)
+                        {
+                            return result;
+                        }
+                        if let Some(target) = ready_linux_thread_handle() {
+                            continued_deadline = Some(deadline.unwrap_or(0));
+                            break 'target target;
+                        }
+                        match linux_epoll_event(input.epoll, true) {
+                            Ok(Some(event)) => {
+                                return if copy_to_linux_user(input.address, &event) {
+                                    1
+                                } else {
+                                    LINUX_EFAULT
+                                };
+                            }
+                            Ok(None) => {}
+                            Err(error) => return error,
+                        }
                     }
-                    return linux_timed_wait_run_others(
-                        output,
-                        caller,
-                        LINUX_EPOLL_WAIT_SYSCALL,
-                        deadline,
-                    )
-                    .unwrap_or(0);
                 }
                 return if yield_current_linux_process(caller, 0) {
                     LINUX_RETURN_TO_KERNEL
@@ -35778,7 +36305,9 @@ fn linux_epoll_wait_duration_live_return(
     let Some(tls) = linux_thread_context(current) else {
         return LINUX_ESRCH;
     };
-    let deadline = if let Some(duration) = duration {
+    let deadline = if let Some(deadline) = continued_deadline {
+        deadline
+    } else if let Some(duration) = duration {
         let Some(deadline) = linux_elapsed_nanoseconds().and_then(|now| now.checked_add(duration))
         else {
             return LINUX_EINVAL;
@@ -35874,7 +36403,7 @@ fn linux_epoll_pwait_live_return(
     timeout: u64,
     signal_mask: LinuxSignalMaskInput,
 ) -> u64 {
-    let signal_mask = match linux_temporary_signal_mask(signal_mask) {
+    let signal_mask = match linux_epoll_signal_mask(signal_mask) {
         Ok(mask) => mask,
         Err(error) => return error,
     };
@@ -35892,9 +36421,18 @@ fn linux_epoll_pwait_live_return(
         caller,
         input,
         duration,
-        LINUX_THREAD_WAIT_EPOLL_PWAIT,
-        Some(signal_mask),
+        LINUX_EPOLL_PWAIT_SYSCALL,
+        signal_mask,
     )
+}
+
+/// The temporary mask an epoll_pwait or epoll_pwait2 call gives, or `None`
+/// for a null mask (musl's epoll_wait passes one).
+fn linux_epoll_signal_mask(input: LinuxSignalMaskInput) -> Result<Option<u64>, u64> {
+    if input.address == 0 {
+        return Ok(None);
+    }
+    linux_temporary_signal_mask(input).map(Some)
 }
 
 fn linux_epoll_pwait2_live_return(
@@ -35924,7 +36462,7 @@ fn linux_epoll_pwait2_live_return(
         };
         Some(duration)
     };
-    let signal_mask = match linux_temporary_signal_mask(signal_mask) {
+    let signal_mask = match linux_epoll_signal_mask(signal_mask) {
         Ok(mask) => mask,
         Err(error) => return error,
     };
@@ -35933,8 +36471,8 @@ fn linux_epoll_pwait2_live_return(
         caller,
         input,
         duration,
-        LINUX_THREAD_WAIT_EPOLL_PWAIT,
-        Some(signal_mask),
+        LINUX_EPOLL_PWAIT2_SYSCALL,
+        signal_mask,
     )
 }
 
@@ -36952,8 +37490,21 @@ fn linux_descriptor_poll_events(descriptor: i32, requested: u16) -> u16 {
         let Some((readable, writable, error)) = crate::linux_socket::readiness(slot) else {
             return LINUX_POLLNVAL;
         };
-        let hangup = linux_device_descriptor(descriptor) & LINUX_DEVICE_PIPE != 0
-            && crate::linux_socket::local_peer_write_closed(slot) == Some(true);
+        let device = linux_device_descriptor(descriptor);
+        let pipe = device & LINUX_DEVICE_PIPE != 0;
+        // A pipe's other end is gone: its read end hangs up (POLLHUP) when
+        // no writer is left, and its write end reports an error (POLLERR)
+        // when no reader is.
+        let peer_gone = pipe && crate::linux_socket::local_peer_write_closed(slot) == Some(true);
+        let write_end = device & 3 == LINUX_DESCRIPTOR_OUTPUT;
+        let hangup = peer_gone && !write_end;
+        let error = error || peer_gone && write_end;
+        // A pipe is readable only with data queued; end-of-file is POLLHUP
+        // alone, where a socket also reports POLLIN.
+        let readable = readable
+            && (!pipe
+                || crate::linux_socket::local_queued_bytes(slot).is_ok_and(|queued| queued != 0));
+        let writable = writable && (!pipe || crate::linux_socket::pipe_writable(slot));
         return (if readable {
             requested & LINUX_POLLIN
         } else {
@@ -42976,38 +43527,100 @@ fn copy_linux_c_string(address: u64, output: &mut [u8]) -> Result<usize, u64> {
 }
 
 fn linux_key_error(error: crate::linux_keyring::Error) -> u64 {
-    match error {
-        crate::linux_keyring::Error::Invalid => LINUX_EINVAL,
-        crate::linux_keyring::Error::NoKey => LINUX_ENOKEY,
-        crate::linux_keyring::Error::NoMemory => LINUX_ENOMEM,
-        crate::linux_keyring::Error::Revoked => LINUX_EKEYREVOKED,
-        crate::linux_keyring::Error::TooBig => LINUX_E2BIG,
+    (-i64::from(error.errno())) as u64
+}
+
+/// Runs `operation` on the domain's keys for the calling thread: its
+/// filesystem ids own and access keys, its real ids pick the user keyrings,
+/// and it acts for other users (CAP_SYS_ADMIN) only where the domain lets
+/// root switch users.
+fn linux_with_keys<R>(
+    operation: impl FnOnce(
+        &mut crate::linux_keyring::Keyrings,
+        &crate::linux_keyring::Caller,
+    ) -> Result<R, crate::linux_keyring::Error>,
+) -> Result<R, u64> {
+    let pid = current_linux_process_pid();
+    let tid = current_linux_tid().unwrap_or(pid);
+    let credentials = current_linux_credentials().unwrap_or(linux_user::Credentials::ROOT);
+    let privileged = current_linux_user_namespace().is_some_and(|namespace| {
+        linux_user::identity_authority(namespace, &credentials).privileged
+    });
+    let groups = linux_process::with_live_process_groups(pid, |groups| {
+        let mut copy = Vec::new();
+        copy.try_reserve_exact(groups.len()).ok()?;
+        copy.extend_from_slice(groups);
+        Some(copy)
+    })
+    .flatten()
+    .unwrap_or_default();
+    let caller = crate::linux_keyring::Caller {
+        uid: credentials.user.filesystem,
+        gid: credentials.group.filesystem,
+        groups: &groups,
+        real_uid: credentials.user.real,
+        real_gid: credentials.group.real,
+        pid,
+        tid,
+        privileged,
+    };
+    crate::linux_keyring::with(|keys| operation(keys, &caller)).map_err(linux_key_error)
+}
+
+/// The kernel clock the key service measures timeouts with.
+fn linux_key_clock() -> u64 {
+    linux_elapsed_nanoseconds().unwrap_or(0)
+}
+
+/// Copies a NUL-terminated key argument that fits in `limit` bytes with its
+/// NUL; a longer one is EINVAL, as Linux's strndup_user makes it.
+fn linux_key_string(address: u64, limit: usize) -> Result<Vec<u8>, u64> {
+    let mut buffer = Vec::new();
+    buffer.try_reserve_exact(limit).map_err(|_| LINUX_ENOMEM)?;
+    buffer.resize(limit, 0);
+    match copy_linux_c_string(address, &mut buffer) {
+        Ok(length) => {
+            buffer.truncate(length);
+            Ok(buffer)
+        }
+        Err(LINUX_ENAMETOOLONG) => Err(LINUX_EINVAL),
+        Err(error) => Err(error),
     }
 }
 
-fn linux_keyring_id(raw: u64) -> Option<i32> {
-    let id = raw as i32;
-    match id {
-        -1 | -2 => Some(crate::linux_keyring::PROCESS_KEYRING),
-        -3 | -5 => Some(crate::linux_keyring::SESSION_KEYRING),
-        -4 => Some(crate::linux_keyring::USER_KEYRING),
-        id @ 1..=3 => Some(id),
-        _ => None,
-    }
+/// Copies a key type name, refusing reserved names (EPERM) before any later
+/// argument is read, as Linux does.
+fn linux_key_type(address: u64) -> Result<Vec<u8>, u64> {
+    let name = linux_key_string(address, ginux_keyrings::TYPE_LIMIT)?;
+    ginux_keyrings::check_type_name(&name).map_err(linux_key_error)?;
+    Ok(name)
 }
 
-fn linux_key_strings(
-    type_address: u64,
-    description_address: u64,
-) -> Result<([u8; 32], usize, [u8; 256], usize), u64> {
-    let mut key_type = [0_u8; crate::linux_keyring::TYPE_CAPACITY];
-    let type_length = copy_linux_c_string(type_address, &mut key_type)?;
-    let mut description = [0_u8; crate::linux_keyring::DESCRIPTION_CAPACITY];
-    let description_length = copy_linux_c_string(description_address, &mut description)?;
-    if !matches!(&key_type[..type_length], b"user" | b"logon") || description_length == 0 {
-        return Err(LINUX_EOPNOTSUPP);
+/// Copies `length` bytes of key payload from `address`.
+fn linux_key_payload(address: u64, length: usize) -> Result<Vec<u8>, u64> {
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(length)
+        .map_err(|_| LINUX_ENOMEM)?;
+    payload.resize(length, 0);
+    if length != 0 && !copy_from_linux_user(address, &mut payload) {
+        return Err(LINUX_EFAULT);
     }
-    Ok((key_type, type_length, description, description_length))
+    Ok(payload)
+}
+
+/// Copies what `output` gives a buffer of `capacity` bytes at `address`
+/// (nothing for a null buffer) and returns the output's full length.
+fn linux_key_output(output: &crate::linux_keyring::Output, address: u64, capacity: u64) -> u64 {
+    let bytes = if address == 0 {
+        &[][..]
+    } else {
+        output.for_buffer(usize::try_from(capacity).unwrap_or(usize::MAX))
+    };
+    if !bytes.is_empty() && !copy_to_linux_user(address, bytes) {
+        return LINUX_EFAULT;
+    }
+    output.len() as u64
 }
 
 fn linux_add_key(
@@ -43015,33 +43628,38 @@ fn linux_add_key(
     description_address: u64,
     payload_address: u64,
     payload_length: u64,
-    destination: u64,
+    keyring: u64,
 ) -> u64 {
-    if linux_keyring_id(destination).is_none() {
-        return LINUX_ENOKEY;
-    }
-    let (key_type, type_length, description, description_length) =
-        match linux_key_strings(type_address, description_address) {
-            Ok(strings) => strings,
-            Err(error) => return error,
-        };
-    let Ok(payload_length) = usize::try_from(payload_length) else {
-        return LINUX_E2BIG;
+    let Some(payload_length) = usize::try_from(payload_length)
+        .ok()
+        .filter(|length| *length <= ginux_keyrings::PAYLOAD_LIMIT)
+    else {
+        return LINUX_EINVAL;
     };
-    if payload_length > crate::linux_keyring::PAYLOAD_CAPACITY {
-        return LINUX_E2BIG;
-    }
-    let mut payload = [0_u8; crate::linux_keyring::PAYLOAD_CAPACITY];
-    if payload_length != 0 && !copy_from_linux_user(payload_address, &mut payload[..payload_length])
-    {
-        return LINUX_EFAULT;
-    }
-    crate::linux_keyring::add(
-        &key_type[..type_length],
-        &description[..description_length],
-        &payload[..payload_length],
-    )
-    .map_or_else(linux_key_error, |serial| serial as u64)
+    let added = (|| {
+        let key_type = linux_key_type(type_address)?;
+        let description = if description_address == 0 {
+            Vec::new()
+        } else {
+            linux_key_string(description_address, ginux_keyrings::DESCRIPTION_LIMIT)?
+        };
+        if key_type == b"keyring" && description.first() == Some(&b'.') {
+            return Err(LINUX_EPERM);
+        }
+        let payload = linux_key_payload(payload_address, payload_length)?;
+        let now = linux_key_clock();
+        linux_with_keys(|keys, caller| {
+            keys.add_key(
+                caller,
+                &key_type,
+                &description,
+                &payload,
+                keyring as i32,
+                now,
+            )
+        })
+    })();
+    added.map_or_else(|error| error, |serial| serial as u64)
 }
 
 fn linux_request_key(
@@ -43050,22 +43668,30 @@ fn linux_request_key(
     callout_address: u64,
     destination: u64,
 ) -> u64 {
-    if destination != 0 && linux_keyring_id(destination).is_none() {
-        return LINUX_ENOKEY;
-    }
-    if callout_address != 0 {
-        let mut callout = [0_u8; LINUX_PATH_MAX];
-        if let Err(error) = copy_linux_c_string(callout_address, &mut callout) {
-            return error;
-        }
-    }
-    let (key_type, type_length, description, description_length) =
-        match linux_key_strings(type_address, description_address) {
-            Ok(strings) => strings,
-            Err(error) => return error,
+    let requested = (|| {
+        let key_type = linux_key_type(type_address)?;
+        let description = linux_key_string(description_address, ginux_keyrings::DESCRIPTION_LIMIT)?;
+        let callout = if callout_address == 0 {
+            None
+        } else {
+            Some(linux_key_string(
+                callout_address,
+                ginux_keyrings::CALLOUT_LIMIT,
+            )?)
         };
-    crate::linux_keyring::search(&key_type[..type_length], &description[..description_length])
-        .map_or_else(linux_key_error, |serial| serial as u64)
+        let now = linux_key_clock();
+        linux_with_keys(|keys, caller| {
+            keys.request_key(
+                caller,
+                &key_type,
+                &description,
+                callout.as_deref(),
+                destination as i32,
+                now,
+            )
+        })
+    })();
+    requested.map_or_else(|error| error, |serial| serial as u64)
 }
 
 fn linux_keyctl(command: u64, second: u64, third: u64, fourth: u64, fifth: u64) -> u64 {
@@ -43073,135 +43699,162 @@ fn linux_keyctl(command: u64, second: u64, third: u64, fourth: u64, fifth: u64) 
     const JOIN_SESSION_KEYRING: u64 = 1;
     const UPDATE: u64 = 2;
     const REVOKE: u64 = 3;
+    const CHOWN: u64 = 4;
     const SETPERM: u64 = 5;
     const DESCRIBE: u64 = 6;
     const CLEAR: u64 = 7;
+    const LINK: u64 = 8;
+    const UNLINK: u64 = 9;
     const SEARCH: u64 = 10;
     const READ: u64 = 11;
+    const INSTANTIATE: u64 = 12;
+    const NEGATE: u64 = 13;
+    const SET_REQKEY_KEYRING: u64 = 14;
+    const SET_TIMEOUT: u64 = 15;
+    const ASSUME_AUTHORITY: u64 = 16;
+    const GET_SECURITY: u64 = 17;
+    const SESSION_TO_PARENT: u64 = 18;
+    const REJECT: u64 = 19;
+    const INSTANTIATE_IOV: u64 = 20;
     const INVALIDATE: u64 = 21;
     const RESTRICT_KEYRING: u64 = 29;
+    const MOVE: u64 = 30;
+    const CAPABILITIES: u64 = 31;
+    let id = second as i32;
+    let now = linux_key_clock();
+    let unit = |result: Result<(), u64>| result.map_or_else(|error| error, |()| 0);
+    let serial = |result: Result<i32, u64>| result.map_or_else(|error| error, |id| id as u64);
+    let output = |result: Result<crate::linux_keyring::Output, u64>| {
+        result.map_or_else(
+            |error| error,
+            |output| linux_key_output(&output, third, fourth),
+        )
+    };
     match command {
-        GET_KEYRING_ID => linux_keyring_id(second).map_or(LINUX_ENOKEY, |id| id as u64),
-        JOIN_SESSION_KEYRING => {
-            if second != 0 {
-                let mut name = [0_u8; LINUX_PATH_MAX];
-                if let Err(error) = copy_linux_c_string(second, &mut name) {
-                    return error;
-                }
-            }
-            crate::linux_keyring::SESSION_KEYRING as u64
-        }
-        UPDATE => {
-            let Ok(length) = usize::try_from(fourth) else {
-                return LINUX_E2BIG;
+        GET_KEYRING_ID => serial(linux_with_keys(|keys, caller| {
+            keys.get_keyring_id(caller, id, third as i32 != 0, now)
+        })),
+        JOIN_SESSION_KEYRING => serial((|| {
+            let name = if second == 0 {
+                None
+            } else {
+                Some(linux_key_string(second, ginux_keyrings::DESCRIPTION_LIMIT)?)
             };
-            if length > crate::linux_keyring::PAYLOAD_CAPACITY {
-                return LINUX_E2BIG;
-            }
-            let mut payload = [0_u8; crate::linux_keyring::PAYLOAD_CAPACITY];
-            if length != 0 && !copy_from_linux_user(third, &mut payload[..length]) {
-                return LINUX_EFAULT;
-            }
-            crate::linux_keyring::update(second as i32, &payload[..length])
-                .map_or_else(linux_key_error, |()| 0)
+            linux_with_keys(|keys, caller| keys.join_session_keyring(caller, name.as_deref()))
+        })()),
+        UPDATE => unit((|| {
+            let length = usize::try_from(fourth)
+                .ok()
+                .filter(|length| *length <= ginux_keyrings::UPDATE_LIMIT)
+                .ok_or(LINUX_EINVAL)?;
+            let payload = linux_key_payload(third, length)?;
+            linux_with_keys(|keys, caller| keys.update(caller, id, &payload, now))
+        })()),
+        REVOKE => unit(linux_with_keys(|keys, caller| keys.revoke(caller, id, now))),
+        CHOWN => {
+            let change = |raw: u64| (raw as u32 != u32::MAX).then_some(raw as u32);
+            unit(linux_with_keys(|keys, caller| {
+                keys.chown(caller, id, change(third), change(fourth), now)
+            }))
         }
-        REVOKE | INVALIDATE => {
-            crate::linux_keyring::revoke(second as i32).map_or_else(linux_key_error, |()| 0)
-        }
-        SETPERM => {
-            if linux_keyring_id(second).is_some()
-                || crate::linux_keyring::describe(
-                    second as i32,
-                    &mut [0; crate::linux_keyring::TYPE_CAPACITY],
-                    &mut [0; crate::linux_keyring::DESCRIPTION_CAPACITY],
-                )
-                .is_ok()
-            {
-                0
+        SETPERM => unit(linux_with_keys(|keys, caller| {
+            keys.set_permissions(caller, id, third as u32, now)
+        })),
+        DESCRIBE => output(linux_with_keys(|keys, caller| {
+            keys.describe(caller, id, now)
+        })),
+        CLEAR => unit(linux_with_keys(|keys, caller| keys.clear(caller, id, now))),
+        LINK => unit(linux_with_keys(|keys, caller| {
+            keys.link(caller, id, third as i32, now)
+        })),
+        UNLINK => unit(linux_with_keys(|keys, caller| {
+            keys.unlink(caller, id, third as i32, now)
+        })),
+        SEARCH => serial((|| {
+            let key_type = linux_key_type(third)?;
+            let description = linux_key_string(fourth, ginux_keyrings::DESCRIPTION_LIMIT)?;
+            linux_with_keys(|keys, caller| {
+                keys.search(caller, id, &key_type, &description, fifth as i32, now)
+            })
+        })()),
+        READ => output(linux_with_keys(|keys, caller| keys.read(caller, id, now))),
+        INSTANTIATE | NEGATE | REJECT | INSTANTIATE_IOV => LINUX_EPERM,
+        SET_REQKEY_KEYRING => serial(linux_with_keys(|keys, caller| {
+            keys.set_request_default(caller, id)
+        })),
+        SET_TIMEOUT => unit(linux_with_keys(|keys, caller| {
+            keys.set_timeout(caller, id, third as u32, now)
+        })),
+        // No upcalls, so there is never an authorization key to assume.
+        ASSUME_AUTHORITY => match id {
+            0 => 0,
+            id if id < 0 => LINUX_EINVAL,
+            _ => LINUX_ENOKEY,
+        },
+        GET_SECURITY => output(linux_with_keys(|keys, caller| {
+            keys.get_security(caller, id, now)
+        })),
+        SESSION_TO_PARENT => unit(linux_keyctl_session_to_parent(now)),
+        INVALIDATE => unit(linux_with_keys(|keys, caller| {
+            keys.invalidate(caller, id, now)
+        })),
+        RESTRICT_KEYRING => unit((|| {
+            let key_type = if third == 0 {
+                None
             } else {
-                LINUX_ENOKEY
-            }
-        }
-        CLEAR => {
-            if linux_keyring_id(second).is_none() {
-                LINUX_ENOKEY
-            } else if crate::linux_keyring::clear() {
-                0
-            } else {
-                LINUX_EIO
-            }
-        }
-        SEARCH => {
-            if linux_keyring_id(second).is_none() || fifth != 0 && linux_keyring_id(fifth).is_none()
-            {
-                return LINUX_ENOKEY;
-            }
-            linux_request_key(third, fourth, 0, fifth)
-        }
-        READ => {
-            let Ok(length) = usize::try_from(fourth) else {
-                return LINUX_EINVAL;
+                Some(linux_key_type(third)?)
             };
-            let mut payload = [0_u8; crate::linux_keyring::PAYLOAD_CAPACITY];
-            let capacity = payload.len();
-            match crate::linux_keyring::read(second as i32, &mut payload[..length.min(capacity)]) {
-                Ok(required) => {
-                    let copied = required.min(length);
-                    if copied != 0 && !copy_to_linux_user(third, &payload[..copied]) {
-                        LINUX_EFAULT
-                    } else {
-                        required as u64
-                    }
-                }
-                Err(error) => linux_key_error(error),
-            }
-        }
-        DESCRIBE => linux_keyctl_describe(second as i32, third, fourth),
-        RESTRICT_KEYRING => {
-            if linux_keyring_id(second).is_some() {
-                0
+            let restriction = if fourth == 0 {
+                None
             } else {
-                LINUX_ENOKEY
-            }
-        }
-        _ => {
-            if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
-                serial_write("ginux: unsupported keyctl command/arguments: ");
-                for value in [command, second, third, fourth, fifth] {
-                    serial_write_u64(value);
-                    serial_write(" ");
-                }
-                serial_write("\r\n");
-            }
-            LINUX_EOPNOTSUPP
-        }
+                Some(linux_key_string(fourth, ginux_keyrings::DESCRIPTION_LIMIT)?)
+            };
+            linux_with_keys(|keys, caller| {
+                keys.restrict_keyring(caller, id, key_type.as_deref(), restriction.as_deref(), now)
+            })
+        })()),
+        MOVE => unit(linux_with_keys(|keys, caller| {
+            keys.move_key(caller, id, third as i32, fourth as i32, fifth as u32, now)
+        })),
+        CAPABILITIES => crate::linux_keyring::Keyrings::capabilities()
+            .map_err(linux_key_error)
+            .map_or_else(
+                |error| error,
+                |output| linux_key_output(&output, second, third),
+            ),
+        _ => LINUX_EOPNOTSUPP,
     }
 }
 
-fn linux_keyctl_describe(serial: i32, output_address: u64, output_length: u64) -> u64 {
-    let mut key_type = [0_u8; crate::linux_keyring::TYPE_CAPACITY];
-    let mut description = [0_u8; crate::linux_keyring::DESCRIPTION_CAPACITY];
-    let info = match crate::linux_keyring::describe(serial, &mut key_type, &mut description) {
-        Ok(info) => info,
-        Err(error) => return linux_key_error(error),
-    };
-    let mut output = [0_u8; 320];
-    let mut used = 0;
-    for part in [
-        &key_type[..info.type_length],
-        b";0;0;3f3f0000;",
-        &description[..info.description_length],
-    ] {
-        output[used..used + part.len()].copy_from_slice(part);
-        used += part.len();
+/// KEYCTL_SESSION_TO_PARENT: the parent takes the caller's session keyring.
+/// Like Linux, it refuses (EPERM) a parent that is init, has other threads,
+/// or does not run with the caller's effective ids.
+fn linux_keyctl_session_to_parent(now: u64) -> Result<(), u64> {
+    let pid = current_linux_process_pid();
+    let credentials = current_linux_credentials().ok_or(LINUX_ESRCH)?;
+    let parent = linux_process::live_process_parent_pid(pid)
+        .filter(|parent| *parent > 1)
+        .ok_or(LINUX_EPERM)?;
+    let parent_credentials = linux_process::live_process_credentials(parent).ok_or(LINUX_EPERM)?;
+    let (user, group) = (credentials.user.effective, credentials.group.effective);
+    let same_owner = [
+        parent_credentials.user.real,
+        parent_credentials.user.effective,
+        parent_credentials.user.saved,
+    ]
+    .iter()
+    .all(|id| *id == user)
+        && [
+            parent_credentials.group.real,
+            parent_credentials.group.effective,
+            parent_credentials.group.saved,
+        ]
+        .iter()
+        .all(|id| *id == group);
+    if !same_owner || linux_process_thread_count(parent) > 1 {
+        return Err(LINUX_EPERM);
     }
-    used += 1;
-    let copied = used.min(output_length as usize);
-    if copied != 0 && !copy_to_linux_user(output_address, &output[..copied]) {
-        LINUX_EFAULT
-    } else {
-        used as u64
-    }
+    linux_with_keys(|keys, caller| keys.session_to_parent(caller, parent, now))
 }
 
 fn copy_linux_id_triple(first: u64, second: u64, third: u64, ids: (u32, u32, u32)) -> u64 {
@@ -44194,7 +44847,7 @@ fn packet_wait_call_for_object(
                 )
             {
                 while !timer::packet_wait_timed_out(caller_domain, request.expected_sequence) {
-                    unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) };
+                    linux_wait_for_interrupt();
                 }
                 return if timer::finish_packet_wait_timer(caller_domain, request.expected_sequence)
                     == Some(true)

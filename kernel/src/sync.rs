@@ -25,6 +25,9 @@ impl LockRank {
     /// The executables behind /proc/PID/exe; ranks below the heap so the
     /// list may grow while held.
     pub(crate) const EXECUTABLES: Self = Self(110);
+    /// Each domain's keys; ranks below the heap so the keys may grow while
+    /// held.
+    pub(crate) const KEYRINGS: Self = Self(115);
     /// Deadlines of timed waits set to restart; ranks below the heap so the
     /// list may grow while held.
     pub(crate) const RESTART_DEADLINES: Self = Self(120);
