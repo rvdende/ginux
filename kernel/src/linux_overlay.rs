@@ -42,6 +42,8 @@ pub(crate) struct Metadata {
     pub(crate) mode: u32,
     pub(crate) owner: u32,
     pub(crate) group: u32,
+    /// How many names the file has (its hard links).
+    pub(crate) links: u32,
     pub(crate) size: usize,
     pub(crate) atime: (i64, i64),
     pub(crate) mtime: (i64, i64),
@@ -143,6 +145,11 @@ struct Node {
     mode: u32,
     owner: u32,
     group: u32,
+    /// A hard link: this node is only a name for the file `alias_of`
+    /// holds, and has no data of its own.
+    alias_of: Option<Handle>,
+    /// How many names the file has: this node's and its aliases'.
+    links: u16,
     /// A memfd's seals (F_SEAL_*, which all fit a byte).
     seals: u8,
     /// The pipe socket behind a FIFO, plus one; 0 before one opens it.
@@ -176,6 +183,8 @@ impl Node {
         mode: 0,
         owner: 0,
         group: 0,
+        alias_of: None,
+        links: 0,
         seals: 0,
         fifo_socket: 0,
         handle: Handle {
@@ -206,6 +215,7 @@ impl Node {
             mode: self.mode,
             owner: self.owner,
             group: self.group,
+            links: u32::from(self.links.max(1)),
             size: self.size,
             atime: self.atime,
             mtime: self.mtime,
@@ -232,6 +242,9 @@ struct Overlay {
     first_mapping_page: FrameLease,
     next_generation: u32,
     next_inode: u64,
+    /// Linked symlinks, so path walks skip looking for them when there are
+    /// none.
+    symlinks: usize,
 }
 
 impl Overlay {
@@ -240,7 +253,13 @@ impl Overlay {
         first_mapping_page: FrameLease::EMPTY,
         next_generation: 0x8000_0000,
         next_inode: 0x10_000,
+        symlinks: 0,
     };
+}
+
+/// The overlay has a symlink a path walk may need to follow.
+pub(crate) fn has_symlinks() -> bool {
+    live().is_some_and(|overlay| overlay.symlinks != 0)
 }
 
 pub(crate) fn register_shared_mapping(
@@ -437,9 +456,13 @@ static OVERLAY_RUNTIME: OverlayRuntimeOwner =
 pub(crate) fn lookup(path: &[u8]) -> Option<Metadata> {
     valid_path(path)?;
     let overlay = live()?;
-    for_each_node(overlay, |node| {
-        (node.linked && !node.whiteout && node.path() == path).then_some(node.metadata())
-    })
+    let named = for_each_node(overlay, |node| {
+        (node.linked && !node.whiteout && node.path() == path).then_some(node)
+    })?;
+    match named.alias_of {
+        Some(file) => metadata(file),
+        None => Some(named.metadata()),
+    }
 }
 
 pub(crate) fn hidden(path: &[u8]) -> bool {
@@ -669,9 +692,13 @@ pub(crate) fn next_child(directory: Handle, cursor: usize) -> Option<Option<Chil
         }
         let mut name = [0_u8; PATH_CAPACITY];
         name[..remainder.len()].copy_from_slice(remainder);
+        let metadata = match node.alias_of {
+            Some(file) => metadata(file)?,
+            None => node.metadata(),
+        };
         Some(Child {
             next_cursor: cursor + 1,
-            metadata: node.metadata(),
+            metadata,
             name_length: remainder.len(),
             name,
         })
@@ -741,6 +768,8 @@ fn create(path: &[u8], kind: NodeKind, mode: u32, initial: &[u8]) -> Option<Hand
         mode: mode & 0o7777,
         owner,
         group,
+        alias_of: None,
+        links: 1,
         seals: 0,
         fifo_socket: 0,
         handle,
@@ -758,6 +787,9 @@ fn create(path: &[u8], kind: NodeKind, mode: u32, initial: &[u8]) -> Option<Hand
     };
     overlay.next_generation = generation;
     overlay.next_inode = inode;
+    if kind == NodeKind::Symlink {
+        overlay.symlinks += 1;
+    }
     if !initial.is_empty() && write(handle, 0, initial) != Some(initial.len()) {
         let _ = unlink(handle);
         return None;
@@ -811,6 +843,8 @@ pub(crate) fn whiteout(path: &[u8]) -> bool {
         mode: 0,
         owner: 0,
         group: 0,
+        alias_of: None,
+        links: 0,
         seals: 0,
         fifo_socket: 0,
         handle: Handle { generation, inode },
@@ -1197,6 +1231,133 @@ pub(crate) fn rename(handle: Handle, path: &[u8]) -> bool {
     true
 }
 
+/// Gives the file `target` (not a directory) another name, `path`: a hard
+/// link. Both names then reach the same data, owner and mode.
+pub(crate) fn create_link(path: &[u8], target: Handle) -> bool {
+    if valid_path(path).is_none() || lookup(path).is_some() {
+        return false;
+    }
+    let Some(file) = node(target) else {
+        return false;
+    };
+    if file.kind == NodeKind::Directory || !file.linked || file.alias_of.is_some() {
+        return false;
+    }
+    let kind = file.kind;
+    let replace_whiteout = hidden(path);
+    let overlay = live_mut();
+    let Some(generation) = overlay.next_generation.checked_add(1) else {
+        return false;
+    };
+    let Some(slot) = (if replace_whiteout {
+        node_by_path_mut(overlay, path)
+    } else {
+        empty_node_slot(overlay)
+    }) else {
+        return false;
+    };
+    let mut stored_path = [0_u8; PATH_CAPACITY];
+    stored_path[..path.len()].copy_from_slice(path);
+    *slot = Node {
+        active: true,
+        linked: true,
+        kind,
+        path_length: path.len() as u16,
+        alias_of: Some(target),
+        handle: Handle {
+            generation,
+            inode: target.inode,
+        },
+        path: stored_path,
+        ..Node::EMPTY
+    };
+    overlay.next_generation = generation;
+    let Some(file) = node_mut(target) else {
+        return false;
+    };
+    file.links = file.links.saturating_add(1);
+    true
+}
+
+/// Removes the name `path`. A file with other names keeps its data under
+/// them: removing an alias drops just that name, and removing the file's
+/// own node moves one alias's name onto it. Directories and files with one
+/// name go as `unlink` does.
+pub(crate) fn unlink_path(path: &[u8]) -> bool {
+    let Some(overlay) = live() else {
+        return false;
+    };
+    let Some(named) = for_each_node(overlay, |node| {
+        (node.linked && !node.whiteout && node.path() == path)
+            .then_some((node.handle, node.alias_of))
+    }) else {
+        return false;
+    };
+    match named {
+        (alias, Some(file)) => drop_alias(alias, file),
+        (file, None) => {
+            let alias = for_each_node(overlay, |node| {
+                (node.linked && node.alias_of == Some(file)).then_some((
+                    node.handle,
+                    node.path,
+                    node.path_length,
+                ))
+            });
+            match alias {
+                Some((alias, alias_path, alias_length)) => {
+                    let Some(node) = node_mut(file) else {
+                        return false;
+                    };
+                    node.path = alias_path;
+                    node.path_length = alias_length;
+                    drop_alias(alias, file)
+                }
+                None => unlink(file),
+            }
+        }
+    }
+}
+
+/// Frees the alias node `alias` of `file` and takes one name off the file.
+fn drop_alias(alias: Handle, file: Handle) -> bool {
+    let Some(node) = node_mut(alias) else {
+        return false;
+    };
+    *node = Node::EMPTY;
+    if let Some(node) = node_mut(file) {
+        node.links = node.links.saturating_sub(1).max(1);
+    }
+    true
+}
+
+/// Renames the name `from` to `to`: an alias moves alone; a file's own node
+/// (or a directory, with everything under it) as `rename` does.
+pub(crate) fn rename_path(from: &[u8], to: &[u8]) -> bool {
+    if valid_path(to).is_none() || lookup(to).is_some() {
+        return false;
+    }
+    let Some(overlay) = live() else {
+        return false;
+    };
+    let Some((handle, alias_of)) = for_each_node(overlay, |node| {
+        (node.linked && !node.whiteout && node.path() == from)
+            .then_some((node.handle, node.alias_of))
+    }) else {
+        return false;
+    };
+    if alias_of.is_none() {
+        return rename(handle, to);
+    }
+    let Some(node) = node_mut(handle) else {
+        return false;
+    };
+    let mut stored_path = [0_u8; PATH_CAPACITY];
+    stored_path[..to.len()].copy_from_slice(to);
+    node.path = stored_path;
+    node.path_length = to.len() as u16;
+    true
+}
+
 pub(crate) fn unlink(handle: Handle) -> bool {
     let Some(metadata) = metadata(handle) else {
         return false;
@@ -1222,6 +1383,10 @@ pub(crate) fn unlink(handle: Handle) -> bool {
         return false;
     };
     node.linked = false;
+    if node.kind == NodeKind::Symlink {
+        let overlay = live_mut();
+        overlay.symlinks = overlay.symlinks.saturating_sub(1);
+    }
     true
 }
 
