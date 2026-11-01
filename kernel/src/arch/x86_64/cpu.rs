@@ -1849,6 +1849,10 @@ const LINUX_THREAD_WAIT_PAUSE: u8 = 13;
 const LINUX_THREAD_WAIT_SIGSUSPEND: u8 = 14;
 const LINUX_THREAD_WAIT_SELECT: u8 = 15;
 const LINUX_THREAD_WAIT_PSELECT: u8 = 16;
+/// Waits a moment, then issues system call `key` again (its saved context
+/// is rewound to the `syscall` instruction): for waits with no waker of
+/// their own, such as a record lock another thread holds.
+const LINUX_THREAD_WAIT_RETRY: u8 = 17;
 const LINUX_SYSCALL_FRAME_REGISTERS: usize = 12;
 static X86_RUNTIME_BACKING_LINUX_THREAD_STATES: [BankedAtomicU8; LINUX_THREAD_LIMIT] =
     [const { BankedAtomicU8::new(LINUX_THREAD_FREE) }; LINUX_THREAD_LIMIT];
@@ -6969,6 +6973,7 @@ fn block_current_linux_thread(kind: u8, key: u64, output: u64, deadline: u64) ->
             | LINUX_THREAD_WAIT_SIGSUSPEND
             | LINUX_THREAD_WAIT_SELECT
             | LINUX_THREAD_WAIT_PSELECT
+            | LINUX_THREAD_WAIT_RETRY
     ) || key == 0
         || X86_RUNTIME.LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) != LINUX_THREAD_RUNNING
         || X86_RUNTIME.LINUX_THREAD_WAIT_KINDS[slot].load(Ordering::SeqCst)
@@ -27991,10 +27996,8 @@ fn linux_openat_path(
             )
         })
         .map(|(pid, _)| pid);
-    let virtual_device = matches!(
-        path,
-        b"/dev/null" | b"/dev/zero" | b"/dev/console" | b"/dev/tty"
-    ) || linux_graphics_path_kind(path).is_some();
+    let virtual_device =
+        LinuxCharacterDevice::from_path(path).is_some() || linux_graphics_path_kind(path).is_some();
     let writable_proc_path = linux_runtime_file_kind(path).is_some_and(linux_writable_proc_file);
     if tmp_path && flags & LINUX_O_DIRECTORY != 0 {
         return LINUX_ENOTDIR;
@@ -28300,9 +28303,9 @@ fn linux_openat_path(
         // The kernel's devices come before the image: its /dev is only a
         // directory, and /dev/null would open as that.
         match path {
-            b"/dev/null" => 0,
-            b"/dev/zero" => LINUX_DEVICE_ZERO,
-            b"/dev/console" | b"/dev/tty" => LINUX_DEVICE_CONSOLE,
+            path if LinuxCharacterDevice::from_path(path).is_some() => {
+                LinuxCharacterDevice::from_path(path).map_or(0, LinuxCharacterDevice::kind)
+            }
             path => match linux_relative_path_kind(directory, path) {
                 Ok(Some(kind)) => kind,
                 Ok(None) => match linux_root_directory_kind(path)
@@ -29271,12 +29274,12 @@ fn linux_ensure_dev_nodes() {
     if !image_has(b"dev/shm") && crate::linux_overlay::lookup(b"dev/shm").is_none() {
         root_owned(crate::linux_overlay::create_directory(b"dev/shm", 0o1777));
     }
-    for (name, device) in [
-        (&b"dev/null"[..], LinuxCharacterDevice::Null),
-        (b"dev/zero", LinuxCharacterDevice::Zero),
-        (b"dev/console", LinuxCharacterDevice::Console),
-        (b"dev/tty", LinuxCharacterDevice::Tty),
-    ] {
+    for device in LinuxCharacterDevice::ALL {
+        let mut path = [0_u8; 16];
+        let name = device.name();
+        path[..4].copy_from_slice(b"dev/");
+        path[4..4 + name.len()].copy_from_slice(name);
+        let name = &path[..4 + name.len()];
         if crate::linux_overlay::lookup(name).is_none() {
             let (_, major, minor, permissions) = device.identity();
             root_owned(crate::linux_overlay::create_device(
@@ -29464,9 +29467,14 @@ fn linux_device_node_kind(
         .ok_or(LINUX_ENOENT)?
         .device;
     match (kind, linux_device_numbers(device)) {
-        (crate::linux_overlay::NodeKind::CharacterDevice, (1, 3)) => Ok(0),
-        (crate::linux_overlay::NodeKind::CharacterDevice, (1, 5)) => Ok(LINUX_DEVICE_ZERO),
-        (crate::linux_overlay::NodeKind::CharacterDevice, (5, 0 | 1)) => Ok(LINUX_DEVICE_CONSOLE),
+        (crate::linux_overlay::NodeKind::CharacterDevice, numbers) => LinuxCharacterDevice::ALL
+            .into_iter()
+            .find(|device| {
+                let (_, major, minor, _) = device.identity();
+                (major, minor) == numbers
+            })
+            .map(LinuxCharacterDevice::kind)
+            .ok_or(LINUX_ENXIO),
         _ => Err(LINUX_ENXIO),
     }
 }
@@ -31017,7 +31025,7 @@ fn linux_faccessat(directory: u64, path_address: u64, mode: u64, flags: u64) -> 
         return if denied { LINUX_EACCES } else { 0 };
     }
     let directory = match path {
-        b"/dev/null" | b"/dev/zero" | b"/dev/console" | b"/dev/tty" => false,
+        path if LinuxCharacterDevice::from_path(path).is_some() => false,
         path if linux_root_directory_kind(path).is_some() => true,
         path if linux_runtime_file_kind(path).is_some() => {
             let kind = linux_runtime_file_kind(path).unwrap_or(0);
@@ -33060,14 +33068,23 @@ fn linux_descriptor_read(descriptor: u64, address: u64, count: u64) -> u64 {
         if device & LINUX_DEVICE_ZERO == 0 || count == 0 {
             return 0;
         }
+        if device & !3 == LINUX_DEVICE_RANDOM {
+            return linux_getrandom(address, count, 0);
+        }
         let Ok(length) = usize::try_from(count) else {
             return LINUX_EINVAL;
         };
-        if length > LINUX_WRITE_LIMIT {
-            return LINUX_EINVAL;
-        }
-        if !copy_to_linux_user(address, &[0_u8; LINUX_WRITE_LIMIT][..length]) {
-            return LINUX_EFAULT;
+        // /dev/zero (and /dev/full) fill the whole buffer, a chunk at a time.
+        let zeros = [0_u8; LINUX_WRITE_LIMIT];
+        for offset in (0..length).step_by(LINUX_WRITE_LIMIT) {
+            let chunk = (length - offset).min(LINUX_WRITE_LIMIT);
+            if !copy_to_linux_user(address + offset as u64, &zeros[..chunk]) {
+                return if offset == 0 {
+                    LINUX_EFAULT
+                } else {
+                    offset as u64
+                };
+            }
         }
         count
     } else {
@@ -37349,7 +37366,7 @@ fn linux_epoll_wait_duration_live_return(
                         }) {
                             return 0;
                         }
-                        if let Some(result) =
+                        if let LinuxWaitTurn::Done(result) =
                             linux_timed_wait_run_others(output, caller, number, deadline)
                         {
                             return result;
@@ -38004,13 +38021,8 @@ fn linux_fanotify_mark(
         crate::published_rootfs::ROOT_HANDLE,
         &canonical[..length],
     );
-    let virtual_device = matches!(
-        &canonical[..length],
-        b"dev/null" | b"dev/zero" | b"dev/console" | b"dev/tty"
-    ) || matches!(
-        &path[..path_length],
-        b"/dev/null" | b"/dev/zero" | b"/dev/console" | b"/dev/tty"
-    );
+    let virtual_device = LinuxCharacterDevice::from_canonical(&canonical[..length]).is_some()
+        || LinuxCharacterDevice::from_path(&path[..path_length]).is_some();
     if overlay.is_none() && oci.is_none() && !virtual_device {
         return LINUX_ENOENT;
     }
@@ -38225,13 +38237,8 @@ fn linux_inotify_add_watch(descriptor: u64, path_address: u64, mask: u64) -> u64
         crate::published_rootfs::ROOT_HANDLE,
         &canonical[..length],
     );
-    let virtual_device = matches!(
-        &canonical[..length],
-        b"dev/null" | b"dev/zero" | b"dev/console" | b"dev/tty"
-    ) || matches!(
-        &path[..path_length],
-        b"/dev/null" | b"/dev/zero" | b"/dev/console" | b"/dev/tty"
-    );
+    let virtual_device = LinuxCharacterDevice::from_canonical(&canonical[..length]).is_some()
+        || LinuxCharacterDevice::from_path(&path[..path_length]).is_some();
     if overlay.is_none() && oci.is_none() && !virtual_device {
         return LINUX_ENOENT;
     }
@@ -38833,6 +38840,8 @@ fn linux_descriptor_write(descriptor: u64, address: u64, count: u64) -> u64 {
     if access == LINUX_DESCRIPTOR_OUTPUT || access == 3 {
         if device & LINUX_DEVICE_CONSOLE != 0 {
             linux_bounded_console_write(address, count)
+        } else if device & !3 == LINUX_DEVICE_FULL && count != 0 {
+            LINUX_ENOSPC
         } else {
             count
         }
@@ -38952,6 +38961,15 @@ fn linux_descriptor_readv(descriptor: u64, vectors: u64, count: u64) -> u64 {
     }
     if device & LINUX_DEVICE_ZERO == 0 {
         return 0;
+    }
+    if device & !3 == LINUX_DEVICE_RANDOM {
+        for (address, length) in ranges[..vector_count].iter().copied() {
+            let result = linux_getrandom(address, length as u64, 0);
+            if result >= u64::MAX - 4095 {
+                return result;
+            }
+        }
+        return total as u64;
     }
     let zeros = [0_u8; LINUX_WRITE_LIMIT];
     for (address, length) in ranges[..vector_count].iter().copied() {
@@ -41708,9 +41726,90 @@ fn linux_fcntl_setlkw_live_return(
         match run_other_linux_processes(output, caller, LINUX_FCNTL_SYSCALL) {
             Some(LinuxBlockedWait::Recheck) => {}
             Some(LinuxBlockedWait::Return(result)) => return result,
-            None => return LINUX_EINTR,
+            // A sibling thread, which may hold the lock, is ready: it runs
+            // while this one waits a tick and takes the lock again. With
+            // nothing else to run, the holder is on another CPU.
+            None => match ready_linux_thread_handle() {
+                Some(target) => {
+                    return linux_retry_after_thread_live_return(
+                        output,
+                        caller,
+                        LINUX_FCNTL_SYSCALL,
+                        target,
+                    )
+                }
+                None => linux_wait_for_interrupt(),
+            },
         }
     }
+}
+
+/// Blocks the calling thread for a millisecond, set to issue system call
+/// `number` again when it wakes (`LINUX_THREAD_WAIT_RETRY`), and switches
+/// to the ready sibling thread `target`.
+fn linux_retry_after_thread_live_return(
+    output: *mut LinuxSyscallFrame,
+    caller: LinuxUserContext,
+    number: u64,
+    target: LinuxThreadHandle,
+) -> u64 {
+    let Some(current) = current_linux_thread_handle() else {
+        return LINUX_ESRCH;
+    };
+    let Some(tls) = linux_thread_context(current) else {
+        return LINUX_ESRCH;
+    };
+    let Some(deadline) = linux_elapsed_nanoseconds().map(|now| now.saturating_add(1_000_000))
+    else {
+        return LINUX_EINVAL;
+    };
+    let mut restart = caller;
+    restart.rip = caller.rip.wrapping_sub(LINUX_SYSCALL_INSTRUCTION_SIZE);
+    restart.rax = number;
+    if !save_linux_thread_return_context(current, restart)
+        || !block_current_linux_thread(LINUX_THREAD_WAIT_RETRY, number, 0, deadline)
+    {
+        return LINUX_EINVAL;
+    }
+    let mut target_registers = LinuxSyscallFrame::ZERO;
+    let mut target_rip = 0;
+    let mut target_rsp = 0;
+    let mut target_rflags = 0;
+    let mut target_rax = 0;
+    if !install_linux_thread_return(
+        target,
+        &mut target_registers,
+        &mut target_rip,
+        &mut target_rsp,
+        &mut target_rflags,
+        &mut target_rax,
+    ) {
+        let slot = usize::from(current.slot);
+        X86_RUNTIME.LINUX_THREAD_WAIT_KINDS[slot].store(LINUX_THREAD_WAIT_NONE, Ordering::SeqCst);
+        X86_RUNTIME.LINUX_THREAD_WAIT_KEYS[slot].store(0, Ordering::SeqCst);
+        X86_RUNTIME.LINUX_THREAD_WAIT_DEADLINES[slot].store(0, Ordering::SeqCst);
+        X86_RUNTIME.LINUX_THREAD_STATES[slot].store(LINUX_THREAD_RUNNING, Ordering::SeqCst);
+        X86_RUNTIME
+            .LINUX_CURRENT_THREAD_SLOT
+            .store(current.slot, Ordering::SeqCst);
+        let _ = install_linux_tls_context(tls);
+        return LINUX_EINVAL;
+    }
+    let selected = LinuxUserContext {
+        registers: target_registers,
+        rip: target_rip,
+        rsp: target_rsp,
+        rflags: target_rflags,
+        rax: target_rax,
+        fs_base: active_fs_base(),
+    };
+    if !write_linux_thread_live_return(output, target, selected) {
+        return LINUX_EINVAL;
+    }
+    X86_RUNTIME
+        .LINUX_LIVE_RETURN_VALIDATED
+        .store(true, Ordering::SeqCst);
+    LINUX_RETURN_FROM_IRET
 }
 
 /// The status flags (O_NONBLOCK, O_APPEND) of socket or pipe `descriptor`.
@@ -43539,30 +43638,71 @@ fn linux_membarrier(command: u64, flags: u64, _cpu_id: u64) -> u64 {
 enum LinuxCharacterDevice {
     Null,
     Zero,
+    Full,
+    Random,
+    Urandom,
     Console,
     Tty,
 }
 
 impl LinuxCharacterDevice {
-    fn from_path(path: &[u8]) -> Option<Self> {
-        match path {
-            b"/dev/null" => Some(Self::Null),
-            b"/dev/zero" => Some(Self::Zero),
-            b"/dev/console" => Some(Self::Console),
-            b"/dev/tty" => Some(Self::Tty),
-            _ => None,
+    const ALL: [Self; 7] = [
+        Self::Null,
+        Self::Zero,
+        Self::Full,
+        Self::Random,
+        Self::Urandom,
+        Self::Console,
+        Self::Tty,
+    ];
+
+    /// The device's name in /dev.
+    fn name(self) -> &'static [u8] {
+        match self {
+            Self::Null => b"null",
+            Self::Zero => b"zero",
+            Self::Full => b"full",
+            Self::Random => b"random",
+            Self::Urandom => b"urandom",
+            Self::Console => b"console",
+            Self::Tty => b"tty",
         }
+    }
+
+    /// The device at `path`, `/dev/NAME`.
+    fn from_path(path: &[u8]) -> Option<Self> {
+        Self::from_name(path.strip_prefix(b"/dev/")?)
+    }
+
+    /// The device at canonical `path` (`dev/NAME`).
+    fn from_canonical(path: &[u8]) -> Option<Self> {
+        Self::from_name(path.strip_prefix(b"dev/")?)
+    }
+
+    fn from_name(name: &[u8]) -> Option<Self> {
+        Self::ALL.into_iter().find(|device| device.name() == name)
     }
 
     /// The device an open descriptor's kind (`linux_device_descriptor`)
     /// names: /dev/null opens with no kind bits, only its access mode.
     fn from_kind(kind: u16) -> Self {
-        if kind & LINUX_DEVICE_ZERO != 0 {
-            Self::Zero
-        } else if kind & !3 == 0 {
-            Self::Null
-        } else {
-            Self::Console
+        match kind & !3 {
+            LINUX_DEVICE_FULL => Self::Full,
+            LINUX_DEVICE_RANDOM => Self::Urandom,
+            _ if kind & LINUX_DEVICE_ZERO != 0 => Self::Zero,
+            0 => Self::Null,
+            _ => Self::Console,
+        }
+    }
+
+    /// The kind bits a descriptor opened on the device carries.
+    fn kind(self) -> u16 {
+        match self {
+            Self::Null => 0,
+            Self::Zero => LINUX_DEVICE_ZERO,
+            Self::Full => LINUX_DEVICE_FULL,
+            Self::Random | Self::Urandom => LINUX_DEVICE_RANDOM,
+            Self::Console | Self::Tty => LINUX_DEVICE_CONSOLE,
         }
     }
 
@@ -43571,6 +43711,9 @@ impl LinuxCharacterDevice {
         match self {
             Self::Null => (1, 1, 3, 0o666),
             Self::Zero => (2, 1, 5, 0o666),
+            Self::Full => (6, 1, 7, 0o666),
+            Self::Random => (7, 1, 8, 0o666),
+            Self::Urandom => (8, 1, 9, 0o666),
             Self::Console => (3, 5, 1, 0o600),
             Self::Tty => (5, 5, 0, 0o666),
         }
@@ -44626,9 +44769,15 @@ fn linux_descriptor_link_target(
         }
     } else {
         match LinuxCharacterDevice::from_kind(state) {
-            LinuxCharacterDevice::Null if state != 0 => (b"/dev/null", false),
+            // The console of the standard descriptors has no kind bits.
+            LinuxCharacterDevice::Null if state == 0 => (b"/dev/console", false),
+            LinuxCharacterDevice::Null => (b"/dev/null", false),
             LinuxCharacterDevice::Zero => (b"/dev/zero", false),
-            _ => (b"/dev/console", false),
+            LinuxCharacterDevice::Full => (b"/dev/full", false),
+            LinuxCharacterDevice::Random | LinuxCharacterDevice::Urandom => {
+                (b"/dev/urandom", false)
+            }
+            LinuxCharacterDevice::Console | LinuxCharacterDevice::Tty => (b"/dev/console", false),
         }
     };
     output.get_mut(..prefix.len())?.copy_from_slice(prefix);

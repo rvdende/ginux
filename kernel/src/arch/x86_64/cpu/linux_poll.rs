@@ -671,11 +671,18 @@ fn linux_poll_run_others_live_return(
                 },
             );
         }
-        if let Some(result) = linux_timed_wait_run_others(output, caller, number, deadline) {
+        let turn = linux_timed_wait_run_others(output, caller, number, deadline);
+        if let LinuxWaitTurn::Done(result) = turn {
             return Ok(result);
         }
         if let Some(target) = ready_linux_thread_handle() {
             return Err((target, deadline));
+        }
+        if let Some((deadline, now)) = deadline.zip(linux_elapsed_nanoseconds()) {
+            timer::request_linux_tick_within(deadline.saturating_sub(now));
+        }
+        if !matches!(turn, LinuxWaitTurn::Idle) {
+            continue;
         }
         if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
             linux_wait_for_interrupt();
@@ -802,7 +809,7 @@ pub(super) fn linux_poll_wait_live_return(
             if ready_linux_thread_handle().is_some() {
                 break;
             }
-            if let Some(result) =
+            if let LinuxWaitTurn::Done(result) =
                 linux_timed_wait_run_others(output, caller, poll_syscall, deadline)
             {
                 return result;
@@ -837,15 +844,16 @@ pub(super) fn linux_poll_wait_live_return(
             && current_linux_process_pid() != 1
         {
             loop {
-                if let Some(result) =
-                    linux_timed_wait_run_others(output, caller, LINUX_PAUSE_SYSCALL, None)
-                {
+                let turn = linux_timed_wait_run_others(output, caller, LINUX_PAUSE_SYSCALL, None);
+                if let LinuxWaitTurn::Done(result) = turn {
                     return result;
                 }
                 if let Some(target) = ready_linux_thread_handle() {
                     break 'target target;
                 }
-                linux_wait_for_interrupt();
+                if let LinuxWaitTurn::Idle = turn {
+                    linux_wait_for_interrupt();
+                }
             }
         }
         if matches!(

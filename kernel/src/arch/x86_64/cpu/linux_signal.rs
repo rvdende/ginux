@@ -779,6 +779,11 @@ pub(super) fn expire_linux_waits() -> u32 {
                     (LINUX_EAGAIN, &X86_RUNTIME.LINUX_SIGNAL_WAIT_TIMEOUT_COUNT)
                 }
                 LINUX_THREAD_WAIT_SLEEP => (0, &X86_RUNTIME.LINUX_SLEEP_WAKE_COUNT),
+                // The rewound call is issued again: rax is its number.
+                LINUX_THREAD_WAIT_RETRY => (
+                    X86_RUNTIME.LINUX_THREAD_WAIT_KEYS[slot].load(Ordering::SeqCst),
+                    &X86_RUNTIME.LINUX_SLEEP_WAKE_COUNT,
+                ),
                 _ => continue,
             };
         X86_RUNTIME.LINUX_THREAD_RAXS[slot].store(result, Ordering::SeqCst);

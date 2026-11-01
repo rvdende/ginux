@@ -360,10 +360,21 @@ runtime CPU; `t` lists every task's threads):
   `live_frame_lease`) read the frame's metadata word without the allocator
   lock: the kernel's owner slot never changes and metadata words are
   written atomically. They took the lock about 3 million times a second.
-- Creating a process still costs about 90 ms of a one-CPU domain while a
-  large application runs (a shell polling with `sleep 1; grep` showed as a
-  90 ms hitch every second in cadrs); fork, exec and exit take a full
-  address-space snapshot.
+- A timed wait (nanosleep, poll, pause) that the runtime loop resumed to
+  look at its wait again used to halt the CPU until its deadline, holding
+  it from every other process: a shell loop's `sleep 0.2` stalled cadrs
+  for the whole 200 ms (median frame 136 ms with five spawns a second).
+  Resumed, it now parks again, as futex and wait4 waits do, after asking
+  for a tick at its deadline; only a wait with nothing else to run halts
+  (`LinuxWaitTurn`). With that loop running, cadrs's median is 31 ms:
+  processes are still picked down the first running child of each
+  process, so a busy branch can hold back another for up to two seconds,
+  and picking branches in turn broke `cat | tar` pipelines (a fork
+  transaction's order matters); real wakeups (step 5) are the fix. The
+  price of re-parking is switches: while cadrs spins on sched_yield for
+  the GPU, every rotation resumes each parked waiter to look again, about
+  20,000 process switches a second, on CPU time the renderer was not using
+  (its steady frame went from 17.3 to 16.9 ms). Wakeups remove that too.
 - Timed waits wake at their deadline: the one-shot tick is brought forward
   to the earliest blocked thread's deadline.
 

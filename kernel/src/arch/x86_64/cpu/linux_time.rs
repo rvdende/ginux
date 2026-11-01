@@ -500,34 +500,46 @@ pub(super) fn take_linux_restart_deadline(rip: u64) -> Option<u64> {
     Some(deadlines.swap_remove(index).deadline)
 }
 
+/// What a wait's turn at letting other processes run came to.
+pub(super) enum LinuxWaitTurn {
+    /// The call ends with this result.
+    Done(u64),
+    /// The call waited parked while others ran and was resumed to look at
+    /// its wait again. If it goes on waiting it parks again: halting here
+    /// would hold the only CPU from a parked process with work to do (a
+    /// shell's `sleep 0.2` stalled a renderer for the whole 200 ms).
+    Resumed,
+    /// Nothing else could run: wait for an interrupt.
+    Idle,
+}
+
 /// Lets other processes run while a timed wait has nothing to wait for in
-/// its own process. Returns the syscall result when this process yielded
-/// (its call restarts later with the same deadline), or `None` to keep
-/// waiting here.
+/// its own process.
 pub(super) fn linux_timed_wait_run_others(
     output: *mut LinuxSyscallFrame,
     caller: LinuxUserContext,
     number: u64,
     deadline: Option<u64>,
-) -> Option<u64> {
+) -> LinuxWaitTurn {
     if let Some(deadline) = deadline {
         save_linux_restart_deadline(caller.rip, deadline);
     }
-    let result = match run_other_linux_processes(output, caller, number) {
+    let turn = match run_other_linux_processes(output, caller, number) {
         // Yielded, or set to start again from user mode: the call comes
         // back and takes its deadline.
         Some(LinuxBlockedWait::Return(result))
             if result == LINUX_RETURN_TO_KERNEL || result == number =>
         {
-            return Some(result);
+            return LinuxWaitTurn::Done(result);
         }
-        Some(LinuxBlockedWait::Return(result)) => Some(result),
-        _ => None,
+        Some(LinuxBlockedWait::Return(result)) => LinuxWaitTurn::Done(result),
+        Some(LinuxBlockedWait::Recheck) => LinuxWaitTurn::Resumed,
+        None => LinuxWaitTurn::Idle,
     };
     // The wait ended here (a signal, or other processes ran and it goes on
     // waiting in this call): the saved deadline goes with it.
     let _ = take_linux_restart_deadline(caller.rip);
-    result
+    turn
 }
 
 pub(super) fn linux_nanosleep_live_return(
@@ -644,19 +656,21 @@ fn linux_sleep_live_return(
         // handled normally between checks. Once a sibling thread is ready,
         // this thread sleeps as a thread wait while it runs.
         while linux_elapsed_nanoseconds().is_some_and(|now| now < deadline) {
-            if let Some(result) =
-                linux_timed_wait_run_others(output, caller, number, Some(deadline))
-            {
+            let turn = linux_timed_wait_run_others(output, caller, number, Some(deadline));
+            if let LinuxWaitTurn::Done(result) = turn {
                 return result;
             }
             if let Some(target) = ready_linux_thread_handle() {
                 break 'target target;
             }
-            // Wake at the deadline, not on the next tick after it.
+            // Wake at the deadline, not on the next tick after it, whether
+            // this CPU halts here or in the runtime loop.
             if let Some(now) = linux_elapsed_nanoseconds() {
                 timer::request_linux_tick_within(deadline.saturating_sub(now));
             }
-            linux_wait_for_interrupt();
+            if let LinuxWaitTurn::Idle = turn {
+                linux_wait_for_interrupt();
+            }
         }
         return 0;
     };

@@ -647,6 +647,11 @@ pub(super) const LINUX_FIOCLEX: u64 = 0x5451;
 pub(super) const LINUX_DESCRIPTOR_INPUT: u16 = 1;
 pub(super) const LINUX_DESCRIPTOR_OUTPUT: u16 = 2;
 pub(super) const LINUX_DEVICE_ZERO: u16 = 1 << 2;
+/// /dev/urandom and /dev/random: the zero bit with one of the anonymous
+/// file bits, which those kinds only ever use alone (compared exactly).
+pub(super) const LINUX_DEVICE_RANDOM: u16 = LINUX_DEVICE_ZERO | 1 << 8;
+/// /dev/full, encoded as LINUX_DEVICE_RANDOM is.
+pub(super) const LINUX_DEVICE_FULL: u16 = LINUX_DEVICE_ZERO | 1 << 9;
 pub(super) const LINUX_DEVICE_CONSOLE: u16 = 1 << 3;
 pub(super) const LINUX_DEVICE_DIRECTORY: u16 = 1 << 4;
 pub(super) const LINUX_DEVICE_USERFAULTFD: u16 = 1 << 8;
