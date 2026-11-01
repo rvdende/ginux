@@ -24127,6 +24127,63 @@ fn linux_proc_fdinfo_target(path: &[u8]) -> Option<u64> {
     linux_pidfd_descriptor(descriptor).then_some(descriptor)
 }
 
+/// The command name (comm) of process `pid`, in `name`: the running
+/// process's own, or the one saved with another's state.
+fn linux_process_name(pid: u32, name: &mut [u8; 16]) -> &[u8] {
+    let words = if pid == current_linux_process_pid() {
+        [
+            X86_RUNTIME
+                .ELF_PROBE_PROCESS_NAME_LOW
+                .load(Ordering::SeqCst),
+            X86_RUNTIME
+                .ELF_PROBE_PROCESS_NAME_HIGH
+                .load(Ordering::SeqCst),
+        ]
+    } else {
+        linux_process_runtime_state(pid)
+            .filter(|state| state.valid)
+            .map_or([0; 2], |state| state.process_name)
+    };
+    name[..8].copy_from_slice(&words[0].to_ne_bytes());
+    name[8..].copy_from_slice(&words[1].to_ne_bytes());
+    let length = name.iter().position(|byte| *byte == 0).unwrap_or(15);
+    if length == 0 {
+        return b"process";
+    }
+    &name[..length]
+}
+
+/// The live process a `/proc/PID` path names (`proc/PID` when not
+/// `absolute`), with or without a trailing slash.
+fn linux_proc_pid_directory(path: &[u8], absolute: bool) -> Option<u32> {
+    let path = path.strip_suffix(b"/").unwrap_or(path);
+    let digits = if absolute {
+        path.strip_prefix(b"/proc/")?
+    } else {
+        path.strip_prefix(b"proc/")?
+    };
+    if digits.is_empty() || digits[0] == b'0' {
+        return None;
+    }
+    let pid = digits.iter().try_fold(0_u32, |value, byte| {
+        byte.is_ascii_digit()
+            .then(|| value.checked_mul(10)?.checked_add(u32::from(byte - b'0')))
+            .flatten()
+    })?;
+    linux_process::live_process_status(pid).map(|_| pid)
+}
+
+/// The directory kind of process `pid`'s /proc directory. Pids 1 and 2 have
+/// their own; every other process's directory lists the same names as pid
+/// 1's, and its files resolve by the pid in their path.
+fn linux_proc_pid_directory_kind(pid: u32) -> u16 {
+    if pid == 2 && linux_process::live_process_status(2).is_some() {
+        LINUX_PROC_PID2_DIRECTORY
+    } else {
+        LINUX_PROC_PID1_DIRECTORY
+    }
+}
+
 fn linux_proc_pid_file_kind(pid: u32, name: &[u8]) -> Option<u16> {
     linux_process::live_process_status(pid)?;
     match (pid, name) {
@@ -24166,15 +24223,14 @@ fn linux_root_directory_kind(path: &[u8]) -> Option<u16> {
     match path {
         b"/" => Some(LINUX_ROOT_DIRECTORY),
         b"/dev" => Some(LINUX_DEVICE_DIRECTORY),
-        b"/proc/self" => match current_linux_process_pid() {
-            1 => Some(LINUX_PROC_PID1_DIRECTORY),
-            2 if linux_process::live_process_status(2).is_some() => Some(LINUX_PROC_PID2_DIRECTORY),
-            _ => None,
-        },
+        b"/proc/self" | b"/proc/self/" => {
+            Some(linux_proc_pid_directory_kind(current_linux_process_pid()))
+        }
         b"/proc/1" => Some(LINUX_PROC_PID1_DIRECTORY),
         b"/proc/2" if linux_process::live_process_status(2).is_some() => {
             Some(LINUX_PROC_PID2_DIRECTORY)
         }
+        _ if linux_proc_pid_directory(path, true).is_some() => Some(LINUX_PROC_PID1_DIRECTORY),
         b"/sys/fs/cgroup" => Some(LINUX_CGROUP_DIRECTORY),
         _ => {
             let name = path.strip_prefix(b"/")?;
@@ -24209,18 +24265,17 @@ fn linux_measured_path_kind(path: &[u8]) -> Option<u16> {
             return Some(kind);
         }
     }
-    if let Some(name) = path.strip_prefix(b"proc/self/") {
+    if let Some(name) = path
+        .strip_prefix(b"proc/self/")
+        .filter(|name| !name.is_empty())
+    {
         return linux_proc_pid_file_kind(current_linux_process_pid(), name);
     }
     if let Some((pid, name)) = linux_proc_numeric_file(path, false) {
         return linux_proc_pid_file_kind(pid, name);
     }
-    if path == b"proc/self" {
-        return match current_linux_process_pid() {
-            1 => Some(LINUX_PROC_PID1_DIRECTORY),
-            2 if linux_process::live_process_status(2).is_some() => Some(LINUX_PROC_PID2_DIRECTORY),
-            _ => None,
-        };
+    if path == b"proc/self" || path == b"proc/self/" {
+        return Some(linux_proc_pid_directory_kind(current_linux_process_pid()));
     }
     if path == b"proc/self/fd" {
         return Some(LINUX_PROC_FD_DIRECTORY);
@@ -24230,6 +24285,9 @@ fn linux_measured_path_kind(path: &[u8]) -> Option<u16> {
     }
     if path == b"proc/2" && linux_process::live_process_status(2).is_some() {
         return Some(LINUX_PROC_PID2_DIRECTORY);
+    }
+    if linux_proc_pid_directory(path, false).is_some() {
+        return Some(LINUX_PROC_PID1_DIRECTORY);
     }
     if path == b"proc/1/status" {
         return Some(LINUX_FILE_PROC_STATUS);
@@ -30944,9 +31002,12 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
         };
         let mut file = [0_u8; 256];
         let mut used = 0_usize;
+        let mut name = [0_u8; 16];
         let generated = match state & !3 {
             LINUX_FILE_PROC_DYNAMIC_STATUS => {
-                append_linux_bytes(&mut file, &mut used, b"Name:\tprocess\nState:\t")
+                append_linux_bytes(&mut file, &mut used, b"Name:\t")
+                    && append_linux_bytes(&mut file, &mut used, linux_process_name(pid, &mut name))
+                    && append_linux_bytes(&mut file, &mut used, b"\nState:\t")
                     && append_linux_bytes(&mut file, &mut used, &[state_letter])
                     && append_linux_bytes(
                         &mut file,
@@ -30970,7 +31031,9 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
             }
             LINUX_FILE_PROC_DYNAMIC_STAT => {
                 append_linux_decimal(&mut file, &mut used, u64::from(status.pid))
-                    && append_linux_bytes(&mut file, &mut used, b" (process) ")
+                    && append_linux_bytes(&mut file, &mut used, b" (")
+                    && append_linux_bytes(&mut file, &mut used, linux_process_name(pid, &mut name))
+                    && append_linux_bytes(&mut file, &mut used, b") ")
                     && append_linux_bytes(&mut file, &mut used, &[state_letter])
                     && append_linux_bytes(&mut file, &mut used, b" ")
                     && append_linux_decimal(&mut file, &mut used, u64::from(status.parent_pid))

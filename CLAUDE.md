@@ -40,11 +40,14 @@ through a Linux ABI personality. It is not a rewrite of Linux:
 3. **A real task and memory model:** per-process memory-area tracking (VMAs),
    a shared page cache, and dynamically sized tables in place of the fixed
    arrays (32 threads per process, kept in per-thread arrays that the
-   scheduler's task struct should replace; the process table and the
-   socket table, which pipes share, grow on demand). Pages have a map count
-   in the frame allocator (`memory::share_frames`): every address space
-   that maps another's frame takes a count, and releasing drops one. Move
-   large structures off the kernel stack.
+   scheduler's task struct should replace; 256 processes per domain, set
+   by the u8 runtime slot ids). The socket table (which pipes share), the
+   scheduler's thread table and each process's address-space lists grow
+   on demand. Pages have a map count in the frame allocator
+   (`memory::share_frames`): every address space that maps another's frame
+   takes a count, and releasing drops one. Anonymous MAP_SHARED memory is
+   an unnamed overlay shmem node, freed with its last mapping. Move large
+   structures off the kernel stack.
 4. **Compatibility driven by the Linux Test Project (LTP)** rather than by
    finding bugs one program at a time: `just test-ltp` (docs/LTP.md has the
    baseline and failure clusters).
