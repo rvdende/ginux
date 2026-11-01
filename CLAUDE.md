@@ -110,6 +110,13 @@ ioctls, timed spans in `kernel/src/linux_profile.rs`). Tick samples miss
 kernel work done with interrupts off; sample CPU 0 from the host instead
 (monitor `info registers`, symbolized as above).
 
+To see which system call a Linux program trips on, run it with
+`GINUX_STRACE=1` in its environment: that process and every process it
+starts log each call to the kernel log as `ginux: strace PID/TID
+NUMBER(args, "path") = result` (errors as `-errno`;
+`kernel/src/linux_strace.rs`). Domains have no ptrace and images seldom
+ship strace.
+
 ## Conventions
 
 - Commit and push straight to `main` of origin (github.com/rvdende/ginux);

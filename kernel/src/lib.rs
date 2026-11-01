@@ -33,6 +33,7 @@ mod linux_profile;
 mod linux_record_lock;
 mod linux_signal;
 mod linux_socket;
+mod linux_strace;
 mod linux_sysv_ipc;
 mod linux_tmpfs;
 mod linux_user;

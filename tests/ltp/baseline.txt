@@ -3,7 +3,7 @@
 # ("known failure"); a failure of any other test is a regression and fails
 # the run. Rewrite it from a run with LTP_UPDATE_BASELINE=1
 # (tests/qemu/ltp.sh --update-baseline); LTP_STRICT=1 ignores it.
-# From target/ltp-results-full16.txt (2026-11-01), list=tests/ltp/syscalls.list ltp=20260930 kernel=f58e6619-dirty.
+# From target/ltp-results-full17.txt (2026-11-01), list=tests/ltp/syscalls.list ltp=20260930 kernel=6a94cac8-dirty.
 abort01 TFAIL
 accept01 TFAIL
 accept02 TBROK
@@ -17,7 +17,7 @@ adjtimex03 TBROK
 arch_prctl01 TFAIL
 bind01 TFAIL
 bind02 TFAIL
-bind04 TBROK
+bind04 HANG
 bind05 TBROK
 brk02 TFAIL
 capget01 TFAIL
@@ -84,7 +84,6 @@ fallocate02 TFAIL
 fallocate03 TFAIL
 fsetxattr02 TBROK
 fchdir03 TFAIL
-fchownat03 TFAIL
 fcntl07 TWARN
 fcntl07_64 TWARN
 fcntl11 TFAIL
@@ -104,7 +103,6 @@ fcntl31_64 TFAIL
 fcntl33 TWARN
 fcntl33_64 TWARN
 fcntl34 TBROK
-fcntl34_64 TBROK
 fcntl35 TBROK
 fcntl35_64 TBROK
 fcntl36 TBROK
@@ -200,7 +198,7 @@ lseek02 TWARN
 lsm_list_modules01 TFAIL
 mlockall02 TFAIL
 mlockall03 TFAIL
-mkdir03 TFAIL
+mkdir03 TWARN
 mknod06 TWARN
 mknod07 TFAIL
 mlock02 TBROK
@@ -218,7 +216,7 @@ mmap18 TBROK
 mmap20 TFAIL
 mmap23 TFAIL
 mmap24 TFAIL
-mount08 TBROK
+mount08 TFAIL
 mount_setattr02 TBROK
 mprotect01 TBROK
 mprotect05 TBROK
@@ -250,7 +248,6 @@ munlockall01 TBROK
 munmap04 TBROK
 nanosleep02 TFAIL
 name_to_handle_at01 TFAIL
-name_to_handle_at02 TFAIL
 nftw01 TFAIL
 nftw6401 TFAIL
 nice05 TBROK
@@ -309,8 +306,7 @@ readlinkat02 TFAIL
 realpath01 TBROK
 reboot01 TFAIL
 reboot02 TFAIL
-recv01 TBROK
-recvfrom01 TBROK
+recvfrom01 TFAIL
 recvmsg01 TBROK
 recvmmsg01 TBROK
 remap_file_pages01 TBROK
@@ -332,10 +328,10 @@ semctl02 TFAIL
 semctl04 TFAIL
 semget02 TFAIL
 semop02 TBROK
-send01 TBROK
+send01 TFAIL
 send02 TBROK
 sendmsg01 TBROK
-sendto01 TBROK
+sendto01 TFAIL
 setdomainname01 TFAIL
 setdomainname02 TFAIL
 setdomainname03 TWARN
@@ -347,7 +343,7 @@ setitimer01 TFAIL
 setns02 TWARN
 setrlimit01 TBROK
 setrlimit06 TFAIL
-setsockopt01 TBROK
+setsockopt01 TFAIL
 setsockopt10 HANG
 settimeofday01 TBROK
 settimeofday02 TFAIL

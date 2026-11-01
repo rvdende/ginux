@@ -627,6 +627,12 @@ pub(super) const LINUX_TCGETS: u64 = 0x5401;
 pub(super) const LINUX_TCSETS: u64 = 0x5402;
 pub(super) const LINUX_TCSETSW: u64 = 0x5403;
 pub(super) const LINUX_TCSETSF: u64 = 0x5404;
+/// The termios2 forms (`struct termios2`: termios and input and output
+/// speeds), which Rust's rustix uses.
+pub(super) const LINUX_TCGETS2: u64 = 0x802c_542a;
+pub(super) const LINUX_TCSETS2: u64 = 0x402c_542b;
+pub(super) const LINUX_TCSETSW2: u64 = 0x402c_542c;
+pub(super) const LINUX_TCSETSF2: u64 = 0x402c_542d;
 pub(super) const LINUX_TIOCSCTTY: u64 = 0x540e;
 pub(super) const LINUX_TIOCGPGRP: u64 = 0x540f;
 pub(super) const LINUX_TIOCSPGRP: u64 = 0x5410;

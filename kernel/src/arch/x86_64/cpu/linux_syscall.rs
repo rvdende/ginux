@@ -42,10 +42,88 @@ pub(super) extern "sysv64" fn linux_syscall_handler(
     user_rflags: u64,
 ) -> u64 {
     LINUX_SYSCALL_ENTRIES.fetch_add(1, Ordering::Relaxed);
+    let traced = linux_strace_call(number, registers);
     let started = timer::timestamp_counter();
     let result = linux_syscall_dispatch(number, registers, user_stack, user_rip, user_rflags);
     crate::linux_profile::time_syscall(number, timer::timestamp_counter().wrapping_sub(started));
+    if let Some(call) = traced.filter(|call| !crate::linux_strace::logged_before(call.number)) {
+        call.log(Some(result));
+    }
     result
+}
+
+/// The trace line of this system call when its process is traced
+/// (`crate::linux_strace`): an exec whose environment asks for it starts a
+/// trace, and a traced process's children are traced too.
+fn linux_strace_call(
+    number: u64,
+    registers: *mut LinuxSyscallFrame,
+) -> Option<crate::linux_strace::Call> {
+    if registers.is_null() || !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::Relaxed) {
+        return None;
+    }
+    // SAFETY: as in linux_syscall_dispatch, the entry stub passes the
+    // aligned base of the saved register frame.
+    let saved = unsafe { registers.read() };
+    let argument = |index: usize| saved.argument(index).unwrap_or(0);
+    // Arguments in order: rdi, rsi, rdx, r10.
+    let arguments = [argument(5), argument(4), argument(3), argument(0)];
+    let instance = linux_execution_instance();
+    let pid = current_linux_process_pid();
+    let environment = match number {
+        LINUX_EXECVE_SYSCALL => Some(arguments[2]),
+        LINUX_EXECVEAT_SYSCALL => Some(arguments[3]),
+        _ => None,
+    };
+    if environment.is_some_and(linux_environment_requests_strace) {
+        crate::linux_strace::trace(instance, pid);
+    }
+    if !crate::linux_strace::active() {
+        return None;
+    }
+    if !crate::linux_strace::traced(instance, pid) {
+        let parent = linux_process::live_process_parent_pid(pid)?;
+        if !crate::linux_strace::traced(instance, parent) {
+            return None;
+        }
+        crate::linux_strace::trace(instance, pid);
+    }
+    let mut call = crate::linux_strace::Call {
+        pid,
+        tid: current_linux_tid().unwrap_or(0),
+        number,
+        arguments,
+        path: [0; 128],
+        path_length: 0,
+    };
+    if let Some(index) = crate::linux_strace::path_argument(number) {
+        let mut path = [0_u8; LINUX_PATH_MAX];
+        if let Ok(length) = copy_linux_c_string(arguments[index], &mut path) {
+            call.path_length = length.min(call.path.len());
+            call.path[..call.path_length].copy_from_slice(&path[..call.path_length]);
+        }
+    }
+    if crate::linux_strace::logged_before(number) {
+        call.log(None);
+    }
+    Some(call)
+}
+
+/// Whether the environment vector at `address` holds `GINUX_STRACE=1`.
+fn linux_environment_requests_strace(address: u64) -> bool {
+    let wanted = crate::linux_strace::ENVIRONMENT;
+    (0..4096_u64)
+        .map_while(|index| {
+            let mut pointer = [0_u8; 8];
+            copy_from_linux_user(address.checked_add(index * 8)?, &mut pointer)
+                .then(|| u64::from_ne_bytes(pointer))
+                .filter(|pointer| *pointer != 0)
+        })
+        .any(|pointer| {
+            let mut entry = [0_u8; 15];
+            copy_from_linux_user(pointer, &mut entry[..wanted.len()])
+                && entry[..wanted.len()] == *wanted
+        })
 }
 
 fn linux_syscall_dispatch(

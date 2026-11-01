@@ -573,3 +573,7 @@ interior-mutable	kernel/src/arch/x86_64/cpu/linux_syscall.rs	LINUX_SYSCALL_ENTRI
 interior-mutable	kernel/src/drivers/virtio_gpu.rs	MAPS_LOGGED	platform-device	allowlist	none	atomic-diagnostic-counter
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_YIELD_ROTATED_AT	domain-runtime	allowlist	none	atomic-yield-rate-limit
 interior-mutable	kernel/src/linux_profile.rs	MEMORY_COUNTS	domain-runtime	allowlist	none	atomic-diagnostic-profile
+interior-mutable	kernel/src/linux_strace.rs	TRACED	domain-runtime	allowlist	none	atomic-diagnostic-trace
+interior-mutable	kernel/src/linux_strace.rs	NEXT	domain-runtime	allowlist	none	atomic-diagnostic-trace
+interior-mutable	kernel/src/linux_strace.rs	ACTIVE	domain-runtime	allowlist	none	atomic-diagnostic-trace
+interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_MAKING_DEV_NODES	domain-runtime	allowlist	none	atomic-reentrancy-guard

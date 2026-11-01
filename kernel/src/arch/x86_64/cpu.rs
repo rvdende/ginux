@@ -24504,15 +24504,9 @@ fn linux_readlink_at(
         Err(error) => return error,
     };
     let path = &path[..path_length];
-    if let Some(descriptor_bytes) = path.strip_prefix(b"/proc/self/fd/") {
-        let Some(descriptor) = descriptor_bytes.iter().try_fold(0_u64, |value, byte| {
-            byte.is_ascii_digit()
-                .then_some(value.checked_mul(10)?.checked_add(u64::from(byte - b'0'))?)
-        }) else {
-            return LINUX_ENOENT;
-        };
+    if let Some(descriptor) = linux_descriptor_link_at(directory, path, false) {
         let mut target = [0_u8; crate::linux_overlay::PATH_CAPACITY];
-        let Some(target_length) = linux_descriptor_path(descriptor, &mut target) else {
+        let Some(target_length) = linux_descriptor_link_target(descriptor, &mut target) else {
             return LINUX_ENOENT;
         };
         let output_length = usize::try_from(output_size)
@@ -26384,13 +26378,9 @@ fn linux_execve_at(
                 Some(length) => Some(length),
                 None => return LINUX_EBADF,
             }
-        } else if let Some(descriptor_bytes) = path[..path_length].strip_prefix(b"/proc/self/fd/") {
-            let Some(descriptor) = descriptor_bytes.iter().try_fold(0_u64, |value, byte| {
-                byte.is_ascii_digit()
-                    .then_some(value.checked_mul(10)?.checked_add(u64::from(byte - b'0'))?)
-            }) else {
-                return LINUX_ENOENT;
-            };
+        } else if let Some(descriptor) =
+            linux_descriptor_link_at(directory, &path[..path_length], true)
+        {
             match linux_descriptor_path(descriptor, &mut resolved) {
                 Some(length) => Some(length),
                 None => return LINUX_ENOENT,
@@ -27385,6 +27375,9 @@ fn linux_canonical_path_at(
     if output[..length].starts_with(b"dev/dri") || output[..length].starts_with(b"sys/dev") {
         crate::linux_drm::ensure_nodes();
     }
+    if &output[..length] == b"dev" || output[..length].starts_with(b"dev/") {
+        linux_ensure_dev_nodes();
+    }
     // Root may search every directory; anyone else needs search permission
     // on each directory the walk passes through.
     if current_linux_credentials().is_some_and(|credentials| !credentials.filesystem_privileged()) {
@@ -27917,13 +27910,29 @@ fn linux_openat_path(
             | LINUX_O_NOFOLLOW
             | LINUX_O_NOATIME
             | LINUX_O_PATH);
-    if let Some(descriptor_bytes) = path[..path_length].strip_prefix(b"/proc/self/fd/") {
-        let Some(descriptor) = descriptor_bytes.iter().try_fold(0_u64, |value, byte| {
-            byte.is_ascii_digit()
-                .then_some(value.checked_mul(10)?.checked_add(u64::from(byte - b'0'))?)
-        }) else {
+    if let Some(descriptor) = linux_descriptor_link_at(directory, &path[..path_length], true) {
+        if !linux_descriptor_open(descriptor) {
             return LINUX_ENOENT;
-        };
+        }
+        // A pipe end opens again as itself, with this open's flags. Linux
+        // would also open the other end; opening a socket is ENXIO.
+        if linux_pipe_descriptor(descriptor) {
+            let end = linux_device_descriptor(descriptor) & 3;
+            if (access + 1) as u16 & !end != 0 {
+                return LINUX_ENXIO;
+            }
+            let reopened = linux_device_dup_at_least(descriptor, 0, flags & LINUX_O_CLOEXEC != 0);
+            if let Some(status) = (reopened < LINUX_RETURN_TO_KERNEL)
+                .then(|| linux_socket_flags_cell(reopened))
+                .flatten()
+            {
+                linux_descriptor_set_status_flags(status, flags, LINUX_O_NONBLOCK);
+            }
+            return reopened;
+        }
+        if linux_socket_slot(descriptor).is_some() {
+            return LINUX_ENXIO;
+        }
         if linux_overlay_descriptor_handle(descriptor).is_some() {
             let reopened = linux_device_dup_at_least(descriptor, 0, flags & LINUX_O_CLOEXEC != 0);
             if reopened >= LINUX_RETURN_TO_KERNEL {
@@ -27957,9 +27966,13 @@ fn linux_openat_path(
             }
             return reopened;
         }
+        // Anything else opens again by its path (the console as
+        // /dev/console); one with no path (an eventfd) cannot be opened.
         let mut resolved = [0_u8; crate::linux_overlay::PATH_CAPACITY];
-        let Some(resolved_length) = linux_descriptor_path(descriptor, &mut resolved) else {
-            return LINUX_ENOENT;
+        let Some(resolved_length) = linux_descriptor_link_target(descriptor, &mut resolved)
+            .filter(|length| resolved[..*length].starts_with(b"/"))
+        else {
+            return LINUX_ENXIO;
         };
         path[..resolved_length].copy_from_slice(&resolved[..resolved_length]);
         path_length = resolved_length;
@@ -28137,16 +28150,20 @@ fn linux_openat_path(
     }
     if let Some(metadata) = overlay_metadata {
         overlay_handle = Some(metadata.handle);
-        if flags & LINUX_O_TRUNC != 0
-            && (access == 0 || metadata.kind != crate::linux_overlay::NodeKind::File)
+        // O_TRUNC truncates regular files only; Linux ignores it for
+        // devices and FIFOs (`2>/dev/null` opens O_CREAT|O_TRUNC).
+        let regular = metadata.kind == crate::linux_overlay::NodeKind::File;
+        if flags & LINUX_O_TRUNC != 0 && metadata.kind == crate::linux_overlay::NodeKind::Directory
         {
-            return if metadata.kind == crate::linux_overlay::NodeKind::Directory {
-                LINUX_EISDIR
-            } else {
-                LINUX_EACCES
-            };
+            return LINUX_EISDIR;
         }
-        if flags & LINUX_O_TRUNC != 0 && !crate::linux_overlay::truncate(metadata.handle, 0) {
+        if flags & LINUX_O_TRUNC != 0 && regular && access == 0 {
+            return LINUX_EACCES;
+        }
+        if flags & LINUX_O_TRUNC != 0
+            && regular
+            && !crate::linux_overlay::truncate(metadata.handle, 0)
+        {
             return LINUX_EIO;
         }
     } else if canonical_length.is_some()
@@ -28232,11 +28249,17 @@ fn linux_openat_path(
             {
                 return linux_open_render_node(flags);
             }
+            // A device file opens the kernel's device itself: the
+            // descriptor keeps no tie to the file, so reads and writes go
+            // to the device and fstat shows it.
             Some(
                 kind @ (crate::linux_overlay::NodeKind::CharacterDevice
                 | crate::linux_overlay::NodeKind::BlockDevice),
             ) => match linux_device_node_kind(handle, kind) {
-                Ok(kind) => kind,
+                Ok(kind) => {
+                    overlay_handle = None;
+                    kind
+                }
                 Err(error) => return error,
             },
             None => return LINUX_ENOENT,
@@ -29044,6 +29067,18 @@ fn linux_newfstatat(directory: u64, path_address: u64, stat_address: u64, flags:
             LINUX_EFAULT
         };
     }
+    if let Some(stat) =
+        linux_descriptor_link_path_stat(directory, path, flags & LINUX_AT_SYMLINK_NOFOLLOW == 0)
+    {
+        let Some(stat) = stat else {
+            return LINUX_ENOENT;
+        };
+        return if copy_to_linux_user(stat_address, &stat) {
+            0
+        } else {
+            LINUX_EFAULT
+        };
+    }
     if let Some(kind) = linux_virtual_mount_path_at(directory, path) {
         let stat = if kind & LINUX_DEVICE_DIRECTORY != 0 {
             linux_stat(
@@ -29199,6 +29234,67 @@ fn linux_mkdirat(directory: u64, path_address: u64, mode: u64) -> u64 {
 /// Creates the root cgroup's control files if they are missing. /proc/mounts
 /// shows cgroup2 mounted at /sys/fs/cgroup from the start, so they must
 /// exist before anything mounts it.
+/// Set while `linux_ensure_dev_nodes` makes the nodes: making one walks its
+/// parent, `/dev`, which comes back here.
+static LINUX_MAKING_DEV_NODES: AtomicBool = AtomicBool::new(false);
+
+/// Makes the kernel's devices and Linux's standard links in the domain's
+/// `/dev` (in its overlay) the first time a path under `/dev` is walked, so
+/// listing it and lstat find what open and stat already do: `null`,
+/// `zero`, `console` and `tty` (`LinuxCharacterDevice`), `fd`, `stdin`,
+/// `stdout` and `stderr` linking into `/proc/self/fd`, and `shm` for POSIX
+/// shared memory.
+fn linux_ensure_dev_nodes() {
+    const LINKS: [(&[u8], &[u8]); 4] = [
+        (b"dev/fd", b"/proc/self/fd"),
+        (b"dev/stdin", b"/proc/self/fd/0"),
+        (b"dev/stdout", b"/proc/self/fd/1"),
+        (b"dev/stderr", b"/proc/self/fd/2"),
+    ];
+    // dev/stderr is made last: once it exists, everything does (or the
+    // domain removed some on purpose).
+    if crate::linux_overlay::lookup(b"dev/stderr").is_some()
+        || crate::linux_overlay::hidden(b"dev/stderr")
+        || LINUX_MAKING_DEV_NODES.swap(true, Ordering::Acquire)
+    {
+        return;
+    }
+    let root_owned = |handle: Option<crate::linux_overlay::Handle>| {
+        if let Some(handle) = handle {
+            let _ = crate::linux_overlay::set_owner(handle, 0, 0);
+        }
+    };
+    let image_has = |path: &[u8]| crate::published_rootfs::exact_entry(path).is_some();
+    if !image_has(b"dev") && crate::linux_overlay::lookup(b"dev").is_none() {
+        root_owned(crate::linux_overlay::create_directory(b"dev", 0o755));
+    }
+    if !image_has(b"dev/shm") && crate::linux_overlay::lookup(b"dev/shm").is_none() {
+        root_owned(crate::linux_overlay::create_directory(b"dev/shm", 0o1777));
+    }
+    for (name, device) in [
+        (&b"dev/null"[..], LinuxCharacterDevice::Null),
+        (b"dev/zero", LinuxCharacterDevice::Zero),
+        (b"dev/console", LinuxCharacterDevice::Console),
+        (b"dev/tty", LinuxCharacterDevice::Tty),
+    ] {
+        if crate::linux_overlay::lookup(name).is_none() {
+            let (_, major, minor, permissions) = device.identity();
+            root_owned(crate::linux_overlay::create_device(
+                name,
+                crate::linux_overlay::NodeKind::CharacterDevice,
+                permissions,
+                major << 8 | minor,
+            ));
+        }
+    }
+    for (name, target) in LINKS {
+        if crate::linux_overlay::lookup(name).is_none() {
+            root_owned(crate::linux_overlay::create_symlink(name, target));
+        }
+    }
+    LINUX_MAKING_DEV_NODES.store(false, Ordering::Release);
+}
+
 fn linux_ensure_cgroup_root() -> bool {
     [
         (&b"sys/fs/cgroup/cgroup.procs"[..], &b""[..]),
@@ -29537,15 +29633,7 @@ fn linux_linkat(
     let by_descriptor = if old_path_length == 0 && flags & AT_EMPTY_PATH != 0 {
         Some(old_directory)
     } else if flags & AT_SYMLINK_FOLLOW != 0 {
-        old_path[..old_path_length]
-            .strip_prefix(b"/proc/self/fd/")
-            .and_then(|digits| {
-                digits.iter().try_fold(0_u64, |value, byte| {
-                    byte.is_ascii_digit()
-                        .then(|| value.checked_mul(10)?.checked_add(u64::from(byte - b'0')))
-                        .flatten()
-                })
-            })
+        linux_descriptor_link_at(old_directory, &old_path[..old_path_length], true)
     } else {
         None
     };
@@ -30987,6 +31075,18 @@ fn linux_statx(directory: u64, path_address: u64, flags: u64, mask: u64, stat_ad
         };
         let statx = linux_statx_from_stat(&stat);
         return if copy_to_linux_user(stat_address, &statx) {
+            0
+        } else {
+            LINUX_EFAULT
+        };
+    }
+    if let Some(stat) =
+        linux_descriptor_link_path_stat(directory, path, flags & LINUX_AT_SYMLINK_NOFOLLOW == 0)
+    {
+        let Some(stat) = stat else {
+            return LINUX_ENOENT;
+        };
+        return if copy_to_linux_user(stat_address, &linux_statx_from_stat(&stat)) {
             0
         } else {
             LINUX_EFAULT
@@ -39500,6 +39600,29 @@ fn linux_tty_ioctl(request: u64, argument: u64) -> u64 {
                 LINUX_ENOTTY
             }
         }
+        // termios2: the same settings followed by the input and output
+        // speeds, which the console reports as 38400 baud and ignores.
+        LINUX_TCGETS2 => {
+            let result = linux_tty_get_termios(argument);
+            let speeds = [38_400_u32.to_ne_bytes(), 38_400_u32.to_ne_bytes()].concat();
+            if result != 0 {
+                result
+            } else if argument
+                .checked_add(36)
+                .is_some_and(|address| copy_to_linux_user(address, &speeds))
+            {
+                0
+            } else {
+                LINUX_EFAULT
+            }
+        }
+        LINUX_TCSETS2 | LINUX_TCSETSW2 | LINUX_TCSETSF2 => {
+            if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
+                linux_tty_set_termios(argument)
+            } else {
+                LINUX_ENOTTY
+            }
+        }
         LINUX_TIOCSCTTY => {
             let Some(session) = linux_process::live_process_session(pid) else {
                 return LINUX_ESRCH;
@@ -40906,13 +41029,8 @@ fn linux_descriptor_close_live_return(
     let blocked_writer = closes_pipe_reader.then(blocked_linux_pipe_writer).flatten();
     let result = linux_descriptor_close_with_wake(descriptor, false);
     if result != 0 {
-        if result == LINUX_EBADF && X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
-            serial_write("ginux: close syscall rejected pid/fd: ");
-            serial_write_u64(u64::from(current_linux_process_pid()));
-            serial_write(" ");
-            serial_write_u64(descriptor);
-            serial_write("\r\n");
-        }
+        // EBADF is an ordinary answer: shells close descriptors that may
+        // not be open.
         return result;
     }
     let Some(target) = blocked_writer else {
@@ -41595,6 +41713,19 @@ fn linux_fcntl_setlkw_live_return(
     }
 }
 
+/// The status flags (O_NONBLOCK, O_APPEND) of socket or pipe `descriptor`.
+fn linux_socket_flags_cell(descriptor: u64) -> Option<&'static AtomicU32> {
+    linux_socket_slot(descriptor)?;
+    usize::try_from(descriptor)
+        .ok()
+        .and_then(|index| X86_RUNTIME.ELF_PROBE_STDIO_SOCKET_FLAGS.get(index))
+        .or_else(|| {
+            X86_RUNTIME
+                .ELF_PROBE_SOCKET_FLAGS
+                .get(linux_socket_descriptor_index(descriptor)?)
+        })
+}
+
 fn linux_descriptor_set_nonblocking(flags: &dyn LinuxFileCell<u32>, argument: u64) -> u64 {
     linux_descriptor_set_status_flags(flags, argument, LINUX_O_NONBLOCK)
 }
@@ -41920,27 +42051,35 @@ fn linux_getdents(descriptor: u64, address: u64, count: u64, legacy: bool) -> u6
                 }
             }
         } else if directory == b"proc/1" {
-            let entry_count = if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
-                10
-            } else {
-                8
-            };
+            let runtime = X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst);
+            let entry_count = if runtime { 15 } else { 8 };
             if cursor > entry_count {
                 return LINUX_EINVAL;
             }
-            for (index, inode, name) in [
-                (0_usize, 17_u64, &b"status"[..]),
-                (1_usize, 19_u64, &b"mountinfo"[..]),
-                (2_usize, 20_u64, &b"uid_map"[..]),
-                (3_usize, 21_u64, &b"gid_map"[..]),
-                (4_usize, 22_u64, &b"setgroups"[..]),
-                (5_usize, 32_u64, &b"stat"[..]),
-                (6_usize, 33_u64, &b"statm"[..]),
-                (7_usize, 37_u64, &b"cgroup"[..]),
-                (8_usize, 40_u64, &b"cmdline"[..]),
-                (9_usize, 41_u64, &b"environ"[..]),
+            let file = |kind| linux_regular_file_inode(kind).unwrap_or(0);
+            for (index, (inode, kind, name)) in [
+                (17_u64, 8_u8, &b"status"[..]),
+                (19, 8, b"mountinfo"),
+                (20, 8, b"uid_map"),
+                (21, 8, b"gid_map"),
+                (22, 8, b"setgroups"),
+                (32, 8, b"stat"),
+                (33, 8, b"statm"),
+                (37, 8, b"cgroup"),
+                (40, 8, b"cmdline"),
+                (41, 8, b"environ"),
+                (file(LINUX_FILE_PROC_DYNAMIC_MAPS), 8, b"maps"),
+                (file(LINUX_FILE_PROC_MOUNTS), 8, b"mounts"),
+                (file(LINUX_FILE_PROC_OOM_SCORE_ADJ), 8, b"oom_score_adj"),
+                (
+                    linux_root_directory_inode(LINUX_PROC_FD_DIRECTORY).unwrap_or(0),
+                    4,
+                    b"fd",
+                ),
+                (47, 10, b"exe"),
             ]
             .into_iter()
+            .enumerate()
             .take(entry_count)
             {
                 if cursor == index {
@@ -41950,7 +42089,7 @@ fn linux_getdents(descriptor: u64, address: u64, count: u64, legacy: bool) -> u6
                         legacy,
                         inode,
                         (index + 3) as i64,
-                        8,
+                        kind,
                         name,
                     ) {
                         if used == 0 {
@@ -43814,8 +43953,11 @@ fn linux_descriptor_stat(descriptor: u64) -> Option<[u8; LINUX_STAT_SIZE]> {
     {
         return Some(linux_console_stat());
     }
+    // Pipes and sockets are numbered by their socket slot, as Linux's
+    // pipefs and sockfs inodes tell them apart.
+    let socket_inode = || 0x1000 + linux_socket_slot(descriptor).map_or(0, u64::from);
     if linux_pipe_descriptor(descriptor) {
-        return Some(linux_stat(LINUX_STAT_FIFO_MODE, 3));
+        return Some(linux_stat(LINUX_STAT_FIFO_MODE, socket_inode()));
     }
     if let Some((class, _)) = linux_object_descriptor(descriptor) {
         if class == crate::linux_drm::CLASS_FILE {
@@ -43827,7 +43969,7 @@ fn linux_descriptor_stat(descriptor: u64) -> Option<[u8; LINUX_STAT_SIZE]> {
         return Some(linux_stat(LINUX_STAT_ANONYMOUS_MODE, 4));
     }
     if linux_socket_slot(descriptor).is_some() {
-        return Some(linux_stat(LINUX_STAT_SOCKET_MODE, 4));
+        return Some(linux_stat(LINUX_STAT_SOCKET_MODE, socket_inode()));
     }
     if linux_epoll_descriptor(descriptor)
         || linux_eventfd_descriptor(descriptor)
@@ -44108,21 +44250,16 @@ fn linux_mount_filesystem(
         target_length -= 1;
     }
     let mut resolved_target = [0_u8; crate::linux_overlay::PATH_CAPACITY];
-    let target =
-        if let Some(descriptor_bytes) = target[..target_length].strip_prefix(b"/proc/self/fd/") {
-            let Some(descriptor) = descriptor_bytes.iter().try_fold(0_u64, |value, byte| {
-                byte.is_ascii_digit()
-                    .then_some(value.checked_mul(10)?.checked_add(u64::from(byte - b'0'))?)
-            }) else {
-                return LINUX_ENOENT;
-            };
-            let Some(length) = linux_descriptor_path(descriptor, &mut resolved_target) else {
-                return LINUX_ENOENT;
-            };
-            &resolved_target[..length]
-        } else {
-            &target[..target_length]
+    let target = if let Some(descriptor) =
+        linux_descriptor_link_at(LINUX_AT_FDCWD.into(), &target[..target_length], true)
+    {
+        let Some(length) = linux_descriptor_path(descriptor, &mut resolved_target) else {
+            return LINUX_ENOENT;
         };
+        &resolved_target[..length]
+    } else {
+        &target[..target_length]
+    };
     let target_is_api_directory = matches!(
         target,
         b"/dev/shm"
@@ -44370,6 +44507,184 @@ fn linux_mount_setattr(
         }
     }
     0
+}
+
+/// The descriptor a `/proc/self/fd/N` magic link in `path` names, with
+/// `path` taken relative to `directory` as a path argument is: also
+/// `/proc/thread-self/fd/N`, the caller's own `/proc/PID/fd/N`, `/dev/fd/N`
+/// (`/dev/fd` links to `/proc/self/fd`) and, through a directory descriptor
+/// of `/proc/self/fd`, plain `N`. With `follow`, also `/dev/stdin`,
+/// `/dev/stdout` and `/dev/stderr`, links to the first three.
+fn linux_descriptor_link_at(directory: u64, path: &[u8], follow: bool) -> Option<u64> {
+    let mut absolute = [0_u8; 96];
+    let path = if path.starts_with(b"/") {
+        path
+    } else {
+        if directory as u32 == LINUX_AT_FDCWD {
+            return None;
+        }
+        let parent = linux_measured_directory_path(linux_device_descriptor(directory))?;
+        let length = 1 + parent.len() + 1 + path.len();
+        let output = absolute.get_mut(..length)?;
+        output[0] = b'/';
+        output[1..1 + parent.len()].copy_from_slice(parent);
+        output[1 + parent.len()] = b'/';
+        output[2 + parent.len()..].copy_from_slice(path);
+        output
+    };
+    let digits = if let Some(rest) = path.strip_prefix(b"/proc/") {
+        let separator = rest.iter().position(|byte| *byte == b'/')?;
+        let owner = &rest[..separator];
+        let own = |id: u32| {
+            let mut number = [0_u8; 10];
+            let mut length = 0;
+            let mut value = id;
+            loop {
+                number[length] = b'0' + (value % 10) as u8;
+                length += 1;
+                value /= 10;
+                if value == 0 {
+                    break;
+                }
+            }
+            number[..length].reverse();
+            owner == &number[..length]
+        };
+        if !(owner == b"self"
+            || owner == b"thread-self"
+            || own(current_linux_process_pid())
+            || current_linux_tid().is_some_and(own))
+        {
+            return None;
+        }
+        rest[separator + 1..].strip_prefix(b"fd/")?
+    } else if let Some(digits) = path.strip_prefix(b"/dev/fd/") {
+        digits
+    } else {
+        return match (follow, path) {
+            (true, b"/dev/stdin") => Some(0),
+            (true, b"/dev/stdout") => Some(1),
+            (true, b"/dev/stderr") => Some(2),
+            _ => None,
+        };
+    };
+    if digits.is_empty() || digits.len() > 10 {
+        return None;
+    }
+    digits.iter().try_fold(0_u64, |value, byte| {
+        byte.is_ascii_digit()
+            .then(|| value * 10 + u64::from(byte - b'0'))
+    })
+}
+
+/// What `readlink` shows for `descriptor`'s `/proc/self/fd` entry: the
+/// path of its file, or Linux's name for one that has none.
+fn linux_descriptor_link_target(
+    descriptor: u64,
+    output: &mut [u8; crate::linux_overlay::PATH_CAPACITY],
+) -> Option<usize> {
+    if let Some(length) = linux_descriptor_path(descriptor, output) {
+        return Some(length);
+    }
+    if !linux_descriptor_open(descriptor) {
+        return None;
+    }
+    let state = linux_device_descriptor(descriptor);
+    let inode = linux_descriptor_stat(descriptor).map_or(0, |stat| {
+        u64::from_ne_bytes(stat[8..16].try_into().unwrap_or([0; 8]))
+    });
+    let (prefix, numbered): (&[u8], bool) = if linux_pipe_descriptor(descriptor) {
+        (b"pipe:[", true)
+    } else if linux_socket_slot(descriptor).is_some() {
+        (b"socket:[", true)
+    } else if linux_epoll_descriptor(descriptor) {
+        (b"anon_inode:[eventpoll]", false)
+    } else if linux_eventfd_descriptor(descriptor) {
+        (b"anon_inode:[eventfd]", false)
+    } else if linux_timerfd_descriptor(descriptor) {
+        (b"anon_inode:[timerfd]", false)
+    } else if linux_signalfd_descriptor(descriptor) {
+        (b"anon_inode:[signalfd]", false)
+    } else if linux_inotify_descriptor(descriptor) {
+        (b"anon_inode:inotify", false)
+    } else if linux_pidfd_descriptor(descriptor) {
+        (b"anon_inode:[pidfd]", false)
+    } else if linux_userfaultfd_descriptor(descriptor) {
+        (b"anon_inode:[userfaultfd]", false)
+    } else if linux_fanotify_descriptor(descriptor) {
+        (b"anon_inode:[fanotify]", false)
+    } else if linux_io_uring_descriptor(descriptor) {
+        (b"anon_inode:[io_uring]", false)
+    } else if linux_object_descriptor(descriptor)
+        .is_some_and(|(class, _)| class == crate::linux_drm::CLASS_FILE)
+    {
+        (b"/dev/dri/renderD128", false)
+    } else if let Some(device) = linux_graphics_device(state) {
+        match device {
+            LinuxGraphicsDevice::Framebuffer => (b"/dev/fb0", false),
+            LinuxGraphicsDevice::Input(_) => (b"/dev/input/event", true),
+        }
+    } else {
+        match LinuxCharacterDevice::from_kind(state) {
+            LinuxCharacterDevice::Null if state != 0 => (b"/dev/null", false),
+            LinuxCharacterDevice::Zero => (b"/dev/zero", false),
+            _ => (b"/dev/console", false),
+        }
+    };
+    output.get_mut(..prefix.len())?.copy_from_slice(prefix);
+    let mut length = prefix.len();
+    if numbered {
+        let number = match linux_graphics_device(state) {
+            Some(LinuxGraphicsDevice::Input(device)) => device as u64,
+            _ => inode,
+        };
+        let mut digits = [0_u8; 20];
+        let mut count = 0;
+        let mut value = number;
+        loop {
+            digits[count] = b'0' + (value % 10) as u8;
+            count += 1;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
+        }
+        for digit in digits[..count].iter().rev() {
+            *output.get_mut(length)? = *digit;
+            length += 1;
+        }
+        if prefix.ends_with(b"[") {
+            *output.get_mut(length)? = b']';
+            length += 1;
+        }
+    }
+    Some(length)
+}
+
+/// lstat of `descriptor`'s `/proc/self/fd` entry: a symbolic link, as
+/// listed by getdents (inode 1000 + N), its size the target's length.
+fn linux_descriptor_link_stat(descriptor: u64) -> Option<[u8; LINUX_STAT_SIZE]> {
+    let mut target = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    let length = linux_descriptor_link_target(descriptor, &mut target)?;
+    let mut stat = linux_stat(0o120_777, 1_000 + descriptor);
+    stat[48..56].copy_from_slice(&(length as u64).to_ne_bytes());
+    Some(stat)
+}
+
+/// stat of what the magic link `path` names (`linux_descriptor_link_at`)
+/// when following it, else of the link; `Some(None)` when its descriptor is
+/// not open, `None` when `path` is no such link.
+fn linux_descriptor_link_path_stat(
+    directory: u64,
+    path: &[u8],
+    follow: bool,
+) -> Option<Option<[u8; LINUX_STAT_SIZE]>> {
+    let descriptor = linux_descriptor_link_at(directory, path, follow)?;
+    Some(if follow {
+        linux_descriptor_stat(descriptor)
+    } else {
+        linux_descriptor_link_stat(descriptor)
+    })
 }
 
 fn linux_descriptor_path(
