@@ -744,7 +744,12 @@ pub(super) extern "sysv64" fn linux_syscall_handler(
         ),
         LINUX_BRK_SYSCALL => {
             if runtime_mode {
-                linux_runtime_brk(first_argument)
+                let previous = X86_RUNTIME.ELF_PROBE_BRK.load(Ordering::SeqCst);
+                let program_break = linux_runtime_brk(first_argument);
+                if program_break != previous {
+                    linux_record_heap(program_break);
+                }
+                program_break
             } else {
                 let current = X86_RUNTIME.ELF_PROBE_BRK.load(Ordering::SeqCst);
                 let limit = X86_RUNTIME.ELF_PROBE_BRK_LIMIT.load(Ordering::SeqCst);

@@ -21645,6 +21645,46 @@ fn linux_record_exec_image(
             },
         );
     }
+    let stack = X86_RUNTIME.ELF_PROBE_STACK_LOW.load(Ordering::SeqCst)
+        ..X86_RUNTIME.ELF_PROBE_STACK.load(Ordering::SeqCst);
+    if !stack.is_empty() {
+        crate::linux_areas::map(
+            linux_execution_instance(),
+            current_linux_process_pid(),
+            Area {
+                start: stack.start,
+                end: stack.end,
+                protection: Protection::from_bits(LINUX_PROT_READ | LINUX_PROT_WRITE),
+                shared: false,
+                backing: Backing::Stack,
+            },
+        );
+    }
+}
+
+/// Records the program break's heap, from its base up to `program_break`.
+fn linux_record_heap(program_break: u64) {
+    use crate::linux_areas::{Area, Backing, Protection};
+    let limit = X86_RUNTIME.ELF_PROBE_BRK_LIMIT.load(Ordering::SeqCst);
+    let base = limit.saturating_sub((LINUX_RUNTIME_HEAP_PAGES * PAGE_SIZE) as u64);
+    let (instance, pid) = (linux_execution_instance(), current_linux_process_pid());
+    crate::linux_areas::unmap(instance, pid, base, limit - base);
+    let Some(end) = program_break.checked_next_multiple_of(PAGE_SIZE as u64) else {
+        return;
+    };
+    if end > base {
+        crate::linux_areas::map(
+            instance,
+            pid,
+            Area {
+                start: base,
+                end: end.min(limit),
+                protection: Protection::from_bits(LINUX_PROT_READ | LINUX_PROT_WRITE),
+                shared: false,
+                backing: Backing::Heap,
+            },
+        );
+    }
 }
 
 /// Records a successful mmap of `length` bytes at `address` in the
