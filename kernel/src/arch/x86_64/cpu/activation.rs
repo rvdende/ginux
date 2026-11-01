@@ -14,10 +14,18 @@
 //! rest of the slot unmapped, so kernel work that overflows its stack faults
 //! on a guard page (reported as a double fault) instead of overwriting the
 //! memory below it. Stacks are reused, never unmapped.
+//!
+//! A kernel context parks on its stack by switching to another: the switch
+//! saves the callee-saved registers and the stack pointer, loads another
+//! context's, and returns into wherever that one switched away (or, for a
+//! new context, into its function). This is how a blocked system call will
+//! wait on its own stack while others run; `verify_stack_switching` proves
+//! the mechanism at boot.
 
 use alloc::vec::Vec;
 use core::arch::global_asm;
 use core::ffi::c_void;
+use core::mem::size_of;
 
 use crate::arch::x86_64::paging;
 use crate::memory::{self, FrameOwner};
@@ -76,6 +84,10 @@ static STACK_POOL: SpinLock<StackPool> = SpinLock::new(
     },
 );
 
+/// Whether the first activation has checked stack switching yet.
+static SWITCHING_VERIFIED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Processes with a live activation, outermost first.
 static ACTIVE_PIDS: SpinLock<Vec<u32>> = SpinLock::new(LockRank::KERNEL_STACKS, Vec::new());
 
@@ -104,7 +116,43 @@ ginux_call_on_stack:
 "#
 );
 
+global_asm!(
+    r#"
+    .text
+    .global ginux_switch_stack
+// ginux_switch_stack(save: rdi, load: rsi) saves the callee-saved registers
+// on the current stack, stores its stack pointer at [rdi], loads the stack
+// pointer in rsi, restores that context's callee-saved registers and
+// returns into wherever it switched away.
+ginux_switch_stack:
+    push rbp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov [rdi], rsp
+    mov rsp, rsi
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+    .global ginux_context_start
+// A new context's first switch returns here with its function in r12 and
+// the function's argument in r13. The function never returns.
+ginux_context_start:
+    mov rdi, r13
+    call r12
+    ud2
+"#
+);
+
 extern "sysv64" {
+    fn ginux_switch_stack(save: *mut usize, load: usize);
+    fn ginux_context_start();
     fn ginux_call_on_stack(
         top: usize,
         function: extern "sysv64" fn(*mut c_void),
@@ -142,19 +190,17 @@ pub(super) unsafe fn enter_on_own_stack(
     general: *const u64,
     rflags: u64,
 ) -> bool {
-    let kernel_stack = {
-        let mut pool = STACK_POOL.lock();
-        match pool.free.pop() {
-            Some(stack) => stack,
-            None => {
-                let slot = pool.next_slot;
-                let Some(stack) = KernelStack::new(slot) else {
-                    return false;
-                };
-                pool.next_slot = slot + 1;
-                stack
-            }
+    // The first activation proves stack switching on the stack window it
+    // is about to use (the self-test cannot run earlier in boot, before
+    // the runtime owns its frames).
+    if !SWITCHING_VERIFIED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        if !verify_stack_switching() {
+            crate::kernel_fail("ginux: kernel stack switching invalid\r\n");
         }
+        crate::serial_write_raw(b"ginux: kernel stack switching validated\r\n");
+    }
+    let Some(kernel_stack) = take_stack() else {
+        return false;
     };
     {
         let mut active = ACTIVE_PIDS.lock();
@@ -186,6 +232,101 @@ pub(super) unsafe fn enter_on_own_stack(
         }
     }
     STACK_POOL.lock().free.push(kernel_stack);
+    true
+}
+
+/// Takes a kernel stack from the pool, or maps a new one.
+fn take_stack() -> Option<KernelStack> {
+    let mut pool = STACK_POOL.lock();
+    if let Some(stack) = pool.free.pop() {
+        return Some(stack);
+    }
+    let slot = pool.next_slot;
+    let stack = KernelStack::new(slot)?;
+    pool.next_slot = slot + 1;
+    Some(stack)
+}
+
+/// Lays out a new context on the stack ending at `top` so that switching
+/// to the returned stack pointer starts `function(argument)`.
+///
+/// # Safety
+///
+/// `top` must be the 16-byte aligned end of a mapped kernel stack that
+/// nothing else uses while the context lives.
+unsafe fn new_context(
+    top: usize,
+    function: extern "sysv64" fn(*mut c_void) -> !,
+    argument: *mut c_void,
+) -> usize {
+    // Six callee-saved registers and the return address, placed so that
+    // the stack is 16-byte aligned when ginux_context_start calls function.
+    let saved = top - 9 * size_of::<usize>();
+    let frame = saved as *mut usize;
+    let words = [
+        0,                                         // r15
+        0,                                         // r14
+        argument as usize,                         // r13
+        function as usize,                         // r12
+        0,                                         // rbx
+        0,                                         // rbp
+        ginux_context_start as *const () as usize, // return address
+    ];
+    for (index, word) in words.into_iter().enumerate() {
+        // SAFETY: the caller hands over the stack below `top`, and these
+        // seven words lie within its top page.
+        unsafe { frame.add(index).write(word) };
+    }
+    saved
+}
+
+/// The state the switching self-test passes between its two contexts.
+struct PingPong {
+    boot: usize,
+    context: usize,
+    rounds: u32,
+}
+
+extern "sysv64" fn ping_pong(argument: *mut c_void) -> ! {
+    let state = argument.cast::<PingPong>();
+    loop {
+        // SAFETY: verify_stack_switching keeps the state alive and only
+        // touches it while this context is parked.
+        unsafe {
+            (*state).rounds += 1;
+            ginux_switch_stack(&raw mut (*state).context, (*state).boot);
+        }
+    }
+}
+
+/// Starts a context on a stack of its own, switches into it and back three
+/// times, and checks each round ran on that stack and came back here.
+pub(super) fn verify_stack_switching() -> bool {
+    let Some(stack) = take_stack() else {
+        return false;
+    };
+    let mut state = PingPong {
+        boot: 0,
+        context: 0,
+        rounds: 0,
+    };
+    let state_pointer = &raw mut state;
+    // SAFETY: the stack is this test's until it goes back to the pool, and
+    // the state outlives every switch into the context.
+    unsafe {
+        (*state_pointer).context = new_context(stack.top, ping_pong, state_pointer.cast());
+        for round in 1..=3 {
+            ginux_switch_stack(&raw mut (*state_pointer).boot, (*state_pointer).context);
+            let parked = (*state_pointer).context;
+            if (*state_pointer).rounds != round
+                || !(stack.top - STACK_SIZE..stack.top).contains(&parked)
+            {
+                return false;
+            }
+        }
+    }
+    // The context stays parked; its stack is reused like any other.
+    STACK_POOL.lock().free.push(stack);
     true
 }
 

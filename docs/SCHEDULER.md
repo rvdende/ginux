@@ -205,6 +205,20 @@ Order:
 Progress on step 1: every dispatched process is entered through
 `run_dispatched_linux_process` (cpu.rs), the place the loop will own.
 
+Progress on kernel stacks (2026-11-01): every activation already runs on a
+guarded 256 KiB kernel stack of its own (`cpu/activation.rs`), and the
+switch between kernel contexts now exists: `ginux_switch_stack(save, load)`
+saves the callee-saved registers and stack pointer, loads another
+context's and returns into it, and `new_context` lays out a fresh stack
+so its first switch starts a function. `verify_stack_switching` runs at
+every boot ("kernel stack switching validated"). The next step uses it: a
+system call that must wait parks its activation (switches to the
+scheduler's context, keeping its frames on its own stack) instead of
+yielding with a restart, and the loop at the runtime entry resumes parked
+activations when what they wait for is ready. That removes the restart
+model's stale contexts (the checkpoint timeouts above) and lets pause()
+sleep without the starvation rename14 showed.
+
 First attempt at step 4 (2026-11-01, parked behind
 `LINUX_SCHEDULER_LOOP = false` in cpu.rs): init yields like every other
 process (`yield_current_linux_process` no longer refuses pid 1) and
