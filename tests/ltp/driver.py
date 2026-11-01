@@ -94,10 +94,10 @@ def parse_list(path, default_budget):
     return tests
 
 
-# A result line from the new LTP API ("file.c:12: TFAIL: ...") or the old
-# one ("name    1  TFAIL  :  ...").
-RESULT_PRINTED_TFAIL = re.compile(rb"(?m)(?:\.c:\d+: |^\S+\s+\d+\s+)TFAIL\b")
-RESULT_PRINTED_TBROK = re.compile(rb"(?m)(?:\.c:\d+: |^\S+\s+\d+\s+)TBROK\b")
+def printed_result(output, kind):
+    """Whether the test printed a `kind` result line: from the new LTP API
+    ("file.c:12: TFAIL: ...") or the old one ("name    1  TFAIL  :  ...")."""
+    return re.search(rb"(?m)(?:\.c:\d+: |^\S+\s+\d+\s+)" + kind + rb"\b", output) is not None
 
 
 def classify(status, output, budget):
@@ -123,10 +123,13 @@ def classify(status, output, budget):
         # does not yet reach the library's process from the test, so the
         # exit status can claim success after the test reported a failure:
         # the results it printed decide.
-        if RESULT_PRINTED_TBROK.search(output):
-            return "TBROK", f"{status} (TBROK printed)"
-        if RESULT_PRINTED_TFAIL.search(output):
-            return "TFAIL", f"{status} (TFAIL printed)"
+        # LTP's rule: any break, failure or warning marks the test; skips
+        # (TCONF) only when nothing passed.
+        for kind in (b"TBROK", b"TFAIL", b"TWARN"):
+            if printed_result(output, kind):
+                return kind.decode(), f"{status} ({kind.decode()} printed)"
+        if printed_result(output, b"TCONF") and not printed_result(output, b"TPASS"):
+            return "TCONF", f"{status} (TCONF printed)"
         return "TPASS", status
     if code in (126, 127):
         return "TBROK", f"{status} (could not execute)"

@@ -29,7 +29,13 @@ pub(super) fn linux_clock_gettime(clock: u64, output_address: u64) -> u64 {
     let mut timespec = [0_u8; 16];
     timespec[..8].copy_from_slice(&seconds.to_ne_bytes());
     timespec[8..].copy_from_slice(&nanoseconds.to_ne_bytes());
-    if !address_space::copy_to_current_linux_user_fast(output_address, &timespec) {
+    // The fast copy takes only pages already present and writable; one not
+    // yet touched or shared copy-on-write is made writable by the full copy
+    // (on the boot CPU, which may change page tables).
+    if !address_space::copy_to_current_linux_user_fast(output_address, &timespec)
+        && (current_linux_runtime_cpu_index() != 0
+            || !copy_to_linux_user(output_address, &timespec))
+    {
         return LINUX_EFAULT;
     }
     0

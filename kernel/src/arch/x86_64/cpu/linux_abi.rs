@@ -732,6 +732,8 @@ pub(super) const LINUX_PROC_DYNAMIC_STATUS_NODE: u16 = 0xe100;
 pub(super) const LINUX_FILE_PROC_DYNAMIC_STATUS: u16 =
     LINUX_FILE_MASK | LINUX_PROC_DYNAMIC_STATUS_NODE;
 pub(super) const LINUX_PROC_DYNAMIC_STATM_NODE: u16 = 0xe000;
+pub(super) const LINUX_PROC_DYNAMIC_MAPS_NODE: u16 = 0xd100;
+pub(super) const LINUX_FILE_PROC_DYNAMIC_MAPS: u16 = LINUX_FILE_MASK | LINUX_PROC_DYNAMIC_MAPS_NODE;
 pub(super) const LINUX_FILE_PROC_DYNAMIC_STATM: u16 =
     LINUX_FILE_MASK | LINUX_PROC_DYNAMIC_STATM_NODE;
 pub(super) const LINUX_CGROUP_DIRECTORY_NODE: u16 = 0xeb00;
@@ -933,7 +935,7 @@ use super::{LINUX_RUNTIME_INSTANCE_LIMIT, PAGE_SIZE};
 /// The fixed file nodes and the `/proc/sys` nodes are distinct and clear of
 /// the `/dev/input/eventN` range, so no file is taken for another.
 const _: () = {
-    const NODES: [u16; 36] = [
+    const NODES: [u16; 37] = [
         LINUX_PROC_PID2_DIRECTORY_NODE,
         LINUX_PROC_FD_DIRECTORY_NODE,
         LINUX_PROC_PID2_STATUS_NODE,
@@ -963,6 +965,7 @@ const _: () = {
         LINUX_PROC_DYNAMIC_STAT_NODE,
         LINUX_PROC_DYNAMIC_STATUS_NODE,
         LINUX_PROC_DYNAMIC_STATM_NODE,
+        LINUX_PROC_DYNAMIC_MAPS_NODE,
         LINUX_CGROUP_DIRECTORY_NODE,
         LINUX_MOUNTINFO_FILE_NODE,
         LINUX_UID_MAP_FILE_NODE,

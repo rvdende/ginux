@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use core::{
     arch::{asm, global_asm},
     cell::UnsafeCell,
@@ -5655,6 +5656,68 @@ pub(crate) fn current_linux_range_mapped(address: u64, length: usize, writable: 
         };
         page = next;
     }
+}
+
+/// A run of user address space with one access mode, as /proc/PID/maps
+/// lists it: `protection` holds Linux's PROT_READ/WRITE/EXEC bits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LinuxMemoryArea {
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+    pub(crate) protection: u8,
+    pub(crate) shared: bool,
+}
+
+/// The areas the user half of the address space rooted at `root` maps or
+/// reserves, in address order: pages next to each other with the same
+/// access join one area.
+pub(crate) fn linux_memory_areas(root: u64) -> Vec<LinuxMemoryArea> {
+    fn walk(table_address: u64, level: usize, prefix: u64, areas: &mut Vec<LinuxMemoryArea>) {
+        let Some(table) = mapped_frame::<u64>(table_address) else {
+            return;
+        };
+        let end = if level == 0 { 256 } else { ENTRY_COUNT };
+        for index in 0..end {
+            let value = unsafe { table.add(index).read() };
+            let address = prefix | (index as u64) << [39_u32, 30, 21, 12][level];
+            if level < 3 {
+                if value & (PRESENT | USER | LARGE_PAGE) == PRESENT | USER {
+                    walk(value & ADDRESS_MASK, level + 1, address, areas);
+                }
+                continue;
+            }
+            if value & USER == 0 {
+                continue;
+            }
+            let page = linux_runtime_page_from_value(value);
+            if !page.occupied {
+                continue;
+            }
+            let area = LinuxMemoryArea {
+                start: address,
+                end: address + PAGE_SIZE as u64,
+                protection: page.protection,
+                shared: page.shared,
+            };
+            match areas.last_mut() {
+                Some(last)
+                    if last.end == area.start
+                        && last.protection == area.protection
+                        && last.shared == area.shared =>
+                {
+                    last.end = area.end;
+                }
+                _ => {
+                    if areas.try_reserve(1).is_ok() {
+                        areas.push(area);
+                    }
+                }
+            }
+        }
+    }
+    let mut areas = Vec::new();
+    walk(root, 0, 0, &mut areas);
+    areas
 }
 
 pub(crate) fn current_root_address() -> u64 {

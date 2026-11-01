@@ -23978,6 +23978,7 @@ fn linux_proc_pid_file_kind(pid: u32, name: &[u8]) -> Option<u16> {
         (_, b"status") => Some(LINUX_FILE_PROC_DYNAMIC_STATUS),
         (_, b"stat") => Some(LINUX_FILE_PROC_DYNAMIC_STAT),
         (_, b"statm") => Some(LINUX_FILE_PROC_DYNAMIC_STATM),
+        (_, b"maps") => Some(LINUX_FILE_PROC_DYNAMIC_MAPS),
         _ => None,
     }
 }
@@ -26650,7 +26651,12 @@ fn linux_openat(directory: u64, path_address: u64, flags: u64, mode: u64) -> u64
     let tmp_path = path == b"/tmp/ginux-ready";
     let proc_fdinfo_target = linux_proc_fdinfo_target(path);
     let proc_dynamic_pid = linux_proc_process_file(path)
-        .filter(|(_, name)| matches!(*name, b"status" | b"stat" | b"statm" | b"oom_score_adj"))
+        .filter(|(_, name)| {
+            matches!(
+                *name,
+                b"status" | b"stat" | b"statm" | b"maps" | b"oom_score_adj"
+            )
+        })
         .map(|(pid, _)| pid);
     let virtual_device = matches!(
         path,
@@ -30561,6 +30567,7 @@ fn linux_descriptor_read(descriptor: u64, address: u64, count: u64) -> u64 {
             | LINUX_FILE_PROC_DYNAMIC_STAT
             | LINUX_FILE_PROC_DYNAMIC_STATUS
             | LINUX_FILE_PROC_DYNAMIC_STATM
+            | LINUX_FILE_PROC_DYNAMIC_MAPS
             | LINUX_FILE_PROC_OOM_SCORE_ADJ
     ) {
         let offset = linux_descriptor_offset(descriptor).load(Ordering::SeqCst);
@@ -30687,6 +30694,25 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
             .saturating_add(usize::try_from(count).unwrap_or(usize::MAX))
             .min(used);
         return if copy_to_linux_user(address, &file[start..end]) {
+            (end - start) as u64
+        } else {
+            LINUX_EFAULT
+        };
+    }
+    if state & !3 == LINUX_FILE_PROC_DYNAMIC_MAPS {
+        let Some(pid) = linux_proc_dynamic_descriptor_pid(descriptor) else {
+            return LINUX_EBADF;
+        };
+        let Some(maps) = linux_proc_maps(pid) else {
+            return LINUX_ENOENT;
+        };
+        let start = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(maps.len());
+        let end = start
+            .saturating_add(usize::try_from(count).unwrap_or(usize::MAX))
+            .min(maps.len());
+        return if start == end || copy_to_linux_user(address, &maps[start..end]) {
             (end - start) as u64
         } else {
             LINUX_EFAULT
@@ -36286,12 +36312,93 @@ fn linux_descriptor_tmp_generation(descriptor: u64) -> Option<u32> {
     }
 }
 
+/// /proc/PID/maps: the process's memory areas from its page tables, named
+/// where the kernel placed them.
+fn linux_proc_maps(pid: u32) -> Option<Vec<u8>> {
+    let current = pid == current_linux_process_pid();
+    let root = if current {
+        address_space::current_root_address()
+    } else {
+        linux_process::live_process_root(pid)?.address()
+    };
+    let stack = current.then(|| {
+        X86_RUNTIME.ELF_PROBE_STACK_LOW.load(Ordering::SeqCst)
+            ..X86_RUNTIME.ELF_PROBE_STACK.load(Ordering::SeqCst)
+    });
+    let mut text = Vec::new();
+    for area in address_space::linux_memory_areas(root) {
+        let name: &[u8] = if area.start == crate::linux_elf::VVAR_ADDRESS {
+            b"[vvar]"
+        } else if area.start == crate::linux_elf::VDSO_ADDRESS {
+            b"[vdso]"
+        } else if stack
+            .as_ref()
+            .is_some_and(|stack| stack.contains(&area.start))
+        {
+            b"[stack]"
+        } else {
+            b""
+        };
+        let mut line = [0_u8; 128];
+        let mut used = 0;
+        let flags = [
+            if area.protection & LINUX_PROT_READ as u8 != 0 {
+                b'r'
+            } else {
+                b'-'
+            },
+            if area.protection & LINUX_PROT_WRITE as u8 != 0 {
+                b'w'
+            } else {
+                b'-'
+            },
+            if area.protection & LINUX_PROT_EXEC as u8 != 0 {
+                b'x'
+            } else {
+                b'-'
+            },
+            if area.shared { b's' } else { b'p' },
+        ];
+        let written = append_linux_hex(&mut line, &mut used, area.start)
+            && append_linux_bytes(&mut line, &mut used, b"-")
+            && append_linux_hex(&mut line, &mut used, area.end)
+            && append_linux_bytes(&mut line, &mut used, b" ")
+            && append_linux_bytes(&mut line, &mut used, &flags)
+            && append_linux_bytes(&mut line, &mut used, b" 00000000 00:00 0")
+            && (name.is_empty()
+                || append_linux_bytes(&mut line, &mut used, b"                          ")
+                    && append_linux_bytes(&mut line, &mut used, name))
+            && append_linux_bytes(&mut line, &mut used, b"\n");
+        if !written || text.try_reserve(used).is_err() {
+            return None;
+        }
+        text.extend_from_slice(&line[..used]);
+    }
+    Some(text)
+}
+
+/// Appends `value` in lowercase hex, at least eight digits, as /proc/PID/maps
+/// prints addresses.
+fn append_linux_hex(output: &mut [u8], used: &mut usize, value: u64) -> bool {
+    let digits = (16 - value.leading_zeros() as usize / 4).max(8);
+    let Some(target) = output.get_mut(*used..*used + digits) else {
+        return false;
+    };
+    for (index, byte) in target.iter_mut().enumerate() {
+        let shift = (digits - 1 - index) * 4;
+        *byte = b"0123456789abcdef"[(value >> shift & 15) as usize];
+    }
+    *used += digits;
+    true
+}
+
 fn linux_proc_dynamic_descriptor_pid(descriptor: u64) -> Option<u32> {
     matches!(
         linux_device_descriptor(descriptor) & !3,
         LINUX_FILE_PROC_DYNAMIC_STAT
             | LINUX_FILE_PROC_DYNAMIC_STATUS
             | LINUX_FILE_PROC_DYNAMIC_STATM
+            | LINUX_FILE_PROC_DYNAMIC_MAPS
             | LINUX_FILE_PROC_OOM_SCORE_ADJ
     )
     .then(|| linux_descriptor_tmp_generation(descriptor))
@@ -36333,6 +36440,7 @@ fn linux_proc_file(state: u16) -> bool {
             | LINUX_FILE_PROC_DYNAMIC_STAT
             | LINUX_FILE_PROC_DYNAMIC_STATUS
             | LINUX_FILE_PROC_DYNAMIC_STATM
+            | LINUX_FILE_PROC_DYNAMIC_MAPS
             | LINUX_FILE_PROC_MOUNTS
     ) || linux_proc_sysctl(state).is_some()
 }
@@ -36504,7 +36612,8 @@ fn linux_regular_file(state: u16) -> Option<&'static [u8]> {
         LINUX_FILE_PROC_BOOT_ID => return Some(linux_boot_id()),
         LINUX_FILE_PROC_DYNAMIC_STAT
         | LINUX_FILE_PROC_DYNAMIC_STATUS
-        | LINUX_FILE_PROC_DYNAMIC_STATM => return None,
+        | LINUX_FILE_PROC_DYNAMIC_STATM
+        | LINUX_FILE_PROC_DYNAMIC_MAPS => return None,
         LINUX_FILE_PROC_PID1_STAT => return Some(LINUX_PROC_PID1_STAT),
         LINUX_FILE_PROC_PID1_STATM => return Some(LINUX_PROC_PID1_STATM),
         LINUX_FILE_PROC_PID2_STATM => {
@@ -36586,7 +36695,8 @@ fn linux_regular_file_inode(state: u16) -> Option<u64> {
         LINUX_FILE_PROC_BOOT_ID => return Some(49),
         LINUX_FILE_PROC_DYNAMIC_STAT
         | LINUX_FILE_PROC_DYNAMIC_STATUS
-        | LINUX_FILE_PROC_DYNAMIC_STATM => return Some(48),
+        | LINUX_FILE_PROC_DYNAMIC_STATM
+        | LINUX_FILE_PROC_DYNAMIC_MAPS => return Some(48),
         _ => {}
     }
     if linux_tmp_file(state) {
