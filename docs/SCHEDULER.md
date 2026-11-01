@@ -274,6 +274,13 @@ yields:
   the epoll branch for pid 1, and `take_linux_child_yield(1)` as the only
   signal that init is waiting.
 
+Resolved (2026-11-01): the checkpoint timeouts were not the restart model.
+The FUTEX_WAKE fast path in `linux_syscall_handler`, taken before the
+kernel-entry lock, woke only the calling process's threads, so a child's
+TST_CHECKPOINT_WAKE never reached its parent's futex wait; it now defers
+to the full path whenever another process waits (e043be5a). The analysis
+below is kept for its account of how the waits then behaved.
+
 What LTP's checkpoint timeouts (about 25 tests: pause01/02, tgkill01-03,
 setpgid03, fork04, ...) come down to, traced on 2026-11-01 with pause01: a
 child forked child-first calls TST_CHECKPOINT_WAKE before its parent waits,
