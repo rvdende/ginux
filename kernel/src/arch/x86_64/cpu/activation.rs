@@ -101,24 +101,6 @@ struct EntryArguments {
 global_asm!(
     r#"
     .text
-    .global ginux_call_on_stack
-// ginux_call_on_stack(top: rdi, function: rsi, argument: rdx) calls
-// function(argument) with rsp = top and returns on the caller's stack.
-ginux_call_on_stack:
-    push rbp
-    mov rbp, rsp
-    mov rsp, rdi
-    mov rdi, rdx
-    call rsi
-    mov rsp, rbp
-    pop rbp
-    ret
-"#
-);
-
-global_asm!(
-    r#"
-    .text
     .global ginux_switch_stack
 // ginux_switch_stack(save: rdi, load: rsi) saves the callee-saved registers
 // on the current stack, stores its stack pointer at [rdi], loads the stack
@@ -153,26 +135,38 @@ ginux_context_start:
 extern "sysv64" {
     fn ginux_switch_stack(save: *mut usize, load: usize);
     fn ginux_context_start();
-    fn ginux_call_on_stack(
-        top: usize,
-        function: extern "sysv64" fn(*mut c_void),
-        argument: *mut c_void,
-    );
 }
 
-extern "sysv64" fn enter_user_mode(argument: *mut c_void) {
-    // SAFETY: `enter_on_own_stack` passes its live EntryArguments.
-    let arguments = unsafe { &*argument.cast::<EntryArguments>() };
-    // SAFETY: as for `enter_on_own_stack`; the entry stub records this stack
-    // as the return stack, so the process's system calls run here too.
+/// One entry into a process: a kernel context on the activation's own stack
+/// that enters user mode, and the context that entered it.
+struct Activation {
+    arguments: EntryArguments,
+    /// The entering context's stack pointer while the activation runs.
+    caller: usize,
+    /// The activation's stack pointer while it does not run.
+    context: usize,
+}
+
+/// An activation's context: runs the process until one of its system calls
+/// returns to the kernel, then switches back to whoever entered it for
+/// good.
+extern "sysv64" fn run_activation(argument: *mut c_void) -> ! {
+    let activation = argument.cast::<Activation>();
+    // SAFETY: `enter_on_own_stack` keeps the activation alive until this
+    // context switches back to it, which it does exactly once, last. The
+    // entry stub records this stack as the return stack, so the process's
+    // system calls run here too.
     unsafe {
+        let arguments = &(*activation).arguments;
         super::ginux_process_user_enter(
             arguments.entry,
             arguments.stack,
             arguments.general,
             arguments.rflags,
-        )
-    };
+        );
+        ginux_switch_stack(&raw mut (*activation).context, (*activation).caller);
+    }
+    unreachable!("a finished activation is never resumed")
 }
 
 /// Enters process `pid`'s user mode on an activation stack of its own and
@@ -209,22 +203,32 @@ pub(super) unsafe fn enter_on_own_stack(
         }
         active.push(pid);
     }
-    let mut arguments = EntryArguments {
-        entry,
-        stack,
-        general,
-        rflags,
+    let mut activation = Activation {
+        arguments: EntryArguments {
+            entry,
+            stack,
+            general,
+            rflags,
+        },
+        caller: 0,
+        context: 0,
     };
+    let activation_pointer = &raw mut activation;
     // SAFETY: the stack is exclusively this activation's until it is
-    // returned to the free list below, and `enter_user_mode` only reads the
-    // arguments, which outlive the call.
+    // returned to the free list below; the activation record outlives the
+    // context, which switches back here when the process returns to the
+    // kernel and is never resumed.
     unsafe {
-        ginux_call_on_stack(
+        (*activation_pointer).context = new_context(
             kernel_stack.top,
-            enter_user_mode,
-            (&raw mut arguments).cast::<c_void>(),
-        )
-    };
+            run_activation,
+            activation_pointer.cast::<c_void>(),
+        );
+        ginux_switch_stack(
+            &raw mut (*activation_pointer).caller,
+            (*activation_pointer).context,
+        );
+    }
     {
         let mut active = ACTIVE_PIDS.lock();
         if let Some(position) = active.iter().rposition(|active| *active == pid) {
