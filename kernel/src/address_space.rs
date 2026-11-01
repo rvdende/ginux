@@ -5715,6 +5715,20 @@ pub(crate) fn current_root_address() -> u64 {
     current_root()
 }
 
+/// Puts back `previous` after a parked process ran, unless it was released
+/// meanwhile (then the kernel's tables, and false), as
+/// `resume_live_linux_process` does after an entry.
+pub(crate) fn restore_root_after_resume(previous: u64) -> bool {
+    if linux_root_is_usable(previous) {
+        unsafe { activate(previous) };
+        true
+    } else {
+        unsafe { activate(paging::kernel_root_address()) };
+        crate::serial_write_raw(b"ginux: resume returned to a released address space\r\n");
+        false
+    }
+}
+
 /// Loads `root` into CR3: a parked system call puts back its process's
 /// address space when it is resumed.
 ///

@@ -205,11 +205,21 @@ pub(crate) fn kernel_entry_lock() -> KernelEntryGuard {
     KERNEL_ENTRY_LOCK.lock()
 }
 
+/// The kernel-entry lock serializes kernel work across CPUs. It is
+/// recursive per CPU: each entry on the owning CPU adds to its depth, and
+/// the lock is released when the depth returns to zero, whichever entry
+/// leaves last. Entries need not leave in the order they came: a system
+/// call parked on its own stack (see `cpu::activation`) keeps its entry
+/// while others start and finish theirs, as Linux's tasks did with the big
+/// kernel lock held across a sleep.
 struct KernelEntryLock {
     next: AtomicU32,
     owner: AtomicU32,
     cpu_owner: AtomicU16,
     depths: [AtomicU32; CPU_SLOT_LIMIT],
+    /// The lock rank each CPU held before it took the lock, put back when
+    /// it releases it.
+    previous_ranks: [AtomicU16; CPU_SLOT_LIMIT],
 }
 
 impl KernelEntryLock {
@@ -219,6 +229,7 @@ impl KernelEntryLock {
             owner: AtomicU32::new(0),
             cpu_owner: AtomicU16::new(0),
             depths: [const { AtomicU32::new(0) }; CPU_SLOT_LIMIT],
+            previous_ranks: [const { AtomicU16::new(0) }; CPU_SLOT_LIMIT],
         }
     }
 
@@ -235,8 +246,6 @@ impl KernelEntryLock {
                 lock: self,
                 cpu,
                 interrupt_state,
-                outermost: false,
-                previous_rank: 0,
             };
         }
 
@@ -245,14 +254,13 @@ impl KernelEntryLock {
         while self.owner.load(Ordering::Acquire) != ticket {
             spin_loop();
         }
+        self.previous_ranks[cpu].store(previous_rank, Ordering::Release);
         self.depths[cpu].store(1, Ordering::Release);
         self.cpu_owner.store(encoded_cpu, Ordering::Release);
         KernelEntryGuard {
             lock: self,
             cpu,
             interrupt_state,
-            outermost: true,
-            previous_rank,
         }
     }
 }
@@ -261,19 +269,21 @@ pub(crate) struct KernelEntryGuard {
     lock: &'static KernelEntryLock,
     cpu: usize,
     interrupt_state: InterruptState,
-    outermost: bool,
-    previous_rank: u16,
 }
 
 impl Drop for KernelEntryGuard {
     fn drop(&mut self) {
         let previous = self.lock.depths[self.cpu].fetch_sub(1, Ordering::AcqRel);
-        if previous == 0 || self.outermost != (previous == 1) {
+        if previous == 0 {
             crate::kernel_fail("ginux: invalid kernel-entry release depth\r\n");
         }
-        if self.outermost {
+        // The last entry on this CPU to leave releases the lock.
+        if previous == 1 {
             self.lock.cpu_owner.store(0, Ordering::Release);
-            leave_rank(LockRank::ARCHITECTURE, self.previous_rank);
+            leave_rank(
+                LockRank::ARCHITECTURE,
+                self.lock.previous_ranks[self.cpu].load(Ordering::Acquire),
+            );
             self.lock.owner.fetch_add(1, Ordering::Release);
         }
         restore_interrupts(self.interrupt_state);

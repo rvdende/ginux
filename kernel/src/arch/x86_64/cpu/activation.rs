@@ -161,7 +161,9 @@ enum State {
 /// enters user mode and runs the process's system calls, and the context
 /// that entered (or last resumed) it.
 struct Activation {
-    pid: u32,
+    /// The process: its domain instance in the high half, its pid in the
+    /// low half (pids repeat across domains).
+    owner: u64,
     stack: KernelStack,
     entry: usize,
     user_stack: usize,
@@ -240,7 +242,7 @@ unsafe fn run(activation: *mut Activation) -> Outcome {
 /// address space and validated the complete user context in `general`
 /// (fifteen registers).
 pub(super) unsafe fn enter_on_own_stack(
-    pid: u32,
+    owner: u64,
     entry: usize,
     stack: usize,
     general: *const u64,
@@ -263,7 +265,7 @@ pub(super) unsafe fn enter_on_own_stack(
     }
     let top = kernel_stack.top;
     let mut record = Box::new(Activation {
-        pid,
+        owner,
         stack: kernel_stack,
         entry,
         user_stack: stack,
@@ -281,9 +283,9 @@ pub(super) unsafe fn enter_on_own_stack(
         let mut activations = ACTIVATIONS.lock();
         if activations
             .iter()
-            .any(|candidate| candidate.pid == pid && candidate.state == State::Running)
+            .any(|candidate| candidate.owner == owner && candidate.state == State::Running)
         {
-            report_reentry(pid, &activations);
+            report_reentry(owner, &activations);
         }
         activations.push(record);
     }
@@ -291,19 +293,19 @@ pub(super) unsafe fn enter_on_own_stack(
     Some(unsafe { run(activation) })
 }
 
-/// Parks the running activation of process `pid`: the system call it is in
+/// Parks the running activation of process `owner`: the system call it is in
 /// waits on the activation's stack while the context that entered or
 /// resumed it runs, and continues from here when `resume` switches back.
 /// Returns false, without parking, when this is not that activation's
 /// stack (a process run below another's frames cannot park).
-pub(super) fn park(pid: u32) -> bool {
+pub(super) fn park(owner: u64) -> bool {
     let here = 0_u8;
     let here = &raw const here as usize;
     let activation = ACTIVATIONS
         .lock()
         .iter_mut()
         .rev()
-        .find(|candidate| candidate.pid == pid && candidate.state == State::Running)
+        .find(|candidate| candidate.owner == owner && candidate.state == State::Running)
         .filter(|candidate| (candidate.stack.top - STACK_SIZE..candidate.stack.top).contains(&here))
         .map(|candidate| &raw mut **candidate);
     let Some(activation) = activation else {
@@ -322,18 +324,18 @@ pub(super) fn park(pid: u32) -> bool {
     true
 }
 
-/// Resumes the parked activation of process `pid` until it parks again or
+/// Resumes the parked activation of process `owner` until it parks again or
 /// finishes; `None` when it has none.
 ///
 /// # Safety
 ///
-/// The caller made `pid` the current process again (its address space,
+/// The caller made the process current again (its address space,
 /// thread pointer and per-process kernel state), as for entering it.
-pub(super) unsafe fn resume(pid: u32) -> Option<Outcome> {
+pub(super) unsafe fn resume(owner: u64) -> Option<Outcome> {
     let activation = ACTIVATIONS
         .lock()
         .iter_mut()
-        .find(|candidate| candidate.pid == pid && candidate.state == State::Parked)
+        .find(|candidate| candidate.owner == owner && candidate.state == State::Parked)
         .map(|candidate| &raw mut **candidate)?;
     // SAFETY: a parked record stays in ACTIVATIONS until its context runs
     // again and finishes.
@@ -343,12 +345,36 @@ pub(super) unsafe fn resume(pid: u32) -> Option<Outcome> {
     }
 }
 
-/// Process `pid` has a parked activation.
-pub(super) fn is_parked(pid: u32) -> bool {
+/// Process `owner` has a parked activation.
+pub(super) fn is_parked(owner: u64) -> bool {
     ACTIVATIONS
         .lock()
         .iter()
-        .any(|candidate| candidate.pid == pid && candidate.state == State::Parked)
+        .any(|candidate| candidate.owner == owner && candidate.state == State::Parked)
+}
+
+/// Drops the parked activations of domain instance `instance` when its
+/// runtime stops: their system calls never continue, and their stacks are
+/// reused.
+pub(super) fn discard_parked(instance: u32) {
+    let discarded = {
+        let mut activations = ACTIVATIONS.lock();
+        let mut discarded = Vec::new();
+        let mut index = 0;
+        while index < activations.len() {
+            let candidate = &activations[index];
+            if candidate.state == State::Parked && (candidate.owner >> 32) as u32 == instance {
+                discarded.push(activations.remove(index));
+            } else {
+                index += 1;
+            }
+        }
+        discarded
+    };
+    let mut pool = STACK_POOL.lock();
+    for activation in discarded {
+        pool.free.push(activation.stack);
+    }
 }
 
 /// Takes a kernel stack from the pool, or maps a new one.
@@ -449,16 +475,16 @@ pub(super) fn verify_stack_switching() -> bool {
 /// A process entered while an earlier activation of it is still running
 /// inside a system call: it now runs twice, which the scheduler rework
 /// removes.
-fn report_reentry(pid: u32, activations: &[Box<Activation>]) {
+fn report_reentry(owner: u64, activations: &[Box<Activation>]) {
     crate::serial_write_raw(b"ginux: process re-entered during its own system call; pid ");
-    crate::serial_write_u64(u64::from(pid));
+    crate::serial_write_u64(owner & u64::from(u32::MAX));
     crate::serial_write_raw(b" active");
     for activation in activations
         .iter()
         .filter(|activation| activation.state == State::Running)
     {
         crate::serial_write_raw(b" ");
-        crate::serial_write_u64(u64::from(activation.pid));
+        crate::serial_write_u64(activation.owner & u64::from(u32::MAX));
     }
     crate::serial_write_raw(b"\r\n");
 }

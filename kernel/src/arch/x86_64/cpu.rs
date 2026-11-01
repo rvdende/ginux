@@ -2940,7 +2940,7 @@ unsafe fn enter_linux_runtime_process(
     let entered = X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
         && current_linux_runtime_cpu_index() == 0
         && activation::enter_on_own_stack(
-            current_linux_process_pid(),
+            linux_activation_owner(current_linux_process_pid()),
             entry,
             stack,
             general,
@@ -5557,6 +5557,7 @@ pub(crate) fn mark_configured_container_booting() {
 }
 
 pub(crate) fn stop_configured_container() {
+    activation::discard_parked(linux_execution_instance() as u32);
     crate::linux_exe::forget_instance(X86_RUNTIME.LINUX_EXECUTION_INSTANCE.load(Ordering::SeqCst));
     crate::linux_areas::forget_instance(linux_execution_instance());
     crate::linux_mounts::forget_instance(linux_execution_instance());
@@ -13298,6 +13299,10 @@ fn run_other_linux_processes(
         if !signal_was_active && X86_RUNTIME.LINUX_SIGNAL_ACTIVE.load(Ordering::SeqCst) {
             return Some(LinuxBlockedWait::Return(0));
         }
+        // Yield as if to restart the call (what whoever entered this process
+        // expects), then park in it: the call keeps its place and checks its
+        // wait again when resumed. Where it cannot park, the call restarts
+        // from user mode instead.
         let mut restart = caller;
         restart.rip = caller.rip.wrapping_sub(LINUX_SYSCALL_INSTRUCTION_SIZE);
         if !yield_current_linux_process(restart, number) {
@@ -13305,7 +13310,24 @@ fn run_other_linux_processes(
         }
         // Waiting in the call: /proc shows it sleeping until dispatched.
         linux_process::set_live_process_waiting(pid, true);
-        return Some(LinuxBlockedWait::Return(LINUX_RETURN_TO_KERNEL));
+        if !park_linux_process(pid) {
+            return Some(LinuxBlockedWait::Return(LINUX_RETURN_TO_KERNEL));
+        }
+        let mut interrupted = caller;
+        interrupted.rax = LINUX_EINTR;
+        let delivered = linux_deliver_pending_signal_restarting(
+            output,
+            interrupted,
+            (caller.rip, caller.rflags),
+            Some(number),
+        );
+        return Some(if delivered != 0 {
+            LinuxBlockedWait::Return(delivered)
+        } else if X86_RUNTIME.LINUX_SIGNAL_ACTIVE.load(Ordering::SeqCst) {
+            LinuxBlockedWait::Return(0)
+        } else {
+            LinuxBlockedWait::Recheck
+        });
     }
     if !refresh_live_linux_process_registry(caller) {
         return None;
@@ -13370,6 +13392,12 @@ fn run_one_other_linux_process(pid: u32) -> bool {
         || descendant.is_some_and(|child| run_scheduled_linux_process(pid, Some(child)))
 }
 
+/// The key activations of process `pid` in the running domain have: the
+/// domain's instance in the high half, since pids repeat across domains.
+fn linux_activation_owner(pid: u32) -> u64 {
+    ((linux_execution_instance() as u64) << 32) | u64::from(pid)
+}
+
 /// Parks the current process `pid` inside its system call (see
 /// `activation::park`) and, once resumed, makes its thread pointer and
 /// address space current again, which whatever ran meanwhile replaced.
@@ -13377,7 +13405,7 @@ fn run_one_other_linux_process(pid: u32) -> bool {
 fn park_linux_process(pid: u32) -> bool {
     let fs_base = active_fs_base();
     let root = address_space::current_root_address();
-    if !activation::park(pid) {
+    if !activation::park(linux_activation_owner(pid)) {
         return false;
     }
     // SAFETY: both are this process's, saved on its own stack before it
@@ -13386,6 +13414,11 @@ fn park_linux_process(pid: u32) -> bool {
         write_msr(FS_BASE_MSR, fs_base);
         address_space::activate_root(root);
     }
+    // What a system call entry checks, the parked call checks on waking:
+    // expired waits, and an expired real timer raising SIGALRM, which then
+    // interrupts the wait.
+    expire_linux_waits();
+    let _ = refresh_linux_real_timer();
     true
 }
 
@@ -13403,7 +13436,7 @@ fn resume_parked_linux_process(pid: u32) -> bool {
     LINUX_PROCESS_SLICE.store(0, Ordering::SeqCst);
     // SAFETY: `pid` is current again: everything that ran while it was
     // parked ran nested as its child, which put its kernel state back.
-    let resumed = unsafe { activation::resume(pid) }.is_some();
+    let resumed = unsafe { activation::resume(linux_activation_owner(pid)) }.is_some();
     unsafe { (*entry_state).return_stack = previous_return_stack };
     resumed
 }
@@ -13852,6 +13885,14 @@ fn write_linux_thread_live_return(
 /// yield, a fork that runs the child), a fault or a preemption. Every
 /// process the kernel runs is entered here.
 fn run_dispatched_linux_process(process: &linux_process::LiveProcessDispatch) -> bool {
+    // A process parked in a system call continues there; it puts back its
+    // own address space and thread pointer, and the caller's root is put
+    // back after.
+    if activation::is_parked(linux_activation_owner(process.pid)) {
+        let previous_root = address_space::current_root_address();
+        let resumed = resume_parked_linux_process(process.pid);
+        return address_space::restore_root_after_resume(previous_root) && resumed;
+    }
     address_space::resume_live_linux_process(
         process.root,
         process.rip,
@@ -14216,7 +14257,7 @@ fn run_linux_runtime_loop() -> bool {
                 return false;
             }
         }
-        if !activation::is_parked(1) {
+        if !activation::is_parked(linux_activation_owner(1)) {
             return true;
         }
         if !X86_RUNTIME.LINUX_RUNTIME_SUSPENDED.load(Ordering::Acquire)
@@ -14249,6 +14290,8 @@ fn finish_linux_runtime(mmap: u64, saved_msrs: [u64; 5]) -> LinuxElfResult {
             ..LinuxElfResult::FAILED
         };
     }
+    // The runtime is over: calls still parked never continue.
+    activation::discard_parked(linux_execution_instance() as u32);
     let completed = X86_RUNTIME
         .ELF_PROBE_COMPLETED
         .swap(false, Ordering::SeqCst);
@@ -24757,11 +24800,30 @@ fn linux_chdir(path_address: u64) -> u64 {
     let path = &path[..length];
     if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
         let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
-        if let Ok(length) = linux_canonical_path_at(u64::from(LINUX_AT_FDCWD), path, &mut canonical)
-        {
-            if let Some(metadata) = crate::linux_overlay::lookup(&canonical[..length]) {
+        let canonical_length =
+            match linux_canonical_path_at(u64::from(LINUX_AT_FDCWD), path, &mut canonical) {
+                Ok(length) => Some(length),
+                Err(error @ (LINUX_EACCES | LINUX_ENOTDIR | LINUX_ELOOP | LINUX_ENAMETOOLONG)) => {
+                    return error
+                }
+                Err(_) => None,
+            };
+        if let Some(length) = canonical_length {
+            let found = match linux_overlay_lookup_following(&mut canonical, length, true) {
+                Ok((_, _, found)) => found,
+                Err(error) => return error,
+            };
+            if let Some(metadata) = found {
                 if metadata.kind != crate::linux_overlay::NodeKind::Directory {
                     return LINUX_ENOTDIR;
+                }
+                // Changing into a directory needs search permission on it.
+                if let Err(error) = linux_check_access(
+                    Some(linux_overlay_file_access(metadata)),
+                    ginux_credentials::access::EXECUTE,
+                    false,
+                ) {
+                    return error;
                 }
                 X86_RUNTIME.ELF_PROBE_OVERLAY_CWD.store(
                     crate::linux_overlay::generation(metadata.handle),
@@ -24784,7 +24846,9 @@ fn linux_chdir(path_address: u64) -> u64 {
             return 0;
         }
         let Some((handle, entry)) = linux_rootfs_path_at(u64::from(LINUX_AT_FDCWD), path) else {
-            return LINUX_ENOENT;
+            return canonical_length.map_or(LINUX_ENOENT, |length| {
+                linux_missing_path_error(&canonical[..length])
+            });
         };
         if entry.is_some_and(|entry| entry.kind != crate::published_rootfs::EntryKind::Directory) {
             return LINUX_ENOTDIR;
@@ -35456,8 +35520,11 @@ fn run_scheduled_linux_process(parent_pid: u32, target_pid: Option<u32>) -> bool
     X86_RUNTIME
         .LINUX_CURRENT_PROCESS_PID
         .store(selected.pid, Ordering::SeqCst);
+    // A parked process is resumed even when killed: its wait sees the
+    // signal and ends the process from its own stack.
     let pending_sigkill = linux_peek_dynamic_signal(1 << (LINUX_SIGKILL - 1))
-        .is_some_and(|(_, pending)| u64::from(pending.signal) == LINUX_SIGKILL);
+        .is_some_and(|(_, pending)| u64::from(pending.signal) == LINUX_SIGKILL)
+        && !activation::is_parked(linux_activation_owner(selected.pid));
     let mut resumed = if pending_sigkill {
         linux_terminate_by_default_signal(LINUX_SIGKILL) == LINUX_RETURN_TO_KERNEL
     } else {

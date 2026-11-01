@@ -233,10 +233,23 @@ running other processes nested inside them, and the runtime loop
 (`run_linux_runtime_loop`) runs one other process at a time (one with
 SIGKILL pending first, then the deepest running descendant, then the run
 queue: `run_one_other_linux_process`) and resumes init to check its wait
-again, halting when nothing ran. All suites pass with it. Next: other
-processes park instead of yielding with a restart, so a blocked call keeps
-its place instead of being re-issued from user mode (the checkpoint
-timeouts below).
+again, halting when nothing ran. All suites pass with it.
+
+Every other process now parks too: its wait in `run_other_linux_processes`
+still records a yield (what whoever entered it expects) but then parks, so
+the call keeps its place instead of being re-issued from user mode.
+`run_dispatched_linux_process`, the one place processes are entered,
+resumes a parked process instead of entering it again (and puts back the
+caller's address space after); a parked process with SIGKILL pending is
+resumed so its own wait ends it. On waking, a parked call checks what a
+system call entry would (expired waits, the real timer raising SIGALRM).
+Parked calls leave the kernel in any order, so the kernel-entry lock is
+now released when its depth returns to zero, whichever entry leaves last,
+as Linux tasks held the big kernel lock across a sleep. Parked
+activations are keyed by domain instance and pid, and dropped when the
+domain's runtime ends. What is left of step 5: wakeups instead of resuming
+every parked call to check again, activations per thread instead of per
+process, and timer preemption parking instead of restarting.
 
 First attempt at step 4 (2026-11-01, superseded by parking above; it was
 parked behind a `LINUX_SCHEDULER_LOOP = false` switch in cpu.rs): init yields like every other

@@ -533,16 +533,34 @@ pub(super) fn linux_futex_live_return(
                 woken: false,
             });
         }
-        let result = match run_other_linux_processes(output, caller, LINUX_FUTEX_SYSCALL) {
-            // Yielded: the call starts again and finds its wait.
-            Some(LinuxBlockedWait::Return(LINUX_RETURN_TO_KERNEL)) => {
-                return LINUX_RETURN_TO_KERNEL;
+        let result = loop {
+            match run_other_linux_processes(output, caller, LINUX_FUTEX_SYSCALL) {
+                // Yielded: the call starts again and finds its wait.
+                Some(LinuxBlockedWait::Return(LINUX_RETURN_TO_KERNEL)) => {
+                    return LINUX_RETURN_TO_KERNEL;
+                }
+                Some(LinuxBlockedWait::Return(result)) => break result,
+                // Nothing else could run, or a sibling thread was made ready,
+                // which the next wait switches to: a spurious wakeup, which
+                // callers allow for by checking their condition again.
+                None => break 0,
+                // Waited in the call (parked): done when FUTEX_WAKE marked the
+                // wait or its deadline passed, else wait again.
+                Some(LinuxBlockedWait::Recheck) => {
+                    let woken = LINUX_FUTEX_COORDINATION
+                        .lock()
+                        .iter()
+                        .any(|wait| wait.pid == pid && wait.woken);
+                    if woken {
+                        break 0;
+                    }
+                    if deadline != 0
+                        && linux_elapsed_nanoseconds().is_some_and(|now| now >= deadline)
+                    {
+                        break LINUX_ETIMEDOUT;
+                    }
+                }
             }
-            Some(LinuxBlockedWait::Return(result)) => result,
-            // Callers recheck their condition after any wakeup, spurious ones
-            // included; that also covers a sibling thread made ready meanwhile,
-            // which the next wait switches to.
-            Some(LinuxBlockedWait::Recheck) | None => 0,
         };
         let _ = take_linux_process_futex_wait(&mut LINUX_FUTEX_COORDINATION.lock(), pid);
         return result;
