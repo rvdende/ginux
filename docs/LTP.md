@@ -210,7 +210,7 @@ Requirements: Docker (the build runs in a pinned Alpine container), QEMU with
 KVM, and OVMF.
 
 ```sh
-make ltp            # tools/ltp/build.sh: build LTP into build/ltp (once, ~5 min)
+make ltp            # tools/ltp/build.sh: build LTP into build/ltp (~5 min once; then a no-op)
 make test-ltp OVMF_CODE=/usr/share/OVMF/OVMF_CODE_4M.fd \
     OVMF_VARS=/usr/share/OVMF/OVMF_VARS_4M.fd
 ```
@@ -270,7 +270,11 @@ the baseline, not an error.
   test that does not build under musl is skipped, not patched
   (`build/ltp/build-failures.txt`: today `fmtmsg01`, `timer_create01`,
   `timer_create03`). The build tree stays in `target/ltp-build`, so reruns are
-  incremental. Outputs: the stripped tree `build/ltp/ltp`, `ltp.tar.gz`, and
+  incremental, and a rerun with nothing changed returns at once: stamps in
+  `build/ltp` (`.tree-inputs`, `.runner-inputs`) hash the release, builder
+  image, variant and `tools/ltp` scripts, and Docker starts only when one of
+  them changed (only for the runner when just `ltp-runner.c` did; `--force`
+  rebuilds anyway). Outputs: the stripped tree `build/ltp/ltp`, `ltp.tar.gz`, and
   `ltp.tar.xz` (21 MB instead of 226 MB: the static binaries share most of
   their code, which only xz's large window sees), which is what the domain
   downloads.

@@ -48,12 +48,12 @@ test-rust-userland:
 rust-rootfs:
     make rust-rootfs
 
-# Build the LTP syscall tests statically for musl in Docker (about 5 minutes the first time).
+# Build the LTP syscall tests statically for musl in Docker (about 5 minutes the first time; a no-op when up to date).
 ltp:
     make ltp
 
 # Run LTP syscall tests in a Ginux domain (all: ~16 min): `just test-ltp '^mmap'` takes a regex, `just test-ltp '' 'kill12 getpid01'` names tests.
 test-ltp filter="" tests="":
-    [ -s build/ltp/ltp.tar.xz ] || make ltp
+    make ltp
     OVMF_CODE={{ovmf_code}} OVMF_VARS={{ovmf_vars}} LTP_FILTER='{{filter}}' LTP_TESTS='{{tests}}' make test-ltp ESP_DIR=build/esp-ltp
     @echo "Results: target/ltp-results.txt; failure clusters: target/ltp-report.txt; per-test logs: target/ltp/logs/"
