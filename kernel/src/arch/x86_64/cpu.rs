@@ -29134,8 +29134,9 @@ fn linux_newfstatat(directory: u64, path_address: u64, stat_address: u64, flags:
             linux_root_directory_inode(kind).unwrap_or(0),
         ),
         (Some(kind), _) => linux_regular_file_stat(kind),
-        (None, b"/dev/null" | b"/dev/zero" | b"/dev/console" | b"/dev/tty") => {
-            linux_stat(LINUX_STAT_CHARACTER_DEVICE_MODE, 1)
+        (None, path) if LinuxCharacterDevice::from_path(path).is_some() => {
+            LinuxCharacterDevice::from_path(path)
+                .map_or([0; LINUX_STAT_SIZE], |device| device.stat())
         }
         (None, path) if linux_root_directory_kind(path).is_some() => linux_stat(
             LINUX_STAT_DIRECTORY_MODE,
@@ -29724,6 +29725,28 @@ fn linux_unlinkat(directory: u64, path_address: u64, flags: u64) -> u64 {
         }
     }
     let Some(metadata) = crate::linux_overlay::lookup(&canonical[..length]) else {
+        // A name only the image has: removing it whites it out, after the
+        // checks the overlay's own names get below.
+        let image_directory = crate::published_rootfs::exact_entry(&canonical[..length])
+            .map(|entry| entry.kind == crate::published_rootfs::EntryKind::Directory);
+        if !crate::linux_overlay::hidden(&canonical[..length]) {
+            match (image_directory, flags == LINUX_AT_REMOVEDIR) {
+                (Some(false), true) => return LINUX_ENOTDIR,
+                (Some(true), false) => return LINUX_EISDIR,
+                (Some(true), true)
+                    if crate::linux_mounts::is_mount_point(
+                        linux_execution_instance(),
+                        &canonical[..length],
+                    ) =>
+                {
+                    return LINUX_EBUSY
+                }
+                (Some(true), true) if !linux_merged_directory_empty(&canonical[..length]) => {
+                    return LINUX_ENOTEMPTY
+                }
+                _ => {}
+            }
+        }
         return if crate::linux_overlay::hidden(&canonical[..length]) {
             LINUX_ENOENT
         } else if crate::published_rootfs::lookup_at(
@@ -29763,6 +29786,13 @@ fn linux_unlinkat(directory: u64, path_address: u64, flags: u64) -> u64 {
         &canonical[..length],
     )
     .is_some();
+    // The image's entries below a directory the overlay also has are its
+    // entries too (linux_getdents lists them).
+    if metadata.kind == crate::linux_overlay::NodeKind::Directory
+        && !linux_merged_directory_empty(&canonical[..length])
+    {
+        return LINUX_ENOTEMPTY;
+    }
     let removed = if metadata.kind == crate::linux_overlay::NodeKind::Directory {
         crate::linux_overlay::unlink(metadata.handle)
     } else {
@@ -31071,33 +31101,34 @@ fn linux_statx(directory: u64, path_address: u64, flags: u64, mask: u64, stat_ad
         Ok(kind) => kind,
         Err(error) => return error,
     };
-    let (inode, minor, mode, size) = match (relative_kind, path) {
+    let (inode, device, mode, size) = match (relative_kind, path) {
         (Some(kind), _) if kind & LINUX_DEVICE_DIRECTORY != 0 => (
             linux_root_directory_inode(kind).unwrap_or(0),
-            0,
+            None,
             LINUX_STAT_DIRECTORY_MODE,
             0,
         ),
         (Some(kind), _) => (
             linux_regular_file_inode(kind).unwrap_or(0),
-            0,
+            None,
             linux_regular_file_mode(kind),
             linux_file_size(kind),
         ),
-        (None, b"/dev/null") => (1_u64, 3_u32, LINUX_STAT_CHARACTER_DEVICE_MODE, 0),
-        (None, b"/dev/zero") => (2, 5, LINUX_STAT_CHARACTER_DEVICE_MODE, 0),
-        (None, b"/dev/console") => (3, 1, LINUX_STAT_CHARACTER_DEVICE_MODE, 0),
-        (None, b"/dev/tty") => (3, 0, LINUX_STAT_CHARACTER_DEVICE_MODE, 0),
+        (None, path) if LinuxCharacterDevice::from_path(path).is_some() => {
+            let (inode, major, minor, permissions) = LinuxCharacterDevice::from_path(path)
+                .map_or((0, 0, 0, 0), LinuxCharacterDevice::identity);
+            (inode, Some((major, minor)), 0o020_000 | permissions, 0)
+        }
         (None, path) if linux_root_directory_kind(path).is_some() => (
             linux_root_directory_inode(linux_root_directory_kind(path).unwrap_or(0)).unwrap_or(0),
-            0,
+            None,
             LINUX_STAT_DIRECTORY_MODE,
             0,
         ),
         (None, path) => match linux_runtime_file_kind(path) {
             Some(kind) => (
                 linux_regular_file_inode(kind).unwrap_or(0),
-                0,
+                None,
                 linux_regular_file_mode(kind),
                 linux_file_size(kind),
             ),
@@ -31119,8 +31150,8 @@ fn linux_statx(directory: u64, path_address: u64, flags: u64, mask: u64, stat_ad
     stat[32..40].copy_from_slice(&inode.to_ne_bytes());
     stat[40..48].copy_from_slice(&size.to_ne_bytes());
     stat[48..56].copy_from_slice(&size.div_ceil(512).to_ne_bytes());
-    if mode == LINUX_STAT_CHARACTER_DEVICE_MODE {
-        stat[128..132].copy_from_slice(&1_u32.to_ne_bytes());
+    if let Some((major, minor)) = device {
+        stat[128..132].copy_from_slice(&major.to_ne_bytes());
         stat[132..136].copy_from_slice(&minor.to_ne_bytes());
     }
     if !copy_to_linux_user(stat_address, &stat) {
@@ -41583,6 +41614,62 @@ fn linux_descriptor_set_status_flags(
     0
 }
 
+/// getdents cookies from here on walk a merged directory's overlay entries
+/// (`linux_getdents`); those below it walk the image's.
+const LINUX_DIRENT_OVERLAY_PHASE: u64 = 1 << 40;
+
+/// The image's directory at canonical `path`, unless the overlay hides it:
+/// the lower half of a directory the overlay also has.
+fn linux_image_directory(path: &[u8]) -> Option<u16> {
+    if crate::linux_overlay::hidden(path) {
+        return None;
+    }
+    if !path.is_empty()
+        && crate::published_rootfs::exact_entry(path)?.kind
+            != crate::published_rootfs::EntryKind::Directory
+    {
+        return None;
+    }
+    crate::published_rootfs::lookup_at(crate::published_rootfs::ROOT_HANDLE, path)
+        .map(|(handle, _)| handle)
+}
+
+/// Whether the directory at canonical `path` lists nothing but `.` and `..`
+/// (linux_getdents): no overlay entry below it and no image entry the
+/// overlay leaves visible.
+fn linux_merged_directory_empty(path: &[u8]) -> bool {
+    if matches!(crate::linux_overlay::next_child_at(path, 0), Some(Some(_))) {
+        return false;
+    }
+    let Some(lower) = linux_image_directory(path) else {
+        return true;
+    };
+    let mut cursor = 0;
+    while let Some(Some(child)) = crate::published_rootfs::next_child(lower, cursor) {
+        let mut child_path = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+        if linux_child_path(path, child.name, &mut child_path).is_some_and(|child_path| {
+            crate::linux_overlay::lookup(child_path).is_none()
+                && !crate::linux_overlay::hidden(child_path)
+        }) {
+            return false;
+        }
+        cursor = child.next_cursor;
+    }
+    true
+}
+
+/// `name` below the canonical directory `parent`, in `output`.
+fn linux_child_path<'a>(parent: &[u8], name: &[u8], output: &'a mut [u8]) -> Option<&'a [u8]> {
+    let separator = usize::from(!parent.is_empty());
+    let output = output.get_mut(..parent.len() + separator + name.len())?;
+    output[..parent.len()].copy_from_slice(parent);
+    if separator != 0 {
+        output[parent.len()] = b'/';
+    }
+    output[parent.len() + separator..].copy_from_slice(name);
+    Some(output)
+}
+
 fn linux_getdents64(descriptor: u64, address: u64, count: u64) -> u64 {
     linux_getdents(descriptor, address, count, false)
 }
@@ -41602,99 +41689,51 @@ fn linux_getdents(descriptor: u64, address: u64, count: u64, legacy: bool) -> u6
     let mut used = 0_usize;
     let next_offset;
     let rootfs_directory = linux_rootfs_descriptor(descriptor);
-    if let Some(directory) = linux_overlay_descriptor_handle(descriptor) {
-        let initial = offset == 0;
-        let mut cursor = if initial {
-            0
-        } else {
-            let Some(cursor) = offset
-                .checked_sub(2)
-                .and_then(|cursor| usize::try_from(cursor).ok())
-            else {
-                return LINUX_EINVAL;
-            };
-            cursor
-        };
-        if initial {
-            for (inode, next, name) in [
-                (directory.inode(), 1_i64, &b"."[..]),
-                (directory.inode(), 2, &b".."[..]),
-            ] {
-                if !append_linux_dirent(
-                    &mut entries[..output_capacity],
-                    &mut used,
-                    legacy,
-                    inode,
-                    next,
-                    4,
-                    name,
-                ) {
-                    return LINUX_EINVAL;
-                }
-            }
-        }
-        loop {
-            let Some(child) = crate::linux_overlay::next_child(directory, cursor) else {
-                return LINUX_EBADF;
-            };
-            let Some(child) = child else {
-                break;
-            };
-            let kind = match child.metadata.kind {
-                crate::linux_overlay::NodeKind::File => 8,
-                crate::linux_overlay::NodeKind::Directory => 4,
-                crate::linux_overlay::NodeKind::Symlink => 10,
-                crate::linux_overlay::NodeKind::Fifo => 1,
-                crate::linux_overlay::NodeKind::CharacterDevice => 2,
-                crate::linux_overlay::NodeKind::BlockDevice => 6,
-            };
-            let Some(cookie) = child.next_cursor.checked_add(2) else {
-                return LINUX_EINVAL;
-            };
-            let Ok(next) = i64::try_from(cookie) else {
-                return LINUX_EINVAL;
-            };
-            if !append_linux_dirent(
-                &mut entries[..output_capacity],
-                &mut used,
-                legacy,
-                child.metadata.handle.inode(),
-                next,
-                kind,
-                child.name(),
-            ) {
-                if used == 0 {
-                    return LINUX_EINVAL;
-                }
-                break;
-            }
-            cursor = child.next_cursor;
-        }
-        if used == 0 {
-            return 0;
-        }
-        next_offset = (cursor + 2) as u64;
-    } else if rootfs_directory != 0 {
-        let initial = offset == 0;
-        let mut cursor = if initial {
-            0
-        } else {
-            let Some(cursor) = offset
-                .checked_sub(2)
-                .and_then(|cursor| usize::try_from(cursor).ok())
-            else {
-                return LINUX_EINVAL;
-            };
-            cursor
-        };
-        if initial {
-            for (inode, next, name) in [
-                (linux_rootfs_inode(rootfs_directory), 1_i64, &b"."[..]),
+    let overlay_directory = linux_overlay_descriptor_handle(descriptor);
+    if overlay_directory.is_some() || rootfs_directory != 0 {
+        // The directory as path lookup sees it (linux_path_access): the
+        // image's entries the overlay neither hides nor replaces, then the
+        // overlay's own. Cookies from LINUX_DIRENT_OVERLAY_PHASE on walk the
+        // overlay, those below it the image.
+        let mut path = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+        let (directory_inode, parent_inode, path_length, lower) = match overlay_directory {
+            Some(directory) => {
+                let Some(length) = crate::linux_overlay::copy_path(directory, &mut path) else {
+                    return LINUX_EBADF;
+                };
                 (
+                    directory.inode(),
+                    directory.inode(),
+                    length,
+                    linux_image_directory(&path[..length]),
+                )
+            }
+            None => {
+                let Some(length) = crate::published_rootfs::copy_path(rootfs_directory, &mut path)
+                else {
+                    return LINUX_EBADF;
+                };
+                (
+                    linux_rootfs_inode(rootfs_directory),
                     linux_rootfs_inode(crate::published_rootfs::ROOT_HANDLE),
-                    2,
-                    &b".."[..],
-                ),
+                    length,
+                    Some(rootfs_directory),
+                )
+            }
+        };
+        let directory_path = &path[..path_length];
+        let initial = offset == 0;
+        let Some(mut cookie) = (if initial {
+            Some(0)
+        } else {
+            offset.checked_sub(2)
+        }) else {
+            return LINUX_EINVAL;
+        };
+        if initial {
+            for (inode, next, name) in [
+                (directory_inode, 1_i64, &b"."[..]),
+                (parent_inode, 2, &b".."[..]),
             ] {
                 if !append_linux_dirent(
                     &mut entries[..output_capacity],
@@ -41709,42 +41748,98 @@ fn linux_getdents(descriptor: u64, address: u64, count: u64, legacy: bool) -> u6
                 }
             }
         }
-        loop {
-            let Some(child) = crate::published_rootfs::next_child(rootfs_directory, cursor) else {
-                return LINUX_EINVAL;
-            };
-            let Some(child) = child else {
-                break;
-            };
-            let kind = match child.entry.kind {
-                crate::published_rootfs::EntryKind::Directory => 4,
-                crate::published_rootfs::EntryKind::File => 8,
-                crate::published_rootfs::EntryKind::Hardlink => 8,
-                crate::published_rootfs::EntryKind::Symlink => 10,
-            };
-            let Ok(next) = i64::try_from(child.next_cursor + 2) else {
-                return LINUX_EINVAL;
-            };
-            if !append_linux_dirent(
-                &mut entries[..output_capacity],
-                &mut used,
-                legacy,
-                linux_rootfs_inode(child.handle),
-                next,
-                kind,
-                child.name,
-            ) {
-                if used == 0 {
+        let mut full = false;
+        if cookie < LINUX_DIRENT_OVERLAY_PHASE {
+            if let Some(lower) = lower {
+                let Ok(mut cursor) = usize::try_from(cookie) else {
                     return LINUX_EINVAL;
+                };
+                loop {
+                    let Some(child) = crate::published_rootfs::next_child(lower, cursor) else {
+                        return LINUX_EINVAL;
+                    };
+                    let Some(child) = child else {
+                        break;
+                    };
+                    let mut child_path = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+                    let shown = linux_child_path(directory_path, child.name, &mut child_path)
+                        .is_some_and(|child_path| {
+                            crate::linux_overlay::lookup(child_path).is_none()
+                                && !crate::linux_overlay::hidden(child_path)
+                        });
+                    let kind = match child.entry.kind {
+                        crate::published_rootfs::EntryKind::Directory => 4,
+                        crate::published_rootfs::EntryKind::File => 8,
+                        crate::published_rootfs::EntryKind::Hardlink => 8,
+                        crate::published_rootfs::EntryKind::Symlink => 10,
+                    };
+                    let Ok(next) = i64::try_from(child.next_cursor + 2) else {
+                        return LINUX_EINVAL;
+                    };
+                    if shown
+                        && !append_linux_dirent(
+                            &mut entries[..output_capacity],
+                            &mut used,
+                            legacy,
+                            linux_rootfs_inode(child.handle),
+                            next,
+                            kind,
+                            child.name,
+                        )
+                    {
+                        full = true;
+                        break;
+                    }
+                    cursor = child.next_cursor;
+                    cookie = cursor as u64;
                 }
-                break;
             }
-            cursor = child.next_cursor;
+            if !full {
+                cookie = LINUX_DIRENT_OVERLAY_PHASE;
+            }
+        }
+        if !full {
+            let Ok(mut cursor) = usize::try_from(cookie - LINUX_DIRENT_OVERLAY_PHASE) else {
+                return LINUX_EINVAL;
+            };
+            // No overlay (a domain without a writable layer) lists nothing.
+            while let Some(Some(child)) =
+                crate::linux_overlay::next_child_at(directory_path, cursor)
+            {
+                let kind = match child.metadata.kind {
+                    crate::linux_overlay::NodeKind::File => 8,
+                    crate::linux_overlay::NodeKind::Directory => 4,
+                    crate::linux_overlay::NodeKind::Symlink => 10,
+                    crate::linux_overlay::NodeKind::Fifo => 1,
+                    crate::linux_overlay::NodeKind::CharacterDevice => 2,
+                    crate::linux_overlay::NodeKind::BlockDevice => 6,
+                };
+                let Some(next) = (child.next_cursor as u64)
+                    .checked_add(LINUX_DIRENT_OVERLAY_PHASE + 2)
+                    .and_then(|next| i64::try_from(next).ok())
+                else {
+                    return LINUX_EINVAL;
+                };
+                if !append_linux_dirent(
+                    &mut entries[..output_capacity],
+                    &mut used,
+                    legacy,
+                    child.metadata.handle.inode(),
+                    next,
+                    kind,
+                    child.name(),
+                ) {
+                    full = true;
+                    break;
+                }
+                cursor = child.next_cursor;
+                cookie = LINUX_DIRENT_OVERLAY_PHASE + cursor as u64;
+            }
         }
         if used == 0 {
-            return 0;
+            return if full { LINUX_EINVAL } else { 0 };
         }
-        next_offset = u64::try_from(cursor + 2).unwrap_or(u64::MAX);
+        next_offset = cookie + 2;
     } else if let Some(directory) = linux_measured_directory_path(state) {
         let directory_inode = linux_root_directory_inode(state).unwrap_or(0);
         let parent_inode = if directory.is_empty() {
@@ -43298,8 +43393,62 @@ fn linux_membarrier(command: u64, flags: u64, _cpu_id: u64) -> u64 {
     }
 }
 
+/// The character devices the kernel provides itself. Each has its own
+/// inode and Linux's device number: programs compare them (GNU grep takes
+/// output whose identity is /dev/null's as discarded and prints nothing).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LinuxCharacterDevice {
+    Null,
+    Zero,
+    Console,
+    Tty,
+}
+
+impl LinuxCharacterDevice {
+    fn from_path(path: &[u8]) -> Option<Self> {
+        match path {
+            b"/dev/null" => Some(Self::Null),
+            b"/dev/zero" => Some(Self::Zero),
+            b"/dev/console" => Some(Self::Console),
+            b"/dev/tty" => Some(Self::Tty),
+            _ => None,
+        }
+    }
+
+    /// The device an open descriptor's kind (`linux_device_descriptor`)
+    /// names: /dev/null opens with no kind bits, only its access mode.
+    fn from_kind(kind: u16) -> Self {
+        if kind & LINUX_DEVICE_ZERO != 0 {
+            Self::Zero
+        } else if kind & !3 == 0 {
+            Self::Null
+        } else {
+            Self::Console
+        }
+    }
+
+    /// Inode, major and minor number and permissions, as on Linux.
+    fn identity(self) -> (u64, u32, u32, u32) {
+        match self {
+            Self::Null => (1, 1, 3, 0o666),
+            Self::Zero => (2, 1, 5, 0o666),
+            Self::Console => (3, 5, 1, 0o600),
+            Self::Tty => (5, 5, 0, 0o666),
+        }
+    }
+
+    fn stat(self) -> [u8; LINUX_STAT_SIZE] {
+        let (inode, major, minor, permissions) = self.identity();
+        let mut stat = linux_stat(0o020_000 | permissions, inode);
+        let (major, minor) = (u64::from(major), u64::from(minor));
+        let rdev = (minor & 0xff) | (major << 8) | ((minor & !0xff) << 12);
+        stat[40..48].copy_from_slice(&rdev.to_ne_bytes());
+        stat
+    }
+}
+
 fn linux_console_stat() -> [u8; LINUX_STAT_SIZE] {
-    linux_stat(LINUX_STAT_CHARACTER_DEVICE_MODE, 1)
+    LinuxCharacterDevice::Console.stat()
 }
 
 /// Character devices for graphical sessions: the firmware framebuffer as
@@ -43712,7 +43861,7 @@ fn linux_descriptor_stat(descriptor: u64) -> Option<[u8; LINUX_STAT_SIZE]> {
         } else if device & LINUX_FILE_MASK != 0 {
             linux_regular_file_stat(device)
         } else {
-            linux_console_stat()
+            LinuxCharacterDevice::from_kind(device).stat()
         }
     })
 }

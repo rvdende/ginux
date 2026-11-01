@@ -788,10 +788,16 @@ pub(crate) fn path_hash(handle: Handle) -> Option<u64> {
     Some(hash.max(1))
 }
 
-pub(crate) fn next_child(directory: Handle, cursor: usize) -> Option<Option<Child>> {
-    let mut parent = [0_u8; PATH_CAPACITY];
-    let parent_length = copy_path(directory, &mut parent)?;
-    let mut prefix_length = parent_length;
+/// The overlay's entry after `cursor` directly below the canonical
+/// directory path `directory` ("" for the root), whether or not the overlay
+/// has a node for the directory itself: files created in a directory of the
+/// image are overlay nodes below the image's directory.
+pub(crate) fn next_child_at(directory: &[u8], cursor: usize) -> Option<Option<Child>> {
+    let mut parent = [0_u8; PATH_CAPACITY + 1];
+    parent
+        .get_mut(..directory.len())?
+        .copy_from_slice(directory);
+    let mut prefix_length = directory.len();
     if prefix_length != 0 {
         parent[prefix_length] = b'/';
         prefix_length += 1;

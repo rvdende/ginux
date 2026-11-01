@@ -124,7 +124,14 @@ cadrs (Bevy, wgpu) in an Ubuntu 26.04 domain with one CPU, 1280x800, its
 under ginux-wm: after the first 100 frames (startup: a 5 s first frame and a
 9 s scene load) mean 17.4 ms (57 fps), median 17 ms, p90 19 ms, worst 50 ms.
 Before cheaper process switches (docs/SCHEDULER.md) the median was 23 ms
-(p90 33 ms). Software rendering (lavapipe) on the same domain was 295 ms. Multi-CPU
+(p90 33 ms). Software rendering (lavapipe) on the same domain was 295 ms.
+cadrs exits with SIGSEGV after its scenario (status 139). That is the
+application and driver, not Ginux: the main thread destroys the Vulkan
+instance (the loader unloads `libvulkan_virtio.so`) and only then wakes a
+thread that had used Venus; that thread exits, and glibc runs the
+thread-specific-data destructor Venus registered with `pthread_key_create`
+in the unloaded library. With the library kept loaded (`LD_PRELOAD`) the
+same destructor dereferences the destroyed instance's ring instead. Multi-CPU
 domains (`cpu=N`) are not yet usable with a compositor: a process whose
 threads run on other CPUs cannot be switched out (docs/SCHEDULER.md).
 
