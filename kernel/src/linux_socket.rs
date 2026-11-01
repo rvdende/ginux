@@ -1,14 +1,28 @@
-#![allow(static_mut_refs)]
+//! Sockets and pipes of Linux processes: TCP and UDP through smoltcp over
+//! the domain's virtio network device, and local streams (pipes,
+//! socketpairs, Unix sockets and TCP connections between the interface's
+//! own addresses) whose bytes stay in the kernel.
+//!
+//! Every socket lives in one table that grows as sockets open, as Linux's
+//! file table does; a socket's id is its index there, which descriptors
+//! store, and a closed socket's entry is reused. The table, smoltcp's state
+//! and the device sit behind one lock, ranked below the kernel heap so that
+//! the table, queues and socket buffers can grow while it is held. Calls
+//! that wait take the lock once per attempt, so others run in between.
+//!
+//! Files that are not sockets travel through SCM_RIGHTS as file rights,
+//! queued with ids from `FILE_RIGHT_BASE` up, so that a queue of rights
+//! holds sockets and files alike.
+#![deny(unsafe_code)]
 
-use core::{
-    cell::UnsafeCell,
-    ptr::{read_volatile, write_volatile},
-    sync::atomic::{compiler_fence, Ordering},
-};
+#[allow(unsafe_code)]
+mod virtio_net;
+
+use alloc::collections::VecDeque;
+use alloc::vec::Vec;
 
 use smoltcp::{
-    iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet, SocketStorage},
-    phy::{Device, DeviceCapabilities, Medium, PacketMeta, RxToken, TxToken},
+    iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet},
     socket::{tcp, udp},
     time::{Duration, Instant},
     wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address},
@@ -16,30 +30,33 @@ use smoltcp::{
 
 use crate::{
     arch::x86_64::{
-        iommu::{DeviceTranslation, DeviceTranslationProfile},
+        iommu::DeviceTranslationProfile,
         paging::MmioMapping,
-        pci::{self, VirtioNetworkDevice, VirtioNetworkInitialization},
+        pci::{VirtioNetworkDevice, VirtioNetworkInitialization},
     },
-    memory, network,
+    network,
+    sync::{LockRank, SpinLock},
 };
+use virtio_net::{VirtioNet, LOOPBACK_FRAME_COUNT};
 
-const SLOT_COUNT: usize = 64;
+/// A socket's id: its index in the table. Descriptors store it plus one,
+/// with 0 for no socket.
+pub(crate) type SlotId = u16;
+
+/// Ids from here up name file rights; sockets take the ids below.
+const FILE_RIGHT_BASE: usize = 0xf000;
+/// File rights in flight at once: their ids, plus one, still fit a `SlotId`.
+const FILE_RIGHT_LIMIT: usize = SlotId::MAX as usize - FILE_RIGHT_BASE;
 const UNIX_PATH_CAPACITY: usize = 108;
-pub(crate) const PASSED_RIGHT_LIMIT: usize = SLOT_COUNT;
+/// Rights one SCM_RIGHTS message carries.
+pub(crate) const PASSED_RIGHT_LIMIT: usize = 64;
+/// Credentials (SCM_CREDENTIALS) a Unix socket holds for its reader.
+const CREDENTIAL_QUEUE_LIMIT: usize = 64;
+/// The longest accept queue: Linux's default `somaxconn`.
+const BACKLOG_LIMIT: usize = 4096;
 const TCP_BUFFER_SIZE: usize = 64 * 1024;
 const UDP_BUFFER_SIZE: usize = 16 * 1024;
 const UDP_PACKET_COUNT: usize = 16;
-const QUEUE_SIZE: u16 = 8;
-const RX_DESC_OFFSET: usize = 0x000;
-const RX_AVAIL_OFFSET: usize = 0x080;
-const RX_USED_OFFSET: usize = 0x100;
-const TX_DESC_OFFSET: usize = 0x180;
-const TX_AVAIL_OFFSET: usize = 0x200;
-const TX_USED_OFFSET: usize = 0x280;
-const RX_BUFFER_OFFSET: usize = 0x400;
-const TX_BUFFER_OFFSET: usize = 0xa00;
-const RX_DESCRIPTOR_LENGTH: usize = 0x5ff;
-const VIRTIO_HEADER_LENGTH: usize = 12;
 const BLOCKING_POLL_LIMIT: usize = 20_000;
 /// Bytes a local stream (a pipe or a socketpair) queues for a writer that
 /// must not block: Linux's default pipe capacity. A blocking writer is not
@@ -47,81 +64,9 @@ const BLOCKING_POLL_LIMIT: usize = 20_000;
 const LOCAL_QUEUE_CAPACITY: usize = 64 * 1024;
 /// Writes up to this size go into a local queue whole or not at all.
 const LOCAL_ATOMIC_WRITE: usize = 4096;
-/// Frames the interface sends to one of its own addresses (127.0.0.0/8 or
-/// its configured address) come back to it instead of going to the wire.
-const LOOPBACK_FRAME_COUNT: usize = 16;
-const LOOPBACK_FRAME_SIZE: usize = 1514;
+/// Local queues hold their bytes in chunks of this size.
+const LOCAL_CHUNK: usize = 4096;
 const PAGE_SIZE: usize = 4096;
-const LOCAL_DATA_CAPACITY: usize =
-    PAGE_SIZE - core::mem::size_of::<memory::FrameLease>() - core::mem::size_of::<u32>();
-
-#[repr(C)]
-struct LocalDataPage {
-    next: memory::FrameLease,
-    used: u32,
-    bytes: [u8; LOCAL_DATA_CAPACITY],
-}
-
-const _: () = assert!(core::mem::size_of::<LocalDataPage>() == PAGE_SIZE);
-
-struct LoopbackFrames {
-    frames: [[u8; LOOPBACK_FRAME_SIZE]; LOOPBACK_FRAME_COUNT],
-    lengths: [u16; LOOPBACK_FRAME_COUNT],
-    head: usize,
-    count: usize,
-}
-
-impl LoopbackFrames {
-    const EMPTY: Self = Self {
-        frames: [[0; LOOPBACK_FRAME_SIZE]; LOOPBACK_FRAME_COUNT],
-        lengths: [0; LOOPBACK_FRAME_COUNT],
-        head: 0,
-        count: 0,
-    };
-
-    /// Queues a copy of `frame`; a full queue drops it, as a busy wire would.
-    fn push(&mut self, frame: &[u8]) {
-        if self.count == LOOPBACK_FRAME_COUNT || frame.len() > LOOPBACK_FRAME_SIZE {
-            return;
-        }
-        let index = (self.head + self.count) % LOOPBACK_FRAME_COUNT;
-        self.frames[index][..frame.len()].copy_from_slice(frame);
-        self.lengths[index] = frame.len() as u16;
-        self.count += 1;
-    }
-
-    fn front(&self) -> &[u8] {
-        if self.count == 0 {
-            return &[];
-        }
-        &self.frames[self.head][..usize::from(self.lengths[self.head])]
-    }
-
-    fn pop(&mut self) {
-        if self.count != 0 {
-            self.head = (self.head + 1) % LOOPBACK_FRAME_COUNT;
-            self.count -= 1;
-        }
-    }
-}
-
-/// Whether an Ethernet frame is addressed to one of the interface's own
-/// IPv4 addresses: an IPv4 packet's destination or an ARP request's target.
-fn frame_loops_back(frame: &[u8], local_address: u32) -> bool {
-    let target = match frame.get(12..14) {
-        Some([0x08, 0x00]) => frame.get(30..34),
-        Some([0x08, 0x06]) => frame.get(38..42),
-        _ => None,
-    };
-    target
-        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
-        .is_some_and(|octets| octets[0] == 127 || u32::from_be_bytes(octets) == local_address)
-}
-
-/// Whether `address` (host order) is one of the interface's own.
-fn is_local_address(runtime: &Runtime, address: u32) -> bool {
-    address >> 24 == 127 || address == runtime.local_address
-}
 
 #[derive(Clone, Copy)]
 struct Platform {
@@ -169,23 +114,9 @@ pub(crate) enum TimeoutOption {
     Send,
 }
 
-#[derive(Clone, Copy)]
-struct Slot {
-    occupied: bool,
-    owner: u8,
-    references: u16,
-    kind: Kind,
-    handle: Option<SocketHandle>,
-    remote: Option<IpEndpoint>,
-    local_port: u16,
-    tcp_buffer: Option<u8>,
-    listening: bool,
-    backlog: u8,
-    pending_length: u8,
-    pending: [u8; SLOT_COUNT],
-    peer: Option<u8>,
-    read_shutdown: bool,
-    write_shutdown: bool,
+/// Socket options, which an accepted socket takes from its listener.
+#[derive(Clone, Copy, Default)]
+struct Options {
     reuse_address: bool,
     keep_alive: bool,
     receive_errors: bool,
@@ -194,57 +125,178 @@ struct Slot {
     timestamp: bool,
     receive_timeout_us: u64,
     send_timeout_us: u64,
-    pending_right_count: u8,
-    pending_right_slots: [u8; SLOT_COUNT],
-    pending_right_flags: [u32; SLOT_COUNT],
-    pending_credential_count: u8,
-    pending_credentials: [(u32, u32, u32); SLOT_COUNT],
+}
+
+/// The bytes a local stream holds for its reader, in chunks taken from the
+/// heap as they fill and returned as they drain.
+#[derive(Default)]
+struct LocalQueue {
+    chunks: VecDeque<Vec<u8>>,
+    /// Where reading resumes in the first chunk.
+    head: usize,
+    length: usize,
+}
+
+impl LocalQueue {
+    fn len(&self) -> usize {
+        self.length
+    }
+
+    fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+
+    /// Appends as much of `input` as memory allows and says how much.
+    fn push(&mut self, input: &[u8]) -> usize {
+        let mut rest = input;
+        if let Some(tail) = self.chunks.back_mut() {
+            let fits = rest.len().min(LOCAL_CHUNK.saturating_sub(tail.len()));
+            tail.extend_from_slice(&rest[..fits]);
+            rest = &rest[fits..];
+        }
+        while !rest.is_empty() {
+            let mut chunk = Vec::new();
+            if chunk.try_reserve_exact(LOCAL_CHUNK).is_err() || self.chunks.try_reserve(1).is_err()
+            {
+                break;
+            }
+            let fits = rest.len().min(LOCAL_CHUNK);
+            chunk.extend_from_slice(&rest[..fits]);
+            self.chunks.push_back(chunk);
+            rest = &rest[fits..];
+        }
+        let queued = input.len() - rest.len();
+        self.length += queued;
+        queued
+    }
+
+    /// Copies the first bytes into `output` without removing them.
+    fn peek(&self, output: &mut [u8]) -> usize {
+        let mut copied = 0;
+        let mut head = self.head;
+        for chunk in &self.chunks {
+            if copied == output.len() {
+                break;
+            }
+            let bytes = &chunk[head..];
+            let amount = bytes.len().min(output.len() - copied);
+            output[copied..copied + amount].copy_from_slice(&bytes[..amount]);
+            copied += amount;
+            head = 0;
+        }
+        copied
+    }
+
+    /// Moves the first bytes into `output`.
+    fn pop(&mut self, output: &mut [u8]) -> usize {
+        let copied = self.peek(output);
+        let mut rest = copied;
+        while rest != 0 {
+            let Some(front) = self.chunks.front() else {
+                break;
+            };
+            let available = front.len() - self.head;
+            if rest < available {
+                self.head += rest;
+                break;
+            }
+            rest -= available;
+            self.chunks.pop_front();
+            self.head = 0;
+        }
+        self.length -= copied;
+        copied
+    }
+}
+
+struct Slot {
+    /// The domain (container slot) that opened the socket.
+    owner: u8,
+    references: u16,
+    kind: Kind,
+    /// The smoltcp socket of a TCP or UDP socket.
+    handle: Option<SocketHandle>,
+    remote: Option<IpEndpoint>,
+    local_port: u16,
+    listening: bool,
+    backlog: usize,
+    /// Connections waiting for accept on a listening socket.
+    pending: VecDeque<SlotId>,
+    /// The other end of a local stream: itself for a loopback socket, the
+    /// listener for a local TCP connection not yet accepted.
+    peer: Option<SlotId>,
+    read_shutdown: bool,
+    write_shutdown: bool,
+    options: Options,
+    /// SCM_RIGHTS queued for this socket's reader: ids and descriptor flags.
+    rights: Vec<(SlotId, u32)>,
+    /// SCM_CREDENTIALS queued for this socket's reader.
+    credentials: VecDeque<(u32, u32, u32)>,
     peer_credentials: Option<(u32, u32, u32)>,
-    local_first: memory::FrameLease,
-    local_last: memory::FrameLease,
-    local_head: usize,
-    local_length: usize,
+    /// Bytes queued for this socket's reader.
+    local: LocalQueue,
     /// Bytes the local queue holds for a writer that must not block (a
     /// pipe's F_SETPIPE_SZ), or 0 for LOCAL_QUEUE_CAPACITY.
     local_capacity: u32,
+    /// A Unix socket's type: 1 stream, 2 datagram, 5 sequenced packets.
+    unix_type: u8,
+    /// The path a Unix socket is bound to; empty when it has none.
+    unix_path: Vec<u8>,
 }
 
 impl Slot {
+    fn new(kind: Kind, owner: u8) -> Self {
+        Self {
+            owner,
+            references: 1,
+            kind,
+            handle: None,
+            remote: None,
+            local_port: 0,
+            listening: false,
+            backlog: 0,
+            pending: VecDeque::new(),
+            peer: None,
+            read_shutdown: false,
+            write_shutdown: false,
+            options: Options::default(),
+            rights: Vec::new(),
+            credentials: VecDeque::new(),
+            peer_credentials: None,
+            local: LocalQueue::default(),
+            local_capacity: 0,
+            unix_type: 0,
+            unix_path: Vec::new(),
+        }
+    }
+
+    /// Whether the socket's bytes go through local queues: a Unix socket,
+    /// or a TCP socket connected to one of the interface's own addresses.
+    fn is_local(&self) -> bool {
+        self.kind == Kind::Unix || self.peer.is_some() && !self.listening
+    }
+}
+
+/// A file description travelling as SCM_RIGHTS: the descriptor state a
+/// receiver needs to open its own descriptor for the same file. Rights are
+/// queued as socket ids, so file rights use the ids from FILE_RIGHT_BASE
+/// up, and duplicate and close count references to them like sockets.
+#[derive(Clone, Copy)]
+pub(crate) struct FileRight {
+    pub(crate) device: u16,
+    pub(crate) rootfs: u16,
+    pub(crate) generation: u32,
+    pub(crate) flags: u32,
+    pub(crate) offset: u64,
+}
+
+impl FileRight {
     const EMPTY: Self = Self {
-        occupied: false,
-        owner: 0,
-        references: 0,
-        kind: Kind::Tcp,
-        handle: None,
-        remote: None,
-        local_port: 0,
-        tcp_buffer: None,
-        listening: false,
-        backlog: 0,
-        pending_length: 0,
-        pending: [0; SLOT_COUNT],
-        peer: None,
-        read_shutdown: false,
-        write_shutdown: false,
-        reuse_address: false,
-        keep_alive: false,
-        receive_errors: false,
-        no_delay: false,
-        pass_credentials: false,
-        timestamp: false,
-        receive_timeout_us: 0,
-        send_timeout_us: 0,
-        pending_right_count: 0,
-        pending_right_slots: [0; SLOT_COUNT],
-        pending_right_flags: [0; SLOT_COUNT],
-        pending_credential_count: 0,
-        pending_credentials: [(0, 0, 0); SLOT_COUNT],
-        peer_credentials: None,
-        local_first: memory::FrameLease::EMPTY,
-        local_last: memory::FrameLease::EMPTY,
-        local_head: 0,
-        local_length: 0,
-        local_capacity: 0,
+        device: 0,
+        rootfs: 0,
+        generation: 0,
+        flags: 0,
+        offset: 0,
     };
 }
 
@@ -252,138 +304,69 @@ struct Runtime {
     interface: Interface,
     device: VirtioNet,
     sockets: SocketSet<'static>,
-    _dma: memory::FrameLease,
-    _translation: DeviceTranslation,
     tick: i64,
     next_port: u16,
     local_address: u32,
 }
 
-struct SocketRuntimeOwner {
-    platform: UnsafeCell<Option<Platform>>,
-    runtime: UnsafeCell<Option<Runtime>>,
-    slots: UnsafeCell<[Slot; SLOT_COUNT]>,
-    unix_socket_types: UnsafeCell<[u8; SLOT_COUNT]>,
-    unix_path_lengths: UnsafeCell<[u8; SLOT_COUNT]>,
-    unix_paths: UnsafeCell<[[u8; UNIX_PATH_CAPACITY]; SLOT_COUNT]>,
-    unix_inflight_rights: UnsafeCell<usize>,
-    file_rights: UnsafeCell<[(u8, FileRight); SLOT_COUNT]>,
-    socket_storage: UnsafeCell<[SocketStorage<'static>; SLOT_COUNT]>,
-    tcp_rx: UnsafeCell<[[u8; TCP_BUFFER_SIZE]; SLOT_COUNT]>,
-    tcp_tx: UnsafeCell<[[u8; TCP_BUFFER_SIZE]; SLOT_COUNT]>,
-    udp_rx: UnsafeCell<[[u8; UDP_BUFFER_SIZE]; SLOT_COUNT]>,
-    udp_tx: UnsafeCell<[[u8; UDP_BUFFER_SIZE]; SLOT_COUNT]>,
-    udp_rx_meta: UnsafeCell<[[udp::PacketMetadata; UDP_PACKET_COUNT]; SLOT_COUNT]>,
-    udp_tx_meta: UnsafeCell<[[udp::PacketMetadata; UDP_PACKET_COUNT]; SLOT_COUNT]>,
-    loopback: UnsafeCell<LoopbackFrames>,
+struct Sockets {
+    platform: Option<Platform>,
+    runtime: Option<Runtime>,
+    slots: Vec<Option<Slot>>,
+    /// File rights by id less FILE_RIGHT_BASE, with their reference counts;
+    /// a count of 0 marks a free entry.
+    file_rights: Vec<(u32, FileRight)>,
+    /// Rights queued on Unix sockets and not yet received.
+    unix_inflight_rights: usize,
 }
 
-unsafe impl Sync for SocketRuntimeOwner {}
-
-static SOCKET_RUNTIME_OWNER: SocketRuntimeOwner = SocketRuntimeOwner {
-    platform: UnsafeCell::new(None),
-    runtime: UnsafeCell::new(None),
-    slots: UnsafeCell::new([Slot::EMPTY; SLOT_COUNT]),
-    unix_socket_types: UnsafeCell::new([0; SLOT_COUNT]),
-    unix_path_lengths: UnsafeCell::new([0; SLOT_COUNT]),
-    unix_paths: UnsafeCell::new([[0; UNIX_PATH_CAPACITY]; SLOT_COUNT]),
-    unix_inflight_rights: UnsafeCell::new(0),
-    file_rights: UnsafeCell::new([(0, FileRight::EMPTY); SLOT_COUNT]),
-    socket_storage: UnsafeCell::new([SocketStorage::EMPTY; SLOT_COUNT]),
-    tcp_rx: UnsafeCell::new([[0; TCP_BUFFER_SIZE]; SLOT_COUNT]),
-    tcp_tx: UnsafeCell::new([[0; TCP_BUFFER_SIZE]; SLOT_COUNT]),
-    udp_rx: UnsafeCell::new([[0; UDP_BUFFER_SIZE]; SLOT_COUNT]),
-    udp_tx: UnsafeCell::new([[0; UDP_BUFFER_SIZE]; SLOT_COUNT]),
-    udp_rx_meta: UnsafeCell::new([[udp::PacketMetadata::EMPTY; UDP_PACKET_COUNT]; SLOT_COUNT]),
-    udp_tx_meta: UnsafeCell::new([[udp::PacketMetadata::EMPTY; UDP_PACKET_COUNT]; SLOT_COUNT]),
-    loopback: UnsafeCell::new(LoopbackFrames::EMPTY),
-};
+static SOCKETS: SpinLock<Sockets> = SpinLock::new(
+    LockRank::SOCKETS,
+    Sockets {
+        platform: None,
+        runtime: None,
+        slots: Vec::new(),
+        file_rights: Vec::new(),
+        unix_inflight_rights: 0,
+    },
+);
 
 fn current_owner() -> u8 {
     crate::arch::x86_64::cpu::current_container_slot().unwrap_or(crate::control_abi::DOMAIN_LIMIT)
         as u8
 }
 
-macro_rules! owner_field {
-    ($name:ident, $field:ident, $ty:ty) => {
-        unsafe fn $name() -> &'static mut $ty {
-            // SAFETY: Socket lifecycle operations are serialized by the active
-            // domain until Gate 8 supplies the owner lock.
-            unsafe { &mut *SOCKET_RUNTIME_OWNER.$field.get() }
-        }
-    };
+/// A zero-filled buffer, or `Exhausted` when the heap has no room for it.
+fn filled<T: Clone>(length: usize, value: T) -> Result<Vec<T>, Error> {
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(length)
+        .map_err(|_| Error::Exhausted)?;
+    buffer.resize(length, value);
+    Ok(buffer)
 }
 
-owner_field!(socket_platform, platform, Option<Platform>);
-owner_field!(socket_runtime_state, runtime, Option<Runtime>);
-owner_field!(socket_slots, slots, [Slot; SLOT_COUNT]);
-owner_field!(unix_socket_types, unix_socket_types, [u8; SLOT_COUNT]);
-owner_field!(unix_path_lengths, unix_path_lengths, [u8; SLOT_COUNT]);
-owner_field!(
-    unix_paths,
-    unix_paths,
-    [[u8; UNIX_PATH_CAPACITY]; SLOT_COUNT]
-);
-owner_field!(unix_inflight_rights_state, unix_inflight_rights, usize);
-owner_field!(file_rights, file_rights, [(u8, FileRight); SLOT_COUNT]);
-owner_field!(
-    socket_storage,
-    socket_storage,
-    [SocketStorage<'static>; SLOT_COUNT]
-);
-owner_field!(tcp_rx, tcp_rx, [[u8; TCP_BUFFER_SIZE]; SLOT_COUNT]);
-owner_field!(tcp_tx, tcp_tx, [[u8; TCP_BUFFER_SIZE]; SLOT_COUNT]);
-owner_field!(udp_rx, udp_rx, [[u8; UDP_BUFFER_SIZE]; SLOT_COUNT]);
-owner_field!(udp_tx, udp_tx, [[u8; UDP_BUFFER_SIZE]; SLOT_COUNT]);
-owner_field!(
-    udp_rx_meta,
-    udp_rx_meta,
-    [[udp::PacketMetadata; UDP_PACKET_COUNT]; SLOT_COUNT]
-);
-owner_field!(
-    udp_tx_meta,
-    udp_tx_meta,
-    [[udp::PacketMetadata; UDP_PACKET_COUNT]; SLOT_COUNT]
-);
-owner_field!(loopback_frames, loopback, LoopbackFrames);
-
-fn free_tcp_buffer() -> Option<usize> {
-    (0..SLOT_COUNT).find(|candidate| unsafe {
-        socket_slots()
-            .iter()
-            .all(|slot| !slot.occupied || slot.tcp_buffer.map(usize::from) != Some(*candidate))
-    })
+fn add_tcp_socket(runtime: &mut Runtime) -> Result<SocketHandle, Error> {
+    let rx = tcp::SocketBuffer::new(filled(TCP_BUFFER_SIZE, 0_u8)?);
+    let tx = tcp::SocketBuffer::new(filled(TCP_BUFFER_SIZE, 0_u8)?);
+    Ok(runtime.sockets.add(tcp::Socket::new(rx, tx)))
 }
 
-fn local_page(frame: memory::FrameLease) -> Option<&'static LocalDataPage> {
-    let address = frame.direct_map_address()?;
-    Some(unsafe { &*(address as *const LocalDataPage) })
+fn add_udp_socket(runtime: &mut Runtime) -> Result<SocketHandle, Error> {
+    let rx = udp::PacketBuffer::new(
+        filled(UDP_PACKET_COUNT, udp::PacketMetadata::EMPTY)?,
+        filled(UDP_BUFFER_SIZE, 0_u8)?,
+    );
+    let tx = udp::PacketBuffer::new(
+        filled(UDP_PACKET_COUNT, udp::PacketMetadata::EMPTY)?,
+        filled(UDP_BUFFER_SIZE, 0_u8)?,
+    );
+    Ok(runtime.sockets.add(udp::Socket::new(rx, tx)))
 }
 
-fn local_page_mut(frame: memory::FrameLease) -> Option<&'static mut LocalDataPage> {
-    let address = frame.direct_map_address()?;
-    Some(unsafe { &mut *(address as *mut LocalDataPage) })
-}
-
-fn release_local_pages(mut page: memory::FrameLease) -> bool {
-    while page != memory::FrameLease::EMPTY {
-        let Some(next) = local_page(page).map(|data| data.next) else {
-            return false;
-        };
-        if !memory::scrub_and_release_frames(
-            memory::FrameOwner::KERNEL,
-            core::slice::from_ref(&page),
-        ) {
-            return false;
-        }
-        page = next;
-    }
-    true
-}
-
-/// Queues `input` on a local stream's receive queue: into the room left in
-/// its last page, then in new pages. With `capacity`, queues only what fits
-/// (EAGAIN when nothing does, or when a small write does not fit whole).
+/// Queues `input` on a local stream's receive queue. With `capacity`,
+/// queues only what fits (EAGAIN when nothing does, or when a small write
+/// does not fit whole).
 fn append_local_data(
     state: &mut Slot,
     input: &[u8],
@@ -397,78 +380,1340 @@ fn append_local_data(
         }
     });
     let room = capacity.map_or(input.len(), |capacity| {
-        capacity.saturating_sub(state.local_length)
+        capacity.saturating_sub(state.local.len())
     });
     if room == 0 || input.len() <= LOCAL_ATOMIC_WRITE && input.len() > room {
         return Err(Error::WouldBlock);
     }
-    let input = &input[..input.len().min(room)];
-    let new_length = state
-        .local_length
-        .checked_add(input.len())
-        .ok_or(Error::Exhausted)?;
-    let mut rest = input;
-    // An empty queue has no last page (and the empty lease must not be
-    // dereferenced: it names physical page 0).
-    if let Some(tail) = (state.local_last != memory::FrameLease::EMPTY)
-        .then(|| local_page_mut(state.local_last))
-        .flatten()
-    {
-        let used = tail.used as usize;
-        let fits = rest.len().min(LOCAL_DATA_CAPACITY - used);
-        tail.bytes[used..used + fits].copy_from_slice(&rest[..fits]);
-        tail.used += fits as u32;
-        rest = &rest[fits..];
+    match state.local.push(&input[..input.len().min(room)]) {
+        0 => Err(Error::Exhausted),
+        queued => Ok(queued),
     }
-    if !rest.is_empty() {
-        let Some((first, last)) = allocate_local_pages(rest) else {
-            // What went into the last page stays queued.
-            let queued = input.len() - rest.len();
-            state.local_length += queued;
-            return if queued == 0 {
-                Err(Error::Exhausted)
-            } else {
-                Ok(queued)
-            };
-        };
-        if state.local_last == memory::FrameLease::EMPTY {
-            state.local_first = first;
-        } else if let Some(tail) = local_page_mut(state.local_last) {
-            tail.next = first;
-        } else {
-            let _ = release_local_pages(first);
-            return Err(Error::Invalid);
-        }
-        state.local_last = last;
-    }
-    state.local_length = new_length;
-    Ok(input.len())
 }
 
-fn allocate_local_pages(input: &[u8]) -> Option<(memory::FrameLease, memory::FrameLease)> {
-    let mut first = memory::FrameLease::EMPTY;
-    let mut last = memory::FrameLease::EMPTY;
-    for chunk in input.chunks(LOCAL_DATA_CAPACITY) {
-        let Some([page]) = memory::allocate_frames::<1>(memory::FrameOwner::KERNEL) else {
-            let _ = release_local_pages(first);
-            return None;
-        };
-        let Some(data) = local_page_mut(page) else {
-            let _ = memory::scrub_and_release_frames(memory::FrameOwner::KERNEL, &[page]);
-            let _ = release_local_pages(first);
-            return None;
-        };
-        data.next = memory::FrameLease::EMPTY;
-        data.used = chunk.len() as u32;
-        data.bytes[..chunk.len()].copy_from_slice(chunk);
-        if last == memory::FrameLease::EMPTY {
-            first = page;
-        } else {
-            local_page_mut(last)?.next = page;
+/// Whether `address` (host order) is one of the interface's own.
+fn is_local_address(runtime: &Runtime, address: u32) -> bool {
+    address >> 24 == 127 || address == runtime.local_address
+}
+
+fn port_in_use(slots: &[Option<Slot>], kind: Kind, port: u16, except: usize) -> bool {
+    port != 0
+        && slots.iter().enumerate().any(|(index, slot)| {
+            index != except
+                && slot
+                    .as_ref()
+                    .is_some_and(|slot| slot.kind == kind && slot.local_port == port)
+        })
+}
+
+fn allocate_ephemeral_port(
+    next_port: &mut u16,
+    slots: &[Option<Slot>],
+    kind: Kind,
+    except: usize,
+) -> Option<u16> {
+    for _ in 0..(u16::MAX - 49_152) {
+        let port = (*next_port).max(49_152);
+        *next_port = port.wrapping_add(1).max(49_152);
+        if !port_in_use(slots, kind, port, except) {
+            return Some(port);
         }
-        last = page;
     }
-    (first != memory::FrameLease::EMPTY).then_some((first, last))
+    None
+}
+
+/// The index of a free table entry, growing the table when none is.
+fn vacant(slots: &mut Vec<Option<Slot>>) -> Result<usize, Error> {
+    if let Some(index) = slots.iter().position(Option::is_none) {
+        return Ok(index);
+    }
+    if slots.len() >= FILE_RIGHT_BASE {
+        return Err(Error::Exhausted);
+    }
+    slots.try_reserve(1).map_err(|_| Error::Exhausted)?;
+    slots.push(None);
+    Ok(slots.len() - 1)
+}
+
+fn slot_in(slots: &[Option<Slot>], id: SlotId) -> Option<&Slot> {
+    slots.get(usize::from(id))?.as_ref()
+}
+
+fn slot_in_mut(slots: &mut [Option<Slot>], id: SlotId) -> Option<&mut Slot> {
+    slots.get_mut(usize::from(id))?.as_mut()
+}
+
+fn unix_in_mut(slots: &mut [Option<Slot>], id: SlotId) -> Option<&mut Slot> {
+    slot_in_mut(slots, id).filter(|state| state.kind == Kind::Unix)
+}
+
+pub(crate) fn endpoint(address: u32, port: u16) -> IpEndpoint {
+    IpEndpoint::new(
+        IpAddress::Ipv4(Ipv4Address::from_octets(address.to_be_bytes())),
+        port,
+    )
+}
+
+impl Sockets {
+    fn slot(&self, id: SlotId) -> Option<&Slot> {
+        slot_in(&self.slots, id)
+    }
+
+    fn slot_mut(&mut self, id: SlotId) -> Option<&mut Slot> {
+        slot_in_mut(&mut self.slots, id)
+    }
+
+    fn unix(&self, id: SlotId) -> Option<&Slot> {
+        self.slot(id).filter(|state| state.kind == Kind::Unix)
+    }
+
+    /// Puts a new socket in the table and returns its id.
+    fn insert(&mut self, slot: Slot) -> Result<SlotId, Error> {
+        let index = vacant(&mut self.slots)?;
+        self.slots[index] = Some(slot);
+        Ok(index as SlotId)
+    }
+
+    fn configure(&mut self, platform: Platform) -> bool {
+        if self.platform.is_some() {
+            return false;
+        }
+        self.platform = Some(platform);
+        true
+    }
+
+    /// Starts smoltcp on the domain's network device the first time a
+    /// socket needs it.
+    fn start_runtime(&mut self) -> Result<(), Error> {
+        if self.runtime.is_some() {
+            return Ok(());
+        }
+        let platform = self.platform.ok_or(Error::Unavailable)?;
+        let configuration = network::ipv4_configuration();
+        let ipv4 = configuration as u32;
+        let prefix = (configuration >> 32) as u8;
+        let gateway = network::ipv4_gateway() as u32;
+        if ipv4 == 0 || prefix > 32 || gateway == 0 {
+            return Err(Error::Unavailable);
+        }
+        let mut device = VirtioNet::start(&platform, ipv4).ok_or(Error::Unavailable)?;
+        let mut config = InterfaceConfig::new(EthernetAddress(platform.initialization.mac).into());
+        config.random_seed = u64::from(ipv4) << 32 | u64::from(gateway);
+        let mut interface = Interface::new(config, &mut device, Instant::from_millis(0));
+        interface.update_ip_addrs(|addresses| {
+            let _ = addresses.push(IpCidr::new(
+                IpAddress::Ipv4(Ipv4Address::from_octets(ipv4.to_be_bytes())),
+                prefix,
+            ));
+            let _ = addresses.push(IpCidr::new(
+                IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)),
+                8,
+            ));
+        });
+        if interface
+            .routes_mut()
+            .add_default_ipv4_route(Ipv4Address::from_octets(gateway.to_be_bytes()))
+            .is_err()
+        {
+            let _ = device.stop(&platform);
+            return Err(Error::Unavailable);
+        }
+        self.runtime = Some(Runtime {
+            interface,
+            device,
+            sockets: SocketSet::new(Vec::new()),
+            tick: 0,
+            next_port: 49_152,
+            local_address: ipv4,
+        });
+        Ok(())
+    }
+
+    fn runtime(&mut self) -> Result<&mut Runtime, Error> {
+        self.start_runtime()?;
+        self.runtime.as_mut().ok_or(Error::Unavailable)
+    }
+
+    fn poll(&mut self) {
+        if !network::link_is_up() {
+            return;
+        }
+        let Some(runtime) = self.runtime.as_mut() else {
+            return;
+        };
+        // Frames sent to the interface's own addresses are received on the
+        // next pass, so a loopback exchange completes within one poll.
+        for _ in 0..LOOPBACK_FRAME_COUNT {
+            runtime.tick = runtime.tick.wrapping_add(1);
+            let _ = runtime.interface.poll(
+                Instant::from_millis(runtime.tick),
+                &mut runtime.device,
+                &mut runtime.sockets,
+            );
+            if !runtime.device.loopback_pending() {
+                break;
+            }
+        }
+        // A TCP socket shut down for reading discards what arrives.
+        for state in self.slots.iter().flatten().filter(|state| {
+            state.kind == Kind::Tcp
+                && !state.listening
+                && state.peer.is_none()
+                && state.read_shutdown
+        }) {
+            let Some(handle) = state.handle else {
+                continue;
+            };
+            let socket = runtime.sockets.get_mut::<tcp::Socket>(handle);
+            while socket.can_recv() {
+                if socket.recv(|bytes| (bytes.len(), ())).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn teardown(&mut self) -> bool {
+        let Some(platform) = self.platform else {
+            return false;
+        };
+        let Some(runtime) = self.runtime.take() else {
+            return false;
+        };
+        runtime.device.stop(&platform)
+    }
+
+    fn open(&mut self, kind: Kind) -> Result<SlotId, Error> {
+        let handle = match kind {
+            Kind::Unix => return self.open_unix(1),
+            Kind::Tcp => add_tcp_socket(self.runtime()?)?,
+            Kind::Udp => add_udp_socket(self.runtime()?)?,
+        };
+        let mut slot = Slot::new(kind, current_owner());
+        slot.handle = Some(handle);
+        let id = self.insert(slot);
+        if id.is_err() {
+            if let Some(runtime) = self.runtime.as_mut() {
+                runtime.sockets.remove(handle);
+            }
+        }
+        id
+    }
+
+    fn open_unix(&mut self, socket_type: u8) -> Result<SlotId, Error> {
+        if !matches!(socket_type, 1 | 2 | 5) {
+            return Err(Error::Invalid);
+        }
+        let mut slot = Slot::new(Kind::Unix, current_owner());
+        slot.unix_type = socket_type;
+        self.insert(slot)
+    }
+
+    fn socket_type(&self, id: SlotId) -> Option<u8> {
+        let state = self.slot(id)?;
+        match state.kind {
+            Kind::Tcp => Some(1),
+            Kind::Udp => Some(2),
+            Kind::Unix => Some(state.unix_type),
+        }
+    }
+
+    fn bind_unix(&mut self, id: SlotId, path: &[u8]) -> Result<(), Error> {
+        if path.is_empty() || path.len() > UNIX_PATH_CAPACITY {
+            return Err(Error::Invalid);
+        }
+        let state = self.unix(id).ok_or(Error::Invalid)?;
+        if state.peer.is_some() || !state.unix_path.is_empty() {
+            return Err(Error::Invalid);
+        }
+        let owner = state.owner;
+        let in_use = self.slots.iter().enumerate().any(|(candidate, slot)| {
+            candidate != usize::from(id)
+                && slot
+                    .as_ref()
+                    .is_some_and(|slot| slot.owner == owner && slot.unix_path == path)
+        });
+        if in_use {
+            return Err(Error::AddressInUse);
+        }
+        let mut name = Vec::new();
+        name.try_reserve_exact(path.len())
+            .map_err(|_| Error::Exhausted)?;
+        name.extend_from_slice(path);
+        unix_in_mut(&mut self.slots, id)
+            .ok_or(Error::Invalid)?
+            .unix_path = name;
+        Ok(())
+    }
+
+    fn connect_unix(&mut self, id: SlotId, path: &[u8]) -> Result<(), Error> {
+        let state = self.unix(id).ok_or(Error::Invalid)?;
+        if state.peer.is_some() {
+            return Err(Error::Invalid);
+        }
+        let (owner, unix_type) = (state.owner, state.unix_type);
+        let peer = self
+            .slots
+            .iter()
+            .enumerate()
+            .find(|(candidate, slot)| {
+                *candidate != usize::from(id)
+                    && slot.as_ref().is_some_and(|slot| {
+                        slot.owner == owner
+                            && slot.kind == Kind::Unix
+                            && slot.unix_type == unix_type
+                            && slot.unix_path == path
+                    })
+            })
+            .map(|(candidate, _)| candidate as SlotId)
+            .ok_or(Error::NotConnected)?;
+        if unix_type == 2 {
+            unix_in_mut(&mut self.slots, id).ok_or(Error::Invalid)?.peer = Some(peer);
+            return Ok(());
+        }
+        let listener = self.slot(peer).ok_or(Error::Invalid)?;
+        if !listener.listening || listener.pending.len() >= listener.backlog {
+            return Err(Error::WouldBlock);
+        }
+        // The listener's end of the connection, which accept hands out.
+        let mut accepted = Slot::new(Kind::Unix, listener.owner);
+        accepted.peer = Some(id);
+        accepted.options = listener.options;
+        accepted.unix_type = listener.unix_type;
+        slot_in_mut(&mut self.slots, peer)
+            .ok_or(Error::Invalid)?
+            .pending
+            .try_reserve(1)
+            .map_err(|_| Error::Exhausted)?;
+        let accepted = self.insert(accepted)?;
+        unix_in_mut(&mut self.slots, id).ok_or(Error::Invalid)?.peer = Some(accepted);
+        slot_in_mut(&mut self.slots, peer)
+            .ok_or(Error::Invalid)?
+            .pending
+            .push_back(accepted);
+        Ok(())
+    }
+
+    fn unix_name(&self, id: SlotId) -> Option<Vec<u8>> {
+        let path = &self.unix(id)?.unix_path;
+        let mut name = Vec::new();
+        name.try_reserve_exact(path.len()).ok()?;
+        name.extend_from_slice(path);
+        Some(name)
+    }
+
+    fn open_pair(&mut self, socket_type: u8) -> Result<(SlotId, SlotId), Error> {
+        if !matches!(socket_type, 1 | 2 | 5) {
+            return Err(Error::Invalid);
+        }
+        let owner = current_owner();
+        let mut first = Slot::new(Kind::Unix, owner);
+        first.unix_type = socket_type;
+        let mut second = Slot::new(Kind::Unix, owner);
+        second.unix_type = socket_type;
+        let first = self.insert(first)?;
+        second.peer = Some(first);
+        let second = match self.insert(second) {
+            Ok(second) => second,
+            Err(error) => {
+                self.slots[usize::from(first)] = None;
+                return Err(error);
+            }
+        };
+        self.slot_mut(first).ok_or(Error::Invalid)?.peer = Some(second);
+        Ok((first, second))
+    }
+
+    fn open_loopback(&mut self, socket_type: u8) -> Result<SlotId, Error> {
+        let (id, peer) = self.open_pair(socket_type)?;
+        if !self.close(peer) {
+            let _ = self.close(id);
+            return Err(Error::Invalid);
+        }
+        self.slot_mut(id).ok_or(Error::Invalid)?.peer = Some(id);
+        Ok(id)
+    }
+
+    fn close(&mut self, id: SlotId) -> bool {
+        if let Some(references) = self.file_right_references(id) {
+            *references -= 1;
+            return true;
+        }
+        let index = usize::from(id);
+        let Some(state) = slot_in_mut(&mut self.slots, id) else {
+            return false;
+        };
+        if state.references > 1 {
+            state.references -= 1;
+            return true;
+        }
+        if state.kind == Kind::Unix || state.handle.is_none() && !state.listening {
+            if state.rights.len() > self.unix_inflight_rights {
+                return false;
+            }
+            let Some(state) = self.slots[index].take() else {
+                return false;
+            };
+            for other in self.slots.iter_mut().flatten() {
+                if other.peer == Some(id) {
+                    other.peer = None;
+                }
+                other.pending.retain(|pending| *pending != id);
+            }
+            self.unix_inflight_rights -= state.rights.len();
+            for (right, _) in state.rights {
+                let _ = self.close(right);
+            }
+            for connection in state.pending {
+                let _ = self.close(connection);
+            }
+            return true;
+        }
+        let Some(runtime) = self.runtime.as_mut() else {
+            return false;
+        };
+        let Some(handle) = state.handle else {
+            return false;
+        };
+        runtime.sockets.remove(handle);
+        self.slots[index] = None;
+        true
+    }
+
+    fn shutdown_socket(&mut self, id: SlotId, how: u8) -> Result<(), Error> {
+        if how > 2 {
+            return Err(Error::Invalid);
+        }
+        let state = self
+            .slot(id)
+            .filter(|state| !state.listening)
+            .ok_or(Error::NotConnected)?;
+        let peer_connected = state.peer.is_some_and(|peer| self.slot(peer).is_some());
+        if state.remote.is_none() && !peer_connected {
+            return Err(Error::NotConnected);
+        }
+        let state = slot_in_mut(&mut self.slots, id).ok_or(Error::NotConnected)?;
+        if matches!(how, 0 | 2) {
+            state.local = LocalQueue::default();
+            state.read_shutdown = true;
+        }
+        if matches!(how, 1 | 2) {
+            state.write_shutdown = true;
+            if state.kind == Kind::Tcp && state.peer.is_none() {
+                let runtime = self.runtime.as_mut().ok_or(Error::Unavailable)?;
+                let handle = state.handle.ok_or(Error::Invalid)?;
+                runtime.sockets.get_mut::<tcp::Socket>(handle).close();
+            }
+        }
+        Ok(())
+    }
+
+    /// Closes every socket of the current domain as it is torn down, and
+    /// stops the device once no domain has sockets left.
+    fn shutdown(&mut self) -> bool {
+        // A domain teardown owns every remaining socket reference, including
+        // duplicated descriptors and SCM_RIGHTS references that no live
+        // process can release after its process tree has been retired.
+        let owner = current_owner();
+        for index in 0..self.slots.len() {
+            let Some(state) = self.slots[index]
+                .as_mut()
+                .filter(|state| state.owner == owner)
+            else {
+                continue;
+            };
+            state.references = 1;
+            if !self.close(index as SlotId) {
+                return false;
+            }
+        }
+        if self.slots.iter().any(Option::is_some) {
+            return true;
+        }
+        self.slots = Vec::new();
+        self.unix_inflight_rights = 0;
+        self.file_rights = Vec::new();
+        if self.runtime.is_none() {
+            return true;
+        }
+        self.teardown()
+    }
+
+    fn duplicate(&mut self, id: SlotId) -> bool {
+        if let Some(references) = self.file_right_references(id) {
+            return references
+                .checked_add(1)
+                .map(|count| *references = count)
+                .is_some();
+        }
+        self.slot_mut(id)
+            .and_then(|state| {
+                state.references = state.references.checked_add(1)?;
+                Some(())
+            })
+            .is_some()
+    }
+
+    fn set_boolean_option(
+        &mut self,
+        id: SlotId,
+        option: BooleanOption,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        let state = slot_in_mut(&mut self.slots, id).ok_or(Error::Invalid)?;
+        let options = &mut state.options;
+        match option {
+            BooleanOption::ReuseAddress => options.reuse_address = enabled,
+            BooleanOption::KeepAlive => options.keep_alive = enabled,
+            BooleanOption::ReceiveErrors => options.receive_errors = enabled,
+            BooleanOption::NoDelay => options.no_delay = enabled,
+            BooleanOption::PassCredentials => options.pass_credentials = enabled,
+            BooleanOption::Timestamp => options.timestamp = enabled,
+        }
+        if state.kind == Kind::Tcp {
+            if let Some(handle) = state.handle {
+                let runtime = self.runtime.as_mut().ok_or(Error::Unavailable)?;
+                let socket = runtime.sockets.get_mut::<tcp::Socket>(handle);
+                match option {
+                    BooleanOption::KeepAlive => {
+                        socket.set_keep_alive(enabled.then_some(Duration::from_secs(75)))
+                    }
+                    BooleanOption::NoDelay => socket.set_nagle_enabled(!enabled),
+                    BooleanOption::ReuseAddress
+                    | BooleanOption::ReceiveErrors
+                    | BooleanOption::PassCredentials
+                    | BooleanOption::Timestamp => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn boolean_option(&self, id: SlotId, option: BooleanOption) -> Result<bool, Error> {
+        let options = self.slot(id).ok_or(Error::Invalid)?.options;
+        Ok(match option {
+            BooleanOption::ReuseAddress => options.reuse_address,
+            BooleanOption::KeepAlive => options.keep_alive,
+            BooleanOption::ReceiveErrors => options.receive_errors,
+            BooleanOption::NoDelay => options.no_delay,
+            BooleanOption::PassCredentials => options.pass_credentials,
+            BooleanOption::Timestamp => options.timestamp,
+        })
+    }
+
+    fn set_timeout_option(
+        &mut self,
+        id: SlotId,
+        option: TimeoutOption,
+        microseconds: u64,
+    ) -> Result<(), Error> {
+        let options = &mut self.slot_mut(id).ok_or(Error::Invalid)?.options;
+        match option {
+            TimeoutOption::Receive => options.receive_timeout_us = microseconds,
+            TimeoutOption::Send => options.send_timeout_us = microseconds,
+        }
+        Ok(())
+    }
+
+    fn timeout_option(&self, id: SlotId, option: TimeoutOption) -> Result<u64, Error> {
+        let options = self.slot(id).ok_or(Error::Invalid)?.options;
+        Ok(match option {
+            TimeoutOption::Receive => options.receive_timeout_us,
+            TimeoutOption::Send => options.send_timeout_us,
+        })
+    }
+
+    fn bind(&mut self, id: SlotId, address: u32, requested_port: u16) -> Result<u16, Error> {
+        self.poll();
+        self.start_runtime()?;
+        let index = usize::from(id);
+        let Self { runtime, slots, .. } = self;
+        let runtime = runtime.as_mut().ok_or(Error::Unavailable)?;
+        let state = slot_in(slots, id).ok_or(Error::Invalid)?;
+        if state.kind == Kind::Unix || state.local_port != 0 || state.remote.is_some() {
+            return Err(Error::Invalid);
+        }
+        let (kind, handle) = (state.kind, state.handle);
+        if address != 0 && !is_local_address(runtime, address) {
+            return Err(Error::AddressNotAvailable);
+        }
+        let port = if requested_port == 0 {
+            allocate_ephemeral_port(&mut runtime.next_port, slots, kind, index)
+                .ok_or(Error::Exhausted)?
+        } else {
+            requested_port
+        };
+        if port_in_use(slots, kind, port, index) {
+            return Err(Error::AddressInUse);
+        }
+        if kind == Kind::Udp {
+            runtime
+                .sockets
+                .get_mut::<udp::Socket>(handle.ok_or(Error::Invalid)?)
+                .bind(port)
+                .map_err(|_| Error::AddressInUse)?;
+        }
+        slot_in_mut(slots, id).ok_or(Error::Invalid)?.local_port = port;
+        Ok(port)
+    }
+
+    fn listen(&mut self, id: SlotId, requested_backlog: usize) -> Result<(), Error> {
+        self.poll();
+        let index = usize::from(id);
+        let state = self.slot(id).ok_or(Error::Invalid)?;
+        if state.remote.is_some() {
+            return Err(Error::Invalid);
+        }
+        let backlog = requested_backlog.clamp(1, BACKLOG_LIMIT);
+        if state.kind == Kind::Unix {
+            if state.unix_path.is_empty() {
+                return Err(Error::Invalid);
+            }
+            let state = self.slot_mut(id).ok_or(Error::Invalid)?;
+            state.listening = true;
+            state.backlog = backlog;
+            return Ok(());
+        }
+        if state.kind != Kind::Tcp {
+            return Err(Error::Invalid);
+        }
+        let (current_port, handle) = (state.local_port, state.handle);
+        self.start_runtime()?;
+        let Self { runtime, slots, .. } = self;
+        let runtime = runtime.as_mut().ok_or(Error::Unavailable)?;
+        let local_port = if current_port == 0 {
+            allocate_ephemeral_port(&mut runtime.next_port, slots, Kind::Tcp, index)
+                .ok_or(Error::Exhausted)?
+        } else {
+            current_port
+        };
+        runtime
+            .sockets
+            .get_mut::<tcp::Socket>(handle.ok_or(Error::Invalid)?)
+            .listen(local_port)
+            .map_err(|_| Error::Invalid)?;
+        let state = slot_in_mut(slots, id).ok_or(Error::Invalid)?;
+        state.local_port = local_port;
+        state.listening = true;
+        state.backlog = backlog;
+        Ok(())
+    }
+
+    fn accept(&mut self, id: SlotId) -> Result<(SlotId, IpEndpoint), Error> {
+        self.poll();
+        let kind = self
+            .slot(id)
+            .filter(|state| matches!(state.kind, Kind::Tcp | Kind::Unix) && state.listening)
+            .ok_or(Error::Invalid)?
+            .kind;
+        if kind == Kind::Tcp {
+            self.start_runtime()?;
+        }
+        let local_address = self
+            .runtime
+            .as_ref()
+            .map_or(0, |runtime| runtime.local_address);
+        // Connections whose client has gone are dropped from the queue.
+        while let Some(client) = self
+            .slot(id)
+            .and_then(|state| state.pending.front().copied())
+        {
+            if self
+                .slot(client)
+                .is_some_and(|state| state.kind == kind && !state.listening)
+            {
+                break;
+            }
+            if let Some(listener) = self.slot_mut(id) {
+                listener.pending.pop_front();
+            }
+        }
+        if let Some(client) = self
+            .slot(id)
+            .and_then(|state| state.pending.front().copied())
+        {
+            if kind == Kind::Unix {
+                // connect_unix made the listener's end already.
+                if let Some(listener) = self.slot_mut(id) {
+                    listener.pending.pop_front();
+                }
+                return Ok((client, endpoint(local_address, 0)));
+            }
+            // A TCP connection from one of the interface's own addresses:
+            // the two ends exchange bytes through local queues.
+            let client_port = self.slot(client).ok_or(Error::Invalid)?.local_port;
+            let listener = self.slot(id).ok_or(Error::Invalid)?;
+            let remote = endpoint(local_address, client_port);
+            let mut accepted = Slot::new(Kind::Tcp, listener.owner);
+            accepted.remote = Some(remote);
+            accepted.local_port = listener.local_port;
+            accepted.peer = Some(client);
+            accepted.options = listener.options;
+            let accepted = self.insert(accepted)?;
+            self.slot_mut(client).ok_or(Error::Invalid)?.peer = Some(accepted);
+            if let Some(listener) = self.slot_mut(id) {
+                listener.pending.pop_front();
+            }
+            return Ok((accepted, remote));
+        }
+        if kind == Kind::Unix {
+            return Err(Error::WouldBlock);
+        }
+        // smoltcp's listening socket is the connection now: it becomes the
+        // accepted socket, and a new one listens in its place.
+        let Self { runtime, slots, .. } = self;
+        let runtime = runtime.as_mut().ok_or(Error::Unavailable)?;
+        let listener = slot_in(slots, id).ok_or(Error::Invalid)?;
+        let handle = listener.handle.ok_or(Error::Invalid)?;
+        let socket = runtime.sockets.get::<tcp::Socket>(handle);
+        if !matches!(
+            socket.state(),
+            tcp::State::Established | tcp::State::CloseWait
+        ) {
+            return Err(Error::WouldBlock);
+        }
+        let remote = socket.remote_endpoint().ok_or(Error::Invalid)?;
+        let (owner, local_port, options) = (listener.owner, listener.local_port, listener.options);
+        let accepted_index = vacant(slots)?;
+        let replacement = add_tcp_socket(runtime)?;
+        if runtime
+            .sockets
+            .get_mut::<tcp::Socket>(replacement)
+            .listen(local_port)
+            .is_err()
+        {
+            runtime.sockets.remove(replacement);
+            return Err(Error::Invalid);
+        }
+        let accepted_socket = runtime.sockets.get_mut::<tcp::Socket>(handle);
+        accepted_socket.set_nagle_enabled(!options.no_delay);
+        accepted_socket.set_keep_alive(options.keep_alive.then_some(Duration::from_secs(75)));
+        let mut accepted = Slot::new(Kind::Tcp, owner);
+        accepted.handle = Some(handle);
+        accepted.remote = Some(remote);
+        accepted.local_port = local_port;
+        accepted.options = options;
+        slots[accepted_index] = Some(accepted);
+        let listener = slot_in_mut(slots, id).ok_or(Error::Invalid)?;
+        listener.handle = Some(replacement);
+        listener.remote = None;
+        listener.listening = true;
+        Ok((accepted_index as SlotId, remote))
+    }
+
+    fn connect(&mut self, id: SlotId, remote: IpEndpoint) -> Result<(), Error> {
+        self.poll();
+        self.start_runtime()?;
+        let index = usize::from(id);
+        let Self { runtime, slots, .. } = self;
+        let runtime = runtime.as_mut().ok_or(Error::Unavailable)?;
+        let state = slot_in(slots, id).ok_or(Error::Invalid)?;
+        let handle = state.handle.ok_or(Error::Invalid)?;
+        if state.listening {
+            return Err(Error::Invalid);
+        }
+        let (kind, current_port) = (state.kind, state.local_port);
+        let local_port = if current_port == 0 {
+            allocate_ephemeral_port(&mut runtime.next_port, slots, kind, index)
+                .ok_or(Error::Exhausted)?
+        } else {
+            current_port
+        };
+        if kind == Kind::Tcp
+            && matches!(remote.addr, IpAddress::Ipv4(address)
+                if is_local_address(runtime, u32::from_be_bytes(address.octets())))
+        {
+            let listener = slots.iter().position(|candidate| {
+                candidate.as_ref().is_some_and(|candidate| {
+                    candidate.kind == Kind::Tcp
+                        && candidate.listening
+                        && candidate.local_port == remote.port
+                        && candidate.pending.len() < candidate.backlog
+                })
+            });
+            if let Some(listener) = listener {
+                let listener = listener as SlotId;
+                let queue = &mut slot_in_mut(slots, listener).ok_or(Error::Invalid)?.pending;
+                queue.try_reserve(1).map_err(|_| Error::Exhausted)?;
+                queue.push_back(id);
+                let state = slot_in_mut(slots, id).ok_or(Error::Invalid)?;
+                state.local_port = local_port;
+                state.remote = Some(remote);
+                state.peer = Some(listener);
+                return Ok(());
+            }
+        }
+        match kind {
+            Kind::Tcp => {
+                let socket = runtime.sockets.get_mut::<tcp::Socket>(handle);
+                if socket.is_active() {
+                    return if socket.may_send() {
+                        Ok(())
+                    } else {
+                        Err(Error::InProgress)
+                    };
+                }
+                socket
+                    .connect(runtime.interface.context(), remote, local_port)
+                    .map_err(|_| Error::Invalid)?;
+                let state = slot_in_mut(slots, id).ok_or(Error::Invalid)?;
+                state.local_port = local_port;
+                state.remote = Some(remote);
+                Err(Error::InProgress)
+            }
+            Kind::Udp => {
+                let socket = runtime.sockets.get_mut::<udp::Socket>(handle);
+                if !socket.is_open() {
+                    socket.bind(local_port).map_err(|_| Error::Invalid)?;
+                }
+                let state = slot_in_mut(slots, id).ok_or(Error::Invalid)?;
+                state.local_port = local_port;
+                state.remote = Some(remote);
+                Ok(())
+            }
+            Kind::Unix => Err(Error::Invalid),
+        }
+    }
+
+    fn send_queued(
+        &mut self,
+        id: SlotId,
+        input: &[u8],
+        remote: Option<IpEndpoint>,
+        local_capacity: Option<usize>,
+    ) -> Result<usize, Error> {
+        self.poll();
+        let state = self.slot(id).ok_or(Error::Invalid)?;
+        if state.peer == Some(id) {
+            // A loopback socket reads what it writes.
+            if remote.is_some() {
+                return Err(Error::Invalid);
+            }
+            if state.write_shutdown {
+                return Err(Error::BrokenPipe);
+            }
+            if input.is_empty() {
+                return Ok(0);
+            }
+            let state = self.slot_mut(id).ok_or(Error::Invalid)?;
+            return append_local_data(state, input, local_capacity);
+        }
+        if state.write_shutdown {
+            return Err(Error::BrokenPipe);
+        }
+        if state.is_local() {
+            if remote.is_some() {
+                return Err(Error::Invalid);
+            }
+            let kind = state.kind;
+            let peer = state.peer.ok_or(Error::NotConnected)?;
+            let Some(peer_state) = self
+                .slot_mut(peer)
+                .filter(|slot| slot.kind == kind && !slot.listening)
+            else {
+                crate::serial_write("ginux: local socket peer unavailable slot/peer ");
+                crate::serial_write_u64(u64::from(id));
+                crate::serial_write(" ");
+                crate::serial_write_u64(u64::from(peer));
+                crate::serial_write("\r\n");
+                return Err(Error::NotConnected);
+            };
+            if input.is_empty() {
+                return Ok(0);
+            }
+            return append_local_data(peer_state, input, local_capacity);
+        }
+        let (kind, handle, connected) = (state.kind, state.handle, state.remote);
+        let runtime = self.runtime()?;
+        let handle = handle.ok_or(Error::Invalid)?;
+        match kind {
+            Kind::Tcp => {
+                let socket = runtime.sockets.get_mut::<tcp::Socket>(handle);
+                if socket.can_send() {
+                    socket.send_slice(input).map_err(|_| Error::Reset)
+                } else if socket.may_send() {
+                    Err(Error::WouldBlock)
+                } else {
+                    Err(Error::NotConnected)
+                }
+            }
+            Kind::Udp => {
+                let endpoint = remote.or(connected).ok_or(Error::NotConnected)?;
+                runtime
+                    .sockets
+                    .get_mut::<udp::Socket>(handle)
+                    .send_slice(input, endpoint)
+                    .map(|_| input.len())
+                    .map_err(|_| Error::WouldBlock)
+            }
+            Kind::Unix => Err(Error::Invalid),
+        }
+    }
+
+    /// What a local stream with nothing queued returns: EAGAIN while its
+    /// peer may still write, else end of file.
+    fn local_empty_result(&self, state: &Slot) -> Result<usize, Error> {
+        let peer = state.peer.and_then(|peer| self.slot(peer));
+        if state.unix_type == 2 || peer.is_some_and(|peer| !peer.write_shutdown) {
+            Err(Error::WouldBlock)
+        } else {
+            Ok(0)
+        }
+    }
+
+    fn recv(
+        &mut self,
+        id: SlotId,
+        output: &mut [u8],
+    ) -> Result<(usize, Option<IpEndpoint>), Error> {
+        if self.slot(id).is_some_and(|state| state.kind == Kind::Udp) {
+            return self
+                .recv_message(id, output, false)
+                .map(|(copied, _message_length, endpoint)| (copied, endpoint));
+        }
+        self.poll();
+        let state = slot_in_mut(&mut self.slots, id).ok_or(Error::Invalid)?;
+        if state.read_shutdown {
+            return Ok((0, None));
+        }
+        if state.is_local() {
+            let received = state.local.pop(output);
+            if received != 0 {
+                return Ok((received, None));
+            }
+            let state = self.slot(id).ok_or(Error::Invalid)?;
+            return self.local_empty_result(state).map(|size| (size, None));
+        }
+        let (kind, handle) = (state.kind, state.handle);
+        let runtime = self.runtime()?;
+        let handle = handle.ok_or(Error::Invalid)?;
+        match kind {
+            Kind::Tcp => {
+                let socket = runtime.sockets.get_mut::<tcp::Socket>(handle);
+                if socket.can_recv() {
+                    socket
+                        .recv_slice(output)
+                        .map(|size| (size, None))
+                        .map_err(|_| Error::Reset)
+                } else if socket.may_recv() {
+                    Err(Error::WouldBlock)
+                } else {
+                    Ok((0, None))
+                }
+            }
+            Kind::Udp => runtime
+                .sockets
+                .get_mut::<udp::Socket>(handle)
+                .recv_slice(output)
+                .map(|(size, metadata)| (size, Some(metadata.endpoint)))
+                .map_err(|_| Error::WouldBlock),
+            Kind::Unix => Err(Error::Invalid),
+        }
+    }
+
+    fn peek_local(&self, id: SlotId, output: &mut [u8]) -> Result<usize, Error> {
+        let state = self
+            .slot(id)
+            .filter(|state| state.is_local())
+            .ok_or(Error::Invalid)?;
+        match state.local.peek(output) {
+            0 => self.local_empty_result(state),
+            returned => Ok(returned),
+        }
+    }
+
+    /// A pipe's capacity (F_GETPIPE_SZ).
+    fn local_capacity(&self, id: SlotId) -> Result<usize, Error> {
+        self.unix(id)
+            .map(|state| {
+                if state.local_capacity == 0 {
+                    LOCAL_QUEUE_CAPACITY
+                } else {
+                    state.local_capacity as usize
+                }
+            })
+            .ok_or(Error::Invalid)
+    }
+
+    /// Sets a pipe's capacity (F_SETPIPE_SZ) on both its ends: `requested`
+    /// rounded up to a power of two of at least a page. `Exhausted` when
+    /// more is queued than the new capacity holds.
+    fn set_local_capacity(&mut self, id: SlotId, requested: usize) -> Result<usize, Error> {
+        let capacity = requested
+            .max(PAGE_SIZE)
+            .checked_next_power_of_two()
+            .filter(|capacity| *capacity <= u32::MAX as usize)
+            .ok_or(Error::Invalid)?;
+        let state = self.unix(id).ok_or(Error::Invalid)?;
+        let ends = [Some(id), state.peer];
+        if ends.iter().flatten().any(|end| {
+            self.slot(*end)
+                .is_some_and(|end| end.local.len() > capacity)
+        }) {
+            return Err(Error::Exhausted);
+        }
+        for end in ends.into_iter().flatten() {
+            if let Some(end) = self.slot_mut(end) {
+                end.local_capacity = capacity as u32;
+            }
+        }
+        Ok(capacity)
+    }
+
+    /// The bytes in a pipe, read from either end (its data waits in the
+    /// read end's queue).
+    fn pipe_queued_bytes(&self, id: SlotId) -> Result<usize, Error> {
+        let state = self.unix(id).ok_or(Error::Invalid)?;
+        let peer = state
+            .peer
+            .and_then(|peer| self.slot(peer))
+            .map_or(0, |peer| peer.local.len());
+        Ok(state.local.len() + peer)
+    }
+
+    fn peek(
+        &mut self,
+        id: SlotId,
+        output: &mut [u8],
+    ) -> Result<(usize, Option<IpEndpoint>), Error> {
+        if self.slot(id).is_some_and(|state| state.kind == Kind::Udp) {
+            return self
+                .recv_message(id, output, true)
+                .map(|(copied, _message_length, endpoint)| (copied, endpoint));
+        }
+        self.poll();
+        let state = self.slot(id).ok_or(Error::Invalid)?;
+        if state.read_shutdown {
+            return Ok((0, None));
+        }
+        if state.is_local() {
+            return self.peek_local(id, output).map(|received| (received, None));
+        }
+        let (kind, handle) = (state.kind, state.handle);
+        let runtime = self.runtime()?;
+        let handle = handle.ok_or(Error::Invalid)?;
+        match kind {
+            Kind::Tcp => {
+                let socket = runtime.sockets.get_mut::<tcp::Socket>(handle);
+                if socket.can_recv() {
+                    socket
+                        .peek_slice(output)
+                        .map(|size| (size, None))
+                        .map_err(|_| Error::Reset)
+                } else if socket.may_recv() {
+                    Err(Error::WouldBlock)
+                } else {
+                    Ok((0, None))
+                }
+            }
+            Kind::Udp => runtime
+                .sockets
+                .get_mut::<udp::Socket>(handle)
+                .peek_slice(output)
+                .map(|(size, metadata)| (size, Some(metadata.endpoint)))
+                .map_err(|_| Error::WouldBlock),
+            Kind::Unix => Err(Error::Invalid),
+        }
+    }
+
+    fn recv_message(
+        &mut self,
+        id: SlotId,
+        output: &mut [u8],
+        peek_only: bool,
+    ) -> Result<(usize, usize, Option<IpEndpoint>), Error> {
+        if !self.slot(id).is_some_and(|state| state.kind == Kind::Udp) {
+            let (copied, endpoint) = if peek_only {
+                self.peek(id, output)?
+            } else {
+                self.recv(id, output)?
+            };
+            return Ok((copied, copied, endpoint));
+        }
+        self.poll();
+        let state = self.slot(id).ok_or(Error::Invalid)?;
+        if state.read_shutdown {
+            return Ok((0, 0, None));
+        }
+        let handle = state.handle.ok_or(Error::Invalid)?;
+        let runtime = self.runtime()?;
+        let socket = runtime.sockets.get_mut::<udp::Socket>(handle);
+        let (payload, endpoint) = if peek_only {
+            let (payload, metadata) = socket.peek().map_err(|_| Error::WouldBlock)?;
+            (payload, metadata.endpoint)
+        } else {
+            let (payload, metadata) = socket.recv().map_err(|_| Error::WouldBlock)?;
+            (payload, metadata.endpoint)
+        };
+        let copied = output.len().min(payload.len());
+        output[..copied].copy_from_slice(&payload[..copied]);
+        Ok((copied, payload.len(), Some(endpoint)))
+    }
+
+    fn readiness(&mut self, id: SlotId) -> Option<(bool, bool, bool)> {
+        self.poll();
+        let state = self.slot(id)?;
+        if state.listening && !state.pending.is_empty() {
+            return Some((true, false, false));
+        }
+        if state.kind == Kind::Unix || state.peer.is_some() {
+            let named = state.kind == Kind::Unix && !state.unix_path.is_empty();
+            let peer = state.peer.and_then(|peer| self.slot(peer));
+            let peer_open = peer.is_some();
+            let writable = !state.write_shutdown && peer_open;
+            let peer_eof = state.unix_type != 2
+                && (!named && !peer_open || peer.is_some_and(|peer| peer.write_shutdown));
+            let readable = state.read_shutdown || !state.local.is_empty() || peer_eof;
+            return Some((readable, writable, false));
+        }
+        let runtime = self.runtime.as_ref()?;
+        let handle = state.handle?;
+        Some(match state.kind {
+            Kind::Tcp => {
+                let socket = runtime.sockets.get::<tcp::Socket>(handle);
+                if state.listening {
+                    (
+                        matches!(
+                            socket.state(),
+                            tcp::State::Established | tcp::State::CloseWait
+                        ),
+                        false,
+                        false,
+                    )
+                } else {
+                    (
+                        state.read_shutdown || socket.can_recv() || !socket.may_recv(),
+                        !state.write_shutdown && socket.can_send(),
+                        !socket.is_open() && state.remote.is_some(),
+                    )
+                }
+            }
+            Kind::Udp => {
+                let socket = runtime.sockets.get::<udp::Socket>(handle);
+                (socket.can_recv(), socket.can_send(), false)
+            }
+            Kind::Unix => return None,
+        })
+    }
+
+    fn local_peer_write_closed(&self, id: SlotId) -> Option<bool> {
+        let state = self.unix(id)?;
+        if !state.unix_path.is_empty() || state.unix_type == 2 {
+            return Some(false);
+        }
+        let peer = state.peer.and_then(|peer| self.slot(peer));
+        Some(!peer.is_some_and(|peer| !peer.write_shutdown))
+    }
+
+    fn names(&self, id: SlotId) -> Option<(IpEndpoint, Option<IpEndpoint>)> {
+        let state = self.slot(id).filter(|state| state.kind != Kind::Unix)?;
+        let runtime = self.runtime.as_ref()?;
+        Some((
+            endpoint(runtime.local_address, state.local_port),
+            state.remote,
+        ))
+    }
+
+    fn set_unix_pair_credentials(
+        &mut self,
+        first: SlotId,
+        second: SlotId,
+        credentials: (u32, u32, u32),
+    ) -> bool {
+        let paired = |end: SlotId, other: SlotId| {
+            self.unix(end)
+                .is_some_and(|state| state.peer == Some(other))
+        };
+        if !paired(first, second) || !paired(second, first) {
+            return false;
+        }
+        for end in [first, second] {
+            if let Some(state) = self.slot_mut(end) {
+                state.peer_credentials = Some(credentials);
+            }
+        }
+        true
+    }
+
+    fn queue_file_right(&mut self, right: FileRight) -> Option<SlotId> {
+        let index = match self
+            .file_rights
+            .iter()
+            .position(|(references, _)| *references == 0)
+        {
+            Some(index) => index,
+            None if self.file_rights.len() < FILE_RIGHT_LIMIT => {
+                self.file_rights.try_reserve(1).ok()?;
+                self.file_rights.push((0, FileRight::EMPTY));
+                self.file_rights.len() - 1
+            }
+            None => return None,
+        };
+        self.file_rights[index] = (1, right);
+        SlotId::try_from(FILE_RIGHT_BASE + index).ok()
+    }
+
+    fn file_right(&self, id: SlotId) -> Option<FileRight> {
+        let index = usize::from(id).checked_sub(FILE_RIGHT_BASE)?;
+        self.file_rights
+            .get(index)
+            .filter(|(references, _)| *references != 0)
+            .map(|(_, right)| *right)
+    }
+
+    fn file_right_references(&mut self, id: SlotId) -> Option<&mut u32> {
+        let index = usize::from(id).checked_sub(FILE_RIGHT_BASE)?;
+        self.file_rights
+            .get_mut(index)
+            .map(|(references, _)| references)
+            .filter(|references| **references != 0)
+    }
+
+    /// The connected peer of a Unix socket `sender`.
+    fn unix_peer(&self, sender: SlotId) -> Result<SlotId, Error> {
+        self.unix(sender)
+            .ok_or(Error::Invalid)?
+            .peer
+            .ok_or(Error::NotConnected)
+    }
+
+    fn queue_unix_rights(&mut self, sender: SlotId, rights: &[(SlotId, u32)]) -> Result<(), Error> {
+        if rights.is_empty() || rights.len() > PASSED_RIGHT_LIMIT {
+            return Err(Error::Invalid);
+        }
+        let peer = self.unix_peer(sender)?;
+        if rights.iter().any(|(right, _)| *right == peer) {
+            return Err(Error::Invalid);
+        }
+        let peer_state = unix_in_mut(&mut self.slots, peer).ok_or(Error::NotConnected)?;
+        if !peer_state.rights.is_empty() {
+            return Err(Error::WouldBlock);
+        }
+        let next_inflight = self
+            .unix_inflight_rights
+            .checked_add(rights.len())
+            .ok_or(Error::Exhausted)?;
+        peer_state
+            .rights
+            .try_reserve_exact(rights.len())
+            .map_err(|_| Error::Exhausted)?;
+        peer_state.rights.extend_from_slice(rights);
+        self.unix_inflight_rights = next_inflight;
+        Ok(())
+    }
+
+    fn unix_right_queue_available(&self, sender: SlotId, rights: &[SlotId]) -> Result<(), Error> {
+        if rights.is_empty() || rights.len() > PASSED_RIGHT_LIMIT {
+            return Err(Error::Invalid);
+        }
+        let peer = self.unix_peer(sender)?;
+        if rights.contains(&peer) {
+            return Err(Error::Invalid);
+        }
+        let peer_state = self.unix(peer).ok_or(Error::NotConnected)?;
+        if !peer_state.rights.is_empty() || !peer_state.local.is_empty() {
+            return Err(Error::WouldBlock);
+        }
+        Ok(())
+    }
+
+    fn unix_credentials_queue_available(&self, sender: SlotId) -> Result<(), Error> {
+        let peer = self.unix_peer(sender)?;
+        let peer_state = self.unix(peer).ok_or(Error::NotConnected)?;
+        if peer_state.credentials.len() == CREDENTIAL_QUEUE_LIMIT {
+            return Err(Error::WouldBlock);
+        }
+        Ok(())
+    }
+
+    fn receive_unix_rights(
+        &mut self,
+        receiver: SlotId,
+        output: &mut [(SlotId, u32)],
+        peek_only: bool,
+    ) -> Result<usize, Error> {
+        let state = self.unix(receiver).ok_or(Error::Invalid)?;
+        let count = state.rights.len();
+        let output = output.get_mut(..count).ok_or(Error::Invalid)?;
+        output.copy_from_slice(&state.rights);
+        if peek_only {
+            // The receiver gets references of its own; the queued ones stay.
+            for (duplicated, (right, _)) in output.iter().enumerate() {
+                if !self.duplicate(*right) {
+                    for (rollback, _) in &output[..duplicated] {
+                        let _ = self.close(*rollback);
+                    }
+                    return Err(Error::Exhausted);
+                }
+            }
+        } else {
+            if count > self.unix_inflight_rights {
+                return Err(Error::Invalid);
+            }
+            unix_in_mut(&mut self.slots, receiver)
+                .ok_or(Error::Invalid)?
+                .rights
+                .clear();
+            self.unix_inflight_rights -= count;
+        }
+        Ok(count)
+    }
+
+    fn queue_unix_credentials(
+        &mut self,
+        sender: SlotId,
+        credentials: (u32, u32, u32),
+    ) -> Result<(), Error> {
+        let peer = self.unix_peer(sender)?;
+        let queue = &mut unix_in_mut(&mut self.slots, peer)
+            .ok_or(Error::NotConnected)?
+            .credentials;
+        if queue.len() == CREDENTIAL_QUEUE_LIMIT {
+            return Err(Error::WouldBlock);
+        }
+        queue.try_reserve(1).map_err(|_| Error::Exhausted)?;
+        queue.push_back(credentials);
+        Ok(())
+    }
+
+    fn receive_unix_credentials(
+        &mut self,
+        receiver: SlotId,
+        peek_only: bool,
+    ) -> Result<Option<(u32, u32, u32)>, Error> {
+        let queue = &mut unix_in_mut(&mut self.slots, receiver)
+            .ok_or(Error::Invalid)?
+            .credentials;
+        Ok(if peek_only {
+            queue.front().copied()
+        } else {
+            queue.pop_front()
+        })
+    }
+
+    /// Drops the rights (closing them) and, with `credentials`, the
+    /// credentials queued for `receiver`; says whether rights were closed.
+    fn discard_unix_ancillary(
+        &mut self,
+        receiver: SlotId,
+        credentials: bool,
+    ) -> Result<bool, Error> {
+        let state = unix_in_mut(&mut self.slots, receiver).ok_or(Error::Invalid)?;
+        if credentials {
+            state.credentials.clear();
+        }
+        let count = state.rights.len();
+        if count > self.unix_inflight_rights {
+            return Err(Error::Invalid);
+        }
+        let rights = core::mem::take(&mut state.rights);
+        self.unix_inflight_rights -= count;
+        let mut closed = count != 0;
+        for (right, _) in rights {
+            closed &= self.close(right);
+        }
+        Ok(closed)
+    }
 }
 
 pub(crate) fn configure(
@@ -478,663 +1723,109 @@ pub(crate) fn configure(
     notification: MmioMapping,
     iommu: DeviceTranslationProfile,
 ) -> bool {
-    unsafe {
-        if socket_platform().is_some() {
-            return false;
-        }
-        *socket_platform() = Some(Platform {
-            device,
-            initialization,
-            common,
-            notification,
-            iommu,
-        });
-    }
-    true
+    SOCKETS.lock().configure(Platform {
+        device,
+        initialization,
+        common,
+        notification,
+        iommu,
+    })
 }
 
-pub(crate) fn open(kind: Kind) -> Result<u8, Error> {
-    if kind == Kind::Unix {
-        return open_unix(1);
-    }
-    let runtime = runtime()?;
-    let slot =
-        unsafe { socket_slots().iter().position(|slot| !slot.occupied) }.ok_or(Error::Exhausted)?;
-    let tcp_buffer = if kind == Kind::Tcp {
-        Some(free_tcp_buffer().ok_or(Error::Exhausted)? as u8)
-    } else {
-        None
-    };
-    let handle = match kind {
-        Kind::Tcp => {
-            let buffer = usize::from(tcp_buffer.ok_or(Error::Exhausted)?);
-            let rx = tcp::SocketBuffer::new(unsafe {
-                core::slice::from_raw_parts_mut(tcp_rx()[buffer].as_mut_ptr(), TCP_BUFFER_SIZE)
-            });
-            let tx = tcp::SocketBuffer::new(unsafe {
-                core::slice::from_raw_parts_mut(tcp_tx()[buffer].as_mut_ptr(), TCP_BUFFER_SIZE)
-            });
-            runtime.sockets.add(tcp::Socket::new(rx, tx))
-        }
-        Kind::Udp => {
-            let rx = udp::PacketBuffer::new(
-                unsafe {
-                    core::slice::from_raw_parts_mut(
-                        udp_rx_meta()[slot].as_mut_ptr(),
-                        UDP_PACKET_COUNT,
-                    )
-                },
-                unsafe {
-                    core::slice::from_raw_parts_mut(udp_rx()[slot].as_mut_ptr(), UDP_BUFFER_SIZE)
-                },
-            );
-            let tx = udp::PacketBuffer::new(
-                unsafe {
-                    core::slice::from_raw_parts_mut(
-                        udp_tx_meta()[slot].as_mut_ptr(),
-                        UDP_PACKET_COUNT,
-                    )
-                },
-                unsafe {
-                    core::slice::from_raw_parts_mut(udp_tx()[slot].as_mut_ptr(), UDP_BUFFER_SIZE)
-                },
-            );
-            runtime.sockets.add(udp::Socket::new(rx, tx))
-        }
-        Kind::Unix => return Err(Error::Invalid),
-    };
-    unsafe {
-        socket_slots()[slot] = Slot {
-            occupied: true,
-            owner: current_owner(),
-            references: 1,
-            kind,
-            handle: Some(handle),
-            remote: None,
-            local_port: 0,
-            tcp_buffer,
-            listening: false,
-            backlog: 0,
-            pending_length: 0,
-            pending: [0; SLOT_COUNT],
-            peer: None,
-            read_shutdown: false,
-            write_shutdown: false,
-            reuse_address: false,
-            keep_alive: false,
-            receive_errors: false,
-            no_delay: false,
-            pass_credentials: false,
-            timestamp: false,
-            receive_timeout_us: 0,
-            send_timeout_us: 0,
-            pending_right_count: 0,
-            pending_right_slots: [0; SLOT_COUNT],
-            pending_right_flags: [0; SLOT_COUNT],
-            pending_credential_count: 0,
-            pending_credentials: [(0, 0, 0); SLOT_COUNT],
-            peer_credentials: None,
-            local_first: memory::FrameLease::EMPTY,
-            local_last: memory::FrameLease::EMPTY,
-            local_head: 0,
-            local_length: 0,
-            local_capacity: 0,
-        };
-    }
-    Ok(slot as u8)
+pub(crate) fn open(kind: Kind) -> Result<SlotId, Error> {
+    SOCKETS.lock().open(kind)
 }
 
-pub(crate) fn open_unix(socket_type: u8) -> Result<u8, Error> {
-    if !matches!(socket_type, 1 | 2 | 5) {
-        return Err(Error::Invalid);
-    }
-    let slot =
-        unsafe { socket_slots().iter().position(|slot| !slot.occupied) }.ok_or(Error::Exhausted)?;
-    unsafe {
-        socket_slots()[slot] = Slot {
-            occupied: true,
-            owner: current_owner(),
-            references: 1,
-            kind: Kind::Unix,
-            ..Slot::EMPTY
-        };
-        unix_socket_types()[slot] = socket_type;
-        unix_path_lengths()[slot] = 0;
-        unix_paths()[slot].fill(0);
-    }
-    Ok(slot as u8)
+pub(crate) fn open_unix(socket_type: u8) -> Result<SlotId, Error> {
+    SOCKETS.lock().open_unix(socket_type)
 }
 
-fn unix_socket_type(slot: u8) -> Option<u8> {
-    let index = usize::from(slot);
-    unsafe { socket_slots().get(index) }
-        .is_some_and(|state| state.occupied && state.kind == Kind::Unix)
-        .then(|| unsafe { unix_socket_types()[index] })
+pub(crate) fn socket_type(id: SlotId) -> Option<u8> {
+    SOCKETS.lock().socket_type(id)
 }
 
-pub(crate) fn socket_type(slot: u8) -> Option<u8> {
-    match kind(slot)? {
-        Kind::Tcp => Some(1),
-        Kind::Udp => Some(2),
-        Kind::Unix => unix_socket_type(slot),
-    }
+pub(crate) fn bind_unix(id: SlotId, path: &[u8]) -> Result<(), Error> {
+    SOCKETS.lock().bind_unix(id, path)
 }
 
-pub(crate) fn bind_unix(slot: u8, path: &[u8]) -> Result<(), Error> {
-    let index = usize::from(slot);
-    if path.is_empty() || path.len() > UNIX_PATH_CAPACITY {
-        return Err(Error::Invalid);
-    }
-    let state = unsafe { socket_slots().get(index) }
-        .filter(|state| state.occupied && state.kind == Kind::Unix)
-        .ok_or(Error::Invalid)?;
-    if state.peer.is_some() || unsafe { unix_path_lengths()[index] } != 0 {
-        return Err(Error::Invalid);
-    }
-    let in_use = unsafe {
-        let owner = state.owner;
-        unix_path_lengths()
-            .iter()
-            .enumerate()
-            .any(|(candidate, length)| {
-                candidate != index
-                    && usize::from(*length) == path.len()
-                    && socket_slots()[candidate].occupied
-                    && socket_slots()[candidate].owner == owner
-                    && unix_paths()[candidate][..path.len()] == *path
-            })
-    };
-    if in_use {
-        return Err(Error::AddressInUse);
-    }
-    unsafe {
-        unix_paths()[index][..path.len()].copy_from_slice(path);
-        unix_path_lengths()[index] = path.len() as u8;
-    }
-    Ok(())
+pub(crate) fn connect_unix(id: SlotId, path: &[u8]) -> Result<(), Error> {
+    SOCKETS.lock().connect_unix(id, path)
 }
 
-pub(crate) fn connect_unix(slot: u8, path: &[u8]) -> Result<(), Error> {
-    let index = usize::from(slot);
-    let state = unsafe { socket_slots().get(index).copied() }
-        .filter(|state| state.occupied && state.kind == Kind::Unix)
-        .ok_or(Error::Invalid)?;
-    if state.peer.is_some() {
-        return Err(Error::Invalid);
-    }
-    let peer = unsafe {
-        let owner = state.owner;
-        unix_path_lengths()
-            .iter()
-            .enumerate()
-            .find(|(candidate, length)| {
-                *candidate != index
-                    && usize::from(**length) == path.len()
-                    && socket_slots()[*candidate].occupied
-                    && socket_slots()[*candidate].owner == owner
-                    && socket_slots()[*candidate].kind == Kind::Unix
-                    && unix_socket_types()[*candidate] == unix_socket_types()[index]
-                    && unix_paths()[*candidate][..path.len()] == *path
-            })
-            .map(|(candidate, _)| candidate)
-    }
-    .ok_or(Error::NotConnected)?;
-    if unsafe { unix_socket_types()[index] } == 2 {
-        unsafe { socket_slots()[index].peer = Some(peer as u8) };
-        return Ok(());
-    }
-    let listener = unsafe { socket_slots()[peer] };
-    if !listener.listening || usize::from(listener.pending_length) >= usize::from(listener.backlog)
-    {
-        return Err(Error::WouldBlock);
-    }
-    let accepted = unsafe { socket_slots().iter().position(|state| !state.occupied) }
-        .ok_or(Error::Exhausted)?;
-    unsafe {
-        socket_slots()[accepted] = Slot {
-            occupied: true,
-            owner: listener.owner,
-            references: 1,
-            kind: Kind::Unix,
-            handle: None,
-            remote: None,
-            local_port: 0,
-            tcp_buffer: None,
-            listening: false,
-            backlog: 0,
-            pending_length: 0,
-            pending: [0; SLOT_COUNT],
-            peer: Some(slot),
-            read_shutdown: false,
-            write_shutdown: false,
-            reuse_address: listener.reuse_address,
-            keep_alive: listener.keep_alive,
-            receive_errors: listener.receive_errors,
-            no_delay: listener.no_delay,
-            pass_credentials: listener.pass_credentials,
-            timestamp: listener.timestamp,
-            receive_timeout_us: listener.receive_timeout_us,
-            send_timeout_us: listener.send_timeout_us,
-            pending_right_count: 0,
-            pending_right_slots: [0; SLOT_COUNT],
-            pending_right_flags: [0; SLOT_COUNT],
-            pending_credential_count: 0,
-            pending_credentials: [(0, 0, 0); SLOT_COUNT],
-            peer_credentials: None,
-            local_first: memory::FrameLease::EMPTY,
-            local_last: memory::FrameLease::EMPTY,
-            local_head: 0,
-            local_length: 0,
-            local_capacity: 0,
-        };
-        socket_slots()[index].peer = Some(accepted as u8);
-        unix_socket_types()[accepted] = unix_socket_types()[peer];
-        socket_slots()[peer].pending[usize::from(listener.pending_length)] = accepted as u8;
-        socket_slots()[peer].pending_length += 1;
-    }
-    Ok(())
+/// The path a Unix socket is bound to, empty when it has none.
+pub(crate) fn unix_name(id: SlotId) -> Option<Vec<u8>> {
+    SOCKETS.lock().unix_name(id)
 }
 
-pub(crate) fn unix_name(slot: u8) -> Option<&'static [u8]> {
-    let index = usize::from(slot);
-    unsafe { socket_slots().get(index) }
-        .filter(|state| state.occupied && state.kind == Kind::Unix)?;
-    let length = usize::from(unsafe { *unix_path_lengths().get(index)? });
-    Some(unsafe { &unix_paths()[index][..length] })
+pub(crate) fn unix_peer_name(id: SlotId) -> Option<Vec<u8>> {
+    let sockets = SOCKETS.lock();
+    sockets.unix_name(sockets.unix(id)?.peer?)
 }
 
-pub(crate) fn unix_peer_name(slot: u8) -> Option<&'static [u8]> {
-    let peer = unsafe { socket_slots().get(usize::from(slot)).copied() }
-        .filter(|state| state.occupied && state.kind == Kind::Unix)?
-        .peer?;
-    unix_name(peer)
+pub(crate) fn open_pair(socket_type: u8) -> Result<(SlotId, SlotId), Error> {
+    SOCKETS.lock().open_pair(socket_type)
 }
 
-pub(crate) fn open_pair(socket_type: u8) -> Result<(u8, u8), Error> {
-    if !matches!(socket_type, 1 | 2 | 5) {
-        return Err(Error::Invalid);
-    }
-    let first =
-        unsafe { socket_slots().iter().position(|slot| !slot.occupied) }.ok_or(Error::Exhausted)?;
-    let second = unsafe {
-        socket_slots()
-            .iter()
-            .enumerate()
-            .find(|(index, slot)| *index != first && !slot.occupied)
-            .map(|(index, _)| index)
-    }
-    .ok_or(Error::Exhausted)?;
-    unsafe {
-        socket_slots()[first] = Slot {
-            occupied: true,
-            owner: current_owner(),
-            references: 1,
-            kind: Kind::Unix,
-            handle: None,
-            remote: None,
-            local_port: 0,
-            tcp_buffer: None,
-            listening: false,
-            backlog: 0,
-            pending_length: 0,
-            pending: [0; SLOT_COUNT],
-            peer: Some(second as u8),
-            read_shutdown: false,
-            write_shutdown: false,
-            reuse_address: false,
-            keep_alive: false,
-            receive_errors: false,
-            no_delay: false,
-            pass_credentials: false,
-            timestamp: false,
-            receive_timeout_us: 0,
-            send_timeout_us: 0,
-            pending_right_count: 0,
-            pending_right_slots: [0; SLOT_COUNT],
-            pending_right_flags: [0; SLOT_COUNT],
-            pending_credential_count: 0,
-            pending_credentials: [(0, 0, 0); SLOT_COUNT],
-            peer_credentials: None,
-            local_first: memory::FrameLease::EMPTY,
-            local_last: memory::FrameLease::EMPTY,
-            local_head: 0,
-            local_length: 0,
-            local_capacity: 0,
-        };
-        socket_slots()[second] = Slot {
-            occupied: true,
-            owner: current_owner(),
-            references: 1,
-            kind: Kind::Unix,
-            handle: None,
-            remote: None,
-            local_port: 0,
-            tcp_buffer: None,
-            listening: false,
-            backlog: 0,
-            pending_length: 0,
-            pending: [0; SLOT_COUNT],
-            peer: Some(first as u8),
-            read_shutdown: false,
-            write_shutdown: false,
-            reuse_address: false,
-            keep_alive: false,
-            receive_errors: false,
-            no_delay: false,
-            pass_credentials: false,
-            timestamp: false,
-            receive_timeout_us: 0,
-            send_timeout_us: 0,
-            pending_right_count: 0,
-            pending_right_slots: [0; SLOT_COUNT],
-            pending_right_flags: [0; SLOT_COUNT],
-            pending_credential_count: 0,
-            pending_credentials: [(0, 0, 0); SLOT_COUNT],
-            peer_credentials: None,
-            local_first: memory::FrameLease::EMPTY,
-            local_last: memory::FrameLease::EMPTY,
-            local_head: 0,
-            local_length: 0,
-            local_capacity: 0,
-        };
-        unix_socket_types()[first] = socket_type;
-        unix_socket_types()[second] = socket_type;
-        unix_path_lengths()[first] = 0;
-        unix_path_lengths()[second] = 0;
-        unix_paths()[first].fill(0);
-        unix_paths()[second].fill(0);
-    }
-    Ok((first as u8, second as u8))
+pub(crate) fn open_loopback(socket_type: u8) -> Result<SlotId, Error> {
+    SOCKETS.lock().open_loopback(socket_type)
 }
 
-pub(crate) fn open_loopback(socket_type: u8) -> Result<u8, Error> {
-    let (slot, peer) = open_pair(socket_type)?;
-    if !close(peer) {
-        let _ = close(slot);
-        return Err(Error::Invalid);
-    }
-    let Some(state) =
-        (unsafe { socket_slots().get_mut(usize::from(slot)) }).filter(|state| state.occupied)
-    else {
-        return Err(Error::Invalid);
-    };
-    state.peer = Some(slot);
-    Ok(slot)
+pub(crate) fn close(id: SlotId) -> bool {
+    SOCKETS.lock().close(id)
 }
 
-pub(crate) fn close(slot: u8) -> bool {
-    if let Some(references) = file_right_references(slot) {
-        *references -= 1;
-        return true;
-    }
-    let index = usize::from(slot);
-    let Some(state) = (unsafe { socket_slots().get_mut(index) }).filter(|slot| slot.occupied)
-    else {
-        return false;
-    };
-    if state.references > 1 {
-        state.references -= 1;
-        return true;
-    }
-    if state.kind == Kind::Unix || state.handle.is_none() && !state.listening {
-        let pending_right_count = usize::from(state.pending_right_count);
-        let pending_connection_count = usize::from(state.pending_length);
-        let pending_connections = state.pending;
-        if pending_right_count > unsafe { *unix_inflight_rights_state() } {
-            return false;
-        }
-        if !release_local_pages(state.local_first) {
-            return false;
-        }
-        if state.kind == Kind::Tcp {
-            if let Some(handle) = state.handle.take() {
-                let Some(runtime) = runtime_existing() else {
-                    return false;
-                };
-                runtime.sockets.remove(handle);
-            }
-        }
-        let pending_rights = state.pending_right_slots;
-        *state = Slot::EMPTY;
-        unsafe {
-            unix_socket_types()[index] = 0;
-            unix_path_lengths()[index] = 0;
-            unix_paths()[index].fill(0);
-            for candidate in socket_slots() {
-                if !candidate.occupied {
-                    continue;
-                }
-                if candidate.peer == Some(slot) {
-                    candidate.peer = None;
-                }
-                let mut retained = 0_usize;
-                for offset in 0..usize::from(candidate.pending_length) {
-                    let pending = candidate.pending[offset];
-                    if pending != slot {
-                        candidate.pending[retained] = pending;
-                        retained += 1;
-                    }
-                }
-                candidate.pending[retained..].fill(0);
-                candidate.pending_length = retained as u8;
-            }
-        }
-        unsafe { *unix_inflight_rights_state() -= pending_right_count };
-        for right in pending_rights.into_iter().take(pending_right_count) {
-            let _ = close(right);
-        }
-        for connection in pending_connections
-            .into_iter()
-            .take(pending_connection_count)
-        {
-            let _ = close(connection);
-        }
-        return true;
-    }
-    let Some(runtime) = runtime_existing() else {
-        return false;
-    };
-    let Some(handle) = state.handle.take() else {
-        return false;
-    };
-    runtime.sockets.remove(handle);
-    *state = Slot::EMPTY;
-    true
-}
-
-pub(crate) fn shutdown_socket(slot: u8, how: u8) -> Result<(), Error> {
-    if how > 2 {
-        return Err(Error::Invalid);
-    }
-    let index = usize::from(slot);
-    let state = unsafe { socket_slots().get_mut(index) }
-        .filter(|state| state.occupied && !state.listening)
-        .ok_or(Error::NotConnected)?;
-    let peer_connected = state.peer.is_some_and(|peer| {
-        unsafe { socket_slots().get(usize::from(peer)) }.is_some_and(|peer| peer.occupied)
-    });
-    if state.remote.is_none() && !peer_connected {
-        return Err(Error::NotConnected);
-    }
-    if matches!(how, 0 | 2) {
-        if !release_local_pages(state.local_first) {
-            return Err(Error::Invalid);
-        }
-        state.local_first = memory::FrameLease::EMPTY;
-        state.local_last = memory::FrameLease::EMPTY;
-        state.local_head = 0;
-        state.local_length = 0;
-        state.read_shutdown = true;
-    }
-    if matches!(how, 1 | 2) {
-        state.write_shutdown = true;
-        if state.kind == Kind::Tcp && state.peer.is_none() {
-            let runtime = runtime_existing().ok_or(Error::Unavailable)?;
-            let handle = state.handle.ok_or(Error::Invalid)?;
-            runtime.sockets.get_mut::<tcp::Socket>(handle).close();
-        }
-    }
-    Ok(())
+pub(crate) fn shutdown_socket(id: SlotId, how: u8) -> Result<(), Error> {
+    SOCKETS.lock().shutdown_socket(id, how)
 }
 
 pub(crate) fn shutdown() -> bool {
-    // A domain teardown owns every remaining socket reference, including
-    // duplicated descriptors and SCM_RIGHTS references that no live process
-    // can release after its process tree has been retired.
-    let mut index = 0;
-    let owner = current_owner();
-    while index < SLOT_COUNT {
-        if unsafe { socket_slots()[index].occupied && socket_slots()[index].owner == owner } {
-            unsafe { socket_slots()[index].references = 1 };
-            if !close(index as u8) {
-                return false;
-            }
-        }
-        index += 1;
-    }
-    if unsafe { socket_slots().iter().any(|slot| slot.occupied) } {
-        return true;
-    }
-    unsafe { *unix_inflight_rights_state() = 0 };
-    unsafe { *file_rights() = [(0, FileRight::EMPTY); SLOT_COUNT] };
-    if unsafe { socket_runtime_state().is_none() } {
-        return true;
-    }
-    teardown()
+    SOCKETS.lock().shutdown()
 }
 
-pub(crate) fn duplicate(slot: u8) -> bool {
-    if let Some(references) = file_right_references(slot) {
-        return references
-            .checked_add(1)
-            .map(|count| *references = count)
-            .is_some();
-    }
-    unsafe { socket_slots().get_mut(usize::from(slot)) }
-        .filter(|state| state.occupied)
-        .and_then(|state| {
-            state.references = state.references.checked_add(1)?;
-            Some(())
-        })
-        .is_some()
+pub(crate) fn duplicate(id: SlotId) -> bool {
+    SOCKETS.lock().duplicate(id)
 }
 
-fn port_in_use(kind: Kind, port: u16, except: usize) -> bool {
-    unsafe {
-        socket_slots().iter().enumerate().any(|(index, slot)| {
-            index != except
-                && slot.occupied
-                && slot.kind == kind
-                && slot.local_port == port
-                && port != 0
-        })
-    }
+pub(crate) fn kind(id: SlotId) -> Option<Kind> {
+    SOCKETS.lock().slot(id).map(|state| state.kind)
 }
 
-fn allocate_ephemeral_port(runtime: &mut Runtime, kind: Kind, except: usize) -> Option<u16> {
-    for _ in 0..(u16::MAX - 49_152) {
-        let port = runtime.next_port.max(49_152);
-        runtime.next_port = port.wrapping_add(1).max(49_152);
-        if !port_in_use(kind, port, except) {
-            return Some(port);
-        }
-    }
-    None
-}
-
-pub(crate) fn kind(slot: u8) -> Option<Kind> {
-    unsafe { socket_slots().get(usize::from(slot)) }
-        .filter(|state| state.occupied)
-        .map(|state| state.kind)
-}
-
-pub(crate) fn is_listening(slot: u8) -> bool {
-    unsafe { socket_slots().get(usize::from(slot)) }
-        .is_some_and(|state| state.occupied && state.listening)
+pub(crate) fn is_listening(id: SlotId) -> bool {
+    SOCKETS.lock().slot(id).is_some_and(|state| state.listening)
 }
 
 pub(crate) fn set_boolean_option(
-    slot: u8,
+    id: SlotId,
     option: BooleanOption,
     enabled: bool,
 ) -> Result<(), Error> {
-    let state = unsafe { socket_slots().get_mut(usize::from(slot)) }
-        .filter(|state| state.occupied)
-        .ok_or(Error::Invalid)?;
-    match option {
-        BooleanOption::ReuseAddress => state.reuse_address = enabled,
-        BooleanOption::KeepAlive => state.keep_alive = enabled,
-        BooleanOption::ReceiveErrors => state.receive_errors = enabled,
-        BooleanOption::NoDelay => state.no_delay = enabled,
-        BooleanOption::PassCredentials => state.pass_credentials = enabled,
-        BooleanOption::Timestamp => state.timestamp = enabled,
-    }
-    if state.kind == Kind::Tcp {
-        if let Some(handle) = state.handle {
-            let runtime = runtime_existing().ok_or(Error::Unavailable)?;
-            let socket = runtime.sockets.get_mut::<tcp::Socket>(handle);
-            match option {
-                BooleanOption::KeepAlive => {
-                    socket.set_keep_alive(enabled.then_some(Duration::from_secs(75)))
-                }
-                BooleanOption::NoDelay => socket.set_nagle_enabled(!enabled),
-                BooleanOption::ReuseAddress
-                | BooleanOption::ReceiveErrors
-                | BooleanOption::PassCredentials
-                | BooleanOption::Timestamp => {}
-            }
-        }
-    }
-    Ok(())
+    SOCKETS.lock().set_boolean_option(id, option, enabled)
 }
 
-pub(crate) fn boolean_option(slot: u8, option: BooleanOption) -> Result<bool, Error> {
-    let state = unsafe { socket_slots().get(usize::from(slot)) }
-        .filter(|state| state.occupied)
-        .ok_or(Error::Invalid)?;
-    Ok(match option {
-        BooleanOption::ReuseAddress => state.reuse_address,
-        BooleanOption::KeepAlive => state.keep_alive,
-        BooleanOption::ReceiveErrors => state.receive_errors,
-        BooleanOption::NoDelay => state.no_delay,
-        BooleanOption::PassCredentials => state.pass_credentials,
-        BooleanOption::Timestamp => state.timestamp,
-    })
+pub(crate) fn boolean_option(id: SlotId, option: BooleanOption) -> Result<bool, Error> {
+    SOCKETS.lock().boolean_option(id, option)
 }
 
 pub(crate) fn set_timeout_option(
-    slot: u8,
+    id: SlotId,
     option: TimeoutOption,
     microseconds: u64,
 ) -> Result<(), Error> {
-    let state = unsafe { socket_slots().get_mut(usize::from(slot)) }
-        .filter(|state| state.occupied)
-        .ok_or(Error::Invalid)?;
-    match option {
-        TimeoutOption::Receive => state.receive_timeout_us = microseconds,
-        TimeoutOption::Send => state.send_timeout_us = microseconds,
-    }
-    Ok(())
+    SOCKETS.lock().set_timeout_option(id, option, microseconds)
 }
 
-pub(crate) fn timeout_option(slot: u8, option: TimeoutOption) -> Result<u64, Error> {
-    let state = unsafe { socket_slots().get(usize::from(slot)) }
-        .filter(|state| state.occupied)
-        .ok_or(Error::Invalid)?;
-    Ok(match option {
-        TimeoutOption::Receive => state.receive_timeout_us,
-        TimeoutOption::Send => state.send_timeout_us,
-    })
+pub(crate) fn timeout_option(id: SlotId, option: TimeoutOption) -> Result<u64, Error> {
+    SOCKETS.lock().timeout_option(id, option)
 }
 
 /// Whether a timeout (SO_RCVTIMEO or SO_SNDTIMEO) bounds blocking calls on
-/// the socket in `slot`.
-pub(crate) fn has_timeout(slot: u8, option: TimeoutOption) -> bool {
-    timeout_poll_limit(slot, option).is_some()
+/// the socket `id`.
+pub(crate) fn has_timeout(id: SlotId, option: TimeoutOption) -> bool {
+    timeout_poll_limit(id, option).is_some()
 }
 
-fn timeout_poll_limit(slot: u8, option: TimeoutOption) -> Option<usize> {
-    timeout_option(slot, option)
+fn timeout_poll_limit(id: SlotId, option: TimeoutOption) -> Option<usize> {
+    timeout_option(id, option)
         .ok()
         .filter(|microseconds| *microseconds != 0)
         .map(|microseconds| {
@@ -1144,260 +1835,22 @@ fn timeout_poll_limit(slot: u8, option: TimeoutOption) -> Option<usize> {
         })
 }
 
-pub(crate) fn bind(slot: u8, address: u32, requested_port: u16) -> Result<u16, Error> {
-    poll();
-    let runtime = runtime()?;
-    let index = usize::from(slot);
-    let state = unsafe { socket_slots().get(index).copied() }
-        .filter(|state| state.occupied)
-        .ok_or(Error::Invalid)?;
-    if state.kind == Kind::Unix || state.local_port != 0 || state.remote.is_some() {
-        return Err(Error::Invalid);
-    }
-    if address != 0 && !is_local_address(runtime, address) {
-        return Err(Error::AddressNotAvailable);
-    }
-    let port = if requested_port == 0 {
-        allocate_ephemeral_port(runtime, state.kind, index).ok_or(Error::Exhausted)?
-    } else {
-        requested_port
-    };
-    if port_in_use(state.kind, port, index) {
-        return Err(Error::AddressInUse);
-    }
-    if state.kind == Kind::Udp {
-        let handle = state.handle.ok_or(Error::Invalid)?;
-        runtime
-            .sockets
-            .get_mut::<udp::Socket>(handle)
-            .bind(port)
-            .map_err(|_| Error::AddressInUse)?;
-    }
-    unsafe { socket_slots()[index].local_port = port };
-    Ok(port)
+pub(crate) fn bind(id: SlotId, address: u32, requested_port: u16) -> Result<u16, Error> {
+    SOCKETS.lock().bind(id, address, requested_port)
 }
 
-pub(crate) fn listen(slot: u8, requested_backlog: usize) -> Result<(), Error> {
-    poll();
-    let index = usize::from(slot);
-    let state = unsafe { socket_slots().get(index).copied() }
-        .filter(|state| state.occupied)
-        .ok_or(Error::Invalid)?;
-    if state.remote.is_some() {
-        return Err(Error::Invalid);
-    }
-    if state.kind == Kind::Unix {
-        if unsafe { unix_path_lengths()[index] } == 0 {
-            return Err(Error::Invalid);
-        }
-        unsafe {
-            socket_slots()[index].listening = true;
-            socket_slots()[index].backlog = requested_backlog.clamp(1, SLOT_COUNT) as u8;
-        }
-        return Ok(());
-    }
-    if state.kind != Kind::Tcp {
-        return Err(Error::Invalid);
-    }
-    let runtime = runtime()?;
-    let local_port = if state.local_port == 0 {
-        allocate_ephemeral_port(runtime, Kind::Tcp, index).ok_or(Error::Exhausted)?
-    } else {
-        state.local_port
-    };
-    let handle = state.handle.ok_or(Error::Invalid)?;
-    runtime
-        .sockets
-        .get_mut::<tcp::Socket>(handle)
-        .listen(local_port)
-        .map_err(|_| Error::Invalid)?;
-    unsafe {
-        socket_slots()[index].local_port = local_port;
-        socket_slots()[index].listening = true;
-        socket_slots()[index].backlog = requested_backlog.clamp(1, SLOT_COUNT) as u8;
-    }
-    Ok(())
+pub(crate) fn listen(id: SlotId, requested_backlog: usize) -> Result<(), Error> {
+    SOCKETS.lock().listen(id, requested_backlog)
 }
 
-fn add_tcp_socket(runtime: &mut Runtime, buffer: usize) -> SocketHandle {
-    let rx = tcp::SocketBuffer::new(unsafe {
-        core::slice::from_raw_parts_mut(tcp_rx()[buffer].as_mut_ptr(), TCP_BUFFER_SIZE)
-    });
-    let tx = tcp::SocketBuffer::new(unsafe {
-        core::slice::from_raw_parts_mut(tcp_tx()[buffer].as_mut_ptr(), TCP_BUFFER_SIZE)
-    });
-    runtime.sockets.add(tcp::Socket::new(rx, tx))
+pub(crate) fn accept(id: SlotId) -> Result<(SlotId, IpEndpoint), Error> {
+    SOCKETS.lock().accept(id)
 }
 
-pub(crate) fn accept(slot: u8) -> Result<(u8, IpEndpoint), Error> {
-    poll();
-    let runtime = runtime()?;
-    let listener_index = usize::from(slot);
-    let mut listener = unsafe { socket_slots().get(listener_index).copied() }
-        .filter(|state| {
-            state.occupied && matches!(state.kind, Kind::Tcp | Kind::Unix) && state.listening
-        })
-        .ok_or(Error::Invalid)?;
-    while listener.pending_length != 0 {
-        let client_index = usize::from(listener.pending[0]);
-        let valid = unsafe { socket_slots().get(client_index).copied() }
-            .is_some_and(|state| state.occupied && state.kind == listener.kind && !state.listening);
-        if valid {
-            break;
-        }
-        unsafe {
-            socket_slots()[listener_index]
-                .pending
-                .copy_within(1..usize::from(listener.pending_length), 0);
-            socket_slots()[listener_index].pending_length -= 1;
-            listener = socket_slots()[listener_index];
-        }
-    }
-    if listener.pending_length != 0 {
-        let client_slot = listener.pending[0];
-        let client_index = usize::from(client_slot);
-        let client = unsafe { socket_slots().get(client_index).copied() }
-            .filter(|state| state.occupied && state.kind == listener.kind && !state.listening)
-            .ok_or(Error::Invalid)?;
-        if listener.kind == Kind::Unix {
-            unsafe {
-                socket_slots()[listener_index]
-                    .pending
-                    .copy_within(1..usize::from(listener.pending_length), 0);
-                socket_slots()[listener_index].pending_length -= 1;
-            }
-            return Ok((client_slot, endpoint(runtime.local_address, 0)));
-        }
-        let accepted_index = unsafe { socket_slots().iter().position(|state| !state.occupied) }
-            .ok_or(Error::Exhausted)?;
-        let remote = endpoint(runtime.local_address, client.local_port);
-        unsafe {
-            socket_slots()[accepted_index] = Slot {
-                occupied: true,
-                owner: listener.owner,
-                references: 1,
-                kind: listener.kind,
-                handle: None,
-                remote: (listener.kind == Kind::Tcp).then_some(remote),
-                local_port: listener.local_port,
-                tcp_buffer: None,
-                listening: false,
-                backlog: 0,
-                pending_length: 0,
-                pending: [0; SLOT_COUNT],
-                peer: Some(client_slot),
-                read_shutdown: false,
-                write_shutdown: false,
-                reuse_address: listener.reuse_address,
-                keep_alive: listener.keep_alive,
-                receive_errors: listener.receive_errors,
-                no_delay: listener.no_delay,
-                pass_credentials: listener.pass_credentials,
-                timestamp: listener.timestamp,
-                receive_timeout_us: listener.receive_timeout_us,
-                send_timeout_us: listener.send_timeout_us,
-                pending_right_count: 0,
-                pending_right_slots: [0; SLOT_COUNT],
-                pending_right_flags: [0; SLOT_COUNT],
-                pending_credential_count: 0,
-                pending_credentials: [(0, 0, 0); SLOT_COUNT],
-                peer_credentials: None,
-                local_first: memory::FrameLease::EMPTY,
-                local_last: memory::FrameLease::EMPTY,
-                local_head: 0,
-                local_length: 0,
-                local_capacity: 0,
-            };
-            socket_slots()[client_index].peer = Some(accepted_index as u8);
-            if listener.kind == Kind::Unix {
-                unix_socket_types()[accepted_index] = unix_socket_types()[listener_index];
-            }
-            socket_slots()[listener_index]
-                .pending
-                .copy_within(1..usize::from(listener.pending_length), 0);
-            socket_slots()[listener_index].pending_length -= 1;
-        }
-        return Ok((accepted_index as u8, remote));
-    }
-    if listener.kind == Kind::Unix {
-        return Err(Error::WouldBlock);
-    }
-    let handle = listener.handle.ok_or(Error::Invalid)?;
-    let socket = runtime.sockets.get::<tcp::Socket>(handle);
-    if !matches!(
-        socket.state(),
-        tcp::State::Established | tcp::State::CloseWait
-    ) {
-        return Err(Error::WouldBlock);
-    }
-    let remote = socket.remote_endpoint().ok_or(Error::Invalid)?;
-    let accepted_index = unsafe { socket_slots().iter().position(|state| !state.occupied) }
-        .ok_or(Error::Exhausted)?;
-    let replacement_buffer = free_tcp_buffer().ok_or(Error::Exhausted)?;
-    let replacement = add_tcp_socket(runtime, replacement_buffer);
-    if runtime
-        .sockets
-        .get_mut::<tcp::Socket>(replacement)
-        .listen(listener.local_port)
-        .is_err()
-    {
-        runtime.sockets.remove(replacement);
-        return Err(Error::Invalid);
-    }
-    {
-        let accepted_socket = runtime.sockets.get_mut::<tcp::Socket>(handle);
-        accepted_socket.set_nagle_enabled(!listener.no_delay);
-        accepted_socket.set_keep_alive(listener.keep_alive.then_some(Duration::from_secs(75)));
-    }
-    unsafe {
-        socket_slots()[accepted_index] = Slot {
-            occupied: true,
-            owner: listener.owner,
-            references: 1,
-            kind: Kind::Tcp,
-            handle: Some(handle),
-            remote: Some(remote),
-            local_port: listener.local_port,
-            tcp_buffer: listener.tcp_buffer,
-            listening: false,
-            backlog: 0,
-            pending_length: 0,
-            pending: [0; SLOT_COUNT],
-            peer: None,
-            read_shutdown: false,
-            write_shutdown: false,
-            reuse_address: listener.reuse_address,
-            keep_alive: listener.keep_alive,
-            receive_errors: listener.receive_errors,
-            no_delay: listener.no_delay,
-            pass_credentials: listener.pass_credentials,
-            timestamp: listener.timestamp,
-            receive_timeout_us: listener.receive_timeout_us,
-            send_timeout_us: listener.send_timeout_us,
-            pending_right_count: 0,
-            pending_right_slots: [0; SLOT_COUNT],
-            pending_right_flags: [0; SLOT_COUNT],
-            pending_credential_count: 0,
-            pending_credentials: [(0, 0, 0); SLOT_COUNT],
-            peer_credentials: None,
-            local_first: memory::FrameLease::EMPTY,
-            local_last: memory::FrameLease::EMPTY,
-            local_head: 0,
-            local_length: 0,
-            local_capacity: 0,
-        };
-        socket_slots()[listener_index].handle = Some(replacement);
-        socket_slots()[listener_index].remote = None;
-        socket_slots()[listener_index].tcp_buffer = Some(replacement_buffer as u8);
-        socket_slots()[listener_index].listening = true;
-    }
-    Ok((accepted_index as u8, remote))
-}
-
-pub(crate) fn accept_blocking(slot: u8) -> Result<(u8, IpEndpoint), Error> {
-    if let Some(limit) = timeout_poll_limit(slot, TimeoutOption::Receive) {
+pub(crate) fn accept_blocking(id: SlotId) -> Result<(SlotId, IpEndpoint), Error> {
+    if let Some(limit) = timeout_poll_limit(id, TimeoutOption::Receive) {
         for _ in 0..limit {
-            match accept(slot) {
+            match accept(id) {
                 Err(Error::WouldBlock | Error::InProgress) => core::hint::spin_loop(),
                 result => return result,
             }
@@ -1405,205 +1858,32 @@ pub(crate) fn accept_blocking(slot: u8) -> Result<(u8, IpEndpoint), Error> {
         return Err(Error::WouldBlock);
     }
     loop {
-        match accept(slot) {
+        match accept(id) {
             Err(Error::WouldBlock | Error::InProgress) => core::hint::spin_loop(),
             result => return result,
         }
     }
 }
 
-fn teardown() -> bool {
-    let Some(platform) = (unsafe { socket_platform() }) else {
-        return false;
-    };
-    let Some(runtime) = (unsafe { socket_runtime_state().take() }) else {
-        return false;
-    };
-    let loopback = unsafe { loopback_frames() };
-    loopback.head = 0;
-    loopback.count = 0;
-    pci::quiesce_isolated_network(platform.device, platform.common)
-        && runtime._translation.finish()
-        && memory::scrub_and_release_frames(memory::FrameOwner::KERNEL, &[runtime._dma])
-}
-
-pub(crate) fn connect(slot: u8, remote: IpEndpoint) -> Result<(), Error> {
-    poll();
-    let runtime = runtime()?;
-    let index = usize::from(slot);
-    let state = unsafe { socket_slots().get(index).copied() }
-        .filter(|slot| slot.occupied)
-        .ok_or(Error::Invalid)?;
-    let handle = state.handle.ok_or(Error::Invalid)?;
-    if state.listening {
-        return Err(Error::Invalid);
-    }
-    let local_port = if state.local_port == 0 {
-        allocate_ephemeral_port(runtime, state.kind, index).ok_or(Error::Exhausted)?
-    } else {
-        state.local_port
-    };
-    if state.kind == Kind::Tcp
-        && matches!(remote.addr, IpAddress::Ipv4(address)
-            if is_local_address(runtime, u32::from_be_bytes(address.octets())))
-    {
-        let listener = unsafe {
-            socket_slots().iter().position(|candidate| {
-                candidate.occupied
-                    && candidate.kind == Kind::Tcp
-                    && candidate.listening
-                    && candidate.local_port == remote.port
-                    && candidate.pending_length < candidate.backlog
-            })
-        };
-        if let Some(listener) = listener {
-            unsafe {
-                socket_slots()[index].local_port = local_port;
-                socket_slots()[index].remote = Some(remote);
-                socket_slots()[index].peer = Some(listener as u8);
-                let pending = usize::from(socket_slots()[listener].pending_length);
-                socket_slots()[listener].pending[pending] = slot;
-                socket_slots()[listener].pending_length += 1;
-            }
-            return Ok(());
-        }
-    }
-    match state.kind {
-        Kind::Tcp => {
-            let socket = runtime.sockets.get_mut::<tcp::Socket>(handle);
-            if socket.is_active() {
-                return if socket.may_send() {
-                    Ok(())
-                } else {
-                    Err(Error::InProgress)
-                };
-            }
-            socket
-                .connect(runtime.interface.context(), remote, local_port)
-                .map_err(|_| Error::Invalid)?;
-            unsafe {
-                socket_slots()[index].local_port = local_port;
-                socket_slots()[index].remote = Some(remote);
-            }
-            Err(Error::InProgress)
-        }
-        Kind::Udp => {
-            let socket = runtime.sockets.get_mut::<udp::Socket>(handle);
-            if !socket.is_open() {
-                socket.bind(local_port).map_err(|_| Error::Invalid)?;
-            }
-            unsafe {
-                socket_slots()[index].local_port = local_port;
-                socket_slots()[index].remote = Some(remote);
-            }
-            Ok(())
-        }
-        Kind::Unix => Err(Error::Invalid),
-    }
+pub(crate) fn connect(id: SlotId, remote: IpEndpoint) -> Result<(), Error> {
+    SOCKETS.lock().connect(id, remote)
 }
 
 /// Sends without blocking: a full local queue is `WouldBlock`.
-pub(crate) fn send(slot: u8, input: &[u8], remote: Option<IpEndpoint>) -> Result<usize, Error> {
-    send_queued(slot, input, remote, Some(LOCAL_QUEUE_CAPACITY))
-}
-
-fn send_queued(
-    slot: u8,
-    input: &[u8],
-    remote: Option<IpEndpoint>,
-    local_capacity: Option<usize>,
-) -> Result<usize, Error> {
-    poll();
-    let index = usize::from(slot);
-    let loopback = unsafe { socket_slots().get(index) }
-        .filter(|state| state.occupied && state.peer == Some(slot))
-        .is_some();
-    if loopback {
-        if remote.is_some() {
-            return Err(Error::Invalid);
-        }
-        let state = unsafe { socket_slots().get_mut(index) }.ok_or(Error::Invalid)?;
-        if state.write_shutdown {
-            return Err(Error::BrokenPipe);
-        }
-        if input.is_empty() {
-            return Ok(0);
-        }
-        return append_local_data(state, input, local_capacity);
-    }
-    let state = unsafe { socket_slots().get(usize::from(slot)) }
-        .filter(|slot| slot.occupied)
-        .ok_or(Error::Invalid)?;
-    if state.write_shutdown {
-        return Err(Error::BrokenPipe);
-    }
-    if state.kind == Kind::Unix || state.peer.is_some() && !state.listening {
-        if remote.is_some() {
-            return Err(Error::Invalid);
-        }
-        let peer = usize::from(state.peer.ok_or(Error::NotConnected)?);
-        let Some(peer_state) = (unsafe { socket_slots().get_mut(peer) })
-            .filter(|slot| slot.occupied && slot.kind == state.kind && !slot.listening)
-        else {
-            crate::serial_write(
-                "ginux: local socket peer unavailable slot/peer/occupied/references ",
-            );
-            crate::serial_write_u64(u64::from(slot));
-            crate::serial_write(" ");
-            crate::serial_write_u64(peer as u64);
-            crate::serial_write(" ");
-            let observed = unsafe { socket_slots().get(peer).copied().unwrap_or(Slot::EMPTY) };
-            crate::serial_write_u64(u64::from(observed.occupied));
-            crate::serial_write(" ");
-            crate::serial_write_u64(u64::from(observed.references));
-            crate::serial_write(" ");
-            crate::serial_write_u64(observed.kind as u64);
-            crate::serial_write(" ");
-            crate::serial_write_u64(state.kind as u64);
-            crate::serial_write(" ");
-            crate::serial_write_u64(u64::from(observed.listening));
-            crate::serial_write("\r\n");
-            return Err(Error::NotConnected);
-        };
-        if input.is_empty() {
-            return Ok(0);
-        }
-        return append_local_data(peer_state, input, local_capacity);
-    }
-    let runtime = runtime()?;
-    let handle = state.handle.ok_or(Error::Invalid)?;
-    match state.kind {
-        Kind::Tcp => {
-            let socket = runtime.sockets.get_mut::<tcp::Socket>(handle);
-            if socket.can_send() {
-                socket.send_slice(input).map_err(|_| Error::Reset)
-            } else if socket.may_send() {
-                Err(Error::WouldBlock)
-            } else {
-                Err(Error::NotConnected)
-            }
-        }
-        Kind::Udp => {
-            let endpoint = remote.or(state.remote).ok_or(Error::NotConnected)?;
-            runtime
-                .sockets
-                .get_mut::<udp::Socket>(handle)
-                .send_slice(input, endpoint)
-                .map(|_| input.len())
-                .map_err(|_| Error::WouldBlock)
-        }
-        Kind::Unix => unreachable!(),
-    }
+pub(crate) fn send(id: SlotId, input: &[u8], remote: Option<IpEndpoint>) -> Result<usize, Error> {
+    SOCKETS
+        .lock()
+        .send_queued(id, input, remote, Some(LOCAL_QUEUE_CAPACITY))
 }
 
 pub(crate) fn send_blocking(
-    slot: u8,
+    id: SlotId,
     input: &[u8],
     remote: Option<IpEndpoint>,
 ) -> Result<usize, Error> {
-    let limit = timeout_poll_limit(slot, TimeoutOption::Send).unwrap_or(BLOCKING_POLL_LIMIT);
+    let limit = timeout_poll_limit(id, TimeoutOption::Send).unwrap_or(BLOCKING_POLL_LIMIT);
     for _ in 0..limit {
-        match send_queued(slot, input, remote, None) {
+        match SOCKETS.lock().send_queued(id, input, remote, None) {
             Err(Error::WouldBlock | Error::InProgress) => core::hint::spin_loop(),
             result => return result,
         }
@@ -1611,277 +1891,47 @@ pub(crate) fn send_blocking(
     Err(Error::WouldBlock)
 }
 
-pub(crate) fn recv(slot: u8, output: &mut [u8]) -> Result<(usize, Option<IpEndpoint>), Error> {
-    if kind(slot) == Some(Kind::Udp) {
-        return recv_message(slot, output, false)
-            .map(|(copied, _message_length, endpoint)| (copied, endpoint));
-    }
-    poll();
-    let state = unsafe { socket_slots().get_mut(usize::from(slot)) }
-        .filter(|slot| slot.occupied)
-        .ok_or(Error::Invalid)?;
-    if state.read_shutdown {
-        return Ok((0, None));
-    }
-    if state.kind == Kind::Unix || state.peer.is_some() && !state.listening {
-        let received = output.len().min(state.local_length);
-        let mut copied = 0_usize;
-        while copied < received {
-            let page = state.local_first;
-            let data = local_page(page).ok_or(Error::Invalid)?;
-            let used = usize::try_from(data.used)
-                .ok()
-                .filter(|used| *used <= LOCAL_DATA_CAPACITY)
-                .ok_or(Error::Invalid)?;
-            if state.local_head >= used {
-                return Err(Error::Invalid);
-            }
-            let amount = (received - copied).min(used - state.local_head);
-            output[copied..copied + amount]
-                .copy_from_slice(&data.bytes[state.local_head..state.local_head + amount]);
-            copied += amount;
-            state.local_head += amount;
-            if state.local_head == used {
-                let next = data.next;
-                if !memory::scrub_and_release_frames(
-                    memory::FrameOwner::KERNEL,
-                    core::slice::from_ref(&page),
-                ) {
-                    return Err(Error::Invalid);
-                }
-                state.local_first = next;
-                state.local_head = 0;
-                if next == memory::FrameLease::EMPTY {
-                    state.local_last = memory::FrameLease::EMPTY;
-                }
-            }
-        }
-        state.local_length -= received;
-        if received != 0 {
-            return Ok((received, None));
-        }
-        let peer = state
-            .peer
-            .and_then(|peer| unsafe { socket_slots().get(usize::from(peer)) });
-        let peer_open = peer.is_some_and(|peer| peer.occupied);
-        return if unix_socket_type(slot) == Some(2)
-            || peer_open && !peer.is_some_and(|peer| peer.write_shutdown)
-        {
-            Err(Error::WouldBlock)
-        } else {
-            Ok((0, None))
-        };
-    }
-    let runtime = runtime()?;
-    let handle = state.handle.ok_or(Error::Invalid)?;
-    match state.kind {
-        Kind::Tcp => {
-            let socket = runtime.sockets.get_mut::<tcp::Socket>(handle);
-            if socket.can_recv() {
-                socket
-                    .recv_slice(output)
-                    .map(|size| (size, None))
-                    .map_err(|_| Error::Reset)
-            } else if socket.may_recv() {
-                Err(Error::WouldBlock)
-            } else {
-                Ok((0, None))
-            }
-        }
-        Kind::Udp => runtime
-            .sockets
-            .get_mut::<udp::Socket>(handle)
-            .recv_slice(output)
-            .map(|(size, metadata)| (size, Some(metadata.endpoint)))
-            .map_err(|_| Error::WouldBlock),
-        Kind::Unix => unreachable!(),
-    }
+pub(crate) fn recv(id: SlotId, output: &mut [u8]) -> Result<(usize, Option<IpEndpoint>), Error> {
+    SOCKETS.lock().recv(id, output)
 }
 
-pub(crate) fn peek_local(slot: u8, output: &mut [u8]) -> Result<usize, Error> {
-    let state = unsafe { socket_slots().get(usize::from(slot)) }
-        .filter(|slot| {
-            slot.occupied && (slot.kind == Kind::Unix || slot.peer.is_some() && !slot.listening)
-        })
-        .ok_or(Error::Invalid)?;
-    let returned = output.len().min(state.local_length);
-    let mut page = state.local_first;
-    let mut head = state.local_head;
-    let mut copied = 0_usize;
-    while copied < returned {
-        let data = local_page(page).ok_or(Error::Invalid)?;
-        let used = usize::try_from(data.used)
-            .ok()
-            .filter(|used| *used <= LOCAL_DATA_CAPACITY)
-            .ok_or(Error::Invalid)?;
-        if head >= used {
-            return Err(Error::Invalid);
-        }
-        let amount = (returned - copied).min(used - head);
-        output[copied..copied + amount].copy_from_slice(&data.bytes[head..head + amount]);
-        copied += amount;
-        head += amount;
-        if head == used {
-            page = data.next;
-            head = 0;
-        }
-    }
-    if returned != 0 {
-        return Ok(returned);
-    }
-    let peer = state
-        .peer
-        .and_then(|peer| unsafe { socket_slots().get(usize::from(peer)) });
-    let peer_open = peer.is_some_and(|peer| peer.occupied);
-    if unix_socket_type(slot) == Some(2)
-        || peer_open && !peer.is_some_and(|peer| peer.write_shutdown)
-    {
-        Err(Error::WouldBlock)
-    } else {
-        Ok(0)
-    }
+pub(crate) fn peek_local(id: SlotId, output: &mut [u8]) -> Result<usize, Error> {
+    SOCKETS.lock().peek_local(id, output)
 }
 
 /// A pipe's capacity (F_GETPIPE_SZ).
-pub(crate) fn local_capacity(slot: u8) -> Result<usize, Error> {
-    unsafe { socket_slots().get(usize::from(slot)) }
-        .filter(|slot| slot.occupied && slot.kind == Kind::Unix)
-        .map(|slot| {
-            if slot.local_capacity == 0 {
-                LOCAL_QUEUE_CAPACITY
-            } else {
-                slot.local_capacity as usize
-            }
-        })
+pub(crate) fn local_capacity(id: SlotId) -> Result<usize, Error> {
+    SOCKETS.lock().local_capacity(id)
+}
+
+/// Sets a pipe's capacity (F_SETPIPE_SZ); see `Sockets::set_local_capacity`.
+pub(crate) fn set_local_capacity(id: SlotId, requested: usize) -> Result<usize, Error> {
+    SOCKETS.lock().set_local_capacity(id, requested)
+}
+
+/// The bytes in a pipe, read from either end.
+pub(crate) fn pipe_queued_bytes(id: SlotId) -> Result<usize, Error> {
+    SOCKETS.lock().pipe_queued_bytes(id)
+}
+
+pub(crate) fn local_queued_bytes(id: SlotId) -> Result<usize, Error> {
+    SOCKETS
+        .lock()
+        .unix(id)
+        .map(|state| state.local.len())
         .ok_or(Error::Invalid)
-}
-
-/// Sets a pipe's capacity (F_SETPIPE_SZ) on both its ends: `requested`
-/// rounded up to a power of two of at least a page. `Exhausted` when more
-/// is queued than the new capacity holds.
-pub(crate) fn set_local_capacity(slot: u8, requested: usize) -> Result<usize, Error> {
-    let capacity = requested
-        .max(PAGE_SIZE)
-        .checked_next_power_of_two()
-        .filter(|capacity| *capacity <= u32::MAX as usize)
-        .ok_or(Error::Invalid)?;
-    let index = usize::from(slot);
-    let state = unsafe { socket_slots().get(index).copied() }
-        .filter(|slot| slot.occupied && slot.kind == Kind::Unix)
-        .ok_or(Error::Invalid)?;
-    let ends = [Some(index), state.peer.map(usize::from)];
-    if ends
-        .iter()
-        .flatten()
-        .any(|end| unsafe { socket_slots()[*end].local_length } > capacity)
-    {
-        return Err(Error::Exhausted);
-    }
-    for end in ends.into_iter().flatten() {
-        unsafe { socket_slots()[end].local_capacity = capacity as u32 };
-    }
-    Ok(capacity)
-}
-
-/// The bytes in a pipe, read from either end (its data waits in the read
-/// end's queue).
-pub(crate) fn pipe_queued_bytes(slot: u8) -> Result<usize, Error> {
-    let state = unsafe { socket_slots().get(usize::from(slot)).copied() }
-        .filter(|slot| slot.occupied && slot.kind == Kind::Unix)
-        .ok_or(Error::Invalid)?;
-    let peer = state
-        .peer
-        .and_then(|peer| unsafe { socket_slots().get(usize::from(peer)).copied() })
-        .filter(|peer| peer.occupied)
-        .map_or(0, |peer| peer.local_length);
-    Ok(state.local_length + peer)
-}
-
-pub(crate) fn local_queued_bytes(slot: u8) -> Result<usize, Error> {
-    unsafe { socket_slots().get(usize::from(slot)) }
-        .filter(|slot| slot.occupied && slot.kind == Kind::Unix)
-        .map(|slot| slot.local_length)
-        .ok_or(Error::Invalid)
-}
-
-pub(crate) fn peek(slot: u8, output: &mut [u8]) -> Result<(usize, Option<IpEndpoint>), Error> {
-    if kind(slot) == Some(Kind::Udp) {
-        return recv_message(slot, output, true)
-            .map(|(copied, _message_length, endpoint)| (copied, endpoint));
-    }
-    poll();
-    let state = unsafe { socket_slots().get(usize::from(slot)) }
-        .filter(|slot| slot.occupied)
-        .ok_or(Error::Invalid)?;
-    if state.read_shutdown {
-        return Ok((0, None));
-    }
-    if state.kind == Kind::Unix || state.peer.is_some() && !state.listening {
-        return peek_local(slot, output).map(|received| (received, None));
-    }
-    let runtime = runtime()?;
-    let handle = state.handle.ok_or(Error::Invalid)?;
-    match state.kind {
-        Kind::Tcp => {
-            let socket = runtime.sockets.get_mut::<tcp::Socket>(handle);
-            if socket.can_recv() {
-                socket
-                    .peek_slice(output)
-                    .map(|size| (size, None))
-                    .map_err(|_| Error::Reset)
-            } else if socket.may_recv() {
-                Err(Error::WouldBlock)
-            } else {
-                Ok((0, None))
-            }
-        }
-        Kind::Udp => runtime
-            .sockets
-            .get_mut::<udp::Socket>(handle)
-            .peek_slice(output)
-            .map(|(size, metadata)| (size, Some(metadata.endpoint)))
-            .map_err(|_| Error::WouldBlock),
-        Kind::Unix => unreachable!(),
-    }
 }
 
 pub(crate) fn recv_message(
-    slot: u8,
+    id: SlotId,
     output: &mut [u8],
     peek_only: bool,
 ) -> Result<(usize, usize, Option<IpEndpoint>), Error> {
-    if kind(slot) != Some(Kind::Udp) {
-        let (copied, endpoint) = if peek_only {
-            peek(slot, output)?
-        } else {
-            recv(slot, output)?
-        };
-        return Ok((copied, copied, endpoint));
-    }
-    poll();
-    let state = unsafe { socket_slots().get(usize::from(slot)) }
-        .filter(|slot| slot.occupied && slot.kind == Kind::Udp)
-        .ok_or(Error::Invalid)?;
-    if state.read_shutdown {
-        return Ok((0, 0, None));
-    }
-    let runtime = runtime()?;
-    let handle = state.handle.ok_or(Error::Invalid)?;
-    let socket = runtime.sockets.get_mut::<udp::Socket>(handle);
-    let (payload, endpoint) = if peek_only {
-        let (payload, metadata) = socket.peek().map_err(|_| Error::WouldBlock)?;
-        (payload, metadata.endpoint)
-    } else {
-        let (payload, metadata) = socket.recv().map_err(|_| Error::WouldBlock)?;
-        (payload, metadata.endpoint)
-    };
-    let copied = output.len().min(payload.len());
-    output[..copied].copy_from_slice(&payload[..copied]);
-    Ok((copied, payload.len(), Some(endpoint)))
+    SOCKETS.lock().recv_message(id, output, peek_only)
 }
 
 pub(crate) fn recv_message_blocking(
-    slot: u8,
+    id: SlotId,
     output: &mut [u8],
     peek_only: bool,
     wait_all: bool,
@@ -1889,10 +1939,10 @@ pub(crate) fn recv_message_blocking(
     if output.is_empty() {
         return Ok((0, 0, None));
     }
-    if !wait_all || kind(slot) == Some(Kind::Udp) {
-        let limit = timeout_poll_limit(slot, TimeoutOption::Receive).unwrap_or(BLOCKING_POLL_LIMIT);
+    let limit = timeout_poll_limit(id, TimeoutOption::Receive).unwrap_or(BLOCKING_POLL_LIMIT);
+    if !wait_all || kind(id) == Some(Kind::Udp) {
         for _ in 0..limit {
-            match recv_message(slot, output, peek_only) {
+            match recv_message(id, output, peek_only) {
                 Err(Error::WouldBlock | Error::InProgress) => core::hint::spin_loop(),
                 result => return result,
             }
@@ -1902,9 +1952,8 @@ pub(crate) fn recv_message_blocking(
     }
     if peek_only {
         let mut observed = 0;
-        let limit = timeout_poll_limit(slot, TimeoutOption::Receive).unwrap_or(BLOCKING_POLL_LIMIT);
         for _ in 0..limit {
-            match recv_message(slot, output, true) {
+            match recv_message(id, output, true) {
                 Ok((copied, _, endpoint)) if copied == output.len() || copied == 0 => {
                     return Ok((copied, copied, endpoint));
                 }
@@ -1927,9 +1976,8 @@ pub(crate) fn recv_message_blocking(
         };
     }
     let mut received = 0;
-    let limit = timeout_poll_limit(slot, TimeoutOption::Receive).unwrap_or(BLOCKING_POLL_LIMIT);
     for _ in 0..limit {
-        match recv_message(slot, &mut output[received..], false) {
+        match recv_message(id, &mut output[received..], false) {
             Ok((0, _, endpoint)) => return Ok((received, received, endpoint)),
             Ok((copied, _, endpoint)) => {
                 received += copied;
@@ -1956,12 +2004,12 @@ pub(crate) fn recv_message_blocking(
 }
 
 pub(crate) fn recv_blocking(
-    slot: u8,
+    id: SlotId,
     output: &mut [u8],
 ) -> Result<(usize, Option<IpEndpoint>), Error> {
-    let limit = timeout_poll_limit(slot, TimeoutOption::Receive).unwrap_or(BLOCKING_POLL_LIMIT);
+    let limit = timeout_poll_limit(id, TimeoutOption::Receive).unwrap_or(BLOCKING_POLL_LIMIT);
     for _ in 0..limit {
-        match recv(slot, output) {
+        match recv(id, output) {
             Err(Error::WouldBlock | Error::InProgress) => core::hint::spin_loop(),
             result => return result,
         }
@@ -1970,10 +2018,10 @@ pub(crate) fn recv_blocking(
     Err(Error::WouldBlock)
 }
 
-pub(crate) fn complete_connect(slot: u8) -> Result<(), Error> {
-    let limit = timeout_poll_limit(slot, TimeoutOption::Send).unwrap_or(BLOCKING_POLL_LIMIT);
+pub(crate) fn complete_connect(id: SlotId) -> Result<(), Error> {
+    let limit = timeout_poll_limit(id, TimeoutOption::Send).unwrap_or(BLOCKING_POLL_LIMIT);
     for _ in 0..limit {
-        let Some((_, writable, error)) = readiness(slot) else {
+        let Some((_, writable, error)) = readiness(id) else {
             return Err(Error::Invalid);
         };
         if writable {
@@ -1989,726 +2037,135 @@ pub(crate) fn complete_connect(slot: u8) -> Result<(), Error> {
 }
 
 fn report_timeout(operation: &str) {
-    let Some(runtime) = runtime_existing() else {
+    let sockets = SOCKETS.lock();
+    let Some(runtime) = sockets.runtime.as_ref() else {
         return;
     };
+    let [rx_avail, rx_used, tx_avail, tx_used] = runtime.device.queue_positions();
     crate::serial_write("ginux: socket ");
     crate::serial_write(operation);
     crate::serial_write(" timeout rx/tx available/used: ");
-    crate::serial_write_u64(u64::from(runtime.device.rx_avail));
+    crate::serial_write_u64(u64::from(rx_avail));
     crate::serial_write("/");
-    crate::serial_write_u64(u64::from(unsafe {
-        read_u16(runtime.device.dma + RX_USED_OFFSET + 2)
-    }));
+    crate::serial_write_u64(u64::from(rx_used));
     crate::serial_write(" ");
-    crate::serial_write_u64(u64::from(runtime.device.tx_avail));
+    crate::serial_write_u64(u64::from(tx_avail));
     crate::serial_write("/");
-    crate::serial_write_u64(u64::from(unsafe {
-        read_u16(runtime.device.dma + TX_USED_OFFSET + 2)
-    }));
+    crate::serial_write_u64(u64::from(tx_used));
     crate::serial_write("\r\n");
 }
 
-pub(crate) fn readiness(slot: u8) -> Option<(bool, bool, bool)> {
-    poll();
-    let state = unsafe { socket_slots().get(usize::from(slot)) }?
-        .occupied
-        .then(|| unsafe { socket_slots()[usize::from(slot)] })?;
-    if state.listening && state.pending_length != 0 {
-        return Some((true, false, false));
-    }
-    if state.kind == Kind::Unix || state.peer.is_some() {
-        let named =
-            state.kind == Kind::Unix && unsafe { unix_path_lengths()[usize::from(slot)] } != 0;
-        let peer = state
-            .peer
-            .and_then(|peer| unsafe { socket_slots().get(usize::from(peer)) });
-        let peer_open = peer.is_some_and(|peer| peer.occupied);
-        let writable = !state.write_shutdown && peer.is_some_and(|peer| peer.occupied);
-        let peer_eof = unsafe { unix_socket_types()[usize::from(slot)] } != 2
-            && (!named && !peer_open || peer.is_some_and(|peer| peer.write_shutdown));
-        let readable = state.read_shutdown || state.local_length != 0 || peer_eof;
-        return Some((readable, writable, false));
-    }
-    let runtime = runtime_existing()?;
-    let handle = state.handle?;
-    Some(match state.kind {
-        Kind::Tcp => {
-            let socket = runtime.sockets.get::<tcp::Socket>(handle);
-            if state.listening {
-                (
-                    matches!(
-                        socket.state(),
-                        tcp::State::Established | tcp::State::CloseWait
-                    ),
-                    false,
-                    false,
-                )
-            } else {
-                (
-                    state.read_shutdown || socket.can_recv() || !socket.may_recv(),
-                    !state.write_shutdown && socket.can_send(),
-                    !socket.is_open() && state.remote.is_some(),
-                )
-            }
-        }
-        Kind::Udp => {
-            let socket = runtime.sockets.get::<udp::Socket>(handle);
-            (socket.can_recv(), socket.can_send(), false)
-        }
-        Kind::Unix => unreachable!(),
-    })
+pub(crate) fn readiness(id: SlotId) -> Option<(bool, bool, bool)> {
+    SOCKETS.lock().readiness(id)
 }
 
-pub(crate) fn local_peer_write_closed(slot: u8) -> Option<bool> {
-    if unix_name(slot).is_some_and(|name| !name.is_empty()) {
-        return Some(false);
-    }
-    let state = unsafe { socket_slots().get(usize::from(slot)) }
-        .filter(|state| state.occupied && state.kind == Kind::Unix)?;
-    if unix_socket_type(slot) == Some(2) {
-        return Some(false);
-    }
-    let peer = state
-        .peer
-        .and_then(|peer| unsafe { socket_slots().get(usize::from(peer)) });
-    Some(!peer.is_some_and(|peer| peer.occupied && !peer.write_shutdown))
+pub(crate) fn local_peer_write_closed(id: SlotId) -> Option<bool> {
+    SOCKETS.lock().local_peer_write_closed(id)
 }
 
-pub(crate) fn local_peer_slot(slot: u8) -> Option<u8> {
-    unsafe { socket_slots().get(usize::from(slot)) }
-        .filter(|state| state.occupied && state.kind == Kind::Unix)?
-        .peer
+pub(crate) fn local_peer_slot(id: SlotId) -> Option<SlotId> {
+    SOCKETS.lock().unix(id)?.peer
 }
 
-pub(crate) fn names(slot: u8) -> Option<(IpEndpoint, Option<IpEndpoint>)> {
-    let state = unsafe { *socket_slots().get(usize::from(slot))? };
-    if !state.occupied || state.kind == Kind::Unix {
-        return None;
-    }
-    let runtime = runtime_existing()?;
-    Some((
-        endpoint(runtime.local_address, state.local_port),
-        state.remote,
-    ))
+pub(crate) fn names(id: SlotId) -> Option<(IpEndpoint, Option<IpEndpoint>)> {
+    SOCKETS.lock().names(id)
 }
 
 pub(crate) fn set_unix_pair_credentials(
-    first: u8,
-    second: u8,
+    first: SlotId,
+    second: SlotId,
     credentials: (u32, u32, u32),
 ) -> bool {
-    let first_valid = unsafe { socket_slots().get(usize::from(first)) }.is_some_and(|state| {
-        state.occupied && state.kind == Kind::Unix && state.peer == Some(second)
-    });
-    let second_valid = unsafe { socket_slots().get(usize::from(second)) }.is_some_and(|state| {
-        state.occupied && state.kind == Kind::Unix && state.peer == Some(first)
-    });
-    if !first_valid || !second_valid {
-        return false;
-    }
-    unsafe {
-        socket_slots()[usize::from(first)].peer_credentials = Some(credentials);
-        socket_slots()[usize::from(second)].peer_credentials = Some(credentials);
-    }
-    true
+    SOCKETS
+        .lock()
+        .set_unix_pair_credentials(first, second, credentials)
 }
 
-pub(crate) fn unix_peer_credentials(slot: u8) -> Option<(u32, u32, u32)> {
-    unsafe { socket_slots().get(usize::from(slot)) }
-        .filter(|state| state.occupied && state.kind == Kind::Unix)
-        .and_then(|state| state.peer_credentials)
+pub(crate) fn unix_peer_credentials(id: SlotId) -> Option<(u32, u32, u32)> {
+    SOCKETS.lock().unix(id)?.peer_credentials
 }
 
-/// A file description travelling as SCM_RIGHTS: the descriptor state a
-/// receiver needs to open its own descriptor for the same file. Rights are
-/// queued as slot numbers, so file rights use the numbers from SLOT_COUNT
-/// up, and duplicate and close count references to them like sockets.
-#[derive(Clone, Copy)]
-pub(crate) struct FileRight {
-    pub(crate) device: u16,
-    pub(crate) rootfs: u16,
-    pub(crate) generation: u32,
-    pub(crate) flags: u32,
-    pub(crate) offset: u64,
+pub(crate) fn queue_file_right(right: FileRight) -> Option<SlotId> {
+    SOCKETS.lock().queue_file_right(right)
 }
 
-impl FileRight {
-    const EMPTY: Self = Self {
-        device: 0,
-        rootfs: 0,
-        generation: 0,
-        flags: 0,
-        offset: 0,
-    };
+pub(crate) fn file_right(id: SlotId) -> Option<FileRight> {
+    SOCKETS.lock().file_right(id)
 }
 
-pub(crate) fn queue_file_right(right: FileRight) -> Option<u8> {
-    let index = unsafe { file_rights().iter() }.position(|(references, _)| *references == 0)?;
-    unsafe { file_rights()[index] = (1, right) };
-    u8::try_from(SLOT_COUNT + index).ok()
-}
-
-pub(crate) fn file_right(slot: u8) -> Option<FileRight> {
-    let index = usize::from(slot).checked_sub(SLOT_COUNT)?;
-    unsafe { file_rights().get(index) }
-        .filter(|(references, _)| *references != 0)
-        .map(|(_, right)| *right)
-}
-
-fn file_right_references(slot: u8) -> Option<&'static mut u8> {
-    let index = usize::from(slot).checked_sub(SLOT_COUNT)?;
-    unsafe { file_rights().get_mut(index) }
-        .map(|(references, _)| references)
-        .filter(|references| **references != 0)
-}
-
-pub(crate) fn queue_unix_rights(sender: u8, rights: &[(u8, u32)]) -> Result<(), Error> {
-    if rights.is_empty() || rights.len() > PASSED_RIGHT_LIMIT {
-        return Err(Error::Invalid);
-    }
-    let sender_state = unsafe { socket_slots().get(usize::from(sender)).copied() }
-        .filter(|state| state.occupied && state.kind == Kind::Unix)
-        .ok_or(Error::Invalid)?;
-    let peer = sender_state.peer.ok_or(Error::NotConnected)?;
-    if rights.iter().any(|(right, _)| *right == peer) {
-        return Err(Error::Invalid);
-    }
-    let peer_state = unsafe { socket_slots().get_mut(usize::from(peer)) }
-        .filter(|state| state.occupied && state.kind == Kind::Unix)
-        .ok_or(Error::NotConnected)?;
-    if peer_state.pending_right_count != 0 {
-        return Err(Error::WouldBlock);
-    }
-    let next_inflight = unsafe { *unix_inflight_rights_state() }
-        .checked_add(rights.len())
-        .ok_or(Error::Exhausted)?;
-    for (index, (right, flags)) in rights.iter().copied().enumerate() {
-        peer_state.pending_right_slots[index] = right;
-        peer_state.pending_right_flags[index] = flags;
-    }
-    peer_state.pending_right_count = rights.len() as u8;
-    unsafe { *unix_inflight_rights_state() = next_inflight };
-    Ok(())
+pub(crate) fn queue_unix_rights(sender: SlotId, rights: &[(SlotId, u32)]) -> Result<(), Error> {
+    SOCKETS.lock().queue_unix_rights(sender, rights)
 }
 
 pub(crate) fn unix_inflight_rights() -> usize {
-    unsafe { *unix_inflight_rights_state() }
+    SOCKETS.lock().unix_inflight_rights
 }
 
-pub(crate) fn unix_right_queue_available(sender: u8, rights: &[u8]) -> Result<(), Error> {
-    if rights.is_empty() || rights.len() > PASSED_RIGHT_LIMIT {
-        return Err(Error::Invalid);
-    }
-    let sender_state = unsafe { socket_slots().get(usize::from(sender)).copied() }
-        .filter(|state| state.occupied && state.kind == Kind::Unix)
-        .ok_or(Error::Invalid)?;
-    let peer = sender_state.peer.ok_or(Error::NotConnected)?;
-    if rights.contains(&peer) {
-        return Err(Error::Invalid);
-    }
-    let peer_state = unsafe { socket_slots().get(usize::from(peer)) }
-        .filter(|state| state.occupied && state.kind == Kind::Unix)
-        .ok_or(Error::NotConnected)?;
-    if peer_state.pending_right_count != 0 || peer_state.local_length != 0 {
-        return Err(Error::WouldBlock);
-    }
-    Ok(())
+pub(crate) fn unix_right_queue_available(sender: SlotId, rights: &[SlotId]) -> Result<(), Error> {
+    SOCKETS.lock().unix_right_queue_available(sender, rights)
 }
 
-pub(crate) fn unix_credentials_queue_available(sender: u8) -> Result<(), Error> {
-    let sender_state = unsafe { socket_slots().get(usize::from(sender)).copied() }
-        .filter(|state| state.occupied && state.kind == Kind::Unix)
-        .ok_or(Error::Invalid)?;
-    let peer = sender_state.peer.ok_or(Error::NotConnected)?;
-    let peer_state = unsafe { socket_slots().get(usize::from(peer)) }
-        .filter(|state| state.occupied && state.kind == Kind::Unix)
-        .ok_or(Error::NotConnected)?;
-    if usize::from(peer_state.pending_credential_count) == peer_state.pending_credentials.len() {
-        return Err(Error::WouldBlock);
-    }
-    Ok(())
+pub(crate) fn unix_credentials_queue_available(sender: SlotId) -> Result<(), Error> {
+    SOCKETS.lock().unix_credentials_queue_available(sender)
 }
 
 pub(crate) fn receive_unix_rights(
-    receiver: u8,
-    output: &mut [(u8, u32)],
+    receiver: SlotId,
+    output: &mut [(SlotId, u32)],
     peek_only: bool,
 ) -> Result<usize, Error> {
-    let state = unsafe { socket_slots().get_mut(usize::from(receiver)) }
-        .filter(|state| state.occupied && state.kind == Kind::Unix)
-        .ok_or(Error::Invalid)?;
-    let count = usize::from(state.pending_right_count);
-    if output.len() < count {
-        return Err(Error::Invalid);
-    }
-    if peek_only {
-        for (duplicated, right) in state
-            .pending_right_slots
-            .into_iter()
-            .take(count)
-            .enumerate()
-        {
-            if !duplicate(right) {
-                for rollback in state.pending_right_slots.into_iter().take(duplicated) {
-                    let _ = close(rollback);
-                }
-                return Err(Error::Exhausted);
-            }
-        }
-    } else {
-        if count > unsafe { *unix_inflight_rights_state() } {
-            return Err(Error::Invalid);
-        }
-        state.pending_right_count = 0;
-        unsafe { *unix_inflight_rights_state() -= count };
-    }
-    for (index, entry) in output.iter_mut().enumerate().take(count) {
-        *entry = (
-            state.pending_right_slots[index],
-            state.pending_right_flags[index],
-        );
-    }
-    Ok(count)
+    SOCKETS
+        .lock()
+        .receive_unix_rights(receiver, output, peek_only)
 }
 
-pub(crate) fn unix_right_count(receiver: u8) -> usize {
-    unsafe { socket_slots().get(usize::from(receiver)) }
-        .filter(|state| state.occupied && state.kind == Kind::Unix)
-        .map_or(0, |state| usize::from(state.pending_right_count))
+pub(crate) fn unix_right_count(receiver: SlotId) -> usize {
+    SOCKETS
+        .lock()
+        .unix(receiver)
+        .map_or(0, |state| state.rights.len())
 }
 
-pub(crate) fn unix_peer_passes_credentials(sender: u8) -> Result<bool, Error> {
-    let sender_state = unsafe { socket_slots().get(usize::from(sender)).copied() }
-        .filter(|state| state.occupied && state.kind == Kind::Unix)
-        .ok_or(Error::Invalid)?;
-    let peer = sender_state.peer.ok_or(Error::NotConnected)?;
-    let peer_state = unsafe { socket_slots().get(usize::from(peer)) }
-        .filter(|state| state.occupied && state.kind == Kind::Unix)
-        .ok_or(Error::NotConnected)?;
-    Ok(peer_state.pass_credentials)
+pub(crate) fn unix_peer_passes_credentials(sender: SlotId) -> Result<bool, Error> {
+    let sockets = SOCKETS.lock();
+    let peer = sockets.unix_peer(sender)?;
+    sockets
+        .unix(peer)
+        .map(|state| state.options.pass_credentials)
+        .ok_or(Error::NotConnected)
 }
 
 pub(crate) fn queue_unix_credentials(
-    sender: u8,
+    sender: SlotId,
     credentials: (u32, u32, u32),
 ) -> Result<(), Error> {
-    let sender_state = unsafe { socket_slots().get(usize::from(sender)).copied() }
-        .filter(|state| state.occupied && state.kind == Kind::Unix)
-        .ok_or(Error::Invalid)?;
-    let peer = sender_state.peer.ok_or(Error::NotConnected)?;
-    let peer_state = unsafe { socket_slots().get_mut(usize::from(peer)) }
-        .filter(|state| state.occupied && state.kind == Kind::Unix)
-        .ok_or(Error::NotConnected)?;
-    let count = usize::from(peer_state.pending_credential_count);
-    if count == peer_state.pending_credentials.len() {
-        return Err(Error::WouldBlock);
-    }
-    peer_state.pending_credentials[count] = credentials;
-    peer_state.pending_credential_count += 1;
-    Ok(())
+    SOCKETS.lock().queue_unix_credentials(sender, credentials)
 }
 
 pub(crate) fn receive_unix_credentials(
-    receiver: u8,
+    receiver: SlotId,
     peek_only: bool,
 ) -> Result<Option<(u32, u32, u32)>, Error> {
-    let state = unsafe { socket_slots().get_mut(usize::from(receiver)) }
-        .filter(|state| state.occupied && state.kind == Kind::Unix)
-        .ok_or(Error::Invalid)?;
-    let count = usize::from(state.pending_credential_count);
-    let credentials = (count != 0).then_some(state.pending_credentials[0]);
-    if !peek_only && count != 0 {
-        state.pending_credentials.copy_within(1..count, 0);
-        state.pending_credentials[count - 1] = (0, 0, 0);
-        state.pending_credential_count -= 1;
-    }
-    Ok(credentials)
+    SOCKETS.lock().receive_unix_credentials(receiver, peek_only)
 }
 
-pub(crate) fn unix_credentials_pending(receiver: u8) -> bool {
-    unsafe { socket_slots().get(usize::from(receiver)) }.is_some_and(|state| {
-        state.occupied && state.kind == Kind::Unix && state.pending_credential_count != 0
-    })
+pub(crate) fn unix_credentials_pending(receiver: SlotId) -> bool {
+    SOCKETS
+        .lock()
+        .unix(receiver)
+        .is_some_and(|state| !state.credentials.is_empty())
 }
 
-pub(crate) fn discard_unix_ancillary(receiver: u8) -> Result<bool, Error> {
-    let state = unsafe { socket_slots().get_mut(usize::from(receiver)) }
-        .filter(|state| state.occupied && state.kind == Kind::Unix)
-        .ok_or(Error::Invalid)?;
-    state.pending_credential_count = 0;
-    state.pending_credentials.fill((0, 0, 0));
-    let count = usize::from(state.pending_right_count);
-    if count > unsafe { *unix_inflight_rights_state() } {
-        return Err(Error::Invalid);
-    }
-    state.pending_right_count = 0;
-    unsafe { *unix_inflight_rights_state() -= count };
-    let rights = state.pending_right_slots;
-    let mut closed = count != 0;
-    for right in rights.into_iter().take(count) {
-        closed &= close(right);
-    }
-    Ok(closed)
+pub(crate) fn discard_unix_ancillary(receiver: SlotId) -> Result<bool, Error> {
+    SOCKETS.lock().discard_unix_ancillary(receiver, true)
 }
 
-pub(crate) fn discard_unix_peer_ancillary(sender: u8) -> Result<bool, Error> {
-    let sender_state = unsafe { socket_slots().get(usize::from(sender)).copied() }
-        .filter(|state| state.occupied && state.kind == Kind::Unix)
-        .ok_or(Error::Invalid)?;
-    discard_unix_ancillary(sender_state.peer.ok_or(Error::NotConnected)?)
+pub(crate) fn discard_unix_peer_ancillary(sender: SlotId) -> Result<bool, Error> {
+    let mut sockets = SOCKETS.lock();
+    let peer = sockets.unix_peer(sender)?;
+    sockets.discard_unix_ancillary(peer, true)
 }
 
-pub(crate) fn discard_unix_rights(receiver: u8) -> Result<bool, Error> {
-    let state = unsafe { socket_slots().get_mut(usize::from(receiver)) }
-        .filter(|state| state.occupied && state.kind == Kind::Unix)
-        .ok_or(Error::Invalid)?;
-    let count = usize::from(state.pending_right_count);
-    if count > unsafe { *unix_inflight_rights_state() } {
-        return Err(Error::Invalid);
-    }
-    state.pending_right_count = 0;
-    unsafe { *unix_inflight_rights_state() -= count };
-    let rights = state.pending_right_slots;
-    let mut closed = count != 0;
-    for right in rights.into_iter().take(count) {
-        closed &= close(right);
-    }
-    Ok(closed)
-}
-
-pub(crate) fn endpoint(address: u32, port: u16) -> IpEndpoint {
-    IpEndpoint::new(
-        IpAddress::Ipv4(Ipv4Address::from_octets(address.to_be_bytes())),
-        port,
-    )
-}
-
-fn poll() {
-    if !network::link_is_up() {
-        return;
-    }
-    let Some(runtime) = runtime_existing() else {
-        return;
-    };
-    // Frames sent to the interface's own addresses are received on the next
-    // pass, so a loopback exchange completes within one poll.
-    for _ in 0..LOOPBACK_FRAME_COUNT {
-        runtime.tick = runtime.tick.wrapping_add(1);
-        let _ = runtime.interface.poll(
-            Instant::from_millis(runtime.tick),
-            &mut runtime.device,
-            &mut runtime.sockets,
-        );
-        if unsafe { loopback_frames() }.count == 0 {
-            break;
-        }
-    }
-    drain_shutdown_tcp_receivers(runtime);
-}
-
-fn drain_shutdown_tcp_receivers(runtime: &mut Runtime) {
-    for state in unsafe { socket_slots().iter() }.filter(|state| {
-        state.occupied
-            && state.kind == Kind::Tcp
-            && !state.listening
-            && state.peer.is_none()
-            && state.read_shutdown
-    }) {
-        let Some(handle) = state.handle else {
-            continue;
-        };
-        let socket = runtime.sockets.get_mut::<tcp::Socket>(handle);
-        while socket.can_recv() {
-            if socket.recv(|bytes| (bytes.len(), ())).is_err() {
-                break;
-            }
-        }
-    }
-}
-
-fn runtime() -> Result<&'static mut Runtime, Error> {
-    if let Some(runtime) = runtime_existing() {
-        return Ok(runtime);
-    }
-    let platform = unsafe { socket_platform() }.ok_or(Error::Unavailable)?;
-    let configuration = network::ipv4_configuration();
-    let ipv4 = configuration as u32;
-    let prefix = (configuration >> 32) as u8;
-    let gateway = network::ipv4_gateway() as u32;
-    if ipv4 == 0 || prefix > 32 || gateway == 0 {
-        return Err(Error::Unavailable);
-    }
-    let receive = platform
-        .notification
-        .address(platform.initialization.receive_notification, 2)
-        .ok_or(Error::Unavailable)?;
-    let transmit = platform
-        .notification
-        .address(platform.initialization.transmit_notification, 2)
-        .ok_or(Error::Unavailable)?;
-    let [dma] =
-        memory::allocate_frames::<1>(memory::FrameOwner::KERNEL).ok_or(Error::Unavailable)?;
-    let Some(dma_virtual) = dma.direct_map_address() else {
-        let _ = memory::scrub_and_release_frames(memory::FrameOwner::KERNEL, &[dma]);
-        return Err(Error::Unavailable);
-    };
-    let Some(translation) = platform.iommu.activate(dma) else {
-        let _ = memory::scrub_and_release_frames(memory::FrameOwner::KERNEL, &[dma]);
-        return Err(Error::Unavailable);
-    };
-    if !translation.is_active()
-        || !(unsafe {
-            pci::activate_kernel_network_queues(
-                platform.device,
-                platform.common,
-                dma.address(),
-                dma_virtual,
-            )
-        })
-    {
-        let _ = translation.finish();
-        let _ = memory::scrub_and_release_frames(memory::FrameOwner::KERNEL, &[dma]);
-        return Err(Error::Unavailable);
-    }
-    let mut device = unsafe { VirtioNet::new(dma_virtual, dma.address(), receive, transmit, ipv4) };
-    let mut config = InterfaceConfig::new(EthernetAddress(platform.initialization.mac).into());
-    config.random_seed = u64::from(ipv4) << 32 | u64::from(gateway);
-    let mut interface = Interface::new(config, &mut device, Instant::from_millis(0));
-    interface.update_ip_addrs(|addresses| {
-        let _ = addresses.push(IpCidr::new(
-            IpAddress::Ipv4(Ipv4Address::from_octets(ipv4.to_be_bytes())),
-            prefix,
-        ));
-        let _ = addresses.push(IpCidr::new(
-            IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)),
-            8,
-        ));
-    });
-    if interface
-        .routes_mut()
-        .add_default_ipv4_route(Ipv4Address::from_octets(gateway.to_be_bytes()))
-        .is_err()
-    {
-        let _ = pci::quiesce_isolated_network(platform.device, platform.common);
-        let _ = translation.finish();
-        let _ = memory::scrub_and_release_frames(memory::FrameOwner::KERNEL, &[dma]);
-        return Err(Error::Unavailable);
-    }
-    let sockets = SocketSet::new(unsafe {
-        core::slice::from_raw_parts_mut(socket_storage().as_mut_ptr(), SLOT_COUNT)
-    });
-    unsafe {
-        *socket_runtime_state() = Some(Runtime {
-            interface,
-            device,
-            sockets,
-            _dma: dma,
-            _translation: translation,
-            tick: 0,
-            next_port: 49_152,
-            local_address: ipv4,
-        });
-    }
-    runtime_existing().ok_or(Error::Unavailable)
-}
-
-fn runtime_existing() -> Option<&'static mut Runtime> {
-    unsafe { socket_runtime_state().as_mut() }
-}
-
-struct VirtioNet {
-    dma: usize,
-    dma_device: u64,
-    rx_notify: usize,
-    tx_notify: usize,
-    local_address: u32,
-    rx_avail: u16,
-    rx_used: u16,
-    tx_avail: u16,
-    tx_used: u16,
-}
-
-impl VirtioNet {
-    unsafe fn new(
-        dma: usize,
-        dma_device: u64,
-        rx_notify: usize,
-        tx_notify: usize,
-        local_address: u32,
-    ) -> Self {
-        let mut device = Self {
-            dma,
-            dma_device,
-            rx_notify,
-            tx_notify,
-            local_address,
-            rx_avail: 0,
-            rx_used: 0,
-            tx_avail: 0,
-            tx_used: 0,
-        };
-        device.post_receive();
-        device
-    }
-
-    unsafe fn post_receive(&mut self) {
-        write_u64(
-            self.dma + RX_DESC_OFFSET,
-            self.dma_device + RX_BUFFER_OFFSET as u64,
-        );
-        write_u32(self.dma + RX_DESC_OFFSET + 8, RX_DESCRIPTOR_LENGTH as u32);
-        write_u16(self.dma + RX_DESC_OFFSET + 12, 2);
-        write_u16(self.dma + RX_DESC_OFFSET + 14, 0);
-        write_u16(
-            self.dma + RX_AVAIL_OFFSET + 4 + usize::from(self.rx_avail % QUEUE_SIZE) * 2,
-            0,
-        );
-        self.rx_avail = self.rx_avail.wrapping_add(1);
-        compiler_fence(Ordering::SeqCst);
-        write_u16(self.dma + RX_AVAIL_OFFSET + 2, self.rx_avail);
-        write_u16(self.rx_notify, 0);
-    }
-}
-
-enum NetworkRxToken {
-    Virtio(*mut VirtioNet, usize),
-    Loopback,
-}
-struct VirtioTxToken(*mut VirtioNet);
-
-impl RxToken for NetworkRxToken {
-    fn consume<R, F>(self, callback: F) -> R
-    where
-        F: FnOnce(&[u8]) -> R,
-    {
-        let Self::Virtio(device, length) = self else {
-            let frames = unsafe { loopback_frames() };
-            let result = callback(frames.front());
-            frames.pop();
-            return result;
-        };
-        unsafe {
-            let device = &mut *device;
-            let bytes = core::slice::from_raw_parts(
-                (device.dma + RX_BUFFER_OFFSET + VIRTIO_HEADER_LENGTH) as *const u8,
-                length,
-            );
-            let result = callback(bytes);
-            device.rx_used = device.rx_used.wrapping_add(1);
-            device.post_receive();
-            result
-        }
-    }
-
-    fn meta(&self) -> PacketMeta {
-        PacketMeta::default()
-    }
-}
-
-impl TxToken for VirtioTxToken {
-    fn consume<R, F>(self, length: usize, callback: F) -> R
-    where
-        F: FnOnce(&mut [u8]) -> R,
-    {
-        unsafe {
-            let device = &mut *self.0;
-            core::slice::from_raw_parts_mut(
-                (device.dma + TX_BUFFER_OFFSET) as *mut u8,
-                VIRTIO_HEADER_LENGTH,
-            )
-            .fill(0);
-            let bytes = core::slice::from_raw_parts_mut(
-                (device.dma + TX_BUFFER_OFFSET + VIRTIO_HEADER_LENGTH) as *mut u8,
-                length,
-            );
-            let result = callback(bytes);
-            if frame_loops_back(bytes, device.local_address) {
-                loopback_frames().push(bytes);
-                return result;
-            }
-            write_u64(
-                device.dma + TX_DESC_OFFSET,
-                device.dma_device + TX_BUFFER_OFFSET as u64,
-            );
-            write_u32(
-                device.dma + TX_DESC_OFFSET + 8,
-                (length + VIRTIO_HEADER_LENGTH) as u32,
-            );
-            write_u16(device.dma + TX_DESC_OFFSET + 12, 0);
-            write_u16(device.dma + TX_DESC_OFFSET + 14, 0);
-            write_u16(
-                device.dma + TX_AVAIL_OFFSET + 4 + usize::from(device.tx_avail % QUEUE_SIZE) * 2,
-                0,
-            );
-            device.tx_avail = device.tx_avail.wrapping_add(1);
-            compiler_fence(Ordering::SeqCst);
-            write_u16(device.dma + TX_AVAIL_OFFSET + 2, device.tx_avail);
-            write_u16(device.tx_notify, 1);
-            result
-        }
-    }
-}
-
-impl Device for VirtioNet {
-    type RxToken<'a>
-        = NetworkRxToken
-    where
-        Self: 'a;
-    type TxToken<'a>
-        = VirtioTxToken
-    where
-        Self: 'a;
-
-    fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        if unsafe { loopback_frames() }.count != 0 {
-            return Some((NetworkRxToken::Loopback, VirtioTxToken(self as *mut Self)));
-        }
-        let used = unsafe { read_u16(self.dma + RX_USED_OFFSET + 2) };
-        if used == self.rx_used {
-            return None;
-        }
-        let element = self.dma + RX_USED_OFFSET + 4 + usize::from(self.rx_used % QUEUE_SIZE) * 8;
-        let length = unsafe { read_u32(element + 4) as usize }.checked_sub(VIRTIO_HEADER_LENGTH)?;
-        let pointer = self as *mut Self;
-        Some((
-            NetworkRxToken::Virtio(pointer, length),
-            VirtioTxToken(pointer),
-        ))
-    }
-
-    fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        let used = unsafe { read_u16(self.dma + TX_USED_OFFSET + 2) };
-        if used != self.tx_used {
-            self.tx_used = used;
-        }
-        (self.tx_used == self.tx_avail).then_some(VirtioTxToken(self as *mut Self))
-    }
-
-    fn capabilities(&self) -> DeviceCapabilities {
-        let mut capabilities = DeviceCapabilities::default();
-        capabilities.medium = Medium::Ethernet;
-        capabilities.max_transmission_unit = 1514;
-        capabilities
-    }
-}
-
-unsafe fn write_u16(address: usize, value: u16) {
-    write_volatile(address as *mut u16, value);
-}
-
-unsafe fn write_u32(address: usize, value: u32) {
-    write_volatile(address as *mut u32, value);
-}
-
-unsafe fn write_u64(address: usize, value: u64) {
-    write_volatile(address as *mut u64, value);
-}
-
-unsafe fn read_u16(address: usize) -> u16 {
-    read_volatile(address as *const u16)
-}
-
-unsafe fn read_u32(address: usize) -> u32 {
-    read_volatile(address as *const u32)
+pub(crate) fn discard_unix_rights(receiver: SlotId) -> Result<bool, Error> {
+    SOCKETS.lock().discard_unix_ancillary(receiver, false)
 }

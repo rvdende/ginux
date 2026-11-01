@@ -322,7 +322,7 @@ struct X86RuntimeOwner {
     ELF_PROBE_SIGNAL_MASK: RuntimeRef<BankedAtomicU64>,
     ELF_PROBE_SIGNAL_RESTORERS: RuntimeRef<[BankedAtomicU64; LINUX_SIGNAL_COUNT]>,
     ELF_PROBE_SOCKET_FLAGS: RuntimeRef<[BankedAtomicU32; LINUX_DEVICE_DESCRIPTOR_COUNT]>,
-    ELF_PROBE_SOCKET_SLOTS: RuntimeRef<[BankedAtomicU8; LINUX_DEVICE_DESCRIPTOR_COUNT]>,
+    ELF_PROBE_SOCKET_SLOTS: RuntimeRef<[BankedAtomicU16; LINUX_DEVICE_DESCRIPTOR_COUNT]>,
     ELF_PROBE_STACK: RuntimeRef<BankedAtomicU64>,
     ELF_PROBE_STACK_FRAME: RuntimeRef<BankedAtomicU64>,
     ELF_PROBE_STACK_GENERATION: RuntimeRef<BankedAtomicU32>,
@@ -333,7 +333,7 @@ struct X86RuntimeOwner {
     ELF_PROBE_STDIO_OPEN_FILE_IDS: RuntimeRef<[BankedAtomicU64; 3]>,
     ELF_PROBE_STDIO_ROOTFS_DESCRIPTORS: RuntimeRef<[BankedAtomicU16; 3]>,
     ELF_PROBE_STDIO_SOCKET_FLAGS: RuntimeRef<[BankedAtomicU32; 3]>,
-    ELF_PROBE_STDIO_SOCKET_SLOTS: RuntimeRef<[BankedAtomicU8; 3]>,
+    ELF_PROBE_STDIO_SOCKET_SLOTS: RuntimeRef<[BankedAtomicU16; 3]>,
     ELF_PROBE_STDIO_TMP_FILE_GENERATIONS: RuntimeRef<[BankedAtomicU32; 3]>,
     ELF_PROBE_SYSTEM_INIT: RuntimeRef<AtomicBool>,
     ELF_PROBE_TERMINATION_SIGNAL: RuntimeRef<BankedAtomicU32>,
@@ -1990,13 +1990,14 @@ static X86_RUNTIME_BACKING_ELF_PROBE_DEVICE_DESCRIPTORS: [BankedAtomicU16;
 static X86_RUNTIME_BACKING_ELF_PROBE_ROOTFS_DESCRIPTORS: [BankedAtomicU16;
     LINUX_DEVICE_DESCRIPTOR_COUNT] =
     [const { BankedAtomicU16::new(0) }; LINUX_DEVICE_DESCRIPTOR_COUNT];
-static X86_RUNTIME_BACKING_ELF_PROBE_SOCKET_SLOTS: [BankedAtomicU8; LINUX_DEVICE_DESCRIPTOR_COUNT] =
-    [const { BankedAtomicU8::new(0) }; LINUX_DEVICE_DESCRIPTOR_COUNT];
+static X86_RUNTIME_BACKING_ELF_PROBE_SOCKET_SLOTS: [BankedAtomicU16;
+    LINUX_DEVICE_DESCRIPTOR_COUNT] =
+    [const { BankedAtomicU16::new(0) }; LINUX_DEVICE_DESCRIPTOR_COUNT];
 static X86_RUNTIME_BACKING_ELF_PROBE_SOCKET_FLAGS: [BankedAtomicU32;
     LINUX_DEVICE_DESCRIPTOR_COUNT] =
     [const { BankedAtomicU32::new(0) }; LINUX_DEVICE_DESCRIPTOR_COUNT];
-static X86_RUNTIME_BACKING_ELF_PROBE_STDIO_SOCKET_SLOTS: [BankedAtomicU8; 3] =
-    [const { BankedAtomicU8::new(0) }; 3];
+static X86_RUNTIME_BACKING_ELF_PROBE_STDIO_SOCKET_SLOTS: [BankedAtomicU16; 3] =
+    [const { BankedAtomicU16::new(0) }; 3];
 static X86_RUNTIME_BACKING_ELF_PROBE_STDIO_SOCKET_FLAGS: [BankedAtomicU32; 3] =
     [const { BankedAtomicU32::new(0) }; 3];
 static X86_RUNTIME_BACKING_ELF_PROBE_TMP_FILE_GENERATIONS: [BankedAtomicU32;
@@ -3256,7 +3257,7 @@ pub(crate) fn execute_linux_process_child(
 }
 
 pub(crate) fn execute_cross_cpu_runtime_operation(operation: u64) -> bool {
-    let slot = (operation >> 8) as u8;
+    let slot = (operation >> 8) as crate::linux_socket::SlotId;
     match operation & 0xff {
         CROSS_CPU_RUNTIME_SIGNAL => crate::linux_signal::enqueue(
             linux_process::current_ipc_instance(),
@@ -14361,9 +14362,9 @@ struct LinuxDescriptorRuntimeState {
     close_on_exec: [u64; LINUX_DESCRIPTOR_FLAG_WORD_COUNT],
     devices: [u16; LINUX_DEVICE_DESCRIPTOR_COUNT],
     rootfs: [u16; LINUX_DEVICE_DESCRIPTOR_COUNT],
-    sockets: [u8; LINUX_DEVICE_DESCRIPTOR_COUNT],
+    sockets: [crate::linux_socket::SlotId; LINUX_DEVICE_DESCRIPTOR_COUNT],
     socket_flags: [u32; LINUX_DEVICE_DESCRIPTOR_COUNT],
-    stdio_sockets: [u8; 3],
+    stdio_sockets: [crate::linux_socket::SlotId; 3],
     stdio_socket_flags: [u32; 3],
     tmp_generations: [u32; LINUX_DEVICE_DESCRIPTOR_COUNT],
     offsets: [u64; LINUX_DEVICE_DESCRIPTOR_COUNT],
@@ -20005,7 +20006,7 @@ fn verify_linux_unix_inflight_rights() -> bool {
         LINUX_RLIMIT_NOFILE,
         original_limit,
     ) == 0;
-    let mut received = [(0_u8, 0_u32); crate::linux_socket::PASSED_RIGHT_LIMIT];
+    let mut received = [(0, 0_u32); crate::linux_socket::PASSED_RIGHT_LIMIT];
     let first_received = first_queued
         && crate::linux_socket::receive_unix_rights(receiver, &mut received, false) == Ok(1)
         && received[0].0 == sender
@@ -28975,7 +28976,7 @@ fn linux_statx_set_mount(stat: &mut [u8; 256], filesystem: LinuxFilesystemKind) 
     stat[144..152].copy_from_slice(&mount_id.to_ne_bytes());
 }
 
-fn linux_socket_slot(descriptor: u64) -> Option<u8> {
+fn linux_socket_slot(descriptor: u64) -> Option<crate::linux_socket::SlotId> {
     let descriptor = u64::from(descriptor as u32);
     if let Some(slot) = usize::try_from(descriptor)
         .ok()
@@ -29599,7 +29600,7 @@ fn linux_socket_sendmsg(descriptor: u64, message: u64, flags: u64) -> u64 {
             Err(error) => return error,
         }
     };
-    let mut passed_rights = [(0_u8, 0_u32); crate::linux_socket::PASSED_RIGHT_LIMIT];
+    let mut passed_rights = [(0, 0_u32); crate::linux_socket::PASSED_RIGHT_LIMIT];
     let mut passed_files = [None; crate::linux_socket::PASSED_RIGHT_LIMIT];
     let mut passed_right_count = 0_usize;
     let mut passed_credentials = None;
@@ -29638,7 +29639,7 @@ fn linux_socket_sendmsg(descriptor: u64, message: u64, flags: u64) -> u64 {
                     return LINUX_EINVAL;
                 }
                 passed_right_count = payload_length as usize / 4;
-                let mut right_slots = [0_u8; crate::linux_socket::PASSED_RIGHT_LIMIT];
+                let mut right_slots = [0; crate::linux_socket::PASSED_RIGHT_LIMIT];
                 for index in 0..passed_right_count {
                     let start = 16 + index * 4;
                     let descriptor =
@@ -29657,7 +29658,7 @@ fn linux_socket_sendmsg(descriptor: u64, message: u64, flags: u64) -> u64 {
                             return LINUX_EBADF;
                         };
                         passed_files[index] = Some(file);
-                        right_slots[index] = u8::MAX;
+                        right_slots[index] = crate::linux_socket::SlotId::MAX;
                     }
                 }
                 if let Err(error) = crate::linux_socket::unix_right_queue_available(
@@ -29782,7 +29783,11 @@ fn linux_socket_sendmsg(descriptor: u64, message: u64, flags: u64) -> u64 {
     }
 }
 
-fn linux_install_received_socket(slot: u8, flags: u32, close_on_exec: bool) -> Option<u64> {
+fn linux_install_received_socket(
+    slot: crate::linux_socket::SlotId,
+    flags: u32,
+    close_on_exec: bool,
+) -> Option<u64> {
     let descriptor = (LINUX_AUX_DESCRIPTOR_FIRST..linux_nofile_soft_limit())
         .find(|descriptor| linux_aux_descriptor_free(*descriptor))?;
     let index = (descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
@@ -29995,7 +30000,7 @@ fn linux_socket_recvmsg(
                 let _ = crate::linux_socket::discard_unix_rights(slot);
             }
         } else {
-            let mut rights = [(0_u8, 0_u32); crate::linux_socket::PASSED_RIGHT_LIMIT];
+            let mut rights = [(0, 0_u32); crate::linux_socket::PASSED_RIGHT_LIMIT];
             let received_rights =
                 match crate::linux_socket::receive_unix_rights(slot, &mut rights, peek_only) {
                     Ok(count) if count == right_count => count,
@@ -30164,8 +30169,9 @@ fn linux_socket_send_live_return(
         linux_broken_pipe_live_return(output, caller)
     } else if result < u64::MAX - 4095
         && X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
-        && crate::linux_socket::kind(linux_socket_slot(descriptor).unwrap_or(u8::MAX))
-            == Some(crate::linux_socket::Kind::Unix)
+        && crate::linux_socket::kind(
+            linux_socket_slot(descriptor).unwrap_or(crate::linux_socket::SlotId::MAX),
+        ) == Some(crate::linux_socket::Kind::Unix)
         && X86_RUNTIME
             .LINUX_PROCESS_SCHEDULER_NESTING
             .load(Ordering::SeqCst)
@@ -30311,7 +30317,7 @@ fn linux_socket_name(descriptor: u64, address: u64, length: u64, peer: bool) -> 
             };
             name
         } else {
-            crate::linux_socket::unix_name(slot).unwrap_or(b"")
+            crate::linux_socket::unix_name(slot).unwrap_or_default()
         };
         let mut supplied = [0_u8; 4];
         if !copy_from_linux_user(length, &mut supplied) {
@@ -30319,7 +30325,7 @@ fn linux_socket_name(descriptor: u64, address: u64, length: u64, peer: bool) -> 
         }
         let mut sockaddr = [0_u8; 110];
         sockaddr[..2].copy_from_slice(&1_u16.to_ne_bytes());
-        sockaddr[2..2 + name.len()].copy_from_slice(name);
+        sockaddr[2..2 + name.len()].copy_from_slice(&name);
         let actual = 2 + name.len() + usize::from(name.first().is_some_and(|byte| *byte != 0));
         let output_length = (u32::from_ne_bytes(supplied) as usize).min(actual);
         return if copy_to_linux_user(address, &sockaddr[..output_length])
@@ -35321,7 +35327,7 @@ fn linux_pidfd_getfd(pid_descriptor: u64, target: u64, flags: u64) -> u64 {
 fn linux_saved_descriptor(
     state: &LinuxDescriptorRuntimeState,
     descriptor: u64,
-) -> Option<(u16, u16, u8, u32, u32, u64, u64)> {
+) -> Option<(u16, u16, crate::linux_socket::SlotId, u32, u32, u64, u64)> {
     if descriptor >= LINUX_DESCRIPTOR_TABLE_LIMIT {
         return None;
     }

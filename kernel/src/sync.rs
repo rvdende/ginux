@@ -16,6 +16,9 @@ impl LockRank {
     pub(crate) const PRIMITIVE_TEST_LOW: Self = Self(1);
     pub(crate) const PRIMITIVE_TEST_HIGH: Self = Self(2);
     pub(crate) const ARCHITECTURE: Self = Self(10);
+    /// The socket table with smoltcp and the network device under it; ranks
+    /// below the heap so the table and socket buffers may grow while held.
+    pub(crate) const SOCKETS: Self = Self(14);
     pub(crate) const CROSS_CPU_DISPATCH: Self = Self(15);
     /// The record (fcntl) lock table; ranks below the heap so the table may
     /// grow while held.

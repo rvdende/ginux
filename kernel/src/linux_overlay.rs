@@ -135,8 +135,10 @@ struct Node {
     kind: NodeKind,
     path_length: u16,
     mode: u32,
-    seals: u32,
-    fifo_socket: u8,
+    /// A memfd's seals (F_SEAL_*, which all fit a byte).
+    seals: u8,
+    /// The pipe socket behind a FIFO, plus one; 0 before one opens it.
+    fifo_socket: u16,
     handle: Handle,
     size: usize,
     first_page: FrameLease,
@@ -533,11 +535,12 @@ fn make_node_paged(node: &mut Node) -> bool {
 
 pub(crate) fn file_seals(handle: Handle) -> Option<u32> {
     let node = node(handle)?;
-    (node.data == Data::Memfd).then_some(node.seals)
+    (node.data == Data::Memfd).then_some(u32::from(node.seals))
 }
 
 pub(crate) fn add_file_seals(handle: Handle, seals: u32) -> Option<bool> {
     let node = node_mut(handle)?;
+    let seals = u8::try_from(seals).ok()?;
     if node.data != Data::Memfd {
         return None;
     }
@@ -621,12 +624,12 @@ pub(crate) fn create_fifo(path: &[u8], mode: u32) -> Option<Handle> {
     create(path, NodeKind::Fifo, mode, &[])
 }
 
-pub(crate) fn fifo_socket(handle: Handle) -> Option<u8> {
+pub(crate) fn fifo_socket(handle: Handle) -> Option<crate::linux_socket::SlotId> {
     let node = node(handle)?;
     (node.kind == NodeKind::Fifo && node.fifo_socket != 0).then_some(node.fifo_socket - 1)
 }
 
-pub(crate) fn set_fifo_socket(handle: Handle, slot: u8) -> bool {
+pub(crate) fn set_fifo_socket(handle: Handle, slot: crate::linux_socket::SlotId) -> bool {
     let Some(node) = node_mut(handle).filter(|node| node.kind == NodeKind::Fifo) else {
         return false;
     };
