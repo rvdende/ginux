@@ -13184,10 +13184,11 @@ fn run_other_linux_processes(
         .LINUX_PROCESS_LAST_BLOCKED_PID
         .swap(0, Ordering::SeqCst);
     let preferred = descendant.filter(|child| *child != last_blocked);
-    // A killed process sleeping in a wait goes first: dispatching it ends
-    // it, as SIGKILL wakes a sleeping task in Linux, where it would
-    // otherwise keep its memory and process slot until its turn came.
-    let killed = linux_killed_sleeping_process(pid);
+    // A killed process goes first: dispatching it ends it, as SIGKILL
+    // wakes a task in Linux, where it would otherwise keep its memory and
+    // process slot until its turn came. One the run queue cannot dispatch
+    // (it is not ready) is passed over.
+    let killed = linux_killed_process(pid);
     if !refresh_live_linux_process_registry(caller)
         || !(killed.is_some_and(|killed| run_scheduled_linux_process(pid, Some(killed)))
             || preferred.is_some_and(|child| run_scheduled_linux_process(pid, Some(child)))
@@ -13219,16 +13220,16 @@ fn run_other_linux_processes(
     })
 }
 
-/// A process other than `current` that sleeps in a wait with SIGKILL
-/// pending.
-fn linux_killed_sleeping_process(current: u32) -> Option<u32> {
+/// A process other than `current`, running or sleeping in a wait, with
+/// SIGKILL pending.
+fn linux_killed_process(current: u32) -> Option<u32> {
     let kill = 1_u64 << (LINUX_SIGKILL - 1);
     let mut from = 1;
     while let Some(pid) = linux_process::next_live_pid(from) {
         from = pid.checked_add(1)?;
         if pid == current
             || !linux_process::live_process_status(pid)
-                .is_some_and(|status| status.state == linux_process::LiveProcessState::Sleeping)
+                .is_some_and(|status| status.state.is_running())
         {
             continue;
         }

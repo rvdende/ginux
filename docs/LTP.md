@@ -17,6 +17,8 @@ QEMU, and reports one machine-parseable line per test plus failure clusters.
 | `778dd3d0` | blocking semop/msgsnd/msgrcv, cross-process futexes, sleeping state, pipe capacity, SA_RESTART, CPU time, signals on the timer tick | 1362 | 420 | 240 | 504 | 141 | 43 | 0 | 14 |
 | `18f44c93` | POSIX record locks, epoll_wait waits outside init, MAP_SHARED file pages shared | 1362 | 388 | 256 | 441 | 170 | 92 | 0 | 15 |
 | `7c6e1149` | `/proc/PID/maps`, clock_gettime into any writable page | 1362 | 471 | 261 | 431 | 173 | 10 | 0 | 16 |
+| `68bb7d48` | compat batch (`/dev/null`, pipe sizes, stream writes, status fields, connect errors) | 1362 | 492 | 264 | 405 | 174 | 10 | 1 | 16 |
+| `bdeb9c12` | growing socket table, FUTEX_REQUEUE, nanosleep restarts, /proc lists every process, shared anonymous memory, killed sleepers run first, right-sized process lists | 1362 | 503 | 265 | 380 | 181 | 10 | 0 | 23 |
 
 \* Counted with the exit status alone, which overstated passes (below).
 The later rows are rescored from each run's saved console logs with LTP's
@@ -36,6 +38,14 @@ with fd 0 refused, about 60 "Test haven't reported results" or "bad magic"
 from the lost page) were counted as passes. The driver now classifies by the printed results when
 the exit status claims success, and shared mappings of a file now map the
 file's own pages.
+
+The `bdeb9c12` run no longer runs out of memory near its end (futex
+and fork-heavy tests used to leave processes and ~380 MB behind, so every
+exec after futex_cmp_requeue01 failed). Its extra hangs are tests that now
+get further (futex_wait02/03, futex_wake03), and wait401 and waitpid10,
+which pass alone but hung after killed processes outlived their tests;
+killed processes now run first and die, and pause() sleeps properly
+(after the run: signal01 passes, kill11 fails instead of breaking).
 
 A crash takes the whole domain down, so the run reboots for the next test:
 the `de94acb9` run needed 23 boots against 68 before, the `76719aee` run 6,
