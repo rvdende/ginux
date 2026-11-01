@@ -22,6 +22,7 @@ QEMU, and reports one machine-parseable line per test plus failure clusters.
 | `e35668d6` | /proc/PID directories and names, PageEntry, pause() sleeping, killed processes run first, restart deadlines in a pruned list | 1362 | 507 | 272 | 376 | 181 | 10 | 0 | 16 |
 | `62aaf7da` | credentials and file owners (`user-switching=true` for the LTP domain), permission checks, hard links, overlay symlinks in path walks, Linux path errors, unshare of user/mount namespaces | 1362 | 627 | 263 | 228 | 214 | 13 | 0 | 17 |
 | `250c427b` | domain mounts (read-only, nodev, umount2), device files, PATH_MAX paths and namei-style symlink walks, renameat2 exchange; every process parks in its blocking calls (`chdir04` fixed after this run) | 1362 | 644 | 257 | 212 | 222 | 14 | 0 | 13 |
+| `22941a5a` | the FUTEX_WAKE fast path wakes other processes' waits (most "tst_checkpoint_wait failed" breaks), SIGKILL ends a parked process | 1362 | 659 | 261 | 193 | 222 | 13 | 0 | 14 |
 
 \* Counted with the exit status alone, which overstated passes (below).
 The later rows are rescored from each run's saved console logs with LTP's
