@@ -204,6 +204,9 @@ struct Slot {
     local_last: memory::FrameLease,
     local_head: usize,
     local_length: usize,
+    /// Bytes the local queue holds for a writer that must not block (a
+    /// pipe's F_SETPIPE_SZ), or 0 for LOCAL_QUEUE_CAPACITY.
+    local_capacity: u32,
 }
 
 impl Slot {
@@ -241,6 +244,7 @@ impl Slot {
         local_last: memory::FrameLease::EMPTY,
         local_head: 0,
         local_length: 0,
+        local_capacity: 0,
     };
 }
 
@@ -385,6 +389,13 @@ fn append_local_data(
     input: &[u8],
     capacity: Option<usize>,
 ) -> Result<usize, Error> {
+    let capacity = capacity.map(|capacity| {
+        if state.local_capacity == 0 {
+            capacity
+        } else {
+            state.local_capacity as usize
+        }
+    });
     let room = capacity.map_or(input.len(), |capacity| {
         capacity.saturating_sub(state.local_length)
     });
@@ -567,6 +578,7 @@ pub(crate) fn open(kind: Kind) -> Result<u8, Error> {
             local_last: memory::FrameLease::EMPTY,
             local_head: 0,
             local_length: 0,
+            local_capacity: 0,
         };
     }
     Ok(slot as u8)
@@ -713,6 +725,7 @@ pub(crate) fn connect_unix(slot: u8, path: &[u8]) -> Result<(), Error> {
             local_last: memory::FrameLease::EMPTY,
             local_head: 0,
             local_length: 0,
+            local_capacity: 0,
         };
         socket_slots()[index].peer = Some(accepted as u8);
         unix_socket_types()[accepted] = unix_socket_types()[peer];
@@ -786,6 +799,7 @@ pub(crate) fn open_pair(socket_type: u8) -> Result<(u8, u8), Error> {
             local_last: memory::FrameLease::EMPTY,
             local_head: 0,
             local_length: 0,
+            local_capacity: 0,
         };
         socket_slots()[second] = Slot {
             occupied: true,
@@ -821,6 +835,7 @@ pub(crate) fn open_pair(socket_type: u8) -> Result<(u8, u8), Error> {
             local_last: memory::FrameLease::EMPTY,
             local_head: 0,
             local_length: 0,
+            local_capacity: 0,
         };
         unix_socket_types()[first] = socket_type;
         unix_socket_types()[second] = socket_type;
@@ -1291,6 +1306,7 @@ pub(crate) fn accept(slot: u8) -> Result<(u8, IpEndpoint), Error> {
                 local_last: memory::FrameLease::EMPTY,
                 local_head: 0,
                 local_length: 0,
+                local_capacity: 0,
             };
             socket_slots()[client_index].peer = Some(accepted_index as u8);
             if listener.kind == Kind::Unix {
@@ -1368,6 +1384,7 @@ pub(crate) fn accept(slot: u8) -> Result<(u8, IpEndpoint), Error> {
             local_last: memory::FrameLease::EMPTY,
             local_head: 0,
             local_length: 0,
+            local_capacity: 0,
         };
         socket_slots()[listener_index].handle = Some(replacement);
         socket_slots()[listener_index].remote = None;
@@ -1723,6 +1740,61 @@ pub(crate) fn peek_local(slot: u8, output: &mut [u8]) -> Result<usize, Error> {
     } else {
         Ok(0)
     }
+}
+
+/// A pipe's capacity (F_GETPIPE_SZ).
+pub(crate) fn local_capacity(slot: u8) -> Result<usize, Error> {
+    unsafe { socket_slots().get(usize::from(slot)) }
+        .filter(|slot| slot.occupied && slot.kind == Kind::Unix)
+        .map(|slot| {
+            if slot.local_capacity == 0 {
+                LOCAL_QUEUE_CAPACITY
+            } else {
+                slot.local_capacity as usize
+            }
+        })
+        .ok_or(Error::Invalid)
+}
+
+/// Sets a pipe's capacity (F_SETPIPE_SZ) on both its ends: `requested`
+/// rounded up to a power of two of at least a page. `Exhausted` when more
+/// is queued than the new capacity holds.
+pub(crate) fn set_local_capacity(slot: u8, requested: usize) -> Result<usize, Error> {
+    let capacity = requested
+        .max(PAGE_SIZE)
+        .checked_next_power_of_two()
+        .filter(|capacity| *capacity <= u32::MAX as usize)
+        .ok_or(Error::Invalid)?;
+    let index = usize::from(slot);
+    let state = unsafe { socket_slots().get(index).copied() }
+        .filter(|slot| slot.occupied && slot.kind == Kind::Unix)
+        .ok_or(Error::Invalid)?;
+    let ends = [Some(index), state.peer.map(usize::from)];
+    if ends
+        .iter()
+        .flatten()
+        .any(|end| unsafe { socket_slots()[*end].local_length } > capacity)
+    {
+        return Err(Error::Exhausted);
+    }
+    for end in ends.into_iter().flatten() {
+        unsafe { socket_slots()[end].local_capacity = capacity as u32 };
+    }
+    Ok(capacity)
+}
+
+/// The bytes in a pipe, read from either end (its data waits in the read
+/// end's queue).
+pub(crate) fn pipe_queued_bytes(slot: u8) -> Result<usize, Error> {
+    let state = unsafe { socket_slots().get(usize::from(slot)).copied() }
+        .filter(|slot| slot.occupied && slot.kind == Kind::Unix)
+        .ok_or(Error::Invalid)?;
+    let peer = state
+        .peer
+        .and_then(|peer| unsafe { socket_slots().get(usize::from(peer)).copied() })
+        .filter(|peer| peer.occupied)
+        .map_or(0, |peer| peer.local_length);
+    Ok(state.local_length + peer)
 }
 
 pub(crate) fn local_queued_bytes(slot: u8) -> Result<usize, Error> {

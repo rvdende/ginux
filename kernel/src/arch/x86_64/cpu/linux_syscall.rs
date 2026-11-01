@@ -555,7 +555,7 @@ pub(super) extern "sysv64" fn linux_syscall_handler(
                     let Some(slot) = linux_socket_slot(first_argument) else {
                         return LINUX_EBADF;
                     };
-                    match crate::linux_socket::local_queued_bytes(slot) {
+                    match crate::linux_socket::pipe_queued_bytes(slot) {
                         Ok(available) => available.min(i32::MAX as usize) as u32,
                         Err(error) => return linux_socket_error(error),
                     }

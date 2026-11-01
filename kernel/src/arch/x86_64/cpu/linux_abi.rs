@@ -443,6 +443,11 @@ pub(super) const LINUX_EAGAIN: u64 = u64::MAX - 10;
 pub(super) const LINUX_EPIPE: u64 = u64::MAX - 31;
 pub(super) const LINUX_EACCES: u64 = u64::MAX - 12;
 pub(super) const LINUX_EBUSY: u64 = u64::MAX - 15;
+pub(super) const LINUX_ECONNREFUSED: u64 = u64::MAX - 110;
+pub(super) const LINUX_F_SETPIPE_SZ: u64 = 1031;
+pub(super) const LINUX_F_GETPIPE_SZ: u64 = 1032;
+/// /proc/sys/fs/pipe-max-size: the largest pipe an unprivileged process may ask for.
+pub(super) const LINUX_PIPE_MAX_SIZE: u64 = 1_048_576;
 pub(super) const LINUX_EEXIST: u64 = u64::MAX - 16;
 pub(super) const LINUX_ENODEV: u64 = u64::MAX - 18;
 pub(super) const LINUX_ENOTDIR: u64 = u64::MAX - 19;
@@ -671,12 +676,13 @@ pub(super) const LINUX_FILE_PROC_MOUNTS: u16 = LINUX_FILE_MASK | LINUX_PROC_MOUN
 /// file exists but cannot be written, and runs it when the file is absent.
 /// `/proc/sys/fs/aio-max-nr`: the most events one io_setup context may hold.
 pub(super) const LINUX_AIO_MAX_NR: u64 = 65_536;
-pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 5] = [
+pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 6] = [
     (0xd700, b"sys/kernel/pid_max", b"4194304\n"),
     (0xd600, b"sys/kernel/tainted", b"0\n"),
     (0xd500, b"sys/user/max_user_namespaces", b"3\n"),
     (0xd400, b"sys/fs/pipe-max-size", b"1048576\n"),
     (0xd200, b"sys/fs/aio-max-nr", b"65536\n"),
+    (0xd000, b"sys/fs/pipe-user-pages-soft", b"16384\n"),
 ];
 pub(super) const LINUX_PROC_CPUINFO_NODE: u16 = 0xf800;
 pub(super) const LINUX_FILE_PROC_CPUINFO: u16 = LINUX_FILE_MASK | LINUX_PROC_CPUINFO_NODE;

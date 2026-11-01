@@ -21097,6 +21097,7 @@ fn linux_runtime_mmap(
     fd: u64,
     offset: u64,
 ) -> u64 {
+    let protection = linux_implied_protection(protection);
     if length == 0
         || ![
             0,
@@ -22194,7 +22195,19 @@ fn linux_cachestat(descriptor: u64, range_address: u64, output_address: u64, fla
     }
 }
 
+/// x86 pages that can be written or executed can be read: Linux accepts
+/// PROT_WRITE or PROT_EXEC alone and maps them readable too. Ginux keeps no
+/// page both writable and executable.
+fn linux_implied_protection(protection: u64) -> u64 {
+    if protection & (LINUX_PROT_WRITE | LINUX_PROT_EXEC) != 0 {
+        protection | LINUX_PROT_READ
+    } else {
+        protection
+    }
+}
+
 fn linux_runtime_mprotect(address: u64, length: u64, protection: u64) -> u64 {
+    let protection = linux_implied_protection(protection);
     if ![
         0,
         LINUX_PROT_READ,
@@ -26886,20 +26899,22 @@ fn linux_openat(directory: u64, path_address: u64, flags: u64, mode: u64) -> u64
             Some(crate::published_rootfs::EntryKind::Symlink) => return LINUX_EINVAL,
         }
     } else {
-        match linux_relative_path_kind(directory, path) {
-            Ok(Some(kind)) => kind,
-            Ok(None) => match path {
-                b"/dev/null" => 0,
-                b"/dev/zero" => LINUX_DEVICE_ZERO,
-                b"/dev/console" | b"/dev/tty" => LINUX_DEVICE_CONSOLE,
-                path => match linux_root_directory_kind(path)
+        // The kernel's devices come before the image: its /dev is only a
+        // directory, and /dev/null would open as that.
+        match path {
+            b"/dev/null" => 0,
+            b"/dev/zero" => LINUX_DEVICE_ZERO,
+            b"/dev/console" | b"/dev/tty" => LINUX_DEVICE_CONSOLE,
+            path => match linux_relative_path_kind(directory, path) {
+                Ok(Some(kind)) => kind,
+                Ok(None) => match linux_root_directory_kind(path)
                     .or_else(|| linux_runtime_file_kind(path))
                 {
                     Some(kind) => kind,
                     None => return LINUX_ENOENT,
                 },
+                Err(error) => return error,
             },
-            Err(error) => return error,
         }
     };
     if kind & LINUX_DEVICE_DIRECTORY != 0 && access != 0 {
@@ -29305,8 +29320,15 @@ fn linux_socket_connect(descriptor: u64, address: u64, length: u64) -> u64 {
             Ok(length) => length,
             Err(error) => return error,
         };
-        return crate::linux_socket::connect_unix(slot, &path[..path_length])
-            .map_or_else(linux_socket_error, |()| 0);
+        // No socket bound to the name: Linux fails a path that does not
+        // exist with ENOENT and an abstract name with ECONNREFUSED (musl's
+        // nscd lookup treats both as "no daemon").
+        return match crate::linux_socket::connect_unix(slot, &path[..path_length]) {
+            Ok(()) => 0,
+            Err(crate::linux_socket::Error::NotConnected) if path[0] == 0 => LINUX_ECONNREFUSED,
+            Err(crate::linux_socket::Error::NotConnected) => LINUX_ENOENT,
+            Err(error) => linux_socket_error(error),
+        };
     }
     let endpoint = match linux_socket_address(address, length) {
         Ok(endpoint) => endpoint,
@@ -29345,9 +29367,23 @@ fn linux_socket_sendto(
             Err(error) => return error,
         }
     };
-    let length = usize::try_from(count).unwrap_or(usize::MAX).min(PAGE_SIZE);
-    let mut bytes = [0_u8; PAGE_SIZE];
-    if !copy_from_linux_user(address, &mut bytes[..length]) {
+    // A stream (a pipe, a socketpair, TCP) takes as much of the write as it
+    // has room for in one call; a UDP datagram stays within a page.
+    let limit = if crate::linux_socket::kind(slot) == Some(crate::linux_socket::Kind::Udp) {
+        PAGE_SIZE
+    } else {
+        1 << 20
+    };
+    let length = usize::try_from(count).unwrap_or(usize::MAX).min(limit);
+    if length == 0 && limit != PAGE_SIZE {
+        return 0;
+    }
+    let mut bytes = Vec::new();
+    if bytes.try_reserve_exact(length).is_err() {
+        return LINUX_ENOMEM;
+    }
+    bytes.resize(length, 0);
+    if !copy_from_linux_user(address, &mut bytes) {
         return LINUX_EFAULT;
     }
     let automatic_credentials = if crate::linux_socket::kind(slot)
@@ -30753,11 +30789,15 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
                             linux_process::LiveProcessState::Zombie => b" (zombie)\n",
                         },
                     )
-                    && append_linux_bytes(&mut file, &mut used, b"Pid:\t")
+                    && append_linux_bytes(&mut file, &mut used, b"Tgid:\t")
+                    && append_linux_decimal(&mut file, &mut used, u64::from(status.pid))
+                    && append_linux_bytes(&mut file, &mut used, b"\nPid:\t")
                     && append_linux_decimal(&mut file, &mut used, u64::from(status.pid))
                     && append_linux_bytes(&mut file, &mut used, b"\nPPid:\t")
                     && append_linux_decimal(&mut file, &mut used, u64::from(status.parent_pid))
                     && append_linux_bytes(&mut file, &mut used, b"\n")
+                    && append_linux_credentials_status(&mut file, &mut used)
+                    && append_linux_bytes(&mut file, &mut used, b"VmLck:\t0 kB\nVmSwap:\t0 kB\n")
             }
             LINUX_FILE_PROC_DYNAMIC_STAT => {
                 append_linux_decimal(&mut file, &mut used, u64::from(status.pid))
@@ -30875,6 +30915,49 @@ fn write_linux_decimal(mut value: u64, output: &mut [u8]) -> usize {
         output[index] = reversed[digits - index - 1];
     }
     digits
+}
+
+/// The Uid and Gid lines of /proc/PID/status: real, effective, saved and
+/// filesystem ids (a domain has one identity, shared by its processes).
+fn append_linux_credentials_status(output: &mut [u8], used: &mut usize) -> bool {
+    let credentials = current_linux_credentials().unwrap_or(linux_user::Credentials {
+        uid: 0,
+        gid: 0,
+        euid: 0,
+        egid: 0,
+        suid: 0,
+        sgid: 0,
+        supplementary_gid: 0,
+    });
+    [
+        (
+            b"Uid:" as &[u8],
+            [
+                credentials.uid,
+                credentials.euid,
+                credentials.suid,
+                credentials.euid,
+            ],
+        ),
+        (
+            b"Gid:",
+            [
+                credentials.gid,
+                credentials.egid,
+                credentials.sgid,
+                credentials.egid,
+            ],
+        ),
+    ]
+    .into_iter()
+    .all(|(label, ids)| {
+        append_linux_bytes(output, used, label)
+            && ids.into_iter().all(|id| {
+                append_linux_bytes(output, used, b"\t")
+                    && append_linux_decimal(output, used, u64::from(id))
+            })
+            && append_linux_bytes(output, used, b"\n")
+    })
 }
 
 fn append_linux_bytes(output: &mut [u8], used: &mut usize, bytes: &[u8]) -> bool {
@@ -37834,6 +37917,26 @@ fn linux_descriptor_fcntl(descriptor: u64, command: u64, argument: u64) -> u64 {
             }
             LINUX_F_GETFL => pipe_access | u64::from(flags.load(Ordering::SeqCst)),
             LINUX_F_SETFL => linux_descriptor_set_nonblocking(flags, argument),
+            LINUX_F_GETPIPE_SZ if state & LINUX_DEVICE_PIPE != 0 => linux_socket_slot(descriptor)
+                .map_or(LINUX_EBADF, |slot| {
+                    crate::linux_socket::local_capacity(slot)
+                        .map_or_else(linux_socket_error, |capacity| capacity as u64)
+                }),
+            LINUX_F_SETPIPE_SZ if state & LINUX_DEVICE_PIPE != 0 => {
+                let requested = u64::from(argument as u32);
+                if requested > LINUX_PIPE_MAX_SIZE
+                    && !current_linux_credentials().is_some_and(|value| value.euid == 0)
+                {
+                    return LINUX_EPERM;
+                }
+                linux_socket_slot(descriptor).map_or(LINUX_EBADF, |slot| {
+                    match crate::linux_socket::set_local_capacity(slot, requested as usize) {
+                        Ok(capacity) => capacity as u64,
+                        Err(crate::linux_socket::Error::Exhausted) => LINUX_EBUSY,
+                        Err(error) => linux_socket_error(error),
+                    }
+                })
+            }
             _ => LINUX_EINVAL,
         };
     }
