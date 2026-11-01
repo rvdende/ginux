@@ -13209,17 +13209,22 @@ fn run_other_linux_processes(
     })
 }
 
-/// A process other than `current`, running or sleeping in a wait, with
-/// SIGKILL pending.
+/// A process other than `current` with SIGKILL pending that can be
+/// dispatched: sleeping in a wait, or running as an orphan init adopted. A
+/// running process with a live parent may be one a fork transaction runs
+/// nested on the kernel stack (a child forked child-first), which must not
+/// be entered again from here.
 fn linux_killed_process(current: u32) -> Option<u32> {
     let kill = 1_u64 << (LINUX_SIGKILL - 1);
     let mut from = 1;
     while let Some(pid) = linux_process::next_live_pid(from) {
         from = pid.checked_add(1)?;
-        if pid == current
-            || !linux_process::live_process_status(pid)
-                .is_some_and(|status| status.state.is_running())
-        {
+        let dispatchable = linux_process::live_process_status(pid).is_some_and(|status| {
+            status.state == linux_process::LiveProcessState::Sleeping
+                || status.state == linux_process::LiveProcessState::Running
+                    && status.parent_pid == 1
+        });
+        if pid == current || !dispatchable {
             continue;
         }
         let pending = linux_process::live_process_slot(pid).and_then(|slot| {
@@ -36191,27 +36196,34 @@ fn linux_socket_iov_ranges(
         return Err(LINUX_EFAULT);
     }
     let mut ranges = [(0_u64, 0_usize); LINUX_IOV_LIMIT];
-    let mut total = 0_usize;
-    for (index, vector) in table[..vector_count * 16]
-        .as_chunks::<16>()
-        .0
-        .iter()
-        .enumerate()
+    for (range, vector) in ranges
+        .iter_mut()
+        .zip(table[..vector_count * 16].as_chunks::<16>().0)
     {
-        let address = u64::from_ne_bytes(vector[..8].try_into().unwrap());
-        let length = usize::try_from(u64::from_ne_bytes(vector[8..].try_into().unwrap()))
-            .map_err(|_| LINUX_EINVAL)?;
-        total = total.checked_add(length).ok_or(LINUX_EINVAL)?;
-        if length != 0
-            && !(if writable {
-                linux_writable_user_range_contains(address, length)
+        *range = (
+            u64::from_ne_bytes(vector[..8].try_into().unwrap()),
+            usize::from_ne_bytes(vector[8..].try_into().unwrap()),
+        );
+    }
+    // As Linux, every length is checked (each and their sum must fit an
+    // ssize_t) before any buffer is.
+    let total = ranges[..vector_count]
+        .iter()
+        .try_fold(0_usize, |total, (_, length)| total.checked_add(*length))
+        .filter(|total| *total <= isize::MAX as usize);
+    if total.is_none() {
+        return Err(LINUX_EINVAL);
+    }
+    let accessible = |(address, length): &(u64, usize)| {
+        *length == 0
+            || if writable {
+                linux_writable_user_range_contains(*address, *length)
             } else {
-                linux_readable_user_range_contains(address, length)
-            })
-        {
-            return Err(LINUX_EFAULT);
-        }
-        ranges[index] = (address, length);
+                linux_readable_user_range_contains(*address, *length)
+            }
+    };
+    if !ranges[..vector_count].iter().all(accessible) {
+        return Err(LINUX_EFAULT);
     }
     Ok((ranges, vector_count))
 }

@@ -866,18 +866,6 @@ pub(super) fn linux_poll_wait_live_return(
         {
             return LINUX_RETURN_TO_KERNEL;
         }
-        // pause() waits like any blocking call: other processes run, it
-        // shows as sleeping, and it ends only when a signal is delivered
-        // (EINTR after its handler) or kills the process.
-        if wait_kind == LINUX_THREAD_WAIT_PAUSE {
-            match run_other_linux_processes(output, caller, LINUX_PAUSE_SYSCALL) {
-                Some(LinuxBlockedWait::Return(result)) => return result,
-                Some(LinuxBlockedWait::Recheck) => {
-                    return linux_restart_syscall_live_return(output, caller, LINUX_PAUSE_SYSCALL)
-                }
-                None => {}
-            }
-        }
         if matches!(
             wait_kind,
             LINUX_THREAD_WAIT_PAUSE | LINUX_THREAD_WAIT_SIGSUSPEND

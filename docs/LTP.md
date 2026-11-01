@@ -19,6 +19,7 @@ QEMU, and reports one machine-parseable line per test plus failure clusters.
 | `7c6e1149` | `/proc/PID/maps`, clock_gettime into any writable page | 1362 | 471 | 261 | 431 | 173 | 10 | 0 | 16 |
 | `68bb7d48` | compat batch (`/dev/null`, pipe sizes, stream writes, status fields, connect errors) | 1362 | 492 | 264 | 405 | 174 | 10 | 1 | 16 |
 | `bdeb9c12` | growing socket table, FUTEX_REQUEUE, nanosleep restarts, /proc lists every process, shared anonymous memory, killed sleepers run first, right-sized process lists | 1362 | 503 | 265 | 380 | 181 | 10 | 0 | 23 |
+| `e35668d6` | /proc/PID directories and names, PageEntry, pause() sleeping, killed processes run first, restart deadlines in a pruned list | 1362 | 507 | 272 | 376 | 181 | 10 | 0 | 16 |
 
 \* Counted with the exit status alone, which overstated passes (below).
 The later rows are rescored from each run's saved console logs with LTP's
@@ -46,6 +47,15 @@ get further (futex_wait02/03, futex_wake03), and wait401 and waitpid10,
 which pass alone but hung after killed processes outlived their tests;
 killed processes now run first and die, and pause() sleeps properly
 (after the run: signal01 passes, kill11 fails instead of breaking).
+
+In the `e35668d6` run rename14 wedged the guest: with pause() sleeping
+properly, its parent pauses for SIGALRM while two children rename in busy
+loops, and nothing else got the CPU (not even LTP's own timeout). pause()
+went back to returning EINTR after one yield (signal01 hangs again), and
+init's killed-first pick is limited to sleeping processes and orphans init
+adopted, since a running process with a live parent may be one a fork
+transaction runs nested on the kernel stack. Both wait for the scheduler
+loop.
 
 A crash takes the whole domain down, so the run reboots for the next test:
 the `de94acb9` run needed 23 boots against 68 before, the `76719aee` run 6,
