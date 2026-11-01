@@ -120,9 +120,11 @@ memory buffer, which the compositor draws straight from the client's pool.
 ### Measured (2026-11-01)
 
 cadrs (Bevy, wgpu) in an Ubuntu 26.04 domain with one CPU, 1280x800, its
-`camera_frame_walk` scenario, on the host's Radeon RX 6800 XT through Venus:
-median frame 23 ms windowed under ginux-wm (p90 33 ms), 18 ms headless.
-Software rendering (lavapipe) on the same domain was 295 ms. Multi-CPU
+`camera_frame_walk` scenario, on the host's Radeon RX 6800 XT through Venus,
+under ginux-wm: after the first 100 frames (startup: a 5 s first frame and a
+9 s scene load) mean 17.4 ms (57 fps), median 17 ms, p90 19 ms, worst 50 ms.
+Before cheaper process switches (docs/SCHEDULER.md) the median was 23 ms
+(p90 33 ms). Software rendering (lavapipe) on the same domain was 295 ms. Multi-CPU
 domains (`cpu=N`) are not yet usable with a compositor: a process whose
 threads run on other CPUs cannot be switched out (docs/SCHEDULER.md).
 

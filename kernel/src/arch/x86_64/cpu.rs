@@ -224,12 +224,16 @@ struct X86RuntimeOwner {
     ELF_PROBE_DEPENDENCY_PROTECTIONS: RuntimeRef<[BankedAtomicU8; LINUX_DEPENDENCY_STATE_COUNT]>,
     ELF_PROBE_DEPENDENCY_RELATIVES: RuntimeRef<[BankedAtomicU64; LINUX_DEPENDENCY_STATE_COUNT]>,
     ELF_PROBE_DEPENDENCY_SELECTED_BASE: RuntimeRef<[BankedAtomicU64; LINUX_DEPENDENCY_COUNT]>,
-    ELF_PROBE_DESCRIPTOR_OFFSETS: RuntimeRef<[BankedAtomicU64; LINUX_DEVICE_DESCRIPTOR_COUNT]>,
-    ELF_PROBE_DEVICE_DESCRIPTORS: RuntimeRef<[BankedAtomicU16; LINUX_DEVICE_DESCRIPTOR_COUNT]>,
+    ELF_PROBE_DESCRIPTOR_OFFSETS:
+        RuntimeRef<BankedAtomicArray<AtomicU64, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
+    ELF_PROBE_DEVICE_DESCRIPTORS:
+        RuntimeRef<BankedAtomicArray<AtomicU16, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
     ELF_PROBE_DUMPABLE: RuntimeRef<BankedAtomicBool>,
-    ELF_PROBE_EPOLL_DATA: RuntimeRef<[BankedAtomicU64; LINUX_DESCRIPTOR_TABLE_LIMIT as usize]>,
+    ELF_PROBE_EPOLL_DATA:
+        RuntimeRef<BankedAtomicArray<AtomicU64, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>>,
     ELF_PROBE_EPOLL_DESCRIPTOR: RuntimeRef<BankedAtomicU16>,
-    ELF_PROBE_EPOLL_EVENTS: RuntimeRef<[BankedAtomicU32; LINUX_DESCRIPTOR_TABLE_LIMIT as usize]>,
+    ELF_PROBE_EPOLL_EVENTS:
+        RuntimeRef<BankedAtomicArray<AtomicU32, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>>,
     ELF_PROBE_EVENTFD_COUNTER: RuntimeRef<BankedAtomicU64>,
     ELF_PROBE_EVENTFD_DESCRIPTOR: RuntimeRef<BankedAtomicU16>,
     ELF_PROBE_EVENTFD_FLAGS: RuntimeRef<BankedAtomicU32>,
@@ -267,7 +271,8 @@ struct X86RuntimeOwner {
     ELF_PROBE_MMAP_SEALED: RuntimeRef<[BankedAtomicBool; LINUX_RUNTIME_MMAP_SLOT_COUNT]>,
     ELF_PROBE_NICE: RuntimeRef<BankedAtomicU8>,
     ELF_PROBE_NO_NEW_PRIVS: RuntimeRef<BankedAtomicBool>,
-    ELF_PROBE_OPEN_FILE_IDS: RuntimeRef<[BankedAtomicU64; LINUX_DEVICE_DESCRIPTOR_COUNT]>,
+    ELF_PROBE_OPEN_FILE_IDS:
+        RuntimeRef<BankedAtomicArray<AtomicU64, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
     ELF_PROBE_OVERLAY_CWD: RuntimeRef<BankedAtomicU32>,
     ELF_PROBE_PAGE_TABLE_FRAMES: RuntimeRef<[BankedAtomicU64; 6]>,
     ELF_PROBE_PAGE_TABLE_GENERATIONS: RuntimeRef<[BankedAtomicU32; 6]>,
@@ -310,7 +315,8 @@ struct X86RuntimeOwner {
         RuntimeRef<[BankedAtomicU32; LINUX_ACTIVE_IMAGE_MAPPING_LIMIT]>,
     ELF_PROBE_RLIMITS: RuntimeRef<[BankedAtomicU64; LINUX_RLIMIT_WORDS]>,
     ELF_PROBE_ROOTFS_CWD: RuntimeRef<BankedAtomicU16>,
-    ELF_PROBE_ROOTFS_DESCRIPTORS: RuntimeRef<[BankedAtomicU16; LINUX_DEVICE_DESCRIPTOR_COUNT]>,
+    ELF_PROBE_ROOTFS_DESCRIPTORS:
+        RuntimeRef<BankedAtomicArray<AtomicU16, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
     ELF_PROBE_SECCOMP_STRICT: RuntimeRef<BankedAtomicBool>,
     ELF_PROBE_SECUREBITS: RuntimeRef<BankedAtomicU32>,
     ELF_PROBE_SIBLING_FS_BASE: RuntimeRef<BankedAtomicU64>,
@@ -323,20 +329,20 @@ struct X86RuntimeOwner {
     ELF_PROBE_SIGNAL_HANDLERS: RuntimeRef<[BankedAtomicU64; LINUX_SIGNAL_COUNT]>,
     ELF_PROBE_SIGNAL_MASK: RuntimeRef<BankedAtomicU64>,
     ELF_PROBE_SIGNAL_RESTORERS: RuntimeRef<[BankedAtomicU64; LINUX_SIGNAL_COUNT]>,
-    ELF_PROBE_SOCKET_FLAGS: RuntimeRef<[BankedAtomicU32; LINUX_DEVICE_DESCRIPTOR_COUNT]>,
-    ELF_PROBE_SOCKET_SLOTS: RuntimeRef<[BankedAtomicU16; LINUX_DEVICE_DESCRIPTOR_COUNT]>,
+    ELF_PROBE_SOCKET_FLAGS: RuntimeRef<BankedAtomicArray<AtomicU32, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
+    ELF_PROBE_SOCKET_SLOTS: RuntimeRef<BankedAtomicArray<AtomicU16, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
     ELF_PROBE_STACK: RuntimeRef<BankedAtomicU64>,
     ELF_PROBE_STACK_FRAME: RuntimeRef<BankedAtomicU64>,
     ELF_PROBE_STACK_GENERATION: RuntimeRef<BankedAtomicU32>,
     ELF_PROBE_STACK_LOW: RuntimeRef<BankedAtomicU64>,
     ELF_PROBE_STDERR_OPEN: RuntimeRef<BankedAtomicBool>,
     ELF_PROBE_STDIO_DEVICE_DESCRIPTORS: RuntimeRef<[BankedAtomicU16; 3]>,
-    ELF_PROBE_STDIO_OFFSETS: RuntimeRef<[BankedAtomicU64; 3]>,
-    ELF_PROBE_STDIO_OPEN_FILE_IDS: RuntimeRef<[BankedAtomicU64; 3]>,
+    ELF_PROBE_STDIO_OFFSETS: RuntimeRef<BankedAtomicArray<AtomicU64, 3>>,
+    ELF_PROBE_STDIO_OPEN_FILE_IDS: RuntimeRef<BankedAtomicArray<AtomicU64, 3>>,
     ELF_PROBE_STDIO_ROOTFS_DESCRIPTORS: RuntimeRef<[BankedAtomicU16; 3]>,
-    ELF_PROBE_STDIO_SOCKET_FLAGS: RuntimeRef<[BankedAtomicU32; 3]>,
+    ELF_PROBE_STDIO_SOCKET_FLAGS: RuntimeRef<BankedAtomicArray<AtomicU32, 3>>,
     ELF_PROBE_STDIO_SOCKET_SLOTS: RuntimeRef<[BankedAtomicU16; 3]>,
-    ELF_PROBE_STDIO_TMP_FILE_GENERATIONS: RuntimeRef<[BankedAtomicU32; 3]>,
+    ELF_PROBE_STDIO_TMP_FILE_GENERATIONS: RuntimeRef<BankedAtomicArray<AtomicU32, 3>>,
     ELF_PROBE_SYSTEM_INIT: RuntimeRef<AtomicBool>,
     ELF_PROBE_TERMINATION_SIGNAL: RuntimeRef<BankedAtomicU32>,
     ELF_PROBE_TIMERFD_CLOCK: RuntimeRef<BankedAtomicU8>,
@@ -348,7 +354,8 @@ struct X86RuntimeOwner {
     ELF_PROBE_TLS_FRAMES: RuntimeRef<[BankedAtomicU64; 2]>,
     ELF_PROBE_TLS_GENERATIONS: RuntimeRef<[BankedAtomicU32; 2]>,
     ELF_PROBE_TLS_SIZE: RuntimeRef<BankedAtomicU64>,
-    ELF_PROBE_TMP_FILE_GENERATIONS: RuntimeRef<[BankedAtomicU32; LINUX_DEVICE_DESCRIPTOR_COUNT]>,
+    ELF_PROBE_TMP_FILE_GENERATIONS:
+        RuntimeRef<BankedAtomicArray<AtomicU32, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
     ELF_PROBE_UMASK: RuntimeRef<BankedAtomicU64>,
     LINUX_BOOT_ID: RuntimeRef<LinuxBootIdCell>,
     LINUX_BOOT_ID_STATE: RuntimeRef<AtomicU8>,
@@ -471,13 +478,16 @@ struct X86RuntimeOwner {
     LINUX_RUNTIME_BACKGROUND_YIELD_REQUESTED: RuntimeRef<BankedAtomicBool>,
     LINUX_RUNTIME_CONSOLE_TIMING_WRITTEN: RuntimeRef<BankedAtomicBool>,
     LINUX_RUNTIME_EINVAL_SYSCALLS: RuntimeRef<[BankedAtomicU64; LINUX_RUNTIME_UNSUPPORTED_WORDS]>,
-    LINUX_RUNTIME_EPOLL_ACTIVE: RuntimeRef<[BankedAtomicU8; LINUX_DEVICE_DESCRIPTOR_COUNT]>,
-    LINUX_RUNTIME_EPOLL_ALIASES: RuntimeRef<[BankedAtomicU16; LINUX_DEVICE_DESCRIPTOR_COUNT]>,
+    LINUX_RUNTIME_EPOLL_ACTIVE:
+        RuntimeRef<BankedAtomicArray<AtomicU8, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
+    LINUX_RUNTIME_EPOLL_ALIASES:
+        RuntimeRef<BankedAtomicArray<AtomicU16, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
     LINUX_RUNTIME_EPOLL_WATCH_EPOLL:
-        RuntimeRef<[BankedAtomicU16; LINUX_DESCRIPTOR_TABLE_LIMIT as usize]>,
+        RuntimeRef<BankedAtomicArray<AtomicU16, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>>,
     LINUX_RUNTIME_EPOLL_WATCH_TARGET:
-        RuntimeRef<[BankedAtomicU16; LINUX_DESCRIPTOR_TABLE_LIMIT as usize]>,
-    LINUX_RUNTIME_EVENTFD_ACTIVE: RuntimeRef<[BankedAtomicU8; LINUX_DEVICE_DESCRIPTOR_COUNT]>,
+        RuntimeRef<BankedAtomicArray<AtomicU16, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>>,
+    LINUX_RUNTIME_EVENTFD_ACTIVE:
+        RuntimeRef<BankedAtomicArray<AtomicU8, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
     LINUX_RUNTIME_EXIT_STATUS: RuntimeRef<BankedAtomicU64>,
     LINUX_RUNTIME_FIRST_UNSUPPORTED_SYSCALL: RuntimeRef<BankedAtomicU64>,
     LINUX_RUNTIME_LATE_DIAGNOSTIC_WRITTEN: RuntimeRef<BankedAtomicBool>,
@@ -500,7 +510,8 @@ struct X86RuntimeOwner {
         RuntimeRef<[BankedAtomicU64; LINUX_RUNTIME_SYSCALL_TRACE_LIMIT]>,
     LINUX_RUNTIME_SYSCALL_TRACE: RuntimeRef<[BankedAtomicU64; LINUX_RUNTIME_SYSCALL_TRACE_LIMIT]>,
     LINUX_RUNTIME_SYSCALL_TRACE_COUNT: RuntimeRef<BankedAtomicU64>,
-    LINUX_RUNTIME_TIMERFD_ACTIVE: RuntimeRef<[BankedAtomicU8; LINUX_DEVICE_DESCRIPTOR_COUNT]>,
+    LINUX_RUNTIME_TIMERFD_ACTIVE:
+        RuntimeRef<BankedAtomicArray<AtomicU8, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
     LINUX_RUNTIME_UNSUPPORTED_SYSCALLS:
         RuntimeRef<[BankedAtomicU64; LINUX_RUNTIME_UNSUPPORTED_WORDS]>,
     LINUX_SIGNAL_ACTIVE: RuntimeRef<BankedAtomicBool>,
@@ -1324,6 +1335,56 @@ impl BankedAtomicBool {
     }
 }
 
+/// A table banked per execution instance and laid out instance by instance,
+/// so the current instance's table is one contiguous array: a process switch
+/// copies it in one sequential pass. (An array of `BankedAtomicU16` and the
+/// like interleaves the instances element by element, and copying one table
+/// touched a cache line per element.) Every element starts at zero.
+struct BankedAtomicArray<A, const N: usize>([[A; N]; LINUX_RUNTIME_INSTANCE_LIMIT]);
+
+impl<A, const N: usize> core::ops::Deref for BankedAtomicArray<A, N> {
+    type Target = [A; N];
+    fn deref(&self) -> &[A; N] {
+        &self.0[linux_execution_instance()]
+    }
+}
+
+impl<'a, A, const N: usize> IntoIterator for &'a RuntimeRef<BankedAtomicArray<A, N>> {
+    type Item = &'a A;
+    type IntoIter = core::slice::Iter<'a, A>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+macro_rules! banked_array {
+    ($($atomic:ty => $value:ty),*) => {$(
+        #[allow(dead_code)]
+        impl<const N: usize> BankedAtomicArray<$atomic, N> {
+            const fn new() -> Self {
+                Self([const { [const { <$atomic>::new(0) }; N] }; LINUX_RUNTIME_INSTANCE_LIMIT])
+            }
+
+            /// The current instance's table, read in one pass with relaxed
+            /// loads (the caller orders the pass as a whole).
+            fn snapshot(&self) -> [$value; N] {
+                let table: &[$atomic; N] = self;
+                core::array::from_fn(|index| table[index].load(Ordering::Relaxed))
+            }
+
+            /// Overwrites the current instance's table with relaxed stores.
+            fn install(&self, values: &[$value; N]) {
+                let table: &[$atomic; N] = self;
+                for (cell, value) in table.iter().zip(values) {
+                    cell.store(*value, Ordering::Relaxed);
+                }
+            }
+        }
+    )*};
+}
+
+banked_array!(AtomicU8 => u8, AtomicU16 => u16, AtomicU32 => u32, AtomicU64 => u64);
+
 banked_atomic_integer!(BankedAtomicU8, AtomicU8, u8);
 banked_atomic_integer!(BankedAtomicU16, AtomicU16, u16);
 banked_atomic_integer!(BankedAtomicU32, AtomicU32, u32);
@@ -1969,25 +2030,30 @@ static X86_RUNTIME_BACKING_ELF_PROBE_STDERR_OPEN: BankedAtomicBool = BankedAtomi
 static X86_RUNTIME_BACKING_ELF_PROBE_CONSOLE_CLOEXEC: [BankedAtomicU64;
     LINUX_DESCRIPTOR_FLAG_WORD_COUNT] =
     [const { BankedAtomicU64::new(0) }; LINUX_DESCRIPTOR_FLAG_WORD_COUNT];
-static X86_RUNTIME_BACKING_ELF_PROBE_DEVICE_DESCRIPTORS: [BankedAtomicU16;
-    LINUX_DEVICE_DESCRIPTOR_COUNT] =
-    [const { BankedAtomicU16::new(0) }; LINUX_DEVICE_DESCRIPTOR_COUNT];
-static X86_RUNTIME_BACKING_ELF_PROBE_ROOTFS_DESCRIPTORS: [BankedAtomicU16;
-    LINUX_DEVICE_DESCRIPTOR_COUNT] =
-    [const { BankedAtomicU16::new(0) }; LINUX_DEVICE_DESCRIPTOR_COUNT];
-static X86_RUNTIME_BACKING_ELF_PROBE_SOCKET_SLOTS: [BankedAtomicU16;
-    LINUX_DEVICE_DESCRIPTOR_COUNT] =
-    [const { BankedAtomicU16::new(0) }; LINUX_DEVICE_DESCRIPTOR_COUNT];
-static X86_RUNTIME_BACKING_ELF_PROBE_SOCKET_FLAGS: [BankedAtomicU32;
-    LINUX_DEVICE_DESCRIPTOR_COUNT] =
-    [const { BankedAtomicU32::new(0) }; LINUX_DEVICE_DESCRIPTOR_COUNT];
+static X86_RUNTIME_BACKING_ELF_PROBE_DEVICE_DESCRIPTORS: BankedAtomicArray<
+    AtomicU16,
+    LINUX_DEVICE_DESCRIPTOR_COUNT,
+> = BankedAtomicArray::<AtomicU16, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
+static X86_RUNTIME_BACKING_ELF_PROBE_ROOTFS_DESCRIPTORS: BankedAtomicArray<
+    AtomicU16,
+    LINUX_DEVICE_DESCRIPTOR_COUNT,
+> = BankedAtomicArray::<AtomicU16, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
+static X86_RUNTIME_BACKING_ELF_PROBE_SOCKET_SLOTS: BankedAtomicArray<
+    AtomicU16,
+    LINUX_DEVICE_DESCRIPTOR_COUNT,
+> = BankedAtomicArray::<AtomicU16, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
+static X86_RUNTIME_BACKING_ELF_PROBE_SOCKET_FLAGS: BankedAtomicArray<
+    AtomicU32,
+    LINUX_DEVICE_DESCRIPTOR_COUNT,
+> = BankedAtomicArray::<AtomicU32, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
 static X86_RUNTIME_BACKING_ELF_PROBE_STDIO_SOCKET_SLOTS: [BankedAtomicU16; 3] =
     [const { BankedAtomicU16::new(0) }; 3];
-static X86_RUNTIME_BACKING_ELF_PROBE_STDIO_SOCKET_FLAGS: [BankedAtomicU32; 3] =
-    [const { BankedAtomicU32::new(0) }; 3];
-static X86_RUNTIME_BACKING_ELF_PROBE_TMP_FILE_GENERATIONS: [BankedAtomicU32;
-    LINUX_DEVICE_DESCRIPTOR_COUNT] =
-    [const { BankedAtomicU32::new(0) }; LINUX_DEVICE_DESCRIPTOR_COUNT];
+static X86_RUNTIME_BACKING_ELF_PROBE_STDIO_SOCKET_FLAGS: BankedAtomicArray<AtomicU32, 3> =
+    BankedAtomicArray::<AtomicU32, 3>::new();
+static X86_RUNTIME_BACKING_ELF_PROBE_TMP_FILE_GENERATIONS: BankedAtomicArray<
+    AtomicU32,
+    LINUX_DEVICE_DESCRIPTOR_COUNT,
+> = BankedAtomicArray::<AtomicU32, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
 static X86_RUNTIME_BACKING_LINUX_INOTIFY_WATCH_OWNERS: [AtomicU16; LINUX_INOTIFY_WATCH_SLOT_COUNT] =
     [const { AtomicU16::new(0) }; LINUX_INOTIFY_WATCH_SLOT_COUNT];
 static X86_RUNTIME_BACKING_LINUX_INOTIFY_WATCH_PATHS: [AtomicU64; LINUX_INOTIFY_WATCH_SLOT_COUNT] =
@@ -2016,15 +2082,16 @@ static X86_RUNTIME_BACKING_ELF_PROBE_STDIO_DEVICE_DESCRIPTORS: [BankedAtomicU16;
     [const { BankedAtomicU16::new(0) }; 3];
 static X86_RUNTIME_BACKING_ELF_PROBE_STDIO_ROOTFS_DESCRIPTORS: [BankedAtomicU16; 3] =
     [const { BankedAtomicU16::new(0) }; 3];
-static X86_RUNTIME_BACKING_ELF_PROBE_STDIO_TMP_FILE_GENERATIONS: [BankedAtomicU32; 3] =
-    [const { BankedAtomicU32::new(0) }; 3];
-static X86_RUNTIME_BACKING_ELF_PROBE_STDIO_OFFSETS: [BankedAtomicU64; 3] =
-    [const { BankedAtomicU64::new(0) }; 3];
-static X86_RUNTIME_BACKING_ELF_PROBE_STDIO_OPEN_FILE_IDS: [BankedAtomicU64; 3] =
-    [const { BankedAtomicU64::new(0) }; 3];
-static X86_RUNTIME_BACKING_ELF_PROBE_OPEN_FILE_IDS: [BankedAtomicU64;
-    LINUX_DEVICE_DESCRIPTOR_COUNT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_DEVICE_DESCRIPTOR_COUNT];
+static X86_RUNTIME_BACKING_ELF_PROBE_STDIO_TMP_FILE_GENERATIONS: BankedAtomicArray<AtomicU32, 3> =
+    BankedAtomicArray::<AtomicU32, 3>::new();
+static X86_RUNTIME_BACKING_ELF_PROBE_STDIO_OFFSETS: BankedAtomicArray<AtomicU64, 3> =
+    BankedAtomicArray::<AtomicU64, 3>::new();
+static X86_RUNTIME_BACKING_ELF_PROBE_STDIO_OPEN_FILE_IDS: BankedAtomicArray<AtomicU64, 3> =
+    BankedAtomicArray::<AtomicU64, 3>::new();
+static X86_RUNTIME_BACKING_ELF_PROBE_OPEN_FILE_IDS: BankedAtomicArray<
+    AtomicU64,
+    LINUX_DEVICE_DESCRIPTOR_COUNT,
+> = BankedAtomicArray::<AtomicU64, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
 static X86_RUNTIME_BACKING_LINUX_NEXT_OPEN_FILE_ID: BankedAtomicU64 = BankedAtomicU64::new(1);
 static X86_RUNTIME_BACKING_ELF_PROBE_CWD: BankedAtomicU16 =
     BankedAtomicU16::new(LINUX_ROOT_DIRECTORY);
@@ -2032,43 +2099,51 @@ static X86_RUNTIME_BACKING_ELF_PROBE_ROOTFS_CWD: BankedAtomicU16 =
     BankedAtomicU16::new(crate::published_rootfs::ROOT_HANDLE);
 static X86_RUNTIME_BACKING_ELF_PROBE_OVERLAY_CWD: BankedAtomicU32 = BankedAtomicU32::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_EPOLL_DESCRIPTOR: BankedAtomicU16 = BankedAtomicU16::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_EPOLL_EVENTS: [BankedAtomicU32;
-    LINUX_DESCRIPTOR_TABLE_LIMIT as usize] =
-    [const { BankedAtomicU32::new(0) }; LINUX_DESCRIPTOR_TABLE_LIMIT as usize];
-static X86_RUNTIME_BACKING_ELF_PROBE_EPOLL_DATA: [BankedAtomicU64;
-    LINUX_DESCRIPTOR_TABLE_LIMIT as usize] =
-    [const { BankedAtomicU64::new(0) }; LINUX_DESCRIPTOR_TABLE_LIMIT as usize];
-static X86_RUNTIME_BACKING_LINUX_RUNTIME_EPOLL_ACTIVE: [BankedAtomicU8;
-    LINUX_DEVICE_DESCRIPTOR_COUNT] =
-    [const { BankedAtomicU8::new(0) }; LINUX_DEVICE_DESCRIPTOR_COUNT];
+static X86_RUNTIME_BACKING_ELF_PROBE_EPOLL_EVENTS: BankedAtomicArray<
+    AtomicU32,
+    { LINUX_DESCRIPTOR_TABLE_LIMIT as usize },
+> = BankedAtomicArray::<AtomicU32, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>::new();
+static X86_RUNTIME_BACKING_ELF_PROBE_EPOLL_DATA: BankedAtomicArray<
+    AtomicU64,
+    { LINUX_DESCRIPTOR_TABLE_LIMIT as usize },
+> = BankedAtomicArray::<AtomicU64, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>::new();
+static X86_RUNTIME_BACKING_LINUX_RUNTIME_EPOLL_ACTIVE: BankedAtomicArray<
+    AtomicU8,
+    LINUX_DEVICE_DESCRIPTOR_COUNT,
+> = BankedAtomicArray::<AtomicU8, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
 /// For an epoll descriptor duplicated from another, the descriptor (+ 1)
 /// that owns the shared instance's watches; 0 when it owns them itself.
-static X86_RUNTIME_BACKING_LINUX_RUNTIME_EPOLL_ALIASES: [BankedAtomicU16;
-    LINUX_DEVICE_DESCRIPTOR_COUNT] =
-    [const { BankedAtomicU16::new(0) }; LINUX_DEVICE_DESCRIPTOR_COUNT];
+static X86_RUNTIME_BACKING_LINUX_RUNTIME_EPOLL_ALIASES: BankedAtomicArray<
+    AtomicU16,
+    LINUX_DEVICE_DESCRIPTOR_COUNT,
+> = BankedAtomicArray::<AtomicU16, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
 /// Set while a blocking call on a local socket makes its single attempt, so
 /// the socket layer reports EAGAIN instead of spinning.
 static X86_RUNTIME_BACKING_LINUX_SOCKET_SINGLE_ATTEMPT: AtomicBool = AtomicBool::new(false);
-static X86_RUNTIME_BACKING_LINUX_RUNTIME_EPOLL_WATCH_EPOLL: [BankedAtomicU16;
-    LINUX_DESCRIPTOR_TABLE_LIMIT as usize] =
-    [const { BankedAtomicU16::new(0) }; LINUX_DESCRIPTOR_TABLE_LIMIT as usize];
-static X86_RUNTIME_BACKING_LINUX_RUNTIME_EPOLL_WATCH_TARGET: [BankedAtomicU16;
-    LINUX_DESCRIPTOR_TABLE_LIMIT as usize] =
-    [const { BankedAtomicU16::new(0) }; LINUX_DESCRIPTOR_TABLE_LIMIT as usize];
+static X86_RUNTIME_BACKING_LINUX_RUNTIME_EPOLL_WATCH_EPOLL: BankedAtomicArray<
+    AtomicU16,
+    { LINUX_DESCRIPTOR_TABLE_LIMIT as usize },
+> = BankedAtomicArray::<AtomicU16, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>::new();
+static X86_RUNTIME_BACKING_LINUX_RUNTIME_EPOLL_WATCH_TARGET: BankedAtomicArray<
+    AtomicU16,
+    { LINUX_DESCRIPTOR_TABLE_LIMIT as usize },
+> = BankedAtomicArray::<AtomicU16, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>::new();
 static X86_RUNTIME_BACKING_ELF_PROBE_EVENTFD_DESCRIPTOR: BankedAtomicU16 = BankedAtomicU16::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_EVENTFD_COUNTER: BankedAtomicU64 = BankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_EVENTFD_FLAGS: BankedAtomicU32 = BankedAtomicU32::new(0);
-static X86_RUNTIME_BACKING_LINUX_RUNTIME_EVENTFD_ACTIVE: [BankedAtomicU8;
-    LINUX_DEVICE_DESCRIPTOR_COUNT] =
-    [const { BankedAtomicU8::new(0) }; LINUX_DEVICE_DESCRIPTOR_COUNT];
+static X86_RUNTIME_BACKING_LINUX_RUNTIME_EVENTFD_ACTIVE: BankedAtomicArray<
+    AtomicU8,
+    LINUX_DEVICE_DESCRIPTOR_COUNT,
+> = BankedAtomicArray::<AtomicU8, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
 static X86_RUNTIME_BACKING_ELF_PROBE_TIMERFD_DESCRIPTOR: BankedAtomicU16 = BankedAtomicU16::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_TIMERFD_CLOCK: BankedAtomicU8 = BankedAtomicU8::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_TIMERFD_FLAGS: BankedAtomicU32 = BankedAtomicU32::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_TIMERFD_INTERVAL: BankedAtomicU64 = BankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_TIMERFD_DEADLINE: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_LINUX_RUNTIME_TIMERFD_ACTIVE: [BankedAtomicU8;
-    LINUX_DEVICE_DESCRIPTOR_COUNT] =
-    [const { BankedAtomicU8::new(0) }; LINUX_DEVICE_DESCRIPTOR_COUNT];
+static X86_RUNTIME_BACKING_LINUX_RUNTIME_TIMERFD_ACTIVE: BankedAtomicArray<
+    AtomicU8,
+    LINUX_DEVICE_DESCRIPTOR_COUNT,
+> = BankedAtomicArray::<AtomicU8, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
 static X86_RUNTIME_BACKING_ELF_PROBE_POSIX_TIMER_ACTIVE: BankedAtomicBool =
     BankedAtomicBool::new(false);
 static X86_RUNTIME_BACKING_ELF_PROBE_POSIX_TIMER_INTERVAL: BankedAtomicU64 =
@@ -2086,9 +2161,10 @@ static X86_RUNTIME_BACKING_ELF_PROBE_PIPE_WRITE_FLAGS: BankedAtomicU32 = BankedA
 static X86_RUNTIME_BACKING_ELF_PROBE_PIPE_LENGTH: BankedAtomicU32 = BankedAtomicU32::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_PIPE_BUFFER: [BankedAtomicU8; LINUX_PIPE_CAPACITY] =
     [const { BankedAtomicU8::new(0) }; LINUX_PIPE_CAPACITY];
-static X86_RUNTIME_BACKING_ELF_PROBE_DESCRIPTOR_OFFSETS: [BankedAtomicU64;
-    LINUX_DEVICE_DESCRIPTOR_COUNT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_DEVICE_DESCRIPTOR_COUNT];
+static X86_RUNTIME_BACKING_ELF_PROBE_DESCRIPTOR_OFFSETS: BankedAtomicArray<
+    AtomicU64,
+    LINUX_DEVICE_DESCRIPTOR_COUNT,
+> = BankedAtomicArray::<AtomicU64, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
 static X86_RUNTIME_BACKING_ELF_PROBE_CLOCK_EPOCH: BankedAtomicU64 = BankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_CLOCK_FREQUENCY: BankedAtomicU64 = BankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_PROCESS_NAME_LOW: BankedAtomicU64 = BankedAtomicU64::new(0);
@@ -15113,6 +15189,7 @@ impl Drop for LinuxForkExecFlagGuard {
 // live child and can exhaust the kernel stack during a systemd boot.
 #[inline(never)]
 fn stage_linux_fork_parent_runtime_state(parent_pid: u32) -> Option<LinuxForkParentRuntime> {
+    assign_linux_open_file_ids();
     let mut state = capture_linux_process_runtime_state()?;
     state.active = true;
     state.completed = false;
@@ -15263,6 +15340,7 @@ fn capture_linux_descriptors_for_process(pid: u32) -> bool {
     let Some(state) = linux_process_runtime_state(pid) else {
         return false;
     };
+    assign_linux_open_file_ids();
     state.descriptors = capture_linux_descriptor_runtime_state();
     true
 }
@@ -15705,108 +15783,93 @@ fn restore_linux_process_runtime_state(state: &LinuxProcessRuntimeState) {
         .store(state.next_tid, Ordering::SeqCst);
 }
 
-fn capture_linux_descriptor_runtime_state() -> LinuxDescriptorRuntimeState {
+/// Gives every open descriptor its open-file id before the table is copied
+/// to a child: ids are otherwise assigned on first use, and a parent and
+/// child that each assigned one later would disagree about sharing a file.
+fn assign_linux_open_file_ids() {
     for descriptor in 0..LINUX_DESCRIPTOR_TABLE_LIMIT {
         if linux_descriptor_open(descriptor) {
             let _ = linux_descriptor_open_file_id(descriptor);
         }
     }
+}
+
+// A process switch saves and installs the whole table, and none of it is
+// shared with another CPU then (a process's remote threads are blocked
+// before it is switched out), so the copies use relaxed accesses and one
+// fence instead of a sequentially consistent store per element.
+fn capture_linux_descriptor_runtime_state() -> LinuxDescriptorRuntimeState {
+    core::sync::atomic::fence(Ordering::SeqCst);
     LinuxDescriptorRuntimeState {
         console: X86_RUNTIME
             .ELF_PROBE_CONSOLE_DESCRIPTORS
-            .load(Ordering::SeqCst),
-        stderr_open: X86_RUNTIME.ELF_PROBE_STDERR_OPEN.load(Ordering::SeqCst),
+            .load(Ordering::Relaxed),
+        stderr_open: X86_RUNTIME.ELF_PROBE_STDERR_OPEN.load(Ordering::Relaxed),
         close_on_exec: core::array::from_fn(|index| {
-            X86_RUNTIME.ELF_PROBE_CONSOLE_CLOEXEC[index].load(Ordering::SeqCst)
+            X86_RUNTIME.ELF_PROBE_CONSOLE_CLOEXEC[index].load(Ordering::Relaxed)
         }),
-        devices: core::array::from_fn(|index| {
-            X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index].load(Ordering::SeqCst)
-        }),
-        rootfs: core::array::from_fn(|index| {
-            X86_RUNTIME.ELF_PROBE_ROOTFS_DESCRIPTORS[index].load(Ordering::SeqCst)
-        }),
-        sockets: core::array::from_fn(|index| {
-            X86_RUNTIME.ELF_PROBE_SOCKET_SLOTS[index].load(Ordering::SeqCst)
-        }),
-        socket_flags: core::array::from_fn(|index| {
-            X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index].load(Ordering::SeqCst)
-        }),
+        devices: X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS.snapshot(),
+        rootfs: X86_RUNTIME.ELF_PROBE_ROOTFS_DESCRIPTORS.snapshot(),
+        sockets: X86_RUNTIME.ELF_PROBE_SOCKET_SLOTS.snapshot(),
+        socket_flags: X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS.snapshot(),
         stdio_sockets: core::array::from_fn(|index| {
-            X86_RUNTIME.ELF_PROBE_STDIO_SOCKET_SLOTS[index].load(Ordering::SeqCst)
+            X86_RUNTIME.ELF_PROBE_STDIO_SOCKET_SLOTS[index].load(Ordering::Relaxed)
         }),
         stdio_socket_flags: core::array::from_fn(|index| {
-            X86_RUNTIME.ELF_PROBE_STDIO_SOCKET_FLAGS[index].load(Ordering::SeqCst)
+            X86_RUNTIME.ELF_PROBE_STDIO_SOCKET_FLAGS[index].load(Ordering::Relaxed)
         }),
-        tmp_generations: core::array::from_fn(|index| {
-            X86_RUNTIME.ELF_PROBE_TMP_FILE_GENERATIONS[index].load(Ordering::SeqCst)
-        }),
-        offsets: core::array::from_fn(|index| {
-            X86_RUNTIME.ELF_PROBE_DESCRIPTOR_OFFSETS[index].load(Ordering::SeqCst)
-        }),
+        tmp_generations: X86_RUNTIME.ELF_PROBE_TMP_FILE_GENERATIONS.snapshot(),
+        offsets: X86_RUNTIME.ELF_PROBE_DESCRIPTOR_OFFSETS.snapshot(),
         stdio_devices: core::array::from_fn(|index| {
-            X86_RUNTIME.ELF_PROBE_STDIO_DEVICE_DESCRIPTORS[index].load(Ordering::SeqCst)
+            X86_RUNTIME.ELF_PROBE_STDIO_DEVICE_DESCRIPTORS[index].load(Ordering::Relaxed)
         }),
         stdio_rootfs: core::array::from_fn(|index| {
-            X86_RUNTIME.ELF_PROBE_STDIO_ROOTFS_DESCRIPTORS[index].load(Ordering::SeqCst)
+            X86_RUNTIME.ELF_PROBE_STDIO_ROOTFS_DESCRIPTORS[index].load(Ordering::Relaxed)
         }),
         stdio_tmp_generations: core::array::from_fn(|index| {
-            X86_RUNTIME.ELF_PROBE_STDIO_TMP_FILE_GENERATIONS[index].load(Ordering::SeqCst)
+            X86_RUNTIME.ELF_PROBE_STDIO_TMP_FILE_GENERATIONS[index].load(Ordering::Relaxed)
         }),
         stdio_offsets: core::array::from_fn(|index| {
-            X86_RUNTIME.ELF_PROBE_STDIO_OFFSETS[index].load(Ordering::SeqCst)
+            X86_RUNTIME.ELF_PROBE_STDIO_OFFSETS[index].load(Ordering::Relaxed)
         }),
-        open_file_ids: core::array::from_fn(|index| {
-            X86_RUNTIME.ELF_PROBE_OPEN_FILE_IDS[index].load(Ordering::SeqCst)
-        }),
+        open_file_ids: X86_RUNTIME.ELF_PROBE_OPEN_FILE_IDS.snapshot(),
         stdio_open_file_ids: core::array::from_fn(|index| {
-            X86_RUNTIME.ELF_PROBE_STDIO_OPEN_FILE_IDS[index].load(Ordering::SeqCst)
+            X86_RUNTIME.ELF_PROBE_STDIO_OPEN_FILE_IDS[index].load(Ordering::Relaxed)
         }),
         epoll_descriptor: X86_RUNTIME
             .ELF_PROBE_EPOLL_DESCRIPTOR
-            .load(Ordering::SeqCst),
-        epoll_events: core::array::from_fn(|index| {
-            X86_RUNTIME.ELF_PROBE_EPOLL_EVENTS[index].load(Ordering::SeqCst)
-        }),
-        epoll_data: core::array::from_fn(|index| {
-            X86_RUNTIME.ELF_PROBE_EPOLL_DATA[index].load(Ordering::SeqCst)
-        }),
-        runtime_epoll_active: core::array::from_fn(|index| {
-            X86_RUNTIME.LINUX_RUNTIME_EPOLL_ACTIVE[index].load(Ordering::SeqCst)
-        }),
-        runtime_epoll_aliases: core::array::from_fn(|index| {
-            X86_RUNTIME.LINUX_RUNTIME_EPOLL_ALIASES[index].load(Ordering::SeqCst)
-        }),
-        runtime_epoll_watch_epoll: core::array::from_fn(|index| {
-            X86_RUNTIME.LINUX_RUNTIME_EPOLL_WATCH_EPOLL[index].load(Ordering::SeqCst)
-        }),
-        runtime_epoll_watch_target: core::array::from_fn(|index| {
-            X86_RUNTIME.LINUX_RUNTIME_EPOLL_WATCH_TARGET[index].load(Ordering::SeqCst)
-        }),
-        runtime_eventfd_active: core::array::from_fn(|word| {
-            (0..64).fold(0_u64, |active, bit| {
-                let index = word * 64 + bit;
-                active
-                    | (u64::from(
-                        X86_RUNTIME
-                            .LINUX_RUNTIME_EVENTFD_ACTIVE
-                            .get(index)
-                            .is_some_and(|value| value.load(Ordering::SeqCst) != 0),
-                    ) << bit)
-            })
-        }),
-        runtime_timerfd_active: core::array::from_fn(|word| {
-            (0..64).fold(0_u64, |active, bit| {
-                let index = word * 64 + bit;
-                active
-                    | (u64::from(
-                        X86_RUNTIME
-                            .LINUX_RUNTIME_TIMERFD_ACTIVE
-                            .get(index)
-                            .is_some_and(|value| value.load(Ordering::SeqCst) != 0),
-                    ) << bit)
-            })
-        }),
+            .load(Ordering::Relaxed),
+        epoll_events: X86_RUNTIME.ELF_PROBE_EPOLL_EVENTS.snapshot(),
+        epoll_data: X86_RUNTIME.ELF_PROBE_EPOLL_DATA.snapshot(),
+        runtime_epoll_active: X86_RUNTIME.LINUX_RUNTIME_EPOLL_ACTIVE.snapshot(),
+        runtime_epoll_aliases: X86_RUNTIME.LINUX_RUNTIME_EPOLL_ALIASES.snapshot(),
+        runtime_epoll_watch_epoll: X86_RUNTIME.LINUX_RUNTIME_EPOLL_WATCH_EPOLL.snapshot(),
+        runtime_epoll_watch_target: X86_RUNTIME.LINUX_RUNTIME_EPOLL_WATCH_TARGET.snapshot(),
+        runtime_eventfd_active: linux_descriptor_bitmap(
+            &X86_RUNTIME.LINUX_RUNTIME_EVENTFD_ACTIVE.snapshot(),
+        ),
+        runtime_timerfd_active: linux_descriptor_bitmap(
+            &X86_RUNTIME.LINUX_RUNTIME_TIMERFD_ACTIVE.snapshot(),
+        ),
     }
+}
+
+/// One bit per descriptor, set where `flags` is non-zero.
+fn linux_descriptor_bitmap(
+    flags: &[u8; LINUX_DEVICE_DESCRIPTOR_COUNT],
+) -> [u64; LINUX_DESCRIPTOR_FLAG_WORD_COUNT] {
+    let mut bitmap = [0_u64; LINUX_DESCRIPTOR_FLAG_WORD_COUNT];
+    for (index, flag) in flags.iter().enumerate() {
+        bitmap[index / 64] |= u64::from(*flag != 0) << (index % 64);
+    }
+    bitmap
+}
+
+/// The flags `bitmap` (from `linux_descriptor_bitmap`) records.
+fn linux_descriptor_bitmap_flags(
+    bitmap: &[u64; LINUX_DESCRIPTOR_FLAG_WORD_COUNT],
+) -> [u8; LINUX_DEVICE_DESCRIPTOR_COUNT] {
+    core::array::from_fn(|index| ((bitmap[index / 64] >> (index % 64)) & 1) as u8)
 }
 
 /// The eventfd and timerfd open files saved descriptor table `state` refers
@@ -15934,78 +15997,84 @@ fn restore_linux_descriptor_runtime_state(state: &LinuxDescriptorRuntimeState) {
 fn install_linux_descriptor_runtime_state(state: &LinuxDescriptorRuntimeState) {
     X86_RUNTIME
         .ELF_PROBE_CONSOLE_DESCRIPTORS
-        .store(state.console, Ordering::SeqCst);
+        .store(state.console, Ordering::Relaxed);
     X86_RUNTIME
         .ELF_PROBE_STDERR_OPEN
-        .store(state.stderr_open, Ordering::SeqCst);
+        .store(state.stderr_open, Ordering::Relaxed);
     for (word, value) in X86_RUNTIME
         .ELF_PROBE_CONSOLE_CLOEXEC
         .iter()
         .zip(state.close_on_exec.iter().copied())
     {
-        word.store(value, Ordering::SeqCst);
+        word.store(value, Ordering::Relaxed);
     }
     for index in 0..state.stdio_sockets.len() {
         X86_RUNTIME.ELF_PROBE_STDIO_SOCKET_SLOTS[index]
-            .store(state.stdio_sockets[index], Ordering::SeqCst);
+            .store(state.stdio_sockets[index], Ordering::Relaxed);
         X86_RUNTIME.ELF_PROBE_STDIO_SOCKET_FLAGS[index]
-            .store(state.stdio_socket_flags[index], Ordering::SeqCst);
+            .store(state.stdio_socket_flags[index], Ordering::Relaxed);
     }
-    for index in 0..LINUX_DEVICE_DESCRIPTOR_COUNT {
-        X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index]
-            .store(state.devices[index], Ordering::SeqCst);
-        X86_RUNTIME.ELF_PROBE_ROOTFS_DESCRIPTORS[index]
-            .store(state.rootfs[index], Ordering::SeqCst);
-        X86_RUNTIME.ELF_PROBE_SOCKET_SLOTS[index].store(state.sockets[index], Ordering::SeqCst);
-        X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index]
-            .store(state.socket_flags[index], Ordering::SeqCst);
-        X86_RUNTIME.ELF_PROBE_TMP_FILE_GENERATIONS[index]
-            .store(state.tmp_generations[index], Ordering::SeqCst);
-        X86_RUNTIME.ELF_PROBE_DESCRIPTOR_OFFSETS[index]
-            .store(state.offsets[index], Ordering::SeqCst);
-        X86_RUNTIME.ELF_PROBE_OPEN_FILE_IDS[index]
-            .store(state.open_file_ids[index], Ordering::SeqCst);
-    }
+    X86_RUNTIME
+        .ELF_PROBE_DEVICE_DESCRIPTORS
+        .install(&state.devices);
+    X86_RUNTIME
+        .ELF_PROBE_ROOTFS_DESCRIPTORS
+        .install(&state.rootfs);
+    X86_RUNTIME.ELF_PROBE_SOCKET_SLOTS.install(&state.sockets);
+    X86_RUNTIME
+        .ELF_PROBE_SOCKET_FLAGS
+        .install(&state.socket_flags);
+    X86_RUNTIME
+        .ELF_PROBE_TMP_FILE_GENERATIONS
+        .install(&state.tmp_generations);
+    X86_RUNTIME
+        .ELF_PROBE_DESCRIPTOR_OFFSETS
+        .install(&state.offsets);
+    X86_RUNTIME
+        .ELF_PROBE_OPEN_FILE_IDS
+        .install(&state.open_file_ids);
     for index in 0..state.stdio_devices.len() {
         X86_RUNTIME.ELF_PROBE_STDIO_DEVICE_DESCRIPTORS[index]
-            .store(state.stdio_devices[index], Ordering::SeqCst);
+            .store(state.stdio_devices[index], Ordering::Relaxed);
         X86_RUNTIME.ELF_PROBE_STDIO_ROOTFS_DESCRIPTORS[index]
-            .store(state.stdio_rootfs[index], Ordering::SeqCst);
+            .store(state.stdio_rootfs[index], Ordering::Relaxed);
         X86_RUNTIME.ELF_PROBE_STDIO_TMP_FILE_GENERATIONS[index]
-            .store(state.stdio_tmp_generations[index], Ordering::SeqCst);
+            .store(state.stdio_tmp_generations[index], Ordering::Relaxed);
         X86_RUNTIME.ELF_PROBE_STDIO_OFFSETS[index]
-            .store(state.stdio_offsets[index], Ordering::SeqCst);
+            .store(state.stdio_offsets[index], Ordering::Relaxed);
         X86_RUNTIME.ELF_PROBE_STDIO_OPEN_FILE_IDS[index]
-            .store(state.stdio_open_file_ids[index], Ordering::SeqCst);
+            .store(state.stdio_open_file_ids[index], Ordering::Relaxed);
     }
     X86_RUNTIME
         .ELF_PROBE_EPOLL_DESCRIPTOR
-        .store(state.epoll_descriptor, Ordering::SeqCst);
-    for index in 0..LINUX_DESCRIPTOR_TABLE_LIMIT as usize {
-        X86_RUNTIME.ELF_PROBE_EPOLL_EVENTS[index]
-            .store(state.epoll_events[index], Ordering::SeqCst);
-        X86_RUNTIME.ELF_PROBE_EPOLL_DATA[index].store(state.epoll_data[index], Ordering::SeqCst);
-        X86_RUNTIME.LINUX_RUNTIME_EPOLL_WATCH_EPOLL[index]
-            .store(state.runtime_epoll_watch_epoll[index], Ordering::SeqCst);
-        X86_RUNTIME.LINUX_RUNTIME_EPOLL_WATCH_TARGET[index]
-            .store(state.runtime_epoll_watch_target[index], Ordering::SeqCst);
-    }
-    for index in 0..LINUX_DEVICE_DESCRIPTOR_COUNT {
-        X86_RUNTIME.LINUX_RUNTIME_EPOLL_ACTIVE[index]
-            .store(state.runtime_epoll_active[index], Ordering::SeqCst);
-        X86_RUNTIME.LINUX_RUNTIME_EPOLL_ALIASES[index]
-            .store(state.runtime_epoll_aliases[index], Ordering::SeqCst);
-        let word = index / 64;
-        let bit = index % 64;
-        X86_RUNTIME.LINUX_RUNTIME_EVENTFD_ACTIVE[index].store(
-            ((state.runtime_eventfd_active[word] >> bit) & 1) as u8,
-            Ordering::SeqCst,
-        );
-        X86_RUNTIME.LINUX_RUNTIME_TIMERFD_ACTIVE[index].store(
-            ((state.runtime_timerfd_active[word] >> bit) & 1) as u8,
-            Ordering::SeqCst,
-        );
-    }
+        .store(state.epoll_descriptor, Ordering::Relaxed);
+    X86_RUNTIME
+        .ELF_PROBE_EPOLL_EVENTS
+        .install(&state.epoll_events);
+    X86_RUNTIME.ELF_PROBE_EPOLL_DATA.install(&state.epoll_data);
+    X86_RUNTIME
+        .LINUX_RUNTIME_EPOLL_WATCH_EPOLL
+        .install(&state.runtime_epoll_watch_epoll);
+    X86_RUNTIME
+        .LINUX_RUNTIME_EPOLL_WATCH_TARGET
+        .install(&state.runtime_epoll_watch_target);
+    X86_RUNTIME
+        .LINUX_RUNTIME_EPOLL_ACTIVE
+        .install(&state.runtime_epoll_active);
+    X86_RUNTIME
+        .LINUX_RUNTIME_EPOLL_ALIASES
+        .install(&state.runtime_epoll_aliases);
+    X86_RUNTIME
+        .LINUX_RUNTIME_EVENTFD_ACTIVE
+        .install(&linux_descriptor_bitmap_flags(
+            &state.runtime_eventfd_active,
+        ));
+    X86_RUNTIME
+        .LINUX_RUNTIME_TIMERFD_ACTIVE
+        .install(&linux_descriptor_bitmap_flags(
+            &state.runtime_timerfd_active,
+        ));
+    core::sync::atomic::fence(Ordering::SeqCst);
 }
 
 fn capture_linux_mmap_runtime_state() -> LinuxMmapRuntimeState {
@@ -40329,14 +40398,14 @@ fn linux_overlay_copy_from_user(
     total as u64
 }
 
-fn linux_legacy_descriptor_offset(descriptor: u64) -> &'static BankedAtomicU64 {
+fn linux_legacy_descriptor_offset(descriptor: u64) -> &'static AtomicU64 {
     if descriptor < LINUX_AUX_DESCRIPTOR_FIRST {
         return &X86_RUNTIME.ELF_PROBE_STDIO_OFFSETS[descriptor as usize];
     }
     &X86_RUNTIME.ELF_PROBE_DESCRIPTOR_OFFSETS[(descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize]
 }
 
-fn linux_descriptor_open_file_id_cell(descriptor: u64) -> Option<&'static BankedAtomicU64> {
+fn linux_descriptor_open_file_id_cell(descriptor: u64) -> Option<&'static AtomicU64> {
     if descriptor < LINUX_AUX_DESCRIPTOR_FIRST {
         return X86_RUNTIME
             .ELF_PROBE_STDIO_OPEN_FILE_IDS

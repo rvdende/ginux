@@ -349,8 +349,21 @@ runtime CPU; `t` lists every task's threads):
   with interrupts off, freezing the domain while its shell waited for input;
   they now wait like any other blocking call.
 - A process switch copies the thread table and descriptor tables through
-  banked atomics. Free thread slots are now skipped; the descriptor tables
-  (about 14,000 atomic operations each way) are the next cost.
+  banked atomics. Free thread slots are skipped, and the descriptor tables
+  are banked as whole arrays (`BankedAtomicArray`: one contiguous table
+  per domain instance, copied with relaxed accesses and a fence) instead of
+  arrays of banked cells, which interleaved the instances and touched a
+  cache line per element. Open-file ids are assigned at fork, where they
+  matter, not on every save. A save went from 73 to 15 us and a restore
+  from 46 to 10 us (the profile above: 21% of the CPU to 6%).
+- Frame ownership checks for the kernel's own frames (page-table walks,
+  `live_frame_lease`) read the frame's metadata word without the allocator
+  lock: the kernel's owner slot never changes and metadata words are
+  written atomically. They took the lock about 3 million times a second.
+- Creating a process still costs about 90 ms of a one-CPU domain while a
+  large application runs (a shell polling with `sleep 1; grep` showed as a
+  90 ms hitch every second in cadrs); fork, exec and exit take a full
+  address-space snapshot.
 - Timed waits wake at their deadline: the one-shot tick is brought forward
   to the earliest blocked thread's deadline.
 

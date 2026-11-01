@@ -16,7 +16,7 @@ use crate::{
     EFI_BOOT_SERVICES_DATA, EFI_CONVENTIONAL_MEMORY,
 };
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 const PAGE_SIZE: u64 = 4096;
 const LOW_MEMORY_LIMIT: u64 = 1024 * 1024;
@@ -39,6 +39,13 @@ struct PhysicalMemoryOwner {
     initialized: AtomicBool,
     runtime_extent_starts: [AtomicU64; crate::control_abi::DOMAIN_LIMIT],
     runtime_extent_counts: [AtomicUsize; crate::control_abi::DOMAIN_LIMIT],
+    /// The allocator's metadata table and how many frames it covers, set
+    /// once before `initialized`: whether a frame is live and the kernel's
+    /// can be read without the lock (`kernel_frame_metadata`), since the
+    /// kernel's owner slot never changes and metadata words are written
+    /// atomically.
+    metadata_table: AtomicPtr<u64>,
+    metadata_frames: AtomicUsize,
     allocator: IrqSpinLock<MaybeUninit<FrameAllocator>>,
 }
 
@@ -46,6 +53,8 @@ static PHYSICAL_MEMORY: PhysicalMemoryOwner = PhysicalMemoryOwner {
     initialized: AtomicBool::new(false),
     runtime_extent_starts: [const { AtomicU64::new(0) }; crate::control_abi::DOMAIN_LIMIT],
     runtime_extent_counts: [const { AtomicUsize::new(0) }; crate::control_abi::DOMAIN_LIMIT],
+    metadata_table: AtomicPtr::new(core::ptr::null_mut()),
+    metadata_frames: AtomicUsize::new(0),
     allocator: IrqSpinLock::new(LockRank::PHYSICAL_MEMORY, MaybeUninit::uninit()),
 };
 
@@ -176,13 +185,15 @@ impl FrameAllocator {
     }
 
     fn metadata(&self, index: usize) -> u64 {
-        // SAFETY: index < frames, which the metadata table covers.
-        unsafe { self.metadata.add(index).read() }
+        // SAFETY: index < frames, which the metadata table covers; the words
+        // are aligned and only ever accessed atomically.
+        unsafe { AtomicU64::from_ptr(self.metadata.add(index)).load(Ordering::Acquire) }
     }
 
     fn set_metadata(&mut self, index: usize, value: u64) {
-        // SAFETY: index < frames, which the metadata table covers.
-        unsafe { self.metadata.add(index).write(value) }
+        // SAFETY: as for metadata. Lock-free readers (kernel_frame_metadata)
+        // may load the word concurrently.
+        unsafe { AtomicU64::from_ptr(self.metadata.add(index)).store(value, Ordering::Release) }
     }
 
     fn is_free(&self, index: usize) -> bool {
@@ -713,6 +724,12 @@ pub(crate) fn initialize(boot_info: &BootInfo, ceiling: u64) -> bool {
         }
         storage.write(allocator);
     }
+    PHYSICAL_MEMORY
+        .metadata_table
+        .store(tables as *mut u64, Ordering::Release);
+    PHYSICAL_MEMORY
+        .metadata_frames
+        .store(frames, Ordering::Release);
     PHYSICAL_MEMORY.initialized.store(true, Ordering::Release);
     true
 }
@@ -936,10 +953,35 @@ pub(crate) fn frame_leases_releasable(owner: FrameOwner, frames: &[FrameLease]) 
     }
 }
 
+/// The metadata word of the frame at `address` when it is live and the
+/// kernel's, read without the allocator lock. The answer is a snapshot, as a
+/// locked lookup's is once the lock is dropped.
+fn kernel_frame_metadata(address: u64) -> Option<u64> {
+    if address < LOW_MEMORY_LIMIT || !address.is_multiple_of(PAGE_SIZE) {
+        return None;
+    }
+    let table = PHYSICAL_MEMORY.metadata_table.load(Ordering::Acquire);
+    let index = usize::try_from(address / PAGE_SIZE).ok()?;
+    if table.is_null() || index >= PHYSICAL_MEMORY.metadata_frames.load(Ordering::Acquire) {
+        return None;
+    }
+    // SAFETY: the table covers metadata_frames words from frame 0 (the boot
+    // allocator's first frame) for the kernel's lifetime, and its words are
+    // only accessed atomically.
+    let metadata = unsafe { AtomicU64::from_ptr(table.add(index)).load(Ordering::Acquire) };
+    (metadata & META_LIVE != 0 && metadata & META_OWNER == 0).then_some(metadata)
+}
+
 pub(crate) fn live_frame_lease(owner: FrameOwner, address: u64) -> Option<FrameLease> {
     crate::linux_profile::count_memory(7);
     if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) {
         return None;
+    }
+    if owner.is_kernel() {
+        return kernel_frame_metadata(address).map(|metadata| FrameLease {
+            address,
+            generation: (metadata >> META_GENERATION_SHIFT) as u32,
+        });
     }
     let mut storage = PHYSICAL_MEMORY.allocator.lock();
     // SAFETY: as for allocate_frames.
@@ -1015,6 +1057,15 @@ pub(crate) fn frames_owned_by(owner: FrameOwner, frames: &[FrameLease]) -> bool 
     if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) {
         return false;
     }
+    if owner.is_kernel()
+        && frames.iter().all(|frame| {
+            kernel_frame_metadata(frame.address).is_some_and(|metadata| {
+                (metadata >> META_GENERATION_SHIFT) as u32 == frame.generation
+            })
+        })
+    {
+        return true;
+    }
     let mut storage = PHYSICAL_MEMORY.allocator.lock();
     // SAFETY: as for allocate_frames.
     unsafe {
@@ -1037,6 +1088,14 @@ pub(crate) fn frame_addresses_owned_by(owner: FrameOwner, addresses: &[u64]) -> 
     crate::linux_profile::count_memory(6);
     if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) {
         return false;
+    }
+    if owner.is_kernel()
+        && !addresses.is_empty()
+        && addresses
+            .iter()
+            .all(|address| kernel_frame_metadata(*address).is_some())
+    {
+        return true;
     }
     let mut storage = PHYSICAL_MEMORY.allocator.lock();
     // SAFETY: as for allocate_frames.
