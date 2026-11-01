@@ -9078,7 +9078,30 @@ pub(crate) fn verify_linux_elf_entry(execution: &LinuxElfExecution<'_>) -> Linux
         PRIVILEGE_ENTRY_NMI_PROBE_HITS.store(0, Ordering::SeqCst);
         PRIVILEGE_ENTRY_NMI_PROBE_MASK.store(PRIVILEGE_ENTRY_NMI_STAGE_MASK, Ordering::SeqCst);
     }
-    let user_entered = unsafe { enter_user(execution.entry, execution.stack, 0, 0, 0, 0, 0, 0, 0) };
+    let user_entered = if execution.runtime {
+        // A domain's init runs on an activation stack of its own, as every
+        // later entry into a process does, so its blocked calls can park.
+        let valid = address_space::current_user_entry_context_is_valid(
+            execution.entry as u64,
+            execution.stack as u64,
+        );
+        if valid {
+            let general = [0_u64; 15];
+            // SAFETY: the context was validated against the active address
+            // space, as `enter_user` would.
+            unsafe {
+                enter_linux_runtime_process(
+                    execution.entry,
+                    execution.stack,
+                    general.as_ptr(),
+                    0x202,
+                )
+            };
+        }
+        valid
+    } else {
+        unsafe { enter_user(execution.entry, execution.stack, 0, 0, 0, 0, 0, 0, 0) }
+    };
     if !user_entered {
         if execution.runtime {
             let _ = linux_process::finish_runtime_process_registry();
