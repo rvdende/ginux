@@ -30910,6 +30910,12 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
     if linux_path_descriptor(descriptor) {
         return LINUX_EBADF;
     }
+    if (offset as i64) < 0 {
+        return LINUX_EINVAL;
+    }
+    if state & LINUX_DEVICE_DIRECTORY != 0 {
+        return LINUX_EISDIR;
+    }
     if linux_secret_descriptor(descriptor) {
         return LINUX_EINVAL;
     }
@@ -31336,6 +31342,9 @@ fn linux_regular_file_write_at(descriptor: u64, address: u64, count: u64, offset
     let state = linux_device_descriptor(descriptor);
     if linux_path_descriptor(descriptor) {
         return LINUX_EBADF;
+    }
+    if (offset as i64) < 0 {
+        return LINUX_EINVAL;
     }
     if linux_secret_descriptor(descriptor) {
         return LINUX_EINVAL;
@@ -35958,6 +35967,15 @@ fn linux_positioned_iov(
         Ok(ranges) => ranges,
         Err(error) => return error,
     };
+    if !linux_path_descriptor(descriptor) && (offset as i64) < 0 {
+        return LINUX_EINVAL;
+    }
+    if !write
+        && !linux_path_descriptor(descriptor)
+        && linux_device_descriptor(descriptor) & LINUX_DEVICE_DIRECTORY != 0
+    {
+        return LINUX_EISDIR;
+    }
     let mut offset = if write && flags & LINUX_RWF_APPEND != 0 {
         match linux_descriptor_stat(descriptor) {
             Some(stat) => u64::from_ne_bytes(stat[48..56].try_into().unwrap()),
