@@ -4779,6 +4779,14 @@ fn resume_failed_linux_fork_parent(parent_pid: u32, error: u64) -> bool {
 /// to be found before the scheduler loop of docs/SCHEDULER.md step 3.
 const LINUX_PARENT_FIRST_FORK: bool = false;
 
+/// Init waits like every other process: it gives the CPU back to the
+/// kernel's scheduler loop at the runtime entry (`run_linux_runtime_loop`),
+/// which runs the others, instead of running them nested inside its own
+/// blocking calls (docs/SCHEDULER.md, step 4). Off: with it on, brush as
+/// init livelocks with its child and busybox sh as init reads end of file
+/// from the console (docs/SCHEDULER.md lists what is left).
+const LINUX_SCHEDULER_LOOP: bool = false;
+
 /// Finishes a parent-first fork: keeps the child's prepared state for when it
 /// is scheduled, and resumes the parent with the child's pid as the result
 /// (written by `begin_live_fork`). Kept out of line so the process-state
@@ -13127,7 +13135,7 @@ fn run_other_linux_processes(
         return None;
     }
     let pid = current_linux_process_pid();
-    if pid != 1 {
+    if pid != 1 || LINUX_SCHEDULER_LOOP {
         // A signal that arrived while this call waited interrupts it (EINTR,
         // or a restart after an SA_RESTART handler), as in Linux, instead of
         // the call waiting again.
@@ -13961,14 +13969,66 @@ pub(crate) fn resume_suspended_linux_runtime(mmap: u64) -> LinuxElfResult {
     finish_linux_runtime(mmap, saved_msrs)
 }
 
-fn finish_linux_runtime(mmap: u64, saved_msrs: [u64; 5]) -> LinuxElfResult {
-    let mut forks_completed = true;
-    while X86_RUNTIME.LINUX_FORK_REQUESTED.load(Ordering::SeqCst) {
-        if !execute_deferred_live_fork() {
-            forks_completed = false;
-            break;
+/// The kernel's scheduler loop for a Linux runtime, entered when init first
+/// returns to the kernel: it runs requested forks, and while init waits (it
+/// gave the CPU back with its call set to restart) runs the next process,
+/// the deepest descendant first, then init again; with nothing else ready
+/// the CPU halts until an interrupt. It ends when init exits or the domain
+/// is suspended.
+fn run_linux_runtime_loop() -> bool {
+    loop {
+        while X86_RUNTIME.LINUX_FORK_REQUESTED.load(Ordering::SeqCst) {
+            if !execute_deferred_live_fork() {
+                return false;
+            }
+        }
+        if !LINUX_SCHEDULER_LOOP
+            || X86_RUNTIME.LINUX_RUNTIME_SUSPENDED.load(Ordering::Acquire)
+            || !take_linux_child_yield(1)
+        {
+            return true;
+        }
+        if !run_linux_processes_while_init_waits() {
+            // SAFETY: interrupts wake the CPU for the timer and devices; the
+            // kernel-entry lock serializes the work they start.
+            unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) };
+        }
+        if X86_RUNTIME.LINUX_RUNTIME_SUSPENDED.load(Ordering::Acquire) {
+            return true;
+        }
+        let Some(init) = linux_process::dispatch_live_process(1) else {
+            return false;
+        };
+        if !(sync_live_linux_process_address_space(1) && run_dispatched_linux_process(&init)) {
+            return false;
         }
     }
+}
+
+/// Runs one other process while init waits: the deepest running descendant
+/// is most likely what init waits for, unless it just yielded blocked (it
+/// may wait for its parent); failing that, the next in the run queue.
+fn run_linux_processes_while_init_waits() -> bool {
+    let mut descendant = None;
+    let mut ancestor = 1;
+    for _ in 0..linux_process::PROCESS_RUNTIME_LIMIT {
+        let Some(child) = linux_process::live_running_child_pid(ancestor) else {
+            break;
+        };
+        descendant = Some(child);
+        ancestor = child;
+    }
+    let last_blocked = X86_RUNTIME
+        .LINUX_PROCESS_LAST_BLOCKED_PID
+        .swap(0, Ordering::SeqCst);
+    let preferred = descendant.filter(|child| *child != last_blocked);
+    preferred.is_some_and(|child| run_scheduled_linux_process(1, Some(child)))
+        || run_next_scheduled_linux_process(1)
+        || descendant.is_some_and(|child| run_scheduled_linux_process(1, Some(child)))
+}
+
+fn finish_linux_runtime(mmap: u64, saved_msrs: [u64; 5]) -> LinuxElfResult {
+    let forks_completed = run_linux_runtime_loop();
     if forks_completed && X86_RUNTIME.LINUX_RUNTIME_SUSPENDED.load(Ordering::Acquire) {
         let state_saved = save_container_extended_state();
         let registry_suspended = state_saved && linux_process::suspend_runtime_process_registry();
@@ -34160,6 +34220,7 @@ fn linux_epoll_wait_duration_live_return(
                 .load(Ordering::SeqCst)
                 != 0
                 || current_linux_process_pid() != 1
+                || LINUX_SCHEDULER_LOOP
             {
                 // epoll_wait waits as poll does: other processes run, the
                 // call restarts with its deadline, and a signal interrupts

@@ -205,6 +205,29 @@ Order:
 Progress on step 1: every dispatched process is entered through
 `run_dispatched_linux_process` (cpu.rs), the place the loop will own.
 
+First attempt at step 4 (2026-11-01, parked behind
+`LINUX_SCHEDULER_LOOP = false` in cpu.rs): init yields like every other
+process (`yield_current_linux_process` no longer refuses pid 1) and
+`run_linux_runtime_loop`, at the runtime entry in `finish_linux_runtime`,
+runs one other process (deepest running descendant, then the run queue,
+halting when none ran) and re-enters init. LTP's syscall tests ran, but two
+suites broke, and both point at init-only paths that assume init never
+yields:
+
+- brush as init (`make test-rust-userland`) livelocks with its first child:
+  the loop keeps running pid 2 (`ran=1 descendant=2`), whose only thread is
+  ready but makes no progress, and init is never re-entered with the child's
+  result. The descendant walk, not a round-robin pick over the run queue,
+  chooses what runs; step 2 (the loop owning the run queue) comes first.
+- busybox sh as init (`make test-alpine`) exits after sending the `ESC[6n`
+  cursor query: its console read waits, the yield is refused somewhere on
+  the console path, and the read's `None` (no data) is reported as end of
+  file, so the shell sees EOF on stdin.
+- Paths to revisit before the next attempt: console reads that map "nothing
+  yet" to EOF for init, init's exit (kill rounds run nested in its call),
+  the epoll branch for pid 1, and `take_linux_child_yield(1)` as the only
+  signal that init is waiting.
+
 ### What waits look like until the loop exists (2026-11-01)
 
 A process other than init waits by yielding with its call set to restart,

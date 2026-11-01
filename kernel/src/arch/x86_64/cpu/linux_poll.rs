@@ -660,7 +660,7 @@ pub(super) fn yield_current_linux_process(mut caller: LinuxUserContext, result: 
     // A yield switches to the parent, which a thread of this process still
     // running on another CPU must not see; see linux_remote_thread_running.
     if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
-        || current_linux_process_pid() == 1
+        || current_linux_process_pid() == 1 && !LINUX_SCHEDULER_LOOP
         || linux_remote_thread_running()
     {
         return false;

@@ -8,16 +8,23 @@ QEMU, and reports one machine-parseable line per test plus failure clusters.
 
 ## Progress
 
-| Ginux | Change | Tests run | TPASS | TFAIL | TBROK | TCONF | CRASH | HANG |
-|---|---|---|---|---|---|---|---|---|
-| `d1f41667` | baseline (below) | 1362 | 41* | 39 | 1181 | 75 | 11 | 9 |
-| `62dce194` | `/proc/PID/oom_score_adj` kept per process | 1362 | 1043* | 38 | 130 | 76 | 52 | 17 |
-| `de94acb9` | fork EAGAIN, orphan reparenting, EINTR waits, edge-triggered epoll, timer preemption, killed-by-signal status | 1362 | 466 | 233 | 554 | 76 | 15 | 12 |
-| `76719aee` | a fault kills only its process, frame map counts, IPv4 loopback, `/proc/sys` node clash | 1362 | 498 | 231 | 542 | 75 | 4 | 6 |
-| `778dd3d0` | blocking semop/msgsnd/msgrcv, cross-process futexes, sleeping state, pipe capacity, SA_RESTART, CPU time, signals on the timer tick | 1362 | 526 | 240 | 504 | 76 | 0 | 14 |
+| Ginux | Change | Tests run | TPASS | TFAIL | TBROK | TCONF | TWARN | CRASH | HANG |
+|---|---|---|---|---|---|---|---|---|---|
+| `d1f41667` | baseline (below) | 1362 | 41* | 39 | 1181 | 75 | 6 | 11 | 9 |
+| `62dce194` | `/proc/PID/oom_score_adj` kept per process | 1362 | 1043* | 38 | 130 | 76 | 6 | 52 | 17 |
+| `de94acb9` | fork EAGAIN, orphan reparenting, EINTR waits, edge-triggered epoll, timer preemption, killed-by-signal status | 1362 | 394 | 233 | 554 | 126 | 28 | 15 | 12 |
+| `76719aee` | a fault kills only its process, frame map counts, IPv4 loopback, `/proc/sys` node clash | 1362 | 397 | 231 | 542 | 139 | 43 | 4 | 6 |
+| `778dd3d0` | blocking semop/msgsnd/msgrcv, cross-process futexes, sleeping state, pipe capacity, SA_RESTART, CPU time, signals on the timer tick | 1362 | 420 | 240 | 504 | 141 | 43 | 0 | 14 |
+| `18f44c93` | POSIX record locks, epoll_wait waits outside init, MAP_SHARED file pages shared | 1362 | 388 | 256 | 441 | 170 | 92 | 0 | 15 |
+| `7c6e1149` | `/proc/PID/maps`, clock_gettime into any writable page | 1362 | 471 | 261 | 431 | 173 | 10 | 0 | 16 |
 
-\* Counted with the exit status alone, which overstated passes (below);
-the later rows are rescored from the saved logs.
+\* Counted with the exit status alone, which overstated passes (below).
+The later rows are rescored from each run's saved console logs with LTP's
+own rule (`classify` in `tests/ltp/driver.py`): a test that printed any
+TBROK, TFAIL or TWARN counts as that, and TCONF only when nothing passed.
+Each row ran with that commit's changes on top of its parent. The drop at
+`18f44c93` is the shared result page starting to work: tests whose
+failures were lost before now report them.
 
 **Pass counts before 2026-11-01 were overstated by about 600.** The LTP
 library counts results in a MAP_SHARED page of a /dev/shm file and derives
@@ -32,11 +39,13 @@ file's own pages.
 
 A crash takes the whole domain down, so the run reboots for the next test:
 the `de94acb9` run needed 23 boots against 68 before, the `76719aee` run 6,
-and the `778dd3d0` run went through in one. Its 14 hangs are LTP's own
-30-second timeouts (no guest wedges): epoll_wait01/08/11/12/16,
-pselect01/_64, select02 and select04 (select and epoll_pwait still return
-no events rather than waiting for a signal), poll02 and ppoll01 (fixed
-since), futex_wait03, futex_wake03 and rt_tgsigqueueinfo01. Results of a
+and the `778dd3d0` run went through in one. The `7c6e1149` run's 16 hangs:
+connect01 and fork14 stopped the guest reporting (the host watchdog
+rebooted it); the rest are LTP's own 30-second timeouts with the guest
+still alive: epoll_wait01/08/11/12/16, pselect01/_64, select02 and
+select04 (select and epoll_pwait still return no events rather than
+waiting for a signal), poll02, ppoll01, pause01, tgkill01 and
+rt_tgsigqueueinfo01. Results of a
 full run are kept in `target/ltp-baseline/` (not committed).
 
 ## Baseline (2026-10-31)
