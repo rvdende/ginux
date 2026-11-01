@@ -651,6 +651,7 @@ extern "sysv64" fn application_processor_main(cpu_index: u32) -> ! {
         }
     }
     let _ = cpu::enable_extended_user_state();
+    paging::install_page_attribute_table();
     let Some(apic) = saved_local_apic() else {
         loop {
             unsafe { asm!("hlt", options(nomem, nostack)) };

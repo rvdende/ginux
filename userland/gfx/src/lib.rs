@@ -74,6 +74,42 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// Copies `width` x `height` pixels whose rows `row` gives as
+    /// little-endian 32-bit pixels (a client's shared buffer), with the
+    /// top-left corner at (x, y), blending premultiplied alpha unless they
+    /// are opaque.
+    pub fn blit_rows<'r>(
+        &mut self,
+        (x, y): (i32, i32),
+        (width, height): (i32, i32),
+        opaque: bool,
+        row: impl Fn(usize) -> &'r [u8],
+    ) {
+        let Some((x0, y0, x1, y1)) = self.clip(x, y, width, height) else {
+            return;
+        };
+        let (first, span) = ((x0 - x) as usize * 4, (x1 - x0) as usize);
+        for target_row in y0..y1 {
+            let source = &row((target_row - y) as usize)[first..first + span * 4];
+            let start = (target_row * self.width + x0) as usize;
+            let target = &mut self.pixels[start..start + span];
+            let pixels = source
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|pixel| u32::from_le_bytes(*pixel));
+            if opaque {
+                for (target, source) in target.iter_mut().zip(pixels) {
+                    *target = source | 0xff00_0000;
+                }
+            } else {
+                for (target, source) in target.iter_mut().zip(pixels) {
+                    *target = over(source, *target);
+                }
+            }
+        }
+    }
+
     /// Copies `image` with its top-left corner at (x, y), blending
     /// premultiplied alpha unless the image is opaque.
     pub fn blit(&mut self, x: i32, y: i32, image: &Image) {

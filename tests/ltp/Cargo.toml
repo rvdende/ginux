@@ -1,0 +1,27 @@
+# The LTP harness: runs the Linux Test Project syscall tests in an Alpine
+# domain on Ginux under QEMU, one libtest trial per test (docs/LTP.md).
+#
+#   cargo test --manifest-path tests/ltp/Cargo.toml --test ltp -- accept
+#
+# It is its own workspace, like userland/, so its crates.io dependencies
+# stay out of the kernel workspace.
+[package]
+name = "ginux-ltp"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+libtest-mimic = "0.8.2"
+memchr = "2"
+regex = "1"
+rustix = { version = "1.1", features = ["fs", "process", "termios"] }
+signal-hook = "0.3"
+
+[[test]]
+name = "ltp"
+harness = false

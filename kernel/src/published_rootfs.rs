@@ -523,6 +523,17 @@ pub(crate) fn lookup_at(directory: u16, path: &[u8]) -> Option<(u16, Option<Entr
     Some((handle, Some(entry)))
 }
 
+/// The image's entry at exactly the canonical `path`, links not followed:
+/// what the path walk meets at each step.
+pub(crate) fn exact_entry(path: &[u8]) -> Option<Entry<'static>> {
+    let path = path.strip_prefix(b"/").unwrap_or(path);
+    if path.is_empty() {
+        return None;
+    }
+    let rootfs = rootfs()?;
+    find_visible(&rootfs, path).map(|(_, entry)| entry)
+}
+
 pub(crate) fn lookup_metadata_at(
     directory: u16,
     path: &[u8],

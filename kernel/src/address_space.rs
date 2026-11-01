@@ -5439,8 +5439,24 @@ pub(crate) fn current_linux_active_mapping(address: u64) -> Option<cpu::LinuxAct
     if address >= 1 << 47 {
         return None;
     }
-    let entry = current_linux_leaf(page)?;
-    let value = entry.read();
+    linux_active_mapping_from_leaf(page, current_linux_leaf(page)?.read())
+}
+
+/// The page at `address` as the address space rooted at `root` maps it now:
+/// its live page tables, for a process whose registered mapping list is
+/// stale (see `linux_process::refresh_live_process_context_for_wait`).
+pub(crate) fn linux_active_mapping_in_root(
+    root: memory::FrameLease,
+    address: u64,
+) -> Option<cpu::LinuxActiveImageMapping> {
+    let page = address & !(PAGE_SIZE as u64 - 1);
+    if address >= 1 << 47 || !memory::frames_owned_by(memory::FrameOwner::KERNEL, &[root]) {
+        return None;
+    }
+    linux_active_mapping_from_leaf(page, linux_leaf_in_root(root.address(), page)?.read())
+}
+
+fn linux_active_mapping_from_leaf(page: u64, value: u64) -> Option<cpu::LinuxActiveImageMapping> {
     if value & (PRESENT | USER) != PRESENT | USER {
         return None;
     }
@@ -5455,7 +5471,7 @@ pub(crate) fn current_linux_active_mapping(address: u64) -> Option<cpu::LinuxAct
             memory::FrameLease::from_parts(frame_address, 1)
                 .filter(|frame| memory::frame_lease_is_runtime(*frame))
         })?;
-    let runtime = current_linux_runtime_page(page);
+    let runtime = linux_runtime_page_from_value(value);
     Some(cpu::LinuxActiveImageMapping {
         address: page as usize,
         frame,
@@ -5886,6 +5902,52 @@ fn current_linux_leaf_trusted(address: u64) -> Option<PageEntry> {
     None
 }
 
+/// Whether no page of the `pages` pages from `address` in the current
+/// address space is occupied (present or reserved), as
+/// `current_linux_runtime_page` would say page by page. It walks the tables
+/// a level at a time and skips what an absent table entry covers, so a
+/// search for a free range of many megabytes reads a few entries rather
+/// than every page's leaf; the walk trusts the current tables as
+/// `current_linux_leaf_trusted` does.
+pub(crate) fn current_linux_range_unoccupied(address: u64, pages: usize) -> bool {
+    let Some(end) = (pages as u64)
+        .checked_mul(PAGE_SIZE as u64)
+        .and_then(|size| address.checked_add(size))
+        .filter(|end| *end <= 1 << 47)
+    else {
+        return false;
+    };
+    let mut cursor = address & !(PAGE_SIZE as u64 - 1);
+    'pages: while cursor < end {
+        let mut table = current_root();
+        for (level, shift) in [39_u32, 30, 21].into_iter().enumerate() {
+            let Some(entries) = mapped_frame::<u64>(table & ADDRESS_MASK) else {
+                return false;
+            };
+            // SAFETY: the index is below 512 and the table is one of the
+            // current address space's own, reached through its entries.
+            let entry = unsafe { entries.add(((cursor >> shift) & 0x1ff) as usize).read() };
+            if entry & (PRESENT | USER) != PRESENT | USER || level > 0 && entry & LARGE_PAGE != 0 {
+                // Nothing below this entry is a mapped or reserved page.
+                let span = 1_u64 << shift;
+                cursor = (cursor & !(span - 1)) + span;
+                continue 'pages;
+            }
+            table = entry & ADDRESS_MASK;
+        }
+        let Some(entries) = mapped_frame::<u64>(table & ADDRESS_MASK) else {
+            return false;
+        };
+        // SAFETY: as above, for the leaf table.
+        let leaf = unsafe { entries.add(((cursor >> 12) & 0x1ff) as usize).read() };
+        if leaf & (PRESENT | LINUX_RUNTIME_RESERVED) != 0 {
+            return false;
+        }
+        cursor += PAGE_SIZE as u64;
+    }
+    true
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct LinuxRuntimePage {
     pub(crate) occupied: bool,
@@ -6171,10 +6233,31 @@ pub(crate) fn install_current_linux_shared_page(
 /// Maps a page of device memory, such as the framebuffer, that the frame
 /// allocator does not own. The page is shared, so unmapping it never frees
 /// the memory, and it is not copied into children on fork.
+/// How a device page mapped into a process is cached.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DeviceCaching {
+    WriteBack,
+    WriteCombining,
+    Uncached,
+}
+
+impl DeviceCaching {
+    /// The page-table bits selecting it (the page attribute table
+    /// `paging::install_page_attribute_table` sets up).
+    fn bits(self) -> u64 {
+        match self {
+            Self::WriteBack => 0,
+            Self::WriteCombining => WRITE_THROUGH,
+            Self::Uncached => WRITE_THROUGH | CACHE_DISABLE,
+        }
+    }
+}
+
 pub(crate) fn install_current_linux_device_page(
     address: u64,
     physical: u64,
     writable: bool,
+    caching: DeviceCaching,
 ) -> bool {
     if !physical.is_multiple_of(PAGE_SIZE as u64) || physical & !ADDRESS_MASK != 0 {
         return false;
@@ -6191,6 +6274,7 @@ pub(crate) fn install_current_linux_device_page(
         | NO_EXECUTE
         | LINUX_RUNTIME_SHARED
         | LINUX_RUNTIME_DONTFORK
+        | caching.bits()
         | if writable { WRITABLE } else { 0 };
     unsafe {
         entry.write(value);

@@ -140,11 +140,27 @@ enum Data {
     Shmem,
 }
 
+/// Where a file came from, which decides its link count once it has no
+/// name and whether it may be given one.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Origin {
+    /// Created by name: once unlinked (deleted while open) it has no links.
+    Named,
+    /// A memfd, secret memory or anonymous shared memory: a file of an
+    /// internal filesystem with one link, which no directory can name
+    /// (EXDEV).
+    Pseudo,
+    /// An O_TMPFILE file: no links until linkat(2) names it, which O_EXCL
+    /// forbids (`linkable` false).
+    Temporary { linkable: bool },
+}
+
 #[derive(Clone, Copy)]
 struct Node {
     active: bool,
     linked: bool,
     whiteout: bool,
+    origin: Origin,
     data: Data,
     kind: NodeKind,
     path_length: u16,
@@ -185,6 +201,7 @@ impl Node {
         active: false,
         linked: false,
         whiteout: false,
+        origin: Origin::Named,
         data: Data::Chain,
         kind: NodeKind::File,
         path_length: 0,
@@ -224,7 +241,13 @@ impl Node {
             mode: self.mode,
             owner: self.owner,
             group: self.group,
-            links: u32::from(self.links.max(1)),
+            // Linux counts the names a file has: none for a deleted or
+            // O_TMPFILE file still open, one for a memfd.
+            links: if self.linked || self.origin == Origin::Pseudo {
+                u32::from(self.links.max(1))
+            } else {
+                u32::from(self.links.saturating_sub(1))
+            },
             device: self.device,
             size: self.size,
             atime: self.atime,
@@ -519,8 +542,94 @@ pub(crate) fn configure_memfd(handle: Handle, allow_sealing: bool) -> bool {
         return false;
     }
     node.data = Data::Memfd;
+    node.origin = Origin::Pseudo;
     node.seals = if allow_sealing { 0 } else { 1 };
     true
+}
+
+/// Marks `handle` a file of an internal filesystem (secret memory): one
+/// link, and no directory can name it.
+pub(crate) fn mark_pseudo(handle: Handle) -> bool {
+    node_mut(handle).is_some_and(|node| {
+        node.origin = Origin::Pseudo;
+        true
+    })
+}
+
+/// The name an O_TMPFILE file is created under in its directory, for the
+/// moment before it is unlinked.
+const TEMPORARY_NAME: &[u8] = b".ginux-o-tmpfile";
+
+/// Creates an O_TMPFILE file: a regular file with no name, made as if in
+/// `directory` (owner, group and set-group-ID inheritance from it), that
+/// linkat(2) may later name unless `linkable` is false (O_EXCL).
+pub(crate) fn create_temporary(directory: &[u8], mode: u32, linkable: bool) -> Option<Handle> {
+    let mut path = [0_u8; PATH_CAPACITY];
+    let separator = usize::from(!directory.is_empty());
+    let length = directory.len() + separator + TEMPORARY_NAME.len();
+    let path = path.get_mut(..length)?;
+    path[..directory.len()].copy_from_slice(directory);
+    if separator == 1 {
+        path[directory.len()] = b'/';
+    }
+    path[directory.len() + separator..].copy_from_slice(TEMPORARY_NAME);
+    let handle = create_file(path, mode, &[])?;
+    if !unlink(handle) {
+        return None;
+    }
+    node_mut(handle)?.origin = Origin::Temporary { linkable };
+    Some(handle)
+}
+
+/// Why [`link_unnamed`] could not name a file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LinkError {
+    /// The file was deleted, or is an O_TMPFILE file opened with O_EXCL
+    /// (ENOENT).
+    Gone,
+    /// The file belongs to an internal filesystem (EXDEV).
+    CrossDevice,
+    /// Something already has that name (EEXIST).
+    Exists,
+    /// The name is invalid or the node table is full.
+    Failed,
+}
+
+/// Gives the file `handle`, which has no name, the name `path`: the
+/// linkat(2) of an O_TMPFILE file. A named file gets a hard link from
+/// [`create_link`] instead.
+pub(crate) fn link_unnamed(path: &[u8], handle: Handle) -> Result<(), LinkError> {
+    valid_path(path).ok_or(LinkError::Failed)?;
+    if lookup(path).is_some() {
+        return Err(LinkError::Exists);
+    }
+    let node = node(handle).ok_or(LinkError::Gone)?;
+    match node.origin {
+        Origin::Pseudo => return Err(LinkError::CrossDevice),
+        Origin::Temporary { linkable: true } if !node.linked => {}
+        _ => return Err(LinkError::Gone),
+    }
+    // A whiteout of the same name hides the image's entry; the file takes
+    // its place by taking over the name.
+    if hidden(path) {
+        let overlay = live_mut();
+        let whiteout = node_by_path_mut(overlay, path).ok_or(LinkError::Failed)?;
+        *whiteout = Node::EMPTY;
+    }
+    let node = node_mut(handle).ok_or(LinkError::Gone)?;
+    node.path = [0; PATH_CAPACITY];
+    node.path[..path.len()].copy_from_slice(path);
+    node.path_length = path.len() as u16;
+    node.linked = true;
+    node.links = 1;
+    // Named once, it is an ordinary file (Linux clears I_LINKABLE).
+    node.origin = Origin::Named;
+    Ok(())
+}
+
+/// Whether the file `handle` still has a name.
+pub(crate) fn linked(handle: Handle) -> bool {
+    node(handle).is_some_and(|node| node.linked)
 }
 
 /// Returns the frame that holds page `index` of a paged file (a memfd, or a
@@ -541,6 +650,7 @@ pub(crate) fn create_shmem() -> Option<Handle> {
         let paged = make_node_paged(node);
         if paged {
             node.data = Data::Shmem;
+            node.origin = Origin::Pseudo;
         }
         paged
     });
@@ -782,6 +892,7 @@ fn create(path: &[u8], kind: NodeKind, mode: u32, initial: &[u8]) -> Option<Hand
         active: true,
         linked: true,
         whiteout: false,
+        origin: Origin::Named,
         data: Data::Chain,
         kind,
         path_length: path.len() as u16,
@@ -858,6 +969,7 @@ pub(crate) fn whiteout(path: &[u8]) -> bool {
         active: true,
         linked: true,
         whiteout: true,
+        origin: Origin::Named,
         data: Data::Chain,
         kind: NodeKind::File,
         path_length: path.len() as u16,

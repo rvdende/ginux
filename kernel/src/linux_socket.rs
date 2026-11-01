@@ -82,6 +82,10 @@ pub(crate) enum Kind {
     Tcp,
     Udp,
     Unix,
+    /// Not a socket: an open file of a kernel object (a DRM render node, a
+    /// GPU fence, a dma-buf) that descriptors share as they share sockets,
+    /// by reference; [`object`] says which.
+    Object,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -245,6 +249,8 @@ struct Slot {
     unix_type: u8,
     /// The path a Unix socket is bound to; empty when it has none.
     unix_path: Vec<u8>,
+    /// An object slot's class and id.
+    object: (u8, u64),
 }
 
 impl Slot {
@@ -271,6 +277,7 @@ impl Slot {
             local_capacity: 0,
             unix_type: 0,
             unix_path: Vec::new(),
+            object: (0, 0),
         }
     }
 
@@ -322,6 +329,8 @@ struct Sockets {
     file_rights: Vec<(u32, FileRight)>,
     /// Rights queued on Unix sockets and not yet received.
     unix_inflight_rights: usize,
+    /// Objects whose last reference closed, for their owner to release.
+    released: Vec<(u8, u64)>,
 }
 
 static SOCKETS: SpinLock<Sockets> = SpinLock::new(
@@ -332,6 +341,7 @@ static SOCKETS: SpinLock<Sockets> = SpinLock::new(
         slots: Vec::new(),
         file_rights: Vec::new(),
         unix_inflight_rights: 0,
+        released: Vec::new(),
     },
 );
 
@@ -590,6 +600,7 @@ impl Sockets {
     fn open(&mut self, kind: Kind) -> Result<SlotId, Error> {
         let handle = match kind {
             Kind::Unix => return self.open_unix(1),
+            Kind::Object => return Err(Error::Invalid),
             Kind::Tcp => add_tcp_socket(self.runtime()?)?,
             Kind::Udp => add_udp_socket(self.runtime()?)?,
         };
@@ -619,6 +630,7 @@ impl Sockets {
             Kind::Tcp => Some(1),
             Kind::Udp => Some(2),
             Kind::Unix => Some(state.unix_type),
+            Kind::Object => None,
         }
     }
 
@@ -749,6 +761,16 @@ impl Sockets {
         };
         if state.references > 1 {
             state.references -= 1;
+            return true;
+        }
+        if state.kind == Kind::Object {
+            let object = state.object;
+            self.slots[index] = None;
+            // Kept for the owner to release outside this lock; a full
+            // list leaks the object rather than failing the close.
+            if self.released.try_reserve(1).is_ok() {
+                self.released.push(object);
+            }
             return true;
         }
         if state.kind == Kind::Unix || state.handle.is_none() && !state.listening {
@@ -1176,7 +1198,7 @@ impl Sockets {
                 state.remote = Some(remote);
                 Ok(())
             }
-            Kind::Unix => Err(Error::Invalid),
+            Kind::Unix | Kind::Object => Err(Error::Invalid),
         }
     }
 
@@ -1251,7 +1273,7 @@ impl Sockets {
                     .map(|_| input.len())
                     .map_err(|_| Error::WouldBlock)
             }
-            Kind::Unix => Err(Error::Invalid),
+            Kind::Unix | Kind::Object => Err(Error::Invalid),
         }
     }
 
@@ -1312,7 +1334,7 @@ impl Sockets {
                 .recv_slice(output)
                 .map(|(size, metadata)| (size, Some(metadata.endpoint)))
                 .map_err(|_| Error::WouldBlock),
-            Kind::Unix => Err(Error::Invalid),
+            Kind::Unix | Kind::Object => Err(Error::Invalid),
         }
     }
 
@@ -1429,7 +1451,7 @@ impl Sockets {
                 .peek_slice(output)
                 .map(|(size, metadata)| (size, Some(metadata.endpoint)))
                 .map_err(|_| Error::WouldBlock),
-            Kind::Unix => Err(Error::Invalid),
+            Kind::Unix | Kind::Object => Err(Error::Invalid),
         }
     }
 
@@ -1509,7 +1531,7 @@ impl Sockets {
                 let socket = runtime.sockets.get::<udp::Socket>(handle);
                 (socket.can_recv(), socket.can_send(), false)
             }
-            Kind::Unix => return None,
+            Kind::Unix | Kind::Object => return None,
         })
     }
 
@@ -1805,6 +1827,28 @@ pub(crate) fn duplicate(id: SlotId) -> bool {
 
 pub(crate) fn kind(id: SlotId) -> Option<Kind> {
     SOCKETS.lock().slot(id).map(|state| state.kind)
+}
+
+/// Opens an object slot for `class` and `id`, with one reference.
+pub(crate) fn open_object(class: u8, id: u64) -> Result<SlotId, Error> {
+    let mut sockets = SOCKETS.lock();
+    let mut slot = Slot::new(Kind::Object, current_owner());
+    slot.object = (class, id);
+    sockets.insert(slot)
+}
+
+/// The class and id of object slot `id`.
+pub(crate) fn object(id: SlotId) -> Option<(u8, u64)> {
+    SOCKETS
+        .lock()
+        .slot(id)
+        .filter(|state| state.kind == Kind::Object)
+        .map(|state| state.object)
+}
+
+/// The objects whose last reference has closed since the last call.
+pub(crate) fn take_released_objects() -> Vec<(u8, u64)> {
+    core::mem::take(&mut SOCKETS.lock().released)
 }
 
 pub(crate) fn is_listening(id: SlotId) -> bool {

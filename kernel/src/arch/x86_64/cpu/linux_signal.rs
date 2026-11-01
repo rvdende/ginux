@@ -566,7 +566,7 @@ pub(super) fn linux_rt_sigtimedwait_live_return(
             .LINUX_SYSTEM_SUPERVISOR_WAIT_COUNT
             .load(Ordering::SeqCst)
             != 0
-            || !refresh_live_linux_process_registry(caller)
+            || !refresh_linux_process_registry_for_wait(caller)
             || !save_linux_thread_return_context(current, caller)
             || !block_current_linux_thread(LINUX_THREAD_WAIT_SIGNAL, requested, information, 0)
         {
@@ -701,6 +701,22 @@ pub(super) fn wake_linux_signal_wait_target(
         return true;
     }
     false
+}
+
+/// How long until the earliest deadline a blocked thread of this process
+/// waits for, if any thread has one.
+pub(crate) fn linux_nanoseconds_to_next_wait_deadline() -> Option<u64> {
+    if !X86_RUNTIME.LINUX_TIMED_WAITS_ACTIVE.load(Ordering::Acquire) {
+        return None;
+    }
+    let deadline = (0..LINUX_THREAD_LIMIT)
+        .filter(|slot| {
+            X86_RUNTIME.LINUX_THREAD_STATES[*slot].load(Ordering::Acquire) == LINUX_THREAD_BLOCKED
+        })
+        .map(|slot| X86_RUNTIME.LINUX_THREAD_WAIT_DEADLINES[slot].load(Ordering::Acquire))
+        .filter(|deadline| *deadline != 0)
+        .min()?;
+    Some(deadline.saturating_sub(linux_elapsed_nanoseconds()?))
 }
 
 pub(super) fn expire_linux_waits() -> u32 {
@@ -842,6 +858,16 @@ pub(super) fn linux_interrupt_context(handle: LinuxThreadHandle) -> Option<UserF
         rflags: saved.rflags,
         rsp: saved.rsp,
     })
+}
+
+/// Records where the runtime CPU was for a SysRq `l` profile.
+pub(crate) fn sample_linux_profile(frame: &UserInterruptFrame) {
+    let (instruction, code_selector) = frame.interrupted_at();
+    crate::linux_profile::sample(
+        current_linux_process_pid(),
+        code_selector != u64::from(USER_CODE_SELECTOR),
+        instruction,
+    );
 }
 
 pub(crate) fn expire_linux_waits_from_timer(frame: &mut UserInterruptFrame) {

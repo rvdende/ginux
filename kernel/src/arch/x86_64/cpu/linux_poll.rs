@@ -179,22 +179,6 @@ pub(super) fn linux_select_ready(
     Ok((ready_read, ready_write, ready_count))
 }
 
-pub(super) fn linux_select_waits_for_attached_console(snapshot: LinuxSelectSnapshot) -> bool {
-    let Some(slot) = active_container_slot() else {
-        return false;
-    };
-    if !X86_RUNTIME.CONTAINER_CONSOLE_ATTACHED[slot].load(Ordering::Acquire) {
-        return false;
-    }
-    (0..snapshot.input.descriptor_count).any(|descriptor| {
-        let word = descriptor as usize / u64::BITS as usize;
-        let bit = 1_u64 << (descriptor % u64::BITS as u64);
-        snapshot.requested_read[word] & bit != 0
-            && (u16::from(linux_console_descriptor(descriptor)) & LINUX_DESCRIPTOR_INPUT != 0
-                || linux_device_descriptor(descriptor) & LINUX_DEVICE_CONSOLE != 0)
-    })
-}
-
 pub(super) fn linux_select_copy_result(
     snapshot: LinuxSelectSnapshot,
     ready_read: [u64; LINUX_SELECT_WORD_LIMIT],
@@ -435,39 +419,6 @@ pub(super) fn linux_select_live_return(
             LINUX_EFAULT
         };
     }
-    // An attached domain console is serviced directly by the serial device.
-    // There may be no second runnable Linux thread while an exec child owns
-    // that console, so waiting through the Linux thread scheduler would return
-    // ENOSYS. Wait on the device here and let the following read consume the
-    // byte (including the controller detach escape).
-    if linux_select_waits_for_attached_console(parsed.snapshot) {
-        let deadline = parsed.duration.and_then(|duration| {
-            linux_elapsed_nanoseconds().and_then(|now| now.checked_add(duration))
-        });
-        while !crate::serial_input_ready() {
-            if deadline.is_some_and(|deadline| {
-                linux_elapsed_nanoseconds().is_some_and(|now| now >= deadline)
-            }) {
-                return linux_select_copy_result(
-                    parsed.snapshot,
-                    [0; LINUX_SELECT_WORD_LIMIT],
-                    [0; LINUX_SELECT_WORD_LIMIT],
-                    copy_to_linux_user,
-                );
-            }
-            core::hint::spin_loop();
-        }
-        let (ready_read, ready_write, _) = match linux_select_ready(parsed.snapshot) {
-            Ok(ready) => ready,
-            Err(error) => return error,
-        };
-        return linux_select_copy_result(
-            parsed.snapshot,
-            ready_read,
-            ready_write,
-            copy_to_linux_user,
-        );
-    }
     // With no other thread of this process to switch to, wait here and let
     // other processes run; one of them, or the network, may make a
     // descriptor ready.
@@ -667,7 +618,7 @@ pub(super) fn yield_current_linux_process(mut caller: LinuxUserContext, result: 
     }
     caller.rax = result;
     let pid = current_linux_process_pid();
-    if !refresh_live_linux_process_registry(caller) {
+    if !refresh_linux_process_registry_for_wait(caller) {
         return false;
     }
     X86_RUNTIME

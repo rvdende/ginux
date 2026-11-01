@@ -96,40 +96,42 @@ the virtio-gpu scanout shows the compositor and terminal only if the driver
 became the display in the host's mode and flushed what the compositor wrote
 through its mapping.
 
-## Toward 3D: virgl, Venus and Vulkan
+## 3D: Venus (Vulkan on the host GPU)
 
-The 2D driver is the base for GPU acceleration in VMs. Venus (Mesa's
-Vulkan-over-virtio-gpu driver) needs, roughly in order:
+Ginux runs unmodified Vulkan applications on the host's GPU through Mesa's
+Venus driver, as a Linux guest does. With `GINUX_QEMU_GPU=venus`, run.sh
+gives QEMU a `virtio-gpu-gl-pci` with `blob=on,venus=on`, a `hostmem`
+region (default 4 GiB) and `ioeventfd=on`, on an EGL display
+(`egl-headless`, or `gtk,gl=on` with `GINUX_QEMU_DISPLAY=gtk`). The host
+needs virglrenderer built with Venus (QEMU 10.2 and virglrenderer 1.2 on
+this machine).
 
-1. **Interrupts and fences.** Replace polling with an MSI-X vector for the
-   control queue, and use `VIRTIO_GPU_FLAG_FENCE` so a submission can be
-   waited on without spinning. Many commands in flight, not one batch.
-2. **Feature negotiation for 3D.** Accept `VIRTIO_GPU_F_VIRGL`,
-   `VIRTIO_GPU_F_RESOURCE_BLOB` and `VIRTIO_GPU_F_CONTEXT_INIT` (the driver
-   already reports which the host offers at boot), read capsets with
-   `GET_CAPSET_INFO`/`GET_CAPSET` (Venus is capset 4).
-3. **Contexts per domain.** `CTX_CREATE` with the Venus capset in the
-   context-init flags, one or more per domain, destroyed with the domain;
-   `SUBMIT_3D` carries Venus command streams.
-4. **Blob resources and host-visible memory.** `RESOURCE_CREATE_BLOB`, and
-   the virtio shared-memory region (PCI capability type 8, the `hostmem`
-   BAR) mapped into a domain with `RESOURCE_MAP_BLOB` for Vulkan memory the
-   host GPU writes.
-5. **A Linux uAPI for Mesa.** Venus talks to `/dev/dri/renderD128` through
-   the virtgpu DRM ioctls (`GETPARAM`, `GET_CAPS`, `CONTEXT_INIT`,
-   `RESOURCE_CREATE_BLOB`, `MAP`, `EXECBUFFER`, `WAIT`, `RESOURCE_INFO`),
-   plus the generic DRM version/prime calls. The Linux personality would
-   expose that render node and route it to the domain's contexts.
-6. **Isolation.** The command streams are untrusted; per-domain contexts and
-   resource IDs, and eventually the driver in a ring-3 driver domain with
-   IOMMU-confined DMA (decision 0002), keep one domain from reaching
-   another's resources.
+| Piece | Where | What it does |
+| --- | --- | --- |
+| 3D commands | `crates/virtio-gpu` | Context, capset, blob (create, map, unmap), fenced `SUBMIT_3D` with a ring index, the shared-memory capability. |
+| Device | `kernel/src/drivers/virtio_gpu.rs` | Negotiates `VIRGL`, `RESOURCE_BLOB` and `CONTEXT_INIT`, reads the capsets, places blobs in the host-visible region, keeps fenced submissions in flight (out-of-order completion), and reports a busy queue or fence as `EAGAIN` rather than spinning. |
+| Render node | `crates/drm` (`ginux-drm`), `kernel/src/linux_drm.rs` | `/dev/dri/renderD128` (226:128) with the virtgpu ioctls Mesa uses, sync-file fences, dma-buf export and import, and the sysfs entries libdrm's `drmGetDevices2` reads. An ioctl that must wait for the GPU lets the domain run and is issued again. |
+| Mappings | `kernel/src/arch/x86_64/cpu.rs` (`linux_object_mmap`) | Blob pages are mapped with the caching the host gives in `RESOURCE_MAP_BLOB` (write-back, write-combining or uncached, through the page attribute table every CPU programs). A write-back mapping of memory the GPU writes without snooping never sees fence feedback change. |
 
-On the host side this needs QEMU's `virtio-gpu-gl-pci` with `blob=on` and
-`venus=on`, a `hostmem` size, virglrenderer built with Venus, and an EGL
-display (`-display egl-headless` or `gtk,gl=on`).
+Mesa presents through `wl_shm` (`MESA_VK_WSI_DEBUG=sw`), since ginux-wm has
+no linux-dmabuf yet: the Venus WSI copies each rendered frame into a shared
+memory buffer, which the compositor draws straight from the client's pool.
 
-Smaller follow-ups for the 2D path: the cursor queue (hardware cursor for the
-compositor), display-change events (`VIRTIO_GPU_EVENT_DISPLAY`, resizing the
-host window) with an fbdev mode change, EDID, multiple scanouts, and damage
-tracking for mapped `/dev/fb0` instead of the periodic full refresh.
+### Measured (2026-11-01)
+
+cadrs (Bevy, wgpu) in an Ubuntu 26.04 domain with one CPU, 1280x800, its
+`camera_frame_walk` scenario, on the host's Radeon RX 6800 XT through Venus:
+median frame 23 ms windowed under ginux-wm (p90 33 ms), 18 ms headless.
+Software rendering (lavapipe) on the same domain was 295 ms. Multi-CPU
+domains (`cpu=N`) are not yet usable with a compositor: a process whose
+threads run on other CPUs cannot be switched out (docs/SCHEDULER.md).
+
+```sh
+GINUX_QEMU_GPU=venus tools/qemu/run.sh
+# in the domain:
+VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.json MESA_VK_WSI_DEBUG=sw vulkaninfo --summary
+```
+
+Isolation is still per kernel: contexts and resources belong to the open
+render node file, but the driver runs in the kernel rather than a ring-3
+driver domain (decision 0002), and command streams go to the host as given.

@@ -450,6 +450,7 @@ pub(super) const LINUX_F_GETPIPE_SZ: u64 = 1032;
 /// /proc/sys/fs/pipe-max-size: the largest pipe an unprivileged process may ask for.
 pub(super) const LINUX_PIPE_MAX_SIZE: u64 = 1_048_576;
 pub(super) const LINUX_EEXIST: u64 = u64::MAX - 16;
+pub(super) const LINUX_EXDEV: u64 = u64::MAX - 17;
 pub(super) const LINUX_ENODEV: u64 = u64::MAX - 18;
 pub(super) const LINUX_ENOTDIR: u64 = u64::MAX - 19;
 pub(super) const LINUX_EISDIR: u64 = u64::MAX - 20;
@@ -673,6 +674,10 @@ pub(super) const LINUX_PROC_PID2_STATUS_NODE: u16 = 0xf900;
 pub(super) const LINUX_FILE_PROC_PID2_STATUS: u16 = LINUX_FILE_MASK | LINUX_PROC_PID2_STATUS_NODE;
 pub(super) const LINUX_PROC_MOUNTS_NODE: u16 = 0xdd00;
 pub(super) const LINUX_FILE_PROC_MOUNTS: u16 = LINUX_FILE_MASK | LINUX_PROC_MOUNTS_NODE;
+/// `/proc/sysrq-trigger`: writing `t` lists every task to the kernel log.
+pub(super) const LINUX_PROC_SYSRQ_TRIGGER_NODE: u16 = 0xdc00;
+pub(super) const LINUX_FILE_PROC_SYSRQ_TRIGGER: u16 =
+    LINUX_FILE_MASK | LINUX_PROC_SYSRQ_TRIGGER_NODE;
 /// Read-only `/proc/sys` values: node, path under `/proc`, contents. Values
 /// match what Ginux implements (four user namespaces). Leave out values that
 /// tests save and restore (io_uring_disabled): LTP skips a test when such a
@@ -812,8 +817,10 @@ pub(super) const LINUX_EXEC_LOW_LIMIT: u64 = 0x80_0000;
 pub(super) const LINUX_EXEC_HIGH_LOAD_BASE: u64 = 0x100_0000_0000;
 pub(super) const LINUX_EXEC_HIGH_LIMIT: u64 = 0x180_0000_0000;
 /// The most pages a runtime exec copies in for its program and loader
-/// segments (256 MiB).
-pub(super) const LINUX_EXEC_IMAGE_PAGE_LIMIT: usize = 65_536;
+/// segments (1 GiB: large Rust programs such as a Bevy application are
+/// several hundred MiB). Exec copies the file; mapping its segments from a
+/// page cache instead would lift the copy and the limit.
+pub(super) const LINUX_EXEC_IMAGE_PAGE_LIMIT: usize = 262_144;
 pub(super) const LINUX_PLATFORM: &[u8] = b"x86_64\0";
 pub(super) const LINUX_F_DUPFD: u64 = 0;
 pub(super) const LINUX_F_GETFD: u64 = 1;
@@ -946,7 +953,7 @@ use super::{LINUX_RUNTIME_INSTANCE_LIMIT, PAGE_SIZE};
 /// The fixed file nodes and the `/proc/sys` nodes are distinct and clear of
 /// the `/dev/input/eventN` range, so no file is taken for another.
 const _: () = {
-    const NODES: [u16; 37] = [
+    const NODES: [u16; 38] = [
         LINUX_PROC_PID2_DIRECTORY_NODE,
         LINUX_PROC_FD_DIRECTORY_NODE,
         LINUX_PROC_PID2_STATUS_NODE,
@@ -984,6 +991,7 @@ const _: () = {
         LINUX_SETGROUPS_FILE_NODE,
         LINUX_TMP_FILE_NODE,
         LINUX_FRAMEBUFFER_NODE,
+        LINUX_PROC_SYSRQ_TRIGGER_NODE,
     ];
     const fn node(index: usize) -> u16 {
         if index < NODES.len() {

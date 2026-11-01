@@ -1612,6 +1612,28 @@ pub(crate) fn map_kernel_stack_page(
     true
 }
 
+/// Programs this CPU's page attribute table, which is per CPU: entry 0 stays
+/// write-back, PWT alone selects write-combining (entry 1) and PCD|PWT
+/// uncached (entry 3), as Linux sets it up. Device memory mapped into a
+/// process (a GPU's host-visible blobs) takes the caching its device asks
+/// for through these bits.
+pub(crate) fn install_page_attribute_table() {
+    // SAFETY: IA32_PAT only changes what the PAT, PCD and PWT bits of page
+    // table entries mean. Entry 0 (no bits) stays write-back and entries 2
+    // and 3 keep their defaults, so existing mappings keep their types;
+    // entry 1 (PWT alone) becomes write-combining, which is what the
+    // framebuffer window and device pages setting it ask for.
+    unsafe {
+        asm!(
+            "wrmsr",
+            in("ecx") PAT_MSR,
+            in("eax") PAT_WITH_WRITE_COMBINING as u32,
+            in("edx") (PAT_WITH_WRITE_COMBINING >> 32) as u32,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 /// Maps a framebuffer write-combining into the direct-map slot reserved for it
 /// and returns the virtual address of `physical`. The window holds 1 GiB.
 unsafe fn map_framebuffer_window(

@@ -6,7 +6,10 @@ pub(crate) const PROGRAM_HEADER_SIZE: usize = 56;
 const MIN_LOAD_SEGMENT_COUNT: usize = 2;
 const MAX_LOAD_SEGMENT_COUNT: usize = 3;
 const MAX_PROGRAM_HEADER_COUNT: usize = 9;
-const MAX_RELOCATABLE_LOAD_SEGMENT_COUNT: usize = 4;
+/// Load segments of a dynamically linked program or its loader: lld and
+/// mold give RELRO data and writable data separate segments, so a program
+/// commonly has four or five.
+const MAX_RELOCATABLE_LOAD_SEGMENT_COUNT: usize = 8;
 const MAX_RELOCATABLE_PROGRAM_HEADER_COUNT: usize = 16;
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
@@ -776,6 +779,8 @@ pub(crate) struct RelocatableProcessPlan<'main, 'interpreter> {
     pub(crate) initial_entry: u64,
 }
 
+// A plan lives on the stack for one exec; its 1 KiB is not worth a box.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum RelocatableExecutablePlan<'main, 'interpreter> {
     Interpreted(RelocatableProcessPlan<'main, 'interpreter>),
     Static(RelocatableLoadPlan<'main>),
@@ -1284,19 +1289,13 @@ fn parse_relocatable(bytes: &[u8]) -> Option<RelocatableImage<'_>> {
         return None;
     }
 
+    // Any number of segments may be writable or executable, as in Linux;
+    // the entry point must lie in an executable one (checked below).
     let loads = &segments[..segment_count];
-    if loads
+    if !loads
         .iter()
         .flatten()
-        .filter(|segment| segment.flags & PF_EXECUTE != 0)
-        .count()
-        != 1
-        || loads
-            .iter()
-            .flatten()
-            .filter(|segment| segment.flags & PF_WRITE != 0)
-            .count()
-            != 1
+        .any(|segment| segment.flags & PF_EXECUTE != 0)
     {
         return None;
     }
@@ -2165,13 +2164,11 @@ fn parse_segment(bytes: &[u8], header: usize, position_independent: bool) -> Opt
     })
 }
 
+/// A PT_GNU_STACK asking for a non-executable stack. Linux reads only its
+/// flags; linkers differ in the rest (mold aligns it to 1, ld to 16).
 fn valid_gnu_stack(bytes: &[u8], header: usize) -> bool {
     read_u32(bytes, header) == Some(PT_GNU_STACK)
         && read_u32(bytes, header + 4) == Some(PF_READ | PF_WRITE)
-        && (8..48)
-            .step_by(8)
-            .all(|offset| read_u64(bytes, header + offset) == Some(0))
-        && matches!(read_u64(bytes, header + 48), Some(0 | 16))
 }
 
 fn parse_phdr(bytes: &[u8], header: usize, program_header_count: usize) -> Option<u64> {

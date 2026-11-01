@@ -718,6 +718,7 @@ pub(crate) fn initialize(boot_info: &BootInfo, ceiling: u64) -> bool {
 }
 
 pub(crate) fn allocate_frames<const N: usize>(owner: FrameOwner) -> Option<[FrameLease; N]> {
+    crate::linux_profile::count_memory(0);
     if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) {
         return None;
     }
@@ -936,6 +937,7 @@ pub(crate) fn frame_leases_releasable(owner: FrameOwner, frames: &[FrameLease]) 
 }
 
 pub(crate) fn live_frame_lease(owner: FrameOwner, address: u64) -> Option<FrameLease> {
+    crate::linux_profile::count_memory(7);
     if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) {
         return None;
     }
@@ -945,6 +947,7 @@ pub(crate) fn live_frame_lease(owner: FrameOwner, address: u64) -> Option<FrameL
 }
 
 pub(crate) fn scrub_and_release_frames(owner: FrameOwner, frames: &[FrameLease]) -> bool {
+    crate::linux_profile::count_memory(1);
     if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) || frames.is_empty() {
         return false;
     }
@@ -978,6 +981,7 @@ pub(crate) fn scrub_and_release_frames(owner: FrameOwner, frames: &[FrameLease])
 /// Records that one more address space maps each of `frames`, so releasing
 /// them drops that mapping instead of freeing the pages. All or none.
 pub(crate) fn share_frames(owner: FrameOwner, frames: &[FrameLease]) -> bool {
+    crate::linux_profile::count_memory(2);
     if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) || frames.is_empty() {
         return false;
     }
@@ -988,6 +992,7 @@ pub(crate) fn share_frames(owner: FrameOwner, frames: &[FrameLease]) -> bool {
 
 /// Whether another address space also maps `frame`.
 pub(crate) fn frame_is_shared(frame: FrameLease) -> bool {
+    crate::linux_profile::count_memory(3);
     if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) {
         return false;
     }
@@ -1006,6 +1011,7 @@ pub(crate) fn transfer_frame_owner(from: FrameOwner, to: FrameOwner) -> Option<u
 }
 
 pub(crate) fn frames_owned_by(owner: FrameOwner, frames: &[FrameLease]) -> bool {
+    crate::linux_profile::count_memory(4);
     if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) {
         return false;
     }
@@ -1018,6 +1024,7 @@ pub(crate) fn frames_owned_by(owner: FrameOwner, frames: &[FrameLease]) -> bool 
 }
 
 pub(crate) fn any_frame_lease_live(frames: &[FrameLease]) -> bool {
+    crate::linux_profile::count_memory(5);
     if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) {
         return false;
     }
@@ -1027,6 +1034,7 @@ pub(crate) fn any_frame_lease_live(frames: &[FrameLease]) -> bool {
 }
 
 pub(crate) fn frame_addresses_owned_by(owner: FrameOwner, addresses: &[u64]) -> bool {
+    crate::linux_profile::count_memory(6);
     if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) {
         return false;
     }

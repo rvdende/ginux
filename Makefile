@@ -17,7 +17,7 @@ SYSTEM_PROFILE := profiles/minimal-system-v0/profile.tsv
 
 .DEFAULT_GOAL := help
 
-.PHONY: help doctor manifest system-image test-alpine test-rocky-shell test-rocky-dnf test-multi-domain test-multi-domain-detached test-linux-abi test-linux-runtime test-storage test-oci-cache test-smp test-rocky-smp-futex test-rocky-smp-shared-page test-rocky-smp-thread-context probe-rocky-systemd test-rocky-systemd test-rocky-detached test-domain-responsiveness benchmark-rocky-systemd benchmark-prepare-linux benchmark-prepare-ginux benchmark-linux-comparison benchmark-ginux-boot benchmark-boot-comparison benchmark-ginux-sysbench benchmark-compare benchmark-topology-matrix benchmark-topology-compare profile-rocky-systemd rocky-image rocky-image-check linux-probe controller-runtime network-service protocol-service volume-service abi-conformance architecture-check linux-compat-check build build-verification build-linux-profile run reset-storage boot-media test-boot-media test-hardware-profile test-rust-workloads test-desktop test-desktop-virtio-gpu test-rust-userlandrust-rootfs userland userland-check ltp test-ltp test test-c1 test-c2 fmt gate clean
+.PHONY: help doctor manifest system-image test-alpine test-rocky-shell test-rocky-dnf test-multi-domain test-multi-domain-detached test-linux-abi test-linux-runtime test-storage test-oci-cache test-smp test-rocky-smp-futex test-rocky-smp-shared-page test-rocky-smp-thread-context probe-rocky-systemd test-rocky-systemd test-rocky-detached test-domain-responsiveness benchmark-rocky-systemd benchmark-prepare-linux benchmark-prepare-ginux benchmark-linux-comparison benchmark-ginux-boot benchmark-boot-comparison benchmark-ginux-sysbench benchmark-compare benchmark-topology-matrix benchmark-topology-compare profile-rocky-systemd rocky-image rocky-image-check linux-probe controller-runtime network-service protocol-service volume-service abi-conformance architecture-check linux-compat-check build build-verification build-linux-profile run reset-storage boot-media test-boot-media test-hardware-profile test-rust-workloads test-desktop test-desktop-virtio-gpu test-rust-userlandrust-rootfs userland userland-check ltp test-ltp ltp-check test test-c1 test-c2 fmt gate clean
 
 help:
 	@echo "Ginux development targets"
@@ -35,6 +35,7 @@ help:
 	@echo "  make test-desktop-virtio-gpu  The same desktop on a virtio-gpu display (no VGA)"
 	@echo "  make ltp                 Build the LTP syscall tests statically for musl (Docker)"
 	@echo "  make test-ltp            Run the LTP syscall tests in an Alpine domain (docs/LTP.md)"
+	@echo "  make ltp-check           Check the LTP harness (tests/ltp): fmt, clippy, unit tests"
 	@echo "  make test-rocky-shell Download Rocky at runtime and verify its glibc shell in QEMU"
 	@echo "  make test-rocky-dnf   Download Rocky and verify a real dnf update in QEMU"
 	@echo "  make test-multi-domain Run concurrent Rocky domains in QEMU"
@@ -263,9 +264,18 @@ rust-rootfs:
 ltp:
 	@tools/ltp/build.sh
 
-# LTP_TESTS="a b" or LTP_FILTER=REGEX select tests; see docs/LTP.md.
+# LTP_TESTS="a b" or LTP_FILTER=REGEX select tests, LTP_STRICT=1 fails on
+# every failure (not only regressions against tests/ltp/baseline.txt), and
+# LTP_ARGS passes options to tests/qemu/ltp.sh (e.g. LTP_ARGS='-- -q');
+# see docs/LTP.md.
 test-ltp: build
-	@GINUX_ESP_DIR="$${GINUX_ESP_DIR:-$(abspath $(ESP_DIR))}" tests/qemu/ltp.sh
+	@GINUX_ESP_DIR="$${GINUX_ESP_DIR:-$(abspath $(ESP_DIR))}" tests/qemu/ltp.sh $(LTP_ARGS)
+
+# The LTP harness's own checks: formatting, clippy and its unit tests.
+ltp-check:
+	@cargo fmt --manifest-path tests/ltp/Cargo.toml --check
+	@cargo clippy --manifest-path tests/ltp/Cargo.toml --all-targets -- -D warnings
+	@cargo test --manifest-path tests/ltp/Cargo.toml --lib
 
 test-rust-userland: rust-rootfs build
 	@tests/qemu/rust-userland.sh
@@ -338,6 +348,8 @@ check: manifest architecture-check linux-compat-check
 	@cargo test --package ginux-memory-areas
 	@cargo clippy --package ginux-keyrings --all-targets -- -D warnings
 	@cargo test --package ginux-keyrings
+	@cargo clippy --package ginux-drm --all-targets -- -D warnings
+	@cargo test --package ginux-drm
 	@cargo clippy --package ginux-usb-audio --all-targets -- -D warnings
 	@cargo test --package ginux-usb-audio
 	@cargo clippy --package ginux-usb-hid --all-targets -- -D warnings

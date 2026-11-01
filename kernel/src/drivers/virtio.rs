@@ -6,8 +6,10 @@
 //! live in can join the device window. [`Transport`] then drives the common
 //! configuration through that mapping (reset, feature negotiation, queue
 //! setup, status), and [`SplitQueue`] is a split virtqueue that carries
-//! request/response descriptor chains. There are no interrupts: MSI-X stays
-//! off and INTx is masked, and drivers poll the used ring.
+//! descriptor chains: any number in flight, each returned when the device
+//! has used it, in whatever order it finishes them. There are no
+//! interrupts: MSI-X stays off and INTx is masked, and drivers poll the
+//! used ring.
 //!
 //! This is separate from the reference block and network transport in
 //! `arch/x86_64/pci.rs`, which hands those devices to ring-3 services; the
@@ -30,6 +32,9 @@ const CAPABILITY_LIMIT: usize = 48;
 const CONFIG_COMMON: u8 = 1;
 const CONFIG_NOTIFY: u8 = 2;
 const CONFIG_DEVICE: u8 = 4;
+/// A shared memory region (`VIRTIO_PCI_CAP_SHARED_MEMORY_CFG`), described
+/// by a 64-bit capability.
+const CONFIG_SHARED_MEMORY: u8 = 8;
 /// The largest register span mapped for one device.
 const MAX_REGISTER_SPAN: u64 = 64 * 1024;
 
@@ -76,6 +81,19 @@ pub(crate) struct Probe {
     notify: Window,
     device: Window,
     notify_multiplier: u32,
+    /// The device's shared memory regions: (id, physical address, length).
+    pub(crate) shared_memory: [Option<(u8, u64, u64)>; 2],
+}
+
+impl Probe {
+    /// Shared memory region `id`: its physical address and length.
+    pub(crate) fn shared_memory(&self, id: u8) -> Option<(u64, u64)> {
+        self.shared_memory
+            .iter()
+            .flatten()
+            .find(|(region, ..)| *region == id)
+            .map(|(_, address, length)| (*address, *length))
+    }
 }
 
 /// One `virtio_pci_cap`: which structure, in which BAR, at what offset.
@@ -102,6 +120,7 @@ pub(crate) fn probe(function: Function) -> Option<Probe> {
     let mut notify = None;
     let mut device = None;
     let mut notify_multiplier = 0;
+    let mut shared_memory = [None; 2];
     let mut pointer = config_byte(function, PCI_CAPABILITY_POINTER) & 0xfc;
     for _ in 0..CAPABILITY_LIMIT {
         if pointer < 0x40 {
@@ -120,6 +139,23 @@ pub(crate) fn probe(function: Function) -> Option<Probe> {
             _ => None,
         };
         let bar = config_byte(function, pointer + 4);
+        if kind == CONFIG_SHARED_MEMORY
+            && config_byte(function, pointer) == CAPABILITY_VENDOR_SPECIFIC
+            && length >= 24
+            && bar < 6
+        {
+            let id = config_byte(function, pointer + 5);
+            let high = |offset: u8| u64::from(function.read_u32(pointer + offset)) << 32;
+            let offset = u64::from(function.read_u32(pointer + 8)) | high(16);
+            let size = u64::from(function.read_u32(pointer + 12)) | high(20);
+            let base = function.memory_bar(bar);
+            if let (Some(slot), Some(address)) = (
+                shared_memory.iter_mut().find(|slot| slot.is_none()),
+                base.and_then(|base| base.checked_add(offset)),
+            ) {
+                *slot = Some((id, address, size));
+            }
+        }
         // The first usable structure of each type is the one to use.
         if let Some(slot) = slot.filter(|slot| slot.is_none() && bar < 6) {
             if kind == CONFIG_NOTIFY {
@@ -159,6 +195,7 @@ pub(crate) fn probe(function: Function) -> Option<Probe> {
         notify: window(notify),
         device: window(device),
         notify_multiplier,
+        shared_memory,
     })
 }
 
@@ -294,6 +331,13 @@ impl Transport {
             self.common.write(register + 4, (address >> 32) as u32);
         }
         self.common.write(COMMON_QUEUE_ENABLE, 1_u16);
+        if usize::from(size) > MAX_QUEUE_SIZE {
+            return Err(Error::Queue);
+        }
+        let mut free = [0_u16; MAX_QUEUE_SIZE];
+        for (slot, descriptor) in free.iter_mut().zip(0..size) {
+            *slot = descriptor;
+        }
         Ok(SplitQueue {
             ring,
             layout,
@@ -302,7 +346,11 @@ impl Transport {
             size,
             next_available: 0,
             used_seen: 0,
-            outstanding: 0,
+            free,
+            free_count: size,
+            chains: [[0; MAX_SEGMENTS]; MAX_QUEUE_SIZE],
+            chain_lengths: [0; MAX_QUEUE_SIZE],
+            in_flight: 0,
         })
     }
 
@@ -355,18 +403,24 @@ impl RingLayout {
     }
 }
 
-/// A request the device reads followed by a response it writes, both in
-/// DMA memory: (device address, length).
+/// One buffer of a descriptor chain, in DMA memory.
 #[derive(Clone, Copy)]
-pub(crate) struct Chain {
-    pub(crate) request: (u64, u32),
-    pub(crate) response: (u64, u32),
+pub(crate) struct Segment {
+    pub(crate) address: u64,
+    pub(crate) length: u32,
+    /// The device writes it (a response); otherwise it reads it.
+    pub(crate) writable: bool,
 }
 
-/// A split virtqueue used one batch at a time: the driver submits a batch
-/// of two-descriptor chains and polls until the device has used them all
-/// before submitting the next. Chain `n` of a batch always occupies
-/// descriptors `2n` and `2n + 1`, so no free list is needed.
+/// The most buffers one chain has: a request, a payload, a response.
+pub(crate) const MAX_SEGMENTS: usize = 3;
+/// The largest queue a [`SplitQueue`] runs.
+pub(crate) const MAX_QUEUE_SIZE: usize = 64;
+
+/// A split virtqueue. [`SplitQueue::push`] puts a chain of buffers on the
+/// available ring and returns its head descriptor; [`SplitQueue::pop`]
+/// returns chains as the device finishes with them, in the order it does,
+/// and frees their descriptors.
 pub(crate) struct SplitQueue {
     ring: DmaBuffer,
     layout: RingLayout,
@@ -375,46 +429,73 @@ pub(crate) struct SplitQueue {
     size: u16,
     next_available: u16,
     used_seen: u16,
-    /// Chains of the current batch the device has not used yet.
-    outstanding: u16,
+    /// Free descriptors, a stack of `free_count`.
+    free: [u16; MAX_QUEUE_SIZE],
+    free_count: u16,
+    /// The descriptors of the chain each in-flight head starts.
+    chains: [[u16; MAX_SEGMENTS]; MAX_QUEUE_SIZE],
+    chain_lengths: [u8; MAX_QUEUE_SIZE],
+    /// Chains the device has not used yet.
+    in_flight: u16,
 }
 
 impl SplitQueue {
-    /// The most chains one batch can hold.
-    pub(crate) fn capacity(&self) -> usize {
-        usize::from(self.size / 2)
-    }
-
     /// The ring's DMA region, for I/O MMU admission.
     pub(crate) fn region(&self) -> (u64, u64) {
         self.ring.region()
     }
 
-    /// Submits `chains` as one batch and notifies the device. Returns false,
-    /// submitting nothing, while an earlier batch is outstanding or when
-    /// the batch does not fit.
-    pub(crate) fn submit(&mut self, chains: &[Chain]) -> bool {
-        if self.outstanding != 0 || chains.is_empty() || chains.len() > self.capacity() {
-            return false;
+    /// Whether a chain of `segments` buffers fits now.
+    pub(crate) fn has_room(&self, segments: usize) -> bool {
+        usize::from(self.free_count) >= segments
+    }
+
+    /// Puts a chain of `segments` (the device-read ones first) on the
+    /// available ring and notifies the device. Returns its head, or `None`
+    /// when too few descriptors are free.
+    pub(crate) fn push(&mut self, segments: &[Segment]) -> Option<u16> {
+        if segments.is_empty()
+            || segments.len() > MAX_SEGMENTS
+            || usize::from(self.free_count) < segments.len()
+        {
+            return None;
         }
+        let mut descriptors = [0_u16; MAX_SEGMENTS];
+        for descriptor in descriptors.iter_mut().take(segments.len()) {
+            self.free_count -= 1;
+            *descriptor = self.free[usize::from(self.free_count)];
+        }
+        for (position, segment) in segments.iter().enumerate() {
+            let last = position + 1 == segments.len();
+            let flags = if segment.writable {
+                DESCRIPTOR_WRITE
+            } else {
+                0
+            } | if last { 0 } else { DESCRIPTOR_NEXT };
+            let next = if last { 0 } else { descriptors[position + 1] };
+            self.descriptor(
+                descriptors[position],
+                (segment.address, segment.length),
+                flags,
+                next,
+            );
+        }
+        let head = descriptors[0];
+        self.chains[usize::from(head)] = descriptors;
+        self.chain_lengths[usize::from(head)] = segments.len() as u8;
         let mask = self.size - 1;
-        for (slot, chain) in chains.iter().enumerate() {
-            let head = (slot * 2) as u16;
-            self.descriptor(head, chain.request, DESCRIPTOR_NEXT, head + 1);
-            self.descriptor(head + 1, chain.response, DESCRIPTOR_WRITE, 0);
-            let entry = (self.next_available.wrapping_add(slot as u16) & mask) as usize;
-            self.ring.write(self.layout.available + 4 + 2 * entry, head);
-        }
-        self.next_available = self.next_available.wrapping_add(chains.len() as u16);
-        self.outstanding = chains.len() as u16;
-        // The descriptors and ring entries must be visible before the index
+        let entry = usize::from(self.next_available & mask);
+        self.ring.write(self.layout.available + 4 + 2 * entry, head);
+        self.next_available = self.next_available.wrapping_add(1);
+        self.in_flight += 1;
+        // The descriptors and ring entry must be visible before the index
         // that publishes them, and the index before the notification.
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         self.ring
             .write(self.layout.available + 2, self.next_available);
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         self.notify.write(0, self.index);
-        true
+        Some(head)
     }
 
     fn descriptor(&self, index: u16, (address, length): (u64, u32), flags: u16, next: u16) {
@@ -425,18 +506,28 @@ impl SplitQueue {
         self.ring.write(offset + 14, next);
     }
 
-    /// Whether the device has used every chain submitted so far. Responses
-    /// may be read once this returns true.
-    pub(crate) fn idle(&mut self) -> bool {
-        if self.outstanding == 0 {
-            return true;
-        }
+    /// The next chain the device has used: its head and the bytes it wrote.
+    /// Its descriptors are free again; its buffers may be read now.
+    pub(crate) fn pop(&mut self) -> Option<(u16, u32)> {
         let used: u16 = self.ring.read(self.layout.used + 2);
-        let done = used.wrapping_sub(self.used_seen).min(self.outstanding);
-        self.used_seen = self.used_seen.wrapping_add(done);
-        self.outstanding -= done;
-        // Responses written before the index are read after it.
+        if used == self.used_seen {
+            return None;
+        }
+        // Entries written before the index are read after it.
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
-        self.outstanding == 0
+        let mask = self.size - 1;
+        let entry = self.layout.used + 4 + 8 * usize::from(self.used_seen & mask);
+        let head: u32 = self.ring.read(entry);
+        let written: u32 = self.ring.read(entry + 4);
+        self.used_seen = self.used_seen.wrapping_add(1);
+        let head = u16::try_from(head).ok().filter(|head| *head < self.size)?;
+        let length = usize::from(self.chain_lengths[usize::from(head)]);
+        for descriptor in &self.chains[usize::from(head)][..length] {
+            self.free[usize::from(self.free_count)] = *descriptor;
+            self.free_count += 1;
+        }
+        self.chain_lengths[usize::from(head)] = 0;
+        self.in_flight = self.in_flight.saturating_sub(1);
+        Some((head, written))
     }
 }

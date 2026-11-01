@@ -34,6 +34,9 @@ impl LockRank {
     /// The socket table with smoltcp and the network device under it; ranks
     /// below the heap so the table and socket buffers may grow while held.
     pub(crate) const SOCKETS: Self = Self(140);
+    /// Open DRM render node files and dma-bufs; ranks below the heap so
+    /// the tables may grow while held.
+    pub(crate) const DRM: Self = Self(145);
     pub(crate) const CROSS_CPU_DISPATCH: Self = Self(150);
     /// The record (fcntl) lock table; ranks below the heap so the table may
     /// grow while held.
@@ -331,6 +334,7 @@ fn cpu_slot() -> usize {
 }
 
 fn enter_rank(rank: LockRank) -> u16 {
+    crate::linux_profile::count_lock(rank.0);
     let held = &HELD_RANKS[cpu_slot()];
     let previous = held.load(Ordering::Acquire);
     if previous >= rank.0 {

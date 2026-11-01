@@ -88,7 +88,8 @@ through a Linux ABI personality. It is not a rewrite of Linux:
 - run.sh switches: `GINUX_QEMU_MONITOR=sock` (HMP monitor: `screendump`,
   `sendkey`, `info registers`), `GINUX_QEMU_DISPLAY=gtk`,
   `GINUX_QEMU_USB_INPUT=1`, `GINUX_QEMU_GPU=virtio` (virtio-gpu, no VGA;
-  `virtio-vga` keeps a VGA framebuffer for the firmware) with
+  `virtio-vga` keeps a VGA framebuffer for the firmware; `venus` adds 3D,
+  Vulkan on the host GPU through Mesa's Venus) with
   `GINUX_QEMU_GPU_SIZE=WxH` (docs/GRAPHICS.md), `GINUX_QEMU_LOG=file` (pauses instead of exiting
   on a guest reset), `GINUX_QEMU_LOG_INTERRUPTS=1` with `QEMU_ACCEL=tcg`
   (logs every exception: finds triple faults).
@@ -101,6 +102,13 @@ The image base is also printed at boot. Symbolize with
 `tools/debug/symbolize.sh IMAGE_BASE ADDRESS...` (same sources as the run).
 A CR2 just below RSP is a kernel stack overflow. If the machine resets with no
 report, rerun under `QEMU_ACCEL=tcg GINUX_QEMU_LOG=... GINUX_QEMU_LOG_INTERRUPTS=1`.
+
+For a hang or a slow domain, `echo t > /proc/sysrq-trigger` lists every
+task's threads (state, wait kind and key, saved registers) and `echo l`
+profiles the runtime CPU for 1000 ticks (system calls, lock ranks, DRM
+ioctls, timed spans in `kernel/src/linux_profile.rs`). Tick samples miss
+kernel work done with interrupts off; sample CPU 0 from the host instead
+(monitor `info registers`, symbolized as above).
 
 ## Conventions
 

@@ -26,6 +26,7 @@ ginux-native-abi = { path = "../crates/native-abi" }
 ginux-usb-audio = { path = "../crates/usb-audio" }
 ginux-usb-hid = { path = "../crates/usb-hid" }
 ginux-virtio-gpu = { path = "../crates/virtio-gpu" }
+ginux-drm = { path = "../crates/drm" }
 ginux-volume-format = { path = "../crates/volume-format" }
 ginux-volume-service = { path = "../crates/volume-service" }
 miniz_oxide = { version = "=0.9.1", default-features = false }

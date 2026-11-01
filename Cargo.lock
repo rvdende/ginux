@@ -460,6 +460,10 @@ name = "ginux-credentials"
 version = "0.1.0"
 
 [[package]]
+name = "ginux-drm"
+version = "0.1.0"
+
+[[package]]
 name = "ginux-image-store"
 version = "0.1.0"
 dependencies = [
@@ -473,6 +477,7 @@ dependencies = [
  "ed25519-dalek",
  "font8x8",
  "ginux-credentials",
+ "ginux-drm",
  "ginux-image-store",
  "ginux-keyrings",
  "ginux-memory-areas",

@@ -9,11 +9,13 @@
 //! accumulating damaged rectangles in a single word that can be updated
 //! atomically from any context.
 //!
-//! Only the 2D subset is described: display information, 2D resources with
-//! guest-memory backing, scanouts, transfers and flushes. The 3D commands
-//! (virgl contexts, blob resources, Venus) come later; [`FEATURE_VIRGL`] and
-//! the other feature bits are listed so the driver can report what the host
-//! offers.
+//! The 2D subset gives display information, 2D resources with guest-memory
+//! backing, scanouts, transfers and flushes. The 3D subset is what a Venus
+//! (Vulkan) context needs: capsets, contexts created with a capset
+//! (`CONTEXT_INIT`), command submission, and blob resources of host memory
+//! mapped into the host-visible shared memory region. A 3D command may
+//! carry a fence ([`Fence`]): the device then answers only once the work
+//! before it on the fence's ring is done.
 
 #![no_std]
 
@@ -42,20 +44,69 @@ pub const MAX_SCANOUTS: usize = 16;
 
 /// Bytes of the header that starts every request and response.
 pub const HEADER_SIZE: usize = 24;
-/// Bytes of the largest request [`Command::encode`] produces.
-pub const MAX_REQUEST: usize = 56;
+/// Bytes of the largest request [`Command::encode`] produces
+/// (`CTX_CREATE`, with its 64-byte debug name).
+pub const MAX_REQUEST: usize = 96;
 /// Bytes of the largest response a [`Command`] expects.
 pub const MAX_RESPONSE: usize = HEADER_SIZE + MAX_SCANOUTS * 24;
 
+/// The host-visible shared memory region's id (`VIRTIO_GPU_SHM_ID_HOST_VISIBLE`),
+/// where `RESOURCE_MAP_BLOB` places blobs.
+pub const SHM_ID_HOST_VISIBLE: u8 = 1;
+
+/// Byte offset of `num_capsets` in the device configuration structure.
+pub const CONFIG_NUM_CAPSETS: usize = 12;
+
+/// Capset ids (`VIRTIO_GPU_CAPSET_*`).
+pub const CAPSET_VIRGL: u32 = 1;
+pub const CAPSET_VIRGL2: u32 = 2;
+pub const CAPSET_VENUS: u32 = 4;
+
+/// Where a blob's memory lives (`VIRTIO_GPU_BLOB_MEM_*`).
+pub const BLOB_MEM_GUEST: u32 = 1;
+pub const BLOB_MEM_HOST3D: u32 = 2;
+pub const BLOB_MEM_HOST3D_GUEST: u32 = 3;
+
+/// Blob flags (`VIRTIO_GPU_BLOB_FLAG_*`).
+pub const BLOB_FLAG_USE_MAPPABLE: u32 = 1;
+pub const BLOB_FLAG_USE_SHAREABLE: u32 = 2;
+pub const BLOB_FLAG_USE_CROSS_DEVICE: u32 = 4;
+
+/// How the guest should map a mapped blob (`VIRTIO_GPU_MAP_CACHE_*`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MapCache {
+    None,
+    Cached,
+    Uncached,
+    WriteCombined,
+}
+
 const CMD_GET_DISPLAY_INFO: u32 = 0x0100;
 const CMD_RESOURCE_CREATE_2D: u32 = 0x0101;
+const CMD_RESOURCE_UNREF: u32 = 0x0102;
 const CMD_SET_SCANOUT: u32 = 0x0103;
 const CMD_RESOURCE_FLUSH: u32 = 0x0104;
 const CMD_TRANSFER_TO_HOST_2D: u32 = 0x0105;
 const CMD_RESOURCE_ATTACH_BACKING: u32 = 0x0106;
+const CMD_GET_CAPSET_INFO: u32 = 0x0108;
+const CMD_GET_CAPSET: u32 = 0x0109;
+const CMD_RESOURCE_CREATE_BLOB: u32 = 0x010c;
+const CMD_CTX_CREATE: u32 = 0x0200;
+const CMD_CTX_DESTROY: u32 = 0x0201;
+const CMD_CTX_ATTACH_RESOURCE: u32 = 0x0202;
+const CMD_CTX_DETACH_RESOURCE: u32 = 0x0203;
+const CMD_SUBMIT_3D: u32 = 0x0207;
+const CMD_RESOURCE_MAP_BLOB: u32 = 0x0208;
+const CMD_RESOURCE_UNMAP_BLOB: u32 = 0x0209;
+
+const FLAG_FENCE: u32 = 1 << 0;
+const FLAG_INFO_RING_IDX: u32 = 1 << 1;
 
 const RESP_OK_NODATA: u32 = 0x1100;
 const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
+const RESP_OK_CAPSET_INFO: u32 = 0x1102;
+const RESP_OK_CAPSET: u32 = 0x1103;
+const RESP_OK_MAP_INFO: u32 = 0x1106;
 const RESP_ERR_UNSPEC: u32 = 0x1200;
 const RESP_ERR_OUT_OF_MEMORY: u32 = 0x1201;
 const RESP_ERR_INVALID_SCANOUT_ID: u32 = 0x1202;
@@ -327,7 +378,96 @@ pub enum Command {
         offset: u64,
     },
     /// Updates every scanout showing `rect` of the resource.
-    ResourceFlush { resource: u32, rect: Rect },
+    ResourceFlush {
+        resource: u32,
+        rect: Rect,
+    },
+    /// Destroys a resource; a mapped blob must be unmapped first.
+    ResourceUnref {
+        resource: u32,
+    },
+    /// Asks which capset the `index`th of `num_capsets` is.
+    GetCapsetInfo {
+        index: u32,
+    },
+    /// Fetches `size` bytes (from its capset info) of a capset.
+    GetCapset {
+        id: u32,
+        version: u32,
+        size: u32,
+    },
+    /// Creates 3D context `context` of capset `capset` (CONTEXT_INIT).
+    CtxCreate {
+        context: u32,
+        capset: u32,
+    },
+    CtxDestroy {
+        context: u32,
+    },
+    /// Lets a context use a resource.
+    CtxAttachResource {
+        context: u32,
+        resource: u32,
+    },
+    CtxDetachResource {
+        context: u32,
+        resource: u32,
+    },
+    /// Runs `size` bytes of the context's command stream, which follow the
+    /// request in their own buffer.
+    Submit3d {
+        context: u32,
+        size: u32,
+    },
+    /// Creates a blob resource. A host blob (`BLOB_MEM_HOST3D`) of context
+    /// `context` is named by `id`, which the context's command stream gave
+    /// it (Venus: the memory allocation's id; 0 asks the host for plain
+    /// shared memory); a guest blob would list its pages, which this crate
+    /// does not encode.
+    ResourceCreateBlob {
+        context: u32,
+        resource: u32,
+        memory: u32,
+        flags: u32,
+        id: u64,
+        size: u64,
+    },
+    /// Maps a mappable blob at `offset` of the host-visible region.
+    ResourceMapBlob {
+        resource: u32,
+        offset: u64,
+    },
+    ResourceUnmapBlob {
+        resource: u32,
+    },
+}
+
+/// A fence on a 3D command: the device answers it once the context's work
+/// up to it on ring `ring` (or the context's only timeline, without one)
+/// is done.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Fence {
+    pub id: u64,
+    pub ring: Option<u8>,
+}
+
+/// What [`Command::check`] found in a successful reply that carries data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Reply {
+    /// Success with no data.
+    Done,
+    /// `GET_DISPLAY_INFO`'s modes (parsed by [`DisplayInfo::parse`]).
+    DisplayInfo,
+    /// `GET_CAPSET_INFO`: the capset's id, newest version and data size.
+    CapsetInfo {
+        id: u32,
+        max_version: u32,
+        max_size: u32,
+    },
+    /// `GET_CAPSET`: the data follows the header.
+    Capset,
+    /// `RESOURCE_MAP_BLOB`: how to map it.
+    MapInfo(MapCache),
 }
 
 /// An encoded request: the first `len` bytes of `bytes`.
@@ -398,31 +538,144 @@ impl Command {
                 put_u32(&mut bytes, 40, resource);
                 (CMD_RESOURCE_FLUSH, 48)
             }
+            Self::ResourceUnref { resource } => {
+                put_u32(&mut bytes, 24, resource);
+                (CMD_RESOURCE_UNREF, 32)
+            }
+            Self::GetCapsetInfo { index } => {
+                put_u32(&mut bytes, 24, index);
+                (CMD_GET_CAPSET_INFO, 32)
+            }
+            Self::GetCapset { id, version, .. } => {
+                put_u32(&mut bytes, 24, id);
+                put_u32(&mut bytes, 28, version);
+                (CMD_GET_CAPSET, 32)
+            }
+            Self::CtxCreate { context, capset } => {
+                put_u32(&mut bytes, 16, context);
+                // nlen 0 (no debug name), then context_init: the capset id
+                // in its low byte.
+                put_u32(&mut bytes, 28, capset & 0xff);
+                (CMD_CTX_CREATE, 96)
+            }
+            Self::CtxDestroy { context } => {
+                put_u32(&mut bytes, 16, context);
+                (CMD_CTX_DESTROY, HEADER_SIZE)
+            }
+            Self::CtxAttachResource { context, resource } => {
+                put_u32(&mut bytes, 16, context);
+                put_u32(&mut bytes, 24, resource);
+                (CMD_CTX_ATTACH_RESOURCE, 32)
+            }
+            Self::CtxDetachResource { context, resource } => {
+                put_u32(&mut bytes, 16, context);
+                put_u32(&mut bytes, 24, resource);
+                (CMD_CTX_DETACH_RESOURCE, 32)
+            }
+            Self::Submit3d { context, size } => {
+                put_u32(&mut bytes, 16, context);
+                // size, then num_in_fences (none).
+                put_u32(&mut bytes, 24, size);
+                (CMD_SUBMIT_3D, 32)
+            }
+            Self::ResourceCreateBlob {
+                context,
+                resource,
+                memory,
+                flags,
+                id,
+                size,
+            } => {
+                put_u32(&mut bytes, 16, context);
+                put_u32(&mut bytes, 24, resource);
+                put_u32(&mut bytes, 28, memory);
+                put_u32(&mut bytes, 32, flags);
+                // nr_entries 0: host memory has no guest pages.
+                put_u64(&mut bytes, 40, id);
+                put_u64(&mut bytes, 48, size);
+                (CMD_RESOURCE_CREATE_BLOB, 56)
+            }
+            Self::ResourceMapBlob { resource, offset } => {
+                put_u32(&mut bytes, 24, resource);
+                put_u64(&mut bytes, 32, offset);
+                (CMD_RESOURCE_MAP_BLOB, 40)
+            }
+            Self::ResourceUnmapBlob { resource } => {
+                put_u32(&mut bytes, 24, resource);
+                (CMD_RESOURCE_UNMAP_BLOB, 32)
+            }
         };
-        // flags, fence_id, ctx_id and ring_idx stay zero: no fences, no 3D
-        // context.
         put_u32(&mut bytes, 0, kind);
         Request { bytes, len }
+    }
+
+    /// The request with `fence` in its header: the device answers once the
+    /// work before it is done.
+    pub fn encode_fenced(&self, fence: Fence) -> Request {
+        let mut request = self.encode();
+        let mut flags = FLAG_FENCE;
+        if let Some(ring) = fence.ring {
+            flags |= FLAG_INFO_RING_IDX;
+            request.bytes[20] = ring;
+        }
+        put_u32(&mut request.bytes, 4, flags);
+        put_u64(&mut request.bytes, 8, fence.id);
+        request
     }
 
     /// Bytes the device writes in reply.
     pub fn response_len(&self) -> usize {
         match self {
             Self::GetDisplayInfo => MAX_RESPONSE,
+            Self::GetCapsetInfo { .. } => HEADER_SIZE + 16,
+            Self::GetCapset { size, .. } => HEADER_SIZE + *size as usize,
+            Self::ResourceMapBlob { .. } => HEADER_SIZE + 8,
             _ => HEADER_SIZE,
         }
     }
 
     /// Checks the reply to this command, whose header starts `response`.
     pub fn check(&self, response: &[u8]) -> Result<(), Error> {
-        let expected = match self {
-            Self::GetDisplayInfo => Response::DisplayInfo,
-            _ => Response::NoData,
-        };
-        match Response::parse(response)? {
-            Response::Error(code) => Err(Error::Device(code)),
-            reply if reply == expected => Ok(()),
-            reply => Err(Error::Unexpected(reply)),
+        self.reply(response).map(|_| ())
+    }
+
+    /// Checks the reply to this command and decodes what it carries.
+    pub fn reply(&self, response: &[u8]) -> Result<Reply, Error> {
+        let parsed = Response::parse(response)?;
+        if let Response::Error(code) = parsed {
+            return Err(Error::Device(code));
+        }
+        let unexpected = || Err(Error::Unexpected(parsed));
+        match (self, parsed) {
+            (Self::GetDisplayInfo, Response::DisplayInfo) => Ok(Reply::DisplayInfo),
+            (Self::GetDisplayInfo, _) => unexpected(),
+            (Self::GetCapsetInfo { .. }, Response::CapsetInfo) => {
+                if response.len() < HEADER_SIZE + 12 {
+                    return Err(Error::Truncated);
+                }
+                Ok(Reply::CapsetInfo {
+                    id: get_u32(response, 24),
+                    max_version: get_u32(response, 28),
+                    max_size: get_u32(response, 32),
+                })
+            }
+            (Self::GetCapsetInfo { .. }, _) => unexpected(),
+            (Self::GetCapset { .. }, Response::Capset) => Ok(Reply::Capset),
+            (Self::GetCapset { .. }, _) => unexpected(),
+            (Self::ResourceMapBlob { .. }, Response::MapInfo) => {
+                if response.len() < HEADER_SIZE + 4 {
+                    return Err(Error::Truncated);
+                }
+                Ok(Reply::MapInfo(match get_u32(response, 24) & 0x0f {
+                    1 => MapCache::Cached,
+                    2 => MapCache::Uncached,
+                    3 => MapCache::WriteCombined,
+                    _ => MapCache::None,
+                }))
+            }
+            (Self::ResourceMapBlob { .. }, _) => unexpected(),
+            (_, Response::NoData) => Ok(Reply::Done),
+            _ => unexpected(),
         }
     }
 }
@@ -432,6 +685,9 @@ impl Command {
 pub enum Response {
     NoData,
     DisplayInfo,
+    CapsetInfo,
+    Capset,
+    MapInfo,
     Error(ErrorCode),
     /// A type this crate does not know, including zero: the device never
     /// wrote the header.
@@ -446,6 +702,9 @@ impl Response {
         Ok(match get_u32(bytes, 0) {
             RESP_OK_NODATA => Self::NoData,
             RESP_OK_DISPLAY_INFO => Self::DisplayInfo,
+            RESP_OK_CAPSET_INFO => Self::CapsetInfo,
+            RESP_OK_CAPSET => Self::Capset,
+            RESP_OK_MAP_INFO => Self::MapInfo,
             RESP_ERR_UNSPEC => Self::Error(ErrorCode::Unspecified),
             RESP_ERR_OUT_OF_MEMORY => Self::Error(ErrorCode::OutOfMemory),
             RESP_ERR_INVALID_SCANOUT_ID => Self::Error(ErrorCode::InvalidScanout),
@@ -493,12 +752,172 @@ fn get_u32(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(word)
 }
 
+/// A virtio shared memory region a device describes in its PCI capabilities
+/// (`VIRTIO_PCI_CAP_SHARED_MEMORY_CFG`): which BAR, and where in it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SharedMemory {
+    pub id: u8,
+    pub bar: u8,
+    pub offset: u64,
+    pub length: u64,
+}
+
+impl SharedMemory {
+    /// The PCI capability type of a shared memory region.
+    pub const CAP_TYPE: u8 = 8;
+
+    /// Parses a shared memory capability: `cap` holds its configuration
+    /// bytes from the capability ID on (`virtio_pci_cap64`, 24 bytes).
+    pub fn parse(cap: &[u8]) -> Option<Self> {
+        if cap.len() < 24 || cap[3] != Self::CAP_TYPE {
+            return None;
+        }
+        let low = |offset: usize| u64::from(get_u32(cap, offset));
+        Some(Self {
+            id: cap[5],
+            bar: cap[4],
+            offset: low(8) | low(16) << 32,
+            length: low(12) | low(20) << 32,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn word(bytes: &[u8], offset: usize) -> u32 {
         get_u32(bytes, offset)
+    }
+
+    #[test]
+    fn context_create_names_its_capset() {
+        let request = Command::CtxCreate {
+            context: 3,
+            capset: CAPSET_VENUS,
+        }
+        .encode();
+        let bytes = request.as_bytes();
+        assert_eq!(bytes.len(), 96);
+        assert_eq!(word(bytes, 0), 0x0200);
+        assert_eq!(word(bytes, 16), 3);
+        assert_eq!([word(bytes, 24), word(bytes, 28)], [0, 4]);
+    }
+
+    #[test]
+    fn fenced_submit_carries_its_ring() {
+        let command = Command::Submit3d {
+            context: 2,
+            size: 128,
+        };
+        let request = command.encode_fenced(Fence {
+            id: 0x1_0000_0007,
+            ring: Some(5),
+        });
+        let bytes = request.as_bytes();
+        assert_eq!(bytes.len(), 32);
+        assert_eq!([word(bytes, 0), word(bytes, 4)], [0x0207, 3]);
+        assert_eq!(&bytes[8..16], &0x1_0000_0007_u64.to_le_bytes());
+        assert_eq!([word(bytes, 16), u32::from(bytes[20])], [2, 5]);
+        assert_eq!([word(bytes, 24), word(bytes, 28)], [128, 0]);
+        let unringed = command.encode_fenced(Fence { id: 1, ring: None });
+        assert_eq!(
+            [
+                word(unringed.as_bytes(), 4),
+                u32::from(unringed.as_bytes()[20])
+            ],
+            [1, 0]
+        );
+    }
+
+    #[test]
+    fn host_blob_layout() {
+        let request = Command::ResourceCreateBlob {
+            context: 1,
+            resource: 9,
+            memory: BLOB_MEM_HOST3D,
+            flags: BLOB_FLAG_USE_MAPPABLE,
+            id: 0,
+            size: 1 << 20,
+        }
+        .encode();
+        let bytes = request.as_bytes();
+        assert_eq!(bytes.len(), 56);
+        assert_eq!([word(bytes, 0), word(bytes, 16)], [0x010c, 1]);
+        assert_eq!(
+            [
+                word(bytes, 24),
+                word(bytes, 28),
+                word(bytes, 32),
+                word(bytes, 36)
+            ],
+            [9, 2, 1, 0]
+        );
+        assert_eq!(&bytes[48..56], &(1_u64 << 20).to_le_bytes());
+    }
+
+    #[test]
+    fn capset_and_map_replies_decode() {
+        let mut reply = [0_u8; 40];
+        reply[..4].copy_from_slice(&0x1102_u32.to_le_bytes());
+        reply[24..28].copy_from_slice(&4_u32.to_le_bytes());
+        reply[28..32].copy_from_slice(&0_u32.to_le_bytes());
+        reply[32..36].copy_from_slice(&160_u32.to_le_bytes());
+        assert_eq!(
+            Command::GetCapsetInfo { index: 0 }.reply(&reply),
+            Ok(Reply::CapsetInfo {
+                id: 4,
+                max_version: 0,
+                max_size: 160
+            })
+        );
+        let mut map = [0_u8; 32];
+        map[..4].copy_from_slice(&0x1106_u32.to_le_bytes());
+        map[24..28].copy_from_slice(&1_u32.to_le_bytes());
+        let command = Command::ResourceMapBlob {
+            resource: 9,
+            offset: 0x20_0000,
+        };
+        assert_eq!(command.reply(&map), Ok(Reply::MapInfo(MapCache::Cached)));
+        assert_eq!(command.response_len(), 32);
+        assert_eq!(
+            Command::GetCapset {
+                id: 4,
+                version: 0,
+                size: 160
+            }
+            .response_len(),
+            184
+        );
+        let mut error = [0_u8; 24];
+        error[..4].copy_from_slice(&0x1204_u32.to_le_bytes());
+        assert_eq!(
+            Command::CtxDestroy { context: 1 }.reply(&error),
+            Err(Error::Device(ErrorCode::InvalidContext))
+        );
+    }
+
+    #[test]
+    fn shared_memory_capability_parses() {
+        // cap_vndr 9, cap_next, cap_len 24, cfg_type 8, bar 4, id 1, pad,
+        // offset low, length low, offset high, length high.
+        let mut cap = [0_u8; 24];
+        cap[..6].copy_from_slice(&[9, 0, 24, 8, 4, 1]);
+        cap[8..12].copy_from_slice(&0_u32.to_le_bytes());
+        cap[12..16].copy_from_slice(&0_u32.to_le_bytes());
+        cap[16..20].copy_from_slice(&0_u32.to_le_bytes());
+        cap[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        assert_eq!(
+            SharedMemory::parse(&cap),
+            Some(SharedMemory {
+                id: 1,
+                bar: 4,
+                offset: 0,
+                length: 1 << 32
+            })
+        );
+        cap[3] = 1;
+        assert_eq!(SharedMemory::parse(&cap), None);
     }
 
     #[test]

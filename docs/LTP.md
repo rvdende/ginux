@@ -26,7 +26,7 @@ QEMU, and reports one machine-parseable line per test plus failure clusters.
 
 \* Counted with the exit status alone, which overstated passes (below).
 The later rows are rescored from each run's saved console logs with LTP's
-own rule (`classify` in `tests/ltp/driver.py`): a test that printed any
+own rule (`classify` in `tests/ltp/src/classify.rs`): a test that printed any
 TBROK, TFAIL or TWARN counts as that, and TCONF only when nothing passed.
 Each row ran with that commit's changes on top of its parent. The drop at
 `18f44c93` is the shared result page starting to work: tests whose
@@ -39,7 +39,7 @@ such a page, so results from the test process never reached the library's
 process, which then exited 0: in the `778dd3d0` run 204 tests that
 printed TFAIL and 416 that printed TBROK (60 of them an anonymous mmap
 with fd 0 refused, about 60 "Test haven't reported results" or "bad magic"
-from the lost page) were counted as passes. The driver now classifies by the printed results when
+from the lost page) were counted as passes. The harness now classifies by the printed results when
 the exit status claims success, and shared mappings of a file now map the
 file's own pages.
 
@@ -141,7 +141,7 @@ Counts are tests, from the baseline (B) and the variant (V); the logs are
    creates, removals, chmod, chown, utimes, access(2) and exec check them.
    Root may switch ids only in a domain set `user-switching=true`, the one
    flag that grants it (`linux_user::user_switching_allowed`); the LTP
-   driver sets it. `setgroups03` still fails: LTP built for musl expects
+   harness sets it. `setgroups03` still fails: LTP built for musl expects
    `setgroups(33, ...)` to fail because musl's `NGROUPS` is 32, while
    Linux (and Ginux) allow 65536.
 4. **A signal-killed child is reported as a normal exit with status 128+N**,
@@ -220,27 +220,97 @@ make test-ltp OVMF_CODE=/usr/share/OVMF/OVMF_CODE_4M.fd \
     OVMF_VARS=/usr/share/OVMF/OVMF_VARS_4M.fd
 ```
 
-`make test-ltp` builds Ginux (`make build`) and runs `tests/qemu/ltp.sh`. To
-keep a running VM's `build/esp` untouched, build and boot a separate image:
+`make test-ltp` builds Ginux (`make build`) and runs `tests/qemu/ltp.sh`,
+which builds and runs the Rust harness in `tests/ltp` (below). To keep a
+running VM's `build/esp` untouched, build and boot a separate image:
 `make test-ltp ESP_DIR=build/esp-ltp`. `TMPDIR` defaults to `target/tmp`.
-The full list takes about 16 minutes on KVM today (most tests stop at
-once; the diagnostic variant below takes 53). Select tests with
+The full list takes about 25 minutes on KVM today. Select tests with
 
 ```sh
 tests/qemu/ltp.sh --tests "abort01 accept01"     # by name
 tests/qemu/ltp.sh --filter '^(open|read)'        # by regular expression
-LTP_FILTER='^mmap' make test-ltp                 # the same from make
+tests/qemu/ltp.sh accept                         # libtest's filter: names containing "accept"
+tests/qemu/ltp.sh -- --exact accept01 -q         # libtest's arguments, after --
+LTP_FILTER='^mmap' make test-ltp                 # the same from make (LTP_ARGS for the rest)
 ```
 
-`tests/qemu/ltp.sh --help` lists the other options (default budget, memory,
-domain image, `--variant`).
+`tests/qemu/ltp.sh --help` lists the other options (`--list FILE`,
+`--variant`, `--esp-dir`, budgets, memory, the domain image, `--strict`,
+`--update-baseline`); each sets one of the environment variables the
+harness reads.
 
-Each finished test prints `LTP NAME RESULT SECONDS DETAIL`. On a terminal a
-status line below them shows what runs now and for how long (the boot step,
-such as the first domain start pulling Alpine, or the current test), the
-results so far and the elapsed time, e.g.
-`[412/1362] running fork14 12s | pass 380 fail 20 broken 9 conf 3 | 6m41s`;
-without a terminal the boot steps print as `ltp:` lines instead.
+### The harness
+
+`tests/ltp` is a standalone crate (its own workspace, like `userland/`).
+Its test target `ltp` uses [libtest-mimic](https://crates.io/crates/libtest-mimic)
+to make each entry of the run list one trial, named by its tag, so cargo
+runs it and libtest's arguments select tests:
+
+```sh
+cargo test --manifest-path tests/ltp/Cargo.toml --test ltp -- accept          # names containing accept
+cargo test --manifest-path tests/ltp/Cargo.toml --test ltp -- --exact accept01
+cargo test --manifest-path tests/ltp/Cargo.toml --test ltp -- --list          # list; boots nothing
+cargo test --manifest-path tests/ltp/Cargo.toml --test ltp -- --ignored       # the tests the list skips
+LTP_VARIANT=probe GINUX_ESP_DIR=build/esp-probe LTP_LIST=/path/probe.list \
+    cargo test --manifest-path tests/ltp/Cargo.toml --test ltp -- -q
+make ltp-check                                   # the harness's fmt, clippy and unit tests
+```
+
+The settings come from the environment (`tests/ltp/src/config.rs`):
+`LTP_LIST`, `LTP_TESTS`, `LTP_FILTER`, `LTP_VARIANT`, `GINUX_ESP_DIR`,
+`LTP_BUDGET`, `LTP_GRACE`, `LTP_BETWEEN_TESTS`, `LTP_SETUP_TIMEOUT`,
+`LTP_MAX_BOOTS`, `GINUX_MEMORY`, `LTP_DOMAIN_MEMORY_MIB`, `LTP_IMAGE`,
+`LTP_BASELINE`, `LTP_STRICT=1` and `LTP_UPDATE_BASELINE=1` (relative paths
+are taken from the repository root; `ltp.sh` resolves them from where it
+runs). `--strict` and `--update-baseline` also work as arguments of the
+test binary. The harness applies libtest's selection before it boots, so
+the guest runs only the selected tests. They all share one QEMU session,
+which runs on a background thread in list order; the trials run one at a
+time (`--test-threads` is forced to 1), each waiting for its result.
+`ltp.sh` builds the test binary and runs it directly rather than through
+`cargo test`, so a SIGTERM to its PID or a Ctrl-C reaches it: it stops
+QEMU, writes the final results, prints the summary and exits 1.
+
+Each test is one libtest line:
+
+```text
+test abort01      ... ignored (known failure: TFAIL)
+test access01     ... ok
+test add_key05    ... ignored (TCONF: ...)
+test cachestat01  ... ignored (SKIP: auto: needs a loop block device (mkfs and mount))
+test fork14       ... FAILED
+```
+
+| Result | Trial |
+|---|---|
+| `TPASS` | ok |
+| `TCONF`, `SKIP` | ignored, with the first TCONF message or the list's reason |
+| `TFAIL`, `TBROK`, `TWARN`, `HANG`, `CRASH` | ignored as `known failure: RESULT` if the baseline lists the test; otherwise failed, with the result, its detail and the last 40 lines of the test's log |
+| `NOTRUN` | failed (not reached) |
+
+On a terminal a status line shows what runs now and for how long (the boot
+step, such as the first domain start pulling Alpine, or the current test),
+the results so far and the elapsed time, e.g.
+`[412/1362] running fork14 12s | pass 380 fail 20 broken 9 conf 3 | 6m41s`.
+It follows libtest's open `test NAME ... ` line (or is a line of its own
+when stdout is not the terminal), and messages such as a reboot print above
+it. Without a terminal the boot steps print as `ltp:` lines instead.
+
+### The baseline
+
+`tests/ltp/baseline.txt` lists the tests known not to pass, one
+`NAME RESULT` per line (TFAIL, TBROK, TWARN, HANG or CRASH; tests the list
+skips and TCONFs are not in it). A listed test that fails again is ignored
+as a known failure, whatever its result now; a failure of any other test is
+a regression and fails the run, so a full run with no regressions exits 0
+(failing trials or an incomplete run exit 101). A listed test that passes is
+a pass, and the run ends by printing `newly passing: NAME...` (and
+`no longer failing (now TCONF): NAME...`) so the baseline can be updated:
+`tests/qemu/ltp.sh --update-baseline` (`LTP_UPDATE_BASELINE=1`) rewrites it
+from the run (failing tests that ran get their new result, tests that
+passed or were TCONF are dropped, tests that did not run keep their
+entries). `--strict` (`LTP_STRICT=1`) ignores the baseline: every failure
+fails the run. `LTP_BASELINE=FILE` uses another file, e.g. for a variant.
 
 Outputs:
 
@@ -251,12 +321,12 @@ Outputs:
 | `target/ltp/logs/NAME.log` | the console output of each test, kernel diagnostics included |
 | `target/ltp-serial.log` | the whole serial console of every boot |
 
-While running, the harness prints the same line per test to stdout:
+The results file's detail says why, e.g.
 
 ```text
-LTP abort01 TBROK 0.02 exit=2
-LTP pipeio_1 HANG 60.04 guest-timeout 60s
-LTP getdents01 CRASH 0.42 domain down: ginux: Linux init execution failed; domain marked failed
+abort01 TBROK 0.02 exit=2
+pipeio_1 HANG 60.04 guest-timeout 60s
+getdents01 CRASH 0.42 domain down: ginux: Linux init execution failed; domain marked failed
 ```
 
 | Result | Meaning |
@@ -267,9 +337,6 @@ LTP getdents01 CRASH 0.42 domain down: ginux: Linux init execution failed; domai
 | `CRASH` | the domain, the kernel or QEMU went down during the test; QEMU was rebooted |
 | `SKIP` | marked skipped in the list, with the reason as detail |
 | `NOTRUN` | not reached (the run was interrupted or gave up) |
-
-The driver exits non-zero only when the run is incomplete; test failures are
-the baseline, not an error.
 
 ## How it works
 
@@ -294,7 +361,7 @@ the baseline, not an error.
   `-static`: Ginux runs a file written at runtime only if it is position
   independent; its fixed-address (ET_EXEC) loader accepts only tiny programs
   (5 code pages, 8 pages in all).
-- `tests/qemu/ltp.sh` runs `tests/ltp/driver.py`, which boots Ginux with
+- The harness's session (`tests/ltp/src/session.rs`) boots Ginux with
   `tools/qemu/run.sh` (6 GiB, KVM, a fresh sparse volume in `target/ltp`),
   creates domain `ltp` from `alpine:3.22`, and serves the tree, the runner and
   the run list over HTTP on a free port (the guest reaches it at 10.0.2.2).
@@ -309,7 +376,7 @@ the baseline, not an error.
   budget **in the guest** with `alarm`: at the budget it kills the test's
   process group. Afterwards it kills whatever the test left running (found
   through `/proc`, reported as `leftover=N`) and empties `TMPDIR`.
-- The driver watches the console. If the kernel panics, the domain goes down
+- The session watches the console. If the kernel panics, the domain goes down
   (`domain marked failed`, `Linux init exited`), the runner exits, QEMU
   exits, or a test runs past its budget plus 30 s without an `END` (the guest
   is wedged), it records `CRASH` or `HANG` for the running test, kills QEMU

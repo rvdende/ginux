@@ -20,7 +20,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 LTP = REPO / "build/ltp"
 
-# Keep in step with tests/ltp/driver.py and tests/ltp/setup.sh.
+# Keep in step with tests/ltp/src/config.rs and tests/ltp/setup.sh.
 DEFAULT_BUDGET = 60
 LTP_DEFAULT_TIMEOUT = 30
 RUNTIME_MUL = 0.1

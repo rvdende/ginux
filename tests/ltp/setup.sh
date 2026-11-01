@@ -1,7 +1,7 @@
 #!/bin/sh
 # Runs in the domain's init shell (busybox ash): fetches the LTP tree, the
 # runner and the run list from the host's HTTP server, then execs the runner
-# as the domain's init. Used by tests/ltp/driver.py.
+# as the domain's init. Used by the LTP harness (tests/ltp/src/session.rs).
 #
 #   sh setup.sh BASE_URL FIRST_INDEX
 base=$1

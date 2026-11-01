@@ -193,18 +193,29 @@ impl ProcessExecutionContext {
         self.validation_error(address_space).is_none()
     }
 
-    fn validation_error(self, address_space: &ProcessAddressSpace) -> Option<u8> {
+    /// Whether the registers alone are a context a process may resume in:
+    /// canonical user addresses and no privileged flags.
+    fn registers_valid(self) -> bool {
         const REQUIRED_RFLAGS: u64 = (1 << 1) | (1 << 9);
         const FORBIDDEN_RFLAGS: u64 = (3 << 12) | (1 << 14) | (1 << 17);
-        if self.rip == 0
+        !(self.rip == 0
             || self.rip >= 1 << 47
             || self.rsp == 0
             || self.rsp >= 1 << 47
             || self.fs_base >= 1 << 47
             || self.rflags & REQUIRED_RFLAGS != REQUIRED_RFLAGS
-            || self.rflags & FORBIDDEN_RFLAGS != 0
-        {
+            || self.rflags & FORBIDDEN_RFLAGS != 0)
+    }
+
+    fn validation_error(self, address_space: &ProcessAddressSpace) -> Option<u8> {
+        if !self.registers_valid() {
             return Some(1);
+        }
+        // A stale list may lack the pages the context runs on; the context
+        // was checked against the live page tables when it was recorded
+        // (`refresh_live_process_context_for_wait`).
+        if address_space.stale {
+            return None;
         }
         let contains = |mapping: &cpu::LinuxActiveImageMapping, address: u64| {
             u64::try_from(mapping.address).ok().is_some_and(|start| {
@@ -730,12 +741,13 @@ impl ProcessTable {
             || validate_address_space
                 && (!address_space.is_valid()
                     || self.processes.iter().flatten().any(|process| {
-                        process
-                            .address_space
+                        // A stale list may name frames freed since and now
+                        // another's; the live page tables are its record.
+                        process.address_space.is_some_and(|existing| {
+                            !existing.stale && existing.overlaps(&address_space)
+                        }) || process
+                            .retiring_address_space
                             .is_some_and(|existing| existing.overlaps(&address_space))
-                            || process
-                                .retiring_address_space
-                                .is_some_and(|existing| existing.overlaps(&address_space))
                     }))
         {
             return false;
@@ -2430,6 +2442,56 @@ pub(crate) fn refresh_live_process_context_from_syscall_entry(
     true
 }
 
+/// Records the context the current process `pid` waits in, checked against
+/// its live page tables (the instruction executable, the stack writable)
+/// rather than its registered mapping list, which this marks stale: a wait
+/// costs a few lookups instead of a pass over every mapped page. Its
+/// release then frees what the live page tables map, and fork and exec
+/// take a full snapshot again.
+pub(crate) fn refresh_live_process_context_for_wait(
+    pid: u32,
+    general: [u64; 15],
+    rip: u64,
+    rsp: u64,
+    rflags: u64,
+    fs_base: u64,
+) -> bool {
+    let context = ProcessExecutionContext {
+        general,
+        rip,
+        rsp,
+        rflags,
+        fs_base,
+    };
+    let mapped = context.registers_valid()
+        && address_space::current_linux_active_mapping(rip).is_some_and(|page| page.executable)
+        && rsp
+            .checked_sub(1)
+            .and_then(address_space::current_linux_active_mapping)
+            .is_some_and(|page| page.writable);
+    if !mapped {
+        return false;
+    }
+    let Some(table) = live_process_table_mut() else {
+        return false;
+    };
+    let Some(handle) = table.handle_by_pid(pid) else {
+        return false;
+    };
+    let Some(process) = table.process_mut(handle) else {
+        return false;
+    };
+    if process.state != ProcessState::Running {
+        return false;
+    }
+    let Some(space) = process.address_space.as_mut() else {
+        return false;
+    };
+    space.stale = true;
+    process.context = Some(context);
+    true
+}
+
 pub(crate) fn refresh_live_process_hierarchy(pid: u32, hierarchy: &[memory::FrameLease]) -> bool {
     let Some(table) = live_process_table_mut() else {
         return false;
@@ -3134,9 +3196,13 @@ pub(crate) fn live_process_mapping(
 ) -> Option<cpu::LinuxActiveImageMapping> {
     let table = live_process_table_mut()?;
     let handle = table.handle_by_pid(pid)?;
-    table
-        .process(handle)?
-        .address_space?
+    let space = table.process(handle)?.address_space?;
+    // A stale list lacks pages mapped since its snapshot; the live page
+    // tables have them.
+    if space.stale {
+        return address_space::linux_active_mapping_in_root(space.root(), address as u64);
+    }
+    space
         .mappings()
         .iter()
         .copied()
@@ -3170,6 +3236,19 @@ pub(crate) fn mark_live_process_address_space_stale(pid: u32) -> bool {
     };
     space.stale = true;
     true
+}
+
+/// Whether `pid`'s registered mapping list is stale (see
+/// `refresh_live_process_context_for_wait`), so a fork must snapshot its
+/// address space before copying the list.
+pub(crate) fn live_process_address_space_stale(pid: u32) -> bool {
+    live_process_table_mut().is_some_and(|table| {
+        table
+            .handle_by_pid(pid)
+            .and_then(|handle| table.process(handle))
+            .and_then(|process| process.address_space)
+            .is_some_and(|space| space.stale)
+    })
 }
 
 /// Whether `pid` is a child forked onto its parent's pages that has not

@@ -323,3 +323,38 @@ call completes, fails, is interrupted or the process exits:
 
 The loop replaces the restarts with real blocking (step 5), and these
 records become the wait queues blocked tasks sit on.
+
+### Wait costs and the runtime loop (2026-11-01, measured with cadrs)
+
+A process that waits records where it waits in the process registry. That
+used to be a full snapshot of its address space: every mapped page, checked
+against the frame allocator, on every wait. For a GPU application (hundreds
+of thousands of pages) that was 50 million frame-lock acquisitions a second
+and most of each frame. Waits now record only the execution context, checked
+against the live page tables, and mark the registry's mapping list stale;
+release frees what the live tables map, `process_vm_readv/writev` look
+pages up in them, and fork, exec and exit still take a full snapshot (a
+CLONE_VM fork snapshots a stale parent first).
+
+Other costs found the same way (`echo l > /proc/sysrq-trigger` profiles the
+runtime CPU; `t` lists every task's threads):
+
+- The runtime loop resumed every parked call to recheck it and halted only
+  when nothing ran, so an idle domain spun at 100%. It now waits for an
+  interrupt once every process has had a round without a system call.
+- sched_yield with no ready sibling went round every other process; it now
+  does so at most every 250 us (GPU drivers yield thousands of times a
+  second while they poll for the device).
+- Console reads and selects on the attached console spun on the serial port
+  with interrupts off, freezing the domain while its shell waited for input;
+  they now wait like any other blocking call.
+- A process switch copies the thread table and descriptor tables through
+  banked atomics. Free thread slots are now skipped; the descriptor tables
+  (about 14,000 atomic operations each way) are the next cost.
+- Timed waits wake at their deadline: the one-shot tick is brought forward
+  to the earliest blocked thread's deadline.
+
+Multi-CPU domains still cannot run an application next to its compositor: a
+process whose threads run on application processors cannot be switched out
+until they block, and the remote futex wait spins without marking its thread
+blocked. That needs the per-CPU loop of step 6.

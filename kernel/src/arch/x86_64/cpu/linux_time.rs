@@ -652,6 +652,10 @@ fn linux_sleep_live_return(
             if let Some(target) = ready_linux_thread_handle() {
                 break 'target target;
             }
+            // Wake at the deadline, not on the next tick after it.
+            if let Some(now) = linux_elapsed_nanoseconds() {
+                timer::request_linux_tick_within(deadline.saturating_sub(now));
+            }
             linux_wait_for_interrupt();
         }
         return 0;

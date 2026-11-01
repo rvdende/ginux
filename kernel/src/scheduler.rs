@@ -259,6 +259,11 @@ pub(crate) struct UserInterruptFrame {
 }
 
 impl UserInterruptFrame {
+    /// Where the interrupt came in: the instruction and its code selector.
+    pub(crate) fn interrupted_at(&self) -> (u64, u64) {
+        (self.rip, self.cs)
+    }
+
     pub(crate) fn user_context(
         &self,
         code_selector: u16,

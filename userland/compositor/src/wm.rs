@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ginux_gfx::{Canvas, Image};
+use ginux_gfx::Canvas;
 use wayland_protocols::xdg::shell::server::{xdg_surface::XdgSurface, xdg_toplevel};
 use wayland_server::{
     backend::ObjectId,
@@ -68,7 +68,9 @@ pub struct Surface {
     pub pending: Pending,
     /// Frame callbacks committed and waiting for the next composed frame.
     pub callbacks: Vec<WlCallback>,
-    pub image: Option<Image>,
+    /// The committed buffer, held until the client commits another (it is
+    /// drawn straight from the client's memory), and its width and height.
+    pub buffer: Option<(WlBuffer, i32, i32)>,
     pub role: Role,
     /// Subsurfaces in stacking order, drawn above the surface.
     pub children: Vec<WlSurface>,
@@ -215,7 +217,7 @@ impl State {
             Surface {
                 pending: Pending::default(),
                 callbacks: Vec::new(),
-                image: None,
+                buffer: None,
                 role: Role::None,
                 children: Vec::new(),
             },
@@ -223,9 +225,12 @@ impl State {
     }
 
     pub fn remove_surface(&mut self, id: &ObjectId) {
-        let Some(surface) = self.surfaces.remove(id) else {
+        let Some(mut surface) = self.surfaces.remove(id) else {
             return;
         };
+        if let Some((buffer, ..)) = surface.buffer.take() {
+            buffer.release();
+        }
         if let Role::Subsurface { parent, .. } = &surface.role {
             if let Some(parent) = self.surfaces.get_mut(&parent.id()) {
                 parent.children.retain(|child| child.id() != *id);
@@ -255,12 +260,19 @@ impl State {
         let callbacks = std::mem::take(&mut surface.pending.callbacks);
         surface.callbacks.extend(callbacks);
         if let Some(buffer) = surface.pending.buffer.take() {
-            surface.image = buffer.as_ref().and_then(protocol::read_buffer);
-            if let Some(buffer) = buffer {
-                buffer.release();
+            // The buffer shown so far goes back to the client, unless it
+            // committed the same one again.
+            if let Some((held, ..)) = surface.buffer.take() {
+                if buffer.as_ref() != Some(&held) {
+                    held.release();
+                }
             }
+            surface.buffer = buffer.and_then(|buffer| {
+                let (width, height, _) = protocol::buffer_shape(&buffer)?;
+                Some((buffer, width, height))
+            });
         }
-        let mapped = surface.image.is_some();
+        let mapped = surface.buffer.is_some();
         let role = surface.role.clone();
         self.dirty = true;
         if let Role::Toplevel(window) = role {
@@ -329,7 +341,9 @@ impl State {
         let window = self.windows.remove(index);
         if let Some(surface) = self.surfaces.get_mut(&window.surface.id()) {
             surface.role = Role::None;
-            surface.image = None;
+            if let Some((buffer, ..)) = surface.buffer.take() {
+                buffer.release();
+            }
         }
         if matches!(self.seat.grab, Some(Grab::Move { window, .. }) if window == id) {
             self.seat.grab = None;
@@ -372,8 +386,8 @@ impl State {
         }
         self.surfaces
             .get(&window.surface.id())
-            .and_then(|surface| surface.image.as_ref())
-            .map_or((0, 0), |image| (image.width, image.height))
+            .and_then(|surface| surface.buffer.as_ref())
+            .map_or((0, 0), |(_, width, height)| (*width, *height))
     }
 
     fn raise(&mut self, id: u64) {
@@ -599,9 +613,9 @@ impl State {
                     }
                 }
             }
-            let image = data.image.as_ref()?;
+            let &(_, width, height) = data.buffer.as_ref()?;
             let (local_x, local_y) = (point.0 - origin.0, point.1 - origin.1);
-            (local_x >= 0 && local_y >= 0 && local_x < image.width && local_y < image.height)
+            (local_x >= 0 && local_y >= 0 && local_x < width && local_y < height)
                 .then(|| (surface.clone(), f64::from(local_x), f64::from(local_y)))
         }
         let origin = self
@@ -909,8 +923,8 @@ impl State {
         let Some(data) = self.surfaces.get(&surface.id()) else {
             return;
         };
-        if let Some(image) = &data.image {
-            canvas.blit(origin.0, origin.1, image);
+        if let Some((buffer, ..)) = &data.buffer {
+            protocol::blit_buffer(canvas, origin, buffer);
         }
         for child in &data.children {
             if let Some(Role::Subsurface { x, y, .. }) =

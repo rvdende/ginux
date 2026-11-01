@@ -18,7 +18,9 @@ mod initramfs;
 mod ipc;
 mod linux_aio;
 mod linux_areas;
+mod linux_drm;
 mod linux_elf;
+mod linux_event_files;
 mod linux_exe;
 mod linux_file_cache;
 mod linux_input;
@@ -27,6 +29,7 @@ mod linux_mount;
 mod linux_mounts;
 mod linux_overlay;
 mod linux_process;
+mod linux_profile;
 mod linux_record_lock;
 mod linux_signal;
 mod linux_socket;
@@ -530,6 +533,7 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     if !arch::x86_64::cpu::enable_execute_disable() {
         kernel_fail("ginux: execute-disable unavailable or inactive\r\n");
     }
+    arch::x86_64::paging::install_page_attribute_table();
     // USB host controllers for input are found now so that their registers
     // join the device window of the kernel page tables.
     let usb_hosts = drivers::usb_input::discover();
@@ -5126,7 +5130,7 @@ fn serial_write_elapsed_at(label: &str, started: u64, finished: u64) {
     serial_write(" ms\r\n");
 }
 
-fn serial_write_hex(value: u64) {
+pub(crate) fn serial_write_hex(value: u64) {
     let mut text = *b"0x0000000000000000";
     for (index, digit) in text[2..].iter_mut().enumerate() {
         *digit = b"0123456789abcdef"[((value >> ((15 - index) * 4)) & 0xf) as usize];

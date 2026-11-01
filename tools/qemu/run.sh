@@ -73,14 +73,25 @@ fi
 # it with a virtio-gpu (virtio-gpu-pci, no VGA at all), which Ginux drives
 # as the display; "virtio-vga" is a virtio-gpu that also has a VGA
 # framebuffer for the firmware, which Ginux leaves for the virtio-gpu.
+# "venus" is a virtio-gpu with 3D: Vulkan through Venus runs on the host's
+# GPU (virglrenderer), with GINUX_QEMU_HOSTMEM (default 4G) of host memory
+# to map blobs into; it needs an EGL display, egl-headless unless
+# GINUX_QEMU_DISPLAY asks for a window (gtk, with GL).
 # GINUX_QEMU_GPU_SIZE=WIDTHxHEIGHT sets the mode a virtio-gpu reports.
 gpu=()
 case "${GINUX_QEMU_GPU:-std}" in
     std) ;;
-    virtio | virtio-vga)
+    virtio | virtio-vga | venus)
         gpu_device="virtio-gpu-pci"
         if [[ "$GINUX_QEMU_GPU" == "virtio-vga" ]]; then
             gpu_device="virtio-vga"
+        fi
+        if [[ "$GINUX_QEMU_GPU" == "venus" ]]; then
+            # ioeventfd: a queue notification only signals QEMU's main loop,
+            # which runs the commands, instead of stopping the vCPU until
+            # QEMU has handed them to the renderer (the default for this
+            # device, which made every GPU submission cost ~0.6 ms).
+            gpu_device="virtio-gpu-gl-pci,blob=on,venus=on,hostmem=${GINUX_QEMU_HOSTMEM:-4G},ioeventfd=on"
         fi
         gpu_device+=",disable-legacy=on,iommu_platform=on"
         if [[ -n "${GINUX_QEMU_GPU_SIZE:-}" ]]; then
@@ -93,7 +104,7 @@ case "${GINUX_QEMU_GPU:-std}" in
         gpu=(-vga none -device "$gpu_device")
         ;;
     *)
-        echo "GINUX_QEMU_GPU must be std, virtio or virtio-vga" >&2
+        echo "GINUX_QEMU_GPU must be std, virtio, virtio-vga or venus" >&2
         exit 2
         ;;
 esac
@@ -120,6 +131,13 @@ fi
 # GINUX_QEMU_DISPLAY selects a QEMU display such as gtk or sdl, to see the
 # framebuffer (and a Wayland desktop on /dev/fb0) in a window.
 display="${GINUX_QEMU_DISPLAY:-none}"
+if [[ "${GINUX_QEMU_GPU:-std}" == "venus" ]]; then
+    # virglrenderer renders through EGL on the host's GPU.
+    case "$display" in
+        none) display="egl-headless" ;;
+        gtk | sdl) display+=",gl=on" ;;
+    esac
+fi
 # GINUX_QEMU_MONITOR names a Unix socket for the QEMU monitor, which tests
 # use to take screenshots (screendump) and inject input.
 monitor="none"

@@ -484,6 +484,44 @@ pub(crate) fn arm_linux_wait_timer() -> bool {
     true
 }
 
+/// The APIC count for `nanoseconds` of the Linux tick's clock, at least one
+/// and at most a full tick.
+fn linux_tick_count_for(nanoseconds: u64) -> u32 {
+    let counter_hz = TIMER.interrupt_counter_hz.load(Ordering::Relaxed);
+    let reload = TIMER.linux_wait_reload.load(Ordering::Relaxed).max(1);
+    let count = u128::from(nanoseconds) * u128::from(counter_hz) / 1_000_000_000;
+    u32::try_from(count).unwrap_or(u32::MAX).clamp(1, reload)
+}
+
+/// Brings the next Linux tick forward to `nanoseconds` from now when that
+/// is sooner than the one counting down, so a wait with a deadline (a short
+/// sleep, a poll timeout) ends at it rather than on the next millisecond,
+/// as Linux's high-resolution timers do. The tick runs on the boot CPU's
+/// local APIC; other CPUs leave it alone.
+pub(crate) fn request_linux_tick_within(nanoseconds: u64) {
+    if !TIMER.linux_wait_armed.load(Ordering::Acquire) || cpu::current_cpu_index() != 0 {
+        return;
+    }
+    let mode = if TIMER.interrupt_apic_mode.load(Ordering::SeqCst) == 1 {
+        Mode::X2Apic
+    } else {
+        Mode::XApic
+    };
+    let Some(apic) =
+        LocalApic::from_saved(0, mode, TIMER.interrupt_apic_base.load(Ordering::SeqCst))
+    else {
+        return;
+    };
+    let count = linux_tick_count_for(nanoseconds);
+    // SAFETY: Linux execution owns the boot APIC's timer while the tick is
+    // armed; shortening its count only makes the next tick come sooner.
+    unsafe {
+        if count < apic.read(APIC_CURRENT_COUNT) {
+            apic.write(APIC_INITIAL_COUNT, count);
+        }
+    }
+}
+
 /// Stops the Linux deadline tick while kernel entry still has interrupts off.
 pub(crate) fn finish_linux_wait_timer() -> bool {
     if !TIMER.linux_wait_armed.swap(false, Ordering::SeqCst) {
@@ -692,6 +730,12 @@ pub(crate) unsafe fn verify_device_wait_timeout_interrupt() -> bool {
 }
 
 extern "sysv64" fn timer_interrupt_handler(frame: *mut UserInterruptFrame) {
+    // A SysRq `l` profile samples every tick, before the tick waits for
+    // the kernel entry lock, so a CPU holding that lock shows up too.
+    crate::linux_profile::tick();
+    if let Some(frame) = unsafe { frame.as_ref() } {
+        cpu::sample_linux_profile(frame);
+    }
     let _kernel_entry = crate::sync::kernel_entry_lock();
     TIMER.fired.store(true, Ordering::SeqCst);
     let mode = if TIMER.interrupt_apic_mode.load(Ordering::SeqCst) == 1 {
@@ -764,8 +808,12 @@ extern "sysv64" fn timer_interrupt_handler(frame: *mut UserInterruptFrame) {
         }
         let reload = TIMER.linux_wait_reload.load(Ordering::SeqCst);
         if reload != 0 && TIMER.linux_wait_armed.load(Ordering::SeqCst) {
+            // The next tick comes at the earliest deadline a thread waits
+            // for, if that is sooner than a full tick.
+            let count =
+                cpu::linux_nanoseconds_to_next_wait_deadline().map_or(reload, linux_tick_count_for);
             // SAFETY: the Linux execution phase owns this one-shot timer.
-            unsafe { apic.write(APIC_INITIAL_COUNT, reload) };
+            unsafe { apic.write(APIC_INITIAL_COUNT, count) };
         }
         return;
     }

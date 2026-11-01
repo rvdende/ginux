@@ -39,8 +39,10 @@ use execution::{
 pub(crate) use linux_abi::*;
 use linux_futex::*;
 use linux_poll::*;
-pub(crate) use linux_signal::expire_linux_waits_from_timer;
 use linux_signal::*;
+pub(crate) use linux_signal::{
+    expire_linux_waits_from_timer, linux_nanoseconds_to_next_wait_deadline, sample_linux_profile,
+};
 use linux_syscall::linux_syscall_handler;
 use linux_time::*;
 
@@ -52,7 +54,7 @@ use crate::{
     scheduler::{
         RuntimeAction, UserFaultContext, UserFaultFrame, UserInterruptFrame, UserTrapFrame,
     },
-    serial_write, serial_write_u64, volume,
+    serial_write, serial_write_hex, serial_write_u64, volume,
 };
 
 const KERNEL_CODE_SELECTOR: u16 = 0x08;
@@ -476,8 +478,6 @@ struct X86RuntimeOwner {
     LINUX_RUNTIME_EPOLL_WATCH_TARGET:
         RuntimeRef<[BankedAtomicU16; LINUX_DESCRIPTOR_TABLE_LIMIT as usize]>,
     LINUX_RUNTIME_EVENTFD_ACTIVE: RuntimeRef<[BankedAtomicU8; LINUX_DEVICE_DESCRIPTOR_COUNT]>,
-    LINUX_RUNTIME_EVENTFD_COUNTERS: RuntimeRef<[BankedAtomicU64; LINUX_DEVICE_DESCRIPTOR_COUNT]>,
-    LINUX_RUNTIME_EVENTFD_FLAGS: RuntimeRef<[BankedAtomicU32; LINUX_DEVICE_DESCRIPTOR_COUNT]>,
     LINUX_RUNTIME_EXIT_STATUS: RuntimeRef<BankedAtomicU64>,
     LINUX_RUNTIME_FIRST_UNSUPPORTED_SYSCALL: RuntimeRef<BankedAtomicU64>,
     LINUX_RUNTIME_LATE_DIAGNOSTIC_WRITTEN: RuntimeRef<BankedAtomicBool>,
@@ -501,10 +501,6 @@ struct X86RuntimeOwner {
     LINUX_RUNTIME_SYSCALL_TRACE: RuntimeRef<[BankedAtomicU64; LINUX_RUNTIME_SYSCALL_TRACE_LIMIT]>,
     LINUX_RUNTIME_SYSCALL_TRACE_COUNT: RuntimeRef<BankedAtomicU64>,
     LINUX_RUNTIME_TIMERFD_ACTIVE: RuntimeRef<[BankedAtomicU8; LINUX_DEVICE_DESCRIPTOR_COUNT]>,
-    LINUX_RUNTIME_TIMERFD_CLOCKS: RuntimeRef<[BankedAtomicU8; LINUX_DEVICE_DESCRIPTOR_COUNT]>,
-    LINUX_RUNTIME_TIMERFD_DEADLINES: RuntimeRef<[BankedAtomicU64; LINUX_DEVICE_DESCRIPTOR_COUNT]>,
-    LINUX_RUNTIME_TIMERFD_FLAGS: RuntimeRef<[BankedAtomicU32; LINUX_DEVICE_DESCRIPTOR_COUNT]>,
-    LINUX_RUNTIME_TIMERFD_INTERVALS: RuntimeRef<[BankedAtomicU64; LINUX_DEVICE_DESCRIPTOR_COUNT]>,
     LINUX_RUNTIME_UNSUPPORTED_SYSCALLS:
         RuntimeRef<[BankedAtomicU64; LINUX_RUNTIME_UNSUPPORTED_WORDS]>,
     LINUX_SIGNAL_ACTIVE: RuntimeRef<BankedAtomicBool>,
@@ -1019,8 +1015,6 @@ static X86_RUNTIME: X86RuntimeOwner = X86RuntimeOwner {
         &X86_RUNTIME_BACKING_LINUX_RUNTIME_EPOLL_WATCH_TARGET,
     ),
     LINUX_RUNTIME_EVENTFD_ACTIVE: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_RUNTIME_EVENTFD_ACTIVE),
-    LINUX_RUNTIME_EVENTFD_COUNTERS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_RUNTIME_EVENTFD_COUNTERS),
-    LINUX_RUNTIME_EVENTFD_FLAGS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_RUNTIME_EVENTFD_FLAGS),
     LINUX_RUNTIME_EXIT_STATUS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_RUNTIME_EXIT_STATUS),
     LINUX_RUNTIME_FIRST_UNSUPPORTED_SYSCALL: RuntimeRef(
         &X86_RUNTIME_BACKING_LINUX_RUNTIME_FIRST_UNSUPPORTED_SYSCALL,
@@ -1059,14 +1053,6 @@ static X86_RUNTIME: X86RuntimeOwner = X86RuntimeOwner {
         &X86_RUNTIME_BACKING_LINUX_RUNTIME_SYSCALL_TRACE_COUNT,
     ),
     LINUX_RUNTIME_TIMERFD_ACTIVE: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_RUNTIME_TIMERFD_ACTIVE),
-    LINUX_RUNTIME_TIMERFD_CLOCKS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_RUNTIME_TIMERFD_CLOCKS),
-    LINUX_RUNTIME_TIMERFD_DEADLINES: RuntimeRef(
-        &X86_RUNTIME_BACKING_LINUX_RUNTIME_TIMERFD_DEADLINES,
-    ),
-    LINUX_RUNTIME_TIMERFD_FLAGS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_RUNTIME_TIMERFD_FLAGS),
-    LINUX_RUNTIME_TIMERFD_INTERVALS: RuntimeRef(
-        &X86_RUNTIME_BACKING_LINUX_RUNTIME_TIMERFD_INTERVALS,
-    ),
     LINUX_RUNTIME_UNSUPPORTED_SYSCALLS: RuntimeRef(
         &X86_RUNTIME_BACKING_LINUX_RUNTIME_UNSUPPORTED_SYSCALLS,
     ),
@@ -2075,12 +2061,6 @@ static X86_RUNTIME_BACKING_ELF_PROBE_EVENTFD_FLAGS: BankedAtomicU32 = BankedAtom
 static X86_RUNTIME_BACKING_LINUX_RUNTIME_EVENTFD_ACTIVE: [BankedAtomicU8;
     LINUX_DEVICE_DESCRIPTOR_COUNT] =
     [const { BankedAtomicU8::new(0) }; LINUX_DEVICE_DESCRIPTOR_COUNT];
-static X86_RUNTIME_BACKING_LINUX_RUNTIME_EVENTFD_COUNTERS: [BankedAtomicU64;
-    LINUX_DEVICE_DESCRIPTOR_COUNT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_DEVICE_DESCRIPTOR_COUNT];
-static X86_RUNTIME_BACKING_LINUX_RUNTIME_EVENTFD_FLAGS: [BankedAtomicU32;
-    LINUX_DEVICE_DESCRIPTOR_COUNT] =
-    [const { BankedAtomicU32::new(0) }; LINUX_DEVICE_DESCRIPTOR_COUNT];
 static X86_RUNTIME_BACKING_ELF_PROBE_TIMERFD_DESCRIPTOR: BankedAtomicU16 = BankedAtomicU16::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_TIMERFD_CLOCK: BankedAtomicU8 = BankedAtomicU8::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_TIMERFD_FLAGS: BankedAtomicU32 = BankedAtomicU32::new(0);
@@ -2089,18 +2069,6 @@ static X86_RUNTIME_BACKING_ELF_PROBE_TIMERFD_DEADLINE: BankedAtomicU64 = BankedA
 static X86_RUNTIME_BACKING_LINUX_RUNTIME_TIMERFD_ACTIVE: [BankedAtomicU8;
     LINUX_DEVICE_DESCRIPTOR_COUNT] =
     [const { BankedAtomicU8::new(0) }; LINUX_DEVICE_DESCRIPTOR_COUNT];
-static X86_RUNTIME_BACKING_LINUX_RUNTIME_TIMERFD_CLOCKS: [BankedAtomicU8;
-    LINUX_DEVICE_DESCRIPTOR_COUNT] =
-    [const { BankedAtomicU8::new(0) }; LINUX_DEVICE_DESCRIPTOR_COUNT];
-static X86_RUNTIME_BACKING_LINUX_RUNTIME_TIMERFD_FLAGS: [BankedAtomicU32;
-    LINUX_DEVICE_DESCRIPTOR_COUNT] =
-    [const { BankedAtomicU32::new(0) }; LINUX_DEVICE_DESCRIPTOR_COUNT];
-static X86_RUNTIME_BACKING_LINUX_RUNTIME_TIMERFD_INTERVALS: [BankedAtomicU64;
-    LINUX_DEVICE_DESCRIPTOR_COUNT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_DEVICE_DESCRIPTOR_COUNT];
-static X86_RUNTIME_BACKING_LINUX_RUNTIME_TIMERFD_DEADLINES: [BankedAtomicU64;
-    LINUX_DEVICE_DESCRIPTOR_COUNT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_DEVICE_DESCRIPTOR_COUNT];
 static X86_RUNTIME_BACKING_ELF_PROBE_POSIX_TIMER_ACTIVE: BankedAtomicBool =
     BankedAtomicBool::new(false);
 static X86_RUNTIME_BACKING_ELF_PROBE_POSIX_TIMER_INTERVAL: BankedAtomicU64 =
@@ -4020,6 +3988,14 @@ fn append_linux_process_snapshot_mapping(
 
 fn live_runtime_linux_process_address_space_snapshot(
 ) -> Option<&'static LinuxProcessAddressSpaceSnapshot> {
+    crate::linux_profile::span(
+        crate::linux_profile::Span::Snapshot,
+        take_runtime_linux_process_address_space_snapshot,
+    )
+}
+
+fn take_runtime_linux_process_address_space_snapshot(
+) -> Option<&'static LinuxProcessAddressSpaceSnapshot> {
     X86_RUNTIME
         .LINUX_PROCESS_SNAPSHOT_STAGE
         .store(1, Ordering::SeqCst);
@@ -4586,6 +4562,35 @@ fn refresh_nonruntime_linux_process_registry(context: LinuxUserContext) -> bool 
         context.rflags,
         context.fs_base,
     )
+}
+
+/// Records where a process waits, for the waits that let others run (a
+/// yield, a parked blocking call): its execution context, without a
+/// page-by-page snapshot of what it maps. A snapshot
+/// walks every mapped page and checks each against the frame allocator,
+/// which for a large process (a GPU application maps hundreds of thousands
+/// of pages) cost milliseconds on every wait. The registry's mapping list is
+/// marked stale instead, so the process's release frees what its live page
+/// tables map; fork, exec and exit still take a full snapshot.
+fn refresh_linux_process_registry_for_wait(context: LinuxUserContext) -> bool {
+    if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
+        return refresh_live_linux_process_registry(context);
+    }
+    // The page-table root does not change outside exec, and a stale
+    // registry is released through the live tables, so neither its mapping
+    // list nor its table list is walked here.
+    let pid = current_linux_process_pid();
+    let light = linux_process::refresh_live_process_context_for_wait(
+        pid,
+        context
+            .registers
+            .process_general(context.rax, context.rip, context.rflags),
+        context.rip,
+        context.rsp,
+        context.rflags,
+        context.fs_base,
+    );
+    light || refresh_live_linux_process_registry(context)
 }
 
 fn refresh_live_linux_process_registry(context: LinuxUserContext) -> bool {
@@ -6910,6 +6915,9 @@ fn block_current_linux_thread(kind: u8, key: u64, output: u64, deadline: u64) ->
         X86_RUNTIME
             .LINUX_TIMED_WAITS_ACTIVE
             .store(true, Ordering::Release);
+        if let Some(now) = linux_elapsed_nanoseconds() {
+            timer::request_linux_tick_within(deadline.saturating_sub(now));
+        }
     }
     if matches!(
         kind,
@@ -8695,8 +8703,6 @@ pub(crate) fn verify_linux_elf_entry(execution: &LinuxElfExecution<'_>) -> Linux
         .store(0, Ordering::SeqCst);
     for index in 0..LINUX_DEVICE_DESCRIPTOR_COUNT {
         X86_RUNTIME.LINUX_RUNTIME_EVENTFD_ACTIVE[index].store(0, Ordering::SeqCst);
-        X86_RUNTIME.LINUX_RUNTIME_EVENTFD_COUNTERS[index].store(0, Ordering::SeqCst);
-        X86_RUNTIME.LINUX_RUNTIME_EVENTFD_FLAGS[index].store(0, Ordering::SeqCst);
     }
     X86_RUNTIME
         .ELF_PROBE_TIMERFD_DESCRIPTOR
@@ -8715,10 +8721,6 @@ pub(crate) fn verify_linux_elf_entry(execution: &LinuxElfExecution<'_>) -> Linux
         .store(0, Ordering::SeqCst);
     for index in 0..LINUX_DEVICE_DESCRIPTOR_COUNT {
         X86_RUNTIME.LINUX_RUNTIME_TIMERFD_ACTIVE[index].store(0, Ordering::SeqCst);
-        X86_RUNTIME.LINUX_RUNTIME_TIMERFD_CLOCKS[index].store(0, Ordering::SeqCst);
-        X86_RUNTIME.LINUX_RUNTIME_TIMERFD_FLAGS[index].store(0, Ordering::SeqCst);
-        X86_RUNTIME.LINUX_RUNTIME_TIMERFD_INTERVALS[index].store(0, Ordering::SeqCst);
-        X86_RUNTIME.LINUX_RUNTIME_TIMERFD_DEADLINES[index].store(0, Ordering::SeqCst);
     }
     X86_RUNTIME
         .ELF_PROBE_POSIX_TIMER_ACTIVE
@@ -11961,7 +11963,11 @@ fn linux_request_process_fork(
     // vfork/CLONE_VM inherits the already-owned address space. Updating only
     // the execution context avoids manufacturing a page-per-leaf snapshot for
     // a child that will share the parent's mappings until exec or exit.
-    let refreshed = if share_vm {
+    // A child sharing the parent's memory takes the parent's mapping list
+    // as its own, so a list a wait left stale is snapshotted first.
+    let refreshed = if share_vm
+        && !linux_process::live_process_address_space_stale(current_linux_process_pid())
+    {
         let snapshot = unsafe { &mut *X86_RUNTIME.LINUX_PROCESS_SNAPSHOT_SCRATCH.0 .0.get() };
         let hierarchy_refreshed = address_space::current_linux_process_hierarchy(
             &mut snapshot.hierarchy,
@@ -13356,7 +13362,7 @@ fn run_other_linux_processes(
             LinuxBlockedWait::Recheck
         });
     }
-    if !refresh_live_linux_process_registry(caller) {
+    if !refresh_linux_process_registry_for_wait(caller) {
         return None;
     }
     // Init waits on its own stack: the runtime loop runs the others and
@@ -13501,6 +13507,11 @@ fn linux_killed_process(current: u32) -> Option<u32> {
     None
 }
 
+/// How often, at most, sched_yield lets other processes run.
+const LINUX_YIELD_ROTATION_MICROSECONDS: u64 = 250;
+/// When sched_yield last let other processes run (timestamp counter).
+static LINUX_YIELD_ROTATED_AT: AtomicU64 = AtomicU64::new(0);
+
 fn linux_sched_yield_live_return(
     output: *mut LinuxSyscallFrame,
     registers: LinuxSyscallFrame,
@@ -13525,9 +13536,21 @@ fn linux_sched_yield_live_return(
         // the CPU, as in Linux: a process spinning on sched_yield while it
         // waits for another one would otherwise never let that one run. The
         // call returns 0 when this process is next scheduled. Init, which
-        // runs the others from its own waits, just returns.
-        if current_linux_runtime_cpu_index() == 0
-            && caller.is_some_and(|caller| yield_current_linux_process(caller, 0))
+        // runs the others from its own waits, just returns. The others are
+        // mostly parked waits that only recheck, so a yield goes round them
+        // at most every LINUX_YIELD_ROTATION_MICROSECONDS and otherwise
+        // returns at once: a GPU driver polling for its device's reply
+        // yields thousands of times a second.
+        let now = timer::timestamp_counter();
+        let interval = timer::monotonic_frequency()
+            .map_or(0, |hz| hz / 1_000_000 * LINUX_YIELD_ROTATION_MICROSECONDS);
+        let due = now.wrapping_sub(LINUX_YIELD_ROTATED_AT.load(Ordering::Relaxed)) >= interval;
+        if due
+            && current_linux_runtime_cpu_index() == 0
+            && caller.is_some_and(|caller| {
+                LINUX_YIELD_ROTATED_AT.store(now, Ordering::Relaxed);
+                yield_current_linux_process(caller, 0)
+            })
         {
             return LINUX_RETURN_TO_KERNEL;
         }
@@ -14278,6 +14301,8 @@ pub(crate) fn resume_suspended_linux_runtime(mmap: u64) -> LinuxElfResult {
 /// has finished (init exited, the runtime is suspending, or it forked,
 /// which the loop completes first).
 fn run_linux_runtime_loop() -> bool {
+    let mut entries = linux_syscall::LINUX_SYSCALL_ENTRIES.load(Ordering::Relaxed);
+    let mut idle_rounds = 0_usize;
     loop {
         while X86_RUNTIME.LINUX_FORK_REQUESTED.load(Ordering::SeqCst) {
             if !execute_deferred_live_fork() {
@@ -14297,6 +14322,17 @@ fn run_linux_runtime_loop() -> bool {
         if !resume_parked_linux_process(1) {
             return false;
         }
+        // Rounds in which the process run only rechecked its wait and parked
+        // again make no system call. Once every process has had such a round
+        // in a row, nothing changes until an interrupt (the tick, a device)
+        // does: wait for one instead of going round again.
+        let now = linux_syscall::LINUX_SYSCALL_ENTRIES.load(Ordering::Relaxed);
+        idle_rounds = if now == entries { idle_rounds + 1 } else { 0 };
+        if idle_rounds > usize::from(linux_process::live_process_count().unwrap_or(1)) {
+            linux_wait_for_interrupt();
+            idle_rounds = 0;
+        }
+        entries = linux_syscall::LINUX_SYSCALL_ENTRIES.load(Ordering::Relaxed);
     }
 }
 
@@ -15156,6 +15192,12 @@ fn stage_linux_fork_child_runtime_state(
 }
 
 fn save_current_linux_process_runtime_state(pid: u32) {
+    crate::linux_profile::span(crate::linux_profile::Span::SaveProcess, || {
+        save_current_linux_process_runtime_state_now(pid)
+    })
+}
+
+fn save_current_linux_process_runtime_state_now(pid: u32) {
     let started = cfg!(feature = "linux-boot-profile").then(timer::timestamp_counter);
     linux_process::charge_live_process_cpu(pid, timer::timestamp_counter());
     if let (Some(state), Some(destination)) = (
@@ -15176,6 +15218,12 @@ fn save_current_linux_process_runtime_state(pid: u32) {
 }
 
 fn restore_saved_linux_process_runtime_state(pid: u32) -> bool {
+    crate::linux_profile::span(crate::linux_profile::Span::RestoreProcess, || {
+        restore_saved_linux_process_runtime_state_now(pid)
+    })
+}
+
+fn restore_saved_linux_process_runtime_state_now(pid: u32) -> bool {
     let started = cfg!(feature = "linux-boot-profile").then(timer::timestamp_counter);
     let Some(state) = linux_process_runtime_state(pid).filter(|state| state.valid) else {
         return false;
@@ -15288,6 +15336,13 @@ fn restore_linux_thread_runtime_state(
     last_preempted: u8,
 ) {
     for (slot, state) in threads.iter().enumerate() {
+        // A slot free in both tables is already clear but for its generation.
+        if state.state == LINUX_THREAD_FREE
+            && X86_RUNTIME.LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) == LINUX_THREAD_FREE
+        {
+            X86_RUNTIME.LINUX_THREAD_GENERATIONS[slot].store(state.generation, Ordering::SeqCst);
+            continue;
+        }
         X86_RUNTIME.LINUX_THREAD_STATES[slot].store(state.state, Ordering::SeqCst);
         X86_RUNTIME.LINUX_THREAD_GENERATIONS[slot].store(state.generation, Ordering::SeqCst);
         X86_RUNTIME.LINUX_THREAD_TIDS[slot].store(state.tid, Ordering::SeqCst);
@@ -15401,7 +15456,18 @@ fn capture_linux_process_runtime_state() -> Option<LinuxProcessRuntimeState> {
     let pid = current_linux_process_pid();
     let threads = linux_process_thread_runtime_state(pid)?;
     for (slot, state) in threads.iter_mut().enumerate() {
-        *state = capture_linux_thread_runtime_state(slot);
+        // A free slot is clear but for its generation (see
+        // clear_linux_thread_slot): copying its ~17 KiB of zeros on every
+        // process switch was most of a switch's cost.
+        *state =
+            if X86_RUNTIME.LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) == LINUX_THREAD_FREE {
+                LinuxThreadRuntimeState {
+                    generation: X86_RUNTIME.LINUX_THREAD_GENERATIONS[slot].load(Ordering::SeqCst),
+                    ..LinuxThreadRuntimeState::EMPTY
+                }
+            } else {
+                capture_linux_thread_runtime_state(slot)
+            };
     }
     Some(LinuxProcessRuntimeState {
         valid: true,
@@ -15743,7 +15809,43 @@ fn capture_linux_descriptor_runtime_state() -> LinuxDescriptorRuntimeState {
     }
 }
 
+/// The eventfd and timerfd open files saved descriptor table `state` refers
+/// to: kind and id, one per descriptor.
+fn linux_saved_event_files(
+    state: &LinuxDescriptorRuntimeState,
+) -> impl Iterator<Item = (crate::linux_event_files::Kind, u64)> + '_ {
+    (0..LINUX_DEVICE_DESCRIPTOR_COUNT).filter_map(|index| {
+        let (word, bit) = (index / 64, index % 64);
+        let kind = if (state.runtime_eventfd_active[word] >> bit) & 1 != 0 {
+            crate::linux_event_files::Kind::EventFd
+        } else if (state.runtime_timerfd_active[word] >> bit) & 1 != 0 {
+            crate::linux_event_files::Kind::TimerFd
+        } else {
+            return None;
+        };
+        Some((kind, state.offsets[index]))
+    })
+}
+
 fn retain_linux_descriptor_runtime_state(state: &LinuxDescriptorRuntimeState) -> bool {
+    for (retained, (kind, id)) in linux_saved_event_files(state).enumerate() {
+        if !crate::linux_event_files::retain(kind, id) {
+            for (kind, id) in linux_saved_event_files(state).take(retained) {
+                crate::linux_event_files::release(kind, id);
+            }
+            return false;
+        }
+    }
+    if !retain_linux_descriptor_sockets_and_queues(state) {
+        for (kind, id) in linux_saved_event_files(state) {
+            crate::linux_event_files::release(kind, id);
+        }
+        return false;
+    }
+    true
+}
+
+fn retain_linux_descriptor_sockets_and_queues(state: &LinuxDescriptorRuntimeState) -> bool {
     let mut retained = 0_usize;
     for socket in state.stdio_sockets.iter().chain(&state.sockets).copied() {
         if socket == 0 {
@@ -15795,6 +15897,9 @@ fn retain_linux_descriptor_runtime_state(state: &LinuxDescriptorRuntimeState) ->
 }
 
 fn release_linux_descriptor_runtime_state(state: &LinuxDescriptorRuntimeState) {
+    for (kind, id) in linux_saved_event_files(state) {
+        crate::linux_event_files::release(kind, id);
+    }
     for socket in state
         .stdio_sockets
         .iter()
@@ -16105,9 +16210,7 @@ fn linux_runtime_heap_contains(address: u64) -> bool {
 }
 
 fn linux_runtime_range_available(address: u64, pages: usize) -> bool {
-    (0..pages).all(|page| {
-        !address_space::current_linux_runtime_page(address + (page * PAGE_SIZE) as u64).occupied
-    })
+    address_space::current_linux_range_unoccupied(address, pages)
 }
 
 fn linux_runtime_select_mapping(address: u64, pages: usize, fixed: bool) -> Option<u64> {
@@ -22035,6 +22138,12 @@ fn linux_record_mapping(
 }
 
 fn linux_runtime_munmap(address: u64, length: u64) -> u64 {
+    crate::linux_profile::span(crate::linux_profile::Span::Munmap, || {
+        linux_runtime_munmap_pages(address, length)
+    })
+}
+
+fn linux_runtime_munmap_pages(address: u64, length: u64) -> u64 {
     let Some((_, pages)) = linux_runtime_mapping_range(address, length) else {
         return LINUX_EINVAL;
     };
@@ -24548,6 +24657,7 @@ fn linux_proc_root_file_kind(name: &[u8]) -> Option<u16> {
         b"loadavg" => Some(LINUX_FILE_PROC_LOADAVG),
         b"filesystems" => Some(LINUX_FILE_PROC_FILESYSTEMS),
         b"cmdline" => Some(LINUX_FILE_PROC_CMDLINE),
+        b"sysrq-trigger" => Some(LINUX_FILE_PROC_SYSRQ_TRIGGER),
         _ => None,
     }
 }
@@ -25748,6 +25858,13 @@ fn linux_rootfs_execve_source(
     release_linux_process_shared_mappings(current_linux_process_pid());
     linux_record_exec_image(&plan, path);
     linux_apply_exec_credentials(exec_file);
+    // The new program has no rseq area yet: its C library registers its
+    // own (Linux's rseq_execve), which the old image's would refuse.
+    if let Some(slot) = current_linux_thread_slot() {
+        X86_RUNTIME.LINUX_THREAD_RSEQ_POINTERS[slot].store(0, Ordering::SeqCst);
+        X86_RUNTIME.LINUX_THREAD_RSEQ_LENGTHS[slot].store(0, Ordering::SeqCst);
+        X86_RUNTIME.LINUX_THREAD_RSEQ_SIGNATURES[slot].store(0, Ordering::SeqCst);
+    }
     // The new program starts without thread and process keyrings.
     let (pid, tid) = (current_linux_process_pid(), current_linux_tid());
     let _ = linux_with_keys(|keys, _| {
@@ -27186,7 +27303,35 @@ fn linux_canonical_path_at(
     }
     let length = if path.starts_with(b"/") {
         0
-    } else if directory as u32 == LINUX_AT_FDCWD {
+    } else {
+        linux_walk_start(directory, output)?
+    };
+    let length = linux_walk_path_components(output, length, path, &mut 0, true)?;
+    if length == 0 {
+        return Err(LINUX_EISDIR);
+    }
+    if output[..length].starts_with(b"sys/fs/cgroup/") {
+        linux_ensure_cgroup_root();
+    }
+    if output[..length].starts_with(b"dev/dri") || output[..length].starts_with(b"sys/dev") {
+        crate::linux_drm::ensure_nodes();
+    }
+    // Root may search every directory; anyone else needs search permission
+    // on each directory the walk passes through.
+    if current_linux_credentials().is_some_and(|credentials| !credentials.filesystem_privileged()) {
+        linux_check_path_walk(&output[..length])?;
+    }
+    Ok(length)
+}
+
+/// Where a relative path walk from `directory` starts: the canonical path
+/// of the current directory (AT_FDCWD) or of the directory `directory`
+/// refers to, in `output`; 0 for the root.
+fn linux_walk_start(
+    directory: u64,
+    output: &mut [u8; crate::linux_overlay::PATH_CAPACITY],
+) -> Result<usize, u64> {
+    Ok(if directory as u32 == LINUX_AT_FDCWD {
         let overlay = X86_RUNTIME.ELF_PROBE_OVERLAY_CWD.load(Ordering::SeqCst);
         if overlay != 0 {
             let handle = crate::linux_overlay::from_generation(overlay).ok_or(LINUX_ENOENT)?;
@@ -27228,20 +27373,7 @@ fn linux_canonical_path_at(
         } else {
             crate::published_rootfs::copy_path(handle, output).ok_or(LINUX_ENOTDIR)?
         }
-    };
-    let length = linux_walk_path_components(output, length, path, &mut 0, true)?;
-    if length == 0 {
-        return Err(LINUX_EISDIR);
-    }
-    if output[..length].starts_with(b"sys/fs/cgroup/") {
-        linux_ensure_cgroup_root();
-    }
-    // Root may search every directory; anyone else needs search permission
-    // on each directory the walk passes through.
-    if current_linux_credentials().is_some_and(|credentials| !credentials.filesystem_privileged()) {
-        linux_check_path_walk(&output[..length])?;
-    }
-    Ok(length)
+    })
 }
 
 /// Walks `path`'s components onto the canonical path `output[..length]`,
@@ -27667,35 +27799,55 @@ fn linux_overlay_stat(metadata: crate::linux_overlay::Metadata) -> [u8; LINUX_ST
 }
 
 fn linux_openat(directory: u64, path_address: u64, flags: u64, mode: u64) -> u64 {
-    let directory = u64::from(directory as u32);
-    let flags = u64::from(flags as u32);
-    let mode = u64::from(mode as u32);
     let mut path = [0_u8; LINUX_PATH_MAX];
-    let mut path_length = match copy_linux_c_string(path_address, &mut path) {
+    let path_length = match copy_linux_c_string(path_address, &mut path) {
         Ok(length) => length,
         Err(error) => return error,
     };
+    linux_openat_path(directory, path, path_length, flags, mode)
+}
+
+/// openat(2) of `path[..path_length]`, a path already in kernel memory.
+fn linux_openat_path(
+    directory: u64,
+    mut path: [u8; LINUX_PATH_MAX],
+    mut path_length: usize,
+    flags: u64,
+    mode: u64,
+) -> u64 {
+    /// __O_TMPFILE: an unnamed file in the directory opened.
+    const LINUX_O_TMPFILE_BIT: u64 = 0x40_0000;
+    let directory = u64::from(directory as u32);
+    let flags = u64::from(flags as u32);
+    let mode = u64::from(mode as u32);
     let access = flags & 3;
-    if access == 3
-        || flags
-            & !(3
-                | LINUX_O_CLOEXEC
-                | LINUX_O_NOCTTY
-                | LINUX_O_DIRECTORY
-                | LINUX_O_CREAT
-                | LINUX_O_EXCL
-                | LINUX_O_TRUNC
-                | LINUX_O_APPEND
-                | LINUX_O_NONBLOCK
-                | LINUX_O_LARGEFILE
-                | LINUX_O_NOFOLLOW
-                | LINUX_O_NOATIME
-                | LINUX_O_PATH)
-            != 0
-        || flags & LINUX_O_EXCL != 0 && flags & LINUX_O_CREAT == 0
+    if access == 3 || flags & LINUX_O_EXCL != 0 && flags & LINUX_O_CREAT == 0 {
+        return LINUX_EINVAL;
+    }
+    // O_TMPFILE is __O_TMPFILE with O_DIRECTORY, without O_CREAT, and
+    // needs write access (all EINVAL otherwise, as in Linux).
+    let temporary = flags & LINUX_O_TMPFILE_BIT != 0;
+    if temporary
+        && (flags & (LINUX_O_DIRECTORY | LINUX_O_CREAT) != LINUX_O_DIRECTORY || access == 0)
     {
         return LINUX_EINVAL;
     }
+    // Like Linux's open and openat (only openat2 is strict), ignore the
+    // flags that change nothing here: O_SYNC, O_DSYNC, O_DIRECT, O_ASYNC
+    // and any unknown bit. GNU tar opens what it extracts with some.
+    let flags = flags
+        & (3 | LINUX_O_CLOEXEC
+            | LINUX_O_NOCTTY
+            | LINUX_O_DIRECTORY
+            | LINUX_O_CREAT
+            | LINUX_O_EXCL
+            | LINUX_O_TRUNC
+            | LINUX_O_APPEND
+            | LINUX_O_NONBLOCK
+            | LINUX_O_LARGEFILE
+            | LINUX_O_NOFOLLOW
+            | LINUX_O_NOATIME
+            | LINUX_O_PATH);
     if let Some(descriptor_bytes) = path[..path_length].strip_prefix(b"/proc/self/fd/") {
         let Some(descriptor) = descriptor_bytes.iter().try_fold(0_u64, |value, byte| {
             byte.is_ascii_digit()
@@ -27744,6 +27896,9 @@ fn linux_openat(directory: u64, path_address: u64, flags: u64, mode: u64) -> u64
         path_length = resolved_length;
     }
     let path = &path[..path_length];
+    if temporary {
+        return linux_open_temporary(directory, path, flags, mode);
+    }
     let tmp_path = path == b"/tmp/ginux-ready";
     let proc_fdinfo_target = linux_proc_fdinfo_target(path);
     let proc_dynamic_pid = linux_proc_process_file(path)
@@ -28000,6 +28155,14 @@ fn linux_openat(directory: u64, path_address: u64, flags: u64, mode: u64) -> u64
                 crate::linux_overlay::NodeKind::CharacterDevice
                 | crate::linux_overlay::NodeKind::BlockDevice,
             ) if flags & LINUX_O_PATH != 0 => LINUX_FILE_TMP_SCRATCH,
+            Some(crate::linux_overlay::NodeKind::CharacterDevice)
+                if crate::linux_drm::available()
+                    && crate::linux_overlay::metadata(handle).is_some_and(|metadata| {
+                        metadata.device == crate::linux_drm::NODE_DEVICE
+                    }) =>
+            {
+                return linux_open_render_node(flags);
+            }
             Some(
                 kind @ (crate::linux_overlay::NodeKind::CharacterDevice
                 | crate::linux_overlay::NodeKind::BlockDevice),
@@ -28126,7 +28289,40 @@ fn linux_openat(directory: u64, path_address: u64, flags: u64, mode: u64) -> u64
     descriptor
 }
 
+/// openat2(2)'s RESOLVE_* restrictions on the path walk.
+const LINUX_RESOLVE_NO_XDEV: u64 = 0x01;
+const LINUX_RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+const LINUX_RESOLVE_NO_SYMLINKS: u64 = 0x04;
+const LINUX_RESOLVE_BENEATH: u64 = 0x08;
+const LINUX_RESOLVE_IN_ROOT: u64 = 0x10;
+const LINUX_RESOLVE_CACHED: u64 = 0x20;
+
 fn linux_openat2(directory: u64, path_address: u64, how_address: u64, size: u64) -> u64 {
+    /// The open flags openat2(2) accepts (it rejects the rest, unlike open).
+    const VALID_FLAGS: u64 = 3
+        | LINUX_O_CREAT
+        | LINUX_O_EXCL
+        | LINUX_O_NOCTTY
+        | LINUX_O_TRUNC
+        | LINUX_O_APPEND
+        | LINUX_O_NONBLOCK
+        | 0o10_000 // O_DSYNC
+        | 0o20_000 // O_ASYNC
+        | 0o40_000 // O_DIRECT
+        | LINUX_O_LARGEFILE
+        | LINUX_O_DIRECTORY
+        | LINUX_O_NOFOLLOW
+        | LINUX_O_NOATIME
+        | LINUX_O_CLOEXEC
+        | 0o4_000_000 // __O_SYNC
+        | LINUX_O_PATH
+        | 0o20_000_000; // __O_TMPFILE
+    const RESOLVE_FLAGS: u64 = LINUX_RESOLVE_NO_XDEV
+        | LINUX_RESOLVE_NO_MAGICLINKS
+        | LINUX_RESOLVE_NO_SYMLINKS
+        | LINUX_RESOLVE_BENEATH
+        | LINUX_RESOLVE_IN_ROOT
+        | LINUX_RESOLVE_CACHED;
     let directory = u64::from(directory as u32);
     const OPEN_HOW_SIZE_VER0: usize = 24;
     let Ok(size) = usize::try_from(size) else {
@@ -28160,10 +28356,235 @@ fn linux_openat2(directory: u64, path_address: u64, how_address: u64, size: u64)
     let flags = u64::from_ne_bytes(how[..8].try_into().unwrap());
     let mode = u64::from_ne_bytes(how[8..16].try_into().unwrap());
     let resolve = u64::from_ne_bytes(how[16..24].try_into().unwrap());
-    if resolve != 0 || mode & !0o7777 != 0 || mode != 0 && flags & LINUX_O_CREAT == 0 {
+    let creates = flags & (LINUX_O_CREAT | 0o20_000_000) != 0;
+    if flags & !VALID_FLAGS != 0
+        || resolve & !RESOLVE_FLAGS != 0
+        || resolve & (LINUX_RESOLVE_BENEATH | LINUX_RESOLVE_IN_ROOT)
+            == (LINUX_RESOLVE_BENEATH | LINUX_RESOLVE_IN_ROOT)
+        || mode & !0o7777 != 0
+        || mode != 0 && !creates
+    {
         return LINUX_EINVAL;
     }
-    linux_openat(directory, path_address, flags, mode)
+    // A lookup that could not be done from the cache alone (one that may
+    // create or truncate) is EAGAIN; every other lookup here is cached.
+    if resolve & LINUX_RESOLVE_CACHED != 0
+        && flags & (LINUX_O_CREAT | LINUX_O_TRUNC | 0o20_000_000) != 0
+    {
+        return LINUX_EAGAIN;
+    }
+    let mut path = [0_u8; LINUX_PATH_MAX];
+    let path_length = match copy_linux_c_string(path_address, &mut path) {
+        Ok(length) => length,
+        Err(error) => return error,
+    };
+    let restricted = resolve & !LINUX_RESOLVE_CACHED;
+    if restricted == 0 || path_length == 0 {
+        return linux_openat_path(directory, path, path_length, flags, mode);
+    }
+    // Resolve under the restrictions, then open the canonical path found.
+    let follow_final = flags & (LINUX_O_NOFOLLOW | LINUX_O_PATH) != LINUX_O_NOFOLLOW;
+    let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    let length = match linux_resolve_restricted(
+        directory,
+        &path[..path_length],
+        restricted,
+        follow_final,
+        &mut canonical,
+    ) {
+        Ok(length) => length,
+        Err(error) => return error,
+    };
+    // A trailing slash still asks for a directory.
+    let mut absolute = [0_u8; LINUX_PATH_MAX];
+    absolute[0] = b'/';
+    absolute[1..1 + length].copy_from_slice(&canonical[..length]);
+    let mut absolute_length = length + 1;
+    if length != 0 && path[..path_length].ends_with(b"/") {
+        absolute[absolute_length] = b'/';
+        absolute_length += 1;
+    }
+    linux_openat_path(
+        u64::from(LINUX_AT_FDCWD),
+        absolute,
+        absolute_length,
+        flags,
+        mode,
+    )
+}
+
+/// Whether canonical `path` is a magic link: /proc/PID/fd/N, exe, cwd,
+/// root and the like, which jump instead of naming a path.
+fn linux_magic_link(path: &[u8]) -> bool {
+    let Some(rest) = path.strip_prefix(b"proc/") else {
+        return false;
+    };
+    let Some(separator) = rest.iter().position(|byte| *byte == b'/') else {
+        return false;
+    };
+    let (process, name) = (&rest[..separator], &rest[separator + 1..]);
+    (process == b"self" || process == b"thread-self" || process.iter().all(u8::is_ascii_digit))
+        && (matches!(name, b"exe" | b"cwd" | b"root")
+            || name.starts_with(b"fd/")
+            || name.starts_with(b"map_files/")
+            || name.starts_with(b"ns/"))
+}
+
+/// The target of the symlink at exactly canonical `path`, the overlay's
+/// before the image's, into `target`; `None` if `path` is not a symlink.
+fn linux_exact_symlink(
+    path: &[u8],
+    target: &mut [u8; crate::linux_overlay::PATH_CAPACITY],
+) -> Option<usize> {
+    if let Some(metadata) = crate::linux_overlay::lookup(path) {
+        if metadata.kind != crate::linux_overlay::NodeKind::Symlink {
+            return None;
+        }
+        return crate::linux_overlay::read(metadata.handle, 0, target);
+    }
+    if crate::linux_overlay::hidden(path) {
+        return None;
+    }
+    let entry = crate::published_rootfs::exact_entry(path)
+        .filter(|entry| entry.kind == crate::published_rootfs::EntryKind::Symlink)?;
+    let length = entry.link.len();
+    target.get_mut(..length)?.copy_from_slice(entry.link);
+    Some(length)
+}
+
+/// Resolves `path` relative to `directory` as openat2(2) does under the
+/// RESOLVE_* `restrictions`, into its canonical path in `output` (no
+/// leading slash):
+///
+/// - RESOLVE_BENEATH: the walk may not leave `directory`, by an absolute
+///   path, `..` or a symlink (EXDEV).
+/// - RESOLVE_IN_ROOT: `directory` is the walk's root: absolute paths and
+///   `..` at the top stay in it.
+/// - RESOLVE_NO_SYMLINKS: any symlink on the way is ELOOP, the last
+///   component's too unless it is not followed.
+/// - RESOLVE_NO_MAGICLINKS: likewise for /proc's magic links.
+/// - RESOLVE_NO_XDEV: crossing a mount point is EXDEV.
+fn linux_resolve_restricted(
+    directory: u64,
+    path: &[u8],
+    restrictions: u64,
+    follow_final: bool,
+    output: &mut [u8; crate::linux_overlay::PATH_CAPACITY],
+) -> Result<usize, u64> {
+    const LINK_LIMIT: usize = 40;
+    let mut base = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    let base_length = if path.starts_with(b"/")
+        && restrictions & (LINUX_RESOLVE_BENEATH | LINUX_RESOLVE_IN_ROOT) == 0
+    {
+        0
+    } else {
+        linux_walk_start(directory, &mut base)?
+    };
+    let confined = restrictions & (LINUX_RESOLVE_BENEATH | LINUX_RESOLVE_IN_ROOT) != 0;
+    let top = if confined { base_length } else { 0 };
+    let instance = linux_execution_instance();
+    let mut rest: Vec<u8> = Vec::new();
+    rest.try_reserve_exact(path.len())
+        .map_err(|_| LINUX_ENOMEM)?;
+    rest.extend_from_slice(path);
+    output[..base_length].copy_from_slice(&base[..base_length]);
+    let mut length = base_length;
+    if rest.starts_with(b"/") {
+        if restrictions & LINUX_RESOLVE_BENEATH != 0 {
+            return Err(LINUX_EXDEV);
+        }
+        length = top;
+    }
+    let mut followed = 0;
+    let mut position = 0;
+    while position < rest.len() {
+        let end = rest[position..]
+            .iter()
+            .position(|byte| *byte == b'/')
+            .map_or(rest.len(), |offset| position + offset);
+        let component = &rest[position..end];
+        position = end + 1;
+        let is_last = rest[position.min(rest.len())..]
+            .iter()
+            .all(|byte| *byte == b'/');
+        if component.is_empty() || component == b"." {
+            continue;
+        }
+        if component == b".." {
+            if length <= top {
+                if restrictions & LINUX_RESOLVE_BENEATH != 0 {
+                    return Err(LINUX_EXDEV);
+                }
+                continue;
+            }
+            if restrictions & LINUX_RESOLVE_NO_XDEV != 0
+                && crate::linux_mounts::is_mount_point(instance, &output[..length])
+            {
+                return Err(LINUX_EXDEV);
+            }
+            length = linux_parent_path(&output[..length]).len();
+            continue;
+        }
+        if component.len() > 255 {
+            return Err(LINUX_ENAMETOOLONG);
+        }
+        let parent_length = length;
+        if length != 0 {
+            *output.get_mut(length).ok_or(LINUX_ENAMETOOLONG)? = b'/';
+            length += 1;
+        }
+        let end = length
+            .checked_add(component.len())
+            .filter(|end| *end < output.len())
+            .ok_or(LINUX_ENAMETOOLONG)?;
+        output[length..end].copy_from_slice(component);
+        length = end;
+        if restrictions & LINUX_RESOLVE_NO_XDEV != 0
+            && crate::linux_mounts::is_mount_point(instance, &output[..length])
+        {
+            return Err(LINUX_EXDEV);
+        }
+        if is_last && !follow_final {
+            continue;
+        }
+        if linux_magic_link(&output[..length]) {
+            if restrictions & (LINUX_RESOLVE_NO_MAGICLINKS | LINUX_RESOLVE_NO_SYMLINKS) != 0 {
+                return Err(LINUX_ELOOP);
+            }
+            continue;
+        }
+        let mut target = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+        let Some(target_length) = linux_exact_symlink(&output[..length], &mut target) else {
+            continue;
+        };
+        if restrictions & LINUX_RESOLVE_NO_SYMLINKS != 0 {
+            return Err(LINUX_ELOOP);
+        }
+        followed += 1;
+        if followed > LINK_LIMIT {
+            return Err(LINUX_ELOOP);
+        }
+        // Walk the target from the link's directory, then what remains.
+        let target = &target[..target_length];
+        length = parent_length;
+        if target.starts_with(b"/") {
+            if restrictions & LINUX_RESOLVE_BENEATH != 0 {
+                return Err(LINUX_EXDEV);
+            }
+            length = top;
+        }
+        let mut next: Vec<u8> = Vec::new();
+        next.try_reserve_exact(target.len() + 1 + rest.len().saturating_sub(position))
+            .map_err(|_| LINUX_ENOMEM)?;
+        next.extend_from_slice(target);
+        if position < rest.len() {
+            next.push(b'/');
+            next.extend_from_slice(&rest[position..]);
+        }
+        rest = next;
+        position = 0;
+    }
+    Ok(length)
 }
 
 fn linux_memfd_create(name_address: u64, flags: u64) -> u64 {
@@ -28189,16 +28610,83 @@ fn linux_memfd_create(name_address: u64, flags: u64) -> u64 {
     {
         return LINUX_EIO;
     }
+    linux_install_unnamed_descriptor(descriptor, handle, 3, 0, flags & MFD_CLOEXEC != 0)
+}
+
+/// Makes free descriptor `descriptor` refer to `handle`, an overlay file
+/// with no name (a memfd, secret memory or an O_TMPFILE file), with
+/// `access` (`LINUX_DESCRIPTOR_INPUT`/`OUTPUT` bits) and descriptor status
+/// flags `status`, at offset 0.
+fn linux_install_unnamed_descriptor(
+    descriptor: u64,
+    handle: crate::linux_overlay::Handle,
+    access: u16,
+    status: u32,
+    close_on_exec: bool,
+) -> u64 {
     let index = (descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
     X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index]
-        .store(LINUX_FILE_TMP_SCRATCH | 3, Ordering::SeqCst);
+        .store(LINUX_FILE_TMP_SCRATCH | access, Ordering::SeqCst);
     X86_RUNTIME.ELF_PROBE_ROOTFS_DESCRIPTORS[index].store(0, Ordering::SeqCst);
     X86_RUNTIME.ELF_PROBE_TMP_FILE_GENERATIONS[index]
         .store(crate::linux_overlay::generation(handle), Ordering::SeqCst);
-    X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index].store(0, Ordering::SeqCst);
+    X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index].store(status, Ordering::SeqCst);
     linux_descriptor_offset(descriptor).store(0, Ordering::SeqCst);
-    set_linux_descriptor_close_on_exec(descriptor, flags & MFD_CLOEXEC != 0);
+    set_linux_descriptor_close_on_exec(descriptor, close_on_exec);
     descriptor
+}
+
+/// O_TMPFILE: opens a regular file with no name, made in the directory at
+/// `path` with `mode` less the umask, which linkat(2) can name later unless
+/// `flags` has O_EXCL. The directory must exist (ENOENT, ENOTDIR), be
+/// writable (EROFS) and grant write and search permission (EACCES).
+fn linux_open_temporary(directory: u64, path: &[u8], flags: u64, mode: u64) -> u64 {
+    let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    let length = match linux_canonical_path_at(directory, path, &mut canonical) {
+        Ok(length) => length,
+        Err(error) => return error,
+    };
+    let length = match linux_overlay_lookup_following(&mut canonical, length, true) {
+        Ok((length, _, _)) => length,
+        Err(error) => return error,
+    };
+    let parent = &canonical[..length];
+    let Some(access) = linux_path_access(parent) else {
+        return linux_missing_path_error(parent);
+    };
+    if !access.directory {
+        return LINUX_ENOTDIR;
+    }
+    if linux_read_only_path(parent) {
+        return LINUX_EROFS;
+    }
+    if let Err(error) = linux_check_access(
+        Some(access),
+        ginux_credentials::access::WRITE | ginux_credentials::access::EXECUTE,
+        false,
+    ) {
+        return error;
+    }
+    let Some(descriptor) = (LINUX_AUX_DESCRIPTOR_FIRST..LINUX_AUX_DESCRIPTOR_LIMIT)
+        .find(|descriptor| linux_aux_descriptor_free(*descriptor))
+    else {
+        return LINUX_EMFILE;
+    };
+    let umask = X86_RUNTIME.ELF_PROBE_UMASK.load(Ordering::SeqCst) as u32;
+    let Some(handle) = crate::linux_overlay::create_temporary(
+        parent,
+        (mode as u32) & 0o7777 & !umask,
+        flags & LINUX_O_EXCL == 0,
+    ) else {
+        return LINUX_ENOSPC;
+    };
+    linux_install_unnamed_descriptor(
+        descriptor,
+        handle,
+        (flags & 3) as u16 + 1,
+        (flags & (LINUX_O_APPEND | LINUX_O_NONBLOCK)) as u32,
+        flags & LINUX_O_CLOEXEC != 0,
+    )
 }
 
 fn linux_memfd_secret(flags: u64) -> u64 {
@@ -28214,20 +28702,16 @@ fn linux_memfd_secret(flags: u64) -> u64 {
     let Some(handle) = crate::linux_overlay::create_file(b"tmp/.ginux-secret", 0o600, &[]) else {
         return LINUX_ENOSPC;
     };
-    if !crate::linux_overlay::unlink(handle) {
+    if !crate::linux_overlay::unlink(handle) || !crate::linux_overlay::mark_pseudo(handle) {
         return LINUX_EIO;
     }
-    let index = (descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
-    X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index]
-        .store(LINUX_FILE_TMP_SCRATCH | 3, Ordering::SeqCst);
-    X86_RUNTIME.ELF_PROBE_ROOTFS_DESCRIPTORS[index].store(0, Ordering::SeqCst);
-    X86_RUNTIME.ELF_PROBE_TMP_FILE_GENERATIONS[index]
-        .store(crate::linux_overlay::generation(handle), Ordering::SeqCst);
-    X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index]
-        .store(LINUX_PRIVATE_SECRET_DESCRIPTOR, Ordering::SeqCst);
-    linux_descriptor_offset(descriptor).store(0, Ordering::SeqCst);
-    set_linux_descriptor_close_on_exec(descriptor, flags & FD_CLOEXEC != 0);
-    descriptor
+    linux_install_unnamed_descriptor(
+        descriptor,
+        handle,
+        3,
+        LINUX_PRIVATE_SECRET_DESCRIPTOR,
+        flags & FD_CLOEXEC != 0,
+    )
 }
 
 fn linux_secret_descriptor(descriptor: u64) -> bool {
@@ -28921,6 +29405,36 @@ fn linux_symlinkat(target_address: u64, directory: u64, path_address: u64) -> u6
     crate::linux_overlay::create_symlink(path, &target[..target_length]).map_or(LINUX_ENOSPC, |_| 0)
 }
 
+/// Names `handle`, a file with no name that a descriptor holds, at `path`
+/// relative to `directory`: an O_TMPFILE file not opened with O_EXCL. A
+/// deleted file cannot be named again (ENOENT), nor a memfd (EXDEV).
+fn linux_link_unnamed(handle: crate::linux_overlay::Handle, directory: u64, path: &[u8]) -> u64 {
+    let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    let length = match linux_canonical_path_at(directory, path, &mut canonical) {
+        Ok(length) => length,
+        Err(error) => return error,
+    };
+    let destination = &canonical[..length];
+    if crate::linux_overlay::lookup(destination).is_some()
+        || linux_rootfs_metadata_path_at(directory, path).is_some()
+    {
+        return LINUX_EEXIST;
+    }
+    if !linux_overlay_parent_exists(destination) {
+        return linux_missing_path_error(destination);
+    }
+    if let Err(error) = linux_check_entry_change(destination, false) {
+        return error;
+    }
+    match crate::linux_overlay::link_unnamed(destination, handle) {
+        Ok(()) => 0,
+        Err(crate::linux_overlay::LinkError::Gone) => LINUX_ENOENT,
+        Err(crate::linux_overlay::LinkError::CrossDevice) => LINUX_EXDEV,
+        Err(crate::linux_overlay::LinkError::Exists) => LINUX_EEXIST,
+        Err(crate::linux_overlay::LinkError::Failed) => LINUX_ENOSPC,
+    }
+}
+
 fn linux_linkat(
     old_directory: u64,
     old_path_address: u64,
@@ -28928,14 +29442,16 @@ fn linux_linkat(
     new_path_address: u64,
     flags: u64,
 ) -> u64 {
+    const AT_SYMLINK_FOLLOW: u64 = 0x400;
+    const AT_EMPTY_PATH: u64 = 0x1000;
     let old_directory = u64::from(old_directory as u32);
     let new_directory = u64::from(new_directory as u32);
     let flags = u64::from(flags as u32);
-    if flags != 0 {
+    if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
         return LINUX_EINVAL;
     }
     let mut old_path = [0_u8; LINUX_PATH_MAX];
-    let old_path_length = match copy_linux_c_string(old_path_address, &mut old_path) {
+    let mut old_path_length = match copy_linux_c_string(old_path_address, &mut old_path) {
         Ok(length) => length,
         Err(error) => return error,
     };
@@ -28944,8 +29460,47 @@ fn linux_linkat(
         Ok(length) => length,
         Err(error) => return error,
     };
+    // The file may be named by a descriptor: `old_directory` itself with
+    // AT_EMPTY_PATH and an empty path, or the descriptor a /proc/self/fd/N
+    // path names when AT_SYMLINK_FOLLOW follows it. That is how an
+    // O_TMPFILE file gets its name.
+    let by_descriptor = if old_path_length == 0 && flags & AT_EMPTY_PATH != 0 {
+        Some(old_directory)
+    } else if flags & AT_SYMLINK_FOLLOW != 0 {
+        old_path[..old_path_length]
+            .strip_prefix(b"/proc/self/fd/")
+            .and_then(|digits| {
+                digits.iter().try_fold(0_u64, |value, byte| {
+                    byte.is_ascii_digit()
+                        .then(|| value.checked_mul(10)?.checked_add(u64::from(byte - b'0')))
+                        .flatten()
+                })
+            })
+    } else {
+        None
+    };
+    if let Some(descriptor) = by_descriptor {
+        if let Some(handle) = linux_overlay_descriptor_handle(descriptor)
+            .filter(|handle| !crate::linux_overlay::linked(*handle))
+        {
+            return linux_link_unnamed(handle, new_directory, &new_path[..new_path_length]);
+        }
+        // A named file: link it by its path.
+        let mut resolved = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+        let Some(length) = linux_descriptor_path(descriptor, &mut resolved) else {
+            return if linux_descriptor_open(descriptor) {
+                LINUX_ENOENT
+            } else {
+                LINUX_EBADF
+            };
+        };
+        old_path[..length].copy_from_slice(&resolved[..length]);
+        old_path_length = length;
+    } else if old_path_length == 0 {
+        return LINUX_ENOENT;
+    }
     let mut old_canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
-    let old_length = match linux_canonical_path_at(
+    let mut old_length = match linux_canonical_path_at(
         old_directory,
         &old_path[..old_path_length],
         &mut old_canonical,
@@ -28953,6 +29508,12 @@ fn linux_linkat(
         Ok(length) => length,
         Err(error) => return error,
     };
+    if flags & AT_SYMLINK_FOLLOW != 0 && by_descriptor.is_none() {
+        old_length = match linux_overlay_lookup_following(&mut old_canonical, old_length, true) {
+            Ok((length, _, _)) => length,
+            Err(error) => return error,
+        };
+    }
     let mut new_canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
     let new_length = match linux_canonical_path_at(
         new_directory,
@@ -29409,11 +29970,14 @@ fn linux_copy_up_entry(
     Ok(handle)
 }
 
+/// fchmodat(2) and fchmodat2(2), whose `flags` may be AT_SYMLINK_NOFOLLOW
+/// (a symlink's own mode cannot change: EOPNOTSUPP) and AT_EMPTY_PATH (an
+/// empty path names `directory` itself).
 fn linux_fchmodat(directory: u64, path_address: u64, mode: u64, flags: u64) -> u64 {
     let directory = u64::from(directory as u32);
     let mode = u64::from(mode as u32);
     let flags = u64::from(flags as u32);
-    if flags != 0 {
+    if flags & !(LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_EMPTY_PATH) != 0 {
         return LINUX_EINVAL;
     }
     let mut path = [0_u8; LINUX_PATH_MAX];
@@ -29421,12 +29985,22 @@ fn linux_fchmodat(directory: u64, path_address: u64, mode: u64, flags: u64) -> u
         Ok(length) => length,
         Err(error) => return error,
     };
+    if path_length == 0 && flags & LINUX_AT_EMPTY_PATH != 0 {
+        return linux_fchmod(directory, mode);
+    }
     let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
     let length = match linux_canonical_path_at(directory, &path[..path_length], &mut canonical) {
         Ok(length) => length,
         Err(error) => return error,
     };
-    let length = match linux_overlay_lookup_following(&mut canonical, length, true) {
+    let follow = flags & LINUX_AT_SYMLINK_NOFOLLOW == 0;
+    if !follow {
+        let mut target = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+        if linux_exact_symlink(&canonical[..length], &mut target).is_some() {
+            return LINUX_EOPNOTSUPP;
+        }
+    }
+    let length = match linux_overlay_lookup_following(&mut canonical, length, follow) {
         Ok((length, _, _)) => length,
         Err(error) => return error,
     };
@@ -32089,11 +32663,13 @@ fn linux_socket_getsockopt(
             Some(crate::linux_socket::Kind::Tcp) => 6,
             Some(crate::linux_socket::Kind::Udp) => 17,
             Some(crate::linux_socket::Kind::Unix) => 0,
+            Some(crate::linux_socket::Kind::Object) => return LINUX_ENOTSOCK,
             None => return LINUX_EBADF,
         },
         (1, 39) => match crate::linux_socket::kind(slot) {
             Some(crate::linux_socket::Kind::Tcp | crate::linux_socket::Kind::Udp) => 2,
             Some(crate::linux_socket::Kind::Unix) => 1,
+            Some(crate::linux_socket::Kind::Object) => return LINUX_ENOTSOCK,
             None => return LINUX_EBADF,
         },
         (6, 1) => {
@@ -33266,9 +33842,12 @@ fn linux_eventfd(initial: u64, flags: u64) -> u64 {
     };
     if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
         let index = (descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
-        X86_RUNTIME.LINUX_RUNTIME_EVENTFD_COUNTERS[index]
-            .store(u64::from(initial as u32), Ordering::SeqCst);
-        X86_RUNTIME.LINUX_RUNTIME_EVENTFD_FLAGS[index].store(flags as u32, Ordering::SeqCst);
+        let Some(id) =
+            crate::linux_event_files::create_eventfd(u64::from(initial as u32), flags as u32)
+        else {
+            return LINUX_ENFILE;
+        };
+        linux_legacy_descriptor_offset(descriptor).store(id, Ordering::SeqCst);
         X86_RUNTIME.LINUX_RUNTIME_EVENTFD_ACTIVE[index].store(1, Ordering::SeqCst);
     } else {
         X86_RUNTIME
@@ -33285,15 +33864,18 @@ fn linux_eventfd(initial: u64, flags: u64) -> u64 {
     descriptor
 }
 
+/// An eventfd descriptor's counter and flags: its open file's, or the boot
+/// probe's own.
 fn linux_eventfd_state(
     descriptor: u64,
-) -> Option<(&'static BankedAtomicU64, &'static BankedAtomicU32)> {
+) -> Option<(
+    &'static dyn LinuxFileCell<u64>,
+    &'static dyn LinuxFileCell<u32>,
+)> {
     if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
-        let index = linux_socket_descriptor_index(descriptor)?;
-        (X86_RUNTIME.LINUX_RUNTIME_EVENTFD_ACTIVE[index].load(Ordering::SeqCst) != 0).then_some((
-            &X86_RUNTIME.LINUX_RUNTIME_EVENTFD_COUNTERS[index],
-            &X86_RUNTIME.LINUX_RUNTIME_EVENTFD_FLAGS[index],
-        ))
+        let id = linux_eventfd_file(descriptor)?;
+        let file = crate::linux_event_files::eventfd(id)?;
+        Some((&file.counter, &file.flags))
     } else {
         let stored = X86_RUNTIME
             .ELF_PROBE_EVENTFD_DESCRIPTOR
@@ -33303,6 +33885,55 @@ fn linux_eventfd_state(
             &X86_RUNTIME.ELF_PROBE_EVENTFD_FLAGS,
         ))
     }
+}
+
+/// The open file id of eventfd `descriptor` (in its offset cell).
+fn linux_eventfd_file(descriptor: u64) -> Option<u64> {
+    let index = linux_socket_descriptor_index(descriptor)?;
+    (X86_RUNTIME.LINUX_RUNTIME_EVENTFD_ACTIVE[index].load(Ordering::SeqCst) != 0)
+        .then(|| linux_legacy_descriptor_offset(descriptor).load(Ordering::SeqCst))
+}
+
+/// The open file id of timerfd `descriptor`.
+fn linux_timerfd_file(descriptor: u64) -> Option<u64> {
+    let index = linux_socket_descriptor_index(descriptor)?;
+    (X86_RUNTIME.LINUX_RUNTIME_TIMERFD_ACTIVE[index].load(Ordering::SeqCst) != 0)
+        .then(|| linux_legacy_descriptor_offset(descriptor).load(Ordering::SeqCst))
+}
+
+/// Puts a new descriptor `target` on the eventfd or timerfd open file of
+/// `source`, as dup2 does, closing what `target` held.
+fn linux_event_file_dup(source: u64, target: u64) -> u64 {
+    let (kind, id) = match (linux_eventfd_file(source), linux_timerfd_file(source)) {
+        (Some(id), _) => (crate::linux_event_files::Kind::EventFd, id),
+        (_, Some(id)) => (crate::linux_event_files::Kind::TimerFd, id),
+        _ => return LINUX_EBADF,
+    };
+    if source == target {
+        return target;
+    }
+    // The descriptor kinds below 3 have no eventfd or timerfd slot.
+    if target < LINUX_AUX_DESCRIPTOR_FIRST || target >= linux_nofile_soft_limit() {
+        return LINUX_EBADF;
+    }
+    if linux_descriptor_open(target) && linux_descriptor_close(target) != 0 {
+        return LINUX_EBADF;
+    }
+    if !crate::linux_event_files::retain(kind, id) {
+        return LINUX_EBADF;
+    }
+    let index = (target - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
+    linux_legacy_descriptor_offset(target).store(id, Ordering::SeqCst);
+    match kind {
+        crate::linux_event_files::Kind::EventFd => {
+            X86_RUNTIME.LINUX_RUNTIME_EVENTFD_ACTIVE[index].store(1, Ordering::SeqCst)
+        }
+        crate::linux_event_files::Kind::TimerFd => {
+            X86_RUNTIME.LINUX_RUNTIME_TIMERFD_ACTIVE[index].store(1, Ordering::SeqCst)
+        }
+    }
+    set_linux_descriptor_close_on_exec(target, false);
+    target
 }
 
 fn linux_eventfd_read(descriptor: u64, address: u64, count: u64) -> Option<u64> {
@@ -33597,16 +34228,28 @@ fn linux_descriptor_read_live_return(
             || linux_descriptor_read(descriptor, address, count),
         );
     }
-    // A console read with nothing typed yet would wait inside the kernel and
-    // keep this process's other threads from running (brush reads input on
-    // its own thread, so its main thread could never finish `exit`). Let a
-    // ready sibling thread run and read again later instead.
+    // A read of the attached console with nothing typed yet waits like any
+    // other blocking read instead of spinning on the device, which would
+    // stop the whole domain until someone types: a ready sibling thread runs
+    // (brush reads input on its own thread, so its main thread must be able
+    // to finish `exit`), or other processes do, and the read checks again.
     if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::Acquire)
         && linux_console_input_descriptor(descriptor)
-        && !crate::serial_input_ready()
-        && ready_linux_thread_handle().is_some()
+        && active_container_slot().is_some_and(|slot| {
+            X86_RUNTIME.CONTAINER_CONSOLE_ATTACHED[slot].load(Ordering::Acquire)
+        })
     {
-        return linux_retry_later_live_return(output, caller, LINUX_READ_SYSCALL);
+        while !crate::serial_input_ready() {
+            if ready_linux_thread_handle().is_some() || current_linux_runtime_cpu_index() != 0 {
+                return linux_retry_later_live_return(output, caller, LINUX_READ_SYSCALL);
+            }
+            if let Some(LinuxBlockedWait::Return(result)) =
+                run_other_linux_processes(output, caller, LINUX_READ_SYSCALL)
+            {
+                return result;
+            }
+            core::hint::spin_loop();
+        }
     }
     let immediate =
         if linux_socket_slot(descriptor).is_some() && !linux_socket_nonblocking(descriptor) {
@@ -34226,10 +34869,10 @@ fn linux_timerfd_create(clock: u64, flags: u64) -> u64 {
     };
     if runtime {
         let index = (descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
-        X86_RUNTIME.LINUX_RUNTIME_TIMERFD_CLOCKS[index].store(clock as u8, Ordering::SeqCst);
-        X86_RUNTIME.LINUX_RUNTIME_TIMERFD_FLAGS[index].store(flags as u32, Ordering::SeqCst);
-        X86_RUNTIME.LINUX_RUNTIME_TIMERFD_INTERVALS[index].store(0, Ordering::SeqCst);
-        X86_RUNTIME.LINUX_RUNTIME_TIMERFD_DEADLINES[index].store(0, Ordering::SeqCst);
+        let Some(id) = crate::linux_event_files::create_timerfd(clock as u8, flags as u32) else {
+            return LINUX_ENFILE;
+        };
+        linux_legacy_descriptor_offset(descriptor).store(id, Ordering::SeqCst);
         X86_RUNTIME.LINUX_RUNTIME_TIMERFD_ACTIVE[index].store(1, Ordering::SeqCst);
     } else {
         X86_RUNTIME
@@ -34635,6 +35278,285 @@ fn linux_pipe(address: u64, flags: u64) -> u64 {
         set_linux_descriptor_close_on_exec(descriptor, flags & LINUX_O_CLOEXEC != 0);
     }
     0
+}
+
+/// The kernel object (class and id) an object descriptor refers to: a
+/// DRM render node file, a GPU fence or a dma-buf.
+fn linux_object_descriptor(descriptor: u64) -> Option<(u8, u64)> {
+    linux_socket_slot(descriptor).and_then(crate::linux_socket::object)
+}
+
+/// Makes a descriptor for object `slot`, the lowest free one.
+fn linux_install_object_descriptor(slot: crate::linux_socket::SlotId, flags: u64) -> u64 {
+    let Some(descriptor) = (LINUX_AUX_DESCRIPTOR_FIRST..LINUX_AUX_DESCRIPTOR_LIMIT)
+        .find(|descriptor| linux_aux_descriptor_free(*descriptor))
+    else {
+        let _ = crate::linux_socket::close(slot);
+        crate::linux_drm::collect();
+        return LINUX_EMFILE;
+    };
+    let index = (descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
+    X86_RUNTIME.ELF_PROBE_SOCKET_SLOTS[index].store(slot + 1, Ordering::SeqCst);
+    X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index]
+        .store((flags & LINUX_O_NONBLOCK) as u32, Ordering::SeqCst);
+    X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index]
+        .store(LINUX_DEVICE_SOCKET | 3, Ordering::SeqCst);
+    set_linux_descriptor_close_on_exec(descriptor, flags & LINUX_O_CLOEXEC != 0);
+    descriptor
+}
+
+/// Opens /dev/dri/renderD128.
+fn linux_open_render_node(flags: u64) -> u64 {
+    match crate::linux_drm::open() {
+        Some(slot) => linux_install_object_descriptor(slot, flags),
+        None => LINUX_ENOMEM,
+    }
+}
+
+/// A new descriptor for object `class`/`id`, given its first reference.
+fn linux_open_object(class: u8, id: u64, flags: u64) -> u64 {
+    match crate::linux_socket::open_object(class, id) {
+        Ok(slot) => linux_install_object_descriptor(slot, flags),
+        Err(_) => LINUX_ENOMEM,
+    }
+}
+
+/// The calling process's memory for `ginux_drm`.
+struct LinuxUserMemory;
+
+impl ginux_drm::UserMemory for LinuxUserMemory {
+    fn read(&self, address: u64, output: &mut [u8]) -> bool {
+        copy_from_linux_user(address, output)
+    }
+
+    fn write(&mut self, address: u64, input: &[u8]) -> bool {
+        copy_to_linux_user(address, input)
+    }
+}
+
+fn linux_drm_errno(error: ginux_drm::Errno) -> u64 {
+    (-i64::from(error.number())) as u64
+}
+
+/// read, write and ioctl on an object descriptor.
+fn linux_object_syscall(number: u64, descriptor: u64, buffer: u64, count: u64) -> u64 {
+    const DMA_BUF_IOCTL_SYNC: u64 = 0x4008_6200;
+    let Some((class, id)) = linux_object_descriptor(descriptor) else {
+        return LINUX_EBADF;
+    };
+    match (number, class) {
+        (LINUX_IOCTL_SYSCALL, crate::linux_drm::CLASS_FILE) => {
+            linux_drm_ioctl(id, buffer as u32, count)
+        }
+        // Host memory is coherent: there is nothing to flush.
+        (LINUX_IOCTL_SYSCALL, crate::linux_drm::CLASS_DMABUF)
+            if buffer & 0xffff_ffff == DMA_BUF_IOCTL_SYNC =>
+        {
+            0
+        }
+        (LINUX_IOCTL_SYSCALL, _) => LINUX_ENOTTY,
+        _ => LINUX_EINVAL,
+    }
+}
+
+/// A DRM ioctl on render node file `file`: copies the argument in (Linux
+/// takes the caller's size, zero-extending a shorter structure), runs it,
+/// makes the descriptors it asks for, and copies the argument back.
+/// A DRM ioctl's result: what the call returns, or EAGAIN when it waits for
+/// the GPU (an input fence, a busy buffer, a full queue), which the system
+/// call layer turns into running other work and issuing the call again.
+fn linux_drm_ioctl(file: u64, command: u32, address: u64) -> u64 {
+    let started = timer::timestamp_counter();
+    let result = linux_drm_ioctl_inner(file, command, address);
+    crate::linux_drm::record_ioctl(
+        command,
+        result == LINUX_EAGAIN,
+        timer::timestamp_counter().wrapping_sub(started),
+    );
+    if result >= LINUX_RETURN_TO_KERNEL && result != LINUX_EAGAIN {
+        crate::linux_drm::log_failure(command, result.wrapping_neg());
+    }
+    result
+}
+
+fn linux_drm_ioctl_inner(file: u64, command: u32, address: u64) -> u64 {
+    let (request, user_size) = match ginux_drm::Request::decode(command) {
+        Ok(decoded) => decoded,
+        Err(error) => return linux_drm_errno(error),
+    };
+    let size = request.size();
+    let copied = user_size.min(size);
+    let mut argument = [0_u8; 64];
+    if copied != 0 && !copy_from_linux_user(address, &mut argument[..copied]) {
+        return LINUX_EFAULT;
+    }
+    // An execbuffer waits for its input fence first.
+    if request == ginux_drm::Request::Execbuffer {
+        if let Some(fence) = ginux_drm::execbuffer_in_fence(&argument[..size]) {
+            let Some((crate::linux_drm::CLASS_FENCE, fence)) =
+                linux_object_descriptor(u64::from(fence as u32))
+            else {
+                return LINUX_EINVAL;
+            };
+            if !crate::drivers::virtio_gpu::fence_signaled(fence) {
+                return LINUX_EAGAIN;
+            }
+        }
+    }
+    let mut gpu = crate::drivers::virtio_gpu::VirtioGpu;
+    let outcome = crate::linux_profile::span(crate::linux_profile::Span::DrmFileIoctl, || {
+        crate::linux_drm::with_file(file, |open| {
+            open.ioctl(
+                &mut gpu,
+                &mut LinuxUserMemory,
+                request,
+                &mut argument[..size],
+            )
+        })
+    });
+    let outcome = match outcome {
+        None => return LINUX_EBADF,
+        Some(Err(error)) => return linux_drm_errno(error),
+        Some(Ok(outcome)) => outcome,
+    };
+    match outcome {
+        ginux_drm::Outcome::Done => {}
+        ginux_drm::Outcome::FenceDescriptor { fence, offset } => {
+            let descriptor =
+                crate::linux_profile::span(crate::linux_profile::Span::DrmFenceDescriptor, || {
+                    linux_open_object(crate::linux_drm::CLASS_FENCE, fence, LINUX_O_CLOEXEC)
+                });
+            if descriptor >= LINUX_RETURN_TO_KERNEL {
+                return descriptor;
+            }
+            argument[offset..offset + 4].copy_from_slice(&(descriptor as u32).to_le_bytes());
+        }
+        ginux_drm::Outcome::Export {
+            resource,
+            size: length,
+            flags,
+            offset,
+        } => {
+            let Some(id) = crate::linux_drm::export(crate::linux_drm::DmaBuf {
+                resource,
+                size: length,
+                memory: 2,
+            }) else {
+                return LINUX_ENOMEM;
+            };
+            ginux_drm::Gpu::retain(&mut gpu, resource);
+            let descriptor = linux_open_object(
+                crate::linux_drm::CLASS_DMABUF,
+                id,
+                u64::from(flags) & LINUX_O_CLOEXEC,
+            );
+            if descriptor >= LINUX_RETURN_TO_KERNEL {
+                return descriptor;
+            }
+            argument[offset..offset + 4].copy_from_slice(&(descriptor as u32).to_le_bytes());
+        }
+        ginux_drm::Outcome::Import { descriptor } => {
+            let Some((crate::linux_drm::CLASS_DMABUF, id)) =
+                linux_object_descriptor(u64::from(descriptor as u32))
+            else {
+                return LINUX_EBADF;
+            };
+            let Some(dmabuf) = crate::linux_drm::dmabuf(id) else {
+                return LINUX_EBADF;
+            };
+            let imported = crate::linux_drm::with_file(file, |open| {
+                open.import(
+                    &mut gpu,
+                    dmabuf.resource,
+                    dmabuf.size,
+                    dmabuf.memory,
+                    &mut argument[..size],
+                )
+            });
+            match imported {
+                None => return LINUX_EBADF,
+                Some(Err(error)) => return linux_drm_errno(error),
+                Some(Ok(())) => {}
+            }
+        }
+    }
+    // _IOC_READ: the caller wants the structure back.
+    if command >> 31 != 0 && copied != 0 && !copy_to_linux_user(address, &argument[..copied]) {
+        return LINUX_EFAULT;
+    }
+    0
+}
+
+/// mmap of an object descriptor: a render node maps a blob at the fake
+/// offset DRM_IOCTL_VIRTGPU_MAP gave, and a dma-buf its blob, if mapped.
+fn linux_object_mmap(
+    address: u64,
+    length: u64,
+    protection: u64,
+    flags: u64,
+    descriptor: u64,
+    offset: u64,
+) -> u64 {
+    let Some((class, id)) = linux_object_descriptor(descriptor) else {
+        return LINUX_EBADF;
+    };
+    // Counted with the ioctls, as number 0xff, for a SysRq `l` profile.
+    crate::linux_drm::record_ioctl(0xff, false, 0);
+    if flags & LINUX_MAP_SHARED == 0 || length == 0 || !offset.is_multiple_of(PAGE_SIZE as u64) {
+        return LINUX_EINVAL;
+    }
+    let (physical, cache) = match class {
+        crate::linux_drm::CLASS_FILE => {
+            match crate::linux_drm::with_file(id, |open| open.mmap(offset, length)) {
+                Some(Ok(mapping)) => (mapping.physical, mapping.cache),
+                Some(Err(error)) => return linux_drm_errno(error),
+                None => return LINUX_EBADF,
+            }
+        }
+        crate::linux_drm::CLASS_DMABUF => {
+            let Some(dmabuf) = crate::linux_drm::dmabuf(id) else {
+                return LINUX_EBADF;
+            };
+            if offset
+                .checked_add(length)
+                .is_none_or(|end| end > dmabuf.size.next_multiple_of(PAGE_SIZE as u64))
+            {
+                return LINUX_EINVAL;
+            }
+            match crate::drivers::virtio_gpu::mapped_physical(dmabuf.resource) {
+                Some((physical, cache)) => (physical + offset, cache),
+                None => return LINUX_ENODEV,
+            }
+        }
+        _ => return LINUX_ENODEV,
+    };
+    let pages = length.div_ceil(PAGE_SIZE as u64) as usize;
+    let fixed = flags & LINUX_MAP_FIXED != 0;
+    let Some(mapping) = linux_runtime_select_mapping(address, pages, fixed) else {
+        return LINUX_ENOMEM;
+    };
+    if !linux_runtime_range_available(mapping, pages)
+        && (!fixed || linux_runtime_munmap(mapping, (pages * PAGE_SIZE) as u64) != 0)
+    {
+        return LINUX_ENOMEM;
+    }
+    for page in 0..pages {
+        let installed = address_space::install_current_linux_device_page(
+            mapping + (page * PAGE_SIZE) as u64,
+            physical + (page * PAGE_SIZE) as u64,
+            protection & LINUX_PROT_WRITE != 0,
+            match cache {
+                ginux_drm::Cache::Cached => address_space::DeviceCaching::WriteBack,
+                ginux_drm::Cache::WriteCombined => address_space::DeviceCaching::WriteCombining,
+                ginux_drm::Cache::Uncached => address_space::DeviceCaching::Uncached,
+            },
+        );
+        if !installed {
+            let _ = rollback_linux_runtime_mapping(mapping, page);
+            return LINUX_ENOMEM;
+        }
+    }
+    mapping
 }
 
 fn linux_open_named_fifo(flags: u64, handle: crate::linux_overlay::Handle) -> u64 {
@@ -36256,7 +37178,7 @@ fn linux_epoll_wait_duration_live_return(
                 };
             }
             let parent_pid = current_linux_process_pid();
-            if refresh_live_linux_process_registry(caller)
+            if refresh_linux_process_registry_for_wait(caller)
                 && run_next_scheduled_linux_process(parent_pid)
             {
                 if X86_RUNTIME.LINUX_RUNTIME_SUSPENDED.load(Ordering::Acquire) {
@@ -36506,31 +37428,61 @@ fn linux_eventfd_descriptor(descriptor: u64) -> bool {
     linux_eventfd_state(descriptor).is_some()
 }
 
+/// A field of an eventfd or timerfd: a shared open file's
+/// (`crate::linux_event_files`) or the boot probe's own.
+trait LinuxFileCell<T> {
+    fn load(&self, ordering: Ordering) -> T;
+    fn store(&self, value: T, ordering: Ordering);
+}
+
+macro_rules! linux_file_cell {
+    ($($cell:ty => $value:ty),*) => {$(
+        impl LinuxFileCell<$value> for $cell {
+            fn load(&self, ordering: Ordering) -> $value {
+                <$cell>::load(self, ordering)
+            }
+
+            fn store(&self, value: $value, ordering: Ordering) {
+                <$cell>::store(self, value, ordering)
+            }
+        }
+    )*};
+}
+
+linux_file_cell!(
+    AtomicU8 => u8,
+    AtomicU32 => u32,
+    AtomicU64 => u64,
+    BankedAtomicU8 => u8,
+    BankedAtomicU32 => u32,
+    BankedAtomicU64 => u64
+);
+
+impl<V, T: LinuxFileCell<V>> LinuxFileCell<V> for RuntimeRef<T> {
+    fn load(&self, ordering: Ordering) -> V {
+        self.0.load(ordering)
+    }
+
+    fn store(&self, value: V, ordering: Ordering) {
+        self.0.store(value, ordering)
+    }
+}
+
 struct LinuxTimerfdState {
-    clock: &'static BankedAtomicU8,
-    flags: &'static BankedAtomicU32,
-    interval: &'static BankedAtomicU64,
-    deadline: &'static BankedAtomicU64,
+    clock: &'static dyn LinuxFileCell<u8>,
+    flags: &'static dyn LinuxFileCell<u32>,
+    interval: &'static dyn LinuxFileCell<u64>,
+    deadline: &'static dyn LinuxFileCell<u64>,
 }
 
 fn linux_timerfd_state(descriptor: u64) -> Option<LinuxTimerfdState> {
     if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
-        let index = descriptor
-            .checked_sub(LINUX_AUX_DESCRIPTOR_FIRST)
-            .and_then(|index| usize::try_from(index).ok())?;
-        if X86_RUNTIME
-            .LINUX_RUNTIME_TIMERFD_ACTIVE
-            .get(index)?
-            .load(Ordering::SeqCst)
-            == 0
-        {
-            return None;
-        }
+        let file = crate::linux_event_files::timerfd(linux_timerfd_file(descriptor)?)?;
         return Some(LinuxTimerfdState {
-            clock: &X86_RUNTIME.LINUX_RUNTIME_TIMERFD_CLOCKS[index],
-            flags: &X86_RUNTIME.LINUX_RUNTIME_TIMERFD_FLAGS[index],
-            interval: &X86_RUNTIME.LINUX_RUNTIME_TIMERFD_INTERVALS[index],
-            deadline: &X86_RUNTIME.LINUX_RUNTIME_TIMERFD_DEADLINES[index],
+            clock: &file.clock,
+            flags: &file.flags,
+            interval: &file.interval,
+            deadline: &file.deadline,
         });
     }
     (descriptor >= 2
@@ -37487,6 +38439,21 @@ fn linux_descriptor_poll_events(descriptor: i32, requested: u16) -> u16 {
         };
     }
     if let Some(slot) = linux_socket_slot(descriptor) {
+        if let Some((class, id)) = crate::linux_socket::object(slot) {
+            return match class {
+                // A sync file is readable once its fence has signalled.
+                crate::linux_drm::CLASS_FENCE => {
+                    if crate::drivers::virtio_gpu::fence_signaled(id) {
+                        requested & LINUX_POLLIN
+                    } else {
+                        0
+                    }
+                }
+                crate::linux_drm::CLASS_DMABUF => requested & (LINUX_POLLIN | LINUX_POLLOUT),
+                // A render node has no DRM events to read.
+                _ => 0,
+            };
+        }
         let Some((readable, writable, error)) = crate::linux_socket::readiness(slot) else {
             return LINUX_POLLNVAL;
         };
@@ -37652,6 +38619,9 @@ fn linux_descriptor_write(descriptor: u64, address: u64, count: u64) -> u64 {
     }
     if device & !3 == LINUX_FILE_PROC_OOM_SCORE_ADJ {
         return linux_proc_oom_score_adj_write(descriptor, device, address, count);
+    }
+    if device & !3 == LINUX_FILE_PROC_SYSRQ_TRIGGER {
+        return linux_sysrq_trigger_write(address, count);
     }
     if let Some(result) = linux_overlay_write(descriptor, device, address, count) {
         return result;
@@ -37898,6 +38868,117 @@ fn linux_bounded_console_write(address: u64, count: u64) -> u64 {
 
 /// Writes `/proc/PID/oom_score_adj` as Linux does: at most 12 bytes are read,
 /// surrounding whitespace is ignored and the value must lie in -1000..=1000.
+/// A write to `/proc/sysrq-trigger`: its first byte names the request, as
+/// on Linux. `t` (show task states) lists every task of the domain in the
+/// kernel log and `l` profiles the runtime CPU (`crate::linux_profile`);
+/// keys Ginux has no handler for are accepted and ignored.
+fn linux_sysrq_trigger_write(address: u64, count: u64) -> u64 {
+    if count == 0 {
+        return 0;
+    }
+    let mut key = [0_u8; 1];
+    if !copy_from_linux_user(address, &mut key) {
+        return LINUX_EFAULT;
+    }
+    match key[0] {
+        b't' => linux_show_task_states(),
+        b'l' => crate::linux_profile::start(),
+        _ => {}
+    }
+    count
+}
+
+/// Lists each live process and its threads: the thread state (ready,
+/// running, blocked), what a blocked thread waits for (wait kind and key:
+/// a futex address, or the descriptors of a poll) and its saved user
+/// context, which for a thread inside a system call holds the call number
+/// and arguments.
+fn linux_show_task_states() {
+    serial_write("ginux: sysrq: show task states\r\n");
+    let current = current_linux_process_pid();
+    let mut pid = 1;
+    while let Some(next) = linux_process::next_live_pid(pid) {
+        pid = next + 1;
+        let mut name = [0_u8; 16];
+        serial_write("ginux: task ");
+        serial_write_u64(u64::from(next));
+        serial_write(" ");
+        crate::serial_write_bytes(linux_process_name(next, &mut name));
+        serial_write(
+            match linux_process::live_process_status(next).map(|status| status.state) {
+                Some(linux_process::LiveProcessState::Running) => " R",
+                Some(linux_process::LiveProcessState::Sleeping) => " S",
+                Some(linux_process::LiveProcessState::Stopped) => " T",
+                Some(linux_process::LiveProcessState::Zombie) => " Z",
+                None => " ?",
+            },
+        );
+        if next == current {
+            serial_write(" (current)");
+        }
+        serial_write("\r\n");
+        for slot in 0..LINUX_THREAD_LIMIT {
+            let thread = if next == current {
+                capture_linux_thread_runtime_state(slot)
+            } else {
+                match linux_process_thread_runtime_state(next) {
+                    Some(threads) => threads[slot],
+                    None => break,
+                }
+            };
+            if thread.state != LINUX_THREAD_FREE {
+                linux_show_thread_state(&thread);
+            }
+        }
+    }
+}
+
+fn linux_show_thread_state(thread: &LinuxThreadRuntimeState) {
+    let frame = LinuxSyscallFrame::from_array(thread.registers);
+    serial_write("ginux:   tid ");
+    serial_write_u64(u64::from(thread.tid));
+    serial_write(match thread.state {
+        LINUX_THREAD_READY => " ready",
+        LINUX_THREAD_RUNNING => " running",
+        LINUX_THREAD_BLOCKED => " blocked",
+        _ => " ?",
+    });
+    serial_write(" wait=");
+    serial_write_u64(u64::from(thread.wait_kind));
+    serial_write(" key=");
+    serial_write_hex(thread.wait_key);
+    serial_write(" rip=");
+    serial_write_hex(thread.rip);
+    serial_write(" rsp=");
+    serial_write_hex(thread.rsp);
+    serial_write(" rax=");
+    serial_write_u64(thread.rax);
+    serial_write(" args=");
+    for value in [frame.rdi, frame.rsi, frame.rdx, frame.r10] {
+        serial_write_hex(value);
+        serial_write(",");
+    }
+    if matches!(
+        thread.wait_kind,
+        LINUX_THREAD_WAIT_POLL | LINUX_THREAD_WAIT_PPOLL
+    ) {
+        serial_write(" fds=");
+        let count = usize::try_from(frame.rsi)
+            .unwrap_or(0)
+            .min(LINUX_POLLFD_LIMIT);
+        for (descriptor, events) in thread.poll_descriptors[..count]
+            .iter()
+            .zip(&thread.poll_events[..count])
+        {
+            serial_write_u64(u64::from(*descriptor));
+            serial_write(":");
+            serial_write_u64(u64::from(*events));
+            serial_write(" ");
+        }
+    }
+    serial_write("\r\n");
+}
+
 fn linux_proc_oom_score_adj_write(descriptor: u64, device: u16, address: u64, count: u64) -> u64 {
     if device & 3 & LINUX_DESCRIPTOR_OUTPUT == 0 {
         return LINUX_EBADF;
@@ -37962,6 +39043,7 @@ fn linux_descriptor_writev(descriptor: u64, vectors: u64, count: u64) -> u64 {
     if linux_overlay_descriptor_handle(descriptor).is_some()
         || linux_tmp_file(device)
         || device & !3 == LINUX_FILE_PROC_OOM_SCORE_ADJ
+        || device & !3 == LINUX_FILE_PROC_SYSRQ_TRIGGER
     {
         let (ranges, vector_count) = match linux_socket_iov_ranges(vectors, count, false) {
             Ok(ranges) => ranges,
@@ -38711,6 +39793,7 @@ fn linux_proc_file(state: u16) -> bool {
             | LINUX_FILE_PROC_FILE_MAX
             | LINUX_FILE_PROC_NR_OPEN
             | LINUX_FILE_PROC_OOM_SCORE_ADJ
+            | LINUX_FILE_PROC_SYSRQ_TRIGGER
             | LINUX_FILE_PROC_USER_NAMESPACE
             | LINUX_FILE_PROC_FDINFO
             | LINUX_FILE_PROC_HOSTNAME
@@ -38733,6 +39816,7 @@ fn linux_writable_proc_file(state: u16) -> bool {
         LINUX_FILE_PROC_FILE_MAX
             | LINUX_FILE_PROC_NR_OPEN
             | LINUX_FILE_PROC_OOM_SCORE_ADJ
+            | LINUX_FILE_PROC_SYSRQ_TRIGGER
             | LINUX_FILE_PROC_UID_MAP
             | LINUX_FILE_PROC_GID_MAP
             | LINUX_FILE_PROC_SETGROUPS
@@ -38970,6 +40054,7 @@ fn linux_regular_file_inode(state: u16) -> Option<u64> {
         LINUX_FILE_PROC_FDINFO => return Some(46),
         LINUX_FILE_PROC_HOSTNAME => return Some(47),
         LINUX_FILE_PROC_BOOT_ID => return Some(49),
+        LINUX_FILE_PROC_SYSRQ_TRIGGER => return Some(50),
         LINUX_FILE_PROC_DYNAMIC_STAT
         | LINUX_FILE_PROC_DYNAMIC_STATUS
         | LINUX_FILE_PROC_DYNAMIC_STATM
@@ -39507,6 +40592,7 @@ fn linux_descriptor_close_with_wake_inner(descriptor: u64, wake_waiters: bool) -
     linux_epoll_forget_descriptor(descriptor);
     if let Some(slot) = linux_socket_slot(descriptor) {
         let closed = crate::linux_socket::close(slot);
+        crate::linux_drm::collect();
         if let Some(index) = usize::try_from(descriptor)
             .ok()
             .filter(|index| *index < X86_RUNTIME.ELF_PROBE_STDIO_SOCKET_SLOTS.len())
@@ -39604,9 +40690,11 @@ fn linux_descriptor_close_with_wake_inner(descriptor: u64, wake_waiters: bool) -
     if linux_eventfd_descriptor(descriptor) {
         if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
             let index = (descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
+            if let Some(id) = linux_eventfd_file(descriptor) {
+                crate::linux_event_files::release(crate::linux_event_files::Kind::EventFd, id);
+            }
             X86_RUNTIME.LINUX_RUNTIME_EVENTFD_ACTIVE[index].store(0, Ordering::SeqCst);
-            X86_RUNTIME.LINUX_RUNTIME_EVENTFD_COUNTERS[index].store(0, Ordering::SeqCst);
-            X86_RUNTIME.LINUX_RUNTIME_EVENTFD_FLAGS[index].store(0, Ordering::SeqCst);
+            linux_legacy_descriptor_offset(descriptor).store(0, Ordering::SeqCst);
         } else {
             X86_RUNTIME
                 .ELF_PROBE_EVENTFD_DESCRIPTOR
@@ -39627,11 +40715,11 @@ fn linux_descriptor_close_with_wake_inner(descriptor: u64, wake_waiters: bool) -
     if linux_timerfd_descriptor(descriptor) {
         if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
             let index = (descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
+            if let Some(id) = linux_timerfd_file(descriptor) {
+                crate::linux_event_files::release(crate::linux_event_files::Kind::TimerFd, id);
+            }
             X86_RUNTIME.LINUX_RUNTIME_TIMERFD_ACTIVE[index].store(0, Ordering::SeqCst);
-            X86_RUNTIME.LINUX_RUNTIME_TIMERFD_CLOCKS[index].store(0, Ordering::SeqCst);
-            X86_RUNTIME.LINUX_RUNTIME_TIMERFD_FLAGS[index].store(0, Ordering::SeqCst);
-            X86_RUNTIME.LINUX_RUNTIME_TIMERFD_INTERVALS[index].store(0, Ordering::SeqCst);
-            X86_RUNTIME.LINUX_RUNTIME_TIMERFD_DEADLINES[index].store(0, Ordering::SeqCst);
+            linux_legacy_descriptor_offset(descriptor).store(0, Ordering::SeqCst);
         } else {
             X86_RUNTIME
                 .ELF_PROBE_TIMERFD_DESCRIPTOR
@@ -39810,6 +40898,11 @@ fn linux_console_dup2(source: u64, target: u64) -> u64 {
     let target = u64::from(target as u32);
     if linux_epoll_descriptor(source) {
         return linux_epoll_dup(source, target);
+    }
+    if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
+        && (linux_eventfd_descriptor(source) || linux_timerfd_descriptor(source))
+    {
+        return linux_event_file_dup(source, target);
     }
     let device = linux_device_descriptor(source);
     if device != 0 {
@@ -40151,6 +41244,8 @@ fn linux_descriptor_fcntl(descriptor: u64, command: u64, argument: u64) -> u64 {
                 return LINUX_EBADF;
             };
             return match command {
+                LINUX_F_DUPFD => linux_console_dup_at_least(descriptor, argument, false),
+                LINUX_F_DUPFD_CLOEXEC => linux_console_dup_at_least(descriptor, argument, true),
                 LINUX_F_GETFD | LINUX_F_SETFD => {
                     linux_fcntl_descriptor_flags(descriptor, command, argument)
                 }
@@ -40163,6 +41258,8 @@ fn linux_descriptor_fcntl(descriptor: u64, command: u64, argument: u64) -> u64 {
         }
         if let Some(state) = linux_timerfd_state(descriptor) {
             return match command {
+                LINUX_F_DUPFD => linux_console_dup_at_least(descriptor, argument, false),
+                LINUX_F_DUPFD_CLOEXEC => linux_console_dup_at_least(descriptor, argument, true),
                 LINUX_F_GETFD | LINUX_F_SETFD => {
                     linux_fcntl_descriptor_flags(descriptor, command, argument)
                 }
@@ -40398,12 +41495,12 @@ fn linux_fcntl_setlkw_live_return(
     }
 }
 
-fn linux_descriptor_set_nonblocking(flags: &BankedAtomicU32, argument: u64) -> u64 {
+fn linux_descriptor_set_nonblocking(flags: &dyn LinuxFileCell<u32>, argument: u64) -> u64 {
     linux_descriptor_set_status_flags(flags, argument, LINUX_O_NONBLOCK)
 }
 
 fn linux_descriptor_set_status_flags(
-    flags: &BankedAtomicU32,
+    flags: &dyn LinuxFileCell<u32>,
     argument: u64,
     supported: u64,
 ) -> u64 {
@@ -42373,6 +43470,7 @@ fn linux_framebuffer_mmap(
             mapping + (page * PAGE_SIZE) as u64,
             display.physical + offset + (page * PAGE_SIZE) as u64,
             protection & LINUX_PROT_WRITE != 0,
+            address_space::DeviceCaching::WriteBack,
         );
         if !installed {
             let _ = rollback_linux_runtime_mapping(mapping, page);
@@ -42500,6 +43598,15 @@ fn linux_descriptor_stat(descriptor: u64) -> Option<[u8; LINUX_STAT_SIZE]> {
     }
     if linux_pipe_descriptor(descriptor) {
         return Some(linux_stat(LINUX_STAT_FIFO_MODE, 3));
+    }
+    if let Some((class, _)) = linux_object_descriptor(descriptor) {
+        if class == crate::linux_drm::CLASS_FILE {
+            // A character device, 226:128.
+            let mut stat = linux_stat(0o020_666, 50);
+            stat[40..48].copy_from_slice(&u64::from(crate::linux_drm::NODE_DEVICE).to_ne_bytes());
+            return Some(stat);
+        }
+        return Some(linux_stat(LINUX_STAT_ANONYMOUS_MODE, 4));
     }
     if linux_socket_slot(descriptor).is_some() {
         return Some(linux_stat(LINUX_STAT_SOCKET_MODE, 4));
@@ -46955,6 +48062,12 @@ pub(crate) fn current_container_slot() -> Option<usize> {
 }
 
 pub(crate) fn container_domain_id(slot: usize) -> Option<u64> {
+    crate::linux_profile::span(crate::linux_profile::Span::ContainerDomainId, || {
+        container_domain_id_checked(slot)
+    })
+}
+
+fn container_domain_id_checked(slot: usize) -> Option<u64> {
     let domain = X86_RUNTIME
         .CONTAINER_DOMAIN_IDS
         .get(slot)?
@@ -47394,6 +48507,12 @@ fn exit_result(caller_domain: u64, frame: *mut UserTrapFrame) -> u64 {
 }
 
 extern "sysv64" fn user_fault_handler(frame: *mut UserFaultFrame) -> u64 {
+    crate::linux_profile::span(crate::linux_profile::Span::UserFault, || {
+        handle_user_fault(frame)
+    })
+}
+
+fn handle_user_fault(frame: *mut UserFaultFrame) -> u64 {
     let _kernel_entry = crate::sync::kernel_entry_lock();
     let Some(frame) = (unsafe { frame.as_mut() }) else {
         return u64::MAX;

@@ -29,7 +29,26 @@ fn write_linux_syscall_heartbeat(count: u64, number: u64, registers: &LinuxSysca
     serial_write(")\r\n");
 }
 
+/// System call entries, fast paths included: a count that moves whenever a
+/// process gets past a wait and runs, which the runtime loop watches to
+/// tell progress from parked calls rechecking their waits.
+pub(super) static LINUX_SYSCALL_ENTRIES: AtomicU64 = AtomicU64::new(0);
+
 pub(super) extern "sysv64" fn linux_syscall_handler(
+    number: u64,
+    registers: *mut LinuxSyscallFrame,
+    user_stack: u64,
+    user_rip: u64,
+    user_rflags: u64,
+) -> u64 {
+    LINUX_SYSCALL_ENTRIES.fetch_add(1, Ordering::Relaxed);
+    let started = timer::timestamp_counter();
+    let result = linux_syscall_dispatch(number, registers, user_stack, user_rip, user_rflags);
+    crate::linux_profile::time_syscall(number, timer::timestamp_counter().wrapping_sub(started));
+    result
+}
+
+fn linux_syscall_dispatch(
     number: u64,
     registers: *mut LinuxSyscallFrame,
     user_stack: u64,
@@ -41,6 +60,7 @@ pub(super) extern "sysv64" fn linux_syscall_handler(
         X86_RUNTIME.ELF_PROBE_ACTIVE.store(false, Ordering::SeqCst);
         return LINUX_RETURN_TO_KERNEL;
     }
+    crate::linux_profile::count_syscall(number);
     // SAFETY: the assembly entry stub passes the aligned base of the exact
     // twelve-register frame represented by LinuxSyscallFrame.
     let saved_registers = unsafe { registers.read() };
@@ -219,6 +239,28 @@ pub(super) extern "sysv64" fn linux_syscall_handler(
             if linux_graphics_descriptor(first_argument).is_some() =>
         {
             linux_graphics_syscall(number, first_argument, buffer, count)
+        }
+        LINUX_READ_SYSCALL | LINUX_WRITE_SYSCALL | LINUX_IOCTL_SYSCALL
+            if runtime_mode && linux_object_descriptor(first_argument).is_some() =>
+        {
+            match linux_object_syscall(number, first_argument, buffer, count) {
+                // An ioctl that waits for the GPU: let the rest of the
+                // domain run, then issue it again.
+                LINUX_EAGAIN if number == LINUX_IOCTL_SYSCALL => {
+                    linux_retry_later_live_return(registers, syscall_return, number)
+                }
+                result => result,
+            }
+        }
+        LINUX_MMAP_SYSCALL if runtime_mode && linux_object_descriptor(register(2)).is_some() => {
+            linux_object_mmap(
+                first_argument,
+                buffer,
+                count,
+                register(0),
+                register(2),
+                register(1),
+            )
         }
         LINUX_MMAP_SYSCALL
             if runtime_mode

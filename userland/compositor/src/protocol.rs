@@ -8,7 +8,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use ginux_gfx::Image;
+use ginux_gfx::Canvas;
 use wayland_protocols::xdg::{
     decoration::zv1::server::{zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1},
     shell::server::{xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base},
@@ -299,40 +299,46 @@ pub struct BufferData {
     opaque: bool,
 }
 
-/// Copies a wl_shm buffer's pixels out of its pool.
-pub fn read_buffer(buffer: &wl_buffer::WlBuffer) -> Option<Image> {
+/// A shm buffer's width, height and opacity, if it fits its pool (a
+/// buffer that does not is a protocol error).
+pub fn buffer_shape(buffer: &wl_buffer::WlBuffer) -> Option<(i32, i32, bool)> {
     let data = buffer.data::<BufferData>()?;
     let mapping = data.pool.mapping.lock().ok()?;
-    let rows = data.height as usize;
-    let width = data.width as usize;
-    let end = data.offset.checked_add(data.stride.checked_mul(rows)?)?;
-    if end > mapping.length || data.stride < width * 4 {
+    let fits = data
+        .stride
+        .checked_mul(data.height as usize)
+        .and_then(|size| data.offset.checked_add(size))
+        .is_some_and(|end| end <= mapping.length);
+    if !fits || data.stride < data.width as usize * 4 {
         buffer.post_error(wl_shm::Error::InvalidStride, "buffer exceeds its pool");
         return None;
     }
-    let mut pixels = Vec::with_capacity(width * rows);
-    for row in 0..rows {
-        // SAFETY: the row lies inside the mapping, checked above.
-        let bytes = unsafe {
+    Some((data.width, data.height, data.opaque))
+}
+
+/// Draws a committed shm buffer straight from its pool at `origin`; the
+/// compositor holds the buffer until the client commits another, so the
+/// pixels stay put without being copied out first.
+pub fn blit_buffer(canvas: &mut Canvas<'_>, origin: (i32, i32), buffer: &wl_buffer::WlBuffer) {
+    let Some((width, height, opaque)) = buffer_shape(buffer) else {
+        return;
+    };
+    let Some(data) = buffer.data::<BufferData>() else {
+        return;
+    };
+    let Ok(mapping) = data.pool.mapping.lock() else {
+        return;
+    };
+    canvas.blit_rows(origin, (width, height), opaque, |row| {
+        // SAFETY: buffer_shape checked that every row lies in the mapping,
+        // which the lock keeps in place.
+        unsafe {
             std::slice::from_raw_parts(
                 mapping.address.add(data.offset + row * data.stride),
-                width * 4,
+                width as usize * 4,
             )
-        };
-        pixels.extend(
-            bytes
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|pixel| u32::from_le_bytes(*pixel)),
-        );
-    }
-    Some(Image {
-        width: data.width,
-        height: data.height,
-        pixels,
-        opaque: data.opaque,
-    })
+        }
+    });
 }
 
 impl GlobalDispatch<wl_shm::WlShm, ()> for State {
