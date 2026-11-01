@@ -13313,6 +13313,15 @@ fn run_other_linux_processes(
         if !park_linux_process(pid) {
             return Some(LinuxBlockedWait::Return(LINUX_RETURN_TO_KERNEL));
         }
+        // Resumed to be killed: SIGKILL ends the process from inside its
+        // wait, as Linux's fatal signals wake a sleeping task to exit.
+        if linux_peek_dynamic_signal(1 << (LINUX_SIGKILL - 1))
+            .is_some_and(|(_, pending)| u64::from(pending.signal) == LINUX_SIGKILL)
+        {
+            return Some(LinuxBlockedWait::Return(linux_terminate_by_default_signal(
+                LINUX_SIGKILL,
+            )));
+        }
         let mut interrupted = caller;
         interrupted.rax = LINUX_EINTR;
         let delivered = linux_deliver_pending_signal_restarting(
