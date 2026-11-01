@@ -64,6 +64,94 @@ class BootError(Exception):
     pass
 
 
+class Progress:
+    """What the run is doing. On a terminal, a status line on stderr shows
+    the current boot step or test, how long it has run, the results so far
+    and the elapsed time, redrawn every second; result lines print above it.
+    Without a terminal (a log), boot steps print as plain lines."""
+
+    SHORT = {"TPASS": "pass", "TFAIL": "fail", "TBROK": "broken", "TCONF": "conf",
+             "TWARN": "warn", "CRASH": "crash", "HANG": "hang"}
+
+    def __init__(self, total):
+        self.tty = sys.stderr.isatty()
+        self.lock = threading.Lock()
+        self.total = total
+        self.done = 0
+        self.counts = collections.Counter()
+        self.activity = "starting"
+        self.started = self.since = time.monotonic()
+        if self.tty:
+            threading.Thread(target=self._tick, daemon=True).start()
+
+    def step(self, text):
+        """A boot or setup step began."""
+        with self.lock:
+            self.activity, self.since = text, time.monotonic()
+            if self.tty:
+                self._draw()
+            else:
+                print(f"ltp: {text}", file=sys.stderr, flush=True)
+
+    def test(self, name):
+        """A test began."""
+        with self.lock:
+            self.activity, self.since = f"running {name}", time.monotonic()
+            if self.tty:
+                self._draw()
+
+    def result(self, line, result):
+        """A test finished: its result line goes above the status line."""
+        with self.lock:
+            self.done += 1
+            self.counts[result] += 1
+            self.activity, self.since = "waiting for the next test", time.monotonic()
+            self._print(line, sys.stdout)
+
+    def message(self, text):
+        with self.lock:
+            self._print(text, sys.stderr)
+
+    def close(self):
+        with self.lock:
+            self._clear()
+            self.tty = False
+
+    def _print(self, text, stream):
+        self._clear()
+        print(text, file=stream, flush=True)
+        if self.tty:
+            self._draw()
+
+    def _clear(self):
+        if self.tty:
+            sys.stderr.write("\r\x1b[K")
+            sys.stderr.flush()
+
+    def _draw(self):
+        now = time.monotonic()
+        elapsed = int(now - self.started)
+        counts = " ".join(
+            f"{short} {self.counts[name]}" for name, short in self.SHORT.items() if self.counts[name]
+        )
+        line = (
+            f"[{self.done}/{self.total}] {self.activity} {int(now - self.since)}s"
+            + (f" | {counts}" if counts else "")
+            + f" | {elapsed // 60}m{elapsed % 60:02d}s"
+        )
+        width = shutil.get_terminal_size((100, 24)).columns
+        sys.stderr.write("\r\x1b[K" + line[: max(width - 1, 20)])
+        sys.stderr.flush()
+
+    def _tick(self):
+        while True:
+            time.sleep(1)
+            with self.lock:
+                if not self.tty:
+                    return
+                self._draw()
+
+
 def parse_list(path, default_budget):
     """Parses a run list: `[!]TAG COMMAND [ARG...] [# NOTE]`.
 
@@ -292,6 +380,7 @@ class Run:
         self.args = args
         self.tests = tests
         self.runnable = [test for test in tests if test.skip is None]
+        self.progress = Progress(len(self.runnable))
         self.results = {}
         for test in tests:
             if test.skip is not None:
@@ -307,7 +396,7 @@ class Run:
     def record(self, test, result, seconds, detail, output):
         self.results[test.tag] = Result(result, seconds, detail)
         (self.logs / f"{test.tag}.log").write_bytes(output.replace(b"\r\n", b"\n"))
-        print(f"LTP {test.tag} {result} {seconds:.2f} {detail}", flush=True)
+        self.progress.result(f"LTP {test.tag} {result} {seconds:.2f} {detail}", result)
         self.write_results()
 
     def counts(self):
@@ -342,9 +431,10 @@ class Run:
         failed_boots = 0
         while position < len(self.runnable):
             if self.boots >= self.args.max_boots:
-                print(f"ltp: stopping after {self.boots} boots", file=sys.stderr)
+                self.progress.message(f"ltp: stopping after {self.boots} boots")
                 break
             self.boots += 1
+            self.progress.step(f"boot {self.boots}: booting Ginux")
             qemu = Qemu(self.args, self.boots, self.args.serial_log)
             try:
                 qemu.start()
@@ -354,7 +444,7 @@ class Run:
                 outcome, progressed = f"boot failed: {error}", False
                 tail = qemu.output(max(0, len(qemu.data) - 600)).decode(errors="replace")
                 tail = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", tail)
-                print(f"ltp: boot {self.boots}: {error}; console ends:\n{tail}", file=sys.stderr)
+                self.progress.message(f"ltp: boot {self.boots}: {error}; console ends:\n{tail}")
                 # Start the next boot from a fresh volume in case this one
                 # was left unusable.
                 self.shutdown(qemu)
@@ -365,13 +455,14 @@ class Run:
                 break
             failed_boots = 0 if progressed else failed_boots + 1
             if failed_boots >= 3:
-                print("ltp: three boots in a row made no progress; stopping", file=sys.stderr)
+                self.progress.message("ltp: three boots in a row made no progress; stopping")
                 break
         self.write_results(final=True)
 
     def start_domain(self, qemu, base_url, position):
         args = self.args
         offset = qemu.wait_for(b"ginux> ", 120)
+        self.progress.step(f"boot {self.boots}: configuring the ltp domain")
         # The volume keeps domain configurations across reboots, so after the
         # first boot the domain already exists and creating it is rejected.
         qemu.send("domain new ltp")
@@ -383,9 +474,13 @@ class Run:
             " user-switching=true"
         )
         offset = qemu.wait_for(b"settings accepted", 30, offset)
+        self.progress.step(
+            f"boot {self.boots}: starting the ltp domain ({args.image}; the first start pulls it)"
+        )
         qemu.send("domain start ltp --attach")
         offset = qemu.wait_for(b"ginux: entering configured Linux init", 900, offset)
         offset = qemu.wait_for(b"/ # ", 60, offset)
+        self.progress.step(f"boot {self.boots}: unpacking LTP and starting the runner")
         # The runner cannot replace the init shell: Ginux fails execve in a
         # domain's init process (ENOENT). The quotes keep the shell's echo of
         # this line from looking like a marker.
@@ -417,6 +512,7 @@ class Run:
                 index = int(text.split()[0])
                 test = self.runnable[index]
                 current = (test, when, end)
+                self.progress.test(test.tag)
                 deadline = now + test.budget + args.grace
             elif kind == "END":
                 fields = text.split()
@@ -450,7 +546,7 @@ class Run:
                     test, began, offset = current
                     self.record(test, "CRASH", now - began, what, qemu.output(offset))
                     return what, self.runnable.index(test) + 1, True
-                print(f"ltp: boot {self.boots}: {what} between tests", file=sys.stderr)
+                self.progress.message(f"ltp: boot {self.boots}: {what} between tests")
                 return what, position, progressed
             if now > deadline:
                 if current is not None:
@@ -461,7 +557,7 @@ class Run:
                         qemu.output(offset),
                     )
                     return "wedged", self.runnable.index(test) + 1, True
-                print(f"ltp: boot {self.boots}: no runner progress", file=sys.stderr)
+                self.progress.message(f"ltp: boot {self.boots}: no runner progress")
                 return "stalled", position, progressed
 
     def shutdown(self, qemu):
@@ -578,19 +674,19 @@ def main():
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, on_signal)
-    print(
+    run.progress.message(
         f"ltp: {len(run.runnable)} tests to run, {len(tests) - len(run.runnable)} skipped; "
-        f"results in {args.results}, serial log in {args.serial_log_path}",
-        flush=True,
+        f"results in {args.results}, serial log in {args.serial_log_path}"
     )
     with open(args.serial_log_path, "wb") as serial_log:
         args.serial_log = serial_log
         try:
             run.run(base_url)
         except KeyboardInterrupt:
-            print("ltp: interrupted", file=sys.stderr)
+            run.progress.message("ltp: interrupted")
             run.write_results(final=True)
         finally:
+            run.progress.close()
             server.shutdown()
 
     counts = run.counts()

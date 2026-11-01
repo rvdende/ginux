@@ -235,6 +235,13 @@ LTP_FILTER='^mmap' make test-ltp                 # the same from make
 `tests/qemu/ltp.sh --help` lists the other options (default budget, memory,
 domain image, `--variant`).
 
+Each finished test prints `LTP NAME RESULT SECONDS DETAIL`. On a terminal a
+status line below them shows what runs now and for how long (the boot step,
+such as the first domain start pulling Alpine, or the current test), the
+results so far and the elapsed time, e.g.
+`[412/1362] running fork14 12s | pass 380 fail 20 broken 9 conf 3 | 6m41s`;
+without a terminal the boot steps print as `ltp:` lines instead.
+
 Outputs:
 
 | File | Contents |
