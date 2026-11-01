@@ -2945,7 +2945,8 @@ unsafe fn enter_linux_runtime_process(
             stack,
             general,
             rflags,
-        );
+        )
+        .is_some();
     if !entered {
         ginux_process_user_enter(entry, stack, general, rflags);
     }
@@ -4768,14 +4769,6 @@ fn resume_failed_linux_fork_parent(parent_pid: u32, error: u64) -> bool {
 /// waits for something its parent-first sibling never provides), which has
 /// to be found before the scheduler loop of docs/SCHEDULER.md step 3.
 const LINUX_PARENT_FIRST_FORK: bool = false;
-
-/// Init waits like every other process: it gives the CPU back to the
-/// kernel's scheduler loop at the runtime entry (`run_linux_runtime_loop`),
-/// which runs the others, instead of running them nested inside its own
-/// blocking calls (docs/SCHEDULER.md, step 4). Off: with it on, brush as
-/// init livelocks with its child and busybox sh as init reads end of file
-/// from the console (docs/SCHEDULER.md lists what is left).
-const LINUX_SCHEDULER_LOOP: bool = false;
 
 /// Finishes a parent-first fork: keeps the child's prepared state for when it
 /// is scheduled, and resumes the parent with the child's pid as the result
@@ -13286,7 +13279,7 @@ fn run_other_linux_processes(
         return None;
     }
     let pid = current_linux_process_pid();
-    if pid != 1 || LINUX_SCHEDULER_LOOP {
+    if pid != 1 {
         // A signal that arrived while this call waited interrupts it (EINTR,
         // or a restart after an SA_RESTART handler), as in Linux, instead of
         // the call waiting again.
@@ -13314,43 +13307,22 @@ fn run_other_linux_processes(
         linux_process::set_live_process_waiting(pid, true);
         return Some(LinuxBlockedWait::Return(LINUX_RETURN_TO_KERNEL));
     }
-    // The deepest running descendant is most likely what this process waits
-    // for, such as a linker under a compiler driver; failing that, take the
-    // next process in the run queue. A descendant that just yielded because
-    // it is blocked waits for the rest of the queue to have a turn, since it
-    // may be waiting for its own parent, as a forked child waiting for a
-    // reply on a socketpair does.
-    let mut descendant = None;
-    let mut ancestor = pid;
-    for _ in 0..linux_process::PROCESS_RUNTIME_LIMIT {
-        let Some(child) = linux_process::live_running_child_pid(ancestor) else {
-            break;
-        };
-        descendant = Some(child);
-        ancestor = child;
-    }
-    let last_blocked = X86_RUNTIME
-        .LINUX_PROCESS_LAST_BLOCKED_PID
-        .swap(0, Ordering::SeqCst);
-    let preferred = descendant.filter(|child| *child != last_blocked);
-    // A killed process goes first: dispatching it ends it, as SIGKILL
-    // wakes a task in Linux, where it would otherwise keep its memory and
-    // process slot until its turn came. One the run queue cannot dispatch
-    // (it is not ready) is passed over.
-    let killed = linux_killed_process(pid);
-    if !refresh_live_linux_process_registry(caller)
-        || !(killed.is_some_and(|killed| run_scheduled_linux_process(pid, Some(killed)))
-            || preferred.is_some_and(|child| run_scheduled_linux_process(pid, Some(child)))
-            || run_next_scheduled_linux_process(pid)
-            || descendant.is_some_and(|child| run_scheduled_linux_process(pid, Some(child))))
-    {
+    if !refresh_live_linux_process_registry(caller) {
         return None;
+    }
+    // Init waits on its own stack: the runtime loop runs the others and
+    // resumes it here. Where it cannot park (entered below another's
+    // frames), it runs one of them nested in this call instead.
+    if !park_linux_process(pid) {
+        if !run_one_other_linux_process(pid) {
+            return None;
+        }
+        if !restore_linux_process_live_return(output, pid) {
+            return Some(LinuxBlockedWait::Return(LINUX_EINVAL));
+        }
     }
     if X86_RUNTIME.LINUX_RUNTIME_SUSPENDED.load(Ordering::Acquire) {
         return Some(LinuxBlockedWait::Return(LINUX_RETURN_TO_KERNEL));
-    }
-    if !restore_linux_process_live_return(output, pid) {
-        return Some(LinuxBlockedWait::Return(LINUX_EINVAL));
     }
     let mut interrupted = caller;
     interrupted.rax = LINUX_EINTR;
@@ -13367,6 +13339,73 @@ fn run_other_linux_processes(
     } else {
         LinuxBlockedWait::Recheck
     })
+}
+
+/// Runs one process other than `pid` (init) while it waits; false when none
+/// could run. A killed process goes first: dispatching it ends it, as
+/// SIGKILL wakes a task in Linux, where it would otherwise keep its memory
+/// and process slot until its turn came. Then the deepest running
+/// descendant, most likely what init waits for (a linker under a compiler
+/// driver), unless it just yielded because it is blocked: it may be waiting
+/// for its own parent, as a forked child waiting for a reply on a
+/// socketpair does, so the rest of the run queue gets a turn first.
+fn run_one_other_linux_process(pid: u32) -> bool {
+    let mut descendant = None;
+    let mut ancestor = pid;
+    for _ in 0..linux_process::PROCESS_RUNTIME_LIMIT {
+        let Some(child) = linux_process::live_running_child_pid(ancestor) else {
+            break;
+        };
+        descendant = Some(child);
+        ancestor = child;
+    }
+    let last_blocked = X86_RUNTIME
+        .LINUX_PROCESS_LAST_BLOCKED_PID
+        .swap(0, Ordering::SeqCst);
+    let preferred = descendant.filter(|child| *child != last_blocked);
+    let killed = linux_killed_process(pid);
+    killed.is_some_and(|killed| run_scheduled_linux_process(pid, Some(killed)))
+        || preferred.is_some_and(|child| run_scheduled_linux_process(pid, Some(child)))
+        || run_next_scheduled_linux_process(pid)
+        || descendant.is_some_and(|child| run_scheduled_linux_process(pid, Some(child)))
+}
+
+/// Parks the current process `pid` inside its system call (see
+/// `activation::park`) and, once resumed, makes its thread pointer and
+/// address space current again, which whatever ran meanwhile replaced.
+/// False when it cannot park.
+fn park_linux_process(pid: u32) -> bool {
+    let fs_base = active_fs_base();
+    let root = address_space::current_root_address();
+    if !activation::park(pid) {
+        return false;
+    }
+    // SAFETY: both are this process's, saved on its own stack before it
+    // parked; the process is current again.
+    unsafe {
+        write_msr(FS_BASE_MSR, fs_base);
+        address_space::activate_root(root);
+    }
+    true
+}
+
+/// Resumes process `pid`'s parked system call until it parks again or its
+/// activation finishes; false when it has none. The parked call restores
+/// its own thread pointer and address space.
+fn resume_parked_linux_process(pid: u32) -> bool {
+    X86_RUNTIME
+        .LINUX_CURRENT_PROCESS_PID
+        .store(pid, Ordering::SeqCst);
+    let entry_state = current_entry_state();
+    // SAFETY: the entry state is this CPU's; the resumed call installs its
+    // own while it runs, and the runtime's is put back after.
+    let previous_return_stack = unsafe { (*entry_state).return_stack };
+    LINUX_PROCESS_SLICE.store(0, Ordering::SeqCst);
+    // SAFETY: `pid` is current again: everything that ran while it was
+    // parked ran nested as its child, which put its kernel state back.
+    let resumed = unsafe { activation::resume(pid) }.is_some();
+    unsafe { (*entry_state).return_stack = previous_return_stack };
+    resumed
 }
 
 /// A process other than `current` with SIGKILL pending that can be
@@ -14165,6 +14204,11 @@ pub(crate) fn resume_suspended_linux_runtime(mmap: u64) -> LinuxElfResult {
 /// the deepest descendant first, then init again; with nothing else ready
 /// the CPU halts until an interrupt. It ends when init exits or the domain
 /// is suspended.
+/// The runtime's scheduler loop. While init waits parked in a system call,
+/// it runs one other process at a time and resumes init to check its wait
+/// again, halting when nothing could run; it returns once init's activation
+/// has finished (init exited, the runtime is suspending, or it forked,
+/// which the loop completes first).
 fn run_linux_runtime_loop() -> bool {
     loop {
         while X86_RUNTIME.LINUX_FORK_REQUESTED.load(Ordering::SeqCst) {
@@ -14172,49 +14216,20 @@ fn run_linux_runtime_loop() -> bool {
                 return false;
             }
         }
-        if !LINUX_SCHEDULER_LOOP
-            || X86_RUNTIME.LINUX_RUNTIME_SUSPENDED.load(Ordering::Acquire)
-            || !take_linux_child_yield(1)
-        {
+        if !activation::is_parked(1) {
             return true;
         }
-        if !run_linux_processes_while_init_waits() {
+        if !X86_RUNTIME.LINUX_RUNTIME_SUSPENDED.load(Ordering::Acquire)
+            && !run_one_other_linux_process(1)
+        {
             // SAFETY: interrupts wake the CPU for the timer and devices; the
             // kernel-entry lock serializes the work they start.
             unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) };
         }
-        if X86_RUNTIME.LINUX_RUNTIME_SUSPENDED.load(Ordering::Acquire) {
-            return true;
-        }
-        let Some(init) = linux_process::dispatch_live_process(1) else {
-            return false;
-        };
-        if !(sync_live_linux_process_address_space(1) && run_dispatched_linux_process(&init)) {
+        if !resume_parked_linux_process(1) {
             return false;
         }
     }
-}
-
-/// Runs one other process while init waits: the deepest running descendant
-/// is most likely what init waits for, unless it just yielded blocked (it
-/// may wait for its parent); failing that, the next in the run queue.
-fn run_linux_processes_while_init_waits() -> bool {
-    let mut descendant = None;
-    let mut ancestor = 1;
-    for _ in 0..linux_process::PROCESS_RUNTIME_LIMIT {
-        let Some(child) = linux_process::live_running_child_pid(ancestor) else {
-            break;
-        };
-        descendant = Some(child);
-        ancestor = child;
-    }
-    let last_blocked = X86_RUNTIME
-        .LINUX_PROCESS_LAST_BLOCKED_PID
-        .swap(0, Ordering::SeqCst);
-    let preferred = descendant.filter(|child| *child != last_blocked);
-    preferred.is_some_and(|child| run_scheduled_linux_process(1, Some(child)))
-        || run_next_scheduled_linux_process(1)
-        || descendant.is_some_and(|child| run_scheduled_linux_process(1, Some(child)))
 }
 
 fn finish_linux_runtime(mmap: u64, saved_msrs: [u64; 5]) -> LinuxElfResult {
@@ -35607,7 +35622,6 @@ fn linux_epoll_wait_duration_live_return(
                 .load(Ordering::SeqCst)
                 != 0
                 || current_linux_process_pid() != 1
-                || LINUX_SCHEDULER_LOOP
             {
                 // epoll_wait waits as poll does: other processes run, the
                 // call restarts with its deadline, and a signal interrupts

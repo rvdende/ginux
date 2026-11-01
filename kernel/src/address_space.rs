@@ -5715,6 +5715,16 @@ pub(crate) fn current_root_address() -> u64 {
     current_root()
 }
 
+/// Loads `root` into CR3: a parked system call puts back its process's
+/// address space when it is resumed.
+///
+/// # Safety
+///
+/// `root` is a live root this CPU used before, still mapping the kernel.
+pub(crate) unsafe fn activate_root(root: u64) {
+    unsafe { activate(root) };
+}
+
 pub(crate) fn current_linux_hierarchy_matches(address: u64, frames: &[memory::FrameLease]) -> bool {
     if address >= 1 << 47 || frames.is_empty() || current_root() != frames[0].address() {
         return false;

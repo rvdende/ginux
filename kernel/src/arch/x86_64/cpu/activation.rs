@@ -22,11 +22,13 @@
 //! wait on its own stack while others run; `verify_stack_switching` proves
 //! the mechanism at boot.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::arch::global_asm;
 use core::ffi::c_void;
 use core::mem::size_of;
 
+use super::architecture::CpuEntryState;
 use crate::arch::x86_64::paging;
 use crate::memory::{self, FrameOwner};
 use crate::sync::{LockRank, SpinLock};
@@ -88,15 +90,14 @@ static STACK_POOL: SpinLock<StackPool> = SpinLock::new(
 static SWITCHING_VERIFIED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// Processes with a live activation, outermost first.
-static ACTIVE_PIDS: SpinLock<Vec<u32>> = SpinLock::new(LockRank::KERNEL_STACKS, Vec::new());
-
-struct EntryArguments {
-    entry: usize,
-    stack: usize,
-    general: *const u64,
-    rflags: u64,
-}
+/// Every live activation, running or parked, in the order they were
+/// entered. Each is boxed so its address stays fixed while its context and
+/// the context that entered it use it through raw pointers, without the
+/// lock, across a switch; only the context that entered or resumed an
+/// activation removes it, once it has finished.
+#[allow(clippy::vec_box)] // the boxes keep each record's address fixed
+static ACTIVATIONS: SpinLock<Vec<Box<Activation>>> =
+    SpinLock::new(LockRank::KERNEL_STACKS, Vec::new());
 
 global_asm!(
     r#"
@@ -137,53 +138,114 @@ extern "sysv64" {
     fn ginux_context_start();
 }
 
-/// One entry into a process: a kernel context on the activation's own stack
-/// that enters user mode, and the context that entered it.
+/// What had become of an activation when control came back to the context
+/// that entered or resumed it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Outcome {
+    /// One of the process's system calls returned to the kernel: the
+    /// activation is over.
+    Finished,
+    /// A system call parked: it waits on the activation's stack until
+    /// `resume`.
+    Parked,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum State {
+    Running,
+    Parked,
+    Finished,
+}
+
+/// One entry into a process: a kernel context on a stack of its own that
+/// enters user mode and runs the process's system calls, and the context
+/// that entered (or last resumed) it.
 struct Activation {
-    arguments: EntryArguments,
-    /// The entering context's stack pointer while the activation runs.
+    pid: u32,
+    stack: KernelStack,
+    entry: usize,
+    user_stack: usize,
+    general: [u64; 15],
+    rflags: u64,
+    /// The entering or resuming context's stack pointer while this runs.
     caller: usize,
-    /// The activation's stack pointer while it does not run.
+    /// This activation's stack pointer while it does not run.
     context: usize,
+    state: State,
+    /// A parked system call's CPU entry state (its return stack, kernel
+    /// frame and user return context), which other activations overwrite
+    /// while it waits.
+    entry_state: CpuEntryState,
 }
 
 /// An activation's context: runs the process until one of its system calls
-/// returns to the kernel, then switches back to whoever entered it for
-/// good.
+/// returns to the kernel, then switches back for good.
 extern "sysv64" fn run_activation(argument: *mut c_void) -> ! {
     let activation = argument.cast::<Activation>();
-    // SAFETY: `enter_on_own_stack` keeps the activation alive until this
-    // context switches back to it, which it does exactly once, last. The
+    // SAFETY: the activation stays in ACTIVATIONS until the context that
+    // switched here sees it finished, which this context reports last. The
     // entry stub records this stack as the return stack, so the process's
     // system calls run here too.
     unsafe {
-        let arguments = &(*activation).arguments;
         super::ginux_process_user_enter(
-            arguments.entry,
-            arguments.stack,
-            arguments.general,
-            arguments.rflags,
+            (*activation).entry,
+            (*activation).user_stack,
+            (*activation).general.as_ptr(),
+            (*activation).rflags,
         );
+        (*activation).state = State::Finished;
         ginux_switch_stack(&raw mut (*activation).context, (*activation).caller);
     }
     unreachable!("a finished activation is never resumed")
 }
 
+/// Switches to `activation` until it parks or finishes, and frees it once
+/// finished.
+///
+/// # Safety
+///
+/// `activation` is a live, running record in ACTIVATIONS.
+unsafe fn run(activation: *mut Activation) -> Outcome {
+    // SAFETY: as the caller promises; the record outlives the switch.
+    let state = unsafe {
+        ginux_switch_stack(&raw mut (*activation).caller, (*activation).context);
+        (*activation).state
+    };
+    match state {
+        State::Parked => Outcome::Parked,
+        State::Finished => {
+            let finished = {
+                let mut activations = ACTIVATIONS.lock();
+                activations
+                    .iter()
+                    .position(|candidate| core::ptr::eq(&raw const **candidate, activation))
+                    .map(|index| activations.remove(index))
+            };
+            if let Some(finished) = finished {
+                STACK_POOL.lock().free.push(finished.stack);
+            }
+            Outcome::Finished
+        }
+        State::Running => crate::kernel_fail("ginux: activation switched away while running\r\n"),
+    }
+}
+
 /// Enters process `pid`'s user mode on an activation stack of its own and
-/// returns when one of its system calls returns to the kernel. Returns false
-/// without entering when no stack could be allocated.
+/// returns when one of its system calls returns to the kernel or parks.
+/// Returns `None` without entering when no stack could be allocated.
 ///
 /// # Safety
 ///
 /// As for `ginux_process_user_enter`: the caller activated the process's
-/// address space and validated the complete user context.
+/// address space and validated the complete user context in `general`
+/// (fifteen registers).
 pub(super) unsafe fn enter_on_own_stack(
     pid: u32,
     entry: usize,
     stack: usize,
     general: *const u64,
     rflags: u64,
-) -> bool {
+) -> Option<Outcome> {
     // The first activation proves stack switching on the stack window it
     // is about to use (the self-test cannot run earlier in boot, before
     // the runtime owns its frames).
@@ -193,50 +255,100 @@ pub(super) unsafe fn enter_on_own_stack(
         }
         crate::serial_write_raw(b"ginux: kernel stack switching validated\r\n");
     }
-    let Some(kernel_stack) = take_stack() else {
-        return false;
-    };
-    {
-        let mut active = ACTIVE_PIDS.lock();
-        if active.contains(&pid) {
-            report_reentry(pid, &active);
-        }
-        active.push(pid);
+    let kernel_stack = take_stack()?;
+    let mut registers = [0_u64; 15];
+    for (index, register) in registers.iter_mut().enumerate() {
+        // SAFETY: the caller passes fifteen readable registers.
+        *register = unsafe { general.add(index).read() };
     }
-    let mut activation = Activation {
-        arguments: EntryArguments {
-            entry,
-            stack,
-            general,
-            rflags,
-        },
+    let top = kernel_stack.top;
+    let mut record = Box::new(Activation {
+        pid,
+        stack: kernel_stack,
+        entry,
+        user_stack: stack,
+        general: registers,
+        rflags,
         caller: 0,
         context: 0,
-    };
-    let activation_pointer = &raw mut activation;
-    // SAFETY: the stack is exclusively this activation's until it is
-    // returned to the free list below; the activation record outlives the
-    // context, which switches back here when the process returns to the
-    // kernel and is never resumed.
-    unsafe {
-        (*activation_pointer).context = new_context(
-            kernel_stack.top,
-            run_activation,
-            activation_pointer.cast::<c_void>(),
-        );
-        ginux_switch_stack(
-            &raw mut (*activation_pointer).caller,
-            (*activation_pointer).context,
-        );
-    }
+        state: State::Running,
+        entry_state: CpuEntryState::EMPTY,
+    });
+    let activation: *mut Activation = &raw mut *record;
+    // SAFETY: the stack is this activation's alone until it finishes.
+    unsafe { (*activation).context = new_context(top, run_activation, activation.cast()) };
     {
-        let mut active = ACTIVE_PIDS.lock();
-        if let Some(position) = active.iter().rposition(|active| *active == pid) {
-            active.remove(position);
+        let mut activations = ACTIVATIONS.lock();
+        if activations
+            .iter()
+            .any(|candidate| candidate.pid == pid && candidate.state == State::Running)
+        {
+            report_reentry(pid, &activations);
         }
+        activations.push(record);
     }
-    STACK_POOL.lock().free.push(kernel_stack);
+    // SAFETY: the record was just added and is running.
+    Some(unsafe { run(activation) })
+}
+
+/// Parks the running activation of process `pid`: the system call it is in
+/// waits on the activation's stack while the context that entered or
+/// resumed it runs, and continues from here when `resume` switches back.
+/// Returns false, without parking, when this is not that activation's
+/// stack (a process run below another's frames cannot park).
+pub(super) fn park(pid: u32) -> bool {
+    let here = 0_u8;
+    let here = &raw const here as usize;
+    let activation = ACTIVATIONS
+        .lock()
+        .iter_mut()
+        .rev()
+        .find(|candidate| candidate.pid == pid && candidate.state == State::Running)
+        .filter(|candidate| (candidate.stack.top - STACK_SIZE..candidate.stack.top).contains(&here))
+        .map(|candidate| &raw mut **candidate);
+    let Some(activation) = activation else {
+        return false;
+    };
+    let entry_state = super::current_entry_state();
+    // SAFETY: this is the running activation, on its own stack; its record
+    // stays in ACTIVATIONS while it is parked. The CPU's entry state belongs
+    // to this system call and is put back before it continues.
+    unsafe {
+        (*activation).entry_state = *entry_state;
+        (*activation).state = State::Parked;
+        ginux_switch_stack(&raw mut (*activation).context, (*activation).caller);
+        *entry_state = (*activation).entry_state;
+    }
     true
+}
+
+/// Resumes the parked activation of process `pid` until it parks again or
+/// finishes; `None` when it has none.
+///
+/// # Safety
+///
+/// The caller made `pid` the current process again (its address space,
+/// thread pointer and per-process kernel state), as for entering it.
+pub(super) unsafe fn resume(pid: u32) -> Option<Outcome> {
+    let activation = ACTIVATIONS
+        .lock()
+        .iter_mut()
+        .find(|candidate| candidate.pid == pid && candidate.state == State::Parked)
+        .map(|candidate| &raw mut **candidate)?;
+    // SAFETY: a parked record stays in ACTIVATIONS until its context runs
+    // again and finishes.
+    unsafe {
+        (*activation).state = State::Running;
+        Some(run(activation))
+    }
+}
+
+/// Process `pid` has a parked activation.
+pub(super) fn is_parked(pid: u32) -> bool {
+    ACTIVATIONS
+        .lock()
+        .iter()
+        .any(|candidate| candidate.pid == pid && candidate.state == State::Parked)
 }
 
 /// Takes a kernel stack from the pool, or maps a new one.
@@ -334,15 +446,19 @@ pub(super) fn verify_stack_switching() -> bool {
     true
 }
 
-/// A process entered while an earlier activation of it is still inside a
-/// system call: it now runs twice, which the scheduler rework removes.
-fn report_reentry(pid: u32, active: &[u32]) {
+/// A process entered while an earlier activation of it is still running
+/// inside a system call: it now runs twice, which the scheduler rework
+/// removes.
+fn report_reentry(pid: u32, activations: &[Box<Activation>]) {
     crate::serial_write_raw(b"ginux: process re-entered during its own system call; pid ");
     crate::serial_write_u64(u64::from(pid));
     crate::serial_write_raw(b" active");
-    for pid in active {
+    for activation in activations
+        .iter()
+        .filter(|activation| activation.state == State::Running)
+    {
         crate::serial_write_raw(b" ");
-        crate::serial_write_u64(u64::from(*pid));
+        crate::serial_write_u64(u64::from(activation.pid));
     }
     crate::serial_write_raw(b"\r\n");
 }

@@ -546,7 +546,7 @@ static-mut	kernel/src/linux_input.rs	DEVICES	platform-device	allowlist	none	seri
 static-mut	kernel/src/linux_input.rs	PUMP	platform-device	allowlist	none	serialized-evdev-input-pump
 static-mut	kernel/src/memory.rs	FREE	verification-only	allowlist	none	private-allocator-self-test-tables
 static-mut	kernel/src/memory.rs	METADATA	verification-only	allowlist	none	private-allocator-self-test-tables
-interior-mutable	kernel/src/arch/x86_64/cpu/activation.rs	ACTIVE_PIDS	process-runtime	allowlist	none	locked-activation-reentry-diagnostic
+interior-mutable	kernel/src/arch/x86_64/cpu/activation.rs	ACTIVATIONS	process-runtime	allowlist	none	locked-running-and-parked-activations
 interior-mutable	kernel/src/arch/x86_64/cpu/activation.rs	STACK_POOL	process-runtime	allowlist	none	locked-activation-stack-pool
 interior-mutable	kernel/src/arch/x86_64/cpu/activation.rs	SWITCHING_VERIFIED	process-runtime	allowlist	none	once-per-boot-switching-self-test
 interior-mutable	kernel/src/linux_record_lock.rs	LOCKS	process-runtime	allowlist	none	ranked-record-lock-table

@@ -219,8 +219,27 @@ activations when what they wait for is ready. That removes the restart
 model's stale contexts (the checkpoint timeouts above) and lets pause()
 sleep without the starvation rename14 showed.
 
-First attempt at step 4 (2026-11-01, parked behind
-`LINUX_SCHEDULER_LOOP = false` in cpu.rs): init yields like every other
+Parking (2026-11-01). Activations are entered by switching kernel
+contexts (`activation::enter_on_own_stack` builds a context with
+`new_context` and switches to it), and a domain's init has an activation
+of its own like every other entry. `activation::park` lets a system call
+wait on its activation's stack: it saves the CPU's entry state (return
+stack, kernel frame, user return context) and switches to whoever entered
+or last resumed the activation; `activation::resume` switches back, and the
+call restores its entry state, thread pointer and address space itself
+(`park_linux_process` keeps them in locals on its own stack). Init now
+parks in its blocking calls (`run_other_linux_processes`) instead of
+running other processes nested inside them, and the runtime loop
+(`run_linux_runtime_loop`) runs one other process at a time (one with
+SIGKILL pending first, then the deepest running descendant, then the run
+queue: `run_one_other_linux_process`) and resumes init to check its wait
+again, halting when nothing ran. All suites pass with it. Next: other
+processes park instead of yielding with a restart, so a blocked call keeps
+its place instead of being re-issued from user mode (the checkpoint
+timeouts below).
+
+First attempt at step 4 (2026-11-01, superseded by parking above; it was
+parked behind a `LINUX_SCHEDULER_LOOP = false` switch in cpu.rs): init yields like every other
 process (`yield_current_linux_process` no longer refuses pid 1) and
 `run_linux_runtime_loop`, at the runtime entry in `finish_linux_runtime`,
 runs one other process (deepest running descendant, then the run queue,
