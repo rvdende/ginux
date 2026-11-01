@@ -751,18 +751,17 @@ fn map_linux_leaf_in_root(
     let Some(leaf) = linux_leaf_in_root(root, address) else {
         return false;
     };
-    unsafe {
-        if leaf.read() != 0 {
-            return false;
-        }
-        leaf.write(
-            frame
-                | PRESENT
-                | USER
-                | if writable { WRITABLE } else { 0 }
-                | if executable { 0 } else { NO_EXECUTE },
-        );
+    if leaf.read() != 0 {
+        return false;
     }
+    leaf.write(
+        frame
+            | PRESENT
+            | USER
+            | if writable { WRITABLE } else { 0 }
+            | if executable { 0 } else { NO_EXECUTE },
+    );
+
     true
 }
 
@@ -3174,7 +3173,7 @@ pub(crate) fn copy_to_current_linux_user_fast(address: u64, input: &[u8]) -> boo
         let Some(entry) = current_linux_leaf_trusted(page) else {
             return false;
         };
-        let value = unsafe { entry.read() };
+        let value = entry.read();
         if value & (PRESENT | USER | WRITABLE) != PRESENT | USER | WRITABLE {
             return false;
         }
@@ -3236,14 +3235,14 @@ pub(crate) fn protect_current_linux_pages_read_only(address: u64, frames: &[u64]
     {
         return false;
     }
-    let mut leaves = [core::ptr::null_mut(); cpu::LINUX_MMAP_SLOT_COUNT];
+    let mut leaves = [PageEntry::UNSET; cpu::LINUX_MMAP_SLOT_COUNT];
     let mut values = [0_u64; cpu::LINUX_MMAP_SLOT_COUNT];
     for (index, frame) in frames.iter().enumerate() {
         let page = address + index as u64 * PAGE_SIZE as u64;
         let Some(leaf) = current_linux_leaf(page) else {
             return false;
         };
-        let value = unsafe { leaf.read() };
+        let value = leaf.read();
         if value & ADDRESS_MASK != *frame
             || value & (PRESENT | WRITABLE | USER | NO_EXECUTE)
                 != PRESENT | WRITABLE | USER | NO_EXECUTE
@@ -3262,7 +3261,7 @@ pub(crate) fn protect_current_linux_pages_read_only(address: u64, frames: &[u64]
     }
     leaves[..frames.len()]
         .iter()
-        .all(|leaf| unsafe { leaf.read() } & WRITABLE == 0)
+        .all(|leaf| leaf.read() & WRITABLE == 0)
 }
 
 pub(crate) fn replace_current_linux_pages(
@@ -3285,13 +3284,13 @@ pub(crate) fn replace_current_linux_pages(
     {
         return false;
     }
-    let mut leaves = [core::ptr::null_mut(); cpu::LINUX_MMAP_SLOT_COUNT];
+    let mut leaves = [PageEntry::UNSET; cpu::LINUX_MMAP_SLOT_COUNT];
     for index in 0..new_frames.len() {
         let page = address + (index * PAGE_SIZE) as u64;
         let Some(leaf) = current_linux_leaf(page) else {
             return false;
         };
-        let value = unsafe { leaf.read() };
+        let value = leaf.read();
         let valid = old_frames[index].map_or(value == 0, |frame| {
             value & ADDRESS_MASK == frame.address()
                 && value & (PRESENT | WRITABLE | USER | NO_EXECUTE)
@@ -3314,7 +3313,7 @@ pub(crate) fn replace_current_linux_pages(
         .iter()
         .zip(new_frames)
         .all(|(leaf, frame)| {
-            (unsafe { leaf.read() } & (ADDRESS_MASK | PRESENT | WRITABLE | USER | NO_EXECUTE))
+            (leaf.read() & (ADDRESS_MASK | PRESENT | WRITABLE | USER | NO_EXECUTE))
                 == (frame.address() | new_flags)
         })
 }
@@ -3335,14 +3334,14 @@ pub(crate) fn reserve_current_linux_pages(
     {
         return false;
     }
-    let mut leaves = [core::ptr::null_mut(); cpu::LINUX_MMAP_SLOT_COUNT];
+    let mut leaves = [PageEntry::UNSET; cpu::LINUX_MMAP_SLOT_COUNT];
     let mut values = [0_u64; cpu::LINUX_MMAP_SLOT_COUNT];
     for index in 0..old_frames.len() {
         let page = address + (index * PAGE_SIZE) as u64;
         let Some(leaf) = current_linux_leaf(page) else {
             return false;
         };
-        let value = unsafe { leaf.read() };
+        let value = leaf.read();
         let valid = old_frames[index].map_or(value == 0, |frame| {
             value & ADDRESS_MASK == frame.address()
                 && value & (PRESENT | WRITABLE | USER | NO_EXECUTE)
@@ -3363,7 +3362,7 @@ pub(crate) fn reserve_current_linux_pages(
     }
     if leaves[..old_frames.len()]
         .iter()
-        .all(|leaf| unsafe { leaf.read() == 0 })
+        .all(|leaf| leaf.read() == 0)
     {
         return true;
     }
@@ -3389,12 +3388,12 @@ pub(crate) fn map_current_linux_pages(
     {
         return false;
     }
-    let mut leaves = [core::ptr::null_mut(); cpu::LINUX_MMAP_SLOT_COUNT];
+    let mut leaves = [PageEntry::UNSET; cpu::LINUX_MMAP_SLOT_COUNT];
     for (index, stored_leaf) in leaves.iter_mut().enumerate().take(frames.len()) {
         let Some(leaf) = current_linux_leaf(address + (index * PAGE_SIZE) as u64) else {
             return false;
         };
-        if unsafe { leaf.read() } != 0 {
+        if leaf.read() != 0 {
             return false;
         }
         *stored_leaf = leaf;
@@ -3410,7 +3409,7 @@ pub(crate) fn map_current_linux_pages(
     let installed = leaves[..frames.len()]
         .iter()
         .zip(frames)
-        .all(|(leaf, frame)| unsafe {
+        .all(|(leaf, frame)| {
             leaf.read() & (ADDRESS_MASK | PRESENT | WRITABLE | USER | NO_EXECUTE)
                 == frame.address() | flags
         });
@@ -3466,7 +3465,7 @@ pub(crate) fn protect_current_linux_range_read_only(address: u64, length: u64) -
         let Some(leaf) = current_linux_leaf(page) else {
             return false;
         };
-        let value = unsafe { leaf.read() };
+        let value = leaf.read();
         if value & (PRESENT | USER | WRITABLE | NO_EXECUTE)
             != PRESENT | USER | WRITABLE | NO_EXECUTE
             || !memory::frame_addresses_owned_by(
@@ -3482,7 +3481,7 @@ pub(crate) fn protect_current_linux_range_read_only(address: u64, length: u64) -
         let Some(leaf) = current_linux_leaf(page) else {
             return false;
         };
-        let value = unsafe { leaf.read() };
+        let value = leaf.read();
         unsafe {
             leaf.write(value & !WRITABLE);
             asm!("invlpg [{}]", in(reg) page, options(nostack, preserves_flags));
@@ -3518,7 +3517,7 @@ fn current_linux_tls_frames<'main, 'interpreter, 'dependency>(
         if thread_pointer != page.checked_add(layout.thread_pointer_offset as u64)? {
             return None;
         }
-        let entry = unsafe { current_linux_leaf(page)?.read() };
+        let entry = current_linux_leaf(page)?.read();
         if entry & (PRESENT | WRITABLE | USER | NO_EXECUTE)
             != PRESENT | WRITABLE | USER | NO_EXECUTE
         {
@@ -3570,7 +3569,7 @@ pub(crate) fn current_linux_tls_rematerializable(
         crate::serial_write("ginux: TLS page diagnostics:");
         for thread_pointer in thread_pointers {
             let page = thread_pointer & !(PAGE_SIZE as u64 - 1);
-            let entry = unsafe { current_linux_leaf(page).map_or(0, |leaf| leaf.read()) };
+            let entry = current_linux_leaf(page).map_or(0, |leaf| leaf.read());
             crate::serial_write(" ");
             crate::serial_write_u64(thread_pointer);
             crate::serial_write("/");
@@ -3795,7 +3794,7 @@ fn prepare_linux_hierarchy_replacement(
             } else {
                 0
             };
-        let value = unsafe { entry.read() };
+        let value = entry.read();
         let logical_writable = value & (WRITABLE | LINUX_RUNTIME_COW) != 0;
         if value
             & (ADDRESS_MASK
@@ -3810,7 +3809,7 @@ fn prepare_linux_hierarchy_replacement(
         {
             return false;
         }
-        unsafe { entry.write(0) };
+        entry.write(0);
     }
     for mapping in mappings {
         if mapping.address == 0
@@ -3828,7 +3827,7 @@ fn prepare_linux_hierarchy_replacement(
         };
         let shared = old_mapping_at(mapping.address).is_some_and(|old| old.shared);
         let wipeonfork = linux_leaf_in_root(old_hierarchy[0].address(), mapping.address as u64)
-            .is_some_and(|entry| unsafe { entry.read() & LINUX_RUNTIME_WIPEONFORK != 0 });
+            .is_some_and(|entry| entry.read() & LINUX_RUNTIME_WIPEONFORK != 0);
         let flags = PRESENT
             | USER
             | if mapping.writable { WRITABLE } else { 0 }
@@ -3839,13 +3838,13 @@ fn prepare_linux_hierarchy_replacement(
             } else {
                 0
             };
-        unsafe { entry.write(mapping.frame | flags) };
+        entry.write(mapping.frame | flags);
     }
     !force_verification_failure
         && mappings.iter().all(|mapping| {
             let shared = old_mapping_at(mapping.address).is_some_and(|old| old.shared);
             let wipeonfork = linux_leaf_in_root(old_hierarchy[0].address(), mapping.address as u64)
-                .is_some_and(|entry| unsafe { entry.read() & LINUX_RUNTIME_WIPEONFORK != 0 });
+                .is_some_and(|entry| entry.read() & LINUX_RUNTIME_WIPEONFORK != 0);
             let flags = PRESENT
                 | USER
                 | if mapping.writable { WRITABLE } else { 0 }
@@ -3857,7 +3856,7 @@ fn prepare_linux_hierarchy_replacement(
                     0
                 };
             linux_leaf_in_root(new_hierarchy[0].address(), mapping.address as u64).is_some_and(
-                |entry| unsafe {
+                |entry| {
                     entry.read()
                         & (ADDRESS_MASK
                             | PRESENT
@@ -3876,7 +3875,7 @@ fn prepare_linux_hierarchy_replacement(
                     .iter()
                     .any(|replacement| replacement.address == mapping.address)
                     || linux_leaf_in_root(new_hierarchy[0].address(), mapping.address as u64)
-                        .is_some_and(|entry| unsafe { entry.read() == 0 })
+                        .is_some_and(|entry| entry.read() == 0)
             }))
 }
 
@@ -4174,17 +4173,15 @@ fn install_linux_fork_cow(
             return false;
         };
         let expected = mapping.frame.address() | PRESENT | USER;
-        let parent_value = unsafe { parent.read() };
-        let child_value = unsafe { child.read() };
+        let parent_value = parent.read();
+        let child_value = child.read();
         if parent_value & (ADDRESS_MASK | PRESENT | USER) != expected
             || child_value & (ADDRESS_MASK | PRESENT | USER) != expected
         {
             return false;
         }
-        unsafe {
-            parent.write((parent_value & !WRITABLE) | LINUX_RUNTIME_COW);
-            child.write((child_value & !WRITABLE) | LINUX_RUNTIME_COW);
-        }
+        parent.write((parent_value & !WRITABLE) | LINUX_RUNTIME_COW);
+        child.write((child_value & !WRITABLE) | LINUX_RUNTIME_COW);
     }
     // The child maps every private page the parent does. Count its mappings
     // so each page lives until both have released it.
@@ -4755,11 +4752,11 @@ pub(crate) fn copy_to_linux_process(
             crate::serial_write("ginux: console input page-table leaf unavailable\r\n");
             return false;
         };
-        let mut value = unsafe { leaf.read() };
+        let mut value = leaf.read();
         if value & (PRESENT | USER | WRITABLE) == PRESENT | USER
             && crate::linux_process::prepare_live_process_write(pid, page)
         {
-            value = unsafe { leaf.read() };
+            value = leaf.read();
         }
         if value & (PRESENT | USER | WRITABLE) != PRESENT | USER | WRITABLE {
             crate::serial_write("ginux: console input page is not writable, flags: ");
@@ -5003,18 +5000,14 @@ pub(crate) fn verify_linux_process_hierarchy_clone() -> bool {
         }
 
         let child_root = child_hierarchy[0].address();
-        let code = unsafe { linux_leaf_in_root(child_root, USER_TEST_ADDRESS as u64)?.read() };
-        let data = unsafe {
-            linux_leaf_in_root(child_root, (USER_TEST_ADDRESS + PAGE_SIZE) as u64)?.read()
-        };
-        let parent_code =
-            unsafe { linux_leaf_in_root(parent_root, USER_TEST_ADDRESS as u64)?.read() };
-        let parent_data = unsafe {
-            linux_leaf_in_root(parent_root, (USER_TEST_ADDRESS + PAGE_SIZE) as u64)?.read()
-        };
-        let omitted = unsafe {
-            linux_leaf_in_root(child_root, (USER_TEST_ADDRESS + 2 * PAGE_SIZE) as u64)?.read()
-        };
+        let code = linux_leaf_in_root(child_root, USER_TEST_ADDRESS as u64)?.read();
+        let data =
+            { linux_leaf_in_root(child_root, (USER_TEST_ADDRESS + PAGE_SIZE) as u64)?.read() };
+        let parent_code = linux_leaf_in_root(parent_root, USER_TEST_ADDRESS as u64)?.read();
+        let parent_data =
+            { linux_leaf_in_root(parent_root, (USER_TEST_ADDRESS + PAGE_SIZE) as u64)?.read() };
+        let omitted =
+            { linux_leaf_in_root(child_root, (USER_TEST_ADDRESS + 2 * PAGE_SIZE) as u64)?.read() };
         let child_code_address = child_pages[0].direct_map_address()?;
         let parent_code_address = parent_pages[0].direct_map_address()?;
         unsafe { (child_code_address as *mut u8).write(0x7f) };
@@ -5064,8 +5057,8 @@ pub(crate) fn verify_linux_process_hierarchy_clone() -> bool {
         let address = (USER_TEST_ADDRESS + PAGE_SIZE) as u64;
         let parent_leaf = linux_leaf_in_root(parent_hierarchy[0].address(), address)?;
         let child_leaf = linux_leaf_in_root(hierarchy[0].address(), address)?;
-        let parent_value = unsafe { parent_leaf.read() };
-        let child_value = unsafe { child_leaf.read() };
+        let parent_value = parent_leaf.read();
+        let child_value = child_leaf.read();
         let shared_cow = cloned
             && memory::frame_is_shared(parent_pages[0])
             && memory::frame_is_shared(parent_pages[1])
@@ -5098,10 +5091,8 @@ pub(crate) fn verify_linux_process_hierarchy_clone() -> bool {
             && !memory::frame_is_shared(parent_pages[1])
             && memory::frames_owned_by(memory::FrameOwner::KERNEL, &parent_pages[..2])
             && unsafe { (parent_pages[1].direct_map_address()? as *const u8).read() } == 0x32;
-        unsafe {
-            parent_leaf.write(parent_pages[1].address() | PRESENT | WRITABLE | USER | NO_EXECUTE)
-        };
-        let restored = unsafe { parent_leaf.read() }
+        parent_leaf.write(parent_pages[1].address() | PRESENT | WRITABLE | USER | NO_EXECUTE);
+        let restored = parent_leaf.read()
             & (ADDRESS_MASK | PRESENT | WRITABLE | USER | NO_EXECUTE | LINUX_RUNTIME_COW)
             == parent_pages[1].address() | PRESENT | WRITABLE | USER | NO_EXECUTE;
         let released = memory::scrub_and_release_frames(memory::FrameOwner::KERNEL, &cow);
@@ -5128,21 +5119,21 @@ fn verify_current_linux_image_rollback(
         let Some(entry) = current_linux_leaf(mapping.address as u64) else {
             return false;
         };
-        mapping_entries[index] = unsafe { entry.read() };
+        mapping_entries[index] = entry.read();
     }
     for (index, mapping) in old_mappings.iter().enumerate() {
         let Some(entry) = current_linux_leaf(mapping.address as u64) else {
             return false;
         };
-        clear_entries[index] = unsafe { entry.read() };
+        clear_entries[index] = entry.read();
     }
     let rollback_rejected = !replace_current_linux_image_inner(mappings, old_mappings, true);
     let rollback_restored = mappings.iter().enumerate().all(|(index, mapping)| {
         current_linux_leaf(mapping.address as u64)
-            .is_some_and(|entry| unsafe { entry.read() } == mapping_entries[index])
+            .is_some_and(|entry| entry.read() == mapping_entries[index])
     }) && old_mappings.iter().enumerate().all(|(index, mapping)| {
         current_linux_leaf(mapping.address as u64)
-            .is_some_and(|entry| unsafe { entry.read() } == clear_entries[index])
+            .is_some_and(|entry| entry.read() == clear_entries[index])
             && memory::frames_owned_by(memory::FrameOwner::KERNEL, &[mapping.frame])
     });
     let mut stale_mappings =
@@ -5161,11 +5152,11 @@ fn verify_current_linux_image_rollback(
         !replace_current_linux_image_inner(mappings, &stale_mappings[..old_mappings.len()], false)
             && mappings.iter().enumerate().all(|(index, mapping)| {
                 current_linux_leaf(mapping.address as u64)
-                    .is_some_and(|entry| unsafe { entry.read() } == mapping_entries[index])
+                    .is_some_and(|entry| entry.read() == mapping_entries[index])
             })
             && old_mappings.iter().enumerate().all(|(index, mapping)| {
                 current_linux_leaf(mapping.address as u64)
-                    .is_some_and(|entry| unsafe { entry.read() } == clear_entries[index])
+                    .is_some_and(|entry| entry.read() == clear_entries[index])
                     && memory::frames_owned_by(memory::FrameOwner::KERNEL, &[mapping.frame])
             });
     rollback_rejected && rollback_restored && stale_rejected
@@ -5213,13 +5204,13 @@ fn replace_current_linux_image_inner(
     }
     let mut old_mapping_entries = [0_u64; cpu::LINUX_EXEC_MAPPING_LIMIT];
     let mut old_clear_entries = [0_u64; cpu::LINUX_ACTIVE_IMAGE_MAPPING_LIMIT];
-    let mut mapping_entries = [core::ptr::null_mut(); cpu::LINUX_EXEC_MAPPING_LIMIT];
-    let mut clear_entries = [core::ptr::null_mut(); cpu::LINUX_ACTIVE_IMAGE_MAPPING_LIMIT];
+    let mut mapping_entries = [PageEntry::UNSET; cpu::LINUX_EXEC_MAPPING_LIMIT];
+    let mut clear_entries = [PageEntry::UNSET; cpu::LINUX_ACTIVE_IMAGE_MAPPING_LIMIT];
     for (index, mapping) in mappings.iter().enumerate() {
         let Some(entry) = current_linux_leaf(mapping.address as u64) else {
             return false;
         };
-        let value = unsafe { entry.read() };
+        let value = entry.read();
         mapping_entries[index] = entry;
         old_mapping_entries[index] = value;
     }
@@ -5227,7 +5218,7 @@ fn replace_current_linux_image_inner(
         let Some(entry) = current_linux_leaf(mapping.address as u64) else {
             return false;
         };
-        let value = unsafe { entry.read() };
+        let value = entry.read();
         let expected = mapping.frame.address()
             | PRESENT
             | USER
@@ -5261,7 +5252,7 @@ fn replace_current_linux_image_inner(
                 | USER
                 | if mapping.writable { WRITABLE } else { 0 }
                 | if mapping.executable { 0 } else { NO_EXECUTE };
-            current_linux_leaf(mapping.address as u64).is_some_and(|entry| unsafe {
+            current_linux_leaf(mapping.address as u64).is_some_and(|entry| {
                 entry.read() & (ADDRESS_MASK | PRESENT | WRITABLE | USER | NO_EXECUTE)
                     == (mapping.frame | flags)
             })
@@ -5271,7 +5262,7 @@ fn replace_current_linux_image_inner(
                 .iter()
                 .any(|mapping| mapping.address == old_mapping.address)
                 || current_linux_leaf(old_mapping.address as u64)
-                    .is_some_and(|entry| unsafe { entry.read() == 0 })
+                    .is_some_and(|entry| entry.read() == 0)
         });
     if installed {
         return memory::scrub_and_release_frames(
@@ -5427,7 +5418,7 @@ pub(crate) fn current_linux_mapping_matches(
     {
         return false;
     }
-    current_linux_leaf(address).is_some_and(|entry| unsafe {
+    current_linux_leaf(address).is_some_and(|entry| {
         let value = entry.read();
         let cow = value & LINUX_RUNTIME_COW != 0;
         value & (ADDRESS_MASK | PRESENT | USER | NO_EXECUTE)
@@ -5439,7 +5430,7 @@ pub(crate) fn current_linux_mapping_matches(
 
 pub(crate) fn current_linux_mapping_frame_address(address: u64) -> Option<u64> {
     let entry = current_linux_leaf(address)?;
-    let value = unsafe { entry.read() };
+    let value = entry.read();
     (value & (PRESENT | USER) == PRESENT | USER).then_some(value & ADDRESS_MASK)
 }
 
@@ -5449,7 +5440,7 @@ pub(crate) fn current_linux_active_mapping(address: u64) -> Option<cpu::LinuxAct
         return None;
     }
     let entry = current_linux_leaf(page)?;
-    let value = unsafe { entry.read() };
+    let value = entry.read();
     if value & (PRESENT | USER) != PRESENT | USER {
         return None;
     }
@@ -5488,7 +5479,7 @@ pub(crate) fn linux_cow_page_in_root(
         return None;
     }
     let entry = linux_leaf_in_root(root.address(), address)?;
-    let value = unsafe { entry.read() };
+    let value = entry.read();
     if value & (PRESENT | USER | WRITABLE | LINUX_RUNTIME_COW) != PRESENT | USER | LINUX_RUNTIME_COW
     {
         return None;
@@ -5554,7 +5545,7 @@ pub(crate) fn replace_linux_cow_page_in_root(
     let Some(entry) = linux_leaf_in_root(root.address(), address) else {
         return false;
     };
-    let value = unsafe { entry.read() };
+    let value = entry.read();
     if value & (ADDRESS_MASK | PRESENT | USER | WRITABLE | LINUX_RUNTIME_COW)
         != expected.address() | PRESENT | USER | LINUX_RUNTIME_COW
     {
@@ -5597,7 +5588,7 @@ fn promote_linux_cow_page_in_root_address(
     let Some(entry) = linux_leaf_in_root(root, address) else {
         return false;
     };
-    let value = unsafe { entry.read() };
+    let value = entry.read();
     if value & (ADDRESS_MASK | PRESENT | USER | WRITABLE | LINUX_RUNTIME_COW)
         != expected.address() | PRESENT | USER | LINUX_RUNTIME_COW
     {
@@ -5619,7 +5610,7 @@ pub(crate) fn current_linux_address_executable(address: u64) -> bool {
         return false;
     }
     current_linux_leaf_trusted(address & !(PAGE_SIZE as u64 - 1)).is_some_and(|entry| {
-        let value = unsafe { entry.read() };
+        let value = entry.read();
         value & (PRESENT | USER | NO_EXECUTE) == PRESENT | USER
     })
 }
@@ -5627,7 +5618,7 @@ pub(crate) fn current_linux_address_executable(address: u64) -> bool {
 pub(crate) fn current_linux_page_absent(address: u64) -> bool {
     address < 1 << 47
         && address.is_multiple_of(PAGE_SIZE as u64)
-        && current_linux_leaf(address).is_some_and(|entry| unsafe { entry.read() == 0 })
+        && current_linux_leaf(address).is_some_and(|entry| entry.read() == 0)
 }
 
 pub(crate) fn current_linux_range_mapped(address: u64, length: usize, writable: bool) -> bool {
@@ -5642,7 +5633,7 @@ pub(crate) fn current_linux_range_mapped(address: u64, length: usize, writable: 
     let mut page = first;
     loop {
         let valid = current_linux_leaf(page).is_some_and(|entry| {
-            let value = unsafe { entry.read() };
+            let value = entry.read();
             value & (PRESENT | USER) == PRESENT | USER && (!writable || value & WRITABLE != 0)
         });
         if !valid {
@@ -5786,7 +5777,7 @@ pub(crate) fn zero_current_linux_page(address: u64, frame: u64) -> bool {
     let Some(entry) = current_linux_leaf(address) else {
         return false;
     };
-    let value = unsafe { entry.read() };
+    let value = entry.read();
     if value & ADDRESS_MASK != frame
         || value & (PRESENT | USER | NO_EXECUTE) != PRESENT | USER | NO_EXECUTE
     {
@@ -5795,11 +5786,57 @@ pub(crate) fn zero_current_linux_page(address: u64, frame: u64) -> bool {
     unsafe { zero_frame(frame).is_some() }
 }
 
-fn current_linux_leaf(address: u64) -> Option<*mut u64> {
+/// A page-table entry the kernel reads and writes in place. Only the table
+/// walks below make one, from an entry of a page-table frame they reached
+/// through the direct map. Page-table frames are freed only when their
+/// address space is retired, after the walks of it are done.
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct PageEntry(*mut u64);
+
+impl PageEntry {
+    /// A placeholder for an array slot not yet filled: it reads as 0 and
+    /// ignores writes.
+    const UNSET: Self = Self(core::ptr::null_mut());
+
+    /// # Safety
+    ///
+    /// `entry` must point at an entry of a page-table frame, reached through
+    /// the direct map, that stays a page table while the value is used.
+    unsafe fn new(entry: *mut u64) -> Self {
+        Self(entry)
+    }
+
+    fn read(self) -> u64 {
+        if self.0.is_null() {
+            return 0;
+        }
+        // SAFETY: new's contract keeps the entry mapped and part of a table.
+        unsafe { self.0.read() }
+    }
+
+    /// Reads the entry with a volatile load, for a check the compiler must
+    /// not fold into an earlier read.
+    fn read_volatile(self) -> u64 {
+        if self.0.is_null() {
+            return 0;
+        }
+        // SAFETY: as for read.
+        unsafe { self.0.read_volatile() }
+    }
+
+    fn write(self, value: u64) {
+        if !self.0.is_null() {
+            // SAFETY: as for read.
+            unsafe { self.0.write(value) }
+        }
+    }
+}
+
+fn current_linux_leaf(address: u64) -> Option<PageEntry> {
     linux_leaf_in_root(current_root(), address)
 }
 
-fn current_linux_leaf_trusted(address: u64) -> Option<*mut u64> {
+fn current_linux_leaf_trusted(address: u64) -> Option<PageEntry> {
     let indexes = [
         ((address >> 39) & 0x1ff) as usize,
         ((address >> 30) & 0x1ff) as usize,
@@ -5810,7 +5847,9 @@ fn current_linux_leaf_trusted(address: u64) -> Option<*mut u64> {
     for (level, index) in indexes.into_iter().enumerate() {
         let entries = mapped_frame::<u64>(table & ADDRESS_MASK)?;
         if level == 3 {
-            return Some(unsafe { entries.add(index) });
+            // SAFETY: the walk reached this table through present user
+            // entries of the address space's own tables.
+            return Some(unsafe { PageEntry::new(entries.add(index)) });
         }
         let entry = unsafe { entries.add(index).read() };
         if entry & (PRESENT | USER) != PRESENT | USER
@@ -5880,7 +5919,7 @@ fn linux_runtime_page_from_value(value: u64) -> LinuxRuntimePage {
     }
 }
 
-fn ensure_current_linux_leaf(address: u64) -> Option<*mut u64> {
+fn ensure_current_linux_leaf(address: u64) -> Option<PageEntry> {
     if address >= 1 << 47 || !address.is_multiple_of(PAGE_SIZE as u64) {
         return None;
     }
@@ -5891,22 +5930,24 @@ fn ensure_current_linux_leaf(address: u64) -> Option<*mut u64> {
         ((address >> 12) & 0x1ff) as usize,
     ];
     let mut table = current_root();
-    let mut created_entries = [core::ptr::null_mut(); 3];
+    let mut created_entries = [None; 3];
     let mut created_frames = [memory::FrameLease::EMPTY; 3];
     let mut created = 0;
     for (level, index) in indexes.into_iter().enumerate() {
         let entries = mapped_frame::<u64>(table & ADDRESS_MASK)?;
-        let entry = unsafe { entries.add(index) };
+        // SAFETY: the walk starts at the current root and follows present
+        // user entries or tables it just made.
+        let entry = unsafe { PageEntry::new(entries.add(index)) };
         if level == 3 {
             return Some(entry);
         }
-        let value = unsafe { entry.read() };
+        let value = entry.read();
         if value == 0 {
             let Some([frame]) = memory::allocate_frames::<1>(memory::FrameOwner::KERNEL) else {
                 break;
             };
-            unsafe { entry.write(frame.address() | PRESENT | WRITABLE | USER) };
-            created_entries[created] = entry;
+            entry.write(frame.address() | PRESENT | WRITABLE | USER);
+            created_entries[created] = Some(entry);
             created_frames[created] = frame;
             created += 1;
             table = frame.address();
@@ -5917,7 +5958,9 @@ fn ensure_current_linux_leaf(address: u64) -> Option<*mut u64> {
         }
     }
     for index in (0..created).rev() {
-        unsafe { created_entries[index].write(0) };
+        if let Some(entry) = created_entries[index] {
+            entry.write(0);
+        }
         let _ = memory::scrub_and_release_frames(
             memory::FrameOwner::KERNEL,
             core::slice::from_ref(&created_frames[index]),
@@ -5928,7 +5971,7 @@ fn ensure_current_linux_leaf(address: u64) -> Option<*mut u64> {
 
 pub(crate) fn current_linux_runtime_page(address: u64) -> LinuxRuntimePage {
     current_linux_leaf(address).map_or(LinuxRuntimePage::EMPTY, |entry| {
-        linux_runtime_page_from_value(unsafe { entry.read() })
+        linux_runtime_page_from_value(entry.read())
     })
 }
 
@@ -5948,7 +5991,7 @@ pub(crate) fn refresh_current_linux_runtime_translation(
     // CPU materializes the page, so inspect the authoritative leaf before
     // retrying the fault locally. Never turn this recovery into a permission
     // bypass: the leaf must already grant the exact access that faulted.
-    let value = unsafe { entry.read_volatile() };
+    let value = entry.read_volatile();
     let frame = value & ADDRESS_MASK;
     if !linux_runtime_leaf_grants(value, write, execute)
         || memory::live_frame_lease(memory::FrameOwner::KERNEL, frame).is_none()
@@ -6055,7 +6098,7 @@ pub(crate) fn install_current_linux_runtime_page(
         return None;
     }
     let entry = ensure_current_linux_leaf(address)?;
-    let old_value = unsafe { entry.read() };
+    let old_value = entry.read();
     let old = linux_runtime_page_from_value(old_value);
     if old.occupied && (!replace || old.sealed) {
         return None;
@@ -6065,7 +6108,7 @@ pub(crate) fn install_current_linux_runtime_page(
         | if protection & 2 != 0 { WRITABLE } else { 0 }
         | if protection & 4 != 0 { 0 } else { NO_EXECUTE }
         | if file { LINUX_RUNTIME_FILE } else { 0 };
-    unsafe { entry.write(frame.address() | flags) };
+    entry.write(frame.address() | flags);
     if !smp::invalidate_runtime_translation(address) {
         unsafe {
             entry.write(old_value);
@@ -6073,7 +6116,7 @@ pub(crate) fn install_current_linux_runtime_page(
         }
         return None;
     }
-    (unsafe { entry.read() } & (ADDRESS_MASK | PRESENT | WRITABLE | USER | NO_EXECUTE)
+    (entry.read() & (ADDRESS_MASK | PRESENT | WRITABLE | USER | NO_EXECUTE)
         == frame.address()
             | PRESENT
             | USER
@@ -6093,12 +6136,12 @@ pub(crate) fn install_current_linux_shared_page(
     let Some(entry) = current_linux_leaf(address) else {
         return false;
     };
-    let value = unsafe { entry.read() };
+    let value = entry.read();
     unsafe {
         entry.write(value | LINUX_RUNTIME_SHARED);
         asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
     }
-    linux_runtime_page_from_value(unsafe { entry.read() }).shared
+    linux_runtime_page_from_value(entry.read()).shared
 }
 
 /// Maps a page of device memory, such as the framebuffer, that the frame
@@ -6115,7 +6158,7 @@ pub(crate) fn install_current_linux_device_page(
     let Some(entry) = ensure_current_linux_leaf(address) else {
         return false;
     };
-    if linux_runtime_page_from_value(unsafe { entry.read() }).occupied {
+    if linux_runtime_page_from_value(entry.read()).occupied {
         return false;
     }
     let value = physical
@@ -6136,7 +6179,7 @@ pub(crate) fn mark_current_linux_runtime_page_secret(address: u64) -> bool {
     let Some(entry) = current_linux_leaf(address) else {
         return false;
     };
-    let value = unsafe { entry.read() };
+    let value = entry.read();
     if !linux_runtime_page_from_value(value).occupied {
         return false;
     }
@@ -6144,14 +6187,14 @@ pub(crate) fn mark_current_linux_runtime_page_secret(address: u64) -> bool {
         entry.write(value | LINUX_RUNTIME_SECRET);
         asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
     }
-    linux_runtime_page_from_value(unsafe { entry.read() }).secret
+    linux_runtime_page_from_value(entry.read()).secret
 }
 
 pub(crate) fn set_current_linux_runtime_page_dontfork(address: u64, enabled: bool) -> bool {
     let Some(entry) = current_linux_leaf(address) else {
         return false;
     };
-    let value = unsafe { entry.read() };
+    let value = entry.read();
     if !linux_runtime_page_from_value(value).occupied {
         return false;
     }
@@ -6160,8 +6203,8 @@ pub(crate) fn set_current_linux_runtime_page_dontfork(address: u64, enabled: boo
     } else {
         value & !LINUX_RUNTIME_DONTFORK
     };
-    unsafe { entry.write(replacement) };
-    linux_runtime_page_from_value(unsafe { entry.read() }).dontfork == enabled
+    entry.write(replacement);
+    linux_runtime_page_from_value(entry.read()).dontfork == enabled
 }
 
 pub(crate) fn linux_mapping_wipe_on_fork(root: memory::FrameLease, address: usize) -> Option<bool> {
@@ -6172,7 +6215,7 @@ pub(crate) fn linux_mapping_wipe_on_fork(root: memory::FrameLease, address: usiz
         return None;
     }
     linux_leaf_in_root(root.address(), address as u64).and_then(|entry| {
-        let value = unsafe { entry.read() };
+        let value = entry.read();
         let state = linux_runtime_page_from_value(value);
         state.occupied.then_some(state.wipeonfork)
     })
@@ -6192,7 +6235,7 @@ pub(crate) fn set_linux_mapping_wipe_on_fork(
     let Some(entry) = linux_leaf_in_root(root.address(), address as u64) else {
         return false;
     };
-    let value = unsafe { entry.read() };
+    let value = entry.read();
     if !linux_runtime_page_from_value(value).occupied {
         return false;
     }
@@ -6201,7 +6244,7 @@ pub(crate) fn set_linux_mapping_wipe_on_fork(
     } else {
         value & !LINUX_RUNTIME_WIPEONFORK
     };
-    unsafe { entry.write(replacement) };
+    entry.write(replacement);
     linux_mapping_wipe_on_fork(root, address) == Some(enabled)
 }
 
@@ -6229,7 +6272,7 @@ pub(crate) fn reserve_current_linux_runtime_page(
         return None;
     }
     let entry = ensure_current_linux_leaf(address)?;
-    let old_value = unsafe { entry.read() };
+    let old_value = entry.read();
     let old = linux_runtime_page_from_value(old_value);
     if old.occupied && (!replace || old.sealed) {
         return None;
@@ -6244,7 +6287,7 @@ pub(crate) fn reserve_current_linux_runtime_page(
         | if protection & 2 != 0 { WRITABLE } else { 0 }
         | if protection & 4 != 0 { 0 } else { NO_EXECUTE }
         | if file { LINUX_RUNTIME_FILE } else { 0 };
-    unsafe { entry.write(value) };
+    entry.write(value);
     if !smp::invalidate_runtime_translation(address) {
         unsafe {
             entry.write(old_value);
@@ -6252,17 +6295,17 @@ pub(crate) fn reserve_current_linux_runtime_page(
         }
         return None;
     }
-    (unsafe { entry.read() } == value).then_some(old.frame)
+    (entry.read() == value).then_some(old.frame)
 }
 
 pub(crate) fn remove_current_linux_runtime_page(address: u64) -> LinuxRuntimePage {
     let Some(entry) = current_linux_leaf(address) else {
         return LinuxRuntimePage::EMPTY;
     };
-    let old = linux_runtime_page_from_value(unsafe { entry.read() });
+    let old = linux_runtime_page_from_value(entry.read());
     if old.occupied {
-        let old_value = unsafe { entry.read() };
-        unsafe { entry.write(0) };
+        let old_value = entry.read();
+        entry.write(0);
         if !smp::invalidate_runtime_translation(address) {
             unsafe {
                 entry.write(old_value);
@@ -6350,7 +6393,7 @@ pub(crate) fn protect_current_linux_runtime_page(address: u64, protection: u8) -
     let Some(entry) = current_linux_leaf(address) else {
         return false;
     };
-    let old_value = unsafe { entry.read() };
+    let old_value = entry.read();
     let old = linux_runtime_page_from_value(old_value);
     if !old.occupied || old.sealed {
         return false;
@@ -6420,7 +6463,7 @@ pub(crate) fn protect_current_linux_runtime_page(address: u64, protection: u8) -
                 }
         }
     };
-    unsafe { entry.write(value) };
+    entry.write(value);
     if !smp::invalidate_runtime_translation(address) {
         unsafe {
             entry.write(old_value);
@@ -6428,7 +6471,7 @@ pub(crate) fn protect_current_linux_runtime_page(address: u64, protection: u8) -
         }
         return false;
     }
-    linux_runtime_page_from_value(unsafe { entry.read() }).protection == protection
+    linux_runtime_page_from_value(entry.read()).protection == protection
 }
 
 pub(crate) fn replace_current_linux_runtime_page(
@@ -6442,7 +6485,7 @@ pub(crate) fn replace_current_linux_runtime_page(
         return None;
     }
     let entry = current_linux_leaf(address)?;
-    let old = linux_runtime_page_from_value(unsafe { entry.read() });
+    let old = linux_runtime_page_from_value(entry.read());
     let old_frame = old.frame?;
     if old.sealed || old.shared || old.secret {
         return None;
@@ -6463,8 +6506,8 @@ pub(crate) fn replace_current_linux_runtime_page(
         } else {
             0
         };
-    let old_value = unsafe { entry.read() };
-    unsafe { entry.write(value) };
+    let old_value = entry.read();
+    entry.write(value);
     if !smp::invalidate_runtime_translation(address) {
         unsafe {
             entry.write(old_value);
@@ -6472,7 +6515,7 @@ pub(crate) fn replace_current_linux_runtime_page(
         }
         return None;
     }
-    let current = linux_runtime_page_from_value(unsafe { entry.read() });
+    let current = linux_runtime_page_from_value(entry.read());
     (current.frame == Some(frame)
         && current.protection == protection
         && current.file == old.file
@@ -6485,7 +6528,7 @@ pub(crate) fn seal_current_linux_runtime_page(address: u64) -> bool {
     let Some(entry) = current_linux_leaf(address) else {
         return false;
     };
-    let value = unsafe { entry.read() };
+    let value = entry.read();
     if !linux_runtime_page_from_value(value).occupied {
         return false;
     }
@@ -6493,7 +6536,7 @@ pub(crate) fn seal_current_linux_runtime_page(address: u64) -> bool {
         entry.write(value | LINUX_RUNTIME_SEALED);
         asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
     }
-    linux_runtime_page_from_value(unsafe { entry.read() }).sealed
+    linux_runtime_page_from_value(entry.read()).sealed
 }
 
 pub(crate) fn materialize_current_linux_runtime_page(
@@ -6510,7 +6553,7 @@ pub(crate) fn materialize_current_linux_runtime_page(
     let Some(entry) = current_linux_leaf(address) else {
         return false;
     };
-    let old = linux_runtime_page_from_value(unsafe { entry.read() });
+    let old = linux_runtime_page_from_value(entry.read());
     if !old.occupied || old.frame.is_some() || old.protection != protection || old.file != file {
         return false;
     }
@@ -6533,8 +6576,8 @@ pub(crate) fn materialize_current_linux_runtime_page(
         } else {
             0
         };
-    let old_value = unsafe { entry.read() };
-    unsafe { entry.write(value) };
+    let old_value = entry.read();
+    entry.write(value);
     if !smp::invalidate_runtime_translation(address) {
         unsafe {
             entry.write(old_value);
@@ -6542,7 +6585,7 @@ pub(crate) fn materialize_current_linux_runtime_page(
         }
         return false;
     }
-    let current = linux_runtime_page_from_value(unsafe { entry.read() });
+    let current = linux_runtime_page_from_value(entry.read());
     current.frame == Some(frame)
         && current.protection == protection
         && current.file == file
@@ -6804,7 +6847,7 @@ pub(crate) fn retire_linux_child_address_space(root: memory::FrameLease) -> bool
     memory::scrub_and_release_frames(memory::FrameOwner::KERNEL, core::slice::from_ref(&root))
 }
 
-fn linux_leaf_in_root(root: u64, address: u64) -> Option<*mut u64> {
+fn linux_leaf_in_root(root: u64, address: u64) -> Option<PageEntry> {
     let indexes = [
         ((address >> 39) & 0x1ff) as usize,
         ((address >> 30) & 0x1ff) as usize,
@@ -6818,7 +6861,9 @@ fn linux_leaf_in_root(root: u64, address: u64) -> Option<*mut u64> {
         }
         let entries = mapped_frame::<u64>(table & ADDRESS_MASK)?;
         if level == 3 {
-            return Some(unsafe { entries.add(index) });
+            // SAFETY: the walk reached this table through present user
+            // entries of the address space's own tables.
+            return Some(unsafe { PageEntry::new(entries.add(index)) });
         }
         let entry = unsafe { entries.add(index).read() };
         if entry & (PRESENT | USER) != PRESENT | USER
