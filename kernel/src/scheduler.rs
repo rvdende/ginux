@@ -1,7 +1,11 @@
+use alloc::vec::Vec;
+
 use crate::domain;
 use crate::owned_state::OwnedState;
 
-const MAX_THREADS: usize = 64;
+/// Threads one scheduler holds at most: their slots are 16-bit. The table
+/// grows to it as threads are created.
+const THREAD_LIMIT: usize = u16::MAX as usize;
 const PROCESS_CPU_LIMIT: usize = 4;
 const PROCESS_WORKSPACE_LIMIT: usize = crate::control_abi::DOMAIN_LIMIT + 1;
 pub(crate) const IPC_PEER_CLOSED: u64 = u64::MAX - 4;
@@ -58,6 +62,8 @@ struct Thread {
     wait: Option<WaitReason>,
     context: UserContext,
     priority: i8,
+    /// The CPUs the thread may run on, one bit each.
+    affinity: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -642,7 +648,6 @@ impl ScheduledProcess {
 pub(crate) struct ProcessScheduler {
     scheduler: Scheduler,
     current_by_cpu: [Option<ThreadId>; PROCESS_CPU_LIMIT],
-    affinities: [u64; MAX_THREADS],
     dispatches: [u64; PROCESS_CPU_LIMIT],
 }
 
@@ -653,8 +658,10 @@ struct Scheduled {
 }
 
 struct Scheduler {
-    threads: [Option<Thread>; MAX_THREADS],
-    generations: [u32; MAX_THREADS],
+    threads: Vec<Option<Thread>>,
+    /// The generation of the last thread in each slot, so a stale id never
+    /// names a slot's next thread.
+    generations: Vec<u32>,
     current: Option<ThreadId>,
     next_slot: usize,
 }
@@ -692,8 +699,8 @@ pub(crate) enum RuntimeAction {
 impl Scheduler {
     const fn new() -> Self {
         Self {
-            threads: [None; MAX_THREADS],
-            generations: [0; MAX_THREADS],
+            threads: Vec::new(),
+            generations: Vec::new(),
             current: None,
             next_slot: 0,
         }
@@ -703,7 +710,17 @@ impl Scheduler {
         if domain == 0 || !context.is_valid() {
             return None;
         }
-        let slot = self.threads.iter().position(Option::is_none)?;
+        let slot = match self.threads.iter().position(Option::is_none) {
+            Some(slot) => slot,
+            None if self.threads.len() < THREAD_LIMIT => {
+                self.threads.try_reserve(1).ok()?;
+                self.generations.try_reserve(1).ok()?;
+                self.threads.push(None);
+                self.generations.push(0);
+                self.threads.len() - 1
+            }
+            None => return None,
+        };
         let generation = self.generations[slot].checked_add(1)?;
         let id = ThreadId {
             slot: slot as u16,
@@ -718,6 +735,7 @@ impl Scheduler {
             wait: None,
             context,
             priority: 0,
+            affinity: u64::MAX,
         });
         Some(id)
     }
@@ -747,8 +765,9 @@ impl Scheduler {
             })
             .map(|thread| thread.priority)
             .max()?;
-        for offset in 0..MAX_THREADS {
-            let slot = (self.next_slot + offset) % MAX_THREADS;
+        let slots = self.threads.len();
+        for offset in 0..slots {
+            let slot = (self.next_slot + offset) % slots;
             let Some(mut thread) = self.threads[slot] else {
                 continue;
             };
@@ -759,7 +778,7 @@ impl Scheduler {
                 thread.state = State::Running;
                 self.threads[slot] = Some(thread);
                 self.current = Some(thread.id);
-                self.next_slot = (slot + 1) % MAX_THREADS;
+                self.next_slot = (slot + 1) % slots;
                 return Some(Scheduled {
                     id: thread.id,
                     context: thread.context,
@@ -1022,7 +1041,6 @@ impl ProcessScheduler {
         Self {
             scheduler: Scheduler::new(),
             current_by_cpu: [None; PROCESS_CPU_LIMIT],
-            affinities: [u64::MAX; MAX_THREADS],
             dispatches: [0; PROCESS_CPU_LIMIT],
         }
     }
@@ -1060,7 +1078,7 @@ impl ProcessScheduler {
                 })
                 .count();
             thread.state == State::Ready
-                && scheduler.affinities[usize::from(thread.id.slot)] & (1_u64 << cpu) != 0
+                && thread.affinity & (1_u64 << cpu) != 0
                 && domain_running < domain_limit
         };
         let service_class = self
@@ -1079,8 +1097,9 @@ impl ProcessScheduler {
             .filter(|thread| eligible(thread, self) && class_for(thread.domain) == service_class)
             .map(|thread| thread.priority)
             .max()?;
-        for offset in 0..MAX_THREADS {
-            let slot = (self.scheduler.next_slot + offset) % MAX_THREADS;
+        let slots = self.scheduler.threads.len();
+        for offset in 0..slots {
+            let slot = (self.scheduler.next_slot + offset) % slots;
             let Some(mut thread) = self.scheduler.threads[slot] else {
                 continue;
             };
@@ -1091,7 +1110,7 @@ impl ProcessScheduler {
                 thread.state = State::Running;
                 self.scheduler.threads[slot] = Some(thread);
                 self.current_by_cpu[cpu] = Some(thread.id);
-                self.scheduler.next_slot = (slot + 1) % MAX_THREADS;
+                self.scheduler.next_slot = (slot + 1) % slots;
                 self.dispatches[cpu] = self.dispatches[cpu].saturating_add(1);
                 return Some(ScheduledProcess {
                     handle: ProcessThreadHandle(thread.id),
@@ -1122,7 +1141,6 @@ impl ProcessScheduler {
             .scheduler
             .create(domain, context.0)
             .map(ProcessThreadHandle)?;
-        self.affinities[usize::from(handle.0.slot)] = u64::MAX;
         Some(handle)
     }
 
@@ -1168,9 +1186,7 @@ impl ProcessScheduler {
         }
         let target_context = {
             let target_thread = self.scheduler.thread(target.0)?;
-            if target_thread.state != State::Ready
-                || self.affinities[usize::from(target.0.slot)] & (1_u64 << cpu) == 0
-            {
+            if target_thread.state != State::Ready || target_thread.affinity & (1_u64 << cpu) == 0 {
                 return None;
             }
             target_thread.context
@@ -1201,7 +1217,6 @@ impl ProcessScheduler {
             return false;
         }
         self.scheduler.threads[usize::from(handle.0.slot)] = None;
-        self.affinities[usize::from(handle.0.slot)] = u64::MAX;
         for current in &mut self.current_by_cpu {
             if *current == Some(handle.0) {
                 *current = None;
@@ -1214,15 +1229,14 @@ impl ProcessScheduler {
         self.scheduler.threads.fill(None);
         self.scheduler.current = None;
         self.current_by_cpu.fill(None);
-        self.affinities.fill(u64::MAX);
         self.dispatches.fill(0);
     }
 
     pub(crate) fn set_affinity(&mut self, handle: ProcessThreadHandle, mask: u64) -> bool {
-        if mask == 0 || self.scheduler.thread(handle.0).is_none() {
+        let Some(thread) = self.scheduler.thread_mut(handle.0).filter(|_| mask != 0) else {
             return false;
-        }
-        self.affinities[usize::from(handle.0.slot)] = mask;
+        };
+        thread.affinity = mask;
         true
     }
 
@@ -1247,14 +1261,11 @@ pub(crate) fn acquire_process_scheduler_workspace() -> Option<&'static mut Proce
     // temporary.
     unsafe {
         let workspace = claim.as_mut_ptr();
-        for index in 0..MAX_THREADS {
-            core::ptr::addr_of_mut!((*workspace).scheduler.threads[index]).write(None);
-            core::ptr::addr_of_mut!((*workspace).scheduler.generations[index]).write(0);
-        }
+        core::ptr::addr_of_mut!((*workspace).scheduler.threads).write(Vec::new());
+        core::ptr::addr_of_mut!((*workspace).scheduler.generations).write(Vec::new());
         core::ptr::addr_of_mut!((*workspace).scheduler.current).write(None);
         core::ptr::addr_of_mut!((*workspace).scheduler.next_slot).write(0);
         core::ptr::addr_of_mut!((*workspace).current_by_cpu).write([None; PROCESS_CPU_LIMIT]);
-        core::ptr::addr_of_mut!((*workspace).affinities).write([u64::MAX; MAX_THREADS]);
         core::ptr::addr_of_mut!((*workspace).dispatches).write([0; PROCESS_CPU_LIMIT]);
     }
     claim.publish_initialized();

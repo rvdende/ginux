@@ -12,7 +12,10 @@ use crate::{address_space, arch::x86_64::cpu, control_abi, linux_user, memory, s
 pub(crate) const PROCESS_LIMIT: usize = 256;
 /// Processes with an address space at once: a zombie releases its runtime
 /// slot when it exits, so many unreaped zombies need table slots only.
-pub(crate) const PROCESS_RUNTIME_LIMIT: usize = 64;
+/// Processes of one domain that can exist at once (as many as its process
+/// table holds): each takes a runtime slot, whose saved state and address-
+/// space lists are allocated when the slot is first used.
+pub(crate) const PROCESS_RUNTIME_LIMIT: usize = PROCESS_LIMIT;
 const PROCESS_HIERARCHY_LIMIT: usize = cpu::LINUX_PROCESS_HIERARCHY_LIMIT;
 const PROCESS_PRIVATE_PAGE_LIMIT: usize = cpu::LINUX_PROCESS_MAPPING_LIMIT;
 const PROCESS_PRIVATE_COPY_LIMIT: usize = cpu::LINUX_PROCESS_MAPPING_LIMIT;
@@ -263,10 +266,35 @@ struct ProcessAddressSpace {
     stale: bool,
 }
 
-// Not Copy: an instance is several megabytes and lives only in an allocated extent.
+/// A process's page-table frames and mapped pages as its last snapshot found
+/// them, each list as long as the process needs.
+#[derive(Default)]
 struct ProcessAddressSpaceStorage {
-    hierarchy: [memory::FrameLease; PROCESS_HIERARCHY_LIMIT],
-    mappings: [cpu::LinuxActiveImageMapping; PROCESS_PRIVATE_PAGE_LIMIT],
+    hierarchy: Vec<memory::FrameLease>,
+    mappings: Vec<cpu::LinuxActiveImageMapping>,
+}
+
+impl ProcessAddressSpaceStorage {
+    fn store(
+        &mut self,
+        hierarchy: &[memory::FrameLease],
+        mappings: &[cpu::LinuxActiveImageMapping],
+    ) -> Option<()> {
+        replace_list(&mut self.hierarchy, hierarchy)?;
+        replace_list(&mut self.mappings, mappings)
+    }
+}
+
+/// Makes `list` a copy of `items`, reusing its buffer, and gives back memory
+/// when the list has shrunk to a fraction of it.
+fn replace_list<T: Copy>(list: &mut Vec<T>, items: &[T]) -> Option<()> {
+    list.clear();
+    list.try_reserve_exact(items.len()).ok()?;
+    list.extend_from_slice(items);
+    if list.capacity() > items.len().saturating_mul(4).max(64) {
+        list.shrink_to(items.len());
+    }
+    Some(())
 }
 
 /// Returns the storage for `storage_slot` of the current process instance,
@@ -281,15 +309,10 @@ fn address_space_storage(storage_slot: usize) -> Option<&'static mut ProcessAddr
     let table = unsafe { &mut *PROCESS_ADDRESS_SPACE_STORAGE.0.get() };
     let entry = table.get_mut(index)?;
     if entry.is_null() {
-        let length = size_of::<ProcessAddressSpaceStorage>();
-        let pages = length.div_ceil(PAGE_SIZE);
-        let (first, _) = memory::allocate_contiguous_extent(memory::FrameOwner::KERNEL, pages)?;
-        // The extent is zeroed, and every empty entry is all zeros.
-        *entry = crate::arch::x86_64::paging::direct_map_range_address(first.address(), length)?
-            as *mut ProcessAddressSpaceStorage;
+        *entry = alloc::boxed::Box::into_raw(alloc::boxed::Box::default());
     }
-    // SAFETY: the pointer addresses a live, kernel-owned extent sized for
-    // the storage, and callers do not hold two references to one slot.
+    // SAFETY: the pointer comes from a Box that is never freed, and callers
+    // do not hold two references to one slot.
     Some(unsafe { &mut **entry })
 }
 
@@ -324,12 +347,7 @@ impl ProcessAddressSpace {
         {
             return None;
         }
-        let storage = address_space_storage(storage_slot)?;
-        // The published counts bound every reader. Overwrite only the live
-        // prefixes instead of clearing the full elastic capacity on every
-        // registry refresh.
-        storage.hierarchy[..hierarchy.len()].copy_from_slice(hierarchy);
-        storage.mappings[..mappings.len()].copy_from_slice(mappings);
+        address_space_storage(storage_slot)?.store(hierarchy, mappings)?;
         Some(Self {
             storage_slot: storage_slot as u8,
             hierarchy_count: u32::try_from(hierarchy.len()).ok()?,
@@ -350,10 +368,7 @@ impl ProcessAddressSpace {
         {
             return None;
         }
-        let storage = address_space_storage(storage_slot)?;
-        // Stale tail entries are unreachable because access is count-bounded.
-        storage.hierarchy[..hierarchy.len()].copy_from_slice(hierarchy);
-        storage.mappings[..mappings.len()].copy_from_slice(mappings);
+        address_space_storage(storage_slot)?.store(hierarchy, mappings)?;
         Some(Self {
             storage_slot: storage_slot as u8,
             hierarchy_count: u32::try_from(hierarchy.len()).ok()?,
@@ -369,16 +384,28 @@ impl ProcessAddressSpace {
             .expect("process address-space storage is allocated")
     }
 
+    // A copy of the address space made before its lists were last stored
+    // can count more entries than they hold; it then sees none (and fails
+    // validation) instead of reading past them.
     fn hierarchy(&self) -> &[memory::FrameLease] {
-        &self.storage().hierarchy[..self.hierarchy_count as usize]
+        self.storage()
+            .hierarchy
+            .get(..self.hierarchy_count as usize)
+            .unwrap_or(&[])
     }
 
     fn root(&self) -> memory::FrameLease {
-        self.storage().hierarchy[0]
+        self.hierarchy()
+            .first()
+            .copied()
+            .unwrap_or(memory::FrameLease::EMPTY)
     }
 
     fn mappings(&self) -> &[cpu::LinuxActiveImageMapping] {
-        &self.storage().mappings[..self.mapping_count as usize]
+        self.storage()
+            .mappings
+            .get(..self.mapping_count as usize)
+            .unwrap_or(&[])
     }
 
     fn is_valid(&self) -> bool {
@@ -2335,6 +2362,9 @@ pub(crate) fn refresh_live_process_context_from_syscall_entry(
         return false;
     };
     let mut count = space.mapping_count as usize;
+    if count != storage.mappings.len() {
+        return false;
+    }
     let context_mappings = [instruction_mapping, stack_mapping];
     let missing = context_mappings
         .iter()
@@ -2348,7 +2378,9 @@ pub(crate) fn refresh_live_process_context_from_syscall_entry(
                     .all(|existing| existing.address != mapping.address)
         })
         .count();
-    if count.saturating_add(missing) > storage.mappings.len() {
+    if count.saturating_add(missing) > PROCESS_PRIVATE_PAGE_LIMIT
+        || storage.mappings.try_reserve(missing).is_err()
+    {
         return false;
     }
     for mapping in context_mappings {
@@ -2362,7 +2394,7 @@ pub(crate) fn refresh_live_process_context_from_syscall_entry(
             existing.shared = shared;
             existing.dontfork = dontfork;
         } else {
-            storage.mappings[count] = mapping;
+            storage.mappings.push(mapping);
             count += 1;
         }
     }
@@ -2395,7 +2427,9 @@ pub(crate) fn refresh_live_process_hierarchy(pid: u32, hierarchy: &[memory::Fram
     let Some(storage) = address_space_storage(usize::from(space.storage_slot)) else {
         return false;
     };
-    storage.hierarchy[..hierarchy.len()].copy_from_slice(hierarchy);
+    if replace_list(&mut storage.hierarchy, hierarchy).is_none() {
+        return false;
+    }
     let Some(process) = table.process_mut(handle) else {
         return false;
     };
@@ -3143,8 +3177,11 @@ fn replace_live_process_mapping_inner(
     let Some(storage) = address_space_storage(usize::from(space.storage_slot)) else {
         return false;
     };
-    let Some(mapping) = storage.mappings[..space.mapping_count as usize]
-        .iter_mut()
+    let Some(mapping) = storage
+        .mappings
+        .get_mut(..space.mapping_count as usize)
+        .into_iter()
+        .flatten()
         .find(|mapping| mapping.address == address && mapping.frame == expected)
     else {
         return false;
@@ -3184,14 +3221,17 @@ pub(crate) fn add_live_process_mapping(pid: u32, mapping: cpu::LinuxActiveImageM
         return false;
     };
     let count = space.mapping_count as usize;
-    if count >= storage.mappings.len()
-        || storage.mappings[..count]
+    if count != storage.mappings.len()
+        || count >= PROCESS_PRIVATE_PAGE_LIMIT
+        || storage
+            .mappings
             .iter()
             .any(|existing| existing.address == mapping.address)
+        || storage.mappings.try_reserve(1).is_err()
     {
         return false;
     }
-    storage.mappings[count] = mapping;
+    storage.mappings.push(mapping);
     space.mapping_count += 1;
     true
 }
