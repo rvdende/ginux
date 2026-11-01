@@ -25,6 +25,7 @@ QEMU, and reports one machine-parseable line per test plus failure clusters.
 | `22941a5a` | the FUTEX_WAKE fast path wakes other processes' waits (most "tst_checkpoint_wait failed" breaks), SIGKILL ends a parked process | 1362 | 659 | 261 | 193 | 222 | 13 | 0 | 14 |
 | `114ced1f` | O_TMPFILE, openat2, fchmodat2, shared eventfd/timerfd files, waits without full snapshots; first run of the Rust harness (`tests/ltp`, baseline 430 known failures) | 1362 | 711 | 244 | 170 | 221 | 13 | 0 | 3 |
 | `27ccc587` | descriptor tables banked as whole arrays, open-file ids assigned at fork, lock-free kernel frame checks | 1362 | 720 | 235 | 170 | 222 | 13 | 0 | 2 |
+| `47c5457b` | merged image/overlay directory listings, Linux checks for removing image names, distinct /dev/null and console identities (baseline 420 known failures) | 1362 | 720 | 235 | 170 | 222 | 13 | 0 | 2 |
 
 \* Counted with the exit status alone, which overstated passes (below).
 The later rows are rescored from each run's saved console logs with LTP's
