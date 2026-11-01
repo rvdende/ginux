@@ -23935,7 +23935,7 @@ fn linux_readlink_at(
         X86_RUNTIME.LINUX_EXECUTION_INSTANCE.load(Ordering::SeqCst),
         current_linux_process_pid(),
     );
-    let executable = if let Some(path) = recorded {
+    let executable = if let Some(path) = recorded.as_deref() {
         path
     } else if exec_node == 0 {
         b"/init" as &[u8]

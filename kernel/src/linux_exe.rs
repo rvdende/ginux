@@ -6,35 +6,25 @@
 //! tools such as rustc to find their libraries. A forked child that has not
 //! called execve yet shares its parent's executable, so lookups fall back to
 //! the nearest ancestor with a recorded path.
+#![forbid(unsafe_code)]
 
-use crate::linux_process;
+use alloc::vec::Vec;
 
-const PATH_CAPACITY: usize = 256;
-const ENTRY_LIMIT: usize = 64;
+use crate::{
+    linux_process,
+    sync::{LockRank, SpinLock},
+};
 
-#[derive(Clone, Copy)]
+/// The longest path recorded, Linux's PATH_MAX; longer ones are not.
+const PATH_CAPACITY: usize = 4096;
+
 struct Entry {
     instance: u8,
     pid: u32,
-    length: u16,
-    path: [u8; PATH_CAPACITY],
+    path: Vec<u8>,
 }
 
-const EMPTY: Entry = Entry {
-    instance: 0,
-    pid: 0,
-    length: 0,
-    path: [0; PATH_CAPACITY],
-};
-
-static mut ENTRIES: [Entry; ENTRY_LIMIT] = [EMPTY; ENTRY_LIMIT];
-static mut NEXT_VICTIM: usize = 0;
-
-fn entries() -> &'static mut [Entry; ENTRY_LIMIT] {
-    // SAFETY: the kernel is single-processor and system calls that reach
-    // this module do not nest.
-    unsafe { &mut *core::ptr::addr_of_mut!(ENTRIES) }
-}
+static ENTRIES: SpinLock<Vec<Entry>> = SpinLock::new(LockRank::EXECUTABLES, Vec::new());
 
 /// Records that `pid` in `instance` executed `path`. Relative paths are made
 /// absolute against the root, and paths that do not fit are not recorded.
@@ -44,38 +34,44 @@ pub(crate) fn record(instance: u8, pid: u32, path: &[u8]) {
     if pid == 0 || path.is_empty() || length > PATH_CAPACITY {
         return;
     }
-    let entries = entries();
-    let index = entries
-        .iter()
-        .position(|entry| entry.length != 0 && entry.instance == instance && entry.pid == pid)
-        .or_else(|| entries.iter().position(|entry| entry.length == 0))
-        .unwrap_or_else(|| {
-            // SAFETY: as for entries().
-            unsafe {
-                let victim = NEXT_VICTIM;
-                NEXT_VICTIM = (victim + 1) % ENTRY_LIMIT;
-                victim
-            }
+    let mut absolute = Vec::new();
+    if absolute.try_reserve_exact(length).is_err() {
+        return;
+    }
+    if relative {
+        absolute.push(b'/');
+    }
+    absolute.extend_from_slice(path);
+    let mut entries = ENTRIES.lock();
+    // The process's earlier program goes, and so do processes of this
+    // domain that have ended, whose pids may be reused.
+    entries.retain(|entry| {
+        entry.instance != instance
+            || entry.pid != pid && linux_process::live_process_slot(entry.pid).is_some()
+    });
+    if entries.try_reserve(1).is_ok() {
+        entries.push(Entry {
+            instance,
+            pid,
+            path: absolute,
         });
-    let entry = &mut entries[index];
-    entry.instance = instance;
-    entry.pid = pid;
-    entry.length = length as u16;
-    entry.path[0] = b'/';
-    entry.path[usize::from(relative)..length].copy_from_slice(path);
+    }
 }
 
 /// Returns the executable of `pid` in `instance`, inherited from the nearest
 /// ancestor when the process has not executed a file itself.
-pub(crate) fn lookup(instance: u8, pid: u32) -> Option<&'static [u8]> {
-    let entries = entries();
+pub(crate) fn lookup(instance: u8, pid: u32) -> Option<Vec<u8>> {
+    let entries = ENTRIES.lock();
     let mut current = pid;
     for _ in 0..linux_process::PROCESS_LIMIT {
         if let Some(entry) = entries
             .iter()
-            .find(|entry| entry.length != 0 && entry.instance == instance && entry.pid == current)
+            .find(|entry| entry.instance == instance && entry.pid == current)
         {
-            return Some(&entry.path[..usize::from(entry.length)]);
+            let mut path = Vec::new();
+            path.try_reserve_exact(entry.path.len()).ok()?;
+            path.extend_from_slice(&entry.path);
+            return Some(path);
         }
         let parent = linux_process::live_process_status(current)?.parent_pid;
         if parent == 0 || parent == current {
@@ -88,10 +84,5 @@ pub(crate) fn lookup(instance: u8, pid: u32) -> Option<&'static [u8]> {
 
 /// Forgets every path recorded for `instance`, when its domain stops.
 pub(crate) fn forget_instance(instance: u8) {
-    for entry in entries()
-        .iter_mut()
-        .filter(|entry| entry.instance == instance)
-    {
-        entry.length = 0;
-    }
+    ENTRIES.lock().retain(|entry| entry.instance != instance);
 }

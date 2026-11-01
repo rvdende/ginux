@@ -16,6 +16,9 @@ impl LockRank {
     pub(crate) const PRIMITIVE_TEST_LOW: Self = Self(1);
     pub(crate) const PRIMITIVE_TEST_HIGH: Self = Self(2);
     pub(crate) const ARCHITECTURE: Self = Self(10);
+    /// The executables behind /proc/PID/exe; ranks below the heap so the
+    /// list may grow while held.
+    pub(crate) const EXECUTABLES: Self = Self(11);
     /// Deadlines of timed waits set to restart; ranks below the heap so the
     /// list may grow while held.
     pub(crate) const RESTART_DEADLINES: Self = Self(12);
