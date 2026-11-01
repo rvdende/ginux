@@ -431,6 +431,7 @@ pub(super) const LINUX_SYSCALL_INSTRUCTION_SIZE: u64 = 2;
 pub(super) const LINUX_RETURN_FROM_IRET: u64 = (-4095_i64) as u64;
 pub(super) const LINUX_EPERM: u64 = u64::MAX;
 pub(super) const LINUX_EIO: u64 = u64::MAX - 4;
+pub(super) const LINUX_ENXIO: u64 = u64::MAX - 5;
 pub(super) const LINUX_EINTR: u64 = u64::MAX - 3;
 pub(super) const LINUX_E2BIG: u64 = u64::MAX - 6;
 pub(super) const LINUX_ENOEXEC: u64 = u64::MAX - 7;
@@ -466,6 +467,8 @@ pub(super) const LINUX_ENOMSG: u64 = u64::MAX - 41;
 pub(super) const LINUX_EIDRM: u64 = u64::MAX - 42;
 pub(super) const LINUX_EOVERFLOW: u64 = u64::MAX - 74;
 pub(super) const LINUX_ELOOP: u64 = u64::MAX - 39;
+/// The longest pathname a system call takes, terminator included (PATH_MAX).
+pub(super) const LINUX_PATH_MAX: usize = 4096;
 pub(super) const LINUX_ESTALE: u64 = u64::MAX - 115;
 pub(super) const LINUX_ENOKEY: u64 = u64::MAX - 125;
 pub(super) const LINUX_EKEYREVOKED: u64 = u64::MAX - 127;

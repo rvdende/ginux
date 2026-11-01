@@ -24,6 +24,7 @@ mod linux_file_cache;
 mod linux_input;
 mod linux_keyring;
 mod linux_mount;
+mod linux_mounts;
 mod linux_overlay;
 mod linux_process;
 mod linux_record_lock;

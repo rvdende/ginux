@@ -1157,6 +1157,7 @@ pub(super) extern "sysv64" fn linux_syscall_handler(
         LINUX_MOUNT_SYSCALL => {
             linux_mount_filesystem(first_argument, buffer, count, register(0), register(2))
         }
+        LINUX_UMOUNT2_SYSCALL => linux_umount(first_argument, buffer),
         LINUX_MOUNT_SETATTR_SYSCALL => {
             linux_mount_setattr(first_argument, buffer, count, register(0), register(2))
         }

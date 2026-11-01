@@ -15,38 +15,41 @@ pub(crate) struct LockRank(u16);
 impl LockRank {
     pub(crate) const PRIMITIVE_TEST_LOW: Self = Self(1);
     pub(crate) const PRIMITIVE_TEST_HIGH: Self = Self(2);
-    pub(crate) const ARCHITECTURE: Self = Self(10);
+    pub(crate) const ARCHITECTURE: Self = Self(100);
+    /// The mounts domains made; ranks below the heap so the table may grow
+    /// while held, and above ARCHITECTURE, which system calls run under.
+    pub(crate) const MOUNTS: Self = Self(105);
     /// Processes' memory areas; ranks below the heap so the sets may grow
     /// while held.
-    pub(crate) const MEMORY_AREAS: Self = Self(13);
+    pub(crate) const MEMORY_AREAS: Self = Self(130);
     /// The executables behind /proc/PID/exe; ranks below the heap so the
     /// list may grow while held.
-    pub(crate) const EXECUTABLES: Self = Self(11);
+    pub(crate) const EXECUTABLES: Self = Self(110);
     /// Deadlines of timed waits set to restart; ranks below the heap so the
     /// list may grow while held.
-    pub(crate) const RESTART_DEADLINES: Self = Self(12);
+    pub(crate) const RESTART_DEADLINES: Self = Self(120);
     /// The socket table with smoltcp and the network device under it; ranks
     /// below the heap so the table and socket buffers may grow while held.
-    pub(crate) const SOCKETS: Self = Self(14);
-    pub(crate) const CROSS_CPU_DISPATCH: Self = Self(15);
+    pub(crate) const SOCKETS: Self = Self(140);
+    pub(crate) const CROSS_CPU_DISPATCH: Self = Self(150);
     /// The record (fcntl) lock table; ranks below the heap so the table may
     /// grow while held.
-    pub(crate) const RECORD_LOCKS: Self = Self(16);
+    pub(crate) const RECORD_LOCKS: Self = Self(160);
     /// The pool of Linux activation stacks; ranks below the heap so the
     /// pool may grow while held.
-    pub(crate) const KERNEL_STACKS: Self = Self(17);
-    pub(crate) const FUTEX_COORDINATION: Self = Self(18);
+    pub(crate) const KERNEL_STACKS: Self = Self(170);
+    pub(crate) const FUTEX_COORDINATION: Self = Self(180);
     /// The kernel heap refills from the frame allocator while holding its
     /// lock, so it ranks just below it.
-    pub(crate) const KERNEL_HEAP: Self = Self(19);
-    pub(crate) const PHYSICAL_MEMORY: Self = Self(20);
-    pub(crate) const ADDRESS_SPACE: Self = Self(30);
-    pub(crate) const SCHEDULER: Self = Self(40);
-    pub(crate) const DOMAIN_PROCESS: Self = Self(50);
-    pub(crate) const FILESYSTEM: Self = Self(60);
-    pub(crate) const IPC_SIGNAL: Self = Self(70);
-    pub(crate) const DEVICE_NETWORK: Self = Self(80);
-    pub(crate) const DIAGNOSTICS: Self = Self(90);
+    pub(crate) const KERNEL_HEAP: Self = Self(190);
+    pub(crate) const PHYSICAL_MEMORY: Self = Self(200);
+    pub(crate) const ADDRESS_SPACE: Self = Self(300);
+    pub(crate) const SCHEDULER: Self = Self(400);
+    pub(crate) const DOMAIN_PROCESS: Self = Self(500);
+    pub(crate) const FILESYSTEM: Self = Self(600);
+    pub(crate) const IPC_SIGNAL: Self = Self(700);
+    pub(crate) const DEVICE_NETWORK: Self = Self(800);
+    pub(crate) const DIAGNOSTICS: Self = Self(900);
 }
 
 static HELD_RANKS: [AtomicU16; CPU_SLOT_LIMIT] = [const { AtomicU16::new(0) }; CPU_SLOT_LIMIT];

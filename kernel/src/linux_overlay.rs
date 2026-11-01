@@ -21,6 +21,10 @@ pub(crate) enum NodeKind {
     Directory,
     Symlink,
     Fifo,
+    /// A device file (mknod S_IFCHR or S_IFBLK); `Metadata::device` says
+    /// which device.
+    CharacterDevice,
+    BlockDevice,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,6 +48,8 @@ pub(crate) struct Metadata {
     pub(crate) group: u32,
     /// How many names the file has (its hard links).
     pub(crate) links: u32,
+    /// A device file's device number, as mknod(2) and stat(2) encode it.
+    pub(crate) device: u32,
     pub(crate) size: usize,
     pub(crate) atime: (i64, i64),
     pub(crate) mtime: (i64, i64),
@@ -150,6 +156,8 @@ struct Node {
     alias_of: Option<Handle>,
     /// How many names the file has: this node's and its aliases'.
     links: u16,
+    /// A device file's device number.
+    device: u32,
     /// A memfd's seals (F_SEAL_*, which all fit a byte).
     seals: u8,
     /// The pipe socket behind a FIFO, plus one; 0 before one opens it.
@@ -185,6 +193,7 @@ impl Node {
         group: 0,
         alias_of: None,
         links: 0,
+        device: 0,
         seals: 0,
         fifo_socket: 0,
         handle: Handle {
@@ -216,6 +225,7 @@ impl Node {
             owner: self.owner,
             group: self.group,
             links: u32::from(self.links.max(1)),
+            device: self.device,
             size: self.size,
             atime: self.atime,
             mtime: self.mtime,
@@ -721,6 +731,16 @@ pub(crate) fn create_fifo(path: &[u8], mode: u32) -> Option<Handle> {
     create(path, NodeKind::Fifo, mode, &[])
 }
 
+/// Creates a device file at `path` for `device` (mknod S_IFCHR or S_IFBLK).
+pub(crate) fn create_device(path: &[u8], kind: NodeKind, mode: u32, device: u32) -> Option<Handle> {
+    if !matches!(kind, NodeKind::CharacterDevice | NodeKind::BlockDevice) {
+        return None;
+    }
+    let handle = create(path, kind, mode, &[])?;
+    node_mut(handle)?.device = device;
+    Some(handle)
+}
+
 pub(crate) fn fifo_socket(handle: Handle) -> Option<crate::linux_socket::SlotId> {
     let node = node(handle)?;
     (node.kind == NodeKind::Fifo && node.fifo_socket != 0).then_some(node.fifo_socket - 1)
@@ -770,6 +790,7 @@ fn create(path: &[u8], kind: NodeKind, mode: u32, initial: &[u8]) -> Option<Hand
         group,
         alias_of: None,
         links: 1,
+        device: 0,
         seals: 0,
         fifo_socket: 0,
         handle,
@@ -845,6 +866,7 @@ pub(crate) fn whiteout(path: &[u8]) -> bool {
         group: 0,
         alias_of: None,
         links: 0,
+        device: 0,
         seals: 0,
         fifo_socket: 0,
         handle: Handle { generation, inode },
@@ -867,7 +889,10 @@ pub(crate) fn whiteout(path: &[u8]) -> bool {
 
 pub(crate) fn read(handle: Handle, offset: usize, output: &mut [u8]) -> Option<usize> {
     let node = node_mut(handle)?;
-    if matches!(node.kind, NodeKind::Directory | NodeKind::Fifo) {
+    if matches!(
+        node.kind,
+        NodeKind::Directory | NodeKind::Fifo | NodeKind::CharacterDevice | NodeKind::BlockDevice
+    ) {
         return None;
     }
     read_node(node, offset, output)
@@ -928,7 +953,10 @@ pub(crate) fn write(handle: Handle, offset: usize, input: &[u8]) -> Option<usize
         return Some(0);
     }
     let node = node_mut(handle)?;
-    if matches!(node.kind, NodeKind::Directory | NodeKind::Fifo) {
+    if matches!(
+        node.kind,
+        NodeKind::Directory | NodeKind::Fifo | NodeKind::CharacterDevice | NodeKind::BlockDevice
+    ) {
         return None;
     }
     if node.paged() {
@@ -1356,6 +1384,42 @@ pub(crate) fn rename_path(from: &[u8], to: &[u8]) -> bool {
     node.path = stored_path;
     node.path_length = to.len() as u16;
     true
+}
+
+/// Removes everything below the directory `path`, as unmounting a tmpfs
+/// from it drops what was created there. Open files stay readable until
+/// closed, as after unlink.
+pub(crate) fn unlink_below(path: &[u8]) {
+    let overlay = live_mut();
+    let mut page = overlay.first_node_page;
+    let mut symlinks_removed = 0;
+    while page != FrameLease::EMPTY {
+        let Some(nodes) = node_page_mut(page) else {
+            return;
+        };
+        for node in &mut nodes.nodes {
+            let below = node.active
+                && node.linked
+                && node
+                    .path()
+                    .strip_prefix(path)
+                    .is_some_and(|rest| rest.starts_with(b"/"));
+            if !below {
+                continue;
+            }
+            if node.alias_of.is_some() {
+                *node = Node::EMPTY;
+            } else {
+                if node.kind == NodeKind::Symlink && !node.whiteout {
+                    symlinks_removed += 1;
+                }
+                node.linked = false;
+            }
+        }
+        page = nodes.next;
+    }
+    let overlay = live_mut();
+    overlay.symlinks = overlay.symlinks.saturating_sub(symlinks_removed);
 }
 
 pub(crate) fn unlink(handle: Handle) -> bool {

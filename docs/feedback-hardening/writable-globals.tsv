@@ -540,6 +540,7 @@ static-mut	kernel/src/framebuffer.rs	CONSOLE	platform-device	allowlist	none	seri
 static-mut	kernel/src/framebuffer.rs	DISPLAY	platform-device	allowlist	none	immutable-after-boot-framebuffer-mode
 interior-mutable	kernel/src/linux_areas.rs	PROCESSES	process-runtime	allowlist	none	ranked-memory-area-sets
 interior-mutable	kernel/src/linux_exe.rs	ENTRIES	process-runtime	allowlist	none	ranked-executable-path-list
+interior-mutable	kernel/src/linux_mounts.rs	MOUNTS	process-runtime	allowlist	none	ranked-domain-mount-table
 static-mut	kernel/src/linux_input.rs	CONSOLE	platform-device	allowlist	none	serialized-evdev-console-state
 static-mut	kernel/src/linux_input.rs	DEVICES	platform-device	allowlist	none	serialized-evdev-device-queues
 static-mut	kernel/src/linux_input.rs	PUMP	platform-device	allowlist	none	serialized-evdev-input-pump
