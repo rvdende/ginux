@@ -463,9 +463,6 @@ struct X86RuntimeOwner {
     LINUX_PROCESS_SNAPSHOT_STAGE: RuntimeRef<BankedAtomicU8>,
     LINUX_PROCESS_SNAPSHOT_VALIDATED: RuntimeRef<BankedAtomicBool>,
     LINUX_PROCESS_WAIT_COUNT: RuntimeRef<BankedAtomicU32>,
-    LINUX_RESTART_DEADLINES: RuntimeRef<[BankedAtomicU64; LINUX_THREAD_LIMIT]>,
-    LINUX_RESTART_DEADLINE_KEYS: RuntimeRef<[BankedAtomicU64; LINUX_THREAD_LIMIT]>,
-    LINUX_RESTART_DEADLINE_RIPS: RuntimeRef<[BankedAtomicU64; LINUX_THREAD_LIMIT]>,
     LINUX_RUNTIME_BACKGROUND_QUANTA: RuntimeRef<AtomicU32>,
     LINUX_RUNTIME_BACKGROUND_SUSPENDED: RuntimeRef<BankedAtomicBool>,
     LINUX_RUNTIME_BACKGROUND_TICKS: RuntimeRef<BankedAtomicU32>,
@@ -999,9 +996,6 @@ static X86_RUNTIME: X86RuntimeOwner = X86RuntimeOwner {
         &X86_RUNTIME_BACKING_LINUX_PROCESS_SNAPSHOT_VALIDATED,
     ),
     LINUX_PROCESS_WAIT_COUNT: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_PROCESS_WAIT_COUNT),
-    LINUX_RESTART_DEADLINES: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_RESTART_DEADLINES),
-    LINUX_RESTART_DEADLINE_KEYS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_RESTART_DEADLINE_KEYS),
-    LINUX_RESTART_DEADLINE_RIPS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_RESTART_DEADLINE_RIPS),
     LINUX_RUNTIME_BACKGROUND_QUANTA: RuntimeRef(
         &X86_RUNTIME_BACKING_LINUX_RUNTIME_BACKGROUND_QUANTA,
     ),
@@ -1865,6 +1859,11 @@ static X86_RUNTIME_BACKING_LINUX_THREAD_WAIT_PRIOR_SIGNAL_MASKS: [BankedAtomicU6
     LINUX_THREAD_LIMIT] = [const { BankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
 static LINUX_FUTEX_COORDINATION: crate::sync::SpinLock<Vec<LinuxProcessFutexWait>> =
     crate::sync::SpinLock::new(crate::sync::LockRank::FUTEX_COORDINATION, Vec::new());
+/// Absolute deadlines of timed waits (poll, nanosleep, epoll_wait) whose
+/// process yielded to another and will execute the same call again, so the
+/// restarted call keeps its deadline instead of starting a new timeout.
+static LINUX_RESTART_DEADLINES: crate::sync::SpinLock<Vec<LinuxRestartDeadline>> =
+    crate::sync::SpinLock::new(crate::sync::LockRank::RESTART_DEADLINES, Vec::new());
 static X86_RUNTIME_BACKING_LINUX_THREAD_POLL_DESCRIPTORS: [[BankedAtomicU32; LINUX_POLLFD_LIMIT];
     LINUX_THREAD_LIMIT] =
     [const { [const { BankedAtomicU32::new(0) }; LINUX_POLLFD_LIMIT] }; LINUX_THREAD_LIMIT];
@@ -2123,16 +2122,6 @@ static X86_RUNTIME_BACKING_ELF_PROBE_DESCRIPTOR_OFFSETS: [BankedAtomicU64;
     LINUX_DEVICE_DESCRIPTOR_COUNT] =
     [const { BankedAtomicU64::new(0) }; LINUX_DEVICE_DESCRIPTOR_COUNT];
 static X86_RUNTIME_BACKING_ELF_PROBE_CLOCK_EPOCH: BankedAtomicU64 = BankedAtomicU64::new(0);
-/// Absolute deadlines of timed waits (poll, nanosleep) whose process yielded
-/// to another process and will execute the same syscall again. Entries are
-/// keyed by process and thread and by return address, so the restarted call
-/// keeps its original deadline instead of starting a new timeout.
-static X86_RUNTIME_BACKING_LINUX_RESTART_DEADLINE_KEYS: [BankedAtomicU64; LINUX_THREAD_LIMIT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_RESTART_DEADLINE_RIPS: [BankedAtomicU64; LINUX_THREAD_LIMIT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_RESTART_DEADLINES: [BankedAtomicU64; LINUX_THREAD_LIMIT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
 static X86_RUNTIME_BACKING_ELF_PROBE_CLOCK_FREQUENCY: BankedAtomicU64 = BankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_PROCESS_NAME_LOW: BankedAtomicU64 = BankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_PROCESS_NAME_HIGH: BankedAtomicU64 = BankedAtomicU64::new(0);

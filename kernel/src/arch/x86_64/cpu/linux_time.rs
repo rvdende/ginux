@@ -442,35 +442,62 @@ pub(super) fn refresh_linux_real_timer() -> bool {
     true
 }
 
-fn linux_restart_deadline_key() -> u64 {
-    (u64::from(current_linux_process_pid()) << 32) | u64::from(current_linux_tid().unwrap_or(0))
+/// The deadline of a timed wait that yielded with its call set to
+/// restart, kept for when the call starts again: by domain instance,
+/// process, thread and the call's return address.
+#[derive(Clone, Copy)]
+pub(super) struct LinuxRestartDeadline {
+    instance: usize,
+    pid: u32,
+    tid: u32,
+    rip: u64,
+    deadline: u64,
 }
 
 /// Records the deadline of a timed wait about to yield with a restart.
 fn save_linux_restart_deadline(rip: u64, deadline: u64) {
-    let key = linux_restart_deadline_key();
-    let _ = take_linux_restart_deadline(rip);
-    if let Some(index) = X86_RUNTIME
-        .LINUX_RESTART_DEADLINE_KEYS
-        .iter()
-        .position(|entry| entry.load(Ordering::SeqCst) == 0)
-    {
-        X86_RUNTIME.LINUX_RESTART_DEADLINE_RIPS[index].store(rip, Ordering::SeqCst);
-        X86_RUNTIME.LINUX_RESTART_DEADLINES[index].store(deadline, Ordering::SeqCst);
-        X86_RUNTIME.LINUX_RESTART_DEADLINE_KEYS[index].store(key, Ordering::SeqCst);
+    let instance = linux_execution_instance();
+    let (pid, tid) = (
+        current_linux_process_pid(),
+        current_linux_tid().unwrap_or(0),
+    );
+    let mut deadlines = LINUX_RESTART_DEADLINES.lock();
+    // A thread waits in one call at a time, so one it left in an earlier
+    // call (a signal handler ended that wait) is stale, and so are those of
+    // a process that has ended.
+    // (A child still running inside its parent's fork is not published
+    // yet, but it is not gone.)
+    deadlines.retain(|entry| {
+        entry.instance != instance
+            || (entry.pid, entry.tid) != (pid, tid)
+                && linux_process::live_process_slot(entry.pid).is_some()
+                && !linux_process::live_process_status(entry.pid)
+                    .is_some_and(|status| status.state == linux_process::LiveProcessState::Zombie)
+    });
+    if deadlines.try_reserve(1).is_ok() {
+        deadlines.push(LinuxRestartDeadline {
+            instance,
+            pid,
+            tid,
+            rip,
+            deadline,
+        });
     }
 }
 
 /// Returns and forgets the deadline saved when this thread's call at `rip`
 /// last yielded.
 pub(super) fn take_linux_restart_deadline(rip: u64) -> Option<u64> {
-    let key = linux_restart_deadline_key();
-    let index = (0..LINUX_THREAD_LIMIT).find(|index| {
-        X86_RUNTIME.LINUX_RESTART_DEADLINE_KEYS[*index].load(Ordering::SeqCst) == key
-            && X86_RUNTIME.LINUX_RESTART_DEADLINE_RIPS[*index].load(Ordering::SeqCst) == rip
+    let instance = linux_execution_instance();
+    let (pid, tid) = (
+        current_linux_process_pid(),
+        current_linux_tid().unwrap_or(0),
+    );
+    let mut deadlines = LINUX_RESTART_DEADLINES.lock();
+    let index = deadlines.iter().position(|entry| {
+        entry.instance == instance && entry.pid == pid && entry.tid == tid && entry.rip == rip
     })?;
-    X86_RUNTIME.LINUX_RESTART_DEADLINE_KEYS[index].store(0, Ordering::SeqCst);
-    Some(X86_RUNTIME.LINUX_RESTART_DEADLINES[index].load(Ordering::SeqCst))
+    Some(deadlines.swap_remove(index).deadline)
 }
 
 /// Lets other processes run while a timed wait has nothing to wait for in
@@ -486,13 +513,21 @@ pub(super) fn linux_timed_wait_run_others(
     if let Some(deadline) = deadline {
         save_linux_restart_deadline(caller.rip, deadline);
     }
-    if let Some(LinuxBlockedWait::Return(result)) =
-        run_other_linux_processes(output, caller, number)
-    {
-        return Some(result);
-    }
+    let result = match run_other_linux_processes(output, caller, number) {
+        // Yielded, or set to start again from user mode: the call comes
+        // back and takes its deadline.
+        Some(LinuxBlockedWait::Return(result))
+            if result == LINUX_RETURN_TO_KERNEL || result == number =>
+        {
+            return Some(result);
+        }
+        Some(LinuxBlockedWait::Return(result)) => Some(result),
+        _ => None,
+    };
+    // The wait ended here (a signal, or other processes ran and it goes on
+    // waiting in this call): the saved deadline goes with it.
     let _ = take_linux_restart_deadline(caller.rip);
-    None
+    result
 }
 
 pub(super) fn linux_nanosleep_live_return(

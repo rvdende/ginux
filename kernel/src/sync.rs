@@ -16,6 +16,9 @@ impl LockRank {
     pub(crate) const PRIMITIVE_TEST_LOW: Self = Self(1);
     pub(crate) const PRIMITIVE_TEST_HIGH: Self = Self(2);
     pub(crate) const ARCHITECTURE: Self = Self(10);
+    /// Deadlines of timed waits set to restart; ranks below the heap so the
+    /// list may grow while held.
+    pub(crate) const RESTART_DEADLINES: Self = Self(12);
     /// The socket table with smoltcp and the network device under it; ranks
     /// below the heap so the table and socket buffers may grow while held.
     pub(crate) const SOCKETS: Self = Self(14);

@@ -228,6 +228,24 @@ yields:
   the epoll branch for pid 1, and `take_linux_child_yield(1)` as the only
   signal that init is waiting.
 
+What LTP's checkpoint timeouts (about 25 tests: pause01/02, tgkill01-03,
+setpgid03, fork04, ...) come down to, traced on 2026-11-01 with pause01: a
+child forked child-first calls TST_CHECKPOINT_WAKE before its parent waits,
+finds no waiter (correct) and sleeps 1 ms in usleep to retry. The parent
+resumes inside its own fork transaction, waits on the futex, and from then
+on only the parent is dispatched: each of its restarts finds its wait
+record (FUTEX_WAKE from the child would find it too; the futex key is the
+same physical address in both), but the child never calls FUTEX_WAKE
+again. Its nanosleep keeps being entered at the same return address with
+a fresh deadline, as if resumed from the restart point its first yield set
+inside the fork transaction rather than where it had got to. Init's pick
+does choose the child (the deepest descendant) and dispatches it. So the
+fix belongs with the loop: one saved context per process, owned by the run
+queue, instead of the fork transaction resuming the parent nested and the
+child's registry context going stale. Two causes found on the way are
+fixed: restart deadlines leaked (a 32-entry per-domain table whose entries
+only a restart removed) and pause() never showed as sleeping.
+
 ### What waits look like until the loop exists (2026-11-01)
 
 A process other than init waits by yielding with its call set to restart,
