@@ -1,19 +1,28 @@
 use crate::{arch::x86_64::cpu, control_abi, domain};
+use alloc::vec::Vec;
 use core::{
     cell::UnsafeCell,
     sync::atomic::{AtomicBool, Ordering},
 };
 
-const NAMESPACE_LIMIT: usize = 4;
+/// The most user namespaces one domain may hold at once.
+const NAMESPACE_LIMIT: usize = 64;
+/// How deep user namespaces may nest (Linux's limit).
+const NESTING_LIMIT: usize = 32;
 const ROOT_INSIDE_ID: u32 = 0;
 const ROOT_OUTSIDE_ID: u32 = 100_000;
 const ROOT_ID_COUNT: u32 = 1;
 const HOST_INSTANCE: usize = control_abi::DOMAIN_LIMIT;
 const INSTANCE_LIMIT: usize = control_abi::DOMAIN_LIMIT + 1;
 
-pub(crate) const UID_MAP: &[u8] = b"0 100000 1\n";
-pub(crate) const GID_MAP: &[u8] = b"0 100000 1\n";
-pub(crate) const SETGROUPS: &[u8] = b"deny\n";
+/// The ids a domain that allows switching users maps: the 16-bit range, as
+/// a container's subordinate id range usually is (65534 is `nobody`).
+const SWITCHING_ID_COUNT: u32 = 65_536;
+
+const ROOT_ID_MAP: &[u8] = b"0 100000 1\n";
+const SWITCHING_ID_MAP: &[u8] = b"0 100000 65536\n";
+
+pub(crate) use ginux_credentials::{Authority, Credentials};
 
 struct UserRuntimeOwner {
     installed: AtomicBool,
@@ -36,19 +45,7 @@ pub(crate) struct UserNamespaceHandle {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Credentials {
-    pub(crate) uid: u32,
-    pub(crate) gid: u32,
-    pub(crate) euid: u32,
-    pub(crate) egid: u32,
-    pub(crate) suid: u32,
-    pub(crate) sgid: u32,
-    pub(crate) supplementary_gid: u32,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PrivilegedOperation {
-    ChangeIdentity,
     ChangeRoot,
     ManageMounts,
     ManageKernel,
@@ -107,8 +104,11 @@ struct UserNamespace {
 
 struct UserNamespaceTable {
     owner_domain: u64,
-    namespaces: [Option<UserNamespace>; NAMESPACE_LIMIT],
-    generations: [u32; NAMESPACE_LIMIT],
+    /// Grows on demand up to NAMESPACE_LIMIT and never shrinks, so slots
+    /// stay valid.
+    namespaces: Vec<Option<UserNamespace>>,
+    /// The generation each slot last handed out, parallel to `namespaces`.
+    generations: Vec<u32>,
     next_id: u32,
     initial: Option<UserNamespaceHandle>,
 }
@@ -117,8 +117,8 @@ impl UserNamespaceTable {
     const fn new() -> Self {
         Self {
             owner_domain: 0,
-            namespaces: [None; NAMESPACE_LIMIT],
-            generations: [0; NAMESPACE_LIMIT],
+            namespaces: Vec::new(),
+            generations: Vec::new(),
             next_id: 1,
             initial: None,
         }
@@ -133,7 +133,17 @@ impl UserNamespaceTable {
         if uid_map != IdMap::ROOT || gid_map != IdMap::ROOT {
             return None;
         }
-        let slot = self.namespaces.iter().position(Option::is_none)?;
+        let slot = match self.namespaces.iter().position(Option::is_none) {
+            Some(slot) => slot,
+            None if self.namespaces.len() < NAMESPACE_LIMIT => {
+                self.namespaces.try_reserve(1).ok()?;
+                self.generations.try_reserve(1).ok()?;
+                self.namespaces.push(None);
+                self.generations.push(0);
+                self.namespaces.len() - 1
+            }
+            None => return None,
+        };
         let generation = self.generations[slot].checked_add(1)?;
         let id = self.next_id;
         self.next_id = self.next_id.checked_add(1)?;
@@ -200,7 +210,6 @@ pub(crate) fn verify_contract() -> bool {
         || namespace.setgroups_allowed
         || namespace.linux_capabilities != 0
         || [
-            PrivilegedOperation::ChangeIdentity,
             PrivilegedOperation::ChangeRoot,
             PrivilegedOperation::ManageMounts,
             PrivilegedOperation::ManageKernel,
@@ -305,7 +314,7 @@ pub(crate) fn may_signal(sender: UserNamespaceHandle, mut target: UserNamespaceH
     let Some(table) = live_table_for_handle(sender) else {
         return false;
     };
-    for _ in 0..NAMESPACE_LIMIT {
+    for _ in 0..NESTING_LIMIT {
         if target == sender {
             return true;
         }
@@ -341,27 +350,61 @@ pub(crate) fn credentials(handle: UserNamespaceHandle) -> Option<Credentials> {
     {
         return None;
     }
-    Some(Credentials {
-        uid: 0,
-        gid: 0,
-        euid: 0,
-        egid: 0,
-        suid: 0,
-        sgid: 0,
-        supplementary_gid: 0,
-    })
+    Some(Credentials::ROOT)
+}
+
+/// The single gate on changing identity. Root in a domain may take other
+/// user and group ids (setuid, setgid, setgroups and their relatives) only
+/// when the domain was configured with `user-switching=true`. The domain's
+/// user namespace then maps 65536 ids; otherwise it maps only id 0, so
+/// every process stays root. Every identity change asks here and nowhere
+/// else, so this is the one place to secure.
+pub(crate) fn user_switching_allowed(handle: UserNamespaceHandle) -> bool {
+    handle.owner_domain != 0
+        && domain::container_slot_for_domain(handle.owner_domain)
+            .is_some_and(cpu::container_user_switching)
+}
+
+/// What a process with `credentials` in `handle` may do when it changes
+/// its ids: it holds CAP_SETUID and CAP_SETGID while its effective user id
+/// is 0 and its domain allows switching users.
+pub(crate) fn identity_authority(
+    handle: UserNamespaceHandle,
+    credentials: &Credentials,
+) -> Authority {
+    let switching = user_switching_allowed(handle);
+    Authority {
+        privileged: switching && credentials.privileged(),
+        id_count: if switching {
+            SWITCHING_ID_COUNT
+        } else {
+            ROOT_ID_COUNT
+        },
+    }
+}
+
+/// `/proc/PID/uid_map` and `gid_map`: the ids the namespace maps.
+pub(crate) fn id_map(handle: UserNamespaceHandle) -> &'static [u8] {
+    if user_switching_allowed(handle) {
+        SWITCHING_ID_MAP
+    } else {
+        ROOT_ID_MAP
+    }
+}
+
+/// `/proc/PID/setgroups`: whether setgroups(2) may be used.
+pub(crate) fn setgroups_file(handle: UserNamespaceHandle) -> &'static [u8] {
+    if user_switching_allowed(handle) {
+        b"allow\n"
+    } else {
+        b"deny\n"
+    }
 }
 
 pub(crate) fn has_no_linux_capabilities(handle: UserNamespaceHandle) -> bool {
     live_table_for_handle(handle)
         .and_then(|table| table.namespace(handle))
         .is_some_and(|namespace| namespace.linux_capabilities == 0)
-}
-
-pub(crate) fn setgroups_allowed(handle: UserNamespaceHandle) -> bool {
-    live_table_for_handle(handle)
-        .and_then(|table| table.namespace(handle))
-        .is_some_and(|namespace| namespace.setgroups_allowed)
 }
 
 pub(crate) fn privileged_operation_denied(

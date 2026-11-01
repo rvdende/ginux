@@ -14,6 +14,7 @@ linux-boot-profile = []
 path = "src/lib.rs"
 
 [dependencies]
+ginux-credentials = { path = "../crates/credentials" }
 ginux-image-store = { path = "../crates/image-store" }
 ginux-memory-areas = { path = "../crates/memory-areas" }
 ginux-oci = { path = "../crates/oci" }

@@ -376,8 +376,11 @@ class Run:
         # first boot the domain already exists and creating it is rejected.
         qemu.send("domain new ltp")
         offset = qemu.wait_for(b"ginux> ", 30, offset)
+        # LTP's credential tests switch between root and other users (nobody,
+        # bin), which a domain allows only with user-switching=true.
         qemu.send(
             f"domain set ltp image={args.image} init=/bin/sh memory-mib={args.domain_memory_mib}"
+            " user-switching=true"
         )
         offset = qemu.wait_for(b"settings accepted", 30, offset)
         qemu.send("domain start ltp --attach")

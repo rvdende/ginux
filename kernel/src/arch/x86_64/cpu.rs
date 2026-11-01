@@ -5675,7 +5675,10 @@ pub(crate) fn import_persistent_domain_configuration(
             || !valid_domain_personality(personality)
             || cpu_count == 0
             || memory_mib == 0
-            || flags & !(control_abi::DOMAIN_CONFIG_COMPLETE | control_abi::DOMAIN_CONFIG_AUTOSTART)
+            || flags
+                & !(control_abi::DOMAIN_CONFIG_COMPLETE
+                    | control_abi::DOMAIN_CONFIG_AUTOSTART
+                    | control_abi::DOMAIN_CONFIG_USER_SWITCHING)
                 != 0
             || flags
                 & (control_abi::DOMAIN_CONFIG_INIT
@@ -11792,14 +11795,6 @@ pub(crate) fn linux_boot_profile_record_lifecycle_phase(index: usize, started: u
 fn linux_privileged_operation(number: u64) -> Option<linux_user::PrivilegedOperation> {
     use linux_user::PrivilegedOperation;
     match number {
-        LINUX_SETUID_SYSCALL
-        | LINUX_SETGID_SYSCALL
-        | LINUX_SETREUID_SYSCALL
-        | LINUX_SETREGID_SYSCALL
-        | LINUX_SETRESUID_SYSCALL
-        | LINUX_SETRESGID_SYSCALL
-        | LINUX_SETFSUID_SYSCALL
-        | LINUX_SETFSGID_SYSCALL => Some(PrivilegedOperation::ChangeIdentity),
         LINUX_CHROOT_SYSCALL | LINUX_PIVOT_ROOT_SYSCALL => Some(PrivilegedOperation::ChangeRoot),
         LINUX_MOUNT_SYSCALL
         | LINUX_UMOUNT2_SYSCALL
@@ -11820,7 +11815,7 @@ fn linux_privileged_operation(number: u64) -> Option<linux_user::PrivilegedOpera
         | LINUX_KEXEC_LOAD_SYSCALL
         | LINUX_FINIT_MODULE_SYSCALL
         | LINUX_KEXEC_FILE_LOAD_SYSCALL => Some(PrivilegedOperation::ManageKernel),
-        LINUX_UNSHARE_SYSCALL | LINUX_SETNS_SYSCALL => Some(PrivilegedOperation::ManageNamespaces),
+        LINUX_SETNS_SYSCALL => Some(PrivilegedOperation::ManageNamespaces),
         LINUX_IOPL_SYSCALL | LINUX_IOPERM_SYSCALL | LINUX_PERF_EVENT_OPEN_SYSCALL => {
             Some(PrivilegedOperation::RawIo)
         }
@@ -11838,6 +11833,80 @@ fn linux_privileged_operation(number: u64) -> Option<linux_user::PrivilegedOpera
         LINUX_PTRACE_SYSCALL => Some(PrivilegedOperation::TraceProcesses),
         _ => None,
     }
+}
+
+/// unshare(2). Unsharing what a single-threaded process already has alone
+/// (its descriptors, filesystem context, signal handlers, address space,
+/// SysV semaphore undo) does nothing; a new user namespace or (as root) a
+/// new mount namespace replaces the caller's. The other namespaces
+/// (UTS, IPC, network, PID, cgroup, time) are not implemented yet.
+fn linux_unshare(flags: u64) -> u64 {
+    const CLONE_NEWTIME: u64 = 0x80;
+    const CLONE_NEWCGROUP: u64 = 0x0200_0000;
+    const CLONE_NEWUTS: u64 = 0x0400_0000;
+    const CLONE_NEWIPC: u64 = 0x0800_0000;
+    const CLONE_NEWPID: u64 = 0x2000_0000;
+    const CLONE_NEWNET: u64 = 0x4000_0000;
+    const UNIMPLEMENTED: u64 =
+        CLONE_NEWTIME | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWPID | CLONE_NEWNET;
+    const SHARED_WITH_THREADS: u64 = LINUX_CLONE_THREAD | LINUX_CLONE_SIGHAND | LINUX_CLONE_VM;
+    const KNOWN: u64 = UNIMPLEMENTED
+        | SHARED_WITH_THREADS
+        | LINUX_CLONE_FS
+        | LINUX_CLONE_FILES
+        | LINUX_CLONE_SYSVSEM
+        | LINUX_CLONE_NEWNS
+        | LINUX_CLONE_NEWUSER;
+    let flags = u64::from(flags as u32);
+    if flags & !KNOWN != 0 {
+        return LINUX_EINVAL;
+    }
+    let threads = X86_RUNTIME
+        .LINUX_THREAD_STATES
+        .iter()
+        .filter(|state| state.load(Ordering::SeqCst) != LINUX_THREAD_FREE)
+        .count();
+    if flags & (SHARED_WITH_THREADS | LINUX_CLONE_NEWUSER) != 0 && threads > 1 {
+        return LINUX_EINVAL;
+    }
+    let (Some(namespace), Some(credentials)) =
+        (current_linux_user_namespace(), current_linux_credentials())
+    else {
+        return LINUX_ESRCH;
+    };
+    // Making namespaces other than a user namespace needs CAP_SYS_ADMIN,
+    // which a new user namespace grants its creator.
+    let new_namespaces = flags & (UNIMPLEMENTED | LINUX_CLONE_NEWNS);
+    if new_namespaces != 0 && flags & LINUX_CLONE_NEWUSER == 0 && !credentials.privileged() {
+        return LINUX_EPERM;
+    }
+    if flags & UNIMPLEMENTED != 0 {
+        return LINUX_EINVAL;
+    }
+    let pid = current_linux_process_pid();
+    if flags & LINUX_CLONE_NEWUSER != 0 {
+        let Some(child) = linux_user::clone_namespace(namespace) else {
+            return LINUX_ENOSPC;
+        };
+        if !linux_process::set_live_process_user_namespace(pid, child) {
+            let _ = linux_user::retire(child);
+            return LINUX_ENOMEM;
+        }
+    }
+    if flags & LINUX_CLONE_NEWNS != 0 {
+        let Some(state) = linux_process_runtime_state(pid).filter(|state| state.valid) else {
+            return LINUX_ESRCH;
+        };
+        let Some(mount_namespace) = linux_mount::clone_current() else {
+            return LINUX_ENOMEM;
+        };
+        if !linux_mount::switch_to(mount_namespace) {
+            let _ = linux_mount::retire(mount_namespace);
+            return LINUX_ENOMEM;
+        }
+        state.mount_namespace = Some(mount_namespace);
+    }
+    0
 }
 
 fn linux_deny_privileged_operation(number: u64) -> u64 {
@@ -12653,83 +12722,150 @@ fn current_linux_user_namespace() -> Option<linux_user::UserNamespaceHandle> {
 }
 
 fn current_linux_credentials() -> Option<linux_user::Credentials> {
-    linux_user::credentials(current_linux_user_namespace()?)
+    linux_process::live_process_credentials(current_linux_process_pid())
 }
 
+/// The owner, group and mode of a file the current process creates at
+/// canonical `path`: its filesystem ids (root outside a process). In a
+/// set-group-ID directory the file takes the directory's group, a new
+/// directory keeps the bit, and a set-group-ID, group-executable file whose
+/// creator is neither root nor in that group loses it.
+pub(crate) fn linux_new_file_identity(path: &[u8], directory: bool, mode: u32) -> (u32, u32, u32) {
+    let credentials = current_linux_credentials().unwrap_or(linux_user::Credentials::ROOT);
+    let owner = credentials.user.filesystem;
+    let Some(parent) = linux_path_access(linux_parent_path(path))
+        .filter(|parent| parent.directory && parent.mode & 0o2000 != 0)
+    else {
+        return (owner, credentials.group.filesystem, mode);
+    };
+    let mode = if directory {
+        mode | 0o2000
+    } else if mode & 0o2010 == 0o2010
+        && !credentials.filesystem_privileged()
+        && !linux_process::with_live_process_groups(current_linux_process_pid(), |groups| {
+            credentials.in_group(groups, parent.group)
+        })
+        .unwrap_or(false)
+    {
+        mode & !0o2000
+    } else {
+        mode
+    };
+    (owner, parent.group, mode)
+}
+
+/// The set*id system calls, under the rules in `ginux-credentials`; what
+/// the process may switch to comes from `linux_user::identity_authority`.
 fn linux_set_current_identity(number: u64, first: u64, second: u64, third: u64) -> u64 {
-    let Some(credentials) = current_linux_credentials() else {
+    let pid = current_linux_process_pid();
+    let (Some(namespace), Some(mut credentials)) = (
+        current_linux_user_namespace(),
+        linux_process::live_process_credentials(pid),
+    ) else {
         return LINUX_ESRCH;
     };
-    let unchanged =
-        |requested: u64, current: u32| requested as u32 == u32::MAX || requested as u32 == current;
-    let accepted = match number {
-        LINUX_SETUID_SYSCALL => {
-            unchanged(first, credentials.uid)
-                && credentials.uid == credentials.euid
-                && credentials.uid == credentials.suid
+    let authority = linux_user::identity_authority(namespace, &credentials);
+    let [first, second, third] = [first, second, third].map(|id| id as u32);
+    let result = match number {
+        LINUX_SETUID_SYSCALL => credentials.user.set(first, authority),
+        LINUX_SETGID_SYSCALL => credentials.group.set(first, authority),
+        LINUX_SETREUID_SYSCALL => credentials
+            .user
+            .set_real_effective(first, second, authority),
+        LINUX_SETREGID_SYSCALL => credentials
+            .group
+            .set_real_effective(first, second, authority),
+        LINUX_SETRESUID_SYSCALL => credentials
+            .user
+            .set_real_effective_saved(first, second, third, authority),
+        LINUX_SETRESGID_SYSCALL => credentials
+            .group
+            .set_real_effective_saved(first, second, third, authority),
+        LINUX_SETFSUID_SYSCALL | LINUX_SETFSGID_SYSCALL => {
+            let ids = if number == LINUX_SETFSUID_SYSCALL {
+                &mut credentials.user
+            } else {
+                &mut credentials.group
+            };
+            let old = ids.set_filesystem(first, authority);
+            if !linux_process::set_live_process_credentials(pid, credentials) {
+                return LINUX_ESRCH;
+            }
+            return u64::from(old);
         }
-        LINUX_SETGID_SYSCALL => {
-            unchanged(first, credentials.gid)
-                && credentials.gid == credentials.egid
-                && credentials.gid == credentials.sgid
-        }
-        LINUX_SETREUID_SYSCALL => {
-            unchanged(first, credentials.uid) && unchanged(second, credentials.euid)
-        }
-        LINUX_SETREGID_SYSCALL => {
-            unchanged(first, credentials.gid) && unchanged(second, credentials.egid)
-        }
-        LINUX_SETRESUID_SYSCALL => {
-            unchanged(first, credentials.uid)
-                && unchanged(second, credentials.euid)
-                && unchanged(third, credentials.suid)
-        }
-        LINUX_SETRESGID_SYSCALL => {
-            unchanged(first, credentials.gid)
-                && unchanged(second, credentials.egid)
-                && unchanged(third, credentials.sgid)
-        }
-        LINUX_SETFSUID_SYSCALL => unchanged(first, credentials.euid),
-        LINUX_SETFSGID_SYSCALL => unchanged(first, credentials.egid),
-        _ => false,
+        _ => return LINUX_ENOSYS,
     };
-    if accepted {
-        if matches!(number, LINUX_SETFSUID_SYSCALL) {
-            u64::from(credentials.euid)
-        } else if matches!(number, LINUX_SETFSGID_SYSCALL) {
-            u64::from(credentials.egid)
-        } else {
-            0
-        }
-    } else {
-        LINUX_EPERM
+    match result {
+        Ok(()) if linux_process::set_live_process_credentials(pid, credentials) => 0,
+        Ok(()) => LINUX_ESRCH,
+        Err(ginux_credentials::Error::Permission) => LINUX_EPERM,
+        Err(ginux_credentials::Error::Invalid) => LINUX_EINVAL,
     }
 }
 
+/// setgroups(2): only a process that may switch ids sets its groups.
 fn linux_set_current_groups(size: u64, address: u64) -> u64 {
-    let Some(namespace) = current_linux_user_namespace() else {
+    let pid = current_linux_process_pid();
+    let (Some(namespace), Some(credentials)) = (
+        current_linux_user_namespace(),
+        linux_process::live_process_credentials(pid),
+    ) else {
         return LINUX_ESRCH;
     };
-    if !linux_user::setgroups_allowed(namespace) {
+    let authority = linux_user::identity_authority(namespace, &credentials);
+    if !authority.privileged {
         return LINUX_EPERM;
     }
-    let Some(credentials) = current_linux_credentials() else {
-        return LINUX_ESRCH;
+    let count = match usize::try_from(size as i32) {
+        Ok(count) if count <= ginux_credentials::GROUPS_LIMIT => count,
+        _ => return LINUX_EINVAL,
     };
-    match size {
-        0 => 0,
-        1 => {
-            let mut gid = [0_u8; size_of::<u32>()];
-            if !copy_from_linux_user(address, &mut gid) {
-                LINUX_EFAULT
-            } else if u32::from_ne_bytes(gid) == credentials.supplementary_gid {
-                0
-            } else {
-                LINUX_EPERM
-            }
-        }
-        _ => LINUX_EPERM,
+    let mut groups = Vec::new();
+    if groups.try_reserve_exact(count).is_err() {
+        return LINUX_ENOMEM;
     }
+    for index in 0..count {
+        let mut group = [0_u8; size_of::<u32>()];
+        if !copy_from_linux_user(address + (index * size_of::<u32>()) as u64, &mut group) {
+            return LINUX_EFAULT;
+        }
+        groups.push(u32::from_ne_bytes(group));
+    }
+    match ginux_credentials::set_groups(&mut groups, authority) {
+        Ok(()) if linux_process::set_live_process_groups(pid, groups) => 0,
+        Ok(()) => LINUX_ESRCH,
+        Err(ginux_credentials::Error::Permission) => LINUX_EPERM,
+        Err(ginux_credentials::Error::Invalid) => LINUX_EINVAL,
+    }
+}
+
+/// getgroups(2): the count when `size` is 0, else the sorted groups.
+fn linux_get_current_groups(size: u64, address: u64) -> u64 {
+    let Ok(size) = usize::try_from(size as i32) else {
+        return LINUX_EINVAL;
+    };
+    linux_process::with_live_process_groups(current_linux_process_pid(), |groups| {
+        if size == 0 {
+            return groups.len() as u64;
+        }
+        if size < groups.len() {
+            return LINUX_EINVAL;
+        }
+        let mut bytes = Vec::new();
+        if bytes
+            .try_reserve_exact(core::mem::size_of_val(groups))
+            .is_err()
+        {
+            return LINUX_ENOMEM;
+        }
+        bytes.extend(groups.iter().flat_map(|group| group.to_ne_bytes()));
+        if copy_to_linux_user(address, &bytes) {
+            groups.len() as u64
+        } else {
+            LINUX_EFAULT
+        }
+    })
+    .unwrap_or(LINUX_ESRCH)
 }
 
 #[derive(Clone, Copy)]
@@ -12959,9 +13095,8 @@ fn linux_waitid(id_type: u64, id: u64, information: u64, options: u64, rusage: u
     result[..4].copy_from_slice(&(LINUX_SIGCHLD as i32).to_ne_bytes());
     result[8..12].copy_from_slice(&code.to_ne_bytes());
     result[16..20].copy_from_slice(&pid.to_ne_bytes());
-    let uid = linux_process::live_process_user_namespace(pid)
-        .and_then(linux_user::credentials)
-        .map_or(0, |credentials| credentials.uid);
+    let uid =
+        linux_process::live_process_credentials(pid).map_or(0, |credentials| credentials.user.real);
     result[20..24].copy_from_slice(&uid.to_ne_bytes());
     result[24..28].copy_from_slice(&status.to_ne_bytes());
     if information != 0 && !copy_to_linux_user(information, &result) {
@@ -22171,19 +22306,14 @@ fn linux_ptrace_access_permitted(pid: u32) -> bool {
         return false;
     };
     let (Some(caller), Some(target)) = (
-        linux_user::credentials(caller_namespace),
-        linux_user::credentials(target_namespace),
+        current_linux_credentials(),
+        linux_process::live_process_credentials(pid),
     ) else {
         return false;
     };
     target_state.dumpable
         && caller_namespace == target_namespace
-        && [target.uid, target.euid, target.suid]
-            .into_iter()
-            .all(|uid| uid == caller.uid)
-        && [target.gid, target.egid, target.sgid]
-            .into_iter()
-            .all(|gid| gid == caller.gid)
+        && (caller.privileged() || linux_ids_match(&caller, &target))
 }
 
 fn linux_process_vm_remote_iov_ranges(
@@ -24993,7 +25123,13 @@ fn linux_rootfs_execve_source(
         _ => path,
     };
     let mut overlay_image = None;
+    let mut exec_file = None;
     if domain_exec_slot.is_none() {
+        exec_file = linux_exec_file_access(path);
+        if let Err(error) = linux_check_access(exec_file, ginux_credentials::access::EXECUTE, false)
+        {
+            return error;
+        }
         match linux_overlay_exec_image(path) {
             Ok(image) => overlay_image = image,
             Err(error) => return error,
@@ -25067,8 +25203,10 @@ fn linux_rootfs_execve_source(
         // PATH searches in libc try the next directory only on ENOENT, so a
         // missing file must not be reported as ENOEXEC.
         return match crate::published_rootfs::process_plan_failure(path) {
+            ProcessPlanFailure::ExecutableNotFound => {
+                linux_missing_path_error(path.strip_prefix(b"/").unwrap_or(path))
+            }
             ProcessPlanFailure::RootfsUnavailable
-            | ProcessPlanFailure::ExecutableNotFound
             | ProcessPlanFailure::ScriptInterpreterNotFound(_)
             | ProcessPlanFailure::DynamicLoaderNotFound(_) => LINUX_ENOENT,
             ProcessPlanFailure::NotRegularFile
@@ -25420,6 +25558,7 @@ fn linux_rootfs_execve_source(
     }
     release_linux_process_shared_mappings(current_linux_process_pid());
     linux_record_exec_image(&plan, path);
+    linux_apply_exec_credentials(exec_file);
     X86_RUNTIME
         .ELF_PROBE_MMAP_NEXT
         .store(LINUX_RUNTIME_DYNAMIC_MMAP_BASE, Ordering::SeqCst);
@@ -25540,6 +25679,48 @@ fn linux_absolute_exec_path(
 /// Reads an executable written at runtime into a kernel extent. Returns the
 /// extent and the file size, or `None` when absolute `path` does not name a
 /// file in the overlay.
+/// The file execve runs at absolute `path`: the overlay's, or the image's
+/// after following its symlinks.
+fn linux_exec_file_access(path: &[u8]) -> Option<ginux_credentials::FileAccess> {
+    if let Some(metadata) = path
+        .strip_prefix(b"/")
+        .and_then(crate::linux_overlay::lookup)
+        .filter(|metadata| metadata.kind != crate::linux_overlay::NodeKind::Symlink)
+    {
+        return Some(linux_overlay_file_access(metadata));
+    }
+    let (_, entry) = linux_rootfs_path_at(u64::from(LINUX_AT_FDCWD), path)?;
+    entry.map(|entry| ginux_credentials::FileAccess {
+        owner: entry.owner,
+        group: entry.group,
+        mode: entry.mode & 0o7777,
+        directory: entry.kind == crate::published_rootfs::EntryKind::Directory,
+    })
+}
+
+/// execve's credential change: a set-user-ID program makes its owner the
+/// effective user id, a set-group-ID (and group-executable) one its group
+/// the effective group id, when the domain maps that id; the saved and
+/// filesystem ids then follow the effective ones.
+fn linux_apply_exec_credentials(file: Option<ginux_credentials::FileAccess>) {
+    let pid = current_linux_process_pid();
+    let (Some(namespace), Some(mut credentials)) = (
+        current_linux_user_namespace(),
+        linux_process::live_process_credentials(pid),
+    ) else {
+        return;
+    };
+    let id_count = linux_user::identity_authority(namespace, &credentials).id_count;
+    let set_id = |bits: u32, id: fn(&ginux_credentials::FileAccess) -> u32| {
+        file.filter(|file| file.mode & bits == bits)
+            .map(|file| id(&file))
+            .filter(|id| *id < id_count)
+    };
+    credentials.user.exec(set_id(0o4000, |file| file.owner));
+    credentials.group.exec(set_id(0o2010, |file| file.group));
+    linux_process::set_live_process_credentials(pid, credentials);
+}
+
 fn linux_overlay_exec_image(path: &[u8]) -> Result<Option<(LinuxExecScratch, usize)>, u64> {
     let Some(metadata) = path
         .strip_prefix(b"/")
@@ -26770,18 +26951,13 @@ fn linux_copy_up_descriptor(descriptor: u64) -> Result<crate::linux_overlay::Han
     let handle = if let Some(metadata) = crate::linux_overlay::lookup(&path[..length]) {
         metadata.handle
     } else {
-        let mode = linux_rootfs_mode(entry) & 0o7777;
-        match entry.kind {
-            crate::published_rootfs::EntryKind::File
-            | crate::published_rootfs::EntryKind::Hardlink => {
-                crate::linux_overlay::create_file(&path[..length], mode, entry.data)
+        linux_copy_up_entry(&path[..length], entry).map_err(|error| {
+            if error == LINUX_EROFS {
+                LINUX_ENOSPC
+            } else {
+                error
             }
-            crate::published_rootfs::EntryKind::Directory => {
-                crate::linux_overlay::create_directory(&path[..length], mode)
-            }
-            crate::published_rootfs::EntryKind::Symlink => None,
-        }
-        .ok_or(LINUX_ENOSPC)?
+        })?
     };
     let generation = crate::linux_overlay::generation(handle);
     if let Some(slot) = usize::try_from(descriptor)
@@ -26863,7 +27039,186 @@ fn linux_canonical_path_at(
     if length == 0 {
         return Err(LINUX_EISDIR);
     }
+    // Root may search every directory; anyone else needs search permission
+    // on each directory the walk passes through.
+    if current_linux_credentials().is_some_and(|credentials| !credentials.filesystem_privileged()) {
+        linux_check_path_walk(&output[..length])?;
+    }
     Ok(length)
+}
+
+/// What the path walk finds at a directory prefix of a canonical path.
+enum LinuxWalkStep {
+    Directory(ginux_credentials::FileAccess),
+    NotDirectory,
+    /// A symlink, a kernel directory (/proc, /dev) or nothing: the walk
+    /// cannot judge it, and the lookup that follows reports what it finds.
+    Unknown,
+}
+
+fn linux_walk_step(prefix: &[u8]) -> LinuxWalkStep {
+    if let Some(metadata) = crate::linux_overlay::lookup(prefix) {
+        return match metadata.kind {
+            crate::linux_overlay::NodeKind::Directory => {
+                LinuxWalkStep::Directory(linux_overlay_file_access(metadata))
+            }
+            crate::linux_overlay::NodeKind::Symlink => LinuxWalkStep::Unknown,
+            _ => LinuxWalkStep::NotDirectory,
+        };
+    }
+    if crate::linux_overlay::hidden(prefix) {
+        return LinuxWalkStep::Unknown;
+    }
+    match crate::published_rootfs::lookup_at(crate::published_rootfs::ROOT_HANDLE, prefix) {
+        Some((_, Some(entry))) => match entry.kind {
+            crate::published_rootfs::EntryKind::Directory => {
+                LinuxWalkStep::Directory(ginux_credentials::FileAccess {
+                    owner: entry.owner,
+                    group: entry.group,
+                    mode: entry.mode & 0o7777,
+                    directory: true,
+                })
+            }
+            crate::published_rootfs::EntryKind::Symlink => LinuxWalkStep::Unknown,
+            _ => LinuxWalkStep::NotDirectory,
+        },
+        _ => LinuxWalkStep::Unknown,
+    }
+}
+
+/// The directories above the last component of canonical `path`, outermost
+/// first.
+fn linux_walk_prefixes(path: &[u8]) -> impl Iterator<Item = &[u8]> {
+    path.iter()
+        .enumerate()
+        .filter(|(_, byte)| **byte == b'/')
+        .map(|(index, _)| &path[..index])
+}
+
+/// Linux's path walk checks on the directories above the last component of
+/// canonical `path`: each must be a directory (ENOTDIR) the caller may
+/// search (EACCES).
+fn linux_check_path_walk(path: &[u8]) -> Result<(), u64> {
+    for prefix in linux_walk_prefixes(path) {
+        match linux_walk_step(prefix) {
+            LinuxWalkStep::Directory(directory) => {
+                linux_check_access(Some(directory), ginux_credentials::access::EXECUTE, false)?
+            }
+            LinuxWalkStep::NotDirectory => return Err(LINUX_ENOTDIR),
+            LinuxWalkStep::Unknown => return Ok(()),
+        }
+    }
+    Ok(())
+}
+
+/// The error for canonical `path` that does not exist: ENOTDIR when the
+/// walk passes through something that is not a directory, else ENOENT.
+/// Computed only on failure, so lookups that succeed pay nothing.
+fn linux_missing_path_error(path: &[u8]) -> u64 {
+    for prefix in linux_walk_prefixes(path) {
+        match linux_walk_step(prefix) {
+            LinuxWalkStep::Directory(_) => {}
+            LinuxWalkStep::NotDirectory => return LINUX_ENOTDIR,
+            LinuxWalkStep::Unknown => break,
+        }
+    }
+    LINUX_ENOENT
+}
+
+/// The owner, group and mode of the file at canonical `path`: the
+/// overlay's copy if there is one, else the image's. The kernel's own files
+/// (devices, /proc) and the root directory have none, and permission checks
+/// leave them alone.
+fn linux_path_access(path: &[u8]) -> Option<ginux_credentials::FileAccess> {
+    if let Some(metadata) = crate::linux_overlay::lookup(path) {
+        return Some(ginux_credentials::FileAccess {
+            owner: metadata.owner,
+            group: metadata.group,
+            mode: metadata.mode & 0o7777,
+            directory: metadata.kind == crate::linux_overlay::NodeKind::Directory,
+        });
+    }
+    if crate::linux_overlay::hidden(path) {
+        return None;
+    }
+    let (_, entry) =
+        crate::published_rootfs::lookup_at(crate::published_rootfs::ROOT_HANDLE, path)?;
+    let entry = entry?;
+    Some(ginux_credentials::FileAccess {
+        owner: entry.owner,
+        group: entry.group,
+        mode: entry.mode & 0o7777,
+        directory: entry.kind == crate::published_rootfs::EntryKind::Directory,
+    })
+}
+
+/// Checks that the current process may have `wanted` (bits of
+/// `ginux_credentials::access`) on `file`, judged by its filesystem ids, or
+/// by its real ids for access(2): EACCES if not.
+fn linux_check_access(
+    file: Option<ginux_credentials::FileAccess>,
+    wanted: u32,
+    real_ids: bool,
+) -> Result<(), u64> {
+    let (Some(file), Some(mut credentials)) = (file, current_linux_credentials()) else {
+        return Ok(());
+    };
+    if real_ids {
+        credentials.user.filesystem = credentials.user.real;
+        credentials.group.filesystem = credentials.group.real;
+    }
+    if credentials.filesystem_privileged() && wanted & ginux_credentials::access::EXECUTE == 0 {
+        return Ok(());
+    }
+    let allowed = linux_process::with_live_process_groups(current_linux_process_pid(), |groups| {
+        credentials.may_access(groups, file, wanted)
+    })
+    .unwrap_or(true);
+    if allowed {
+        Ok(())
+    } else {
+        Err(LINUX_EACCES)
+    }
+}
+
+/// Checks that the current process may have `wanted` on the file at
+/// canonical `path`.
+fn linux_check_path_access(path: &[u8], wanted: u32) -> Result<(), u64> {
+    linux_check_access(linux_path_access(path), wanted, false)
+}
+
+/// The directory holding canonical `path` (the root directory is empty).
+fn linux_parent_path(path: &[u8]) -> &[u8] {
+    path.iter()
+        .rposition(|byte| *byte == b'/')
+        .map_or(&[][..], |separator| &path[..separator])
+}
+
+/// Checks that the current process may add or remove the entry at
+/// canonical `path`: write and search permission on its directory, and in
+/// a sticky directory (removal only) ownership of the entry or directory,
+/// which fails with EPERM.
+fn linux_check_entry_change(path: &[u8], removal: bool) -> Result<(), u64> {
+    // A parent that is not a directory fails the path walk itself (ENOTDIR,
+    // ELOOP), which the caller reports.
+    let parent = linux_path_access(linux_parent_path(path)).filter(|parent| parent.directory);
+    linux_check_access(
+        parent,
+        ginux_credentials::access::WRITE | ginux_credentials::access::EXECUTE,
+        false,
+    )?;
+    let (Some(parent), Some(credentials)) = (parent, current_linux_credentials()) else {
+        return Ok(());
+    };
+    const STICKY: u32 = 0o1000;
+    if removal
+        && parent.mode & STICKY != 0
+        && !credentials.owns(parent)
+        && linux_path_access(path).is_some_and(|entry| !credentials.owns(entry))
+    {
+        return Err(LINUX_EPERM);
+    }
+    Ok(())
 }
 
 fn linux_overlay_parent_exists(path: &[u8]) -> bool {
@@ -26951,6 +27306,9 @@ fn linux_rootfs_stat(
 ) -> [u8; LINUX_STAT_SIZE] {
     let mode = entry.map_or(LINUX_STAT_DIRECTORY_MODE, linux_rootfs_mode);
     let mut stat = linux_stat(mode, linux_rootfs_inode(handle));
+    let (owner, group) = entry.map_or((0, 0), |entry| (entry.owner, entry.group));
+    stat[28..32].copy_from_slice(&owner.to_ne_bytes());
+    stat[32..36].copy_from_slice(&group.to_ne_bytes());
     let size = entry.map_or(0, |entry| entry.data.len() as u64);
     stat[48..56].copy_from_slice(&size.to_ne_bytes());
     stat[64..72].copy_from_slice(&size.div_ceil(512).to_ne_bytes());
@@ -26965,6 +27323,8 @@ fn linux_overlay_stat(metadata: crate::linux_overlay::Metadata) -> [u8; LINUX_ST
         crate::linux_overlay::NodeKind::Fifo => 0o010000,
     };
     let mut stat = linux_stat(kind | metadata.mode, metadata.handle.inode());
+    stat[28..32].copy_from_slice(&metadata.owner.to_ne_bytes());
+    stat[32..36].copy_from_slice(&metadata.group.to_ne_bytes());
     stat[48..56].copy_from_slice(&(metadata.size as u64).to_ne_bytes());
     stat[64..72].copy_from_slice(&(metadata.size as u64).div_ceil(512).to_ne_bytes());
     stat[72..80].copy_from_slice(&metadata.atime.0.to_ne_bytes());
@@ -27080,7 +27440,13 @@ fn linux_openat(directory: u64, path_address: u64, flags: u64, mode: u64) -> u64
     let mut canonical_length = if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
         match linux_canonical_path_at(directory, path, &mut canonical) {
             Ok(length) => Some(length),
-            Err(error) if flags & LINUX_O_CREAT != 0 => return error,
+            Err(error)
+                if flags & LINUX_O_CREAT != 0
+                    || error == LINUX_EACCES
+                    || error == LINUX_ENOTDIR =>
+            {
+                return error
+            }
             Err(_) => None,
         }
     } else {
@@ -27172,6 +27538,36 @@ fn linux_openat(directory: u64, path_address: u64, flags: u64, mode: u64) -> u64
     {
         return LINUX_EEXIST;
     }
+    if let Some(length) = canonical_length.filter(|_| flags & LINUX_O_PATH == 0) {
+        let path = &canonical[..length];
+        let check = if overlay_metadata.is_some() || rootfs_at_path.is_some() {
+            use ginux_credentials::access::{READ, WRITE};
+            let wanted = match access {
+                0 => READ,
+                1 => WRITE,
+                _ => READ | WRITE,
+            } | if flags & LINUX_O_TRUNC != 0 { WRITE } else { 0 };
+            // Only a file's owner or root may read it without updating its
+            // access time.
+            let noatime_denied = flags & LINUX_O_NOATIME != 0
+                && current_linux_credentials()
+                    .zip(linux_path_access(path))
+                    .is_some_and(|(credentials, file)| !credentials.owns(file));
+            linux_check_path_access(path, wanted).and(if noatime_denied {
+                Err(LINUX_EPERM)
+            } else {
+                Ok(())
+            })
+        } else if flags & LINUX_O_CREAT != 0 && !tmp_path && !virtual_device && !writable_proc_path
+        {
+            linux_check_entry_change(path, false)
+        } else {
+            Ok(())
+        };
+        if let Err(error) = check {
+            return error;
+        }
+    }
     if let Some(metadata) = overlay_metadata {
         overlay_handle = Some(metadata.handle);
         if flags & LINUX_O_TRUNC != 0
@@ -27210,10 +27606,10 @@ fn linux_openat(directory: u64, path_address: u64, flags: u64, mode: u64) -> u64
             return LINUX_EISDIR;
         }
         if rootfs_at_path.is_none() && flags & LINUX_O_CREAT == 0 {
-            return LINUX_ENOENT;
+            return linux_missing_path_error(&canonical[..length]);
         }
         if !linux_overlay_parent_exists(&canonical[..length]) {
-            return LINUX_ENOENT;
+            return linux_missing_path_error(&canonical[..length]);
         }
         let Some(handle) = crate::linux_overlay::create_file(
             &canonical[..length],
@@ -27235,7 +27631,7 @@ fn linux_openat(directory: u64, path_address: u64, flags: u64, mode: u64) -> u64
     {
         let length = canonical_length.unwrap_or(0);
         if !linux_overlay_parent_exists(&canonical[..length]) {
-            return LINUX_ENOENT;
+            return linux_missing_path_error(&canonical[..length]);
         }
         let Some(handle) = crate::linux_overlay::create_file(
             &canonical[..length],
@@ -27304,7 +27700,11 @@ fn linux_openat(directory: u64, path_address: u64, flags: u64, mode: u64) -> u64
                     .or_else(|| linux_runtime_file_kind(path))
                 {
                     Some(kind) => kind,
-                    None => return LINUX_ENOENT,
+                    None => {
+                        return canonical_length.map_or(LINUX_ENOENT, |length| {
+                            linux_missing_path_error(&canonical[..length])
+                        })
+                    }
                 },
                 Err(error) => return error,
             },
@@ -27832,7 +28232,10 @@ fn linux_mkdirat(directory: u64, path_address: u64, mode: u64) -> u64 {
         return LINUX_EEXIST;
     }
     if !linux_overlay_parent_exists(path) {
-        return LINUX_ENOENT;
+        return linux_missing_path_error(path);
+    }
+    if let Err(error) = linux_check_entry_change(path, false) {
+        return error;
     }
     let Some(directory_handle) = crate::linux_overlay::create_directory(
         path,
@@ -28005,7 +28408,10 @@ fn linux_mknodat(directory: u64, path_address: u64, mode: u64, device: u64) -> u
         return LINUX_EEXIST;
     }
     if !linux_overlay_parent_exists(path) {
-        return LINUX_ENOENT;
+        return linux_missing_path_error(path);
+    }
+    if let Err(error) = linux_check_entry_change(path, false) {
+        return error;
     }
     let permissions =
         (mode as u32) & 0o7777 & !(X86_RUNTIME.ELF_PROBE_UMASK.load(Ordering::SeqCst) as u32);
@@ -28043,7 +28449,10 @@ fn linux_symlinkat(target_address: u64, directory: u64, path_address: u64) -> u6
         return LINUX_EEXIST;
     }
     if !linux_overlay_parent_exists(path) {
-        return LINUX_ENOENT;
+        return linux_missing_path_error(path);
+    }
+    if let Err(error) = linux_check_entry_change(path, false) {
+        return error;
     }
     crate::linux_overlay::create_symlink(path, &target[..target_length]).map_or(LINUX_ENOSPC, |_| 0)
 }
@@ -28096,7 +28505,10 @@ fn linux_linkat(
         return LINUX_EEXIST;
     }
     if !linux_overlay_parent_exists(destination) {
-        return LINUX_ENOENT;
+        return linux_missing_path_error(destination);
+    }
+    if let Err(error) = linux_check_entry_change(destination, false) {
+        return error;
     }
     if let Some(source) = crate::linux_overlay::lookup(&old_canonical[..old_length]) {
         if source.kind == crate::linux_overlay::NodeKind::Directory {
@@ -28199,6 +28611,11 @@ fn linux_unlinkat(directory: u64, path_address: u64, flags: u64) -> u64 {
         Ok(length) => length,
         Err(error) => return error,
     };
+    if linux_path_access(&canonical[..length]).is_some() {
+        if let Err(error) = linux_check_entry_change(&canonical[..length], true) {
+            return error;
+        }
+    }
     let Some(metadata) = crate::linux_overlay::lookup(&canonical[..length]) else {
         return if crate::linux_overlay::hidden(&canonical[..length]) {
             LINUX_ENOENT
@@ -28214,7 +28631,7 @@ fn linux_unlinkat(directory: u64, path_address: u64, flags: u64) -> u64 {
                 LINUX_ENOSPC
             }
         } else {
-            LINUX_ENOENT
+            linux_missing_path_error(&canonical[..length])
         };
     };
     if flags == LINUX_AT_REMOVEDIR && metadata.kind != crate::linux_overlay::NodeKind::Directory {
@@ -28361,11 +28778,139 @@ fn linux_fchmod(descriptor: u64, mode: u64) -> u64 {
     }) {
         return LINUX_EPERM;
     }
-    if crate::linux_overlay::set_mode(handle, mode as u32) {
+    linux_overlay_chmod(handle, mode as u32)
+}
+
+fn linux_overlay_file_access(
+    metadata: crate::linux_overlay::Metadata,
+) -> ginux_credentials::FileAccess {
+    ginux_credentials::FileAccess {
+        owner: metadata.owner,
+        group: metadata.group,
+        mode: metadata.mode & 0o7777,
+        directory: metadata.kind == crate::linux_overlay::NodeKind::Directory,
+    }
+}
+
+/// chmod(2) on an overlay file: only its owner or root may change its mode,
+/// and a caller outside the file's group, unless root, cannot set its
+/// set-group-ID bit.
+fn linux_overlay_chmod(handle: crate::linux_overlay::Handle, mut mode: u32) -> u64 {
+    let Some(metadata) = crate::linux_overlay::metadata(handle) else {
+        return LINUX_EIO;
+    };
+    let file = linux_overlay_file_access(metadata);
+    if let Some(credentials) = current_linux_credentials() {
+        if !credentials.owns(file) {
+            return LINUX_EPERM;
+        }
+        let in_group =
+            linux_process::with_live_process_groups(current_linux_process_pid(), |groups| {
+                credentials.in_group(groups, file.group)
+            })
+            .unwrap_or(true);
+        if !credentials.filesystem_privileged() && !in_group {
+            mode &= !0o2000;
+        }
+    }
+    if crate::linux_overlay::set_mode(handle, mode) {
         0
     } else {
         LINUX_EIO
     }
+}
+
+/// chown(2) on an overlay file: root may give it any owner and group that
+/// exists, its owner only one of its own groups. Changing the owner of
+/// anything but a directory clears its set-user-ID bit, and its
+/// set-group-ID bit when group-executable.
+fn linux_overlay_chown(handle: crate::linux_overlay::Handle, owner: u32, group: u32) -> u64 {
+    let Some(metadata) = crate::linux_overlay::metadata(handle) else {
+        return LINUX_EIO;
+    };
+    let file = linux_overlay_file_access(metadata);
+    let (Some(namespace), Some(credentials)) =
+        (current_linux_user_namespace(), current_linux_credentials())
+    else {
+        return LINUX_ESRCH;
+    };
+    let id_count = linux_user::identity_authority(namespace, &credentials).id_count;
+    let unchanged = ginux_credentials::UNCHANGED;
+    if [owner, group]
+        .into_iter()
+        .any(|id| id != unchanged && id >= id_count)
+    {
+        return LINUX_EINVAL;
+    }
+    let permitted =
+        linux_process::with_live_process_groups(current_linux_process_pid(), |groups| {
+            credentials.may_chown(groups, file, owner, group)
+        })
+        .unwrap_or(false);
+    if !permitted {
+        return LINUX_EPERM;
+    }
+    let owner = if owner == unchanged {
+        file.owner
+    } else {
+        owner
+    };
+    let group = if group == unchanged {
+        file.group
+    } else {
+        group
+    };
+    let mut mode = file.mode;
+    if !file.directory {
+        mode &= !0o4000;
+        if mode & 0o010 != 0 {
+            mode &= !0o2000;
+        }
+    }
+    if crate::linux_overlay::set_owner(handle, owner, group)
+        && crate::linux_overlay::set_mode(handle, mode)
+    {
+        0
+    } else {
+        LINUX_EIO
+    }
+}
+
+/// The overlay file at canonical `path`, copied up from the image first if
+/// only the image has it.
+fn linux_copy_up_path(path: &[u8]) -> Result<crate::linux_overlay::Handle, u64> {
+    if let Some(metadata) = crate::linux_overlay::lookup(path) {
+        return Ok(metadata.handle);
+    }
+    if crate::linux_overlay::hidden(path) {
+        return Err(LINUX_ENOENT);
+    }
+    let (_, entry) = crate::published_rootfs::lookup_at(crate::published_rootfs::ROOT_HANDLE, path)
+        .ok_or(LINUX_ENOENT)?;
+    let entry = entry.ok_or(LINUX_EROFS)?;
+    linux_copy_up_entry(path, entry)
+}
+
+/// Copies the image's `entry` at canonical `path` into the overlay, keeping
+/// its mode and owner.
+fn linux_copy_up_entry(
+    path: &[u8],
+    entry: crate::published_rootfs::Entry<'_>,
+) -> Result<crate::linux_overlay::Handle, u64> {
+    let mode = linux_rootfs_mode(entry) & 0o7777;
+    let handle = match entry.kind {
+        crate::published_rootfs::EntryKind::File | crate::published_rootfs::EntryKind::Hardlink => {
+            crate::linux_overlay::create_file(path, mode, entry.data)
+        }
+        crate::published_rootfs::EntryKind::Directory => {
+            crate::linux_overlay::create_directory(path, mode)
+        }
+        crate::published_rootfs::EntryKind::Symlink => return Err(LINUX_EROFS),
+    }
+    .ok_or(LINUX_ENOSPC)?;
+    // The copy keeps the image file's owner, not its copier's.
+    crate::linux_overlay::set_owner(handle, entry.owner, entry.group);
+    Ok(handle)
 }
 
 fn linux_fchmodat(directory: u64, path_address: u64, mode: u64, flags: u64) -> u64 {
@@ -28385,30 +28930,18 @@ fn linux_fchmodat(directory: u64, path_address: u64, mode: u64, flags: u64) -> u
         Ok(length) => length,
         Err(error) => return error,
     };
-    if let Some(metadata) = crate::linux_overlay::lookup(&canonical[..length]) {
-        return if crate::linux_overlay::set_mode(metadata.handle, mode as u32) {
-            0
-        } else {
-            LINUX_EIO
-        };
-    }
-    if crate::published_rootfs::lookup_at(
-        crate::published_rootfs::ROOT_HANDLE,
-        &canonical[..length],
-    )
-    .is_some()
-    {
-        LINUX_EROFS
-    } else {
-        LINUX_ENOENT
+    match linux_copy_up_path(&canonical[..length]) {
+        Ok(handle) => linux_overlay_chmod(handle, mode as u32),
+        Err(error) => error,
     }
 }
 
 fn linux_fchown(descriptor: u64, uid: u64, gid: u64) -> u64 {
     let descriptor = u64::from(descriptor as u32);
-    let _uid = uid as u32;
-    let _gid = gid as u32;
-    linux_copy_up_descriptor(descriptor).map_or_else(|error| error, |_| 0)
+    match linux_copy_up_descriptor(descriptor) {
+        Ok(handle) => linux_overlay_chown(handle, uid as u32, gid as u32),
+        Err(error) => error,
+    }
 }
 
 fn linux_fchownat(directory: u64, path_address: u64, uid: u64, gid: u64, flags: u64) -> u64 {
@@ -28432,18 +28965,9 @@ fn linux_fchownat(directory: u64, path_address: u64, uid: u64, gid: u64, flags: 
         Ok(length) => length,
         Err(error) => return error,
     };
-    if crate::linux_overlay::lookup(&canonical[..length]).is_some() {
-        return 0;
-    }
-    if crate::published_rootfs::lookup_at(
-        crate::published_rootfs::ROOT_HANDLE,
-        &canonical[..length],
-    )
-    .is_some()
-    {
-        LINUX_EROFS
-    } else {
-        LINUX_ENOENT
+    match linux_copy_up_path(&canonical[..length]) {
+        Ok(handle) => linux_overlay_chown(handle, uid as u32, gid as u32),
+        Err(error) => error,
     }
 }
 
@@ -28877,6 +29401,7 @@ fn linux_utimensat(directory: u64, path_address: u64, times_address: u64, flags:
         .map(|(seconds, nanoseconds)| (seconds as i64, nanoseconds as i64))
         .unwrap_or((0, 0));
     let mut times = [now, now];
+    let mut only_now = true;
     if times_address != 0 {
         let mut input = [0_u8; 32];
         if !copy_from_linux_user(times_address, &mut input) {
@@ -28887,6 +29412,7 @@ fn linux_utimensat(directory: u64, path_address: u64, times_address: u64, flags:
             let seconds = i64::from_ne_bytes(input[offset..offset + 8].try_into().unwrap());
             let nanoseconds =
                 i64::from_ne_bytes(input[offset + 8..offset + 16].try_into().unwrap());
+            only_now &= nanoseconds == LINUX_UTIME_NOW;
             *time = match nanoseconds {
                 LINUX_UTIME_NOW => now,
                 LINUX_UTIME_OMIT if index == 0 => metadata.atime,
@@ -28896,7 +29422,26 @@ fn linux_utimensat(directory: u64, path_address: u64, times_address: u64, flags:
             };
         }
     }
+    if let Err(error) = linux_check_set_times(metadata, only_now) {
+        return error;
+    }
     linux_set_times(handle, times)
+}
+
+/// Who may set a file's times: its owner or root may set any; anyone who
+/// may write it may set them to now (EACCES); others none (EPERM).
+fn linux_check_set_times(
+    metadata: crate::linux_overlay::Metadata,
+    only_now: bool,
+) -> Result<(), u64> {
+    let file = linux_overlay_file_access(metadata);
+    if current_linux_credentials().is_none_or(|credentials| credentials.owns(file)) {
+        return Ok(());
+    }
+    if !only_now {
+        return Err(LINUX_EPERM);
+    }
+    linux_check_access(Some(file), ginux_credentials::access::WRITE, false)
 }
 
 fn linux_utime(path_address: u64, times_address: u64) -> u64 {
@@ -28904,6 +29449,12 @@ fn linux_utime(path_address: u64, times_address: u64) -> u64 {
         Ok(handle) => handle,
         Err(error) => return error,
     };
+    let Some(metadata) = crate::linux_overlay::metadata(handle) else {
+        return LINUX_ENOENT;
+    };
+    if let Err(error) = linux_check_set_times(metadata, times_address == 0) {
+        return error;
+    }
     let now = linux_realtime_time()
         .map(|(seconds, nanoseconds)| (seconds as i64, nanoseconds as i64))
         .unwrap_or((0, 0));
@@ -28928,6 +29479,12 @@ fn linux_utimes(directory: u64, path_address: u64, times_address: u64) -> u64 {
         Ok(handle) => handle,
         Err(error) => return error,
     };
+    let Some(metadata) = crate::linux_overlay::metadata(handle) else {
+        return LINUX_ENOENT;
+    };
+    if let Err(error) = linux_check_set_times(metadata, times_address == 0) {
+        return error;
+    }
     let now = linux_realtime_time()
         .map(|(seconds, nanoseconds)| (seconds as i64, nanoseconds as i64))
         .unwrap_or((0, 0));
@@ -29009,6 +29566,11 @@ fn linux_renameat(
     let Some(source) = crate::linux_overlay::lookup(&old_canonical[..old_length]) else {
         return LINUX_ENOENT;
     };
+    if let Err(error) = linux_check_entry_change(&old_canonical[..old_length], true)
+        .and_then(|()| linux_check_entry_change(&new_canonical[..new_length], true))
+    {
+        return error;
+    }
     let target = crate::linux_overlay::lookup(&new_canonical[..new_length]);
     if flags == RENAME_NOREPLACE
         && (target.is_some()
@@ -29021,7 +29583,7 @@ fn linux_renameat(
         return LINUX_EEXIST;
     }
     if !linux_overlay_parent_exists(&new_canonical[..new_length]) {
-        return LINUX_ENOENT;
+        return linux_missing_path_error(&new_canonical[..new_length]);
     }
     if target.is_some_and(|target| !crate::linux_overlay::unlink(target.handle)) {
         return LINUX_ENOTEMPTY;
@@ -29069,23 +29631,40 @@ fn linux_faccessat(directory: u64, path_address: u64, mode: u64, flags: u64) -> 
         };
         return if denied { LINUX_EACCES } else { 0 };
     }
+    // access(2) judges by the real ids, faccessat(AT_EACCESS) the effective.
+    let real_ids = flags & LINUX_AT_EACCESS == 0;
     let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
-    if let Ok(length) = linux_canonical_path_at(directory, path, &mut canonical) {
-        if let Some(metadata) = crate::linux_overlay::lookup(&canonical[..length]) {
-            let denied = mode & 4 != 0 && metadata.mode & 0o444 == 0
-                || mode & 2 != 0 && metadata.mode & 0o222 == 0
-                || mode & 1 != 0 && metadata.mode & 0o111 == 0;
-            return if denied { LINUX_EACCES } else { 0 };
+    let canonical_result = linux_canonical_path_at(directory, path, &mut canonical);
+    if let Err(error) = canonical_result {
+        if error == LINUX_EACCES || error == LINUX_ENOTDIR {
+            return error;
         }
     }
-    {
-        if let Some((_, entry)) = linux_rootfs_path_at(directory, path) {
-            let permissions = entry.map_or(0o555, |entry| entry.mode);
-            let denied = mode & 4 != 0 && permissions & 0o444 == 0
-                || mode & 2 != 0 && permissions & 0o222 == 0
-                || mode & 1 != 0 && permissions & 0o111 == 0;
-            return if denied { LINUX_EACCES } else { 0 };
+    if let Ok(length) = canonical_result {
+        if let Some(metadata) = crate::linux_overlay::lookup(&canonical[..length]) {
+            let file = linux_overlay_file_access(metadata);
+            return linux_check_access(Some(file), mode as u32, real_ids)
+                .map_or_else(|error| error, |()| 0);
         }
+    }
+    if let Some((_, entry)) = linux_rootfs_path_at(directory, path) {
+        // The image's root directory has no entry: r-x for everyone.
+        let file = entry.map_or(
+            ginux_credentials::FileAccess {
+                owner: 0,
+                group: 0,
+                mode: 0o755,
+                directory: true,
+            },
+            |entry| ginux_credentials::FileAccess {
+                owner: entry.owner,
+                group: entry.group,
+                mode: entry.mode & 0o7777,
+                directory: entry.kind == crate::published_rootfs::EntryKind::Directory,
+            },
+        );
+        return linux_check_access(Some(file), mode as u32, real_ids)
+            .map_or_else(|error| error, |()| 0);
     }
     let relative_kind = match linux_relative_path_kind(directory, path) {
         Ok(kind) => kind,
@@ -29118,7 +29697,11 @@ fn linux_faccessat(directory: u64, path_address: u64, mode: u64, flags: u64) -> 
             }
             return 0;
         }
-        _ => return LINUX_ENOENT,
+        _ => {
+            return canonical_result.map_or(LINUX_ENOENT, |length| {
+                linux_missing_path_error(&canonical[..length])
+            })
+        }
     };
     if !directory && mode & 1 != 0 || directory && mode & 2 != 0 {
         LINUX_EACCES
@@ -29197,6 +29780,8 @@ fn linux_statx(directory: u64, path_address: u64, flags: u64, mask: u64, stat_ad
             linux_statx_set_mount(&mut stat, LinuxFilesystemKind::Root);
             stat[4..8].copy_from_slice(&(PAGE_SIZE as u32).to_ne_bytes());
             stat[16..20].copy_from_slice(&1_u32.to_ne_bytes());
+            stat[20..24].copy_from_slice(&metadata.owner.to_ne_bytes());
+            stat[24..28].copy_from_slice(&metadata.group.to_ne_bytes());
             stat[28..30].copy_from_slice(&(mode as u16).to_ne_bytes());
             stat[32..40].copy_from_slice(&metadata.handle.inode().to_ne_bytes());
             stat[40..48].copy_from_slice(&size.to_ne_bytes());
@@ -29221,6 +29806,9 @@ fn linux_statx(directory: u64, path_address: u64, flags: u64, mask: u64, stat_ad
             linux_statx_set_mount(&mut stat, LinuxFilesystemKind::Root);
             stat[4..8].copy_from_slice(&(PAGE_SIZE as u32).to_ne_bytes());
             stat[16..20].copy_from_slice(&1_u32.to_ne_bytes());
+            let (owner, group) = entry.map_or((0, 0), |entry| (entry.owner, entry.group));
+            stat[20..24].copy_from_slice(&owner.to_ne_bytes());
+            stat[24..28].copy_from_slice(&group.to_ne_bytes());
             stat[28..30].copy_from_slice(&(mode as u16).to_ne_bytes());
             stat[32..40].copy_from_slice(&linux_rootfs_inode(handle).to_ne_bytes());
             stat[40..48].copy_from_slice(&size.to_ne_bytes());
@@ -29502,8 +30090,8 @@ fn linux_socket_pair(family: u64, socket_type: u64, protocol: u64, output: u64) 
         second,
         (
             current_linux_process_pid(),
-            credentials.uid,
-            credentials.gid,
+            credentials.user.effective,
+            credentials.group.effective,
         ),
     ) {
         let _ = crate::linux_socket::close(first);
@@ -29791,8 +30379,8 @@ fn linux_socket_sendto(
         }
         Some((
             current_linux_process_pid(),
-            credentials.uid,
-            credentials.gid,
+            credentials.user.effective,
+            credentials.group.effective,
         ))
     } else {
         None
@@ -30010,10 +30598,13 @@ fn linux_socket_sendmsg(descriptor: u64, message: u64, flags: u64) -> u64 {
                 let Some(credentials) = current_linux_credentials() else {
                     return LINUX_ESRCH;
                 };
+                let held = |ids: ginux_credentials::Ids, id: u32| {
+                    credentials.privileged() || [ids.real, ids.effective, ids.saved].contains(&id)
+                };
                 if pid < 0
                     || pid as u32 != current_linux_process_pid()
-                    || uid != credentials.uid
-                    || gid != credentials.gid
+                    || !held(credentials.user, uid)
+                    || !held(credentials.group, gid)
                 {
                     return LINUX_EPERM;
                 }
@@ -30037,8 +30628,8 @@ fn linux_socket_sendmsg(descriptor: u64, message: u64, flags: u64) -> u64 {
         }
         passed_credentials = Some((
             current_linux_process_pid(),
-            credentials.uid,
-            credentials.gid,
+            credentials.user.effective,
+            credentials.group.effective,
         ));
     }
     let mut bytes = [0_u8; PAGE_SIZE];
@@ -31329,35 +31920,12 @@ fn write_linux_decimal(mut value: u64, output: &mut [u8]) -> usize {
 /// The Uid and Gid lines of /proc/PID/status: real, effective, saved and
 /// filesystem ids (a domain has one identity, shared by its processes).
 fn append_linux_credentials_status(output: &mut [u8], used: &mut usize) -> bool {
-    let credentials = current_linux_credentials().unwrap_or(linux_user::Credentials {
-        uid: 0,
-        gid: 0,
-        euid: 0,
-        egid: 0,
-        suid: 0,
-        sgid: 0,
-        supplementary_gid: 0,
-    });
+    let credentials = current_linux_credentials().unwrap_or(linux_user::Credentials::ROOT);
     [
-        (
-            b"Uid:" as &[u8],
-            [
-                credentials.uid,
-                credentials.euid,
-                credentials.suid,
-                credentials.euid,
-            ],
-        ),
-        (
-            b"Gid:",
-            [
-                credentials.gid,
-                credentials.egid,
-                credentials.sgid,
-                credentials.egid,
-            ],
-        ),
+        (b"Uid:" as &[u8], credentials.user),
+        (b"Gid:", credentials.group),
     ]
+    .map(|(label, ids)| (label, [ids.real, ids.effective, ids.saved, ids.filesystem]))
     .into_iter()
     .all(|(label, ids)| {
         append_linux_bytes(output, used, label)
@@ -36652,7 +37220,8 @@ fn linux_tty_ioctl(request: u64, argument: u64) -> u64 {
             }
             let owner = X86_RUNTIME.LINUX_TTY_SESSION.load(Ordering::SeqCst);
             let privileged_force = argument == 1
-                && current_linux_credentials().is_some_and(|credentials| credentials.euid == 0);
+                && current_linux_credentials()
+                    .is_some_and(|credentials| credentials.user.effective == 0);
             if owner != 0 && owner != session && !privileged_force {
                 return LINUX_EPERM;
             }
@@ -36747,7 +37316,9 @@ fn linux_tty_ioctl(request: u64, argument: u64) -> u64 {
             }
         }
         LINUX_TIOCVHANGUP => {
-            if current_linux_credentials().is_some_and(|credentials| credentials.euid == 0) {
+            if current_linux_credentials()
+                .is_some_and(|credentials| credentials.user.effective == 0)
+            {
                 X86_RUNTIME.LINUX_TTY_SESSION.store(0, Ordering::SeqCst);
                 X86_RUNTIME
                     .LINUX_TTY_FOREGROUND_GROUP
@@ -37062,11 +37633,10 @@ fn linux_writable_proc_file(state: u16) -> bool {
 }
 
 fn linux_user_namespace_file(state: u16) -> Option<&'static [u8]> {
-    current_linux_user_namespace()?;
+    let namespace = current_linux_user_namespace()?;
     match state & !3 {
-        LINUX_FILE_PROC_UID_MAP => Some(linux_user::UID_MAP),
-        LINUX_FILE_PROC_GID_MAP => Some(linux_user::GID_MAP),
-        LINUX_FILE_PROC_SETGROUPS => Some(linux_user::SETGROUPS),
+        LINUX_FILE_PROC_UID_MAP | LINUX_FILE_PROC_GID_MAP => Some(linux_user::id_map(namespace)),
+        LINUX_FILE_PROC_SETGROUPS => Some(linux_user::setgroups_file(namespace)),
         _ => None,
     }
 }
@@ -38442,7 +39012,7 @@ fn linux_descriptor_fcntl(descriptor: u64, command: u64, argument: u64) -> u64 {
             LINUX_F_SETPIPE_SZ if state & LINUX_DEVICE_PIPE != 0 => {
                 let requested = u64::from(argument as u32);
                 if requested > LINUX_PIPE_MAX_SIZE
-                    && !current_linux_credentials().is_some_and(|value| value.euid == 0)
+                    && !current_linux_credentials().is_some_and(|value| value.user.effective == 0)
                 {
                     return LINUX_EPERM;
                 }
@@ -39365,20 +39935,24 @@ fn linux_prlimit_permitted(pid: u32) -> bool {
     if pid == current_linux_process_pid() {
         return true;
     }
-    let Some(caller) = current_linux_credentials() else {
+    let (Some(caller), Some(target)) = (
+        current_linux_credentials(),
+        linux_process::live_process_credentials(pid),
+    ) else {
         return false;
     };
-    let Some(target) =
-        linux_process::live_process_user_namespace(pid).and_then(linux_user::credentials)
-    else {
-        return false;
-    };
-    [caller.uid, caller.euid, caller.suid]
-        .into_iter()
-        .all(|caller_id| caller_id == target.uid)
-        && [caller.gid, caller.egid, caller.sgid]
+    caller.privileged() || linux_ids_match(&caller, &target)
+}
+
+/// Every user and group id of `target` is `caller`'s real one: what ptrace
+/// and prlimit require of a caller without the capability.
+fn linux_ids_match(caller: &linux_user::Credentials, target: &linux_user::Credentials) -> bool {
+    let all_are = |ids: ginux_credentials::Ids, id: u32| {
+        [ids.real, ids.effective, ids.saved]
             .into_iter()
-            .all(|caller_id| caller_id == target.gid)
+            .all(|candidate| candidate == id)
+    };
+    all_are(target.user, caller.user.real) && all_are(target.group, caller.group.real)
 }
 
 fn verify_linux_cross_process_prlimit(pid: u32) -> bool {
@@ -39996,7 +40570,7 @@ fn linux_priority_targets(
         LINUX_PRIO_PGRP if who == 0 => {
             linux_process::live_process_group(current_pid).ok_or(LINUX_ESRCH)?
         }
-        LINUX_PRIO_USER if who == 0 => current_credentials.uid,
+        LINUX_PRIO_USER if who == 0 => current_credentials.user.real,
         _ => who,
     };
     let mut targets = [0_u32; linux_process::PROCESS_LIMIT];
@@ -40008,9 +40582,8 @@ fn linux_priority_targets(
         let selected = match which {
             LINUX_PRIO_PROCESS => pid == if selector == 0 { current_pid } else { selector },
             LINUX_PRIO_PGRP => linux_process::live_process_group(pid) == Some(selector),
-            LINUX_PRIO_USER => linux_process::live_process_user_namespace(pid)
-                .and_then(linux_user::credentials)
-                .is_some_and(|credentials| credentials.uid == selector),
+            LINUX_PRIO_USER => linux_process::live_process_credentials(pid)
+                .is_some_and(|credentials| credentials.user.real == selector),
             _ => false,
         };
         if selected {
@@ -40101,20 +40674,20 @@ fn linux_setpriority(which: u64, who: u64, priority: u64) -> u64 {
     };
     let mut result = LINUX_ESRCH;
     for pid in targets[..count].iter().copied() {
-        let Some(namespace) = linux_process::live_process_user_namespace(pid) else {
-            continue;
-        };
-        let Some(target) = linux_user::credentials(namespace) else {
+        let Some(target) = linux_process::live_process_credentials(pid) else {
             continue;
         };
         let Some(current) = linux_process_nice(pid) else {
             continue;
         };
-        if caller.euid != 0 && caller.euid != target.uid && caller.euid != target.euid {
+        if !caller.privileged()
+            && caller.user.effective != target.user.real
+            && caller.user.effective != target.user.effective
+        {
             result = LINUX_EPERM;
             continue;
         }
-        if caller.euid != 0 && encoded < current {
+        if !caller.privileged() && encoded < current {
             result = LINUX_EACCES;
             continue;
         }
@@ -40375,13 +40948,11 @@ fn linux_ioprio_set(which: u64, who: u64, priority: u64) -> u64 {
         return LINUX_ESRCH;
     };
     for pid in targets[..count].iter().copied() {
-        let Some(namespace) = linux_process::live_process_user_namespace(pid) else {
+        let Some(target) = linux_process::live_process_credentials(pid) else {
             return LINUX_ESRCH;
         };
-        let Some(target) = linux_user::credentials(namespace) else {
-            return LINUX_ESRCH;
-        };
-        if caller.euid != 0 && caller.euid != target.uid || caller.euid != 0 && class == 1 {
+        let owner = [caller.user.real, caller.user.effective].contains(&target.user.real);
+        if !caller.privileged() && (!owner || class == 1) {
             return LINUX_EPERM;
         }
     }
@@ -40980,7 +41551,11 @@ fn linux_statfs(path_address: u64, stat_address: u64) -> u64 {
     let path = &path[..length];
     let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
     let canonical_length =
-        linux_canonical_path_at(u64::from(LINUX_AT_FDCWD), path, &mut canonical).ok();
+        match linux_canonical_path_at(u64::from(LINUX_AT_FDCWD), path, &mut canonical) {
+            Ok(length) => Some(length),
+            Err(error) if error == LINUX_EACCES || error == LINUX_ENOTDIR => return error,
+            Err(_) => None,
+        };
     let canonical_is_proc = canonical_length.is_some_and(|length| {
         &canonical[..length] == b"proc" || canonical[..length].starts_with(b"proc/")
     });
@@ -40998,7 +41573,9 @@ fn linux_statfs(path_address: u64, stat_address: u64) -> u64 {
         && !canonical_is_proc
         && !canonical_is_cgroup
     {
-        return LINUX_ENOENT;
+        return canonical_length.map_or(LINUX_ENOENT, |length| {
+            linux_missing_path_error(&canonical[..length])
+        });
     }
     let kind = if virtual_path.is_some() || canonical_is_proc {
         LinuxFilesystemKind::Proc
@@ -41080,7 +41657,7 @@ fn linux_mount_filesystem(
             namespace,
             linux_user::PrivilegedOperation::ManageMounts,
         )
-        || current_linux_credentials().is_none_or(|credentials| credentials.euid != 0)
+        || current_linux_credentials().is_none_or(|credentials| credentials.user.effective != 0)
     {
         return LINUX_EPERM;
     }
@@ -44585,7 +45162,20 @@ fn container_control(domain_id: u64, capability: u64, frame: *mut UserTrapFrame)
         control_abi::DOMAIN_SET_AUTOSTART
             if configurable_container(requested_slot) && read_u64_at(&request, 24) <= 1 =>
         {
-            update_container_autostart(requested_slot.unwrap_or(0), read_u64_at(&request, 24) == 1)
+            update_container_flag(
+                requested_slot.unwrap_or(0),
+                control_abi::DOMAIN_CONFIG_AUTOSTART,
+                read_u64_at(&request, 24) == 1,
+            )
+        }
+        control_abi::DOMAIN_SET_USER_SWITCHING
+            if configurable_container(requested_slot) && read_u64_at(&request, 24) <= 1 =>
+        {
+            update_container_flag(
+                requested_slot.unwrap_or(0),
+                control_abi::DOMAIN_CONFIG_USER_SWITCHING,
+                read_u64_at(&request, 24) == 1,
+            )
         }
         control_abi::DOMAIN_SET_IMAGE
             if configurable_container(requested_slot)
@@ -45204,15 +45794,25 @@ fn update_container_configuration(slot: usize, flag: u16) -> u64 {
     state
 }
 
-fn update_container_autostart(slot: usize, enabled: bool) -> u64 {
+/// Turns a yes-or-no domain setting (autostart, user switching) on or off.
+fn update_container_flag(slot: usize, flag: u16, enabled: bool) -> u64 {
     if enabled {
-        X86_RUNTIME.CONTAINER_CONFIG_FLAGS[slot]
-            .fetch_or(control_abi::DOMAIN_CONFIG_AUTOSTART, Ordering::SeqCst);
+        X86_RUNTIME.CONTAINER_CONFIG_FLAGS[slot].fetch_or(flag, Ordering::SeqCst);
     } else {
-        X86_RUNTIME.CONTAINER_CONFIG_FLAGS[slot]
-            .fetch_and(!control_abi::DOMAIN_CONFIG_AUTOSTART, Ordering::SeqCst);
+        X86_RUNTIME.CONTAINER_CONFIG_FLAGS[slot].fetch_and(!flag, Ordering::SeqCst);
     }
     update_container_configuration(slot, 0)
+}
+
+/// The domain in `slot` was configured with `user-switching=true`; read
+/// only by `linux_user::user_switching_allowed`.
+pub(crate) fn container_user_switching(slot: usize) -> bool {
+    X86_RUNTIME
+        .CONTAINER_CONFIG_FLAGS
+        .get(slot)
+        .is_some_and(|flags| {
+            flags.load(Ordering::Acquire) & control_abi::DOMAIN_CONFIG_USER_SWITCHING != 0
+        })
 }
 
 fn write_container_request(

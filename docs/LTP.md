@@ -132,13 +132,15 @@ Counts are tests, from the baseline (B) and the variant (V); the logs are
    ginux: Linux user fault vector/error/address/rip:14 6 18446744071616660459 4406038
    ginux: Linux init execution failed; domain marked failed
    ```
-3. **Root cannot change credentials** (B 15, V 38): `setuid`, `seteuid`,
-   `setgid`, `setreuid`, `setregid`, `setgroups`, `setfsgid` return `EPERM`
-   for uid 0. The compatibility ledger lists these as Policy-denied, but
-   tests (and daemons) that drop to `nobody` cannot run: `access01..03`,
-   `creat04`, `execve02`, `msgget02`, `ptrace02`, `readlink01`, `semget02`,
-   `kill05`, `mlockall02/03`, `getgroups03`, `fcntl18`, `dirtyc0w`. `access01`
-   (V): `access01.c:256: TBROK: setuid(65534) failed: EPERM (1)`.
+3. ~~**Root cannot change credentials**~~ (B 15, V 38; fixed 2026-11-01):
+   each process now has real, effective, saved and filesystem ids and
+   supplementary groups (`crates/credentials`), files have owners, and opens,
+   creates, removals, chmod, chown, utimes, access(2) and exec check them.
+   Root may switch ids only in a domain set `user-switching=true`, the one
+   flag that grants it (`linux_user::user_switching_allowed`); the LTP
+   driver sets it. `setgroups03` still fails: LTP built for musl expects
+   `setgroups(33, ...)` to fail because musl's `NGROUPS` is 32, while
+   Linux (and Ginux) allow 65536.
 4. **A signal-killed child is reported as a normal exit with status 128+N**,
    and **a parent's `alarm` reaches its child** (V 27 at exactly 30 s; B
    `kill12`). `waitpid` gives `WIFEXITED` with 137 for `SIGKILL`, 139 for
@@ -346,10 +348,11 @@ test permanently write `!TAG COMMAND  # reason`. To run the device tests
 again (once Ginux has loop devices), delete the rule from `SKIP_RULES` in
 `tools/ltp/make-list.py`.
 
-Tests of Policy-denied operations (changing credentials, setting the clock;
-see [LINUX-COMPATIBILITY.md](LINUX-COMPATIBILITY.md)) are deliberately not
-skipped yet: whether a domain's root may drop to `nobody` is a decision, and
-many programs need it. Once decided, mark them with a curated reason, e.g.
+Tests of Policy-denied operations (setting the clock, loading modules; see
+[LINUX-COMPATIBILITY.md](LINUX-COMPATIBILITY.md)) are deliberately not
+skipped yet. Changing credentials is decided: a domain's root may switch
+users only with `user-switching=true`, which the LTP domain sets. Mark a
+denied operation's tests with a curated reason, e.g.
 `!clock_settime01 clock_settime01  # setting the clock is denied in domains`.
 
 To investigate one test, run it alone (`--tests NAME`) and read

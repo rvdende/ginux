@@ -331,7 +331,7 @@ pub(super) fn linux_signal_instance() -> usize {
 pub(super) fn linux_signal_sender() -> (u32, u32) {
     (
         current_linux_process_pid(),
-        current_linux_credentials().map_or(0, |credentials| credentials.uid),
+        current_linux_credentials().map_or(0, |credentials| credentials.user.real),
     )
 }
 
@@ -1383,14 +1383,12 @@ pub(super) fn linux_signal_permitted(target: u32, signal: u64) -> bool {
         return false;
     }
     let (Some(caller), Some(target)) = (
-        linux_user::credentials(caller_namespace),
-        linux_user::credentials(target_namespace),
+        current_linux_credentials(),
+        linux_process::live_process_credentials(target),
     ) else {
         return false;
     };
-    [caller.uid, caller.euid]
-        .into_iter()
-        .any(|sender| sender == target.uid || sender == target.suid)
+    caller.may_signal(&target)
 }
 
 pub(super) fn linux_target_signal_ignored(target: u32, signal: u64) -> bool {

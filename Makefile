@@ -332,6 +332,8 @@ check: manifest architecture-check linux-compat-check
 	@cargo test --package ginux-image-store
 	@cargo clippy --package ginux-runtime-memory -- -D warnings
 	@cargo test --package ginux-runtime-memory
+	@cargo clippy --package ginux-credentials --all-targets -- -D warnings
+	@cargo test --package ginux-credentials
 	@cargo clippy --package ginux-memory-areas --all-targets -- -D warnings
 	@cargo test --package ginux-memory-areas
 	@cargo clippy --package ginux-usb-audio --all-targets -- -D warnings

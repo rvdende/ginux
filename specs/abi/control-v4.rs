@@ -33,6 +33,7 @@ pub const DOMAIN_ATTACH: u64 = 12;
 pub const DOMAIN_SET_PERSONALITY: u64 = 13;
 pub const DOMAIN_POLL_BACKGROUND: u64 = 14;
 pub const DOMAIN_EXEC: u64 = 15;
+pub const DOMAIN_SET_USER_SWITCHING: u64 = 16;
 pub const DOMAIN_EXEC_REQUEST_SIZE: usize = 40;
 pub const DOMAIN_EXEC_REQUEST_VERSION: u16 = 0;
 pub const DOMAIN_EXEC_INTERACTIVE: u16 = 1 << 0;
@@ -51,6 +52,9 @@ pub const DOMAIN_CONFIG_MEMORY: u16 = 1 << 2;
 pub const DOMAIN_CONFIG_AUTOSTART: u16 = 1 << 3;
 pub const DOMAIN_CONFIG_IMAGE: u16 = 1 << 4;
 pub const DOMAIN_CONFIG_PERSONALITY: u16 = 1 << 5;
+/// Root in the domain may switch to other user and group ids (setuid and
+/// relatives); off by default, so every process in a domain stays root.
+pub const DOMAIN_CONFIG_USER_SWITCHING: u16 = 1 << 6;
 pub const DOMAIN_CONFIG_COMPLETE: u16 = DOMAIN_CONFIG_INIT
     | DOMAIN_CONFIG_CPU
     | DOMAIN_CONFIG_MEMORY

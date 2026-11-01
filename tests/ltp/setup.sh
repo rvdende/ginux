@@ -12,7 +12,7 @@ fail() {
     exit 1
 }
 
-mkdir -p /opt /tmp/ltp || fail mkdir
+mkdir -p /opt /tmp/ltp && chmod 1777 /tmp/ltp || fail mkdir
 if [ ! -f /opt/ltp/runtest/syscalls ]; then
     wget -q -O - "$base/ltp.tar.xz" | xzcat | tar -xf - -C /opt
     [ -f /opt/ltp/runtest/syscalls ] || fail "LTP tree download or extraction"

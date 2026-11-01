@@ -42,7 +42,7 @@ Detailed bounded behavior for implemented calls lives in
 The matrix must be updated in the same commit whenever syscall dispatch or its
 documented behavior changes.
 
-Current totals: **82 Complete**, **245 Partial**, **48 Policy-denied**, **0 Missing**.
+Current totals: **91 Complete**, **244 Partial**, **40 Policy-denied**, **0 Missing**.
 
 ## Current stopping point
 
@@ -87,7 +87,7 @@ positive, negative, lifecycle, and cleanup tests pass.
 | Runtime `mmap` | Partial | Page-table-backed anonymous and OCI file mappings, writable overlay-file `MAP_SHARED` mappings with `msync`/unmap writeback and fork inheritance, memfd `MAP_SHARED` mappings of the file's own page frames (coherent across processes and with `read`/`write` without `msync`; frames stay allocated until domain teardown), fixed placement, in-place growth/shrink and movable anonymous `mremap`, protection changes, unmap, `madvise`, and `mincore` support Alpine and the validated Rocky glibc/coreutils path. SysV shared-memory pages remain shared across process hierarchy cloning. NUMA policy calls expose the current single node, validate node-0 masks, and make node-0 placement/migration operations explicit no-ops. Shared writeback currently occurs at page granularity; `MREMAP_DONTUNMAP`, movable file mappings, multi-node NUMA policy, and full Linux page-cache coherency remain incomplete. |
 | `/dev` and terminal ABI | Partial | Selected console/device nodes and bounded termios/winsize ioctls. `/dev/fb0` exposes the firmware framebuffer, or a virtio-gpu surface (docs/GRAPHICS.md), through fbdev (`FBIOGET_VSCREENINFO`/`FBIOPUT_VSCREENINFO`/`FBIOGET_FSCREENINFO`, pan/blank/vsync as no-ops, read/write and `MAP_SHARED` mmap); `/dev/input/event0`-`event3` deliver evdev records from USB keyboards, boot mice and QEMU's tablet with poll readiness and the `EVIOCG*` identity, bit, name and absolute-axis queries. Empty evdev reads return `EAGAIN` instead of blocking, `/dev/input` cannot be listed, and the fbdev mode is fixed at boot (the firmware's, or the one the virtio-gpu host asks for). |
 | `/sys` | Missing | No Linux-compatible sysfs contract. |
-| Credentials and user namespaces | Partial | Container-scoped identity and hard privilege boundary; many mutation calls are policy-denied. |
+| Credentials and user namespaces | Partial | Each process has real, effective, saved and filesystem user and group ids and supplementary groups, inherited across fork and kept across exec (set-user-ID and set-group-ID programs apply); the `set*id`, `setfs*id`, `setgroups` and `getgroups` calls follow Linux's rules (`crates/credentials`). Root in a domain may take other ids only when the domain is set `user-switching=true`, the one flag that grants it: its user namespace then maps ids 0-65535 (`/proc/PID/uid_map` `0 100000 65536`, `setgroups` `allow`); otherwise it maps only 0 and every process stays root. Files have owners and groups (from the image's tar headers, else their creator's filesystem ids); open, create, remove, rename, chmod, chown, utimes, access(2) and exec check the owner, group and other permission bits, root's override, and sticky directories. Path-walk search permission, capabilities other than those implied by uid 0, and nested user-namespace id maps remain incomplete. |
 | Mount and namespace APIs | Partial | Container roots are kernel-created; `listmount` and `statmount` enumerate and describe the domain root and automatic proc mount. General mount, chroot, pivot, unshare, and setns are policy-denied. |
 | Socket API | Partial | Linux TCP/UDP sockets use the kernel network stack and survive the connection churn of OCI and DNF downloads; TCP server sockets, deterministic same-domain TCP connections with a requested-backlog pending queue, repeated `accept`/`accept4`, local `socketpair`, stream half-close, `SIGPIPE`/`MSG_NOSIGNAL`, nondestructive `MSG_PEEK`, stream `MSG_WAITALL`, Linux UDP `MSG_TRUNC` reporting, multi-descriptor AF_UNIX `SCM_RIGHTS` for sockets and files (a passed file gets its own descriptor with the sender's open state, such as a memfd), negative `listen` backlogs meaning the maximum, verified AF_UNIX `SCM_CREDENTIALS`/`SO_PASSCRED` and `SO_PEERCRED`, `MSG_CMSG_CLOEXEC`/`MSG_CTRUNC`, stateful `SO_REUSEADDR`, `SO_KEEPALIVE`, `SO_RCVTIMEO`, `SO_SNDTIMEO`, `IP_RECVERR`, and `TCP_NODELAY`, plus live type/protocol/domain/listener queries are supported. AF_UNIX stream connect now creates a queued server endpoint immediately, allowing pre-`accept` writes, and successful local writes provide a cooperative server scheduling point. Connected named-socket peer credentials remain incomplete. IPv6, general ancillary data, interruptible socket waits, multi-entry external-network listen backlogs, and the full option surface remain pending. |
 | cgroups | Missing | No Linux cgroup filesystem or ABI. |
@@ -566,25 +566,25 @@ therefore omitted.
 | 102 | getuid | Complete |
 | 103 | syslog | Policy-denied |
 | 104 | getgid | Complete |
-| 105 | setuid | Policy-denied |
-| 106 | setgid | Policy-denied |
+| 105 | setuid | Complete |
+| 106 | setgid | Complete |
 | 107 | geteuid | Complete |
 | 108 | getegid | Complete |
 | 109 | setpgid | Partial |
 | 110 | getppid | Complete |
 | 111 | getpgrp | Complete |
 | 112 | setsid | Partial |
-| 113 | setreuid | Policy-denied |
-| 114 | setregid | Policy-denied |
+| 113 | setreuid | Complete |
+| 114 | setregid | Complete |
 | 115 | getgroups | Complete |
-| 116 | setgroups | Partial |
-| 117 | setresuid | Policy-denied |
+| 116 | setgroups | Complete |
+| 117 | setresuid | Complete |
 | 118 | getresuid | Complete |
-| 119 | setresgid | Policy-denied |
+| 119 | setresgid | Complete |
 | 120 | getresgid | Complete |
 | 121 | getpgid | Complete |
-| 122 | setfsuid | Policy-denied |
-| 123 | setfsgid | Policy-denied |
+| 122 | setfsuid | Complete |
+| 123 | setfsgid | Complete |
 | 124 | getsid | Complete |
 | 125 | capget | Partial |
 | 126 | capset | Partial |

@@ -15,7 +15,9 @@ through a Linux ABI personality. It is not a rewrite of Linux:
   isolation as a first-class design (domains with their own roots,
   capabilities and lifecycle), drivers and protocol services in separate
   ring-3 domains with IOMMU-confined DMA, and measured, signed boot inputs and
-  verified OCI roots.
+  verified OCI roots. Root in a domain may switch to other user ids only when
+  the domain is set `user-switching=true`: one flag, checked in one place
+  (`linux_user::user_switching_allowed`), so it is the single point to secure.
 - **Small trusted core.** Confine `unsafe` to a minimal layer (page tables,
   context switch, MMIO, DMA) with documented invariants; everything above it
   is safe Rust (the "framekernel" idea).

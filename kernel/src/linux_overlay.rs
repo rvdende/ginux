@@ -7,7 +7,7 @@ use core::cell::UnsafeCell;
 
 const PAGE_SIZE: usize = 4096;
 pub(crate) const PATH_CAPACITY: usize = 256;
-const NODE_COUNT: usize = 10;
+const NODE_COUNT: usize = 9;
 const MAPPING_COUNT: usize = 100;
 const DATA_CAPACITY: usize = PAGE_SIZE - core::mem::size_of::<FrameLease>();
 const FRAME_INDEX_CAPACITY: usize = PAGE_SIZE / core::mem::size_of::<FrameLease>() - 1;
@@ -40,6 +40,8 @@ pub(crate) struct Metadata {
     pub(crate) handle: Handle,
     pub(crate) kind: NodeKind,
     pub(crate) mode: u32,
+    pub(crate) owner: u32,
+    pub(crate) group: u32,
     pub(crate) size: usize,
     pub(crate) atime: (i64, i64),
     pub(crate) mtime: (i64, i64),
@@ -139,6 +141,8 @@ struct Node {
     kind: NodeKind,
     path_length: u16,
     mode: u32,
+    owner: u32,
+    group: u32,
     /// A memfd's seals (F_SEAL_*, which all fit a byte).
     seals: u8,
     /// The pipe socket behind a FIFO, plus one; 0 before one opens it.
@@ -170,6 +174,8 @@ impl Node {
         kind: NodeKind::File,
         path_length: 0,
         mode: 0,
+        owner: 0,
+        group: 0,
         seals: 0,
         fifo_socket: 0,
         handle: Handle {
@@ -198,6 +204,8 @@ impl Node {
             handle: self.handle,
             kind: self.kind,
             mode: self.mode,
+            owner: self.owner,
+            group: self.group,
             size: self.size,
             atime: self.atime,
             mtime: self.mtime,
@@ -719,6 +727,10 @@ fn create(path: &[u8], kind: NodeKind, mode: u32, initial: &[u8]) -> Option<Hand
     let mut stored_path = [0_u8; PATH_CAPACITY];
     stored_path[..path.len()].copy_from_slice(path);
     let handle = Handle { generation, inode };
+    // A new file belongs to its creator, or to a set-group-ID directory's
+    // group.
+    let (owner, group, mode) =
+        cpu::linux_new_file_identity(path, kind == NodeKind::Directory, mode);
     *node = Node {
         active: true,
         linked: true,
@@ -727,6 +739,8 @@ fn create(path: &[u8], kind: NodeKind, mode: u32, initial: &[u8]) -> Option<Hand
         kind,
         path_length: path.len() as u16,
         mode: mode & 0o7777,
+        owner,
+        group,
         seals: 0,
         fifo_socket: 0,
         handle,
@@ -795,6 +809,8 @@ pub(crate) fn whiteout(path: &[u8]) -> bool {
         kind: NodeKind::File,
         path_length: path.len() as u16,
         mode: 0,
+        owner: 0,
+        group: 0,
         seals: 0,
         fifo_socket: 0,
         handle: Handle { generation, inode },
@@ -973,6 +989,15 @@ pub(crate) fn set_mode(handle: Handle, mode: u32) -> bool {
         return false;
     };
     node.mode = mode & 0o7777;
+    true
+}
+
+pub(crate) fn set_owner(handle: Handle, owner: u32, group: u32) -> bool {
+    let Some(node) = node_mut(handle) else {
+        return false;
+    };
+    node.owner = owner;
+    node.group = group;
     true
 }
 

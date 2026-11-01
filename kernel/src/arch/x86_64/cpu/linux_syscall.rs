@@ -1090,33 +1090,17 @@ pub(super) extern "sysv64" fn linux_syscall_handler(
         }
         LINUX_GET_ROBUST_LIST_SYSCALL => linux_get_robust_list(first_argument, buffer, count),
         LINUX_GETUID_SYSCALL => {
-            current_linux_credentials().map_or(LINUX_ESRCH, |value| u64::from(value.uid))
+            current_linux_credentials().map_or(LINUX_ESRCH, |value| u64::from(value.user.real))
         }
         LINUX_GETGID_SYSCALL => {
-            current_linux_credentials().map_or(LINUX_ESRCH, |value| u64::from(value.gid))
+            current_linux_credentials().map_or(LINUX_ESRCH, |value| u64::from(value.group.real))
         }
         LINUX_GETEUID_SYSCALL => {
-            current_linux_credentials().map_or(LINUX_ESRCH, |value| u64::from(value.euid))
+            current_linux_credentials().map_or(LINUX_ESRCH, |value| u64::from(value.user.effective))
         }
-        LINUX_GETEGID_SYSCALL => {
-            current_linux_credentials().map_or(LINUX_ESRCH, |value| u64::from(value.egid))
-        }
-        LINUX_GETGROUPS_SYSCALL => {
-            let Some(credentials) = current_linux_credentials() else {
-                return LINUX_ESRCH;
-            };
-            let size = first_argument as i32;
-            if size < 0 {
-                return LINUX_EINVAL;
-            }
-            if size == 0 {
-                return 1;
-            }
-            if !copy_to_linux_user(buffer, &credentials.supplementary_gid.to_ne_bytes()) {
-                return LINUX_EFAULT;
-            }
-            1
-        }
+        LINUX_GETEGID_SYSCALL => current_linux_credentials()
+            .map_or(LINUX_ESRCH, |value| u64::from(value.group.effective)),
+        LINUX_GETGROUPS_SYSCALL => linux_get_current_groups(first_argument, buffer),
         LINUX_SETGROUPS_SYSCALL => linux_set_current_groups(first_argument, buffer),
         LINUX_SETUID_SYSCALL
         | LINUX_SETGID_SYSCALL
@@ -1133,10 +1117,11 @@ pub(super) extern "sysv64" fn linux_syscall_handler(
                 return LINUX_ESRCH;
             };
             let ids = if number == LINUX_GETRESUID_SYSCALL {
-                (credentials.uid, credentials.euid, credentials.suid)
+                credentials.user
             } else {
-                (credentials.gid, credentials.egid, credentials.sgid)
+                credentials.group
             };
+            let ids = (ids.real, ids.effective, ids.saved);
             copy_linux_id_triple(first_argument, buffer, count, ids)
         }
         LINUX_PERSONALITY_SYSCALL => linux_personality(first_argument),
@@ -1717,6 +1702,7 @@ pub(super) extern "sysv64" fn linux_syscall_handler(
             X86_RUNTIME.ELF_PROBE_ACTIVE.store(false, Ordering::SeqCst);
             LINUX_RETURN_TO_KERNEL
         }
+        LINUX_UNSHARE_SYSCALL => linux_unshare(first_argument),
         number if linux_privileged_operation(number).is_some() => {
             linux_deny_privileged_operation(number)
         }

@@ -498,6 +498,8 @@ struct Process {
     session: u32,
     executed: bool,
     user_namespace: linux_user::UserNamespaceHandle,
+    /// Its user and group ids: inherited across fork, kept across exec.
+    credentials: linux_user::Credentials,
     runtime_slot: Option<u8>,
     address_space: Option<ProcessAddressSpace>,
     retiring_address_space: Option<ProcessAddressSpace>,
@@ -600,6 +602,9 @@ struct ProcessTable {
     processes: Vec<Option<Process>>,
     /// The generation each slot last handed out, parallel to `processes`.
     generations: Vec<u32>,
+    /// Each slot's supplementary groups, sorted, parallel to `processes`:
+    /// inherited across fork, emptied when the slot is freed.
+    groups: Vec<Vec<u32>>,
     next_pid: u32,
     init: Option<ProcessHandle>,
 }
@@ -610,6 +615,7 @@ impl ProcessTable {
             owner_domain: 0,
             processes: Vec::new(),
             generations: Vec::new(),
+            groups: Vec::new(),
             next_pid: 1,
             init: None,
         }
@@ -1073,6 +1079,7 @@ impl ProcessTable {
             return false;
         }
         self.processes[usize::from(handle.slot)] = None;
+        self.groups[usize::from(handle.slot)] = Vec::new();
         true
     }
 
@@ -1207,6 +1214,7 @@ impl ProcessTable {
             })
         })?;
         let process = self.processes[slot].take()?;
+        self.groups[slot] = Vec::new();
         let ProcessState::Zombie { status } = process.state else {
             return None;
         };
@@ -1460,8 +1468,10 @@ impl ProcessTable {
             None if self.processes.len() < PROCESS_LIMIT => {
                 self.processes.try_reserve(1).ok()?;
                 self.generations.try_reserve(1).ok()?;
+                self.groups.try_reserve(1).ok()?;
                 self.processes.push(None);
                 self.generations.push(0);
+                self.groups.push(Vec::new());
                 self.processes.len() - 1
             }
             None => return None,
@@ -1474,16 +1484,28 @@ impl ProcessTable {
             generation,
             pid,
         };
-        let (process_group, session, cpu_affinity, oom_score_adj) = parent
-            .and_then(|parent| self.process(parent))
-            .map_or((pid, pid, u64::MAX, 0), |parent| {
-                (
-                    parent.process_group,
-                    parent.session,
-                    parent.cpu_affinity,
-                    parent.oom_score_adj,
-                )
-            });
+        let (process_group, session, cpu_affinity, oom_score_adj, credentials) =
+            parent.and_then(|parent| self.process(parent)).map_or(
+                (pid, pid, u64::MAX, 0, linux_user::Credentials::ROOT),
+                |parent| {
+                    (
+                        parent.process_group,
+                        parent.session,
+                        parent.cpu_affinity,
+                        parent.oom_score_adj,
+                        parent.credentials,
+                    )
+                },
+            );
+        // A new process's groups are its parent's; the first is in group 0.
+        let inherited: &[u32] = match parent {
+            Some(parent) => self.groups.get(usize::from(parent.slot))?,
+            None => &[0],
+        };
+        let mut groups = Vec::new();
+        groups.try_reserve_exact(inherited.len()).ok()?;
+        groups.extend_from_slice(inherited);
+        self.groups[slot] = groups;
         self.generations[slot] = generation;
         self.processes[slot] = Some(Process {
             handle,
@@ -1492,6 +1514,7 @@ impl ProcessTable {
             session,
             executed: false,
             user_namespace,
+            credentials,
             runtime_slot: address_space.map(|space| space.storage_slot),
             address_space,
             retiring_address_space: None,
@@ -2279,6 +2302,7 @@ pub(crate) fn install_live_process_registry(
         // emptying them keeps their memory for the next domain.
         (*table).processes.clear();
         (*table).generations.clear();
+        (*table).groups.clear();
         core::ptr::addr_of_mut!((*table).next_pid).write(1);
         core::ptr::addr_of_mut!((*table).init).write(None);
     }
@@ -2555,6 +2579,7 @@ pub(crate) fn force_stop_runtime_process_registry() -> bool {
             return false;
         }
         table.processes[slot] = None;
+        table.groups[slot] = Vec::new();
         if table
             .processes
             .iter()
@@ -2684,6 +2709,54 @@ pub(crate) fn live_process_user_namespace(pid: u32) -> Option<linux_user::UserNa
     let handle = table.handle_by_pid(pid)?;
     let namespace = table.process(handle)?.user_namespace;
     linux_user::credentials(namespace).map(|_| namespace)
+}
+
+pub(crate) fn live_process_credentials(pid: u32) -> Option<linux_user::Credentials> {
+    let table = live_process_table_mut()?;
+    Some(table.process(table.handle_by_pid(pid)?)?.credentials)
+}
+
+pub(crate) fn set_live_process_credentials(pid: u32, credentials: linux_user::Credentials) -> bool {
+    let Some(table) = live_process_table_mut() else {
+        return false;
+    };
+    let Some(process) = table
+        .handle_by_pid(pid)
+        .and_then(|handle| table.process_mut(handle))
+    else {
+        return false;
+    };
+    process.credentials = credentials;
+    true
+}
+
+/// Runs `inspect` on the supplementary groups of `pid`, sorted.
+pub(crate) fn with_live_process_groups<R>(
+    pid: u32,
+    inspect: impl FnOnce(&[u32]) -> R,
+) -> Option<R> {
+    let table = live_process_table_mut()?;
+    let handle = table.handle_by_pid(pid)?;
+    table.process(handle)?;
+    Some(inspect(table.groups.get(usize::from(handle.slot))?))
+}
+
+/// Replaces the supplementary groups of `pid` with `groups`, sorted.
+pub(crate) fn set_live_process_groups(pid: u32, groups: Vec<u32>) -> bool {
+    let Some(table) = live_process_table_mut() else {
+        return false;
+    };
+    let Some(handle) = table.handle_by_pid(pid) else {
+        return false;
+    };
+    if table.process(handle).is_none() {
+        return false;
+    }
+    let Some(slot) = table.groups.get_mut(usize::from(handle.slot)) else {
+        return false;
+    };
+    *slot = groups;
+    true
 }
 
 pub(crate) fn set_live_process_user_namespace(

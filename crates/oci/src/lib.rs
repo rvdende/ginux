@@ -431,6 +431,9 @@ pub struct Entry<'a> {
     pub link: &'a [u8],
     pub kind: EntryKind,
     pub mode: u32,
+    /// The owning user and group ids; 0 when the header's are not octal.
+    pub owner: u32,
+    pub group: u32,
 }
 
 pub struct Rootfs<'a> {
@@ -750,6 +753,12 @@ fn parse_entry(bytes: &[u8], offset: usize) -> Option<(Entry<'_>, usize)> {
     let prefix = terminated(&header[345..345 + TAR_PREFIX_SIZE])?;
     let size = usize::try_from(octal(&header[124..136])?).ok()?;
     let mode = u32::try_from(octal(&header[100..108])?).ok()?;
+    let id = |field: &[u8]| {
+        octal(field)
+            .and_then(|id| u32::try_from(id).ok())
+            .unwrap_or(0)
+    };
+    let (owner, group) = (id(&header[108..116]), id(&header[116..124]));
     let kind = match header[156] {
         0 | b'0' => EntryKind::File,
         b'5' if size == 0 => EntryKind::Directory,
@@ -786,6 +795,8 @@ fn parse_entry(bytes: &[u8], offset: usize) -> Option<(Entry<'_>, usize)> {
             link,
             kind,
             mode,
+            owner,
+            group,
         },
         next,
     ))
