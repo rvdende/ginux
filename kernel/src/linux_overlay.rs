@@ -124,6 +124,10 @@ enum Data {
     Paged,
     /// A memfd, always paged.
     Memfd,
+    /// Anonymous shared memory (MAP_SHARED | MAP_ANONYMOUS), paged and
+    /// unnamed, as Linux backs it with a shmem file. Each process mapping
+    /// it registers its pages, and it is freed once none maps it.
+    Shmem,
 }
 
 #[derive(Clone, Copy)]
@@ -486,6 +490,64 @@ pub(crate) fn memfd_frame(handle: Handle, index: usize) -> Option<FrameLease> {
     let node = node_mut(handle)?;
     node.paged().then_some(())?;
     memfd_page(node, index, true)
+}
+
+/// Makes the unnamed node behind an anonymous shared mapping. Its pages are
+/// allocated zeroed as they are first mapped (`memfd_frame`).
+pub(crate) fn create_shmem() -> Option<Handle> {
+    let handle = create_file(b"tmp/.ginux-shmem", 0o600, &[])?;
+    let made = node_mut(handle).is_some_and(|node| {
+        let paged = make_node_paged(node);
+        if paged {
+            node.data = Data::Shmem;
+        }
+        paged
+    });
+    (unlink(handle) && made).then_some(handle)
+}
+
+/// Frees the anonymous shared memory that no process maps any more. Call
+/// it once the pages of the mappings just unregistered are out of every
+/// page table.
+pub(crate) fn release_unmapped_shmem() {
+    let Some(overlay) = live() else {
+        return;
+    };
+    let mut page = overlay.first_node_page;
+    while page != FrameLease::EMPTY {
+        let Some(nodes) = node_page_mut(page) else {
+            return;
+        };
+        for node in nodes.nodes.iter_mut() {
+            if node.active
+                && node.data == Data::Shmem
+                && !handle_mapped(overlay, node.handle)
+                && release_node_data(node)
+            {
+                *node = Node::EMPTY;
+            }
+        }
+        page = nodes.next;
+    }
+}
+
+/// Whether a process has a shared mapping of `handle` registered.
+fn handle_mapped(overlay: &Overlay, handle: Handle) -> bool {
+    let mut page = overlay.first_mapping_page;
+    while page != FrameLease::EMPTY {
+        let Some(mappings) = mapping_page(page) else {
+            return true;
+        };
+        if mappings
+            .mappings
+            .iter()
+            .any(|mapping| mapping.active && mapping.handle == handle)
+        {
+            return true;
+        }
+        page = mappings.next;
+    }
+    false
 }
 
 /// Moves a file's data into whole frames, so every process that maps it

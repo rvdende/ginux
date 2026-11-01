@@ -5228,6 +5228,7 @@ fn execute_deferred_live_fork() -> bool {
         return false;
     }
     linux_release_process_cgroup(child.pid);
+    release_linux_process_shared_mappings(child.pid);
     if let Some(child_state_slot) = linux_process_runtime_state(child.pid) {
         release_linux_descriptor_runtime_state(&child_state_slot.descriptors);
         *child_state_slot = LinuxProcessRuntimeState::EMPTY;
@@ -12380,7 +12381,7 @@ fn linux_init_exit_kill_others_live_return(
             if linux_process::force_exit_live_process(pid, 128 + LINUX_SIGKILL as u8) {
                 retire_linux_process_record(pid);
                 let _ = linux_process::release_live_process_runtime_slot(pid);
-                crate::linux_overlay::remove_process_shared_mappings(pid);
+                release_linux_process_shared_mappings(pid);
             }
         }
     }
@@ -13183,8 +13184,13 @@ fn run_other_linux_processes(
         .LINUX_PROCESS_LAST_BLOCKED_PID
         .swap(0, Ordering::SeqCst);
     let preferred = descendant.filter(|child| *child != last_blocked);
+    // A killed process sleeping in a wait goes first: dispatching it ends
+    // it, as SIGKILL wakes a sleeping task in Linux, where it would
+    // otherwise keep its memory and process slot until its turn came.
+    let killed = linux_killed_sleeping_process(pid);
     if !refresh_live_linux_process_registry(caller)
-        || !(preferred.is_some_and(|child| run_scheduled_linux_process(pid, Some(child)))
+        || !(killed.is_some_and(|killed| run_scheduled_linux_process(pid, Some(killed)))
+            || preferred.is_some_and(|child| run_scheduled_linux_process(pid, Some(child)))
             || run_next_scheduled_linux_process(pid)
             || descendant.is_some_and(|child| run_scheduled_linux_process(pid, Some(child))))
     {
@@ -13211,6 +13217,34 @@ fn run_other_linux_processes(
     } else {
         LinuxBlockedWait::Recheck
     })
+}
+
+/// A process other than `current` that sleeps in a wait with SIGKILL
+/// pending.
+fn linux_killed_sleeping_process(current: u32) -> Option<u32> {
+    let kill = 1_u64 << (LINUX_SIGKILL - 1);
+    let mut from = 1;
+    while let Some(pid) = linux_process::next_live_pid(from) {
+        from = pid.checked_add(1)?;
+        if pid == current
+            || !linux_process::live_process_status(pid)
+                .is_some_and(|status| status.state == linux_process::LiveProcessState::Sleeping)
+        {
+            continue;
+        }
+        let pending = linux_process::live_process_slot(pid).and_then(|slot| {
+            crate::linux_signal::pending_mask(
+                linux_signal_instance(),
+                crate::linux_signal::Scope::Process,
+                slot,
+            )
+            .ok()
+        });
+        if pending.is_some_and(|mask| mask & kill != 0) {
+            return Some(pid);
+        }
+    }
+    None
 }
 
 fn linux_sched_yield_live_return(
@@ -14307,7 +14341,7 @@ fn release_linux_runtime_mmaps(expected_base: u64) -> bool {
             && X86_RUNTIME.ELF_PROBE_MMAP_GENERATIONS[slot].load(Ordering::SeqCst) == 0;
     }
     let address_cleared = X86_RUNTIME.ELF_PROBE_MMAP.swap(0, Ordering::SeqCst) == expected_base;
-    crate::linux_overlay::remove_process_shared_mappings(pid);
+    release_linux_process_shared_mappings(pid);
     shared_flushed
         && address_valid
         && address_cleared
@@ -21316,12 +21350,28 @@ fn linux_runtime_mmap(
     };
     let file_backed = !anonymous;
     let replace = fixed;
+    if anonymous
+        && sharing == LINUX_MAP_SHARED
+        && matches!(protection, 1 | 3 | 5)
+        && pages <= LINUX_SHMEM_PAGE_LIMIT
+    {
+        return linux_map_shared_anonymous(mapping, pages, protection as u8, replace);
+    }
     if let Some((handle, start)) = overlay_file.filter(|(handle, _)| {
         // A shared mapping maps the file's own pages: a memfd's, or those of
         // a file moved to paged storage on its first shared mapping.
         sharing == LINUX_MAP_SHARED && !secret && crate::linux_overlay::make_paged(*handle)
     }) {
         return linux_map_shared_memfd(mapping, pages, handle, start, protection as u8, replace);
+    }
+    if replace {
+        for page in 0..pages {
+            let page_address = mapping + (page * PAGE_SIZE) as u64;
+            let _ = crate::linux_overlay::remove_shared_mapping(
+                current_linux_process_pid(),
+                page_address,
+            );
+        }
     }
     for (installed, page) in (0..pages).enumerate() {
         let page_address = mapping + (page * PAGE_SIZE) as u64;
@@ -21450,6 +21500,9 @@ fn linux_runtime_mmap(
             }
         }
     }
+    if replace {
+        crate::linux_overlay::release_unmapped_shmem();
+    }
     if anonymous
         && (flags & LINUX_MAP_LOCKED != 0
             || flags & LINUX_MAP_POPULATE != 0 && flags & LINUX_MAP_NONBLOCK == 0)
@@ -21496,7 +21549,55 @@ fn linux_map_shared_memfd(
             return LINUX_ENOMEM;
         }
     }
+    if replace {
+        crate::linux_overlay::release_unmapped_shmem();
+    }
     mapping
+}
+
+/// The largest anonymous shared mapping backed by shared pages (64 MiB).
+/// Its pages are allocated when it is made and registered one by one, so a
+/// larger one, often reserved and barely touched, stays a private mapping
+/// that a fork copies, until mappings are tracked as ranges.
+const LINUX_SHMEM_PAGE_LIMIT: usize = 16 * 1024;
+
+/// Maps anonymous shared memory: the pages of an unnamed shmem node, which
+/// a forked child shares rather than copies, as Linux backs MAP_SHARED |
+/// MAP_ANONYMOUS with a shmem file. Each page is registered to this process,
+/// and the node is freed once no process maps it.
+fn linux_map_shared_anonymous(mapping: u64, pages: usize, protection: u8, replace: bool) -> u64 {
+    let Some(handle) = crate::linux_overlay::create_shmem() else {
+        return LINUX_ENOMEM;
+    };
+    let mapped = linux_map_shared_memfd(mapping, pages, handle, 0, protection, replace);
+    if mapped != mapping {
+        crate::linux_overlay::release_unmapped_shmem();
+        return mapped;
+    }
+    let pid = current_linux_process_pid();
+    for page in 0..pages {
+        let address = mapping + (page * PAGE_SIZE) as u64;
+        if !crate::linux_overlay::register_shared_mapping(pid, address, handle, page * PAGE_SIZE) {
+            for rollback in 0..page {
+                let _ = crate::linux_overlay::remove_shared_mapping(
+                    pid,
+                    mapping + (rollback * PAGE_SIZE) as u64,
+                );
+            }
+            let _ = rollback_linux_runtime_mapping(mapping, pages);
+            crate::linux_overlay::release_unmapped_shmem();
+            return LINUX_ENOMEM;
+        }
+    }
+    mapping
+}
+
+/// Drops the shared mappings registered to `pid`, whose pages its page
+/// tables no longer hold, and frees anonymous shared memory that no process
+/// maps any more.
+fn release_linux_process_shared_mappings(pid: u32) {
+    crate::linux_overlay::remove_process_shared_mappings(pid);
+    crate::linux_overlay::release_unmapped_shmem();
 }
 
 fn linux_runtime_munmap(address: u64, length: u64) -> u64 {
@@ -21519,6 +21620,7 @@ fn linux_runtime_munmap(address: u64, length: u64) -> u64 {
             return LINUX_EINVAL;
         }
     }
+    crate::linux_overlay::release_unmapped_shmem();
     if !address_space::prune_current_linux_page_tables(
         address,
         address + (pages * PAGE_SIZE) as u64,
@@ -25088,6 +25190,7 @@ fn linux_rootfs_execve_source(
         serial_write("ginux: Linux exec mmap release failed\r\n");
         return LINUX_ENOMEM;
     }
+    release_linux_process_shared_mappings(current_linux_process_pid());
     X86_RUNTIME
         .ELF_PROBE_MMAP_NEXT
         .store(LINUX_RUNTIME_DYNAMIC_MMAP_BASE, Ordering::SeqCst);
@@ -34106,6 +34209,7 @@ fn run_scheduled_linux_process(parent_pid: u32, target_pid: Option<u32>) -> bool
             .then(|| linux_process::complete_live_child_exit(selected.pid, status))
             .flatten();
         linux_release_process_cgroup(selected.pid);
+        release_linux_process_shared_mappings(selected.pid);
         if let Some(state) = linux_process_runtime_state(selected.pid) {
             release_linux_descriptor_runtime_state(&state.descriptors);
             *state = LinuxProcessRuntimeState::EMPTY;
