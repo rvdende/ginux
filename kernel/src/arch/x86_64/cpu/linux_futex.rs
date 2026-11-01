@@ -12,6 +12,11 @@ static LINUX_PROFILE_FUTEX_OPERATION_COUNTS: [AtomicU64; 512] = [const { AtomicU
 #[derive(Clone, Copy)]
 pub(super) struct LinuxProcessFutexWait {
     pid: u32,
+    /// The futex word's address in the waiting process, which its call
+    /// passes again when it restarts.
+    address: u64,
+    /// The word waited on, as `linux_futex_key` names it: the address's
+    /// unless a requeue moved the wait to another word.
     key: u64,
     mask: u32,
     /// Elapsed nanoseconds when the wait times out, or 0.
@@ -300,6 +305,50 @@ pub(super) fn linux_remote_futex_wait_fast(
     finish(0)
 }
 
+/// Wakes up to `wake` waiters on the futex word at `source` and moves up
+/// to `requeue` more to the word at `target`, threads of this process and
+/// other processes alike; returns how many it woke or moved, as Linux's
+/// requeue does.
+fn requeue_linux_futex_waits(source: u64, target: u64, wake: u32, requeue: u32) -> u32 {
+    let mut woken = wake_linux_futex_masked(source, u32::MAX, wake);
+    let (source_key, target_key) = (linux_futex_key(source), linux_futex_key(target));
+    let mut waits = LINUX_FUTEX_COORDINATION.lock();
+    waits.retain(|wait| {
+        linux_process::live_process_status(wait.pid).is_some_and(|status| status.state.is_running())
+    });
+    let mut moved = 0;
+    for wait in waits
+        .iter_mut()
+        .filter(|wait| !wait.woken && wait.key == source_key)
+    {
+        if woken < wake {
+            wait.woken = true;
+            linux_process::set_live_process_waiting(wait.pid, false);
+            woken += 1;
+        } else if moved < requeue {
+            wait.key = target_key;
+            moved += 1;
+        } else {
+            break;
+        }
+    }
+    for slot in 0..LINUX_THREAD_LIMIT {
+        if moved == requeue {
+            break;
+        }
+        if X86_RUNTIME.LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) == LINUX_THREAD_BLOCKED
+            && X86_RUNTIME.LINUX_THREAD_WAIT_KINDS[slot].load(Ordering::SeqCst)
+                == LINUX_THREAD_WAIT_FUTEX
+            && X86_RUNTIME.LINUX_THREAD_WAIT_KEYS[slot].load(Ordering::SeqCst) == source
+        {
+            X86_RUNTIME.LINUX_THREAD_WAIT_KEYS[slot].store(target, Ordering::SeqCst);
+            moved += 1;
+        }
+    }
+    woken + moved
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn linux_futex_live_return(
     output: *mut LinuxSyscallFrame,
     caller: LinuxUserContext,
@@ -307,11 +356,14 @@ pub(super) fn linux_futex_live_return(
     operation: u64,
     value: u64,
     timeout: u64,
+    target: u64,
     bitset: u64,
 ) -> u64 {
     const FUTEX_COMMAND_MASK: u64 = 0x7f;
     const FUTEX_WAIT: u64 = 0;
     const FUTEX_WAKE: u64 = 1;
+    const FUTEX_REQUEUE: u64 = 3;
+    const FUTEX_CMP_REQUEUE: u64 = 4;
     const FUTEX_WAIT_BITSET: u64 = 9;
     const FUTEX_WAKE_BITSET: u64 = 10;
     const FUTEX_PRIVATE_FLAG: u64 = 128;
@@ -333,6 +385,27 @@ pub(super) fn linux_futex_live_return(
     let mut bytes = [0_u8; size_of::<u32>()];
     if !copy_from_linux_user(address, &mut bytes) {
         return LINUX_EFAULT;
+    }
+    if matches!(command, FUTEX_REQUEUE | FUTEX_CMP_REQUEUE) {
+        // Both counts are C ints; the timeout argument carries how many
+        // waiters to requeue.
+        let (wake, requeue) = (value as u32 as i32, timeout as u32 as i32);
+        if wake < 0 || requeue < 0 || !target.is_multiple_of(size_of::<u32>() as u64) {
+            return LINUX_EINVAL;
+        }
+        let mut target_bytes = [0_u8; size_of::<u32>()];
+        if !copy_from_linux_user(target, &mut target_bytes) {
+            return LINUX_EFAULT;
+        }
+        if command == FUTEX_CMP_REQUEUE && u32::from_ne_bytes(bytes) != bitset as u32 {
+            return LINUX_EAGAIN;
+        }
+        return u64::from(requeue_linux_futex_waits(
+            address,
+            target,
+            wake as u32,
+            requeue as u32,
+        ));
     }
     if matches!(command, FUTEX_WAKE | FUTEX_WAKE_BITSET) {
         let mask = if command == FUTEX_WAKE_BITSET {
@@ -365,13 +438,15 @@ pub(super) fn linux_futex_live_return(
     // A wait this call began before it restarted ends here: woken by
     // another process, or kept for its deadline if it waits again.
     let pid = current_linux_process_pid();
-    let earlier = take_linux_process_futex_wait(&mut LINUX_FUTEX_COORDINATION.lock(), pid);
+    let earlier = take_linux_process_futex_wait(&mut LINUX_FUTEX_COORDINATION.lock(), pid)
+        .filter(|wait| wait.address == address);
     if earlier.is_some_and(|wait| wait.woken) {
         return 0;
     }
     // musl passes the expected value as a sign-extended int; Linux compares
-    // only the 32-bit futex word.
-    if u32::from_ne_bytes(bytes) != value as u32 {
+    // only the 32-bit futex word. A wait resumed after a restart compared
+    // it when it began, and may since have been requeued to another word.
+    if earlier.is_none() && u32::from_ne_bytes(bytes) != value as u32 {
         return LINUX_EAGAIN;
     }
     let Some(current) = current_linux_thread_handle() else {
@@ -438,10 +513,9 @@ pub(super) fn linux_futex_live_return(
         }
         // Another process may be the one to change the futex word, or to
         // wake it.
-        let key = linux_futex_key(address);
-        let deadline = earlier
-            .filter(|wait| wait.key == key)
-            .map_or(deadline, |wait| wait.deadline);
+        let (key, deadline) = earlier.map_or((linux_futex_key(address), deadline), |wait| {
+            (wait.key, wait.deadline)
+        });
         if deadline != 0 && linux_elapsed_nanoseconds().is_some_and(|now| now >= deadline) {
             return LINUX_ETIMEDOUT;
         }
@@ -452,6 +526,7 @@ pub(super) fn linux_futex_live_return(
             }
             waits.push(LinuxProcessFutexWait {
                 pid,
+                address,
                 key,
                 mask: wait_mask as u32,
                 deadline,
@@ -786,20 +861,10 @@ pub(super) fn linux_futex_requeue(
     if u64::from(u32::from_ne_bytes(source_bytes)) != expected {
         return LINUX_EAGAIN;
     }
-    let woken = wake_linux_futex(source, wake_count as u32);
-    let mut requeued = 0_u32;
-    for slot in 0..LINUX_THREAD_LIMIT {
-        if requeued == requeue_count as u32 {
-            break;
-        }
-        if X86_RUNTIME.LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) == LINUX_THREAD_BLOCKED
-            && X86_RUNTIME.LINUX_THREAD_WAIT_KINDS[slot].load(Ordering::SeqCst)
-                == LINUX_THREAD_WAIT_FUTEX
-            && X86_RUNTIME.LINUX_THREAD_WAIT_KEYS[slot].load(Ordering::SeqCst) == source
-        {
-            X86_RUNTIME.LINUX_THREAD_WAIT_KEYS[slot].store(target, Ordering::SeqCst);
-            requeued += 1;
-        }
-    }
-    u64::from(woken + requeued)
+    u64::from(requeue_linux_futex_waits(
+        source,
+        target,
+        wake_count as u32,
+        requeue_count as u32,
+    ))
 }

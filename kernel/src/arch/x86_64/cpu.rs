@@ -38603,63 +38603,67 @@ fn linux_getdents(descriptor: u64, address: u64, count: u64, legacy: bool) -> u6
                 }
             }
         } else if directory == b"proc" {
-            let child_live = linux_process::live_process_status(2).is_some();
-            let mut full = false;
-            let root_files = [
-                (25_u64, &b"cpuinfo"[..]),
-                (26_u64, &b"meminfo"[..]),
-                (27_u64, &b"stat"[..]),
-                (28_u64, &b"uptime"[..]),
-                (29_u64, &b"loadavg"[..]),
-                (30_u64, &b"filesystems"[..]),
-                (31_u64, &b"cmdline"[..]),
+            // The fixed files, then `self`, then a directory per process.
+            // Cursors from PROC_PID_CURSOR on name the next pid to list, so
+            // processes that come and go between calls shift no others.
+            const PROC_PID_CURSOR: usize = 64;
+            let fixed = [
+                (25_u64, 8_u8, &b"cpuinfo"[..]),
+                (26, 8, &b"meminfo"[..]),
+                (27, 8, &b"stat"[..]),
+                (28, 8, &b"uptime"[..]),
+                (29, 8, &b"loadavg"[..]),
+                (30, 8, &b"filesystems"[..]),
+                (31, 8, &b"cmdline"[..]),
+                (32, 10, &b"self"[..]),
             ];
-            let limit = root_files.len() + 1 + usize::from(child_live);
-            if cursor > limit {
-                return LINUX_EINVAL;
+            let mut full = false;
+            while let Some((inode, kind, name)) = fixed.get(cursor).copied() {
+                if !append_linux_dirent(
+                    &mut entries[..output_capacity],
+                    &mut used,
+                    legacy,
+                    inode,
+                    (cursor + 3) as i64,
+                    kind,
+                    name,
+                ) {
+                    if used == 0 {
+                        return LINUX_EINVAL;
+                    }
+                    full = true;
+                    break;
+                }
+                cursor += 1;
             }
-            for (index, (inode, name)) in root_files.iter().enumerate() {
-                if cursor == index {
+            if !full {
+                cursor = cursor.max(PROC_PID_CURSOR);
+                while let Some(pid) = u32::try_from(cursor - PROC_PID_CURSOR)
+                    .ok()
+                    .and_then(linux_process::next_live_pid)
+                {
+                    let mut name = [0_u8; 20];
+                    let length = write_linux_decimal(u64::from(pid), &mut name);
+                    let next = PROC_PID_CURSOR + pid as usize + 1;
                     if !append_linux_dirent(
                         &mut entries[..output_capacity],
                         &mut used,
                         legacy,
-                        *inode,
-                        (index + 3) as i64,
-                        8,
-                        name,
+                        match pid {
+                            1 => 16,
+                            2 => 23,
+                            _ => 0x1_0000_0000 + u64::from(pid),
+                        },
+                        (next + 2) as i64,
+                        4,
+                        &name[..length],
                     ) {
                         if used == 0 {
                             return LINUX_EINVAL;
                         }
-                        full = true;
                         break;
                     }
-                    cursor += 1;
-                }
-            }
-            if !full {
-                for (index, inode, name) in [
-                    (root_files.len(), 16_u64, &b"1"[..]),
-                    (root_files.len() + 1, 23_u64, &b"2"[..]),
-                ] {
-                    if cursor == index && (name == b"1" || child_live) {
-                        if !append_linux_dirent(
-                            &mut entries[..output_capacity],
-                            &mut used,
-                            legacy,
-                            inode,
-                            (index + 3) as i64,
-                            4,
-                            name,
-                        ) {
-                            if used == 0 {
-                                return LINUX_EINVAL;
-                            }
-                            break;
-                        }
-                        cursor += 1;
-                    }
+                    cursor = next;
                 }
             }
         } else if directory == b"tmp" {

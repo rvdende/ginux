@@ -501,7 +501,12 @@ pub(super) fn linux_nanosleep_live_return(
     request: u64,
     remaining: u64,
 ) -> u64 {
-    linux_clock_nanosleep_live_return(output, caller, LINUX_CLOCK_MONOTONIC, 0, request, remaining)
+    let sleep = LinuxSleep {
+        number: LINUX_NANOSLEEP_SYSCALL,
+        clock: LINUX_CLOCK_MONOTONIC,
+        flags: 0,
+    };
+    linux_sleep_live_return(output, caller, sleep, request, remaining)
 }
 
 pub(super) fn linux_clock_nanosleep_live_return(
@@ -509,6 +514,33 @@ pub(super) fn linux_clock_nanosleep_live_return(
     caller: LinuxUserContext,
     clock: u64,
     flags: u64,
+    request: u64,
+    remaining: u64,
+) -> u64 {
+    let sleep = LinuxSleep {
+        number: LINUX_CLOCK_NANOSLEEP_SYSCALL,
+        clock,
+        flags,
+    };
+    linux_sleep_live_return(output, caller, sleep, request, remaining)
+}
+
+/// A sleep call: its syscall number, which a yield restarts it with, and
+/// its clock and flags.
+struct LinuxSleep {
+    number: u64,
+    clock: u64,
+    flags: u64,
+}
+
+fn linux_sleep_live_return(
+    output: *mut LinuxSyscallFrame,
+    caller: LinuxUserContext,
+    LinuxSleep {
+        number,
+        clock,
+        flags,
+    }: LinuxSleep,
     request: u64,
     remaining: u64,
 ) -> u64 {
@@ -573,12 +605,9 @@ pub(super) fn linux_clock_nanosleep_live_return(
         // the deadline. Device/timer interrupts still wake the CPU and are
         // handled normally between checks.
         while linux_elapsed_nanoseconds().is_some_and(|now| now < deadline) {
-            if let Some(result) = linux_timed_wait_run_others(
-                output,
-                caller,
-                LINUX_CLOCK_NANOSLEEP_SYSCALL,
-                Some(deadline),
-            ) {
+            if let Some(result) =
+                linux_timed_wait_run_others(output, caller, number, Some(deadline))
+            {
                 return result;
             }
             unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) };

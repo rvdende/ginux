@@ -2966,6 +2966,25 @@ pub(crate) fn live_process_pid_at(slot: usize) -> Option<u32> {
         .map(|process| process.handle.pid)
 }
 
+/// The smallest pid at least `from` of a process in the table, as /proc
+/// lists them (zombies included, processes still being made or ended not).
+pub(crate) fn next_live_pid(from: u32) -> Option<u32> {
+    let table = live_process_table_mut()?;
+    table
+        .processes
+        .iter()
+        .flatten()
+        .filter(|process| {
+            !matches!(
+                process.state,
+                ProcessState::Preparing | ProcessState::Exiting
+            )
+        })
+        .map(|process| process.handle.pid)
+        .filter(|pid| *pid >= from)
+        .min()
+}
+
 pub(crate) fn live_process_count() -> Option<u16> {
     let table = live_process_table_mut()?;
     table
