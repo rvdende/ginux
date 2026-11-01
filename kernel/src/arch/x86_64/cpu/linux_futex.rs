@@ -127,7 +127,12 @@ pub(super) fn linux_remote_futex_wait_fast(
         if limit == 0 {
             return Some(0);
         }
-        let _coordination = LINUX_FUTEX_COORDINATION.lock();
+        let coordination = LINUX_FUTEX_COORDINATION.lock();
+        // A process waiting on a futex is woken by the full FUTEX_WAKE, under
+        // the kernel-entry lock; this path sees only this process's threads.
+        if !coordination.is_empty() {
+            return None;
+        }
         let mut woken = 0_u32;
         for slot in 0..LINUX_THREAD_LIMIT {
             if woken == limit {
@@ -659,7 +664,16 @@ pub(super) fn linux_futex_wake(address: u64, mask: u64, count: u64, flags: u64) 
     if !copy_from_linux_user(address, &mut bytes) {
         return LINUX_EFAULT;
     }
-    u64::from(wake_linux_futex_masked(address, mask as u32, count as u32))
+    let limit = count as u32;
+    let threads = wake_linux_futex_masked(address, mask as u32, limit);
+    u64::from(
+        threads
+            + wake_linux_process_futex_waits(
+                linux_futex_key(address),
+                mask as u32,
+                limit - threads,
+            ),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
