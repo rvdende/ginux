@@ -20,6 +20,7 @@ QEMU, and reports one machine-parseable line per test plus failure clusters.
 | `68bb7d48` | compat batch (`/dev/null`, pipe sizes, stream writes, status fields, connect errors) | 1362 | 492 | 264 | 405 | 174 | 10 | 1 | 16 |
 | `bdeb9c12` | growing socket table, FUTEX_REQUEUE, nanosleep restarts, /proc lists every process, shared anonymous memory, killed sleepers run first, right-sized process lists | 1362 | 503 | 265 | 380 | 181 | 10 | 0 | 23 |
 | `e35668d6` | /proc/PID directories and names, PageEntry, pause() sleeping, killed processes run first, restart deadlines in a pruned list | 1362 | 507 | 272 | 376 | 181 | 10 | 0 | 16 |
+| `62aaf7da` | credentials and file owners (`user-switching=true` for the LTP domain), permission checks, hard links, overlay symlinks in path walks, Linux path errors, unshare of user/mount namespaces | 1362 | 627 | 263 | 228 | 214 | 13 | 0 | 17 |
 
 \* Counted with the exit status alone, which overstated passes (below).
 The later rows are rescored from each run's saved console logs with LTP's
