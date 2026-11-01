@@ -47,7 +47,13 @@ through a Linux ABI personality. It is not a rewrite of Linux:
    (`memory::share_frames`): every address space that maps another's frame
    takes a count, and releasing drops one. Anonymous MAP_SHARED memory is
    an unnamed overlay shmem node, freed with its last mapping. Move large
-   structures off the kernel stack.
+   structures off the kernel stack. Memory areas: `crates/memory-areas`
+   (host-tested, safe) holds a process's areas; `kernel/src/linux_areas.rs`
+   keeps one set per process from mmap, munmap, mprotect, mremap and exec's
+   segments (copied at fork, dropped at exec and exit) and `/proc/PID/maps`
+   names files from it. The page tables are still the authority; next:
+   record the stack and heap, then let fault handling and placement use
+   the areas instead of page-table bits.
 4. **Compatibility driven by the Linux Test Project (LTP)** rather than by
    finding bugs one program at a time: `just test-ltp` (docs/LTP.md has the
    baseline and failure clusters).

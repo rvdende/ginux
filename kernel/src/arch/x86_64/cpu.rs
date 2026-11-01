@@ -4936,6 +4936,7 @@ fn execute_deferred_live_fork() -> bool {
     if !crate::linux_overlay::clone_shared_mappings(parent_pid, child.pid) {
         return false;
     }
+    crate::linux_areas::fork(linux_execution_instance(), parent_pid, child.pid);
     if !linux_assign_process_cgroup(child.pid, cgroup_generation) {
         return false;
     }
@@ -5564,6 +5565,7 @@ pub(crate) fn mark_configured_container_booting() {
 
 pub(crate) fn stop_configured_container() {
     crate::linux_exe::forget_instance(X86_RUNTIME.LINUX_EXECUTION_INSTANCE.load(Ordering::SeqCst));
+    crate::linux_areas::forget_instance(linux_execution_instance());
     if let Some(slot) = active_container_slot() {
         if matches!(
             u64::from(X86_RUNTIME.CONTAINER_CONTROL_STATES[slot].load(Ordering::SeqCst)),
@@ -21593,6 +21595,109 @@ fn linux_map_shared_anonymous(mapping: u64, pages: usize, protection: u8, replac
 fn release_linux_process_shared_mappings(pid: u32) {
     crate::linux_overlay::remove_process_shared_mappings(pid);
     crate::linux_overlay::release_unmapped_shmem();
+    crate::linux_areas::forget(linux_execution_instance(), pid);
+}
+
+/// Records the segments exec mapped for the new program: the executable's
+/// at `path`, then its interpreter's at the path its PT_INTERP names.
+fn linux_record_exec_image(
+    plan: &crate::linux_elf::RelocatableExecutablePlan<'_, '_>,
+    path: &[u8],
+) {
+    use crate::linux_areas::{Area, Backing, Protection};
+    use crate::linux_elf::RelocatableExecutablePlan;
+    let main_count = match plan {
+        RelocatableExecutablePlan::Interpreted(process) => process.main.segment_count,
+        _ => plan.segment_count(),
+    };
+    let interpreter_path = match plan {
+        RelocatableExecutablePlan::Interpreted(process) => process.interpreter_path,
+        _ => path,
+    };
+    let (main_path, interpreter_path) = (
+        alloc::sync::Arc::<[u8]>::from(path),
+        alloc::sync::Arc::<[u8]>::from(interpreter_path),
+    );
+    for index in 0..plan.segment_count() {
+        let Some(segment) = plan.segment(index) else {
+            continue;
+        };
+        let protection =
+            1 | if segment.writable { 2 } else { 0 } | if segment.executable { 4 } else { 0 };
+        crate::linux_areas::map(
+            linux_execution_instance(),
+            current_linux_process_pid(),
+            Area {
+                start: segment.virtual_page,
+                end: segment.virtual_page + (segment.page_count * PAGE_SIZE) as u64,
+                protection: Protection::from_bits(protection),
+                shared: false,
+                backing: Backing::File {
+                    device: 0,
+                    inode: 0,
+                    offset: segment.file_page,
+                    path: if index < main_count {
+                        alloc::sync::Arc::clone(&main_path)
+                    } else {
+                        alloc::sync::Arc::clone(&interpreter_path)
+                    },
+                },
+            },
+        );
+    }
+}
+
+/// Records a successful mmap of `length` bytes at `address` in the
+/// process's memory areas, with the file it maps.
+fn linux_record_mapping(
+    address: u64,
+    length: u64,
+    protection: u64,
+    flags: u64,
+    descriptor: u64,
+    offset: u64,
+) {
+    use crate::linux_areas::{Area, Backing, Protection};
+    let Some(end) = address
+        .checked_add(length)
+        .and_then(|end| end.checked_next_multiple_of(PAGE_SIZE as u64))
+    else {
+        return;
+    };
+    if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
+        || end > 1 << 47
+        || !address.is_multiple_of(PAGE_SIZE as u64)
+    {
+        return;
+    }
+    let backing = if flags & LINUX_MAP_ANONYMOUS != 0 {
+        Backing::Anonymous
+    } else {
+        let mut path = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+        match (
+            linux_descriptor_path(descriptor, &mut path),
+            linux_descriptor_stat(descriptor),
+        ) {
+            (Some(length), Some(stat)) => Backing::File {
+                device: u64::from_ne_bytes(stat[..8].try_into().unwrap_or([0; 8])),
+                inode: u64::from_ne_bytes(stat[8..16].try_into().unwrap_or([0; 8])),
+                offset,
+                path: alloc::sync::Arc::from(&path[..length]),
+            },
+            _ => Backing::Anonymous,
+        }
+    };
+    crate::linux_areas::map(
+        linux_execution_instance(),
+        current_linux_process_pid(),
+        Area {
+            start: address,
+            end,
+            protection: Protection::from_bits(protection),
+            shared: flags & LINUX_MAP_SHARED != 0,
+            backing,
+        },
+    );
 }
 
 fn linux_runtime_munmap(address: u64, length: u64) -> u64 {
@@ -22718,6 +22823,36 @@ fn linux_runtime_mincore(address: u64, length: u64, vector: u64) -> u64 {
 }
 
 fn linux_mprotect(address: u64, length: u64, protection: u64) -> u64 {
+    if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
+        // Linux's order: a bad address or protection, then an empty range
+        // (nothing to do), then a range with unmapped pages.
+        const PROT_SEM: u64 = 0x8;
+        const PROT_GROWSDOWN: u64 = 0x0100_0000;
+        const PROT_GROWSUP: u64 = 0x0200_0000;
+        let known = LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC | PROT_SEM;
+        if !address.is_multiple_of(PAGE_SIZE as u64)
+            || protection & !(known | PROT_GROWSDOWN | PROT_GROWSUP) != 0
+            || protection & (PROT_GROWSDOWN | PROT_GROWSUP) == PROT_GROWSDOWN | PROT_GROWSUP
+        {
+            return LINUX_EINVAL;
+        }
+        if length == 0 {
+            return 0;
+        }
+        let Some(end) = address
+            .checked_add(length)
+            .and_then(|end| end.checked_next_multiple_of(PAGE_SIZE as u64))
+            .filter(|end| *end <= 1 << 47)
+        else {
+            return LINUX_ENOMEM;
+        };
+        if (address..end)
+            .step_by(PAGE_SIZE)
+            .any(|page| !address_space::current_linux_runtime_page(page).occupied)
+        {
+            return LINUX_ENOMEM;
+        }
+    }
     if !address.is_multiple_of(PAGE_SIZE as u64) || length == 0 {
         return LINUX_EINVAL;
     }
@@ -25244,6 +25379,7 @@ fn linux_rootfs_execve_source(
         return LINUX_ENOMEM;
     }
     release_linux_process_shared_mappings(current_linux_process_pid());
+    linux_record_exec_image(&plan, path);
     X86_RUNTIME
         .ELF_PROBE_MMAP_NEXT
         .store(LINUX_RUNTIME_DYNAMIC_MMAP_BASE, Ordering::SeqCst);
@@ -36651,6 +36787,107 @@ fn linux_descriptor_tmp_generation(descriptor: u64) -> Option<u32> {
 
 /// /proc/PID/maps: the process's memory areas from its page tables, named
 /// where the kernel placed them.
+/// Appends one `/proc/PID/maps` line for `[start, end)` of `area`, naming
+/// the file `recorded` maps there, or `name` when nothing is recorded.
+fn append_linux_maps_line(
+    text: &mut Vec<u8>,
+    (start, end): (u64, u64),
+    area: &address_space::LinuxMemoryArea,
+    recorded: Option<&crate::linux_areas::Area>,
+    name: &[u8],
+) -> Option<()> {
+    use crate::linux_areas::Backing;
+    let flags = [
+        if area.protection & LINUX_PROT_READ as u8 != 0 {
+            b'r'
+        } else {
+            b'-'
+        },
+        if area.protection & LINUX_PROT_WRITE as u8 != 0 {
+            b'w'
+        } else {
+            b'-'
+        },
+        if area.protection & LINUX_PROT_EXEC as u8 != 0 {
+            b'x'
+        } else {
+            b'-'
+        },
+        if area.shared { b's' } else { b'p' },
+    ];
+    let (offset, device, inode, name) = match recorded.map(|part| (part, &part.backing)) {
+        Some((
+            part,
+            Backing::File {
+                device,
+                inode,
+                offset,
+                path,
+            },
+        )) => (offset + (start - part.start), *device, *inode, &path[..]),
+        Some((_, Backing::Heap)) => (0, 0, 0, &b"[heap]"[..]),
+        Some((_, Backing::Stack)) => (0, 0, 0, &b"[stack]"[..]),
+        _ => (0, 0, 0, name),
+    };
+    // Linux's encoding: the major number in bits 8-19, the minor in bits
+    // 0-7 and 20-31.
+    let major = (device >> 8) & 0xfff;
+    let minor = device & 0xff | (device >> 12) & 0xfff00;
+    let mut line = [0_u8; 160];
+    let mut used = 0;
+    let fixed = append_linux_hex(&mut line, &mut used, start)
+        && append_linux_bytes(&mut line, &mut used, b"-")
+        && append_linux_hex(&mut line, &mut used, end)
+        && append_linux_bytes(&mut line, &mut used, b" ")
+        && append_linux_bytes(&mut line, &mut used, &flags)
+        && append_linux_bytes(&mut line, &mut used, b" ")
+        && append_linux_padded_hex(&mut line, &mut used, offset, 8)
+        && append_linux_bytes(&mut line, &mut used, b" ")
+        && append_linux_padded_hex(&mut line, &mut used, major, 2)
+        && append_linux_bytes(&mut line, &mut used, b":")
+        && append_linux_padded_hex(&mut line, &mut used, minor, 2)
+        && append_linux_bytes(&mut line, &mut used, b" ")
+        && append_linux_decimal(&mut line, &mut used, inode);
+    if !fixed {
+        return None;
+    }
+    // The name starts at column 73, as Linux pads it.
+    let padding = if name.is_empty() {
+        0
+    } else {
+        73_usize.saturating_sub(used).max(1)
+    };
+    text.try_reserve(used + padding + name.len() + 1).ok()?;
+    text.extend_from_slice(&line[..used]);
+    text.extend(core::iter::repeat_n(b' ', padding));
+    text.extend_from_slice(name);
+    text.push(b'\n');
+    Some(())
+}
+
+/// Appends `value` in lowercase hex, zero-padded to at least `width` digits.
+fn append_linux_padded_hex(output: &mut [u8], used: &mut usize, value: u64, width: usize) -> bool {
+    let digits = (64 - value.leading_zeros() as usize).div_ceil(4).max(width);
+    let Some(field) = output.get_mut(*used..*used + digits) else {
+        return false;
+    };
+    for (index, byte) in field.iter_mut().enumerate() {
+        let shift = 4 * (digits - 1 - index);
+        let nibble = if shift < 64 {
+            (value >> shift) & 0xf
+        } else {
+            0
+        } as u8;
+        *byte = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'a' + nibble - 10
+        };
+    }
+    *used += digits;
+    true
+}
+
 fn linux_proc_maps(pid: u32) -> Option<Vec<u8>> {
     let current = pid == current_linux_process_pid();
     let root = if current {
@@ -36662,6 +36899,10 @@ fn linux_proc_maps(pid: u32) -> Option<Vec<u8>> {
         X86_RUNTIME.ELF_PROBE_STACK_LOW.load(Ordering::SeqCst)
             ..X86_RUNTIME.ELF_PROBE_STACK.load(Ordering::SeqCst)
     });
+    // Ranges and protections come from the page tables; the process's
+    // recorded areas add the file, offset and name of what it mapped.
+    let recorded =
+        crate::linux_areas::snapshot(linux_execution_instance(), pid).unwrap_or_default();
     let mut text = Vec::new();
     for area in address_space::linux_memory_areas(root) {
         let name: &[u8] = if area.start == crate::linux_elf::VVAR_ADDRESS {
@@ -36676,40 +36917,22 @@ fn linux_proc_maps(pid: u32) -> Option<Vec<u8>> {
         } else {
             b""
         };
-        let mut line = [0_u8; 128];
-        let mut used = 0;
-        let flags = [
-            if area.protection & LINUX_PROT_READ as u8 != 0 {
-                b'r'
-            } else {
-                b'-'
-            },
-            if area.protection & LINUX_PROT_WRITE as u8 != 0 {
-                b'w'
-            } else {
-                b'-'
-            },
-            if area.protection & LINUX_PROT_EXEC as u8 != 0 {
-                b'x'
-            } else {
-                b'-'
-            },
-            if area.shared { b's' } else { b'p' },
-        ];
-        let written = append_linux_hex(&mut line, &mut used, area.start)
-            && append_linux_bytes(&mut line, &mut used, b"-")
-            && append_linux_hex(&mut line, &mut used, area.end)
-            && append_linux_bytes(&mut line, &mut used, b" ")
-            && append_linux_bytes(&mut line, &mut used, &flags)
-            && append_linux_bytes(&mut line, &mut used, b" 00000000 00:00 0")
-            && (name.is_empty()
-                || append_linux_bytes(&mut line, &mut used, b"                          ")
-                    && append_linux_bytes(&mut line, &mut used, name))
-            && append_linux_bytes(&mut line, &mut used, b"\n");
-        if !written || text.try_reserve(used).is_err() {
-            return None;
+        let mut cursor = area.start;
+        for part in recorded
+            .iter()
+            .filter(|part| part.start < area.end && area.start < part.end)
+        {
+            if part.start > cursor {
+                append_linux_maps_line(&mut text, (cursor, part.start), &area, None, name)?;
+            }
+            let start = cursor.max(part.start);
+            let end = part.end.min(area.end);
+            append_linux_maps_line(&mut text, (start, end), &area, Some(part), name)?;
+            cursor = end;
         }
-        text.extend_from_slice(&line[..used]);
+        if cursor < area.end {
+            append_linux_maps_line(&mut text, (cursor, area.end), &area, None, name)?;
+        }
     }
     Some(text)
 }

@@ -469,6 +469,7 @@ dependencies = [
  "ed25519-dalek",
  "font8x8",
  "ginux-image-store",
+ "ginux-memory-areas",
  "ginux-native-abi",
  "ginux-oci",
  "ginux-oci-cache",
@@ -492,6 +493,10 @@ dependencies = [
  "ginux-volume-service",
  "sha2 0.11.0",
 ]
+
+[[package]]
+name = "ginux-memory-areas"
+version = "0.1.0"
 
 [[package]]
 name = "ginux-native-abi"

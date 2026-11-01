@@ -771,6 +771,8 @@ pub(crate) struct RelocatableLoadPlan<'a> {
 pub(crate) struct RelocatableProcessPlan<'main, 'interpreter> {
     pub(crate) main: RelocatableLoadPlan<'main>,
     pub(crate) interpreter: RelocatableLoadPlan<'interpreter>,
+    /// The interpreter's path, as the main executable's PT_INTERP names it.
+    pub(crate) interpreter_path: &'main [u8],
     pub(crate) initial_entry: u64,
 }
 
@@ -1147,6 +1149,7 @@ pub(crate) fn plan_relocatable_process<'main, 'interpreter>(
         initial_entry: interpreter.entry,
         main,
         interpreter,
+        interpreter_path: main_image.interpreter?,
     })
 }
 

@@ -448,16 +448,36 @@ pub(super) extern "sysv64" fn linux_syscall_handler(
                 register(2),
                 register(1),
             ];
-            linux_mmap(
+            let mapped = linux_mmap(
                 arguments[0],
                 arguments[1],
                 arguments[2],
                 arguments[3],
                 arguments[4],
                 arguments[5],
-            )
+            );
+            linux_record_mapping(
+                mapped,
+                arguments[1],
+                arguments[2],
+                arguments[3],
+                arguments[4],
+                arguments[5],
+            );
+            mapped
         }
-        LINUX_MUNMAP_SYSCALL => linux_munmap(first_argument, buffer),
+        LINUX_MUNMAP_SYSCALL => {
+            let result = linux_munmap(first_argument, buffer);
+            if result == 0 && runtime_mode {
+                crate::linux_areas::unmap(
+                    linux_execution_instance(),
+                    current_linux_process_pid(),
+                    first_argument,
+                    buffer,
+                );
+            }
+            result
+        }
         LINUX_SHMGET_SYSCALL => linux_shmget(first_argument, buffer, count),
         LINUX_SHMAT_SYSCALL => linux_shmat(first_argument, buffer, count),
         LINUX_SHMCTL_SYSCALL => linux_shmctl(first_argument, buffer, count),
@@ -527,13 +547,34 @@ pub(super) extern "sysv64" fn linux_syscall_handler(
             (first_argument, buffer, count, register(0)),
         ),
         LINUX_MREMAP_SYSCALL => {
-            linux_mremap(first_argument, buffer, count, register(0), register(2))
+            let moved = linux_mremap(first_argument, buffer, count, register(0), register(2));
+            if runtime_mode && moved < 1 << 47 {
+                crate::linux_areas::remap(
+                    linux_execution_instance(),
+                    current_linux_process_pid(),
+                    (first_argument, buffer),
+                    (moved, count),
+                );
+            }
+            moved
         }
         LINUX_REMAP_FILE_PAGES_SYSCALL => {
             linux_remap_file_pages(first_argument, buffer, count, register(0), register(2))
         }
         LINUX_MSYNC_SYSCALL => linux_msync(first_argument, buffer, count),
-        LINUX_MPROTECT_SYSCALL => linux_mprotect(first_argument, buffer, count),
+        LINUX_MPROTECT_SYSCALL => {
+            let result = linux_mprotect(first_argument, buffer, count);
+            if result == 0 && runtime_mode {
+                crate::linux_areas::protect(
+                    linux_execution_instance(),
+                    current_linux_process_pid(),
+                    first_argument,
+                    buffer,
+                    crate::linux_areas::Protection::from_bits(count),
+                );
+            }
+            result
+        }
         LINUX_MSEAL_SYSCALL => linux_mseal(first_argument, buffer, count),
         LINUX_PKEY_MPROTECT_SYSCALL => {
             linux_pkey_mprotect(first_argument, buffer, count, register(0))
