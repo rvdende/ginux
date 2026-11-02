@@ -51260,6 +51260,15 @@ fn handle_user_fault(frame: *mut UserFaultFrame) -> u64 {
     if fault_domain.is_none() && materialize_linux_cow_page(fault_metadata) {
         return 0;
     }
+    // A sibling thread on another CPU may have resolved this page's
+    // copy-on-write (or otherwise made it writable) between the hardware
+    // trap and now, having flushed only its own CPU's translation: the
+    // page is writable again but this CPU still faults on a stale entry.
+    // Flush it and let the instruction run again instead of killing the
+    // process over a write the mapping now allows.
+    if fault_domain.is_none() && linux_retry_resolved_write_fault(fault_metadata) {
+        return 0;
+    }
     if fault_domain.is_none()
         && X86_RUNTIME.ELF_PROBE_ACTIVE.load(Ordering::SeqCst)
         && (materialize_linux_runtime_mapping(fault_metadata)
@@ -51625,6 +51634,26 @@ fn materialize_linux_cow_page(fault: domain::FaultMetadata) -> bool {
         return false;
     }
     materialize_linux_cow_address(fault.address & !(PAGE_SIZE as u64 - 1))
+}
+
+/// A present-page write fault that the current mapping now allows: another
+/// CPU made the page writable (it resolved the copy-on-write while this
+/// thread was trapping) and invalidated only its own translation. This CPU
+/// still holds a stale read-only entry, so flush it and retry rather than
+/// treat the write as a protection violation. Returns false when the page
+/// is genuinely not writable, leaving a real fault to be reported.
+fn linux_retry_resolved_write_fault(fault: domain::FaultMetadata) -> bool {
+    if fault.vector != 14 || fault.error & 3 != 3 || fault.address >= 1 << 47 {
+        return false;
+    }
+    let page = fault.address & !(PAGE_SIZE as u64 - 1);
+    if !address_space::current_linux_range_mapped(page, 1, true) {
+        return false;
+    }
+    unsafe {
+        asm!("invlpg [{}]", in(reg) page, options(nostack, preserves_flags));
+    }
+    true
 }
 
 extern "sysv64" fn kernel_linux_cow_fault_handler(error: u64, address: u64) -> u64 {
