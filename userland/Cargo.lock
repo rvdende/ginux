@@ -78,6 +78,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ginux-memtest"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+]
+
+[[package]]
 name = "ginux-term"
 version = "0.1.0"
 dependencies = [

@@ -2455,6 +2455,24 @@ pub(super) fn terminate_linux_process_for_fault(fault: domain::FaultMetadata) ->
     linux_terminate_by_default_signal(linux_fault_signal(fault.vector)) == LINUX_RETURN_TO_KERNEL
 }
 
+/// Kills the faulting process with SIGKILL when a page it may touch could
+/// not be given memory, as Linux's OOM killer does (the parent sees status
+/// 137). Init is left to the fault path: killing it would end the domain.
+pub(super) fn terminate_linux_process_out_of_memory() -> bool {
+    let pid = current_linux_process_pid();
+    if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) || pid == 1 {
+        return false;
+    }
+    let free_kib = memory::frame_counts().map_or(0, |(_, free)| free * 4);
+    serial_write("ginux: out of memory: killed process ");
+    serial_write_u64(u64::from(pid));
+    serial_write(" (free kB ");
+    serial_write_u64(free_kib);
+    serial_write(")\r\n");
+    abort_linux_signal();
+    linux_terminate_by_default_signal(LINUX_SIGKILL) == LINUX_RETURN_TO_KERNEL
+}
+
 pub(super) fn deliver_linux_sigsegv(
     frame: &mut UserFaultFrame,
     fault: domain::FaultMetadata,

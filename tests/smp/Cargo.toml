@@ -3,7 +3,9 @@
 #
 #   make build && cargo test --manifest-path tests/smp/Cargo.toml multicore
 #
-# (`make test-multicore` does both.) Its own workspace, like tests/ltp.
+# (`make test-multicore` does both.) `bigmem` (`make test-bigmem`) runs one
+# 16 GiB process in a 24 GB domain on a 26 GiB guest. Its own workspace,
+# like tests/ltp.
 [package]
 name = "ginux-smp-tests"
 version = "0.1.0"
@@ -15,3 +17,6 @@ publish = false
 
 [[test]]
 name = "multicore"
+
+[[test]]
+name = "bigmem"

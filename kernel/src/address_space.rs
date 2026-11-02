@@ -6,32 +6,83 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
 };
 
+/// Work lists for cloning and validating a process's address space, as long
+/// as the largest address space handled so far (they grow with the process,
+/// not to a fixed page limit).
 struct LinuxProcessCloneScratch {
-    visited_mappings: [bool; cpu::LINUX_PROCESS_MAPPING_LIMIT],
-    child_mappings: [cpu::LinuxExecMapping; cpu::LINUX_PROCESS_MAPPING_LIMIT],
+    visited_mappings: Vec<bool>,
+    child_mappings: Vec<cpu::LinuxExecMapping>,
 }
-
-const EMPTY_LINUX_EXEC_MAPPING: cpu::LinuxExecMapping = cpu::LinuxExecMapping {
-    address: 0,
-    frame: 0,
-    writable: false,
-    executable: false,
-};
 
 struct LinuxProcessScratchOwner {
     clone: UnsafeCell<LinuxProcessCloneScratch>,
-    validation: UnsafeCell<[bool; cpu::LINUX_PROCESS_MAPPING_LIMIT]>,
+    validation: UnsafeCell<Vec<bool>>,
 }
 
 unsafe impl Sync for LinuxProcessScratchOwner {}
 
 static LINUX_PROCESS_SCRATCH: LinuxProcessScratchOwner = LinuxProcessScratchOwner {
     clone: UnsafeCell::new(LinuxProcessCloneScratch {
-        visited_mappings: [false; cpu::LINUX_PROCESS_MAPPING_LIMIT],
-        child_mappings: [EMPTY_LINUX_EXEC_MAPPING; cpu::LINUX_PROCESS_MAPPING_LIMIT],
+        visited_mappings: Vec::new(),
+        child_mappings: Vec::new(),
     }),
-    validation: UnsafeCell::new([false; cpu::LINUX_PROCESS_MAPPING_LIMIT]),
+    validation: UnsafeCell::new(Vec::new()),
 };
+
+/// Makes `list` `length` copies of `value`, reusing its buffer; `None` when
+/// memory for it runs out. A buffer much larger than needed is given back.
+pub(crate) fn fill_list<T: Copy>(list: &mut Vec<T>, length: usize, value: T) -> Option<()> {
+    list.clear();
+    if list.capacity() > length.saturating_mul(4).max(1024) {
+        list.shrink_to(length);
+    }
+    list.try_reserve_exact(length).ok()?;
+    list.resize(length, value);
+    Some(())
+}
+
+/// A new list of `length` copies of `value`, or `None` without the memory.
+fn filled_list<T: Copy>(length: usize, value: T) -> Option<Vec<T>> {
+    let mut list = Vec::new();
+    fill_list(&mut list, length, value)?;
+    Some(list)
+}
+
+/// Finds where a table of `old` moved to in `new` (the same position): a
+/// sorted index, so relocating every entry of a large tree costs a binary
+/// search per entry rather than a scan of the whole hierarchy.
+struct HierarchyRelocation {
+    old: Vec<(u64, u32)>,
+}
+
+impl HierarchyRelocation {
+    fn new(old_hierarchy: &[memory::FrameLease]) -> Option<Self> {
+        let mut old = Vec::new();
+        old.try_reserve_exact(old_hierarchy.len()).ok()?;
+        for (index, frame) in old_hierarchy.iter().enumerate() {
+            old.push((frame.address(), u32::try_from(index).ok()?));
+        }
+        old.sort_unstable_by_key(|(address, _)| *address);
+        Some(Self { old })
+    }
+
+    fn position(&self, address: u64) -> Option<usize> {
+        self.old
+            .binary_search_by_key(&address, |(old, _)| *old)
+            .ok()
+            .map(|found| self.old[found].1 as usize)
+    }
+}
+
+/// Whether every frame in `frames` is a different one (sorting a copy:
+/// large hierarchies made pairwise checks quadratic).
+fn frames_distinct(frames: &[memory::FrameLease]) -> Option<bool> {
+    let mut addresses = Vec::new();
+    addresses.try_reserve_exact(frames.len()).ok()?;
+    addresses.extend(frames.iter().map(|frame| frame.address()));
+    addresses.sort_unstable();
+    Some(addresses.windows(2).all(|pair| pair[0] != pair[1]))
+}
 
 use crate::{
     arch::x86_64::{
@@ -3715,9 +3766,7 @@ fn prepare_linux_hierarchy_replacement(
         }
     };
     if mappings.is_empty()
-        || mappings.len() > cpu::LINUX_PROCESS_MAPPING_LIMIT
         || old_mappings.is_empty()
-        || old_mappings.len() > cpu::LINUX_PROCESS_MAPPING_LIMIT
         || validate_collections
             && (mappings.iter().enumerate().any(|(index, mapping)| {
                 mappings[..index].iter().any(|prior| {
@@ -3754,6 +3803,9 @@ fn prepare_linux_hierarchy_replacement(
         };
         unsafe { core::ptr::copy_nonoverlapping(source, destination, ENTRY_COUNT) };
     }
+    let Some(relocation) = HierarchyRelocation::new(old_hierarchy) else {
+        return false;
+    };
     for frame in new_hierarchy.iter().copied() {
         let Some(entries) = mapped_frame::<u64>(frame.address()) else {
             return false;
@@ -3763,10 +3815,7 @@ fn prepare_linux_hierarchy_replacement(
             if value & PRESENT == 0 {
                 continue;
             }
-            if let Some(position) = old_hierarchy
-                .iter()
-                .position(|old| old.address() == value & ADDRESS_MASK)
-            {
+            if let Some(position) = relocation.position(value & ADDRESS_MASK) {
                 unsafe {
                     entries
                         .add(index)
@@ -3899,6 +3948,9 @@ fn clone_shared_linux_hierarchy(
         };
         unsafe { core::ptr::copy_nonoverlapping(source, destination, ENTRY_COUNT) };
     }
+    let Some(relocation) = HierarchyRelocation::new(old_hierarchy) else {
+        return false;
+    };
     for frame in new_hierarchy.iter().copied() {
         let Some(entries) = mapped_frame::<u64>(frame.address()) else {
             return false;
@@ -3908,10 +3960,7 @@ fn clone_shared_linux_hierarchy(
             if value & PRESENT == 0 {
                 continue;
             }
-            if let Some(position) = old_hierarchy
-                .iter()
-                .position(|old| old.address() == value & ADDRESS_MASK)
-            {
+            if let Some(position) = relocation.position(value & ADDRESS_MASK) {
                 unsafe {
                     entries
                         .add(index)
@@ -3976,8 +4025,7 @@ fn clone_linux_process_hierarchy_inner(
                 })
                 .count()
                 != child_pages.len())
-        || parent_mappings.len() > cpu::LINUX_PROCESS_MAPPING_LIMIT
-        || !(4..=cpu::LINUX_PROCESS_HIERARCHY_LIMIT).contains(&parent_hierarchy.len())
+        || parent_hierarchy.len() < 4
         || parent_hierarchy.len() != child_hierarchy.len()
         || !memory::frames_owned_by(memory::FrameOwner::KERNEL, parent_hierarchy)
         || !memory::frames_owned_by(memory::FrameOwner::KERNEL, child_hierarchy)
@@ -4010,10 +4058,34 @@ fn clone_linux_process_hierarchy_inner(
     {
         return false;
     }
-    let mut visited_hierarchy = [false; cpu::LINUX_PROCESS_HIERARCHY_LIMIT];
     let scratch = unsafe { &mut *LINUX_PROCESS_SCRATCH.clone.get() };
-    scratch.visited_mappings.fill(false);
-    scratch.child_mappings.fill(EMPTY_LINUX_EXEC_MAPPING);
+    let child_mapping_capacity = parent_mappings.len();
+    let (Some(mut visited_hierarchy), Some(()), Some(())) = (
+        filled_list(
+            if validate_parent_tree {
+                parent_hierarchy.len()
+            } else {
+                0
+            },
+            false,
+        ),
+        fill_list(
+            &mut scratch.visited_mappings,
+            if validate_parent_tree {
+                parent_mappings.len()
+            } else {
+                0
+            },
+            false,
+        ),
+        fill_list(
+            &mut scratch.child_mappings,
+            child_mapping_capacity,
+            cpu::LinuxExecMapping::EMPTY,
+        ),
+    ) else {
+        return false;
+    };
     let visited_mappings = &mut scratch.visited_mappings;
     if validate_parent_tree
         && (!validate_complete_linux_process_user_tree(
@@ -4026,7 +4098,7 @@ fn clone_linux_process_hierarchy_inner(
             visited_mappings,
         ) || parent_hierarchy
             .iter()
-            .zip(visited_hierarchy)
+            .zip(visited_hierarchy.iter().copied())
             .any(|(frame, visited)| !visited && !linux_process_hierarchy_frame_is_empty(*frame))
             || visited_mappings[..parent_mappings.len()]
                 .iter()
@@ -4218,8 +4290,7 @@ pub(crate) fn validate_linux_process_address_space(
     mappings: &[cpu::LinuxActiveImageMapping],
 ) -> bool {
     if mappings.is_empty()
-        || mappings.len() > cpu::LINUX_PROCESS_MAPPING_LIMIT
-        || !(4..=cpu::LINUX_PROCESS_HIERARCHY_LIMIT).contains(&hierarchy.len())
+        || hierarchy.len() < 4
         || !memory::frames_owned_by(memory::FrameOwner::KERNEL, hierarchy)
         || hierarchy
             .iter()
@@ -4240,9 +4311,13 @@ pub(crate) fn validate_linux_process_address_space(
     {
         return false;
     }
-    let mut visited_hierarchy = [false; cpu::LINUX_PROCESS_HIERARCHY_LIMIT];
     let visited_mappings = unsafe { &mut *LINUX_PROCESS_SCRATCH.validation.get() };
-    visited_mappings.fill(false);
+    let (Some(mut visited_hierarchy), Some(())) = (
+        filled_list(hierarchy.len(), false),
+        fill_list(visited_mappings, mappings.len(), false),
+    ) else {
+        return false;
+    };
     validate_complete_linux_process_user_tree(
         hierarchy[0].address(),
         0,
@@ -4253,19 +4328,32 @@ pub(crate) fn validate_linux_process_address_space(
         visited_mappings,
     ) && hierarchy
         .iter()
-        .zip(visited_hierarchy)
+        .zip(visited_hierarchy.iter().copied())
         .all(|(frame, visited)| visited || linux_process_hierarchy_frame_is_empty(*frame))
         && visited_mappings[..mappings.len()]
             .iter()
             .all(|visited| *visited)
 }
 
+/// Why a snapshot walk stopped.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum SnapshotWalk {
+    Complete,
+    /// The lists were too short: grow them and walk again.
+    Full,
+    Invalid,
+}
+
+/// Appends the current address space's page-table frames and mapped pages
+/// to `hierarchy` and `mappings` (the first `*_count` entries are kept),
+/// walking the tables in address order. Reports `Full` when either list
+/// ran out of room, so the caller can grow it and walk again.
 pub(crate) fn complete_current_linux_process_snapshot(
-    hierarchy: &mut [memory::FrameLease; cpu::LINUX_PROCESS_HIERARCHY_LIMIT],
+    hierarchy: &mut [memory::FrameLease],
     hierarchy_count: &mut usize,
-    mappings: &mut [cpu::LinuxActiveImageMapping; cpu::LINUX_PROCESS_MAPPING_LIMIT],
+    mappings: &mut [cpu::LinuxActiveImageMapping],
     mapping_count: &mut usize,
-) -> bool {
+) -> SnapshotWalk {
     fn live_mapping_frame(address: u64) -> Option<memory::FrameLease> {
         memory::live_frame_lease(memory::FrameOwner::KERNEL, address).or_else(|| {
             memory::FrameLease::from_parts(address, 1)
@@ -4275,12 +4363,12 @@ pub(crate) fn complete_current_linux_process_snapshot(
 
     fn walk(
         root: u64,
-        hierarchy: &mut [memory::FrameLease; cpu::LINUX_PROCESS_HIERARCHY_LIMIT],
+        hierarchy: &mut [memory::FrameLease],
         hierarchy_count: &mut usize,
-        mappings: &mut [cpu::LinuxActiveImageMapping; cpu::LINUX_PROCESS_MAPPING_LIMIT],
+        mappings: &mut [cpu::LinuxActiveImageMapping],
         mapping_count: &mut usize,
         initial_mapping_count: usize,
-    ) -> bool {
+    ) -> SnapshotWalk {
         #[derive(Clone, Copy)]
         struct Cursor {
             table: u64,
@@ -4299,7 +4387,7 @@ pub(crate) fn complete_current_linux_process_snapshot(
         loop {
             if cursors[level].next_index == ENTRY_COUNT {
                 if level == 0 {
-                    return true;
+                    return SnapshotWalk::Complete;
                 }
                 level -= 1;
                 continue;
@@ -4307,7 +4395,7 @@ pub(crate) fn complete_current_linux_process_snapshot(
             let index = cursors[level].next_index;
             cursors[level].next_index += 1;
             let Some(entries) = mapped_frame::<u64>(cursors[level].table) else {
-                return false;
+                return SnapshotWalk::Invalid;
             };
             let value = unsafe { entries.add(index).read() };
             if value & PRESENT == 0 {
@@ -4316,7 +4404,7 @@ pub(crate) fn complete_current_linux_process_snapshot(
             let child_user_path = value & USER != 0;
             if level == 0 && index >= 256 {
                 if child_user_path {
-                    return false;
+                    return SnapshotWalk::Invalid;
                 }
                 continue;
             }
@@ -4326,22 +4414,19 @@ pub(crate) fn complete_current_linux_process_snapshot(
             let address = cursors[level].prefix | (index as u64) << [39_u32, 30, 21, 12][level];
             if level < 3 {
                 if value & LARGE_PAGE != 0 {
-                    return false;
+                    return SnapshotWalk::Invalid;
                 }
+                // Each table is reached once in a tree; the caller checks
+                // that no frame was recorded twice.
                 let child = value & ADDRESS_MASK;
-                if !hierarchy[..*hierarchy_count]
-                    .iter()
-                    .any(|frame| frame.address() == child)
-                {
-                    let Some(frame) = live_mapping_frame(child) else {
-                        return false;
-                    };
-                    let Some(slot) = hierarchy.get_mut(*hierarchy_count) else {
-                        return false;
-                    };
-                    *slot = frame;
-                    *hierarchy_count += 1;
-                }
+                let Some(frame) = live_mapping_frame(child) else {
+                    return SnapshotWalk::Invalid;
+                };
+                let Some(slot) = hierarchy.get_mut(*hierarchy_count) else {
+                    return SnapshotWalk::Full;
+                };
+                *slot = frame;
+                *hierarchy_count += 1;
                 level += 1;
                 cursors[level] = Cursor {
                     table: child,
@@ -4363,7 +4448,7 @@ pub(crate) fn complete_current_linux_process_snapshot(
                     || cow && (existing.shared || physical_writable)
                     || existing.executable != (value & NO_EXECUTE == 0)
                 {
-                    return false;
+                    return SnapshotWalk::Invalid;
                 }
                 existing.shared = value & LINUX_RUNTIME_SHARED != 0;
                 existing.dontfork = value & LINUX_RUNTIME_DONTFORK != 0;
@@ -4382,10 +4467,10 @@ pub(crate) fn complete_current_linux_process_snapshot(
                 crate::serial_write_bytes(b" ");
                 crate::serial_write_u64(value);
                 crate::serial_write_bytes(b"\r\n");
-                return false;
+                return SnapshotWalk::Invalid;
             };
             let Some(slot) = mappings.get_mut(*mapping_count) else {
-                return false;
+                return SnapshotWalk::Full;
             };
             *slot = cpu::LinuxActiveImageMapping {
                 address: address as usize,
@@ -4404,22 +4489,31 @@ pub(crate) fn complete_current_linux_process_snapshot(
         || *mapping_count > mappings.len()
         || hierarchy[0].address() != current_root()
     {
-        return false;
+        return SnapshotWalk::Invalid;
     }
     let initial_mapping_count = *mapping_count;
-    walk(
+    let walked = walk(
         current_root(),
         hierarchy,
         hierarchy_count,
         mappings,
         mapping_count,
         initial_mapping_count,
-    )
+    );
+    if walked == SnapshotWalk::Complete
+        && frames_distinct(&hierarchy[..*hierarchy_count]) != Some(true)
+    {
+        return SnapshotWalk::Invalid;
+    }
+    walked
 }
 
+/// Records the current address space's page-table frames in `hierarchy`,
+/// root first, and returns how many; `Err(true)` when `hierarchy` was too
+/// short (grow it and call again), `Err(false)` when the tree is invalid.
 pub(crate) fn current_linux_process_hierarchy(
-    hierarchy: &mut [memory::FrameLease; cpu::LINUX_PROCESS_HIERARCHY_LIMIT],
-) -> Option<usize> {
+    hierarchy: &mut [memory::FrameLease],
+) -> Result<usize, bool> {
     #[derive(Clone, Copy)]
     struct Cursor {
         table: u64,
@@ -4431,9 +4525,10 @@ pub(crate) fn current_linux_process_hierarchy(
     };
     let root_address = current_root();
     let root = memory::live_frame_lease(memory::FrameOwner::KERNEL, root_address)
-        .or_else(|| memory::FrameLease::from_parts(root_address, 1))?;
+        .or_else(|| memory::FrameLease::from_parts(root_address, 1))
+        .ok_or(false)?;
     hierarchy.fill(memory::FrameLease::EMPTY);
-    hierarchy[0] = root;
+    *hierarchy.first_mut().ok_or(true)? = root;
     let mut count = 1;
     let mut cursors = [EMPTY; 4];
     cursors[0].table = root_address;
@@ -4441,31 +4536,32 @@ pub(crate) fn current_linux_process_hierarchy(
     loop {
         if cursors[level].next_index == ENTRY_COUNT {
             if level == 0 {
-                return Some(count);
+                return if frames_distinct(&hierarchy[..count]) == Some(true) {
+                    Ok(count)
+                } else {
+                    Err(false)
+                };
             }
             level -= 1;
             continue;
         }
         let index = cursors[level].next_index;
         cursors[level].next_index += 1;
-        let entries = mapped_frame::<u64>(cursors[level].table)?;
+        let entries = mapped_frame::<u64>(cursors[level].table).ok_or(false)?;
         let value = unsafe { entries.add(index).read() };
         if value & (PRESENT | USER) != PRESENT | USER || level == 3 {
             continue;
         }
         if value & LARGE_PAGE != 0 {
-            return None;
+            return Err(false);
         }
+        // Each table is reached once in a tree; checked for repeats at the end.
         let child = value & ADDRESS_MASK;
-        if !hierarchy[..count]
-            .iter()
-            .any(|frame| frame.address() == child)
-        {
-            let frame = memory::live_frame_lease(memory::FrameOwner::KERNEL, child)
-                .or_else(|| memory::FrameLease::from_parts(child, 1))?;
-            *hierarchy.get_mut(count)? = frame;
-            count += 1;
-        }
+        let frame = memory::live_frame_lease(memory::FrameOwner::KERNEL, child)
+            .or_else(|| memory::FrameLease::from_parts(child, 1))
+            .ok_or(false)?;
+        *hierarchy.get_mut(count).ok_or(true)? = frame;
+        count += 1;
         level += 1;
         cursors[level] = Cursor {
             table: child,
@@ -4488,7 +4584,7 @@ pub(crate) fn current_linux_process_user_tree_counts(
         level: usize,
         user_path: bool,
         hierarchy: &[memory::FrameLease],
-        visited: &mut [bool; cpu::LINUX_PROCESS_HIERARCHY_LIMIT],
+        visited: &mut [bool],
         leaves: &mut usize,
     ) -> bool {
         let Some(hierarchy_index) = hierarchy.iter().position(|frame| frame.address() == table)
@@ -4533,10 +4629,10 @@ pub(crate) fn current_linux_process_user_tree_counts(
         true
     }
 
-    if !(4..=cpu::LINUX_PROCESS_HIERARCHY_LIMIT).contains(&hierarchy.len()) {
+    if hierarchy.len() < 4 {
         return None;
     }
-    let mut visited = [false; cpu::LINUX_PROCESS_HIERARCHY_LIMIT];
+    let mut visited = filled_list(hierarchy.len(), false)?;
     let mut leaves = 0;
     walk(
         hierarchy[0].address(),
@@ -4793,8 +4889,8 @@ fn validate_complete_linux_process_user_tree(
     path: (u64, bool),
     hierarchy: &[memory::FrameLease],
     mappings: &[cpu::LinuxActiveImageMapping],
-    visited_hierarchy: &mut [bool; cpu::LINUX_PROCESS_HIERARCHY_LIMIT],
-    visited_mappings: &mut [bool; cpu::LINUX_PROCESS_MAPPING_LIMIT],
+    visited_hierarchy: &mut [bool],
+    visited_mappings: &mut [bool],
 ) -> bool {
     let (prefix, user_path) = path;
     let Some(hierarchy_index) = hierarchy.iter().position(|frame| frame.address() == table) else {

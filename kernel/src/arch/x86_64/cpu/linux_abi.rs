@@ -808,12 +808,6 @@ pub(super) const LINUX_PROC_PID2_ZOMBIE_STAT: &[u8] = b"2 (init) Z 1 1 1 0 -1 41
 pub(super) const LINUX_PROC_PID2_STATM: &[u8] = b"256 64 32 16 0 32 0\n";
 pub(crate) const LINUX_EXEC_MAPPING_LIMIT: usize = 8;
 pub(crate) const LINUX_ACTIVE_IMAGE_MAPPING_LIMIT: usize = 640;
-pub(crate) const LINUX_PROCESS_HIERARCHY_LIMIT: usize = 8192;
-// Pages one Linux process may map; rustc's driver library alone is 74,000.
-// Process address-space records count them in u32 and keep the storage
-// outside the kernel image, so the configured domain memory remains the
-// actual resource bound.
-pub(crate) const LINUX_PROCESS_MAPPING_LIMIT: usize = 262_144;
 pub(super) const LINUX_EXEC_VECTOR_LIMIT: usize = 32;
 pub(super) const LINUX_EXEC_STACK_SIZE: usize = PAGE_SIZE / 2;
 /// Pages for the runtime exec argument, environment and auxiliary-vector

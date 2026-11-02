@@ -4203,11 +4203,14 @@ impl LinuxActiveImageMapping {
     };
 }
 
-#[derive(Clone, Copy)]
+/// A process's page-table frames and mapped pages. The lists are work
+/// areas as long as the largest address space seen lately (they grow when a
+/// walk fills them and shrink back); the first `*_count` entries are the
+/// snapshot and the rest are empty.
 pub(crate) struct LinuxProcessAddressSpaceSnapshot {
-    hierarchy: [memory::FrameLease; LINUX_PROCESS_HIERARCHY_LIMIT],
+    hierarchy: Vec<memory::FrameLease>,
     hierarchy_count: usize,
-    mappings: [LinuxActiveImageMapping; LINUX_PROCESS_MAPPING_LIMIT],
+    mappings: Vec<LinuxActiveImageMapping>,
     mapping_count: usize,
 }
 
@@ -4217,13 +4220,55 @@ unsafe impl Sync for LinuxProcessSnapshotScratch {}
 
 static X86_RUNTIME_BACKING_LINUX_PROCESS_SNAPSHOT_SCRATCH: LinuxProcessSnapshotScratch =
     LinuxProcessSnapshotScratch(UnsafeCell::new(LinuxProcessAddressSpaceSnapshot {
-        hierarchy: [memory::FrameLease::EMPTY; LINUX_PROCESS_HIERARCHY_LIMIT],
+        hierarchy: Vec::new(),
         hierarchy_count: 0,
-        mappings: [LinuxActiveImageMapping::EMPTY; LINUX_PROCESS_MAPPING_LIMIT],
+        mappings: Vec::new(),
         mapping_count: 0,
     }));
 
+/// Starting lengths of the snapshot lists.
+const LINUX_SNAPSHOT_MIN_HIERARCHY: usize = 64;
+const LINUX_SNAPSHOT_MIN_MAPPINGS: usize = 4096;
+
 impl LinuxProcessAddressSpaceSnapshot {
+    /// Empties the lists for a new walk, sized for what the last one found
+    /// (`grow` doubles the list that was full and keeps the other); false
+    /// without the memory.
+    fn reset(&mut self, grow: (bool, bool)) -> bool {
+        let growing = grow.0 || grow.1;
+        let length = |current: usize, used: usize, minimum: usize, grow: bool| {
+            if grow {
+                current.saturating_mul(2).max(minimum)
+            } else if !growing && current > used.saturating_mul(4).max(minimum) {
+                used.saturating_mul(2).max(minimum)
+            } else {
+                current.max(minimum)
+            }
+        };
+        let hierarchy = length(
+            self.hierarchy.len(),
+            self.hierarchy_count,
+            LINUX_SNAPSHOT_MIN_HIERARCHY,
+            grow.0,
+        );
+        let mappings = length(
+            self.mappings.len(),
+            self.mapping_count,
+            LINUX_SNAPSHOT_MIN_MAPPINGS,
+            grow.1,
+        );
+        self.hierarchy_count = 0;
+        self.mapping_count = 0;
+        address_space::fill_list(&mut self.hierarchy, hierarchy, memory::FrameLease::EMPTY)
+            .is_some()
+            && address_space::fill_list(
+                &mut self.mappings,
+                mappings,
+                LinuxActiveImageMapping::EMPTY,
+            )
+            .is_some()
+    }
+
     pub(crate) fn hierarchy(&self) -> &[memory::FrameLease] {
         &self.hierarchy[..self.hierarchy_count]
     }
@@ -4282,7 +4327,7 @@ pub(crate) struct LinuxExecMapping {
 }
 
 impl LinuxExecMapping {
-    const EMPTY: Self = Self {
+    pub(crate) const EMPTY: Self = Self {
         address: 0,
         frame: 0,
         writable: false,
@@ -4430,7 +4475,7 @@ fn linux_active_image_mappings() -> Option<(
 }
 
 fn append_linux_process_snapshot_mapping(
-    mappings: &mut [LinuxActiveImageMapping; LINUX_PROCESS_MAPPING_LIMIT],
+    mappings: &mut [LinuxActiveImageMapping],
     count: &mut usize,
     mapping: LinuxActiveImageMapping,
 ) -> bool {
@@ -4483,26 +4528,45 @@ fn take_runtime_linux_process_address_space_snapshot(
                 .filter(|frame| memory::frame_lease_is_runtime(*frame))
         })?;
     let snapshot = unsafe { &mut *X86_RUNTIME.LINUX_PROCESS_SNAPSHOT_SCRATCH.0 .0.get() };
-    snapshot.hierarchy.fill(memory::FrameLease::EMPTY);
-    snapshot.mappings.fill(LinuxActiveImageMapping::EMPTY);
-    snapshot.hierarchy[0] = root;
-    snapshot.hierarchy_count = 1;
-    snapshot.mapping_count = 0;
     X86_RUNTIME
         .LINUX_PROCESS_SNAPSHOT_STAGE
         .store(8, Ordering::SeqCst);
-    if !address_space::complete_current_linux_process_snapshot(
-        &mut snapshot.hierarchy,
-        &mut snapshot.hierarchy_count,
-        &mut snapshot.mappings,
-        &mut snapshot.mapping_count,
-    ) {
-        serial_write("ginux: runtime snapshot capacity hierarchy/mappings: ");
-        serial_write_u64(snapshot.hierarchy_count as u64);
-        serial_write(" ");
-        serial_write_u64(snapshot.mapping_count as u64);
-        serial_write("\r\n");
-        return None;
+    // Walk into lists sized for the last snapshot; when one fills, grow it
+    // and walk again, so a process may map as much as there is memory for.
+    let mut grow = (false, false);
+    loop {
+        if !snapshot.reset(grow) {
+            serial_write("ginux: runtime snapshot out of memory hierarchy/mappings: ");
+            serial_write_u64(snapshot.hierarchy.len() as u64);
+            serial_write(" ");
+            serial_write_u64(snapshot.mappings.len() as u64);
+            serial_write("\r\n");
+            return None;
+        }
+        snapshot.hierarchy[0] = root;
+        snapshot.hierarchy_count = 1;
+        match address_space::complete_current_linux_process_snapshot(
+            &mut snapshot.hierarchy,
+            &mut snapshot.hierarchy_count,
+            &mut snapshot.mappings,
+            &mut snapshot.mapping_count,
+        ) {
+            address_space::SnapshotWalk::Complete => break,
+            address_space::SnapshotWalk::Full => {
+                grow = (
+                    snapshot.hierarchy_count == snapshot.hierarchy.len(),
+                    snapshot.mapping_count == snapshot.mappings.len(),
+                );
+            }
+            address_space::SnapshotWalk::Invalid => {
+                serial_write("ginux: runtime snapshot walk rejected hierarchy/mappings: ");
+                serial_write_u64(snapshot.hierarchy_count as u64);
+                serial_write(" ");
+                serial_write_u64(snapshot.mapping_count as u64);
+                serial_write("\r\n");
+                return None;
+            }
+        }
     }
     // The kernel just produced this snapshot by walking the active page
     // tables in monotonically increasing virtual-address order. Repeating the
@@ -4551,10 +4615,11 @@ pub(crate) fn live_linux_process_address_space_snapshot(
         return None;
     }
     let snapshot = unsafe { &mut *X86_RUNTIME.LINUX_PROCESS_SNAPSHOT_SCRATCH.0 .0.get() };
-    snapshot.hierarchy.fill(memory::FrameLease::EMPTY);
-    snapshot.mappings.fill(LinuxActiveImageMapping::EMPTY);
-    snapshot.hierarchy_count = 0;
-    snapshot.mapping_count = 0;
+    // The processes this path records are small: the lists' least lengths
+    // hold them.
+    if !snapshot.reset((false, false)) {
+        return None;
+    }
     let hierarchy = &mut snapshot.hierarchy;
     let mappings = &mut snapshot.mappings;
     let mut hierarchy_count = 0;
@@ -4899,12 +4964,13 @@ pub(crate) fn live_linux_process_address_space_snapshot(
         .LINUX_PROCESS_SNAPSHOT_STAGE
         .store(8, Ordering::SeqCst);
 
-    if !address_space::complete_current_linux_process_snapshot(
+    if address_space::complete_current_linux_process_snapshot(
         hierarchy,
         &mut hierarchy_count,
         mappings,
         &mut mapping_count,
-    ) {
+    ) != address_space::SnapshotWalk::Complete
+    {
         if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
             serial_write("ginux: runtime snapshot hierarchy/mappings before rejection: ");
             serial_write_u64(hierarchy_count as u64);
@@ -12447,10 +12513,18 @@ fn linux_request_process_fork(
         && !linux_process::live_process_address_space_stale(current_linux_process_pid())
     {
         let snapshot = unsafe { &mut *X86_RUNTIME.LINUX_PROCESS_SNAPSHOT_SCRATCH.0 .0.get() };
-        let hierarchy_refreshed = address_space::current_linux_process_hierarchy(
-            &mut snapshot.hierarchy,
-        )
-        .is_some_and(|count| {
+        let mut grow = false;
+        let hierarchy_count = loop {
+            if !snapshot.reset((grow, false)) {
+                break None;
+            }
+            match address_space::current_linux_process_hierarchy(&mut snapshot.hierarchy) {
+                Ok(count) => break Some(count),
+                Err(full) if full => grow = true,
+                Err(_) => break None,
+            }
+        };
+        let hierarchy_refreshed = hierarchy_count.is_some_and(|count| {
             linux_process::refresh_live_process_hierarchy(
                 current_linux_process_pid(),
                 &snapshot.hierarchy[..count],
@@ -15057,7 +15131,7 @@ fn linux_allocate_mmap_leases(
     }
     let mut leases = [memory::FrameLease::EMPTY; LINUX_RUNTIME_MMAP_SLOT_COUNT];
     for index in 0..pages {
-        let Some([lease]) = memory::allocate_frames::<1>(memory::FrameOwner::KERNEL) else {
+        let Some([lease]) = memory::allocate_user_frames::<1>() else {
             if index != 0 {
                 let _ =
                     memory::scrub_and_release_frames(memory::FrameOwner::KERNEL, &leases[..index]);
@@ -22362,7 +22436,7 @@ fn linux_runtime_mmap(
             } else {
                 let allocate_started =
                     cfg!(feature = "linux-boot-profile").then(timer::timestamp_counter);
-                let Some([frame]) = memory::allocate_frames::<1>(memory::FrameOwner::KERNEL) else {
+                let Some([frame]) = memory::allocate_user_frames::<1>() else {
                     let _ = rollback_linux_runtime_mapping(mapping, installed);
                     return LINUX_ENOMEM;
                 };
@@ -45763,7 +45837,7 @@ fn materialize_linux_runtime_user_range(address: u64, length: usize, writable: b
             if linux_runtime_primary_stack_contains(page_address) {
                 record_linux_primary_stack_growth(page_address);
             }
-            let Some([frame]) = memory::allocate_frames::<1>(memory::FrameOwner::KERNEL) else {
+            let Some([frame]) = memory::allocate_user_frames::<1>() else {
                 return false;
             };
             if !address_space::prepare_linux_frame(frame.address(), &[])
@@ -45809,7 +45883,7 @@ fn materialize_linux_primary_stack_page(page_address: u64) -> bool {
     {
         return false;
     }
-    let Some([frame]) = memory::allocate_frames::<1>(memory::FrameOwner::KERNEL) else {
+    let Some([frame]) = memory::allocate_user_frames::<1>() else {
         return false;
     };
     if !address_space::prepare_linux_frame(frame.address(), &[])
@@ -49803,6 +49877,8 @@ extern "sysv64" fn user_fault_handler(frame: *mut UserFaultFrame) -> u64 {
 
 fn handle_user_fault(frame: *mut UserFaultFrame) -> u64 {
     let _kernel_entry = crate::sync::kernel_entry_lock();
+    // A refusal recorded before this fault is not this fault's.
+    let _ = memory::take_user_frames_refused();
     let Some(frame) = (unsafe { frame.as_mut() }) else {
         return u64::MAX;
     };
@@ -49842,6 +49918,14 @@ fn handle_user_fault(frame: *mut UserFaultFrame) -> u64 {
         serial_write(" ");
         serial_write_u64(fault_metadata.instruction);
         serial_write("\r\n");
+    }
+    // The page was the process's to touch but no memory was left for it.
+    if fault_domain.is_none()
+        && X86_RUNTIME.ELF_PROBE_ACTIVE.load(Ordering::SeqCst)
+        && memory::take_user_frames_refused()
+        && terminate_linux_process_out_of_memory()
+    {
+        return u64::MAX;
     }
     if fault_domain.is_none() && X86_RUNTIME.ELF_PROBE_ACTIVE.load(Ordering::SeqCst) {
         serial_write("ginux: Linux user fault vector/error/address/rip:");
@@ -50138,7 +50222,7 @@ fn grow_linux_runtime_stack(fault: domain::FaultMetadata) -> bool {
     {
         return false;
     }
-    let Some([frame]) = memory::allocate_frames::<1>(memory::FrameOwner::KERNEL) else {
+    let Some([frame]) = memory::allocate_user_frames::<1>() else {
         return false;
     };
     if !address_space::prepare_linux_frame(frame.address(), &[])
@@ -50237,7 +50321,7 @@ fn materialize_linux_cow_address(address: u64) -> bool {
         return address_space::promote_current_linux_cow_page(address, source, mapping.executable)
             || failed(2);
     }
-    let Some([replacement]) = memory::allocate_frames::<1>(memory::FrameOwner::KERNEL) else {
+    let Some([replacement]) = memory::allocate_user_frames::<1>() else {
         return failed(3);
     };
     let copied = address_space::copy_linux_frame(source, replacement);
@@ -50295,7 +50379,7 @@ fn materialize_linux_runtime_mapping(fault: domain::FaultMetadata) -> bool {
     {
         return false;
     }
-    let Some([frame]) = memory::allocate_frames::<1>(memory::FrameOwner::KERNEL) else {
+    let Some([frame]) = memory::allocate_user_frames::<1>() else {
         return false;
     };
     if !address_space::prepare_linux_frame(frame.address(), &[])

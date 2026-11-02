@@ -46,6 +46,10 @@ struct PhysicalMemoryOwner {
     /// atomically.
     metadata_table: AtomicPtr<u64>,
     metadata_frames: AtomicUsize,
+    /// Set when `allocate_user_frames` refused a request because only the
+    /// kernel's reserve was left; the fault path takes it to tell running
+    /// out of memory from a bad access.
+    user_frames_refused: AtomicBool,
     allocator: IrqSpinLock<MaybeUninit<FrameAllocator>>,
 }
 
@@ -55,6 +59,7 @@ static PHYSICAL_MEMORY: PhysicalMemoryOwner = PhysicalMemoryOwner {
     runtime_extent_counts: [const { AtomicUsize::new(0) }; crate::control_abi::DOMAIN_LIMIT],
     metadata_table: AtomicPtr::new(core::ptr::null_mut()),
     metadata_frames: AtomicUsize::new(0),
+    user_frames_refused: AtomicBool::new(false),
     allocator: IrqSpinLock::new(LockRank::PHYSICAL_MEMORY, MaybeUninit::uninit()),
 };
 
@@ -754,6 +759,59 @@ pub(crate) fn allocate_frames<const N: usize>(owner: FrameOwner) -> Option<[Fram
         }
         Some(frames)
     }
+}
+
+/// Frames user memory may not take: what the kernel needs to keep running
+/// and to tear down the process that ran the machine out of memory (its
+/// signal records, page-table walks, the parent's SIGCHLD). Linux keeps a
+/// similar watermark (`min_free_kbytes`). One part in 64 of RAM, at least
+/// 32 MiB and at most 256 MiB.
+fn user_reserve_frames(total_frames: u64) -> u64 {
+    const MIN: u64 = (32 << 20) / PAGE_SIZE;
+    const MAX: u64 = (256 << 20) / PAGE_SIZE;
+    (total_frames / 64).clamp(MIN, MAX)
+}
+
+/// Allocates zeroed frames for user memory (anonymous pages, stack growth,
+/// copy-on-write copies). Unlike `allocate_frames` it leaves the kernel's
+/// reserve free: when only the reserve is left it fails and records that
+/// (`take_user_frames_refused`), so the faulting process can be killed as
+/// Linux's OOM killer would, while the kernel still has memory to do it.
+pub(crate) fn allocate_user_frames<const N: usize>() -> Option<[FrameLease; N]> {
+    crate::linux_profile::count_memory(0);
+    if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) {
+        return None;
+    }
+    let mut storage = PHYSICAL_MEMORY.allocator.lock();
+    // SAFETY: initialized is published only after the locked storage contains
+    // a valid FrameAllocator.
+    unsafe {
+        let allocator = storage.assume_init_mut();
+        let total = allocator.free_frames + allocator.allocated_frames;
+        if allocator.free_frames < N as u64 + user_reserve_frames(total) {
+            PHYSICAL_MEMORY
+                .user_frames_refused
+                .store(true, Ordering::Release);
+            return None;
+        }
+        let frames = allocator.reserve::<N>(FrameOwner::KERNEL)?;
+        for frame in &frames {
+            let Some(address) = frame.direct_map_address() else {
+                let _ = allocator.release(FrameOwner::KERNEL, frames);
+                return None;
+            };
+            core::ptr::write_bytes(address as *mut u8, 0, PAGE_SIZE as usize);
+        }
+        Some(frames)
+    }
+}
+
+/// Whether `allocate_user_frames` refused a request for lack of memory since
+/// the last call; clears the record.
+pub(crate) fn take_user_frames_refused() -> bool {
+    PHYSICAL_MEMORY
+        .user_frames_refused
+        .swap(false, Ordering::AcqRel)
 }
 
 pub(crate) fn allocate_frame_prefix_into(

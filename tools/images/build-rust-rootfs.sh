@@ -35,7 +35,7 @@ chmod 1777 "$stage/tmp"
 chmod 700 "$stage/root"
 
 install -m 755 "$release/ginux-init" "$stage/sbin/init"
-for program in ginux-wm ginux-term ginux-fetch; do
+for program in ginux-wm ginux-term ginux-fetch ginux-memtest; do
     install -m 755 "$release/$program" "$stage/bin/$program"
 done
 install -m 755 "$tools_root/bin/brush" "$stage/bin/brush"

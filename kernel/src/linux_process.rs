@@ -16,9 +16,6 @@ pub(crate) const PROCESS_LIMIT: usize = 256;
 /// table holds): each takes a runtime slot, whose saved state and address-
 /// space lists are allocated when the slot is first used.
 pub(crate) const PROCESS_RUNTIME_LIMIT: usize = PROCESS_LIMIT;
-const PROCESS_HIERARCHY_LIMIT: usize = cpu::LINUX_PROCESS_HIERARCHY_LIMIT;
-const PROCESS_PRIVATE_PAGE_LIMIT: usize = cpu::LINUX_PROCESS_MAPPING_LIMIT;
-const PROCESS_PRIVATE_COPY_LIMIT: usize = cpu::LINUX_PROCESS_MAPPING_LIMIT;
 const PAGE_SIZE: usize = 4096;
 const FORK_PRIVATE_PAGE_LIMIT: usize = 2;
 const PRESENT: u64 = 1 << 0;
@@ -32,8 +29,8 @@ const PROCESS_INSTANCE_LIMIT: usize = control_abi::DOMAIN_LIMIT + 1;
 const PROCESS_INSTANCE_NONE: u8 = u8::MAX;
 
 struct LiveForkScratch {
-    child_mappings: [cpu::LinuxActiveImageMapping; PROCESS_PRIVATE_PAGE_LIMIT],
-    parent_pages: [memory::FrameLease; PROCESS_PRIVATE_PAGE_LIMIT],
+    child_mappings: Vec<cpu::LinuxActiveImageMapping>,
+    parent_pages: Vec<memory::FrameLease>,
 }
 
 struct ProcessRuntimeOwner(UnsafeCell<ProcessRuntimeState>);
@@ -60,13 +57,13 @@ struct ProcessRuntimeState {
     test_table: UnsafeCell<MaybeUninit<ProcessTable>>,
 }
 
-/// Transient fork and teardown work areas. They hold one maximally populated
-/// address space each, tens of megabytes in all, so they live apart from the
-/// runtime owner: initialized to zero, they take no space in the kernel image.
+/// Transient fork and teardown work areas, each as long as the largest
+/// address space forked lately: they grow with the process instead of
+/// bounding it.
 struct ProcessScratchState {
     fork_scratch: UnsafeCell<LiveForkScratch>,
-    fork_allocation_scratch: UnsafeCell<[memory::FrameLease; PROCESS_PRIVATE_COPY_LIMIT]>,
-    fork_hierarchy_allocation_scratch: UnsafeCell<[memory::FrameLease; PROCESS_HIERARCHY_LIMIT]>,
+    fork_allocation_scratch: UnsafeCell<Vec<memory::FrameLease>>,
+    fork_hierarchy_allocation_scratch: UnsafeCell<Vec<memory::FrameLease>>,
 }
 
 struct ProcessScratchOwner(UnsafeCell<ProcessScratchState>);
@@ -76,16 +73,24 @@ unsafe impl Sync for ProcessScratchOwner {}
 static PROCESS_SCRATCH: ProcessScratchOwner =
     ProcessScratchOwner(UnsafeCell::new(ProcessScratchState {
         fork_scratch: UnsafeCell::new(LiveForkScratch {
-            child_mappings: [cpu::LinuxActiveImageMapping::EMPTY; PROCESS_PRIVATE_PAGE_LIMIT],
-            parent_pages: [memory::FrameLease::EMPTY; PROCESS_PRIVATE_PAGE_LIMIT],
+            child_mappings: Vec::new(),
+            parent_pages: Vec::new(),
         }),
-        fork_allocation_scratch: UnsafeCell::new(
-            [memory::FrameLease::EMPTY; PROCESS_PRIVATE_COPY_LIMIT],
-        ),
-        fork_hierarchy_allocation_scratch: UnsafeCell::new(
-            [memory::FrameLease::EMPTY; PROCESS_HIERARCHY_LIMIT],
-        ),
+        fork_allocation_scratch: UnsafeCell::new(Vec::new()),
+        fork_hierarchy_allocation_scratch: UnsafeCell::new(Vec::new()),
     }));
+
+/// `list` resized to `count` empty leases for a fork to allocate into; empty
+/// (so the allocation fails and the fork backs out) without the memory.
+fn fork_frame_scratch(
+    list: &'static mut Vec<memory::FrameLease>,
+    count: usize,
+) -> &'static mut [memory::FrameLease] {
+    if address_space::fill_list(list, count, memory::FrameLease::EMPTY).is_none() {
+        return &mut [];
+    }
+    list
+}
 
 fn process_scratch() -> &'static ProcessScratchState {
     // SAFETY: as for process_runtime; the recursive kernel-entry boundary
@@ -334,9 +339,8 @@ impl ProcessAddressSpace {
         mappings: &[cpu::LinuxActiveImageMapping],
     ) -> Option<Self> {
         if storage_slot >= PROCESS_RUNTIME_LIMIT
-            || !(4..=PROCESS_HIERARCHY_LIMIT).contains(&hierarchy.len())
+            || hierarchy.len() < 4
             || mappings.is_empty()
-            || mappings.len() > PROCESS_PRIVATE_PAGE_LIMIT
             || !memory::frames_owned_by(memory::FrameOwner::KERNEL, hierarchy)
             || hierarchy
                 .iter()
@@ -372,11 +376,7 @@ impl ProcessAddressSpace {
         hierarchy: &[memory::FrameLease],
         mappings: &[cpu::LinuxActiveImageMapping],
     ) -> Option<Self> {
-        if storage_slot >= PROCESS_RUNTIME_LIMIT
-            || !(4..=PROCESS_HIERARCHY_LIMIT).contains(&hierarchy.len())
-            || mappings.is_empty()
-            || mappings.len() > PROCESS_PRIVATE_PAGE_LIMIT
-        {
+        if storage_slot >= PROCESS_RUNTIME_LIMIT || hierarchy.len() < 4 || mappings.is_empty() {
             return None;
         }
         address_space_storage(storage_slot)?.store(hierarchy, mappings)?;
@@ -902,6 +902,27 @@ impl ProcessTable {
         process_runtime()
             .fork_execution_stage
             .store(1133, Ordering::Release);
+        let parent_page_capacity = if child_pages.is_empty() {
+            0
+        } else {
+            child_pages.len()
+        };
+        if address_space::fill_list(
+            &mut scratch.child_mappings,
+            parent_space.mappings().len(),
+            cpu::LinuxActiveImageMapping::EMPTY,
+        )
+        .is_none()
+            || address_space::fill_list(
+                &mut scratch.parent_pages,
+                parent_page_capacity,
+                memory::FrameLease::EMPTY,
+            )
+            .is_none()
+        {
+            let _ = self.abort_fork(handle);
+            return false;
+        }
         let child_mappings = &mut scratch.child_mappings;
         let parent_pages = &mut scratch.parent_pages;
         let mut private_index = 0;
@@ -1050,31 +1071,36 @@ impl ProcessTable {
         hierarchy: &[memory::FrameLease],
         pages: &[memory::FrameLease],
     ) -> bool {
-        let unique = |frames: &[memory::FrameLease]| {
-            frames
-                .iter()
-                .enumerate()
-                .all(|(index, frame)| !frames[index + 1..].contains(frame))
-        };
-        let unpublished = hierarchy.iter().chain(pages).all(|candidate| {
-            self.processes.iter().flatten().all(|process| {
-                process.address_space.into_iter().all(|space| {
-                    !space.hierarchy().contains(candidate)
-                        && !space.mappings().iter().any(|mapping| {
-                            !mapping.shared
-                                && !memory::frame_lease_is_runtime(mapping.frame)
-                                && mapping.frame == *candidate
-                        })
-                })
+        // The candidates, sorted: each is checked against every frame the
+        // processes use by binary search, since a large process's lists made
+        // a pairwise check take seconds.
+        let mut candidates = Vec::new();
+        if candidates
+            .try_reserve_exact(hierarchy.len() + pages.len())
+            .is_err()
+        {
+            return false;
+        }
+        candidates.extend(hierarchy.iter().chain(pages).map(|frame| frame.address()));
+        candidates.sort_unstable();
+        // Distinct, within and between the two lists.
+        let unique = candidates.windows(2).all(|pair| pair[0] != pair[1]);
+        let candidate =
+            |frame: &memory::FrameLease| candidates.binary_search(&frame.address()).is_ok();
+        let unpublished = self.processes.iter().flatten().all(|process| {
+            process.address_space.into_iter().all(|space| {
+                !space.hierarchy().iter().any(candidate)
+                    && !space.mappings().iter().any(|mapping| {
+                        !mapping.shared
+                            && !memory::frame_lease_is_runtime(mapping.frame)
+                            && candidate(&mapping.frame)
+                    })
             })
         });
-        (4..=PROCESS_HIERARCHY_LIMIT).contains(&hierarchy.len())
-            && pages.len() <= PROCESS_PRIVATE_PAGE_LIMIT
+        hierarchy.len() >= 4
             && memory::frames_owned_by(memory::FrameOwner::KERNEL, hierarchy)
             && (pages.is_empty() || memory::frames_owned_by(memory::FrameOwner::KERNEL, pages))
-            && unique(hierarchy)
-            && unique(pages)
-            && hierarchy.iter().all(|frame| !pages.contains(frame))
+            && unique
             && unpublished
     }
 
@@ -2414,9 +2440,7 @@ pub(crate) fn refresh_live_process_context_from_syscall_entry(
                     .all(|existing| existing.address != mapping.address)
         })
         .count();
-    if count.saturating_add(missing) > PROCESS_PRIVATE_PAGE_LIMIT
-        || storage.mappings.try_reserve(missing).is_err()
-    {
+    if storage.mappings.try_reserve(missing).is_err() {
         return false;
     }
     for mapping in context_mappings {
@@ -2505,9 +2529,7 @@ pub(crate) fn refresh_live_process_hierarchy(pid: u32, hierarchy: &[memory::Fram
     else {
         return false;
     };
-    if !(4..=PROCESS_HIERARCHY_LIMIT).contains(&hierarchy.len())
-        || !memory::frames_owned_by(memory::FrameOwner::KERNEL, hierarchy)
-    {
+    if hierarchy.len() < 4 || !memory::frames_owned_by(memory::FrameOwner::KERNEL, hierarchy) {
         return false;
     }
     let Some(storage) = address_space_storage(usize::from(space.storage_slot)) else {
@@ -3139,7 +3161,21 @@ pub(crate) fn release_live_process_runtime_slot(pid: u32) -> bool {
     if !matches!(process.state, ProcessState::Zombie { .. }) || process.runtime_slot.is_none() {
         return false;
     }
-    process.runtime_slot = None;
+    let slot = process.runtime_slot.take();
+    // Give back the slot's lists: a large process's are many megabytes and
+    // would otherwise stay until another process takes the slot.
+    let referenced = table.processes.iter().flatten().any(|process| {
+        process.runtime_slot == slot
+            || [process.address_space, process.retiring_address_space]
+                .into_iter()
+                .flatten()
+                .any(|space| Some(space.storage_slot) == slot)
+    });
+    if let (false, Some(slot)) = (referenced, slot) {
+        if let Some(storage) = address_space_storage(usize::from(slot)) {
+            *storage = ProcessAddressSpaceStorage::default();
+        }
+    }
     true
 }
 
@@ -3396,7 +3432,6 @@ pub(crate) fn add_live_process_mapping(pid: u32, mapping: cpu::LinuxActiveImageM
     };
     let count = space.mapping_count as usize;
     if count != storage.mappings.len()
-        || count >= PROCESS_PRIVATE_PAGE_LIMIT
         || storage
             .mappings
             .iter()
@@ -3803,8 +3838,10 @@ pub(crate) fn begin_live_fork(
     process_runtime()
         .fork_execution_stage
         .store(111, Ordering::Release);
-    let child_hierarchy =
-        unsafe { &mut *process_scratch().fork_hierarchy_allocation_scratch.get() };
+    let child_hierarchy = fork_frame_scratch(
+        unsafe { &mut *process_scratch().fork_hierarchy_allocation_scratch.get() },
+        hierarchy_count,
+    );
     if !memory::allocate_frame_prefix_into(
         memory::FrameOwner::KERNEL,
         child_hierarchy,
@@ -3816,8 +3853,11 @@ pub(crate) fn begin_live_fork(
     process_runtime()
         .fork_execution_stage
         .store(112, Ordering::Release);
-    let child_pages = unsafe { &mut *process_scratch().fork_allocation_scratch.get() };
     let private_count = private_count.unwrap_or(0);
+    let child_pages = fork_frame_scratch(
+        unsafe { &mut *process_scratch().fork_allocation_scratch.get() },
+        private_count,
+    );
     if private_count != 0
         && !memory::allocate_frame_prefix_into(
             memory::FrameOwner::KERNEL,
@@ -4477,8 +4517,10 @@ fn verify_live_fork_clone_and_execution_transaction() -> bool {
         .iter()
         .filter(|mapping| mapping_requires_fork_copy(mapping))
         .count();
-    let child_hierarchy =
-        unsafe { &mut *process_scratch().fork_hierarchy_allocation_scratch.get() };
+    let child_hierarchy = fork_frame_scratch(
+        unsafe { &mut *process_scratch().fork_hierarchy_allocation_scratch.get() },
+        hierarchy_count,
+    );
     if !memory::allocate_frame_prefix_into(
         memory::FrameOwner::KERNEL,
         child_hierarchy,
@@ -4487,7 +4529,10 @@ fn verify_live_fork_clone_and_execution_transaction() -> bool {
         let _ = table.abort_fork(child_handle);
         return false;
     }
-    let child_pages = unsafe { &mut *process_scratch().fork_allocation_scratch.get() };
+    let child_pages = fork_frame_scratch(
+        unsafe { &mut *process_scratch().fork_allocation_scratch.get() },
+        private_count,
+    );
     if !memory::allocate_frame_prefix_into(memory::FrameOwner::KERNEL, child_pages, private_count) {
         let _released = memory::scrub_and_release_frames(
             memory::FrameOwner::KERNEL,
@@ -4648,8 +4693,10 @@ fn verify_live_fork_clone_only_transaction() -> bool {
         .iter()
         .filter(|mapping| mapping_requires_fork_copy(mapping))
         .count();
-    let child_hierarchy =
-        unsafe { &mut *process_scratch().fork_hierarchy_allocation_scratch.get() };
+    let child_hierarchy = fork_frame_scratch(
+        unsafe { &mut *process_scratch().fork_hierarchy_allocation_scratch.get() },
+        hierarchy_count,
+    );
     if !memory::allocate_frame_prefix_into(
         memory::FrameOwner::KERNEL,
         child_hierarchy,
@@ -4658,7 +4705,10 @@ fn verify_live_fork_clone_only_transaction() -> bool {
         let _ = table.abort_fork(child_handle);
         reject!(208);
     }
-    let child_pages = unsafe { &mut *process_scratch().fork_allocation_scratch.get() };
+    let child_pages = fork_frame_scratch(
+        unsafe { &mut *process_scratch().fork_allocation_scratch.get() },
+        private_count,
+    );
     if !memory::allocate_frame_prefix_into(memory::FrameOwner::KERNEL, child_pages, private_count) {
         let _ = memory::scrub_and_release_frames(
             memory::FrameOwner::KERNEL,
@@ -4985,7 +5035,6 @@ pub(crate) fn copy_private_pages(
 ) -> bool {
     if source.is_empty()
         || source.len() != destination.len()
-        || source.len() > PROCESS_PRIVATE_PAGE_LIMIT
         || !source.iter().all(|frame| {
             memory::frames_owned_by(memory::FrameOwner::KERNEL, &[*frame])
                 || memory::frame_lease_is_runtime(*frame)
@@ -5035,7 +5084,6 @@ fn copy_validated_private_pages(
 ) -> bool {
     if source.is_empty()
         || source.len() != destination.len()
-        || source.len() > PROCESS_PRIVATE_PAGE_LIMIT
         || mappings
             .iter()
             .filter(|mapping| mapping_requires_fork_copy(mapping))
