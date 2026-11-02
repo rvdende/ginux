@@ -1620,6 +1620,34 @@ fn linux_report_process_banks() {
     serial_write("\r\n");
 }
 
+/// Makes the threads of the current process that run on other CPUs leave
+/// them, as `wait_for_linux_process_threads_to_leave` does for an exiting
+/// process, for an exec that ends them: they are told by `LINUX_BANK_DYING`
+/// and drop their contexts, and the flag is cleared once they are out so
+/// the new image's threads can run.
+fn evict_linux_light_threads() {
+    let bank = linux_cpu_bank();
+    if !linux_bank_shared() {
+        return;
+    }
+    LINUX_BANK_DYING[bank].store(true, Ordering::Release);
+    let started = timer::timestamp_counter();
+    while LINUX_BANK_USERS[bank].load(Ordering::Acquire) > 1 {
+        crate::sync::kernel_entry_leave_to_user();
+        core::hint::spin_loop();
+        crate::sync::kernel_entry_return_from_user();
+        if timer::timestamp_counter().wrapping_sub(started) > 20_000_000_000 {
+            serial_write("ginux: threads of an exec'ing process did not leave pid/users: ");
+            serial_write_u64(u64::from(current_linux_process_pid()));
+            serial_write(" ");
+            serial_write_u64(u64::from(LINUX_BANK_USERS[bank].load(Ordering::Acquire)));
+            serial_write("\r\n");
+            break;
+        }
+    }
+    LINUX_BANK_DYING[bank].store(false, Ordering::Release);
+}
+
 /// Whether CPUs other than this one use the bank this CPU uses.
 fn linux_bank_shared() -> bool {
     LINUX_BANK_USERS[linux_cpu_bank()].load(Ordering::Acquire) > 1
@@ -8263,6 +8291,9 @@ fn end_other_linux_threads_for_exec() {
     let Some(current) = current_linux_thread_slot() else {
         return;
     };
+    // Threads on other CPUs leave them first: their slots are cleared
+    // below, and the image they run in is about to go.
+    evict_linux_light_threads();
     for slot in (0..LINUX_THREAD_LIMIT).filter(|slot| *slot != current) {
         if X86_RUNTIME.LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) != LINUX_THREAD_FREE {
             clear_linux_thread_slot(slot);
@@ -28064,9 +28095,7 @@ fn linux_execve_at(
         .count()
         != 1;
     if current_linux_tid() != Some(current_linux_process_pid())
-        || other_threads
-            && (!X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
-                || linux_remote_thread_running())
+        || other_threads && !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
     {
         if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) && current_linux_process_pid() != 1
         {
