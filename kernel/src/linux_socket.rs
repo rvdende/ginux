@@ -57,6 +57,10 @@ const CREDENTIAL_QUEUE_LIMIT: usize = 64;
 /// The longest accept queue: Linux's default `somaxconn`.
 const BACKLOG_LIMIT: usize = 4096;
 const TCP_BUFFER_SIZE: usize = 64 * 1024;
+/// A TCP connection's receive buffer, and so its window (scaled past 64 KiB):
+/// a waiting reader polls the device once a timer tick, so the window is what
+/// the peer can send per tick.
+const TCP_RECEIVE_BUFFER_SIZE: usize = 256 * 1024;
 const UDP_BUFFER_SIZE: usize = 16 * 1024;
 const UDP_PACKET_COUNT: usize = 16;
 const ICMP_BUFFER_SIZE: usize = 16 * 1024;
@@ -433,7 +437,7 @@ fn filled<T: Clone>(length: usize, value: T) -> Result<Vec<T>, Error> {
 }
 
 fn add_tcp_socket(runtime: &mut Runtime) -> Result<SocketHandle, Error> {
-    let rx = tcp::SocketBuffer::new(filled(TCP_BUFFER_SIZE, 0_u8)?);
+    let rx = tcp::SocketBuffer::new(filled(TCP_RECEIVE_BUFFER_SIZE, 0_u8)?);
     let tx = tcp::SocketBuffer::new(filled(TCP_BUFFER_SIZE, 0_u8)?);
     Ok(runtime.sockets.add(tcp::Socket::new(rx, tx)))
 }
