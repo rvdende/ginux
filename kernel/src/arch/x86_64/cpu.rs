@@ -12490,12 +12490,16 @@ fn linux_request_process_fork(
                 caller.rflags,
                 caller.fs_base,
             );
+        // posix_spawn's child stack is fresh mmap memory nothing has touched
+        // yet: its top page is brought in first, so the child (on the
+        // parent's pages) and the parent's list agree on it.
         let child_stack_refreshed = child_stack == 0
             || child_stack.checked_sub(1).is_some_and(|address| {
-                linux_process::import_live_process_mapping_from_hardware(
-                    current_linux_process_pid(),
-                    address,
-                )
+                materialize_linux_runtime_user_range(address, 1, true)
+                    && linux_process::import_live_process_mapping_from_hardware(
+                        current_linux_process_pid(),
+                        address,
+                    )
             });
         context_refreshed && child_stack_refreshed
     } else {
