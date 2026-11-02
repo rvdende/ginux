@@ -18050,6 +18050,7 @@ fn linux_sysv_ipc_error(error: crate::linux_sysv_ipc::Error) -> u64 {
         crate::linux_sysv_ipc::Error::Invalid => LINUX_EINVAL,
         crate::linux_sysv_ipc::Error::NoEntry => LINUX_ENOENT,
         crate::linux_sysv_ipc::Error::NoMemory => LINUX_ENOMEM,
+        crate::linux_sysv_ipc::Error::NoSpace => LINUX_ENOSPC,
         crate::linux_sysv_ipc::Error::Range => LINUX_ERANGE,
         crate::linux_sysv_ipc::Error::WouldBlock => LINUX_EAGAIN,
         crate::linux_sysv_ipc::Error::TooBig => LINUX_E2BIG,
@@ -18067,6 +18068,9 @@ fn linux_shmget(key: u64, size: u64, flags: u64) -> u64 {
     let key = key as u32 as i32;
     let requested =
         linux_proc_sysctl_value(b"sys/kernel/shm_next_id").and_then(|id| u32::try_from(id).ok());
+    let limit = linux_proc_sysctl_value(b"sys/kernel/shmmni")
+        .and_then(|limit| usize::try_from(limit).ok())
+        .unwrap_or(4096);
     let result = crate::linux_sysv_ipc::get_or_create(
         key,
         size,
@@ -18074,7 +18078,7 @@ fn linux_shmget(key: u64, size: u64, flags: u64) -> u64 {
         key == 0 || flags & IPC_CREAT != 0,
         flags & IPC_EXCL != 0,
         current_linux_process_pid(),
-        requested,
+        crate::linux_sysv_ipc::SegmentIds { requested, limit },
     );
     // shm_next_id is used up by the segment it named.
     if requested.is_some_and(|id| result == Ok(id)) {
@@ -26431,6 +26435,35 @@ fn linux_proc_sysctl_index(state: u16) -> Option<usize> {
         .position(|(node, ..)| state & !3 == LINUX_FILE_MASK | node)
 }
 
+/// Each domain's wall-clock offset from the host clock in nanoseconds:
+/// clock_settime, settimeofday and adjtimex move a domain's CLOCK_REALTIME
+/// without touching the host's or another domain's.
+static LINUX_REALTIME_OFFSET_NANOSECONDS: [core::sync::atomic::AtomicI64;
+    control_abi::DOMAIN_LIMIT] =
+    [const { core::sync::atomic::AtomicI64::new(0) }; control_abi::DOMAIN_LIMIT];
+
+/// The current domain's wall-clock offset (`LINUX_REALTIME_OFFSET_NANOSECONDS`).
+fn linux_realtime_offset_nanoseconds() -> i64 {
+    current_container_slot().map_or(0, |slot| {
+        LINUX_REALTIME_OFFSET_NANOSECONDS[slot].load(Ordering::Acquire)
+    })
+}
+
+/// Moves the current domain's wall clock by `delta` nanoseconds.
+fn linux_adjust_realtime_offset(delta: i64) -> bool {
+    let Some(slot) = current_container_slot() else {
+        return false;
+    };
+    let offset = &LINUX_REALTIME_OFFSET_NANOSECONDS[slot];
+    offset.store(
+        offset.load(Ordering::Acquire).saturating_add(delta),
+        Ordering::Release,
+    );
+    // The vDSO page shows the new time at once, not at its next refresh.
+    let _ = refresh_linux_vvar();
+    true
+}
+
 /// A domain has not written this `/proc/sys` value.
 const LINUX_SYSCTL_UNSET: i64 = i64::MIN;
 
@@ -26828,8 +26861,215 @@ fn linux_proc_pid_file_kind(pid: u32, name: &[u8]) -> Option<u16> {
         (_, b"stat") => Some(LINUX_FILE_PROC_DYNAMIC_STAT),
         (_, b"statm") => Some(LINUX_FILE_PROC_DYNAMIC_STATM),
         (_, b"maps") => Some(LINUX_FILE_PROC_DYNAMIC_MAPS),
+        (_, b"comm") => Some(LINUX_FILE_PROC_TASK_COMM),
+        (_, b"task" | b"task/") => Some(LINUX_PROC_TASK_DIRECTORY),
+        (_, name) if name.starts_with(b"task/") => linux_proc_task_file_kind(pid, &name[5..]),
         _ => None,
     }
+}
+
+/// `/proc/PID/task/TID` and the files under it, for a thread `pid` has.
+fn linux_proc_task_file_kind(pid: u32, name: &[u8]) -> Option<u16> {
+    let (digits, file) = match name.iter().position(|byte| *byte == b'/') {
+        Some(at) => (&name[..at], &name[at + 1..]),
+        None => (name, &b""[..]),
+    };
+    if digits.is_empty() || digits[0] == b'0' {
+        return None;
+    }
+    let tid = digits.iter().try_fold(0_u32, |value, byte| {
+        byte.is_ascii_digit()
+            .then(|| value.checked_mul(10)?.checked_add(u32::from(byte - b'0')))
+            .flatten()
+    })?;
+    let mut tids = [0_u32; LINUX_THREAD_LIMIT];
+    let count = linux_process_thread_ids(pid, &mut tids);
+    if !tids[..count].contains(&tid) {
+        return None;
+    }
+    match file {
+        // A thread's directory lists its process's files.
+        b"" => Some(LINUX_PROC_PID1_DIRECTORY),
+        b"comm" => Some(LINUX_FILE_PROC_TASK_COMM),
+        b"stat" => Some(LINUX_FILE_PROC_TASK_STAT),
+        b"status" => Some(LINUX_FILE_PROC_DYNAMIC_STATUS),
+        b"statm" => Some(LINUX_FILE_PROC_DYNAMIC_STATM),
+        _ => None,
+    }
+}
+
+/// The leading decimal of `digits` up to a `/` or its end (a thread id in
+/// a `/proc/PID/task/TID/...` name).
+fn linux_leading_decimal(digits: &[u8]) -> Option<u32> {
+    let digits = digits
+        .iter()
+        .position(|byte| *byte == b'/')
+        .map_or(digits, |at| &digits[..at]);
+    if digits.is_empty() || digits[0] == b'0' {
+        return None;
+    }
+    digits.iter().try_fold(0_u32, |value, byte| {
+        byte.is_ascii_digit()
+            .then(|| value.checked_mul(10)?.checked_add(u32::from(byte - b'0')))
+            .flatten()
+    })
+}
+
+/// The process thread `tid` belongs to, and the thread's state as /proc
+/// shows it: R running or ready, S blocked. The current process's live
+/// table first, then processes live in banks on other CPUs, then saved
+/// records; a process with no thread slot in use is its own single thread.
+fn linux_thread_state_by_tid(tid: u32) -> Option<(u32, u8)> {
+    let letter = |state: u8| {
+        if matches!(state, LINUX_THREAD_RUNNING | LINUX_THREAD_READY) {
+            b'R'
+        } else {
+            b'S'
+        }
+    };
+    let current = current_linux_process_pid();
+    for slot in 0..LINUX_THREAD_LIMIT {
+        let state = X86_RUNTIME.LINUX_THREAD_STATES[slot].load(Ordering::SeqCst);
+        if state != LINUX_THREAD_FREE
+            && X86_RUNTIME.LINUX_THREAD_TIDS[slot].load(Ordering::SeqCst) == tid
+        {
+            return Some((current, letter(state)));
+        }
+    }
+    let instance = linux_execution_instance();
+    for bank in 0..LINUX_CPU_BANK_LIMIT {
+        let pid = LINUX_BANK_PID[bank].load(Ordering::Acquire);
+        if pid == 0
+            || LINUX_BANK_USERS[bank].load(Ordering::Acquire) == 0
+            || usize::from(LINUX_BANK_INSTANCE[bank].load(Ordering::Acquire)) != instance
+        {
+            continue;
+        }
+        for slot in 0..LINUX_THREAD_LIMIT {
+            let state = X86_RUNTIME.LINUX_THREAD_STATES[slot]
+                .at_bank(bank)
+                .load(Ordering::Acquire);
+            if state != LINUX_THREAD_FREE
+                && X86_RUNTIME.LINUX_THREAD_TIDS[slot]
+                    .at_bank(bank)
+                    .load(Ordering::Acquire)
+                    == tid
+            {
+                return Some((pid, letter(state)));
+            }
+        }
+    }
+    let mut pid = 0;
+    while let Some(next) = linux_process::next_live_pid(pid) {
+        pid = next;
+        if let Some(thread) = linux_process_thread_runtime_state(pid).and_then(|threads| {
+            threads
+                .iter()
+                .find(|thread| thread.state != LINUX_THREAD_FREE && thread.tid == tid)
+        }) {
+            return Some((pid, letter(thread.state)));
+        }
+    }
+    let status = linux_process::live_process_status(tid)?;
+    let letter = match status.state {
+        linux_process::LiveProcessState::Running if linux_leader_thread_blocked(tid) => b'S',
+        linux_process::LiveProcessState::Running => b'R',
+        linux_process::LiveProcessState::Sleeping => b'S',
+        linux_process::LiveProcessState::Stopped => b'T',
+        linux_process::LiveProcessState::Zombie => b'Z',
+    };
+    Some((tid, letter))
+}
+
+/// Reads `/proc/PID/task/TID/stat`: the process's stat line with the
+/// thread's id and state.
+fn linux_proc_task_stat_read(descriptor: u64, address: u64, count: u64, offset: u64) -> u64 {
+    let Some(tid) = linux_proc_dynamic_descriptor_pid(descriptor) else {
+        return LINUX_EBADF;
+    };
+    let Some((pid, state_letter)) = linux_thread_state_by_tid(tid) else {
+        return LINUX_ESRCH;
+    };
+    let Some(status) = linux_process::live_process_status(pid) else {
+        return LINUX_ESRCH;
+    };
+    let mut name = [0_u8; 16];
+    let mut file = [0_u8; 256];
+    let mut used = 0;
+    let generated = append_linux_decimal(&mut file, &mut used, u64::from(tid))
+        && append_linux_bytes(&mut file, &mut used, b" (")
+        && append_linux_bytes(&mut file, &mut used, linux_process_name(pid, &mut name))
+        && append_linux_bytes(&mut file, &mut used, b") ")
+        && append_linux_bytes(&mut file, &mut used, &[state_letter])
+        && append_linux_bytes(&mut file, &mut used, b" ")
+        && append_linux_decimal(&mut file, &mut used, u64::from(status.parent_pid))
+        && append_linux_bytes(&mut file, &mut used, b" 1 1 0 -1 4194560 0 0 0 0 ")
+        && append_linux_decimal(&mut file, &mut used, linux_process_cpu_ticks(pid))
+        && append_linux_bytes(&mut file, &mut used, b" 0 0 0 20 0 1 0 1 1048576 256 0 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0\n");
+    if !generated {
+        return LINUX_EIO;
+    }
+    let Ok(start) = usize::try_from(offset) else {
+        return 0;
+    };
+    if start >= used || count == 0 {
+        return 0;
+    }
+    let end = start
+        .saturating_add(usize::try_from(count).unwrap_or(usize::MAX))
+        .min(used);
+    if copy_to_linux_user(address, &file[start..end]) {
+        (end - start) as u64
+    } else {
+        LINUX_EFAULT
+    }
+}
+
+/// The thread ids of process `pid`: from the live table for the current
+/// process, else from the process's saved record; a process with no thread
+/// slots in use has its own id alone.
+fn linux_process_thread_ids(pid: u32, tids: &mut [u32; LINUX_THREAD_LIMIT]) -> usize {
+    let mut count = 0;
+    if pid == current_linux_process_pid() {
+        for slot in 0..LINUX_THREAD_LIMIT {
+            if X86_RUNTIME.LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) != LINUX_THREAD_FREE {
+                tids[count] = X86_RUNTIME.LINUX_THREAD_TIDS[slot].load(Ordering::SeqCst);
+                count += 1;
+            }
+        }
+    } else if let Some(bank) = (0..LINUX_CPU_BANK_LIMIT).find(|bank| {
+        LINUX_BANK_USERS[*bank].load(Ordering::Acquire) != 0
+            && LINUX_BANK_PID[*bank].load(Ordering::Acquire) == pid
+            && usize::from(LINUX_BANK_INSTANCE[*bank].load(Ordering::Acquire))
+                == linux_execution_instance()
+    }) {
+        // A process live in a bank: its threads as they are now, which its
+        // saved record is behind while they run on other CPUs.
+        for slot in 0..LINUX_THREAD_LIMIT {
+            if X86_RUNTIME.LINUX_THREAD_STATES[slot]
+                .at_bank(bank)
+                .load(Ordering::Acquire)
+                != LINUX_THREAD_FREE
+            {
+                tids[count] = X86_RUNTIME.LINUX_THREAD_TIDS[slot]
+                    .at_bank(bank)
+                    .load(Ordering::Acquire);
+                count += 1;
+            }
+        }
+    } else if let Some(threads) = linux_process_thread_runtime_state(pid) {
+        for thread in threads.iter() {
+            if thread.state != LINUX_THREAD_FREE && thread.tid != 0 {
+                tids[count] = thread.tid;
+                count += 1;
+            }
+        }
+    }
+    if count == 0 && linux_process::live_process_status(pid).is_some() {
+        tids[0] = pid;
+        count = 1;
+    }
+    count
 }
 
 fn linux_root_directory_kind(path: &[u8]) -> Option<u16> {
@@ -29223,6 +29463,7 @@ fn linux_root_directory_inode(kind: u16) -> Option<u64> {
             0 => Some(16),
             LINUX_PROC_PID2_DIRECTORY_NODE => Some(23),
             LINUX_PROC_FD_DIRECTORY_NODE => Some(36),
+            LINUX_PROC_TASK_DIRECTORY_NODE => Some(94),
             LINUX_CGROUP_DIRECTORY_NODE => Some(39),
             _ => None,
         };
@@ -29244,6 +29485,7 @@ fn linux_measured_directory_path(kind: u16) -> Option<&'static [u8]> {
             0 => Some(b"proc/1"),
             LINUX_PROC_PID2_DIRECTORY_NODE => Some(b"proc/2"),
             LINUX_PROC_FD_DIRECTORY_NODE => Some(b"proc/self/fd"),
+            LINUX_PROC_TASK_DIRECTORY_NODE => Some(b"proc/self/task"),
             LINUX_CGROUP_DIRECTORY_NODE => Some(b"sys/fs/cgroup"),
             _ => None,
         };
@@ -30031,10 +30273,24 @@ fn linux_openat_path(
         .filter(|(_, name)| {
             matches!(
                 *name,
-                b"status" | b"stat" | b"statm" | b"maps" | b"oom_score_adj"
-            )
+                b"status"
+                    | b"stat"
+                    | b"statm"
+                    | b"maps"
+                    | b"oom_score_adj"
+                    | b"comm"
+                    | b"task"
+                    | b"task/"
+            ) || name.starts_with(b"task/")
         })
-        .map(|(pid, _)| pid);
+        .map(|(pid, name)| {
+            // /proc/PID/task/TID/stat is the thread's: its descriptor keeps
+            // the thread id instead.
+            name.strip_prefix(b"task/")
+                .filter(|rest| rest.ends_with(b"/stat"))
+                .and_then(linux_leading_decimal)
+                .unwrap_or(pid)
+        });
     let virtual_device =
         LinuxCharacterDevice::from_path(path).is_some() || linux_graphics_path_kind(path).is_some();
     let writable_proc_path = linux_runtime_file_kind(path).is_some_and(linux_writable_proc_file);
@@ -35176,6 +35432,8 @@ fn linux_descriptor_read(descriptor: u64, address: u64, count: u64) -> u64 {
             | LINUX_FILE_PROC_DYNAMIC_STATM
             | LINUX_FILE_PROC_DYNAMIC_MAPS
             | LINUX_FILE_PROC_OOM_SCORE_ADJ
+            | LINUX_FILE_PROC_TASK_COMM
+            | LINUX_FILE_PROC_TASK_STAT
     ) || linux_proc_sysctl_index(device).is_some()
     {
         let offset = linux_descriptor_offset(descriptor).load(Ordering::SeqCst);
@@ -35314,6 +35572,9 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
     if linux_proc_sysvipc_file(state) {
         return linux_proc_sysvipc_read(state, address, count, offset);
     }
+    if state & !3 == LINUX_FILE_PROC_TASK_STAT {
+        return linux_proc_task_stat_read(descriptor, address, count, offset);
+    }
     if state & !3 == LINUX_FILE_PROC_STAT {
         return linux_proc_stat_read(address, count, offset);
     }
@@ -35375,6 +35636,7 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
             | LINUX_FILE_PROC_DYNAMIC_STATUS
             | LINUX_FILE_PROC_DYNAMIC_STATM
             | LINUX_FILE_PROC_OOM_SCORE_ADJ
+            | LINUX_FILE_PROC_TASK_COMM
     ) {
         let Some(pid) = linux_proc_dynamic_descriptor_pid(descriptor) else {
             return LINUX_EBADF;
@@ -35432,6 +35694,12 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
             }
             LINUX_FILE_PROC_DYNAMIC_STATM => {
                 append_linux_bytes(&mut file, &mut used, b"256 64 32 16 0 32 0\n")
+            }
+            // A thread's name is its process's (prctl PR_SET_NAME names the
+            // process here).
+            LINUX_FILE_PROC_TASK_COMM => {
+                append_linux_bytes(&mut file, &mut used, linux_process_name(pid, &mut name))
+                    && append_linux_bytes(&mut file, &mut used, b"\n")
             }
             LINUX_FILE_PROC_OOM_SCORE_ADJ => {
                 linux_process::live_process_oom_score_adj(pid).is_some_and(|value| {
@@ -42306,6 +42574,9 @@ fn linux_proc_dynamic_descriptor_pid(descriptor: u64) -> Option<u32> {
             | LINUX_FILE_PROC_DYNAMIC_STATM
             | LINUX_FILE_PROC_DYNAMIC_MAPS
             | LINUX_FILE_PROC_OOM_SCORE_ADJ
+            | LINUX_FILE_PROC_TASK_COMM
+            | LINUX_FILE_PROC_TASK_STAT
+            | LINUX_PROC_TASK_DIRECTORY
     )
     .then(|| linux_descriptor_tmp_generation(descriptor))
     .flatten()?
@@ -42351,6 +42622,8 @@ fn linux_proc_file(state: u16) -> bool {
             | LINUX_FILE_PROC_DYNAMIC_STATUS
             | LINUX_FILE_PROC_DYNAMIC_STATM
             | LINUX_FILE_PROC_DYNAMIC_MAPS
+            | LINUX_FILE_PROC_TASK_COMM
+            | LINUX_FILE_PROC_TASK_STAT
             | LINUX_FILE_PROC_MOUNTS
     ) || linux_proc_sysctl(state).is_some()
 }
@@ -42526,7 +42799,9 @@ fn linux_regular_file(state: u16) -> Option<&'static [u8]> {
         LINUX_FILE_PROC_DYNAMIC_STAT
         | LINUX_FILE_PROC_DYNAMIC_STATUS
         | LINUX_FILE_PROC_DYNAMIC_STATM
-        | LINUX_FILE_PROC_DYNAMIC_MAPS => return None,
+        | LINUX_FILE_PROC_DYNAMIC_MAPS
+        | LINUX_FILE_PROC_TASK_COMM
+        | LINUX_FILE_PROC_TASK_STAT => return None,
         LINUX_FILE_PROC_PID1_STAT => return Some(LINUX_PROC_PID1_STAT),
         LINUX_FILE_PROC_PID1_STATM => return Some(LINUX_PROC_PID1_STATM),
         LINUX_FILE_PROC_PID2_STATM => {
@@ -42614,6 +42889,8 @@ fn linux_regular_file_inode(state: u16) -> Option<u64> {
         | LINUX_FILE_PROC_DYNAMIC_STATUS
         | LINUX_FILE_PROC_DYNAMIC_STATM
         | LINUX_FILE_PROC_DYNAMIC_MAPS => return Some(48),
+        LINUX_FILE_PROC_TASK_COMM => return Some(95),
+        LINUX_FILE_PROC_TASK_STAT => return Some(96),
         _ => {}
     }
     if linux_tmp_file(state) {
@@ -44053,6 +44330,33 @@ fn linux_fcntl_setlkw_live_return(
         if result != LINUX_EAGAIN {
             return result;
         }
+        // On the light path the thread waits its millisecond parked right
+        // here and tries again on whichever CPU picks it up, rather than
+        // moving to the owner for every conflict: fcntl36's 36 threads
+        // contending one lock sent the owner thousands of migrations.
+        if linux_light_thread_here().is_some() {
+            if let (Some(current), Some(deadline)) = (
+                current_linux_thread_handle(),
+                linux_elapsed_nanoseconds().map(|now| now.saturating_add(1_000_000)),
+            ) {
+                let mut restart = caller;
+                restart.rip = caller.rip.wrapping_sub(LINUX_SYSCALL_INSTRUCTION_SIZE);
+                restart.rax = LINUX_FCNTL_SYSCALL;
+                // As a futex wait leaves the light path: the context saved,
+                // the wait recorded with its deadline, and the loop moves on;
+                // the expiry makes the thread ready with the call to issue.
+                if save_linux_thread_return_context(current, restart)
+                    && block_current_linux_thread(
+                        LINUX_THREAD_WAIT_RETRY,
+                        LINUX_FCNTL_SYSCALL,
+                        0,
+                        deadline,
+                    )
+                {
+                    return LINUX_RETURN_TO_KERNEL;
+                }
+            }
+        }
         match run_other_linux_processes(output, caller, LINUX_FCNTL_SYSCALL) {
             Some(LinuxBlockedWait::Recheck) => {}
             Some(LinuxBlockedWait::Return(result)) => return result,
@@ -44477,6 +44781,38 @@ fn linux_getdents(descriptor: u64, address: u64, count: u64, legacy: bool) -> u6
                     }
                     cursor -= 1;
                     break;
+                }
+            }
+        } else if directory == b"proc/self/task" {
+            // The threads of the process the directory was opened for, by id.
+            let pid = linux_proc_dynamic_descriptor_pid(descriptor)
+                .unwrap_or_else(current_linux_process_pid);
+            let mut tids = [0_u32; LINUX_THREAD_LIMIT];
+            let count = linux_process_thread_ids(pid, &mut tids);
+            if cursor > count {
+                return LINUX_EINVAL;
+            }
+            for (index, tid) in tids[..count].iter().enumerate() {
+                if cursor == index {
+                    let mut name = [0_u8; 10];
+                    let mut length = 0;
+                    if !append_linux_decimal(&mut name, &mut length, u64::from(*tid))
+                        || !append_linux_dirent(
+                            &mut entries[..output_capacity],
+                            &mut used,
+                            legacy,
+                            48,
+                            (index + 3) as i64,
+                            4,
+                            &name[..length],
+                        )
+                    {
+                        if used == 0 {
+                            return LINUX_EINVAL;
+                        }
+                        break;
+                    }
+                    cursor += 1;
                 }
             }
         } else if directory == b"proc/1" {

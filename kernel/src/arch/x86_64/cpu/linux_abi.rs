@@ -697,6 +697,17 @@ pub(super) const LINUX_PROC_SYSVIPC_SHM_NODE: u16 = 0xce00;
 pub(super) const LINUX_FILE_PROC_SYSVIPC_SHM: u16 = LINUX_FILE_MASK | LINUX_PROC_SYSVIPC_SHM_NODE;
 pub(super) const LINUX_PROC_SYSVIPC_SEM_NODE: u16 = 0xcf00;
 pub(super) const LINUX_FILE_PROC_SYSVIPC_SEM: u16 = LINUX_FILE_MASK | LINUX_PROC_SYSVIPC_SEM_NODE;
+/// `/proc/PID/task`: a process's threads by id, each a directory of the
+/// process's files, and `/proc/PID/task/TID/comm`, the thread's name.
+pub(super) const LINUX_PROC_TASK_DIRECTORY_NODE: u16 = 0xb600;
+pub(super) const LINUX_PROC_TASK_DIRECTORY: u16 =
+    LINUX_DEVICE_DIRECTORY | LINUX_FILE_PROC_STATUS | LINUX_PROC_TASK_DIRECTORY_NODE;
+pub(super) const LINUX_PROC_TASK_COMM_NODE: u16 = 0xb700;
+pub(super) const LINUX_FILE_PROC_TASK_COMM: u16 = LINUX_FILE_MASK | LINUX_PROC_TASK_COMM_NODE;
+/// `/proc/PID/task/TID/stat`: the thread's stat line, its id first and its
+/// own state (its descriptor keeps the thread id).
+pub(super) const LINUX_PROC_TASK_STAT_NODE: u16 = 0xb800;
+pub(super) const LINUX_FILE_PROC_TASK_STAT: u16 = LINUX_FILE_MASK | LINUX_PROC_TASK_STAT_NODE;
 /// Read-only `/proc/sys` values: node, path under `/proc`, contents. Values
 /// match what Ginux implements (four user namespaces). Leave out values that
 /// tests save and restore (io_uring_disabled): LTP skips a test when such a
@@ -994,7 +1005,10 @@ use super::{LINUX_RUNTIME_INSTANCE_LIMIT, PAGE_SIZE};
 /// The fixed file nodes and the `/proc/sys` nodes are distinct and clear of
 /// the `/dev/input/eventN` range, so no file is taken for another.
 const _: () = {
-    const NODES: [u16; 41] = [
+    const NODES: [u16; 44] = [
+        LINUX_PROC_TASK_DIRECTORY_NODE,
+        LINUX_PROC_TASK_COMM_NODE,
+        LINUX_PROC_TASK_STAT_NODE,
         LINUX_PROC_SYSVIPC_MSG_NODE,
         LINUX_PROC_SYSVIPC_SHM_NODE,
         LINUX_PROC_SYSVIPC_SEM_NODE,

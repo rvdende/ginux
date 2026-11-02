@@ -98,6 +98,8 @@ pub(crate) enum Error {
     Invalid,
     NoEntry,
     NoMemory,
+    /// The domain's segment limit (shmmni) is reached.
+    NoSpace,
     Range,
     WouldBlock,
     TooBig,
@@ -447,8 +449,9 @@ pub(crate) fn get_or_create(
     create: bool,
     exclusive: bool,
     pid: u32,
-    requested: Option<u32>,
+    ids: SegmentIds,
 ) -> Result<u32, Error> {
+    let SegmentIds { requested, limit } = ids;
     let guard = Guard::acquire().ok_or(Error::Invalid)?;
     if key != 0 {
         if let Some(frame) = find_key(guard.instance, key) {
@@ -469,6 +472,20 @@ pub(crate) fn get_or_create(
         return Err(Error::Invalid);
     }
     let pages = usize::try_from(size.div_ceil(PAGE_SIZE as u64)).map_err(|_| Error::Invalid)?;
+    // No more segments than /proc/sys/kernel/shmmni allows (ENOSPC).
+    let mut existing = 0;
+    let mut current = root(
+        &SYSV_IPC_RUNTIME.root_addresses,
+        &SYSV_IPC_RUNTIME.root_generations,
+        guard.instance,
+    );
+    while let Some(page) = current.and_then(segment_page) {
+        existing += 1;
+        if existing >= limit {
+            return Err(Error::NoSpace);
+        }
+        current = (page.next_segment != memory::FrameLease::EMPTY).then_some(page.next_segment);
+    }
     let first = allocate_zeroed().ok_or(Error::NoMemory)?;
     // A requested id (/proc/sys/kernel/shm_next_id) that is free is used, and
     // the counter moves past it; otherwise the next free id.
@@ -539,6 +556,14 @@ pub(crate) fn get_or_create(
         Some(first),
     );
     Ok(id)
+}
+
+/// How a new segment gets its id: the id `/proc/sys/kernel/shm_next_id`
+/// asks for, if any, and how many segments `shmmni` allows in all.
+#[derive(Clone, Copy)]
+pub(crate) struct SegmentIds {
+    pub(crate) requested: Option<u32>,
+    pub(crate) limit: usize,
 }
 
 /// Every segment of the current instance with its id, in creation order,
@@ -2163,7 +2188,10 @@ pub(crate) fn verify_shared_memory_lifecycle() -> bool {
         true,
         true,
         1,
-        None,
+        SegmentIds {
+            requested: None,
+            limit: 4096,
+        },
     ) else {
         return false;
     };
@@ -2203,5 +2231,16 @@ pub(crate) fn verify_shared_memory_lifecycle() -> bool {
     .is_some();
     verified
         && memory::owner_live_frame_count(memory::FrameOwner::KERNEL) == Some(before)
-        && get_or_create(0x4749_4e55, 0, 0, false, false, 1, None) == Err(Error::NoEntry)
+        && get_or_create(
+            0x4749_4e55,
+            0,
+            0,
+            false,
+            false,
+            1,
+            SegmentIds {
+                requested: None,
+                limit: 4096,
+            },
+        ) == Err(Error::NoEntry)
 }

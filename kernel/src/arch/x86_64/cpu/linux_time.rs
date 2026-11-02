@@ -75,6 +75,155 @@ pub(super) fn linux_time(output_address: u64) -> u64 {
     seconds
 }
 
+/// Whether the caller may set the clock: root, standing in for CAP_SYS_TIME.
+fn linux_may_set_clock() -> bool {
+    current_linux_credentials().is_some_and(|credentials| credentials.user.effective == 0)
+}
+
+/// Sets the domain's wall clock to `seconds` and `nanoseconds`: the
+/// difference from the clock as it reads now becomes part of the offset.
+fn linux_set_realtime(seconds: u64, nanoseconds: u64) -> u64 {
+    let Some((now_seconds, now_nanoseconds)) = linux_realtime_time() else {
+        return LINUX_ENOSYS;
+    };
+    let wanted = i128::from(seconds) * i128::from(NANOSECONDS_PER_SECOND) + i128::from(nanoseconds);
+    let now =
+        i128::from(now_seconds) * i128::from(NANOSECONDS_PER_SECOND) + i128::from(now_nanoseconds);
+    let Ok(delta) = i64::try_from(wanted - now) else {
+        return LINUX_EINVAL;
+    };
+    if linux_adjust_realtime_offset(delta) {
+        0
+    } else {
+        LINUX_EINVAL
+    }
+}
+
+/// clock_settime(2): CLOCK_REALTIME alone can be set, by root; the setting
+/// moves this domain's clock, not the host's.
+pub(super) fn linux_clock_settime(clock: u64, address: u64) -> u64 {
+    if u64::from(clock as u32) != LINUX_CLOCK_REALTIME {
+        return LINUX_EINVAL;
+    }
+    let mut specification = [0_u8; 16];
+    if !copy_from_linux_user(address, &mut specification) {
+        return LINUX_EFAULT;
+    }
+    let seconds = i64::from_ne_bytes(specification[..8].try_into().unwrap());
+    let nanoseconds = i64::from_ne_bytes(specification[8..].try_into().unwrap());
+    if seconds < 0 || !(0..NANOSECONDS_PER_SECOND as i64).contains(&nanoseconds) {
+        return LINUX_EINVAL;
+    }
+    if !linux_may_set_clock() {
+        return LINUX_EPERM;
+    }
+    linux_set_realtime(seconds as u64, nanoseconds as u64)
+}
+
+/// settimeofday(2): a timeval, by root; a timezone is accepted and ignored.
+pub(super) fn linux_settimeofday(timeval_address: u64, _timezone_address: u64) -> u64 {
+    if timeval_address == 0 {
+        return 0;
+    }
+    let mut timeval = [0_u8; 16];
+    if !copy_from_linux_user(timeval_address, &mut timeval) {
+        return LINUX_EFAULT;
+    }
+    let seconds = i64::from_ne_bytes(timeval[..8].try_into().unwrap());
+    let microseconds = i64::from_ne_bytes(timeval[8..].try_into().unwrap());
+    if seconds < 0 || !(0..1_000_000).contains(&microseconds) {
+        return LINUX_EINVAL;
+    }
+    if !linux_may_set_clock() {
+        return LINUX_EPERM;
+    }
+    linux_set_realtime(seconds as u64, microseconds as u64 * 1000)
+}
+
+/// adjtimex(2): mode 0 reads the clock's state; ADJ_OFFSET and
+/// ADJ_OFFSET_SINGLESHOT move the clock by the offset and ADJ_SETOFFSET by
+/// the time field (at once, there is no slewing); the other parameters are
+/// checked as Linux does (the tick within 900000..=1100000) and not kept.
+/// The state read back is a synchronized clock at Linux's default tick.
+pub(super) fn linux_adjtimex(address: u64) -> u64 {
+    const ADJ_OFFSET: i32 = 0x0001;
+    const ADJ_SETOFFSET: i32 = 0x0100;
+    const ADJ_NANO: i32 = 0x2000;
+    const ADJ_TICK: i32 = 0x4000;
+    const ADJ_ADJTIME: i32 = 0x8000;
+    const ADJ_OFFSET_SINGLESHOT: i32 = 0x8001;
+    const ADJ_OFFSET_SS_READ: i32 = 0xa001;
+    const TIMEX_SIZE: usize = 208;
+    let mut timex = [0_u8; TIMEX_SIZE];
+    if !copy_from_linux_user(address, &mut timex) {
+        return LINUX_EFAULT;
+    }
+    let modes = i32::from_ne_bytes(timex[..4].try_into().unwrap());
+    let field = |offset: usize| i64::from_ne_bytes(timex[offset..offset + 8].try_into().unwrap());
+    let singleshot = modes == ADJ_OFFSET_SINGLESHOT || modes == ADJ_OFFSET_SS_READ;
+    if modes & ADJ_ADJTIME != 0 && !singleshot {
+        return LINUX_EINVAL;
+    }
+    if modes != 0 && modes != ADJ_OFFSET_SS_READ && !linux_may_set_clock() {
+        return LINUX_EPERM;
+    }
+    // The tick is in microseconds per clock tick: Linux allows a tenth
+    // either side of the nominal 1 s / HZ.
+    let tick_bounds = 900_000 / LINUX_CLOCK_TICKS_PER_SECOND as i64
+        ..=1_100_000 / LINUX_CLOCK_TICKS_PER_SECOND as i64;
+    if !singleshot && modes & ADJ_TICK != 0 && !tick_bounds.contains(&field(88)) {
+        return LINUX_EINVAL;
+    }
+    if modes == ADJ_OFFSET_SINGLESHOT || (!singleshot && modes & ADJ_OFFSET != 0) {
+        let offset = field(8);
+        let delta = if modes & ADJ_NANO != 0 {
+            offset
+        } else {
+            offset.saturating_mul(1000)
+        };
+        if !linux_adjust_realtime_offset(delta) {
+            return LINUX_EINVAL;
+        }
+    }
+    if !singleshot && modes & ADJ_SETOFFSET != 0 {
+        let fraction = if modes & ADJ_NANO != 0 {
+            field(80)
+        } else {
+            field(80).saturating_mul(1000)
+        };
+        let delta = field(72)
+            .saturating_mul(NANOSECONDS_PER_SECOND as i64)
+            .saturating_add(fraction);
+        if !linux_adjust_realtime_offset(delta) {
+            return LINUX_EINVAL;
+        }
+    }
+    let Some((seconds, nanoseconds)) = linux_realtime_time() else {
+        return LINUX_ENOSYS;
+    };
+    let mut output = [0_u8; TIMEX_SIZE];
+    output[..4].copy_from_slice(&modes.to_ne_bytes());
+    output[56..64].copy_from_slice(&1_i64.to_ne_bytes());
+    output[64..72].copy_from_slice(&32_768_000_i64.to_ne_bytes());
+    output[72..80].copy_from_slice(&(seconds as i64).to_ne_bytes());
+    output[80..88].copy_from_slice(&((nanoseconds / 1000) as i64).to_ne_bytes());
+    output[88..96]
+        .copy_from_slice(&(1_000_000 / LINUX_CLOCK_TICKS_PER_SECOND as i64).to_ne_bytes());
+    if !copy_to_linux_user(address, &output) {
+        return LINUX_EFAULT;
+    }
+    0
+}
+
+/// clock_adjtime(2): adjtimex for CLOCK_REALTIME; no other clock here can
+/// be adjusted.
+pub(super) fn linux_clock_adjtime(clock: u64, address: u64) -> u64 {
+    if u64::from(clock as u32) != LINUX_CLOCK_REALTIME {
+        return LINUX_EINVAL;
+    }
+    linux_adjtimex(address)
+}
+
 pub(super) fn linux_uname_with_copy(address: u64, copy: impl FnOnce(u64, &[u8]) -> bool) -> u64 {
     let mut name = [0_u8; LINUX_UTSNAME_SIZE];
     // The Linux personality is "Linux", which rustup's installer, cmake,
@@ -126,6 +275,8 @@ pub(crate) fn refresh_linux_vvar() -> bool {
     let monotonic = now
         .checked_sub(monotonic_epoch)
         .and_then(|ticks| linux_ticks_to_time(ticks, frequency));
+    // The wall time the vDSO hands out carries the domain's clock_settime
+    // offset, as the system call does.
     let realtime = crate::linux_realtime_epoch().and_then(|(seconds, epoch)| {
         now.checked_sub(epoch)
             .and_then(|ticks| linux_ticks_to_time(ticks, frequency))
@@ -134,6 +285,7 @@ pub(crate) fn refresh_linux_vvar() -> bool {
                     .checked_add(elapsed)
                     .map(|seconds| (seconds, nanoseconds))
             })
+            .and_then(|(seconds, nanoseconds)| linux_offset_realtime(seconds, nanoseconds))
     });
     let frame = (0..usize::from(
         X86_RUNTIME
@@ -198,7 +350,26 @@ pub(super) fn linux_realtime_time() -> Option<(u64, u64)> {
     let (epoch_seconds, epoch_counter) = crate::linux_realtime_epoch()?;
     let ticks = timer::timestamp_counter().checked_sub(epoch_counter)?;
     let (elapsed_seconds, nanoseconds) = linux_ticks_to_time(ticks, frequency)?;
-    Some((epoch_seconds.checked_add(elapsed_seconds)?, nanoseconds))
+    linux_offset_realtime(epoch_seconds.checked_add(elapsed_seconds)?, nanoseconds)
+}
+
+/// Applies the current domain's clock_settime/adjtimex offset to a wall
+/// time read from the host clock.
+fn linux_offset_realtime(seconds: u64, nanoseconds: u64) -> Option<(u64, u64)> {
+    let offset = linux_realtime_offset_nanoseconds();
+    if offset == 0 {
+        return Some((seconds, nanoseconds));
+    }
+    let total = i128::from(seconds) * i128::from(NANOSECONDS_PER_SECOND)
+        + i128::from(nanoseconds)
+        + i128::from(offset);
+    if total < 0 {
+        return Some((0, 0));
+    }
+    Some((
+        u64::try_from(total / i128::from(NANOSECONDS_PER_SECOND)).ok()?,
+        (total % i128::from(NANOSECONDS_PER_SECOND)) as u64,
+    ))
 }
 
 pub(super) fn linux_host_realtime_time() -> Option<(u64, u64)> {

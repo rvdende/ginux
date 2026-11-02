@@ -1535,6 +1535,9 @@ fn linux_syscall_dispatch(
             .ELF_PROBE_UMASK
             .swap(first_argument & 0o777, Ordering::SeqCst),
         LINUX_GETTIMEOFDAY_SYSCALL => linux_gettimeofday(first_argument, buffer),
+        LINUX_SETTIMEOFDAY_SYSCALL => linux_settimeofday(first_argument, buffer),
+        LINUX_ADJTIMEX_SYSCALL => linux_adjtimex(first_argument),
+        LINUX_CLOCK_ADJTIME_SYSCALL => linux_clock_adjtime(first_argument, buffer),
         LINUX_GETRLIMIT_SYSCALL => linux_getrlimit(
             first_argument,
             buffer,
@@ -1638,6 +1641,7 @@ fn linux_syscall_dispatch(
         LINUX_IOPRIO_GET_SYSCALL => linux_ioprio_get(first_argument, buffer),
         LINUX_IOPRIO_SET_SYSCALL => linux_ioprio_set(first_argument, buffer, count),
         LINUX_CLOCK_GETTIME_SYSCALL => linux_clock_gettime(first_argument, buffer),
+        LINUX_CLOCK_SETTIME_SYSCALL => linux_clock_settime(first_argument, buffer),
         LINUX_CLOCK_GETRES_SYSCALL => linux_clock_getres(first_argument, buffer),
         LINUX_UTIMENSAT_SYSCALL => linux_utimensat(first_argument, buffer, count, register(0)),
         LINUX_UTIME_SYSCALL => linux_utime(first_argument, buffer),

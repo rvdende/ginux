@@ -606,3 +606,4 @@ interior-mutable	kernel/src/cpu_time.rs	STARTED	per-cpu-arch	allowlist	none	atom
 interior-mutable	kernel/src/cpu_time.rs	RUNS	per-cpu-arch	allowlist	none	atomic-per-cpu-time-accounting
 interior-mutable	kernel/src/arch/x86_64/cpu/architecture.rs	CPU_INDEX_SOURCE	bootstrap-init	allowlist	none	atomic-boot-selected-cpu-index-source
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_SYSCTL_OVERRIDES	domain-runtime	allowlist	none	kernel-entry-serialized-domain-sysctls
+interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_REALTIME_OFFSET_NANOSECONDS	domain-runtime	allowlist	none	kernel-entry-serialized-domain-clock
