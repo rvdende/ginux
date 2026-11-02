@@ -14,6 +14,7 @@ interior-mutable	kernel/src/arch/x86_64/cpu/linux_futex.rs	LINUX_PROFILE_FUTEX_O
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_ABI_TEST_RESULTS	verification-only	allowlist	none	verification-build-only
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_FUTEX_COORDINATION	process-runtime	allowlist	none	ranked-futex-wait-wake-coordination-lock
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_RESTART_DEADLINES	process-runtime	allowlist	none	ranked-restart-deadline-list
+interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_RETRY_SIBLING_HANDOFFS	process-runtime	allowlist	none	atomic-scheduling-heuristic-counter
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	PRIVILEGE_ENTRY_NMI_PROBE_HITS	verification-only	allowlist	none	verification-build-only
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	PRIVILEGE_ENTRY_NMI_PROBE_MASK	verification-only	allowlist	none	verification-build-only
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	SERVICE_FRAMES_TRANSFERRED	verification-only	allowlist	none	verification-build-only

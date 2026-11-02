@@ -13782,6 +13782,18 @@ fn run_other_linux_processes(
     caller: LinuxUserContext,
     number: u64,
 ) -> Option<LinuxBlockedWait> {
+    run_other_linux_processes_deferring(output, caller, number, true)
+}
+
+/// `run_other_linux_processes`; with `defer_to_siblings` false, the other
+/// processes run even while a sibling thread is ready, which may itself be
+/// only waiting to retry its call.
+fn run_other_linux_processes_deferring(
+    output: *mut LinuxSyscallFrame,
+    caller: LinuxUserContext,
+    number: u64,
+    defer_to_siblings: bool,
+) -> Option<LinuxBlockedWait> {
     // Processes run nested on the boot CPU's kernel stack; a thread on an
     // application processor has no process tree to run.
     if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
@@ -13800,7 +13812,7 @@ fn run_other_linux_processes(
     // Descriptor waits made ready while another process ran complete here,
     // in this process's address space; a woken sibling thread runs instead.
     let _ = wake_linux_descriptor_waits();
-    if ready_linux_thread_handle().is_some() {
+    if defer_to_siblings && ready_linux_thread_handle().is_some() {
         return None;
     }
     let pid = current_linux_process_pid();
@@ -34938,6 +34950,10 @@ fn complete_linux_pipe_read_wait(slot: usize) -> bool {
             );
         }
         linux_pipe_readv_ranges(descriptor, &ranges[..vector_count])
+    } else if let Some(slot) = linux_socket_slot(descriptor)
+        .filter(|_| linux_socket_pipe_descriptor(descriptor, LINUX_DESCRIPTOR_INPUT))
+    {
+        linux_socket_pipe_read_wait_result(slot, address, count)
     } else {
         linux_pipe_read(descriptor, address, count).unwrap_or(LINUX_EBADF)
     };
@@ -34955,6 +34971,31 @@ fn complete_linux_pipe_read_wait(slot: usize) -> bool {
         .LINUX_PIPE_READ_WAKE_COUNT
         .fetch_add(1, Ordering::SeqCst);
     true
+}
+
+/// A blocked read of up to `count` bytes (at most a page) from the pipe in
+/// socket table `slot` into `address`: its result once the pipe has data or
+/// no writer, and ENOSYS while the read must still wait.
+fn linux_socket_pipe_read_wait_result(
+    slot: crate::linux_socket::SlotId,
+    address: u64,
+    count: u64,
+) -> u64 {
+    let mut bytes = [0_u8; PAGE_SIZE];
+    let length = usize::try_from(count).unwrap_or(PAGE_SIZE).min(PAGE_SIZE);
+    match crate::linux_socket::recv(slot, &mut bytes[..length]) {
+        Ok((received, _)) => {
+            if copy_to_linux_user(address, &bytes[..received]) {
+                received as u64
+            } else {
+                LINUX_EFAULT
+            }
+        }
+        Err(crate::linux_socket::Error::WouldBlock | crate::linux_socket::Error::InProgress) => {
+            LINUX_ENOSYS
+        }
+        Err(error) => linux_socket_error(error),
+    }
 }
 
 fn wake_linux_pipe_read_waits() -> u32 {
@@ -35093,6 +35134,39 @@ fn linux_descriptor_read_live_return(
     count: u64,
 ) -> u64 {
     if linux_blocking_socket_yields(descriptor) {
+        // A thread of a process with another ready thread blocks on an
+        // empty pipe until a writer fills it, as in Linux: retrying in a
+        // loop, two such threads (git's reader and its sideband thread)
+        // would hand the CPU to each other and starve the writer.
+        if descriptor <= 0xff
+            && linux_socket_pipe_descriptor(descriptor, LINUX_DESCRIPTOR_INPUT)
+            && ready_linux_thread_handle().is_some()
+        {
+            X86_RUNTIME
+                .LINUX_SOCKET_SINGLE_ATTEMPT
+                .store(true, Ordering::SeqCst);
+            let immediate = linux_descriptor_read(descriptor, address, count);
+            X86_RUNTIME
+                .LINUX_SOCKET_SINGLE_ATTEMPT
+                .store(false, Ordering::SeqCst);
+            if immediate != LINUX_EAGAIN || count == 0 {
+                return immediate;
+            }
+            let wait_count = count.min(PAGE_SIZE as u64);
+            if !linux_writable_user_range_contains(address, wait_count as usize) {
+                return LINUX_EFAULT;
+            }
+            return linux_blocking_descriptor_io_live_return(
+                output,
+                caller,
+                LINUX_READ_SYSCALL,
+                LINUX_THREAD_WAIT_PIPE_READ,
+                address,
+                wait_count << 8 | descriptor,
+                0,
+                None,
+            );
+        }
         return linux_local_socket_io_live_return(
             output,
             caller,
@@ -35624,6 +35698,11 @@ fn linux_local_socket_io_live_return(
 
 /// Lets the rest of the domain run before system call `number` starts again:
 /// a ready sibling thread first, and otherwise other processes.
+/// Consecutive times a waiting thread handed the CPU to a ready sibling
+/// thread instead of letting other processes run.
+static LINUX_RETRY_SIBLING_HANDOFFS: AtomicU32 = AtomicU32::new(0);
+const LINUX_RETRY_SIBLING_HANDOFF_LIMIT: u32 = 1;
+
 fn linux_retry_later_live_return(
     output: *mut LinuxSyscallFrame,
     caller: LinuxUserContext,
@@ -35632,10 +35711,21 @@ fn linux_retry_later_live_return(
     let mut restart = caller;
     restart.rip = caller.rip.wrapping_sub(LINUX_SYSCALL_INSTRUCTION_SIZE);
     restart.rax = number;
-    if let (Some(current), Some(target)) = (
-        current_linux_thread_handle(),
-        yield_ready_linux_thread_handle(),
-    ) {
+    // Waiting threads of one process that hand the CPU to each other would
+    // never let the process they wait for run (git's two threads reading
+    // pipes that its index-pack child fills): after a few handoffs in a
+    // row, the other processes get their turn.
+    let handoffs = LINUX_RETRY_SIBLING_HANDOFFS.fetch_add(1, Ordering::Relaxed);
+    let others_first = handoffs >= LINUX_RETRY_SIBLING_HANDOFF_LIMIT;
+    let sibling = if others_first {
+        None
+    } else {
+        yield_ready_linux_thread_handle()
+    };
+    if sibling.is_none() {
+        LINUX_RETRY_SIBLING_HANDOFFS.store(0, Ordering::Relaxed);
+    }
+    if let (Some(current), Some(target)) = (current_linux_thread_handle(), sibling) {
         let mut registers = LinuxSyscallFrame::ZERO;
         let (mut rip, mut rsp, mut rflags, mut rax) = (0, 0, 0, 0);
         if save_linux_thread_return_context(current, restart)
@@ -35665,7 +35755,7 @@ fn linux_retry_later_live_return(
             return LINUX_RETURN_FROM_IRET;
         }
     }
-    match run_other_linux_processes(output, caller, number) {
+    match run_other_linux_processes_deferring(output, caller, number, !others_first) {
         Some(LinuxBlockedWait::Return(result)) => result,
         _ => linux_restart_syscall_live_return(output, caller, number),
     }
