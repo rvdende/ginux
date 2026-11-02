@@ -3,6 +3,7 @@ use crate::{
     control_abi,
     memory::{self, FrameLease, FrameOwner},
 };
+use alloc::collections::BTreeMap;
 use core::cell::UnsafeCell;
 
 const PAGE_SIZE: usize = 4096;
@@ -1574,6 +1575,7 @@ pub(crate) fn unlink(handle: Handle) -> bool {
 
 pub(crate) fn teardown() -> bool {
     let overlay = live_mut();
+    *node_hints() = BTreeMap::new();
     let mut page = core::mem::replace(&mut overlay.first_node_page, FrameLease::EMPTY);
     while page != FrameLease::EMPTY {
         let Some(nodes) = node_page_mut(page) else {
@@ -1951,12 +1953,43 @@ fn release_data_pages(mut page: FrameLease) -> bool {
 }
 
 fn node(handle: Handle) -> Option<&'static Node> {
-    let overlay = live()?;
-    for_each_node(overlay, |node| (node.handle == handle).then_some(node))
+    node_mut(handle).map(|node| &*node)
+}
+
+/// Where each instance's nodes were last found, by inode: a hint checked on
+/// every use (the slot must still hold that handle), so a stale entry only
+/// costs the scan it would have saved. Node pages are freed only in
+/// `teardown`, which clears the instance's hints, so a hint always points
+/// into a live node page. Without it every read, write and page fault of a
+/// file scanned all nodes: rustc mapping its 150 MB driver library from a
+/// domain with tens of thousands of files took minutes.
+struct NodeHints(UnsafeCell<[BTreeMap<u64, usize>; INSTANCE_LIMIT]>);
+
+unsafe impl Sync for NodeHints {}
+
+static NODE_HINTS: NodeHints =
+    NodeHints(UnsafeCell::new([const { BTreeMap::new() }; INSTANCE_LIMIT]));
+
+/// The current instance's node hints. The overlay's own state has the same
+/// owner: whoever runs the instance's file system calls.
+fn node_hints() -> &'static mut BTreeMap<u64, usize> {
+    let index = current_instance();
+    // SAFETY: as for `live_mut`: one instance's overlay is used by one
+    // caller at a time.
+    unsafe { &mut *NODE_HINTS.0.get().cast::<BTreeMap<u64, usize>>().add(index) }
 }
 
 fn node_mut(handle: Handle) -> Option<&'static mut Node> {
     let overlay = live_mut();
+    let hints = node_hints();
+    if let Some(address) = hints.get(&handle.inode).copied() {
+        // SAFETY: hints point at node slots in this instance's node pages,
+        // which stay allocated until `teardown` clears the hints.
+        let node = unsafe { &mut *(address as *mut Node) };
+        if node.active && node.handle == handle {
+            return Some(node);
+        }
+    }
     let mut page = overlay.first_node_page;
     while page != FrameLease::EMPTY {
         let nodes = node_page_mut(page)?;
@@ -1965,7 +1998,9 @@ fn node_mut(handle: Handle) -> Option<&'static mut Node> {
             .iter()
             .position(|node| node.active && node.handle == handle)
         {
-            return nodes.nodes.get_mut(index);
+            let node = nodes.nodes.get_mut(index)?;
+            hints.insert(handle.inode, core::ptr::from_mut(node) as usize);
+            return Some(node);
         }
         page = nodes.next;
     }

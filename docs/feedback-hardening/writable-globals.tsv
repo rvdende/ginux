@@ -463,6 +463,7 @@ interior-mutable	kernel/src/drivers/virtio_gpu.rs	THREE_D_CAPSETS	platform-devic
 interior-mutable	kernel/src/drivers/virtio_gpu.rs	PCI_ADDRESS	platform-device	allowlist	none	atomic-published-at-activation
 interior-mutable	kernel/src/linux_mount.rs	MOUNT_RUNTIME	domain-runtime	allowlist	none	explicit-domain-mount-runtime-owner-root
 interior-mutable	kernel/src/linux_overlay.rs	OVERLAY_RUNTIME	domain-runtime	allowlist	none	explicit-domain-overlay-owner-root
+interior-mutable	kernel/src/linux_overlay.rs	NODE_HINTS	domain-runtime	allowlist	none	validated-lookup-hints-with-overlay-owner
 interior-mutable	kernel/src/linux_process.rs	PROCESS_RUNTIME	process-runtime	allowlist	none	explicit-process-runtime-owner-root
 interior-mutable	kernel/src/linux_process.rs	PROCESS_ADDRESS_SPACE_STORAGE	process-runtime	allowlist	none	demand-initialized-process-address-space-owner
 interior-mutable	kernel/src/linux_signal.rs	SIGNAL_RUNTIME	process-runtime	allowlist	none	explicit-process-signal-runtime-owner-root
