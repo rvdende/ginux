@@ -399,7 +399,7 @@ fn linux_syscall_dispatch(
         // MSG_ERRQUEUE reads the (always empty) error queue without waiting.
         LINUX_RECVFROM_SYSCALL
             if register(0) & (0x140 | LINUX_MSG_ERRQUEUE) == 0
-                && linux_blocking_socket_yields(first_argument, false) =>
+                && linux_blocking_socket_yields(first_argument) =>
         {
             linux_local_socket_io_live_return(
                 registers,
@@ -441,7 +441,7 @@ fn linux_syscall_dispatch(
         }
         LINUX_RECVMSG_SYSCALL
             if count & (0x140 | LINUX_MSG_ERRQUEUE) == 0
-                && linux_blocking_socket_yields(first_argument, false) =>
+                && linux_blocking_socket_yields(first_argument) =>
         {
             linux_local_socket_io_live_return(
                 registers,

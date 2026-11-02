@@ -31383,9 +31383,11 @@ fn linux_socket_create(family: u64, socket_type: u64, protocol: u64) -> u64 {
     const AF_INET: u64 = 2;
     const SOCK_STREAM: u64 = 1;
     const SOCK_DGRAM: u64 = 2;
+    const SOCK_RAW: u64 = 3;
     const SOCK_SEQPACKET: u64 = 5;
     const SOCK_NONBLOCK: u64 = 0x800;
     const SOCK_CLOEXEC: u64 = 0x8_0000;
+    const IPPROTO_ICMP: u64 = 1;
     let family = u64::from(family as u32);
     let socket_type = u64::from(socket_type as u32);
     let protocol = u64::from(protocol as u32);
@@ -31405,7 +31407,12 @@ fn linux_socket_create(family: u64, socket_type: u64, protocol: u64) -> u64 {
         }
         (AF_INET, SOCK_STREAM) if matches!(protocol, 0 | 6) => crate::linux_socket::Kind::Tcp,
         (AF_INET, SOCK_DGRAM) if matches!(protocol, 0 | 17) => crate::linux_socket::Kind::Udp,
-        (AF_INET, SOCK_STREAM | SOCK_DGRAM) => return LINUX_EPROTONOSUPPORT,
+        // Ping sockets, which Linux grants to the groups in ping_group_range
+        // (every group on Ubuntu), and raw ICMP sockets.
+        (AF_INET, SOCK_DGRAM | SOCK_RAW) if protocol == IPPROTO_ICMP => {
+            crate::linux_socket::Kind::Icmp
+        }
+        (AF_INET, SOCK_STREAM | SOCK_DGRAM | SOCK_RAW) => return LINUX_EPROTONOSUPPORT,
         _ => return LINUX_EINVAL,
     };
     let Some(descriptor) = (LINUX_AUX_DESCRIPTOR_FIRST..LINUX_AUX_DESCRIPTOR_LIMIT)
@@ -31415,6 +31422,8 @@ fn linux_socket_create(family: u64, socket_type: u64, protocol: u64) -> u64 {
     };
     let slot = match if kind == crate::linux_socket::Kind::Unix {
         crate::linux_socket::open_unix(base as u8)
+    } else if kind == crate::linux_socket::Kind::Icmp {
+        crate::linux_socket::open_icmp(base == SOCK_RAW)
     } else {
         crate::linux_socket::open(kind)
     } {
@@ -31760,8 +31769,11 @@ fn linux_socket_sendto(
         }
     };
     // A stream (a pipe, a socketpair, TCP) takes as much of the write as it
-    // has room for in one call; a UDP datagram stays within a page.
-    let limit = if crate::linux_socket::kind(slot) == Some(crate::linux_socket::Kind::Udp) {
+    // has room for in one call; a UDP or ICMP datagram stays within a page.
+    let limit = if matches!(
+        crate::linux_socket::kind(slot),
+        Some(crate::linux_socket::Kind::Udp | crate::linux_socket::Kind::Icmp)
+    ) {
         PAGE_SIZE
     } else {
         1 << 20
@@ -31890,7 +31902,10 @@ fn linux_socket_recvfrom(
         let _ = crate::linux_socket::discard_unix_ancillary(slot);
     }
     if flags & MSG_TRUNC != 0
-        && crate::linux_socket::kind(slot) == Some(crate::linux_socket::Kind::Udp)
+        && matches!(
+            crate::linux_socket::kind(slot),
+            Some(crate::linux_socket::Kind::Udp | crate::linux_socket::Kind::Icmp)
+        )
     {
         message_length as u64
     } else {
@@ -32423,13 +32438,34 @@ fn linux_socket_recvmsg(
             control_length += 32;
         }
     }
+    // IP_RECVTTL: the datagram's TTL (SOL_IP, IP_TTL), which ping prints.
+    if let Some(ttl) = crate::linux_socket::received_ttl(slot).filter(|_| {
+        crate::linux_socket::boolean_option(slot, crate::linux_socket::BooleanOption::ReceiveTtl)
+            .unwrap_or(false)
+    }) {
+        if control_capacity.saturating_sub(control_length) < 24 {
+            output_flags |= MSG_CTRUNC;
+        } else {
+            let mut ancillary = [0_u8; 24];
+            ancillary[..8].copy_from_slice(&20_u64.to_ne_bytes());
+            ancillary[12..16].copy_from_slice(&2_i32.to_ne_bytes());
+            ancillary[16..20].copy_from_slice(&i32::from(ttl).to_ne_bytes());
+            if !copy_to_linux_user(control + control_length, &ancillary) {
+                return LINUX_EFAULT;
+            }
+            control_length += 24;
+        }
+    }
     header[40..48].copy_from_slice(&control_length.to_ne_bytes());
     header[48..52].copy_from_slice(&output_flags.to_ne_bytes());
     if !copy_to_linux_user(message, &header) {
         return LINUX_EFAULT;
     }
     if flags & MSG_TRUNC != 0
-        && crate::linux_socket::kind(slot) == Some(crate::linux_socket::Kind::Udp)
+        && matches!(
+            crate::linux_socket::kind(slot),
+            Some(crate::linux_socket::Kind::Udp | crate::linux_socket::Kind::Icmp)
+        )
     {
         message_length as u64
     } else {
@@ -32728,8 +32764,32 @@ fn linux_socket_setsockopt(
         return crate::linux_socket::set_timeout_option(slot, timeout_option, timeout)
             .map_or_else(linux_socket_error, |()| 0);
     }
+    if matches!((level, option), (0, 2) | (255, 1)) {
+        if length < 4 {
+            return LINUX_EINVAL;
+        }
+        let mut supplied = [0_u8; 4];
+        if !copy_from_linux_user(value, &mut supplied) {
+            return LINUX_EFAULT;
+        }
+        let value = i32::from_ne_bytes(supplied);
+        if level == 255 {
+            return crate::linux_socket::set_icmp_filter(slot, value as u32)
+                .map_or(LINUX_EOPNOTSUPP, |()| 0);
+        }
+        // IP_TTL: 1 to 255, or -1 for the default.
+        let ttl = match value {
+            -1 => 0,
+            1..=255 => value as u8,
+            _ => return LINUX_EINVAL,
+        };
+        return crate::linux_socket::set_ttl(slot, ttl).map_or(LINUX_ENOPROTOOPT, |()| 0);
+    }
     let boolean_option = match (level, option) {
+        // IP_RETOPTS: received IP options; smoltcp keeps none to return.
+        (0, 7) => None,
         (0, 11) => Some(crate::linux_socket::BooleanOption::ReceiveErrors),
+        (0, 12) => Some(crate::linux_socket::BooleanOption::ReceiveTtl),
         (1, 2) => Some(crate::linux_socket::BooleanOption::ReuseAddress),
         (1, 9) => Some(crate::linux_socket::BooleanOption::KeepAlive),
         (1, 16) => Some(crate::linux_socket::BooleanOption::PassCredentials),
@@ -32836,9 +32896,22 @@ fn linux_socket_getsockopt(
         Err(error) => Err(linux_socket_error(error)),
     };
     let result = match (level, option) {
+        (0, 2) => match crate::linux_socket::ttl(slot) {
+            Ok(ttl) => i32::from(ttl),
+            Err(_) => return LINUX_ENOPROTOOPT,
+        },
         (0, 11) => match read_boolean(crate::linux_socket::BooleanOption::ReceiveErrors) {
             Ok(value) => value,
             Err(error) => return error,
+        },
+        (0, 12) => match read_boolean(crate::linux_socket::BooleanOption::ReceiveTtl) {
+            Ok(value) => value,
+            Err(error) => return error,
+        },
+        // ICMP_FILTER of a raw ICMP socket.
+        (255, 1) => match crate::linux_socket::icmp_filter(slot) {
+            Ok(filter) => filter as i32,
+            Err(_) => return LINUX_EOPNOTSUPP,
         },
         (1, 2) => match read_boolean(crate::linux_socket::BooleanOption::ReuseAddress) {
             Ok(value) => value,
@@ -32870,12 +32943,17 @@ fn linux_socket_getsockopt(
         (1, 38) => match crate::linux_socket::kind(slot) {
             Some(crate::linux_socket::Kind::Tcp) => 6,
             Some(crate::linux_socket::Kind::Udp) => 17,
+            Some(crate::linux_socket::Kind::Icmp) => 1,
             Some(crate::linux_socket::Kind::Unix) => 0,
             Some(crate::linux_socket::Kind::Object) => return LINUX_ENOTSOCK,
             None => return LINUX_EBADF,
         },
         (1, 39) => match crate::linux_socket::kind(slot) {
-            Some(crate::linux_socket::Kind::Tcp | crate::linux_socket::Kind::Udp) => 2,
+            Some(
+                crate::linux_socket::Kind::Tcp
+                | crate::linux_socket::Kind::Udp
+                | crate::linux_socket::Kind::Icmp,
+            ) => 2,
             Some(crate::linux_socket::Kind::Unix) => 1,
             Some(crate::linux_socket::Kind::Object) => return LINUX_ENOTSOCK,
             None => return LINUX_EBADF,
@@ -34436,7 +34514,7 @@ fn linux_descriptor_read_live_return(
     address: u64,
     count: u64,
 ) -> u64 {
-    if linux_blocking_socket_yields(descriptor, false) {
+    if linux_blocking_socket_yields(descriptor) {
         return linux_local_socket_io_live_return(
             output,
             caller,
@@ -34554,7 +34632,7 @@ fn linux_descriptor_readv_live_return(
     vectors: u64,
     count: u64,
 ) -> u64 {
-    if linux_blocking_socket_yields(descriptor, false) {
+    if linux_blocking_socket_yields(descriptor) {
         return linux_local_socket_io_live_return(
             output,
             caller,
@@ -34610,7 +34688,7 @@ fn linux_descriptor_write_live_return(
     address: u64,
     count: u64,
 ) -> u64 {
-    if linux_blocking_socket_yields(descriptor, true) {
+    if linux_blocking_socket_yields(descriptor) {
         return linux_local_socket_io_live_return(
             output,
             caller,
@@ -34683,7 +34761,7 @@ fn linux_descriptor_writev_live_return(
     vectors: u64,
     count: u64,
 ) -> u64 {
-    if linux_blocking_socket_yields(descriptor, true) {
+    if linux_blocking_socket_yields(descriptor) {
         return linux_local_socket_io_live_return(
             output,
             caller,
@@ -34884,31 +34962,41 @@ fn linux_blocking_descriptor_io_live_return(
 }
 
 /// Whether a blocking call on the socket `descriptor` waits by yielding: a
-/// socket in blocking mode without a timeout for this direction (`write`),
-/// such as a pipe between processes or a TCP connection. Its peer may be
-/// another process, which cannot run while the call spins in the kernel, and
-/// a spin bounded only by an iteration count gave up on slow servers with
-/// EAGAIN, which Linux never returns from a blocking call. Threads on
-/// application processors keep the in-kernel waits.
-fn linux_blocking_socket_yields(descriptor: u64, write: bool) -> bool {
+/// socket in blocking mode, such as a pipe between processes or a TCP
+/// connection. Its peer may be another process, which cannot run while the
+/// call spins in the kernel, and a spin bounded only by an iteration count
+/// gave up on slow servers with EAGAIN, which Linux never returns from a
+/// blocking call. A socket with a timeout (SO_RCVTIMEO, SO_SNDTIMEO) yields
+/// too: spinning out its timeout held the domain's only CPU from the peer
+/// (cadrs's geometry kernel could not send the hello its app waited 10 s
+/// for). Threads on application processors keep the in-kernel waits.
+fn linux_blocking_socket_yields(descriptor: u64) -> bool {
+    X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::Acquire)
+        && current_linux_runtime_cpu_index() == 0
+        && linux_socket_slot(descriptor).is_some()
+        && !linux_socket_nonblocking(descriptor)
+}
+
+/// When a blocking call on the socket `descriptor`, at user address `rip`,
+/// gives up: the deadline an earlier attempt of the same call left, or its
+/// timeout for this direction (`write`) from now; None without a timeout.
+fn linux_socket_wait_deadline(descriptor: u64, write: bool, rip: u64) -> Option<u64> {
     let option = if write {
         crate::linux_socket::TimeoutOption::Send
     } else {
         crate::linux_socket::TimeoutOption::Receive
     };
-    X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::Acquire)
-        && current_linux_runtime_cpu_index() == 0
-        && linux_socket_slot(descriptor).is_some_and(|slot| {
-            crate::linux_socket::kind(slot) == Some(crate::linux_socket::Kind::Unix)
-                || !crate::linux_socket::has_timeout(slot, option)
-        })
-        && !linux_socket_nonblocking(descriptor)
+    let saved = take_linux_restart_deadline(rip);
+    let microseconds = linux_socket_slot(descriptor)
+        .and_then(|slot| crate::linux_socket::timeout_option(slot, option).ok())
+        .filter(|microseconds| *microseconds != 0)?;
+    saved.or_else(|| linux_elapsed_nanoseconds()?.checked_add(microseconds.saturating_mul(1_000)))
 }
 
 /// Runs `operation`, system call `number` on the blocking socket
 /// `descriptor`, once without waiting. If it would block, the rest of the
-/// domain runs and the call starts again. A write to a pipe whose reader is
-/// gone raises SIGPIPE.
+/// domain runs and the call starts again, until the socket's timeout passes
+/// (EAGAIN, as Linux). A write to a pipe whose reader is gone raises SIGPIPE.
 fn linux_local_socket_io_live_return(
     output: *mut LinuxSyscallFrame,
     caller: LinuxUserContext,
@@ -34916,6 +35004,8 @@ fn linux_local_socket_io_live_return(
     descriptor: u64,
     operation: impl FnOnce() -> u64,
 ) -> u64 {
+    let write = matches!(number, LINUX_WRITE_SYSCALL | LINUX_WRITEV_SYSCALL);
+    let deadline = linux_socket_wait_deadline(descriptor, write, caller.rip);
     X86_RUNTIME
         .LINUX_SOCKET_SINGLE_ATTEMPT
         .store(true, Ordering::SeqCst);
@@ -34923,9 +35013,25 @@ fn linux_local_socket_io_live_return(
     X86_RUNTIME
         .LINUX_SOCKET_SINGLE_ATTEMPT
         .store(false, Ordering::SeqCst);
-    let write = matches!(number, LINUX_WRITE_SYSCALL | LINUX_WRITEV_SYSCALL);
     match result {
-        LINUX_EAGAIN => linux_retry_later_live_return(output, caller, number),
+        LINUX_EAGAIN => {
+            let Some(deadline) = deadline else {
+                return linux_retry_later_live_return(output, caller, number);
+            };
+            if linux_elapsed_nanoseconds().is_none_or(|now| now >= deadline) {
+                return LINUX_EAGAIN;
+            }
+            // The restarted call takes the deadline back; a call that ends
+            // here instead (a signal) drops it.
+            save_linux_restart_deadline(caller.rip, deadline);
+            let result = linux_retry_later_live_return(output, caller, number);
+            if !matches!(result, LINUX_RETURN_FROM_IRET | LINUX_RETURN_TO_KERNEL)
+                && result != number
+            {
+                let _ = take_linux_restart_deadline(caller.rip);
+            }
+            result
+        }
         LINUX_EPIPE | LINUX_ENOTCONN
             if write && linux_device_descriptor(descriptor) & LINUX_DEVICE_PIPE != 0 =>
         {

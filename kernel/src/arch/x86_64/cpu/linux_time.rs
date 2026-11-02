@@ -455,7 +455,7 @@ pub(super) struct LinuxRestartDeadline {
 }
 
 /// Records the deadline of a timed wait about to yield with a restart.
-fn save_linux_restart_deadline(rip: u64, deadline: u64) {
+pub(super) fn save_linux_restart_deadline(rip: u64, deadline: u64) {
     let instance = linux_execution_instance();
     let (pid, tid) = (
         current_linux_process_pid(),

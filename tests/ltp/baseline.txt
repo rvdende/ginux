@@ -365,7 +365,6 @@ sigsuspend01 TFAIL
 sigtimedwait01 TFAIL
 sigwait01 TFAIL
 sigwaitinfo01 TFAIL
-socket01 TFAIL
 socketpair01 TFAIL
 sockioctl01 TBROK
 splice08 HANG

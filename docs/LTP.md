@@ -28,6 +28,7 @@ QEMU, and reports one machine-parseable line per test plus failure clusters.
 | `47c5457b` | merged image/overlay directory listings, Linux checks for removing image names, distinct /dev/null and console identities (baseline 420 known failures) | 1362 | 720 | 235 | 170 | 222 | 13 | 0 | 2 |
 | `ab38f442` | /dev nodes, /proc/self/fd magic links, device files open the device, O_TRUNC ignored on devices (baseline 416) | 1362 | 724 | 237 | 162 | 222 | 14 | 0 | 3 |
 | `0a817fe3` | timed waits park again instead of halting, record-lock waits hand off to threads, /dev/urandom, random, full (baseline 413) | 1362 | 727 | 237 | 159 | 222 | 14 | 0 | 3 |
+| ICMP sockets | ping and raw ICMP sockets, blocking socket calls with SO_RCVTIMEO/SO_SNDTIMEO let other processes run (baseline 412) | 1362 | 728 | 236 | 159 | 222 | 14 | 0 | 3 |
 
 \* Counted with the exit status alone, which overstated passes (below).
 The later rows are rescored from each run's saved console logs with LTP's

@@ -1,5 +1,5 @@
-//! Sockets and pipes of Linux processes: TCP and UDP through smoltcp over
-//! the domain's virtio network device, and local streams (pipes,
+//! Sockets and pipes of Linux processes: TCP, UDP and ICMP through smoltcp
+//! over the domain's virtio network device, and local streams (pipes,
 //! socketpairs, Unix sockets and TCP connections between the interface's
 //! own addresses) whose bytes stay in the kernel.
 //!
@@ -23,9 +23,9 @@ use alloc::vec::Vec;
 
 use smoltcp::{
     iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet},
-    socket::{tcp, udp},
+    socket::{raw, tcp, udp},
     time::{Duration, Instant},
-    wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address},
+    wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, IpProtocol, IpVersion, Ipv4Address},
 };
 
 use crate::{
@@ -57,6 +57,11 @@ const BACKLOG_LIMIT: usize = 4096;
 const TCP_BUFFER_SIZE: usize = 64 * 1024;
 const UDP_BUFFER_SIZE: usize = 16 * 1024;
 const UDP_PACKET_COUNT: usize = 16;
+const ICMP_BUFFER_SIZE: usize = 16 * 1024;
+const ICMP_PACKET_COUNT: usize = 16;
+/// The time to live of packets a socket sends unless IP_TTL sets another:
+/// Linux's default `ip_default_ttl`.
+const DEFAULT_TTL: u8 = 64;
 const BLOCKING_POLL_LIMIT: usize = 20_000;
 /// Bytes a local stream (a pipe or a socketpair) queues for a writer that
 /// must not block: Linux's default pipe capacity. A blocking writer is not
@@ -81,6 +86,12 @@ struct Platform {
 pub(crate) enum Kind {
     Tcp,
     Udp,
+    /// An ICMP socket: a ping socket (SOCK_DGRAM, IPPROTO_ICMP) that sends
+    /// echo requests and receives their replies, or a raw one (SOCK_RAW)
+    /// that receives every ICMP packet with its IP header. Both read the
+    /// interface's ICMP packets through a smoltcp raw socket, which keeps
+    /// the IP header (the reply's TTL).
+    Icmp,
     Unix,
     /// Not a socket: an open file of a kernel object (a DRM render node, a
     /// GPU fence, a dma-buf) that descriptors share as they share sockets,
@@ -110,6 +121,8 @@ pub(crate) enum BooleanOption {
     NoDelay,
     PassCredentials,
     Timestamp,
+    /// IP_RECVTTL: received datagrams carry their TTL (an IP_TTL message).
+    ReceiveTtl,
 }
 
 #[derive(Clone, Copy)]
@@ -127,6 +140,9 @@ struct Options {
     no_delay: bool,
     pass_credentials: bool,
     timestamp: bool,
+    receive_ttl: bool,
+    /// IP_TTL; 0 for DEFAULT_TTL.
+    ttl: u8,
     receive_timeout_us: u64,
     send_timeout_us: u64,
 }
@@ -251,6 +267,12 @@ struct Slot {
     unix_path: Vec<u8>,
     /// An object slot's class and id.
     object: (u8, u64),
+    /// An ICMP socket is raw (SOCK_RAW), not a ping socket.
+    icmp_raw: bool,
+    /// ICMP_FILTER of a raw ICMP socket: types (bit numbers) it drops.
+    icmp_filter: u32,
+    /// The TTL of the datagram an ICMP socket received last.
+    received_ttl: u8,
 }
 
 impl Slot {
@@ -278,6 +300,9 @@ impl Slot {
             unix_type: 0,
             unix_path: Vec::new(),
             object: (0, 0),
+            icmp_raw: false,
+            icmp_filter: 0,
+            received_ttl: 0,
         }
     }
 
@@ -376,6 +401,89 @@ fn add_udp_socket(runtime: &mut Runtime) -> Result<SocketHandle, Error> {
         filled(UDP_BUFFER_SIZE, 0_u8)?,
     );
     Ok(runtime.sockets.add(udp::Socket::new(rx, tx)))
+}
+
+/// A smoltcp raw socket that receives every ICMP packet of the interface
+/// and sends the IPv4 packets an ICMP socket builds.
+fn add_icmp_socket(runtime: &mut Runtime) -> Result<SocketHandle, Error> {
+    let rx = raw::PacketBuffer::new(
+        filled(ICMP_PACKET_COUNT, raw::PacketMetadata::EMPTY)?,
+        filled(ICMP_BUFFER_SIZE, 0_u8)?,
+    );
+    let tx = raw::PacketBuffer::new(
+        filled(ICMP_PACKET_COUNT, raw::PacketMetadata::EMPTY)?,
+        filled(ICMP_BUFFER_SIZE, 0_u8)?,
+    );
+    Ok(runtime.sockets.add(raw::Socket::new(
+        Some(IpVersion::Ipv4),
+        Some(IpProtocol::Icmp),
+        rx,
+        tx,
+    )))
+}
+
+/// The Internet checksum (RFC 1071) of `bytes`.
+fn internet_checksum(bytes: &[u8]) -> u16 {
+    let (words, rest) = bytes.as_chunks::<2>();
+    let mut sum = words
+        .iter()
+        .map(|word| u32::from(u16::from_be_bytes(*word)))
+        .sum::<u32>()
+        + rest.first().map_or(0, |byte| u32::from(*byte) << 8);
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// An ICMP packet received by a raw socket: its IPv4 header's length,
+/// source and TTL, and the ICMP message's type and identifier.
+struct IcmpPacket {
+    header_length: usize,
+    source: u32,
+    ttl: u8,
+    icmp_type: u8,
+    identifier: u16,
+}
+
+impl IcmpPacket {
+    fn parse(packet: &[u8]) -> Option<Self> {
+        let header_length = usize::from(packet.first()? & 0xf) * 4;
+        let message = packet
+            .get(header_length..)
+            .filter(|_| header_length >= 20)?;
+        Some(Self {
+            header_length,
+            source: u32::from_be_bytes(packet[12..16].try_into().ok()?),
+            ttl: packet[8],
+            icmp_type: *message.first()?,
+            identifier: message
+                .get(4..6)
+                .map_or(0, |bytes| u16::from_be_bytes([bytes[0], bytes[1]])),
+        })
+    }
+}
+
+/// The IPv4 packet that carries `message` (an ICMP message) from `source`
+/// to `destination`.
+fn icmp_ipv4_packet(
+    source: u32,
+    destination: u32,
+    ttl: u8,
+    message: &[u8],
+) -> Result<Vec<u8>, Error> {
+    let length = u16::try_from(20 + message.len()).map_err(|_| Error::Invalid)?;
+    let mut packet = filled(usize::from(length), 0_u8)?;
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(&length.to_be_bytes());
+    packet[8] = ttl;
+    packet[9] = 1;
+    packet[12..16].copy_from_slice(&source.to_be_bytes());
+    packet[16..20].copy_from_slice(&destination.to_be_bytes());
+    let checksum = internet_checksum(&packet[..20]);
+    packet[10..12].copy_from_slice(&checksum.to_be_bytes());
+    packet[20..].copy_from_slice(message);
+    Ok(packet)
 }
 
 /// Queues `input` on a local stream's receive queue. With `capacity`,
@@ -603,6 +711,7 @@ impl Sockets {
             Kind::Object => return Err(Error::Invalid),
             Kind::Tcp => add_tcp_socket(self.runtime()?)?,
             Kind::Udp => add_udp_socket(self.runtime()?)?,
+            Kind::Icmp => add_icmp_socket(self.runtime()?)?,
         };
         let mut slot = Slot::new(kind, current_owner());
         slot.handle = Some(handle);
@@ -613,6 +722,14 @@ impl Sockets {
             }
         }
         id
+    }
+
+    fn open_icmp(&mut self, raw: bool) -> Result<SlotId, Error> {
+        let id = self.open(Kind::Icmp)?;
+        if let Some(state) = self.slot_mut(id) {
+            state.icmp_raw = raw;
+        }
+        Ok(id)
     }
 
     fn open_unix(&mut self, socket_type: u8) -> Result<SlotId, Error> {
@@ -629,6 +746,7 @@ impl Sockets {
         match state.kind {
             Kind::Tcp => Some(1),
             Kind::Udp => Some(2),
+            Kind::Icmp => Some(if state.icmp_raw { 3 } else { 2 }),
             Kind::Unix => Some(state.unix_type),
             Kind::Object => None,
         }
@@ -896,6 +1014,7 @@ impl Sockets {
             BooleanOption::NoDelay => options.no_delay = enabled,
             BooleanOption::PassCredentials => options.pass_credentials = enabled,
             BooleanOption::Timestamp => options.timestamp = enabled,
+            BooleanOption::ReceiveTtl => options.receive_ttl = enabled,
         }
         if state.kind == Kind::Tcp {
             if let Some(handle) = state.handle {
@@ -909,7 +1028,8 @@ impl Sockets {
                     BooleanOption::ReuseAddress
                     | BooleanOption::ReceiveErrors
                     | BooleanOption::PassCredentials
-                    | BooleanOption::Timestamp => {}
+                    | BooleanOption::Timestamp
+                    | BooleanOption::ReceiveTtl => {}
                 }
             }
         }
@@ -925,6 +1045,7 @@ impl Sockets {
             BooleanOption::NoDelay => options.no_delay,
             BooleanOption::PassCredentials => options.pass_credentials,
             BooleanOption::Timestamp => options.timestamp,
+            BooleanOption::ReceiveTtl => options.receive_ttl,
         })
     }
 
@@ -963,6 +1084,10 @@ impl Sockets {
         let (kind, handle) = (state.kind, state.handle);
         if address != 0 && !is_local_address(runtime, address) {
             return Err(Error::AddressNotAvailable);
+        }
+        // A raw socket has no port: it receives every packet of its protocol.
+        if kind == Kind::Icmp && state.icmp_raw {
+            return Ok(0);
         }
         let port = if requested_port == 0 {
             allocate_ephemeral_port(&mut runtime.next_port, slots, kind, index)
@@ -1198,6 +1323,14 @@ impl Sockets {
                 state.remote = Some(remote);
                 Ok(())
             }
+            Kind::Icmp => {
+                let state = slot_in_mut(slots, id).ok_or(Error::Invalid)?;
+                if !state.icmp_raw {
+                    state.local_port = local_port;
+                }
+                state.remote = Some(remote);
+                Ok(())
+            }
             Kind::Unix | Kind::Object => Err(Error::Invalid),
         }
     }
@@ -1251,6 +1384,9 @@ impl Sockets {
             return append_local_data(peer_state, input, local_capacity);
         }
         let (kind, handle, connected) = (state.kind, state.handle, state.remote);
+        if kind == Kind::Icmp {
+            return self.send_icmp(id, input, remote.or(connected).ok_or(Error::NotConnected)?);
+        }
         let runtime = self.runtime()?;
         let handle = handle.ok_or(Error::Invalid)?;
         match kind {
@@ -1273,8 +1409,123 @@ impl Sockets {
                     .map(|_| input.len())
                     .map_err(|_| Error::WouldBlock)
             }
-            Kind::Unix | Kind::Object => Err(Error::Invalid),
+            Kind::Icmp | Kind::Unix | Kind::Object => Err(Error::Invalid),
         }
+    }
+
+    /// Sends `input`, an ICMP message, to `remote`'s address in an IPv4
+    /// packet. A ping socket sends only echo requests, with its identifier
+    /// (its port, chosen now if it has none) and the checksum filled in, as
+    /// Linux; a raw socket sends the message as it is.
+    fn send_icmp(&mut self, id: SlotId, input: &[u8], remote: IpEndpoint) -> Result<usize, Error> {
+        let IpAddress::Ipv4(destination) = remote.addr;
+        let destination = u32::from_be_bytes(destination.octets());
+        let index = usize::from(id);
+        self.start_runtime()?;
+        let Self { runtime, slots, .. } = self;
+        let runtime = runtime.as_mut().ok_or(Error::Unavailable)?;
+        let state = slot_in(slots, id).ok_or(Error::Invalid)?;
+        let (raw, handle, ttl) = (state.icmp_raw, state.handle, state.options.ttl);
+        let mut message = filled(input.len(), 0_u8)?;
+        message.copy_from_slice(input);
+        if !raw {
+            if message.len() < 8 || message[0] != 8 || message[1] != 0 {
+                return Err(Error::Invalid);
+            }
+            let identifier = match state.local_port {
+                0 => allocate_ephemeral_port(&mut runtime.next_port, slots, Kind::Icmp, index)
+                    .ok_or(Error::Exhausted)?,
+                port => port,
+            };
+            slot_in_mut(slots, id).ok_or(Error::Invalid)?.local_port = identifier;
+            message[4..6].copy_from_slice(&identifier.to_be_bytes());
+            message[2..4].fill(0);
+            let checksum = internet_checksum(&message);
+            message[2..4].copy_from_slice(&checksum.to_be_bytes());
+        }
+        let source = if destination >> 24 == 127 {
+            0x7f00_0001
+        } else {
+            runtime.local_address
+        };
+        let ttl = if ttl == 0 { DEFAULT_TTL } else { ttl };
+        let packet = icmp_ipv4_packet(source, destination, ttl, &message)?;
+        runtime
+            .sockets
+            .get_mut::<raw::Socket>(handle.ok_or(Error::Invalid)?)
+            .send_slice(&packet)
+            .map(|()| input.len())
+            .map_err(|_| Error::WouldBlock)
+    }
+
+    /// Drops the packets at the front of ICMP socket `id`'s queue that are
+    /// not for it, and says whether one that is waits there: an echo reply
+    /// with its identifier for a ping socket, a type its filter passes for
+    /// a raw one.
+    fn icmp_ready(&mut self, id: SlotId) -> bool {
+        let Some(state) = self.slot(id) else {
+            return false;
+        };
+        let (raw, filter, identifier, handle) = (
+            state.icmp_raw,
+            state.icmp_filter,
+            state.local_port,
+            state.handle,
+        );
+        let (Some(runtime), Some(handle)) = (self.runtime.as_mut(), handle) else {
+            return false;
+        };
+        let socket = runtime.sockets.get_mut::<raw::Socket>(handle);
+        loop {
+            let wanted = match socket.peek() {
+                Ok(packet) => IcmpPacket::parse(packet).is_some_and(|packet| {
+                    if raw {
+                        packet.icmp_type >= 32 || filter >> packet.icmp_type & 1 == 0
+                    } else {
+                        packet.icmp_type == 0 && packet.identifier == identifier
+                    }
+                }),
+                Err(_) => return false,
+            };
+            if wanted {
+                return true;
+            }
+            let _ = socket.recv();
+        }
+    }
+
+    /// Receives the next datagram of ICMP socket `id`: the ICMP message of
+    /// an echo reply for a ping socket, the whole IPv4 packet for a raw one.
+    fn recv_icmp(
+        &mut self,
+        id: SlotId,
+        output: &mut [u8],
+        peek_only: bool,
+    ) -> Result<(usize, usize, Option<IpEndpoint>), Error> {
+        if !self.icmp_ready(id) {
+            return Err(Error::WouldBlock);
+        }
+        let state = self.slot(id).ok_or(Error::Invalid)?;
+        let (raw, handle) = (state.icmp_raw, state.handle.ok_or(Error::Invalid)?);
+        let runtime = self.runtime.as_mut().ok_or(Error::Unavailable)?;
+        let socket = runtime.sockets.get_mut::<raw::Socket>(handle);
+        let packet = if peek_only {
+            socket.peek()
+        } else {
+            socket.recv()
+        }
+        .map_err(|_| Error::WouldBlock)?;
+        let header = IcmpPacket::parse(packet).ok_or(Error::WouldBlock)?;
+        let datagram = if raw {
+            packet
+        } else {
+            &packet[header.header_length..]
+        };
+        let copied = output.len().min(datagram.len());
+        output[..copied].copy_from_slice(&datagram[..copied]);
+        let length = datagram.len();
+        self.slot_mut(id).ok_or(Error::Invalid)?.received_ttl = header.ttl;
+        Ok((copied, length, Some(endpoint(header.source, 0))))
     }
 
     /// What a local stream with nothing queued returns: EAGAIN while its
@@ -1293,7 +1544,10 @@ impl Sockets {
         id: SlotId,
         output: &mut [u8],
     ) -> Result<(usize, Option<IpEndpoint>), Error> {
-        if self.slot(id).is_some_and(|state| state.kind == Kind::Udp) {
+        if self
+            .slot(id)
+            .is_some_and(|state| matches!(state.kind, Kind::Udp | Kind::Icmp))
+        {
             return self
                 .recv_message(id, output, false)
                 .map(|(copied, _message_length, endpoint)| (copied, endpoint));
@@ -1334,7 +1588,7 @@ impl Sockets {
                 .recv_slice(output)
                 .map(|(size, metadata)| (size, Some(metadata.endpoint)))
                 .map_err(|_| Error::WouldBlock),
-            Kind::Unix | Kind::Object => Err(Error::Invalid),
+            Kind::Icmp | Kind::Unix | Kind::Object => Err(Error::Invalid),
         }
     }
 
@@ -1415,7 +1669,10 @@ impl Sockets {
         id: SlotId,
         output: &mut [u8],
     ) -> Result<(usize, Option<IpEndpoint>), Error> {
-        if self.slot(id).is_some_and(|state| state.kind == Kind::Udp) {
+        if self
+            .slot(id)
+            .is_some_and(|state| matches!(state.kind, Kind::Udp | Kind::Icmp))
+        {
             return self
                 .recv_message(id, output, true)
                 .map(|(copied, _message_length, endpoint)| (copied, endpoint));
@@ -1451,7 +1708,7 @@ impl Sockets {
                 .peek_slice(output)
                 .map(|(size, metadata)| (size, Some(metadata.endpoint)))
                 .map_err(|_| Error::WouldBlock),
-            Kind::Unix | Kind::Object => Err(Error::Invalid),
+            Kind::Icmp | Kind::Unix | Kind::Object => Err(Error::Invalid),
         }
     }
 
@@ -1461,7 +1718,8 @@ impl Sockets {
         output: &mut [u8],
         peek_only: bool,
     ) -> Result<(usize, usize, Option<IpEndpoint>), Error> {
-        if !self.slot(id).is_some_and(|state| state.kind == Kind::Udp) {
+        let kind = self.slot(id).map(|state| state.kind);
+        if !matches!(kind, Some(Kind::Udp | Kind::Icmp)) {
             let (copied, endpoint) = if peek_only {
                 self.peek(id, output)?
             } else {
@@ -1473,6 +1731,9 @@ impl Sockets {
         let state = self.slot(id).ok_or(Error::Invalid)?;
         if state.read_shutdown {
             return Ok((0, 0, None));
+        }
+        if kind == Some(Kind::Icmp) {
+            return self.recv_icmp(id, output, peek_only);
         }
         let handle = state.handle.ok_or(Error::Invalid)?;
         let runtime = self.runtime()?;
@@ -1491,6 +1752,16 @@ impl Sockets {
 
     fn readiness(&mut self, id: SlotId) -> Option<(bool, bool, bool)> {
         self.poll();
+        if self.slot(id)?.kind == Kind::Icmp {
+            let readable = self.icmp_ready(id);
+            let runtime = self.runtime.as_ref()?;
+            let handle = self.slot(id)?.handle?;
+            return Some((
+                readable,
+                runtime.sockets.get::<raw::Socket>(handle).can_send(),
+                false,
+            ));
+        }
         let state = self.slot(id)?;
         if state.listening && !state.pending.is_empty() {
             return Some((true, false, false));
@@ -1531,7 +1802,7 @@ impl Sockets {
                 let socket = runtime.sockets.get::<udp::Socket>(handle);
                 (socket.can_recv(), socket.can_send(), false)
             }
-            Kind::Unix | Kind::Object => return None,
+            Kind::Icmp | Kind::Unix | Kind::Object => return None,
         })
     }
 
@@ -1779,6 +2050,81 @@ pub(crate) fn open_unix(socket_type: u8) -> Result<SlotId, Error> {
     SOCKETS.lock().open_unix(socket_type)
 }
 
+/// Opens an ICMP socket: a raw one (SOCK_RAW) or a ping socket.
+pub(crate) fn open_icmp(raw: bool) -> Result<SlotId, Error> {
+    SOCKETS.lock().open_icmp(raw)
+}
+
+/// The TTL of the datagram ICMP socket `id` received last.
+pub(crate) fn received_ttl(id: SlotId) -> Option<u8> {
+    SOCKETS
+        .lock()
+        .slot(id)
+        .filter(|state| state.kind == Kind::Icmp)
+        .map(|state| state.received_ttl)
+}
+
+/// Sets IP_TTL, the TTL of the packets socket `id` sends (0 for the
+/// default).
+pub(crate) fn set_ttl(id: SlotId, ttl: u8) -> Result<(), Error> {
+    let mut sockets = SOCKETS.lock();
+    let Sockets { runtime, slots, .. } = &mut *sockets;
+    let state = slot_in_mut(slots, id)
+        .filter(|state| !matches!(state.kind, Kind::Unix | Kind::Object))
+        .ok_or(Error::Invalid)?;
+    state.options.ttl = ttl;
+    let (Some(runtime), Some(handle)) = (runtime.as_mut(), state.handle) else {
+        return Ok(());
+    };
+    let hop_limit = (ttl != 0).then_some(ttl);
+    match state.kind {
+        Kind::Tcp => runtime
+            .sockets
+            .get_mut::<tcp::Socket>(handle)
+            .set_hop_limit(hop_limit),
+        Kind::Udp => runtime
+            .sockets
+            .get_mut::<udp::Socket>(handle)
+            .set_hop_limit(hop_limit),
+        Kind::Icmp | Kind::Unix | Kind::Object => {}
+    }
+    Ok(())
+}
+
+/// IP_TTL of socket `id`.
+pub(crate) fn ttl(id: SlotId) -> Result<u8, Error> {
+    SOCKETS
+        .lock()
+        .slot(id)
+        .filter(|state| !matches!(state.kind, Kind::Unix | Kind::Object))
+        .map(|state| match state.options.ttl {
+            0 => DEFAULT_TTL,
+            ttl => ttl,
+        })
+        .ok_or(Error::Invalid)
+}
+
+/// Sets ICMP_FILTER of raw ICMP socket `id`: the types it drops.
+pub(crate) fn set_icmp_filter(id: SlotId, filter: u32) -> Result<(), Error> {
+    let mut sockets = SOCKETS.lock();
+    let state = sockets
+        .slot_mut(id)
+        .filter(|state| state.kind == Kind::Icmp && state.icmp_raw)
+        .ok_or(Error::Invalid)?;
+    state.icmp_filter = filter;
+    Ok(())
+}
+
+/// ICMP_FILTER of raw ICMP socket `id`.
+pub(crate) fn icmp_filter(id: SlotId) -> Result<u32, Error> {
+    SOCKETS
+        .lock()
+        .slot(id)
+        .filter(|state| state.kind == Kind::Icmp && state.icmp_raw)
+        .map(|state| state.icmp_filter)
+        .ok_or(Error::Invalid)
+}
+
 pub(crate) fn socket_type(id: SlotId) -> Option<u8> {
     SOCKETS.lock().socket_type(id)
 }
@@ -1877,12 +2223,6 @@ pub(crate) fn set_timeout_option(
 
 pub(crate) fn timeout_option(id: SlotId, option: TimeoutOption) -> Result<u64, Error> {
     SOCKETS.lock().timeout_option(id, option)
-}
-
-/// Whether a timeout (SO_RCVTIMEO or SO_SNDTIMEO) bounds blocking calls on
-/// the socket `id`.
-pub(crate) fn has_timeout(id: SlotId, option: TimeoutOption) -> bool {
-    timeout_poll_limit(id, option).is_some()
 }
 
 fn timeout_poll_limit(id: SlotId, option: TimeoutOption) -> Option<usize> {
@@ -2031,7 +2371,7 @@ pub(crate) fn recv_message_blocking(
         return Ok((0, 0, None));
     }
     let limit = timeout_poll_limit(id, TimeoutOption::Receive).unwrap_or(BLOCKING_POLL_LIMIT);
-    if !wait_all || kind(id) == Some(Kind::Udp) {
+    if !wait_all || matches!(kind(id), Some(Kind::Udp | Kind::Icmp)) {
         for _ in 0..limit {
             match recv_message(id, output, peek_only) {
                 Err(Error::WouldBlock | Error::InProgress) => core::hint::spin_loop(),
