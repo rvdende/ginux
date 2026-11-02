@@ -29652,6 +29652,15 @@ fn linux_newfstatat(directory: u64, path_address: u64, stat_address: u64, flags:
     if path.is_empty() && flags & LINUX_AT_EMPTY_PATH == 0 {
         return LINUX_ENOENT;
     }
+    if let Some(stat) =
+        linux_proc_self_exe_stat(directory, path, flags & LINUX_AT_SYMLINK_NOFOLLOW == 0)
+    {
+        return if copy_to_linux_user(stat_address, &stat) {
+            0
+        } else {
+            LINUX_EFAULT
+        };
+    }
     if path.is_empty() {
         let Some(stat) = linux_descriptor_stat(directory) else {
             return LINUX_EBADF;
@@ -31675,6 +31684,15 @@ fn linux_statx(directory: u64, path_address: u64, flags: u64, mask: u64, stat_ad
         };
         let statx = linux_statx_from_stat(&stat);
         return if copy_to_linux_user(stat_address, &statx) {
+            0
+        } else {
+            LINUX_EFAULT
+        };
+    }
+    if let Some(stat) =
+        linux_proc_self_exe_stat(directory, path, flags & LINUX_AT_SYMLINK_NOFOLLOW == 0)
+    {
+        return if copy_to_linux_user(stat_address, &linux_statx_from_stat(&stat)) {
             0
         } else {
             LINUX_EFAULT
@@ -44949,6 +44967,54 @@ fn linux_descriptor_stat(descriptor: u64) -> Option<[u8; LINUX_STAT_SIZE]> {
             LinuxCharacterDevice::from_kind(device).stat()
         }
     })
+}
+
+/// stat or lstat (`follow` false) of /proc/self/exe or /proc/PID/exe of the
+/// calling process: the symlink itself, or the file it runs. `None` for
+/// any other path. rustup's installer checks `test -L /proc/self/exe`.
+fn linux_proc_self_exe_stat(
+    directory: u64,
+    path: &[u8],
+    follow: bool,
+) -> Option<[u8; LINUX_STAT_SIZE]> {
+    const SYMLINK_MODE: u32 = 0o120_777;
+    let pid = current_linux_process_pid();
+    let process = path.strip_prefix(b"/proc/")?.strip_suffix(b"/exe")?;
+    let own = process == b"self"
+        || !process.is_empty()
+            && process.iter().all(u8::is_ascii_digit)
+            && core::str::from_utf8(process)
+                .ok()
+                .and_then(|digits| digits.parse::<u32>().ok())
+                == Some(pid);
+    if directory as u32 != LINUX_AT_FDCWD || !own {
+        return None;
+    }
+    let executable = crate::linux_exe::lookup(
+        X86_RUNTIME.LINUX_EXECUTION_INSTANCE.load(Ordering::SeqCst),
+        pid,
+    )?;
+    if !follow {
+        let mut stat = linux_stat(SYMLINK_MODE, 0);
+        stat[48..56].copy_from_slice(&(executable.len() as u64).to_ne_bytes());
+        return Some(stat);
+    }
+    let relative = executable.strip_prefix(b"/")?;
+    let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    canonical
+        .get_mut(..relative.len())?
+        .copy_from_slice(relative);
+    match linux_overlay_lookup_following(&mut canonical, relative.len(), true).ok()? {
+        (_, _, Some(metadata)) => Some(linux_overlay_stat(metadata)),
+        (length, _, None) => {
+            let mut absolute = [0_u8; crate::linux_overlay::PATH_CAPACITY + 1];
+            absolute[0] = b'/';
+            absolute[1..=length].copy_from_slice(&canonical[..length]);
+            let (handle, entry) =
+                linux_rootfs_path_at(u64::from(LINUX_AT_FDCWD), &absolute[..=length])?;
+            Some(linux_rootfs_stat(handle, entry))
+        }
+    }
 }
 
 fn linux_stat(mode: u32, inode: u64) -> [u8; LINUX_STAT_SIZE] {
