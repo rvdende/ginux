@@ -7155,6 +7155,20 @@ fn retire_linux_thread(handle: LinuxThreadHandle) -> bool {
     true
 }
 
+/// An exec's point of no return: the process's other threads end (Linux's
+/// de_thread), leaving the calling one. linux_execve_at let the exec start
+/// only when none of them runs on another CPU.
+fn end_other_linux_threads_for_exec() {
+    let Some(current) = current_linux_thread_slot() else {
+        return;
+    };
+    for slot in (0..LINUX_THREAD_LIMIT).filter(|slot| *slot != current) {
+        if X86_RUNTIME.LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) != LINUX_THREAD_FREE {
+            clear_linux_thread_slot(slot);
+        }
+    }
+}
+
 fn retire_current_linux_thread() -> bool {
     let slot = X86_RUNTIME
         .LINUX_CURRENT_THREAD_SLOT
@@ -26455,6 +26469,7 @@ fn linux_rootfs_execve_source(
             let _ = linux_descriptor_close(descriptor);
         }
     }
+    end_other_linux_threads_for_exec();
     reset_linux_signal_state_after_exec();
     let _ = set_current_linux_clear_child_tid(0);
     let _ = set_current_linux_robust_list(0);
@@ -26948,13 +26963,20 @@ fn linux_execve_at(
     environment_address: u64,
     allow_empty_path: bool,
 ) -> u64 {
+    // The main thread of a process with other threads may exec too (they
+    // end at the point of no return, as Linux's de_thread does: rustup's
+    // proxies exec the toolchain's rustc from a threaded process), unless
+    // one of them is running on another CPU.
+    let other_threads = X86_RUNTIME
+        .LINUX_THREAD_STATES
+        .iter()
+        .filter(|state| state.load(Ordering::SeqCst) != LINUX_THREAD_FREE)
+        .count()
+        != 1;
     if current_linux_tid() != Some(current_linux_process_pid())
-        || X86_RUNTIME
-            .LINUX_THREAD_STATES
-            .iter()
-            .filter(|state| state.load(Ordering::SeqCst) != LINUX_THREAD_FREE)
-            .count()
-            != 1
+        || other_threads
+            && (!X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
+                || linux_remote_thread_running())
     {
         if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) && current_linux_process_pid() != 1
         {
@@ -27612,6 +27634,7 @@ fn linux_execve_at(
             let _ = linux_descriptor_close(descriptor);
         }
     }
+    end_other_linux_threads_for_exec();
     reset_linux_signal_state_after_exec();
     X86_RUNTIME
         .ELF_PROBE_MEMBARRIER_REGISTRATIONS
@@ -28501,6 +28524,17 @@ fn linux_openat_path(
             | LINUX_O_NOFOLLOW
             | LINUX_O_NOATIME
             | LINUX_O_PATH);
+    // /proc/self/exe opens the file the process runs (rustup's installer
+    // reads its ELF header to learn the bitness).
+    if flags & LINUX_O_NOFOLLOW == 0 {
+        if let Some(executable) = linux_proc_self_exe_target(directory, &path[..path_length]) {
+            let Some(target) = path.get_mut(..executable.len()) else {
+                return LINUX_ENAMETOOLONG;
+            };
+            target.copy_from_slice(&executable);
+            path_length = executable.len();
+        }
+    }
     if let Some(descriptor) = linux_descriptor_link_at(directory, &path[..path_length], true) {
         if !linux_descriptor_open(descriptor) {
             return LINUX_ENOENT;
@@ -44969,15 +45003,9 @@ fn linux_descriptor_stat(descriptor: u64) -> Option<[u8; LINUX_STAT_SIZE]> {
     })
 }
 
-/// stat or lstat (`follow` false) of /proc/self/exe or /proc/PID/exe of the
-/// calling process: the symlink itself, or the file it runs. `None` for
-/// any other path. rustup's installer checks `test -L /proc/self/exe`.
-fn linux_proc_self_exe_stat(
-    directory: u64,
-    path: &[u8],
-    follow: bool,
-) -> Option<[u8; LINUX_STAT_SIZE]> {
-    const SYMLINK_MODE: u32 = 0o120_777;
+/// The path of the program the calling process runs, when `path` (from
+/// `directory`) is its /proc/self/exe or /proc/PID/exe.
+fn linux_proc_self_exe_target(directory: u64, path: &[u8]) -> Option<Vec<u8>> {
     let pid = current_linux_process_pid();
     let process = path.strip_prefix(b"/proc/")?.strip_suffix(b"/exe")?;
     let own = process == b"self"
@@ -44990,10 +45018,22 @@ fn linux_proc_self_exe_stat(
     if directory as u32 != LINUX_AT_FDCWD || !own {
         return None;
     }
-    let executable = crate::linux_exe::lookup(
+    crate::linux_exe::lookup(
         X86_RUNTIME.LINUX_EXECUTION_INSTANCE.load(Ordering::SeqCst),
         pid,
-    )?;
+    )
+}
+
+/// stat or lstat (`follow` false) of /proc/self/exe or /proc/PID/exe of the
+/// calling process: the symlink itself, or the file it runs. `None` for
+/// any other path. rustup's installer checks `test -L /proc/self/exe`.
+fn linux_proc_self_exe_stat(
+    directory: u64,
+    path: &[u8],
+    follow: bool,
+) -> Option<[u8; LINUX_STAT_SIZE]> {
+    const SYMLINK_MODE: u32 = 0o120_777;
+    let executable = linux_proc_self_exe_target(directory, path)?;
     if !follow {
         let mut stat = linux_stat(SYMLINK_MODE, 0);
         stat[48..56].copy_from_slice(&(executable.len() as u64).to_ne_bytes());
