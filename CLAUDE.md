@@ -107,7 +107,9 @@ A CR2 just below RSP is a kernel stack overflow. If the machine resets with no
 report, rerun under `QEMU_ACCEL=tcg GINUX_QEMU_LOG=... GINUX_QEMU_LOG_INTERRUPTS=1`.
 
 For a hang or a slow domain, `echo t > /proc/sysrq-trigger` lists every
-task's threads (state, wait kind and key, saved registers) and `echo l`
+task's threads (state, wait kind and key, saved registers), `echo u` each
+CPU's user/kernel/idle/lock-wait time, the process banks in use and the
+threads run on other CPUs (docs/SCHEDULER.md), and `echo l`
 profiles the runtime CPU for 1000 ticks (system calls, lock ranks, DRM
 ioctls, timed spans in `kernel/src/linux_profile.rs`). Tick samples miss
 kernel work done with interrupts off; sample CPU 0 from the host instead

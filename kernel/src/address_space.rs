@@ -3191,17 +3191,6 @@ pub(crate) fn copy_to_current_user_partial(address: u64, input: &[u8]) -> usize 
     input.len().saturating_sub(remaining)
 }
 
-/// Copy a small value from an already materialized Linux userspace mapping.
-/// The active kernel-owned page tables remain authoritative: every covered
-/// leaf must be present and userspace-accessible, and the fault-recovering raw
-/// copy still converts a concurrent mapping fault into failure.
-pub(crate) fn copy_from_current_linux_user_fast(address: u64, output: &mut [u8]) -> bool {
-    if !current_linux_range_mapped(address, output.len(), false) {
-        return false;
-    }
-    unsafe { cpu::raw_copy_from_user(output.as_mut_ptr(), address as *const u8, output.len()) == 0 }
-}
-
 /// Copy a small result into the active Linux address space without repeating
 /// ownership validation for every page-table level. The kernel creates and
 /// exclusively owns Linux page tables, validates the root before entering
@@ -6291,7 +6280,7 @@ pub(crate) fn install_current_linux_runtime_page(
         | if protection & 4 != 0 { 0 } else { NO_EXECUTE }
         | if file { LINUX_RUNTIME_FILE } else { 0 };
     entry.write(frame.address() | flags);
-    if !smp::invalidate_runtime_translation(address) {
+    if !invalidate_changed_runtime_translation(address, old_value) {
         unsafe {
             entry.write(old_value);
             asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
@@ -6492,7 +6481,7 @@ pub(crate) fn reserve_current_linux_runtime_page(
         | if protection & 4 != 0 { 0 } else { NO_EXECUTE }
         | if file { LINUX_RUNTIME_FILE } else { 0 };
     entry.write(value);
-    if !smp::invalidate_runtime_translation(address) {
+    if !invalidate_changed_runtime_translation(address, old_value) {
         unsafe {
             entry.write(old_value);
             asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
@@ -6500,6 +6489,21 @@ pub(crate) fn reserve_current_linux_runtime_page(
         return None;
     }
     (entry.read() == value).then_some(old.frame)
+}
+
+/// Drops cached translations of `address` after its leaf entry changed from
+/// `old_value`. An entry that was not present was in no TLB: x86 caches
+/// only present translations, and unmapping a page flushed its translation
+/// on every CPU. So a page mapped for the first time, the common case (a
+/// lazily mapped page touched), costs no interrupt to the other CPUs; a
+/// change to a present entry (unmap, protection or frame change) does.
+fn invalidate_changed_runtime_translation(address: u64, old_value: u64) -> bool {
+    if old_value & PRESENT == 0 {
+        // SAFETY: invalidating a translation has no effect beyond the TLB.
+        unsafe { asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags)) };
+        return true;
+    }
+    smp::invalidate_runtime_translation(address)
 }
 
 pub(crate) fn remove_current_linux_runtime_page(address: u64) -> LinuxRuntimePage {
@@ -6510,7 +6514,7 @@ pub(crate) fn remove_current_linux_runtime_page(address: u64) -> LinuxRuntimePag
     if old.occupied {
         let old_value = entry.read();
         entry.write(0);
-        if !smp::invalidate_runtime_translation(address) {
+        if !invalidate_changed_runtime_translation(address, old_value) {
             unsafe {
                 entry.write(old_value);
                 asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
@@ -6668,7 +6672,7 @@ pub(crate) fn protect_current_linux_runtime_page(address: u64, protection: u8) -
         }
     };
     entry.write(value);
-    if !smp::invalidate_runtime_translation(address) {
+    if !invalidate_changed_runtime_translation(address, old_value) {
         unsafe {
             entry.write(old_value);
             asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
@@ -6712,7 +6716,7 @@ pub(crate) fn replace_current_linux_runtime_page(
         };
     let old_value = entry.read();
     entry.write(value);
-    if !smp::invalidate_runtime_translation(address) {
+    if !invalidate_changed_runtime_translation(address, old_value) {
         unsafe {
             entry.write(old_value);
             asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
@@ -6782,7 +6786,7 @@ pub(crate) fn materialize_current_linux_runtime_page(
         };
     let old_value = entry.read();
     entry.write(value);
-    if !smp::invalidate_runtime_translation(address) {
+    if !invalidate_changed_runtime_translation(address, old_value) {
         unsafe {
             entry.write(old_value);
             asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));

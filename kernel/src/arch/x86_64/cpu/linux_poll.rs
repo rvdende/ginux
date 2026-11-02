@@ -610,13 +610,16 @@ pub(super) fn linux_signal_suspend_live_return(
 pub(super) fn yield_current_linux_process(mut caller: LinuxUserContext, result: u64) -> bool {
     // A yield switches to the parent, which a thread of this process still
     // running on another CPU must not see; see linux_remote_thread_running.
-    if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
-        || current_linux_process_pid() == 1
-        || linux_remote_thread_running()
-    {
+    if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) || current_linux_process_pid() == 1 {
         return false;
     }
     caller.rax = result;
+    // A thread on the light path leaves its CPU for the owner's path.
+    if let Some((_, slot)) = linux_light_thread_here() {
+        return linux_thread_handle(slot).is_some_and(|handle| {
+            park_linux_light_thread(handle, caller, true) == LINUX_RETURN_TO_KERNEL
+        });
+    }
     let pid = current_linux_process_pid();
     if !refresh_linux_process_registry_for_wait(caller) {
         return false;

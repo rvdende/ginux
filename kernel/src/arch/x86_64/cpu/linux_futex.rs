@@ -2,7 +2,6 @@
 use super::*;
 
 static LINUX_PROFILE_FIRST_FUTEX_OPERATION: AtomicU64 = AtomicU64::new(u64::MAX);
-static LINUX_PROFILE_FUTEX_FAST_MISS_CPUS: AtomicU64 = AtomicU64::new(0);
 static LINUX_PROFILE_FUTEX_OPERATION_COUNTS: [AtomicU64; 512] = [const { AtomicU64::new(0) }; 512];
 
 /// A process waiting on a futex word while other processes run. A process
@@ -12,6 +11,9 @@ static LINUX_PROFILE_FUTEX_OPERATION_COUNTS: [AtomicU64; 512] = [const { AtomicU
 #[derive(Clone, Copy)]
 pub(super) struct LinuxProcessFutexWait {
     pid: u32,
+    /// The waiting thread: other threads of the process make futex calls
+    /// of their own meanwhile, on other CPUs.
+    tid: u32,
     /// The futex word's address in the waiting process, which its call
     /// passes again when it restarts.
     address: u64,
@@ -40,8 +42,11 @@ fn linux_futex_key(address: u64) -> u64 {
 fn take_linux_process_futex_wait(
     waits: &mut Vec<LinuxProcessFutexWait>,
     pid: u32,
+    tid: u32,
 ) -> Option<LinuxProcessFutexWait> {
-    let index = waits.iter().position(|wait| wait.pid == pid)?;
+    let index = waits
+        .iter()
+        .position(|wait| wait.pid == pid && wait.tid == tid)?;
     Some(waits.swap_remove(index))
 }
 
@@ -102,212 +107,6 @@ pub(super) fn write_linux_futex_profile() {
         serial_write_u64(count);
         serial_write("\r\n");
     }
-}
-
-pub(super) fn linux_remote_futex_wait_fast(
-    address: u64,
-    operation: u64,
-    value: u64,
-    timeout: u64,
-    bitset: u64,
-) -> Option<u64> {
-    const FUTEX_COMMAND_MASK: u64 = 0x7f;
-    const FUTEX_WAIT_BITSET: u64 = 9;
-    const FUTEX_PRIVATE_FLAG: u64 = 128;
-    const FUTEX_CLOCK_REALTIME: u64 = 256;
-
-    profile_linux_futex_operation(operation);
-    // As in linux_futex_live_return, the bitset is a 32-bit value.
-    let bitset = bitset & u64::from(u32::MAX);
-    if !address.is_multiple_of(size_of::<u32>() as u64) {
-        return None;
-    }
-    if matches!(operation, 1 | 129) {
-        let limit = u32::try_from(value).unwrap_or(u32::MAX);
-        if limit == 0 {
-            return Some(0);
-        }
-        let coordination = LINUX_FUTEX_COORDINATION.lock();
-        // A process waiting on a futex is woken by the full FUTEX_WAKE, under
-        // the kernel-entry lock; this path sees only this process's threads.
-        if !coordination.is_empty() {
-            return None;
-        }
-        let mut woken = 0_u32;
-        for slot in 0..LINUX_THREAD_LIMIT {
-            if woken == limit {
-                break;
-            }
-            if X86_RUNTIME.LINUX_THREAD_STATES[slot].load(Ordering::Acquire) != LINUX_THREAD_BLOCKED
-                && X86_RUNTIME.LINUX_THREAD_WAIT_KEYS[slot].load(Ordering::Acquire) == address
-                && X86_RUNTIME.LINUX_THREAD_WAIT_KINDS[slot]
-                    .compare_exchange(
-                        LINUX_THREAD_WAIT_FUTEX,
-                        LINUX_THREAD_WAIT_NONE,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-            {
-                X86_RUNTIME.LINUX_THREAD_WAIT_KEYS[slot].store(0, Ordering::Release);
-                X86_RUNTIME.LINUX_THREAD_WAIT_OUTPUTS[slot].store(0, Ordering::Release);
-                woken += 1;
-            }
-        }
-        if woken < limit {
-            woken = woken.saturating_add(wake_linux_futex_masked_locked(
-                address,
-                u32::MAX,
-                limit - woken,
-            ));
-        }
-        return Some(u64::from(woken));
-    }
-    let command = operation & FUTEX_COMMAND_MASK;
-    let flags = operation & !FUTEX_COMMAND_MASK;
-    if command == FUTEX_WAIT_BITSET {
-        if flags & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME) != 0 || bitset == 0 {
-            return Some(LINUX_EINVAL);
-        }
-        let mut bytes = [0_u8; size_of::<u32>()];
-        if !address_space::copy_from_current_linux_user_fast(address, &mut bytes) {
-            return None;
-        }
-        if u32::from_ne_bytes(bytes) != value as u32 {
-            return Some(LINUX_EAGAIN);
-        }
-        crate::arch::x86_64::smp::linux_runtime_thread_slot()?;
-        if timeout != 0 {
-            let mut timeout_bytes = [0_u8; 16];
-            if !address_space::copy_from_current_linux_user_fast(timeout, &mut timeout_bytes) {
-                return None;
-            }
-            let Some(requested) = linux_timespec_nanoseconds(&timeout_bytes) else {
-                return Some(LINUX_EINVAL);
-            };
-            let expired = if flags & FUTEX_CLOCK_REALTIME == 0 {
-                linux_elapsed_nanoseconds()? >= requested
-            } else {
-                let (seconds, nanoseconds) = linux_realtime_time()?;
-                let Some(realtime_now) = seconds
-                    .checked_mul(NANOSECONDS_PER_SECOND)
-                    .and_then(|seconds| seconds.checked_add(nanoseconds))
-                else {
-                    return Some(LINUX_EINVAL);
-                };
-                realtime_now >= requested
-            };
-            if expired {
-                return Some(LINUX_ETIMEDOUT);
-            }
-        }
-        // A remote application CPU can satisfy the predicate concurrently.
-        // Linux permits this wait to return spuriously, and returning directly
-        // preserves the coordinator's exact live syscall frame.
-        return Some(0);
-    }
-    if !matches!(operation, 0 | 128) || timeout != 0 {
-        return None;
-    }
-    let mut bytes = [0_u8; size_of::<u32>()];
-    if !address_space::copy_from_current_linux_user_fast(address, &mut bytes) {
-        // The ordinary path can materialize a valid lazy Linux mapping before
-        // deciding whether the address is actually invalid.
-        return None;
-    }
-    if u32::from_ne_bytes(bytes) != value as u32 {
-        return Some(LINUX_EAGAIN);
-    }
-    let remote = crate::arch::x86_64::smp::linux_runtime_thread_slot();
-    if remote.is_none() {
-        let cpu = current_linux_runtime_cpu_index();
-        if cfg!(feature = "linux-boot-profile")
-            && cpu < 64
-            && LINUX_PROFILE_FUTEX_FAST_MISS_CPUS.fetch_or(1 << cpu, Ordering::Relaxed) & (1 << cpu)
-                == 0
-        {
-            serial_write("ginux: profile futex fast miss cpu/remote: ");
-            serial_write_u64(cpu as u64);
-            serial_write("/0\r\n");
-        }
-        return None;
-    }
-    if current_linux_runtime_cpu_index() == 0
-        && (0..LINUX_THREAD_LIMIT).any(|slot| {
-            X86_RUNTIME.LINUX_THREAD_STATES[slot].load(Ordering::Acquire) == LINUX_THREAD_READY
-                && !crate::arch::x86_64::smp::linux_runtime_thread_is_remote(slot)
-        })
-    {
-        if cfg!(feature = "linux-boot-profile")
-            && LINUX_PROFILE_FUTEX_FAST_MISS_CPUS.fetch_or(1 << 32, Ordering::Relaxed) & (1 << 32)
-                == 0
-        {
-            serial_write("ginux: profile futex fast miss cpu/remote/local-ready: 0/1/1\r\n");
-        }
-        // Let the ordinary futex path save the coordinator and run the local
-        // worker instead of consuming CPU 0 in a polling wait.
-        return None;
-    }
-    let coordination = LINUX_FUTEX_COORDINATION.lock();
-    if !address_space::copy_from_current_linux_user_fast(address, &mut bytes) {
-        return Some(LINUX_EFAULT);
-    }
-    if u32::from_ne_bytes(bytes) != value as u32 {
-        return Some(LINUX_EAGAIN);
-    }
-    let slot = current_linux_thread_slot()?;
-    if X86_RUNTIME.LINUX_THREAD_WAIT_KINDS[slot].load(Ordering::Acquire) != LINUX_THREAD_WAIT_NONE {
-        return None;
-    }
-    X86_RUNTIME.LINUX_THREAD_WAIT_KEYS[slot].store(address, Ordering::Relaxed);
-    X86_RUNTIME.LINUX_THREAD_WAIT_OUTPUTS[slot].store(u64::from(u32::MAX), Ordering::Relaxed);
-    if X86_RUNTIME.LINUX_THREAD_WAIT_KINDS[slot]
-        .compare_exchange(
-            LINUX_THREAD_WAIT_NONE,
-            LINUX_THREAD_WAIT_FUTEX,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
-        .is_err()
-    {
-        X86_RUNTIME.LINUX_THREAD_WAIT_KEYS[slot].store(0, Ordering::Release);
-        X86_RUNTIME.LINUX_THREAD_WAIT_OUTPUTS[slot].store(0, Ordering::Release);
-        return None;
-    }
-    drop(coordination);
-
-    let finish = |result| {
-        let _coordination = LINUX_FUTEX_COORDINATION.lock();
-        let _ = X86_RUNTIME.LINUX_THREAD_WAIT_KINDS[slot].compare_exchange(
-            LINUX_THREAD_WAIT_FUTEX,
-            LINUX_THREAD_WAIT_NONE,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        X86_RUNTIME.LINUX_THREAD_WAIT_KEYS[slot].store(0, Ordering::Release);
-        X86_RUNTIME.LINUX_THREAD_WAIT_OUTPUTS[slot].store(0, Ordering::Release);
-        Some(result)
-    };
-
-    // Keep the coordinating thread outside the coarse kernel-entry lock while
-    // application CPUs run. The userspace futex word is authoritative; a
-    // changed value completes the wait. Bound the polling interval so unusual
-    // pthread handshakes retain Linux-permitted spurious-wakeup progress.
-    for _ in 0..4096 {
-        if X86_RUNTIME.LINUX_THREAD_WAIT_KINDS[slot].load(Ordering::Acquire)
-            != LINUX_THREAD_WAIT_FUTEX
-        {
-            return finish(0);
-        }
-        if !address_space::copy_from_current_linux_user_fast(address, &mut bytes) {
-            return finish(LINUX_EFAULT);
-        }
-        if u32::from_ne_bytes(bytes) != value as u32 {
-            return finish(0);
-        }
-        core::hint::spin_loop();
-    }
-    finish(0)
 }
 
 /// Wakes up to `wake` waiters on the futex word at `source` and moves up
@@ -443,7 +242,8 @@ pub(super) fn linux_futex_live_return(
     // A wait this call began before it restarted ends here: woken by
     // another process, or kept for its deadline if it waits again.
     let pid = current_linux_process_pid();
-    let earlier = take_linux_process_futex_wait(&mut LINUX_FUTEX_COORDINATION.lock(), pid)
+    let tid = current_linux_tid().unwrap_or(0);
+    let earlier = take_linux_process_futex_wait(&mut LINUX_FUTEX_COORDINATION.lock(), pid, tid)
         .filter(|wait| wait.address == address);
     if earlier.is_some_and(|wait| wait.woken) {
         return 0;
@@ -517,9 +317,6 @@ pub(super) fn linux_futex_live_return(
     // thread wait: the futex word was compared when the wait began.
     let mut compared = false;
     if target.is_none() && current_linux_runtime_cpu_index() == 0 {
-        if crate::arch::x86_64::smp::linux_runtime_thread_slot().is_some() {
-            return 0;
-        }
         // Another process may be the one to change the futex word, or to
         // wake it.
         let key;
@@ -536,6 +333,7 @@ pub(super) fn linux_futex_live_return(
             }
             waits.push(LinuxProcessFutexWait {
                 pid,
+                tid,
                 address,
                 key,
                 mask: wait_mask as u32,
@@ -559,7 +357,7 @@ pub(super) fn linux_futex_live_return(
                     let woken = LINUX_FUTEX_COORDINATION
                         .lock()
                         .iter()
-                        .any(|wait| wait.pid == pid && wait.woken);
+                        .any(|wait| wait.pid == pid && wait.tid == tid && wait.woken);
                     if woken {
                         break Some(0);
                     }
@@ -571,7 +369,7 @@ pub(super) fn linux_futex_live_return(
                 }
             }
         };
-        let wait = take_linux_process_futex_wait(&mut LINUX_FUTEX_COORDINATION.lock(), pid);
+        let wait = take_linux_process_futex_wait(&mut LINUX_FUTEX_COORDINATION.lock(), pid, tid);
         if let Some(result) = result {
             return result;
         }
@@ -583,17 +381,6 @@ pub(super) fn linux_futex_live_return(
             return 0;
         }
         compared = true;
-    }
-    if command == FUTEX_WAIT_BITSET
-        && current_linux_runtime_cpu_index() == 0
-        && crate::arch::x86_64::smp::linux_runtime_thread_slot().is_some()
-    {
-        // A remote application CPU can satisfy this wait concurrently. Linux
-        // permits a futex wait to return spuriously, so keep the coordinator's
-        // live syscall frame intact and let userspace recheck its predicate.
-        // Scheduler-backed switching from this coordinator frame is reserved
-        // for waits whose owner can be suspended and restored exactly.
-        return 0;
     }
     let coordination = LINUX_FUTEX_COORDINATION.lock();
     if !compared {

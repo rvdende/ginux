@@ -185,22 +185,9 @@ fn linux_syscall_dispatch(
     // a hint and selecting that same thread again has no observable effect.
     if number == LINUX_SCHED_YIELD_SYSCALL
         && fast_runtime_syscall
-        && current_linux_runtime_cpu_index() != 0
-        && current_linux_thread_slot() == crate::arch::x86_64::smp::linux_runtime_thread_slot()
+        && linux_light_thread_here().is_some()
     {
         return 0;
-    }
-    if number == LINUX_FUTEX_SYSCALL && fast_runtime_syscall {
-        let register = |index: usize| saved_registers.argument(index).unwrap_or(0);
-        if let Some(result) = linux_remote_futex_wait_fast(
-            register(5),
-            register(4),
-            register(3),
-            register(0),
-            register(1),
-        ) {
-            return result;
-        }
     }
     // Linux normally satisfies supported wall and monotonic clocks through
     // vDSO. Retain a guarded fast syscall fallback for CPU-time clocks and
@@ -215,6 +202,33 @@ fn linux_syscall_dispatch(
     if number == LINUX_PREEMPT_SYSCALL {
         if let Some(result) = linux_complete_timer_preemption(registers, user_rip) {
             return result;
+        }
+    }
+    // A thread on the light path: it leaves the CPU when its process ends,
+    // and calls the light path does not run go to the process's owner.
+    if let Some((bank, slot)) = linux_light_thread_here() {
+        if LINUX_BANK_DYING[bank].load(Ordering::Acquire)
+            || X86_RUNTIME.LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) != LINUX_THREAD_RUNNING
+        {
+            X86_RUNTIME
+                .LINUX_CURRENT_THREAD_SLOT
+                .store(LINUX_THREAD_SLOT_NONE, Ordering::SeqCst);
+            return LINUX_RETURN_TO_KERNEL;
+        }
+        if !linux_light_syscall_allowed(number, saved_registers)
+            || X86_RUNTIME.LINUX_SIGNAL_ACTIVE.load(Ordering::SeqCst)
+            || X86_RUNTIME.ELF_PROBE_PENDING_SIGNALS.load(Ordering::SeqCst) != 0
+            || current_container_slot().is_some_and(crate::linux_signal::any_pending)
+        {
+            let caller = LinuxUserContext {
+                registers: saved_registers,
+                rip: user_rip,
+                rsp: user_stack,
+                rflags: user_rflags,
+                rax: 0,
+                fs_base: active_fs_base(),
+            };
+            return migrate_current_linux_thread_to_owner(caller, number);
         }
     }
     if let Some(result) =
@@ -329,16 +343,6 @@ fn linux_syscall_dispatch(
         .LINUX_FSIZE_LIMIT_HIT
         .store(false, Ordering::SeqCst);
     let result = match number {
-        // A new process runs at once in place of its parent, which a thread
-        // of this process still running on another CPU must not see; the
-        // call starts again once that thread blocks or exits.
-        LINUX_FORK_SYSCALL | LINUX_VFORK_SYSCALL | LINUX_CLONE_SYSCALL | LINUX_CLONE3_SYSCALL
-            if runtime_mode
-                && linux_remote_thread_running()
-                && linux_syscall_creates_process(number, saved_registers.rdi, first_argument) =>
-        {
-            linux_restart_syscall_live_return(registers, syscall_return, number)
-        }
         LINUX_READ_SYSCALL | LINUX_WRITE_SYSCALL | LINUX_IOCTL_SYSCALL
             if linux_graphics_descriptor(first_argument).is_some() =>
         {
@@ -1971,7 +1975,7 @@ fn linux_syscall_dispatch(
         && result != LINUX_RETURN_TO_KERNEL
         && result != LINUX_RETURN_FROM_IRET
         && !X86_RUNTIME.LINUX_SIGNAL_ACTIVE.load(Ordering::Acquire)
-        && !linux_remote_thread_running()
+        && !linux_bank_shared()
         && X86_RUNTIME
             .LINUX_RUNTIME_BACKGROUND_YIELD_REQUESTED
             .swap(false, Ordering::AcqRel)

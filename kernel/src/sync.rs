@@ -37,7 +37,6 @@ impl LockRank {
     /// Open DRM render node files and dma-bufs; ranks below the heap so
     /// the tables may grow while held.
     pub(crate) const DRM: Self = Self(145);
-    pub(crate) const CROSS_CPU_DISPATCH: Self = Self(150);
     /// The record (fcntl) lock table; ranks below the heap so the table may
     /// grow while held.
     pub(crate) const RECORD_LOCKS: Self = Self(160);

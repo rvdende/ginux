@@ -17,6 +17,12 @@ const FAILURES: &[&str] = &[
     "invalid kernel-entry",
     "scheduled process return failed",
     "runtime child completion failed",
+    "thread run failed",
+    "light thread",
+    "no free process bank",
+    "no free idle bank",
+    "owned by two CPUs",
+    "did not leave",
 ];
 
 pub struct Guest {

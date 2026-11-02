@@ -152,7 +152,7 @@ pub(super) fn linux_rt_sigprocmask(how: u64, set: u64, old_set: u64, set_size: u
         }
         Some(u64::from_ne_bytes(bytes) & !LINUX_UNBLOCKABLE_SIGNALS)
     };
-    let current = X86_RUNTIME.ELF_PROBE_SIGNAL_MASK.load(Ordering::SeqCst);
+    let current = current_linux_signal_mask();
     let next = match requested {
         None => current,
         Some(mask) if how == LINUX_SIG_BLOCK => current | mask,
@@ -173,7 +173,7 @@ pub(super) fn linux_rt_sigpending(set: u64, set_size: u64) -> u64 {
     }
     let dynamic = linux_dynamic_pending_masks().map_or(0, |(process, thread)| process | thread);
     let pending = (X86_RUNTIME.ELF_PROBE_PENDING_SIGNALS.load(Ordering::SeqCst) | dynamic)
-        & X86_RUNTIME.ELF_PROBE_SIGNAL_MASK.load(Ordering::SeqCst);
+        & current_linux_signal_mask();
     if copy_to_linux_user(set, &pending.to_ne_bytes()) {
         0
     } else {
@@ -964,9 +964,7 @@ pub(crate) fn expire_linux_waits_from_timer(frame: &mut UserInterruptFrame) {
                 X86_RUNTIME.LINUX_THREAD_WAIT_KINDS[slot].load(Ordering::Acquire),
             ));
             serial_write("/");
-            serial_write_u64(u64::from(
-                crate::arch::x86_64::smp::linux_runtime_thread_is_remote(slot),
-            ));
+            serial_write_u64(u64::from(linux_thread_runs_elsewhere(slot)));
             serial_write("\r\n");
         }
         write_linux_runtime_syscall_trace();

@@ -33,8 +33,7 @@ pub(super) fn linux_clock_gettime(clock: u64, output_address: u64) -> u64 {
     // yet touched or shared copy-on-write is made writable by the full copy
     // (on the boot CPU, which may change page tables).
     if !address_space::copy_to_current_linux_user_fast(output_address, &timespec)
-        && (current_linux_runtime_cpu_index() != 0
-            || !copy_to_linux_user(output_address, &timespec))
+        && !copy_to_linux_user(output_address, &timespec)
     {
         return LINUX_EFAULT;
     }

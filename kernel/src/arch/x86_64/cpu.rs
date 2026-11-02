@@ -388,7 +388,7 @@ struct X86RuntimeOwner {
     LINUX_CONTROLLER_ROOT: RuntimeRef<AtomicU64>,
     LINUX_CROSS_PROCESS_PRLIMIT_VALIDATED: RuntimeRef<BankedAtomicBool>,
     LINUX_CURRENT_PROCESS_PID: RuntimeRef<CpuBankedAtomicU32>,
-    LINUX_CURRENT_THREAD_SLOT: RuntimeRef<CpuBankedAtomicU8>,
+    LINUX_CURRENT_THREAD_SLOT: RuntimeRef<ThreadCpuAtomicU8>,
     LINUX_DESCRIPTOR_WAITS_ACTIVE: RuntimeRef<CpuBankedAtomicBool>,
     LINUX_DOMAIN_EXEC_INJECT: RuntimeRef<AtomicBool>,
     LINUX_EPOLL_LAST_READY_DESCRIPTOR: RuntimeRef<BankedAtomicU64>,
@@ -439,7 +439,7 @@ struct X86RuntimeOwner {
     LINUX_IO_URING_REFS: RuntimeRef<BankedAtomicU16>,
     LINUX_IO_URING_SQES: RuntimeRef<BankedAtomicU64>,
     LINUX_IO_URING_SQ_RING: RuntimeRef<BankedAtomicU64>,
-    LINUX_LAST_PREEMPTED_THREAD_SLOT: RuntimeRef<CpuBankedAtomicU8>,
+    LINUX_LAST_PREEMPTED_THREAD_SLOT: RuntimeRef<ThreadCpuAtomicU8>,
     LINUX_LIVE_RETURN_VALIDATED: RuntimeRef<CpuBankedAtomicBool>,
     LINUX_MASKED_WAIT_INTERRUPT_COUNT: RuntimeRef<BankedAtomicU32>,
     LINUX_NEXT_OPEN_FILE_ID: RuntimeRef<BankedAtomicU64>,
@@ -495,7 +495,7 @@ struct X86RuntimeOwner {
     LINUX_RUNTIME_FIRST_UNSUPPORTED_SYSCALL: RuntimeRef<BankedAtomicU64>,
     LINUX_RUNTIME_LATE_DIAGNOSTIC_WRITTEN: RuntimeRef<BankedAtomicBool>,
     LINUX_RUNTIME_MODE: RuntimeRef<AtomicBool>,
-    LINUX_RUNTIME_PREEMPT_TICKS: RuntimeRef<CpuBankedAtomicU8>,
+    LINUX_RUNTIME_PREEMPT_TICKS: RuntimeRef<ThreadCpuAtomicU8>,
     LINUX_RUNTIME_SLOW_DIAGNOSTIC_WRITTEN: RuntimeRef<BankedAtomicBool>,
     LINUX_RUNTIME_STALLED_DIAGNOSTIC_WRITTEN: RuntimeRef<BankedAtomicBool>,
     LINUX_RUNTIME_SUSPENDED: RuntimeRef<BankedAtomicBool>,
@@ -567,6 +567,9 @@ struct X86RuntimeOwner {
     LINUX_THREAD_STACK_BASES: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
     LINUX_THREAD_STACK_SIZES: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
     LINUX_THREAD_STATES: RuntimeRef<[CpuBankedAtomicU8; LINUX_THREAD_LIMIT]>,
+    /// Per thread slot: the thread, ready, waits for the process's owner
+    /// to run it (its system call is not for the light path).
+    LINUX_THREAD_OWNER_ONLY: RuntimeRef<CpuBankedAtomicArray<AtomicU8, LINUX_THREAD_LIMIT>>,
     LINUX_THREAD_TIDS: RuntimeRef<[CpuBankedAtomicU32; LINUX_THREAD_LIMIT]>,
     LINUX_THREAD_TLS_EXTENTS: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
     LINUX_THREAD_TLS_SIZES: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
@@ -1131,6 +1134,7 @@ static X86_RUNTIME: X86RuntimeOwner = X86RuntimeOwner {
     LINUX_THREAD_STACK_BASES: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_THREAD_STACK_BASES),
     LINUX_THREAD_STACK_SIZES: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_THREAD_STACK_SIZES),
     LINUX_THREAD_STATES: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_THREAD_STATES),
+    LINUX_THREAD_OWNER_ONLY: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_THREAD_OWNER_ONLY),
     LINUX_THREAD_TIDS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_THREAD_TIDS),
     LINUX_THREAD_TLS_EXTENTS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_THREAD_TLS_EXTENTS),
     LINUX_THREAD_TLS_SIZES: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_THREAD_TLS_SIZES),
@@ -1235,18 +1239,416 @@ pub(crate) fn current_linux_execution_instance() -> usize {
     linux_execution_instance()
 }
 
-/// Banks of state each CPU keeps for itself in every execution instance:
-/// the running process's (its descriptors, threads, signal and address
-/// space state) and that of the fork or exec it is in. CPUs running
-/// different processes of one domain at once each have theirs; state the
-/// domain's processes share stays banked per instance only.
-const LINUX_CPU_BANK_LIMIT: usize = LINUX_RUNTIME_INSTANCE_LIMIT * CPU_ENTRY_STATE_LIMIT;
+/// Banks of per-process state: a running process's descriptors, threads,
+/// signal and address-space state, and that of the fork or exec it is in.
+/// A process live on any CPU has one bank, which every CPU running one of
+/// its threads uses (`linux_cpu_bank`); state the domain's processes share
+/// stays banked per instance only. A CPU with no process uses a bank of its
+/// own: the boot CPU has one per execution instance (a suspended domain's
+/// init stays in it), an application processor one. The spares are for CPUs
+/// whose own bank still holds a process other CPUs run threads of.
+const LINUX_BANK_SPARES: usize = CPU_ENTRY_STATE_LIMIT;
+const LINUX_CPU_BANK_LIMIT: usize =
+    LINUX_RUNTIME_INSTANCE_LIMIT + (CPU_ENTRY_STATE_LIMIT - 1) + LINUX_BANK_SPARES;
+const LINUX_BANK_NONE: u8 = u8::MAX;
 
-fn linux_cpu_bank() -> usize {
-    let cpu = current_cpu_index_checked()
+/// The bank CPU `cpu` has for itself in `instance`.
+const fn linux_own_bank(cpu: usize, instance: usize) -> usize {
+    if cpu == 0 {
+        instance
+    } else {
+        LINUX_RUNTIME_INSTANCE_LIMIT + cpu - 1
+    }
+}
+
+/// Per CPU and execution instance, the bank it uses: `LINUX_BANK_NONE` for
+/// its own (`linux_own_bank`), else a bank index.
+static LINUX_CPU_BANK: [[AtomicU8; LINUX_RUNTIME_INSTANCE_LIMIT]; CPU_ENTRY_STATE_LIMIT] =
+    [const { [const { AtomicU8::new(LINUX_BANK_NONE) }; LINUX_RUNTIME_INSTANCE_LIMIT] };
+        CPU_ENTRY_STATE_LIMIT];
+/// Per bank: the process it holds (0: none) and that process's instance.
+static LINUX_BANK_PID: [AtomicU32; LINUX_CPU_BANK_LIMIT] =
+    [const { AtomicU32::new(0) }; LINUX_CPU_BANK_LIMIT];
+static LINUX_BANK_INSTANCE: [AtomicU8; LINUX_CPU_BANK_LIMIT] =
+    [const { AtomicU8::new(0) }; LINUX_CPU_BANK_LIMIT];
+/// Per bank, the CPUs using it: those running threads of its process, or
+/// one idle CPU keeping a spare for itself.
+static LINUX_BANK_USERS: [AtomicU8; LINUX_CPU_BANK_LIMIT] =
+    [const { AtomicU8::new(0) }; LINUX_CPU_BANK_LIMIT];
+/// Per bank, whether a CPU owns its process: runs it as the registry
+/// dispatched it, with the process's own kernel activation.
+static LINUX_BANK_OWNED: [AtomicBool; LINUX_CPU_BANK_LIMIT] =
+    [const { AtomicBool::new(false) }; LINUX_CPU_BANK_LIMIT];
+/// Per bank, while no CPU owns its process: the thread slot whose context
+/// the registry holds, which only the next owner resumes.
+static LINUX_BANK_REGISTRY_THREAD: [AtomicU8; LINUX_CPU_BANK_LIMIT] =
+    [const { AtomicU8::new(LINUX_THREAD_SLOT_NONE) }; LINUX_CPU_BANK_LIMIT];
+/// Per bank, whether its process is exiting: threads of it on other CPUs
+/// leave them.
+static LINUX_BANK_DYING: [AtomicBool; LINUX_CPU_BANK_LIMIT] =
+    [const { AtomicBool::new(false) }; LINUX_CPU_BANK_LIMIT];
+/// Per bank, whether its process's saved record is the one a fork
+/// transaction staged (`stage_linux_fork_parent_runtime_state`): a save
+/// over it keeps what the staging set.
+static LINUX_BANK_STAGED: [AtomicBool; LINUX_CPU_BANK_LIMIT] =
+    [const { AtomicBool::new(false) }; LINUX_CPU_BANK_LIMIT];
+/// Saves of a process from a bank that held none or another: a bookkeeping
+/// error, counted for SysRq `u`.
+static LINUX_BANK_FOREIGN_SAVES: AtomicU32 = AtomicU32::new(0);
+/// Waits that could not park their process (reported for the first few).
+static LINUX_PARK_REFUSALS: AtomicU32 = AtomicU32::new(0);
+
+/// The fork transaction's state passes from the parent's bank to the child's
+/// and back, as it did while a CPU had one bank: what the parent set up for
+/// the child (which pid it tracks, whether its exec releases the parent) and
+/// what the child reports (exited, exec'd, yielded). Copied into a bank a
+/// process is restored into from the bank the CPU used before.
+fn copy_linux_bank_transients(from: usize, to: usize) {
+    macro_rules! copy {
+        ($($field:ident),* $(,)?) => {$(
+            X86_RUNTIME.$field.at_bank(to).store(
+                X86_RUNTIME.$field.at_bank(from).load(Ordering::SeqCst),
+                Ordering::SeqCst,
+            );
+        )*};
+    }
+    copy!(
+        LINUX_PROCESS_CHILD_EXITED,
+        LINUX_PROCESS_CHILD_EXECUTED,
+        LINUX_PROCESS_CHILD_YIELDED,
+        LINUX_PROCESS_CHILD_EXIT_PID,
+        LINUX_PROCESS_CHILD_EXEC_PID,
+        LINUX_PROCESS_CHILD_YIELD_PID,
+        LINUX_PROCESS_CHILD_STATUS,
+        LINUX_PROCESS_RELEASE_PARENT_ON_EXEC,
+        LINUX_FORK_REQUESTED,
+        LINUX_PROCESS_SCHEDULER_NESTING,
+        LINUX_PROCESS_LAST_BLOCKED_PID,
+        LINUX_DOMAIN_EXEC_DEPTH,
+        LINUX_PARENT_RESUMED,
+        LINUX_FORK_CHILD_STACK,
+        LINUX_FORK_SHARE_VM,
+        LINUX_FORK_NEW_MOUNT_NAMESPACE,
+        LINUX_FORK_NEW_USER_NAMESPACE,
+        LINUX_FORK_CGROUP_GENERATION,
+        LINUX_FORK_CHILD_TID_ADDRESS,
+        LINUX_FORK_PIDFD_ADDRESS,
+        LINUX_FORK_CLEAR_SIGHAND,
+    );
+}
+
+fn linux_bank_cpu() -> usize {
+    current_cpu_index_checked()
         .filter(|cpu| *cpu < CPU_ENTRY_STATE_LIMIT)
-        .unwrap_or(0);
-    cpu * LINUX_RUNTIME_INSTANCE_LIMIT + linux_execution_instance()
+        .unwrap_or(0)
+}
+
+/// The bank this CPU uses in the current execution instance.
+fn linux_cpu_bank() -> usize {
+    let cpu = linux_bank_cpu();
+    let instance = linux_execution_instance();
+    let bank = LINUX_CPU_BANK[cpu][instance].load(Ordering::Relaxed);
+    if bank == LINUX_BANK_NONE {
+        linux_own_bank(cpu, instance)
+    } else {
+        usize::from(bank)
+    }
+}
+
+/// This CPU's own bank, for the thread it runs (its current thread slot and
+/// preemption state), whichever process's bank it uses.
+fn linux_thread_cpu_bank() -> usize {
+    linux_own_bank(linux_bank_cpu(), linux_execution_instance())
+}
+
+fn linux_bank_holds(bank: usize, pid: u32, instance: usize) -> bool {
+    LINUX_BANK_PID[bank].load(Ordering::Acquire) == pid
+        && usize::from(LINUX_BANK_INSTANCE[bank].load(Ordering::Acquire)) == instance
+}
+
+/// The bank process `pid` of `instance` is live in: some CPU uses it.
+fn linux_live_process_bank(pid: u32, instance: usize) -> Option<usize> {
+    (0..LINUX_CPU_BANK_LIMIT).find(|bank| {
+        LINUX_BANK_USERS[*bank].load(Ordering::Acquire) != 0
+            && linux_bank_holds(*bank, pid, instance)
+    })
+}
+
+fn linux_bank_is_free(bank: usize) -> bool {
+    LINUX_BANK_PID[bank].load(Ordering::Acquire) == 0
+        && LINUX_BANK_USERS[bank].load(Ordering::Acquire) == 0
+}
+
+/// The spare banks.
+fn linux_spare_banks() -> core::ops::Range<usize> {
+    LINUX_RUNTIME_INSTANCE_LIMIT + CPU_ENTRY_STATE_LIMIT - 1..LINUX_CPU_BANK_LIMIT
+}
+
+fn linux_point_cpu_at_bank(cpu: usize, instance: usize, bank: usize) {
+    let value = if bank == linux_own_bank(cpu, instance) {
+        LINUX_BANK_NONE
+    } else {
+        bank as u8
+    };
+    LINUX_CPU_BANK[cpu][instance].store(value, Ordering::Release);
+}
+
+/// How a CPU came to use a process's bank.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BankAttach {
+    /// Other CPUs run its threads: the bank is the process's current state.
+    Live,
+    /// The caller fills it from the process's saved state.
+    Fresh,
+}
+
+/// Makes the bank of process `pid` (of this instance) this CPU's: the bank
+/// it is live in, or a free one. The bank this CPU used before is let go: a
+/// process the caller saved, or an idle reservation. `owner` for the CPU
+/// that runs the process as the registry dispatched it. None when no bank
+/// is free, or another CPU owns the process.
+fn attach_linux_process_bank(pid: u32, owner: bool) -> Option<BankAttach> {
+    let cpu = linux_bank_cpu();
+    let instance = linux_execution_instance();
+    let current = linux_cpu_bank();
+    // The same process again (a fork transaction restoring what it staged,
+    // a suspended runtime its init): it keeps its bank and is filled from
+    // its saved state unless other CPUs are in it.
+    if LINUX_BANK_USERS[current].load(Ordering::Acquire) != 0
+        && linux_bank_holds(current, pid, instance)
+    {
+        if owner {
+            LINUX_BANK_OWNED[current].store(true, Ordering::Release);
+            LINUX_BANK_REGISTRY_THREAD[current].store(LINUX_THREAD_SLOT_NONE, Ordering::Release);
+            LINUX_BANK_STAGED[current].store(false, Ordering::Release);
+        }
+        return Some(if LINUX_BANK_USERS[current].load(Ordering::Acquire) == 1 {
+            BankAttach::Fresh
+        } else {
+            BankAttach::Live
+        });
+    }
+    linux_release_current_bank(cpu, instance, true);
+    if let Some(bank) = linux_live_process_bank(pid, instance) {
+        if owner && LINUX_BANK_OWNED[bank].swap(true, Ordering::AcqRel) {
+            serial_write("ginux: process owned by two CPUs pid/cpu: ");
+            serial_write_u64(u64::from(pid));
+            serial_write(" ");
+            serial_write_u64(cpu as u64);
+            serial_write("\r\n");
+            linux_take_idle_bank(cpu, instance);
+            return None;
+        }
+        LINUX_BANK_USERS[bank].fetch_add(1, Ordering::AcqRel);
+        if owner {
+            LINUX_BANK_REGISTRY_THREAD[bank].store(LINUX_THREAD_SLOT_NONE, Ordering::Release);
+            LINUX_BANK_STAGED[bank].store(false, Ordering::Release);
+        }
+        linux_point_cpu_at_bank(cpu, instance, bank);
+        X86_RUNTIME
+            .LINUX_CURRENT_PROCESS_PID
+            .store(pid, Ordering::SeqCst);
+        return Some(BankAttach::Live);
+    }
+    let own = linux_own_bank(cpu, instance);
+    let Some(bank) = core::iter::once(own)
+        .chain(linux_spare_banks())
+        .find(|bank| linux_bank_is_free(*bank))
+    else {
+        serial_write("ginux: no free process bank pid/cpu: ");
+        serial_write_u64(u64::from(pid));
+        serial_write(" ");
+        serial_write_u64(cpu as u64);
+        serial_write("\r\n");
+        linux_take_idle_bank(cpu, instance);
+        return None;
+    };
+    LINUX_BANK_PID[bank].store(pid, Ordering::Release);
+    LINUX_BANK_INSTANCE[bank].store(instance as u8, Ordering::Release);
+    LINUX_BANK_USERS[bank].store(1, Ordering::Release);
+    LINUX_BANK_OWNED[bank].store(owner, Ordering::Release);
+    LINUX_BANK_DYING[bank].store(false, Ordering::Release);
+    LINUX_BANK_STAGED[bank].store(false, Ordering::Release);
+    LINUX_BANK_REGISTRY_THREAD[bank].store(LINUX_THREAD_SLOT_NONE, Ordering::Release);
+    if bank != current {
+        copy_linux_bank_transients(current, bank);
+    }
+    linux_point_cpu_at_bank(cpu, instance, bank);
+    // The bank may be another than the one the caller named the process
+    // current in.
+    X86_RUNTIME
+        .LINUX_CURRENT_PROCESS_PID
+        .store(pid, Ordering::SeqCst);
+    Some(BankAttach::Fresh)
+}
+
+/// Lets go of the bank this CPU uses: a process it leaves (saved before by
+/// the caller, or exiting) or a spare it kept while idle. The CPU is left
+/// pointing at its own bank, which may still hold a live process.
+fn linux_release_current_bank(cpu: usize, instance: usize, owner: bool) {
+    let bank = linux_cpu_bank();
+    let own = linux_own_bank(cpu, instance);
+    let pid = LINUX_BANK_PID[bank].load(Ordering::Acquire);
+    if pid != 0 && LINUX_BANK_USERS[bank].load(Ordering::Acquire) != 0 {
+        if owner && LINUX_BANK_OWNED[bank].swap(false, Ordering::AcqRel) {
+            LINUX_BANK_REGISTRY_THREAD[bank].store(
+                X86_RUNTIME.LINUX_CURRENT_THREAD_SLOT.load(Ordering::SeqCst),
+                Ordering::Release,
+            );
+        }
+        if LINUX_BANK_USERS[bank].fetch_sub(1, Ordering::AcqRel) == 1 {
+            LINUX_BANK_PID[bank].store(0, Ordering::Release);
+            LINUX_BANK_INSTANCE[bank].store(0, Ordering::Release);
+            LINUX_BANK_OWNED[bank].store(false, Ordering::Release);
+            LINUX_BANK_DYING[bank].store(false, Ordering::Release);
+        } else {
+            // A fork transaction names the child current before it
+            // restores it: the process's threads elsewhere keep seeing
+            // their own pid.
+            X86_RUNTIME
+                .LINUX_CURRENT_PROCESS_PID
+                .store(pid, Ordering::SeqCst);
+        }
+    } else if bank != own && pid == 0 && LINUX_BANK_USERS[bank].load(Ordering::Acquire) != 0 {
+        LINUX_BANK_USERS[bank].store(0, Ordering::Release);
+    }
+    LINUX_CPU_BANK[cpu][instance].store(LINUX_BANK_NONE, Ordering::Release);
+}
+
+/// Points an idle CPU at a bank holding no process: its own when free, else
+/// a spare it keeps until it attaches to a process.
+fn linux_take_idle_bank(cpu: usize, instance: usize) {
+    if linux_bank_is_free(linux_own_bank(cpu, instance)) {
+        LINUX_CPU_BANK[cpu][instance].store(LINUX_BANK_NONE, Ordering::Release);
+        return;
+    }
+    for bank in linux_spare_banks() {
+        if LINUX_BANK_PID[bank].load(Ordering::Acquire) == 0
+            && LINUX_BANK_USERS[bank]
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            LINUX_CPU_BANK[cpu][instance].store(bank as u8, Ordering::Release);
+            return;
+        }
+    }
+    serial_write("ginux: no free idle bank cpu: ");
+    serial_write_u64(cpu as u64);
+    serial_write("\r\n");
+    LINUX_CPU_BANK[cpu][instance].store(LINUX_BANK_NONE, Ordering::Release);
+}
+
+/// A CPU with no process to run leaves the bank of the one it ran (saved
+/// before, or settled after its exit; `owner` when it ran the process as
+/// the registry dispatched it) and takes an idle one.
+fn leave_linux_process_bank(owner: bool) {
+    let cpu = linux_bank_cpu();
+    let instance = linux_execution_instance();
+    linux_release_current_bank(cpu, instance, owner);
+    linux_take_idle_bank(cpu, instance);
+}
+
+/// Records that the bank this CPU uses holds process `pid`, when the
+/// process was set up in it directly (a domain's init) rather than
+/// restored into it.
+fn adopt_linux_process_bank(pid: u32) {
+    let bank = linux_cpu_bank();
+    if LINUX_BANK_PID[bank].load(Ordering::Acquire) == 0 {
+        LINUX_BANK_PID[bank].store(pid, Ordering::Release);
+        LINUX_BANK_INSTANCE[bank].store(linux_execution_instance() as u8, Ordering::Release);
+        LINUX_BANK_USERS[bank].store(1, Ordering::Release);
+        LINUX_BANK_OWNED[bank].store(true, Ordering::Release);
+        LINUX_BANK_DYING[bank].store(false, Ordering::Release);
+        LINUX_BANK_REGISTRY_THREAD[bank].store(LINUX_THREAD_SLOT_NONE, Ordering::Release);
+    }
+}
+
+/// Per CPU: threads run on the light path, calls put back for the owner,
+/// and the last such call's number (SysRq `u`).
+static LINUX_LIGHT_RUNS: [AtomicU32; CPU_ENTRY_STATE_LIMIT] =
+    [const { AtomicU32::new(0) }; CPU_ENTRY_STATE_LIMIT];
+static LINUX_LIGHT_MIGRATIONS: [AtomicU32; CPU_ENTRY_STATE_LIMIT] =
+    [const { AtomicU32::new(0) }; CPU_ENTRY_STATE_LIMIT];
+static LINUX_LIGHT_LAST_MIGRATION: [AtomicU32; CPU_ENTRY_STATE_LIMIT] =
+    [const { AtomicU32::new(0) }; CPU_ENTRY_STATE_LIMIT];
+
+/// SysRq `u`: the process banks in use and each CPU's light-path counts.
+fn linux_report_process_banks() {
+    serial_write("ginux: sysrq: banks bank/pid/instance/users/owned/registry-thread/dying:\r\n");
+    for bank in 0..LINUX_CPU_BANK_LIMIT {
+        if LINUX_BANK_USERS[bank].load(Ordering::Acquire) == 0
+            && LINUX_BANK_PID[bank].load(Ordering::Acquire) == 0
+        {
+            continue;
+        }
+        serial_write("ginux: bank ");
+        for value in [
+            bank as u64,
+            u64::from(LINUX_BANK_PID[bank].load(Ordering::Acquire)),
+            u64::from(LINUX_BANK_INSTANCE[bank].load(Ordering::Acquire)),
+            u64::from(LINUX_BANK_USERS[bank].load(Ordering::Acquire)),
+            u64::from(LINUX_BANK_OWNED[bank].load(Ordering::Acquire)),
+            u64::from(LINUX_BANK_REGISTRY_THREAD[bank].load(Ordering::Acquire)),
+            u64::from(LINUX_BANK_DYING[bank].load(Ordering::Acquire)),
+        ] {
+            serial_write_u64(value);
+            serial_write(" ");
+        }
+        serial_write("\r\n");
+    }
+    serial_write(
+        "ginux: sysrq: light threads cpu/bank/slot/runs/migrations/last-migrated-call/syscalls:\r\n",
+    );
+    for cpu in 0..CPU_ENTRY_STATE_LIMIT {
+        serial_write("ginux: cpu ");
+        for value in [
+            cpu as u64,
+            u64::from(LINUX_LIGHT_THREAD_BANK[cpu].load(Ordering::Acquire)),
+            u64::from(LINUX_LIGHT_THREAD_SLOT[cpu].load(Ordering::Acquire)),
+            u64::from(LINUX_LIGHT_RUNS[cpu].load(Ordering::Relaxed)),
+            u64::from(LINUX_LIGHT_MIGRATIONS[cpu].load(Ordering::Relaxed)),
+            u64::from(LINUX_LIGHT_LAST_MIGRATION[cpu].load(Ordering::Relaxed)),
+            linux_syscall::LINUX_SYSCALL_ENTRIES[cpu].load(Ordering::Relaxed),
+        ] {
+            serial_write_u64(value);
+            serial_write(" ");
+        }
+        serial_write("\r\n");
+    }
+    serial_write("ginux: sysrq: foreign saves ");
+    serial_write_u64(u64::from(LINUX_BANK_FOREIGN_SAVES.load(Ordering::Relaxed)));
+    serial_write("\r\n");
+}
+
+/// Whether CPUs other than this one use the bank this CPU uses.
+fn linux_bank_shared() -> bool {
+    LINUX_BANK_USERS[linux_cpu_bank()].load(Ordering::Acquire) > 1
+}
+
+/// Before the state of exiting process `pid` goes: its threads running on
+/// other CPUs leave them, told to by `LINUX_BANK_DYING` (their next system
+/// call or timer tick), while this CPU waits with the kernel-entry lock let
+/// go.
+fn wait_for_linux_process_threads_to_leave(pid: u32) {
+    let bank = linux_cpu_bank();
+    if !linux_bank_holds(bank, pid, linux_execution_instance()) || !linux_bank_shared() {
+        return;
+    }
+    LINUX_BANK_DYING[bank].store(true, Ordering::Release);
+    let started = timer::timestamp_counter();
+    while LINUX_BANK_USERS[bank].load(Ordering::Acquire) > 1 {
+        crate::sync::kernel_entry_leave_to_user();
+        core::hint::spin_loop();
+        crate::sync::kernel_entry_return_from_user();
+        if timer::timestamp_counter().wrapping_sub(started) > 20_000_000_000 {
+            serial_write("ginux: threads of exiting process did not leave pid/users: ");
+            serial_write_u64(u64::from(pid));
+            serial_write(" ");
+            serial_write_u64(u64::from(LINUX_BANK_USERS[bank].load(Ordering::Acquire)));
+            serial_write("\r\n");
+            break;
+        }
+    }
 }
 
 macro_rules! banked_atomic_integer {
@@ -1296,6 +1698,25 @@ macro_rules! banked_atomic_integer {
 
             fn load(&self, order: Ordering) -> $value {
                 self.current().load(order)
+            }
+
+            /// The value in bank `bank`, which need not be this CPU's.
+            fn at_bank(&self, bank: usize) -> &$atomic {
+                if self.states[bank].load(Ordering::Acquire) != 2 {
+                    let _ = self.current();
+                    if self.states[bank]
+                        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        self.values[bank].store(self.initial, Ordering::Relaxed);
+                        self.states[bank].store(2, Ordering::Release);
+                    } else {
+                        while self.states[bank].load(Ordering::Acquire) != 2 {
+                            core::hint::spin_loop();
+                        }
+                    }
+                }
+                &self.values[bank]
             }
 
             fn store(&self, value: $value, order: Ordering) {
@@ -1370,6 +1791,24 @@ macro_rules! banked_atomic_bool {
 
             fn load(&self, order: Ordering) -> bool {
                 self.current().load(order)
+            }
+
+            /// The value in bank `bank`, which need not be this CPU's.
+            fn at_bank(&self, bank: usize) -> &AtomicBool {
+                if self.states[bank].load(Ordering::Acquire) != 2 {
+                    if self.states[bank]
+                        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        self.values[bank].store(self.initial, Ordering::Relaxed);
+                        self.states[bank].store(2, Ordering::Release);
+                    } else {
+                        while self.states[bank].load(Ordering::Acquire) != 2 {
+                            core::hint::spin_loop();
+                        }
+                    }
+                }
+                &self.values[bank]
             }
 
             fn store(&self, value: bool, order: Ordering) {
@@ -1470,6 +1909,13 @@ impl<A, const N: usize> core::ops::Deref for CpuBankedAtomicArray<A, N> {
     }
 }
 
+impl<A, const N: usize> CpuBankedAtomicArray<A, N> {
+    /// The table of bank `bank`, which need not be this CPU's.
+    fn at_bank(&self, bank: usize) -> &[A; N] {
+        &self.0[bank]
+    }
+}
+
 impl<'a, A, const N: usize> IntoIterator for &'a RuntimeRef<CpuBankedAtomicArray<A, N>> {
     type Item = &'a A;
     type IntoIter = core::slice::Iter<'a, A>;
@@ -1519,6 +1965,13 @@ banked_atomic_integer!(
     linux_cpu_bank
 );
 banked_atomic_integer!(
+    ThreadCpuAtomicU8,
+    AtomicU8,
+    u8,
+    LINUX_CPU_BANK_LIMIT,
+    linux_thread_cpu_bank
+);
+banked_atomic_integer!(
     CpuBankedAtomicU16,
     AtomicU16,
     u16,
@@ -1547,11 +2000,557 @@ banked_atomic_integer!(
 /// boot CPU runs.
 fn current_linux_runtime_cpu_index() -> usize {
     let cpu = current_cpu_index_checked().unwrap_or(0);
-    if cpu < CPU_ENTRY_STATE_LIMIT && LINUX_SMP_LOOP_ACTIVE[cpu].load(Ordering::Acquire) {
+    if cpu < CPU_ENTRY_STATE_LIMIT
+        && LINUX_SMP_LOOP_ACTIVE[cpu].load(Ordering::Acquire)
+        && LINUX_LIGHT_THREAD_BANK[cpu].load(Ordering::Acquire) == LINUX_BANK_NONE
+    {
         0
     } else {
         cpu
     }
+}
+
+/// Per CPU of a domain runtime's loop: the bank and thread slot of the
+/// thread it runs on the light path (`run_linux_light_thread`): a thread
+/// of a process another CPU owns, or none owns. `LINUX_BANK_NONE` while the
+/// CPU runs a process as the registry dispatched it, or nothing.
+static LINUX_LIGHT_THREAD_BANK: [AtomicU8; CPU_ENTRY_STATE_LIMIT] =
+    [const { AtomicU8::new(LINUX_BANK_NONE) }; CPU_ENTRY_STATE_LIMIT];
+static LINUX_LIGHT_THREAD_SLOT: [AtomicU8; CPU_ENTRY_STATE_LIMIT] =
+    [const { AtomicU8::new(LINUX_THREAD_SLOT_NONE) }; CPU_ENTRY_STATE_LIMIT];
+/// Per CPU: its light thread left the CPU on purpose (preempted, kept for
+/// the owner, or blocked), so the loop looks for other work before it.
+static LINUX_LIGHT_THREAD_YIELDED: [AtomicBool; CPU_ENTRY_STATE_LIMIT] =
+    [const { AtomicBool::new(false) }; CPU_ENTRY_STATE_LIMIT];
+
+/// The bank and thread slot of the light thread this CPU runs, if any.
+fn linux_light_thread_here() -> Option<(usize, usize)> {
+    let cpu = current_cpu_index_checked().filter(|cpu| *cpu < CPU_ENTRY_STATE_LIMIT)?;
+    let bank = LINUX_LIGHT_THREAD_BANK[cpu].load(Ordering::Acquire);
+    (bank != LINUX_BANK_NONE).then(|| {
+        (
+            usize::from(bank),
+            usize::from(LINUX_LIGHT_THREAD_SLOT[cpu].load(Ordering::Acquire)),
+        )
+    })
+}
+
+/// Whether another CPU runs thread `slot` of this CPU's process.
+fn linux_thread_runs_elsewhere(slot: usize) -> bool {
+    let here = linux_bank_cpu();
+    let bank = linux_cpu_bank();
+    (0..CPU_ENTRY_STATE_LIMIT).any(|cpu| {
+        cpu != here
+            && usize::from(LINUX_LIGHT_THREAD_BANK[cpu].load(Ordering::Acquire)) == bank
+            && usize::from(LINUX_LIGHT_THREAD_SLOT[cpu].load(Ordering::Acquire)) == slot
+    })
+}
+
+/// The next thread an idle CPU of the loop can run on the light path, after
+/// `cursor` (a bank and slot index, for a round robin): in a live bank of
+/// this instance whose process is not exiting, ready, not kept for the
+/// owner, and not the thread whose context the registry holds.
+fn pick_linux_light_thread(cursor: &mut usize) -> Option<(usize, usize)> {
+    let instance = linux_execution_instance();
+    let total = LINUX_CPU_BANK_LIMIT * LINUX_THREAD_LIMIT;
+    for step in 1..=total {
+        let index = (*cursor + step) % total;
+        let (bank, slot) = (index / LINUX_THREAD_LIMIT, index % LINUX_THREAD_LIMIT);
+        if LINUX_BANK_USERS[bank].load(Ordering::Acquire) == 0
+            || LINUX_BANK_PID[bank].load(Ordering::Acquire) == 0
+            || usize::from(LINUX_BANK_INSTANCE[bank].load(Ordering::Acquire)) != instance
+            || LINUX_BANK_DYING[bank].load(Ordering::Acquire)
+            || usize::from(LINUX_BANK_REGISTRY_THREAD[bank].load(Ordering::Acquire)) == slot
+            || X86_RUNTIME.LINUX_THREAD_STATES[slot]
+                .at_bank(bank)
+                .load(Ordering::Acquire)
+                != LINUX_THREAD_READY
+            || X86_RUNTIME.LINUX_THREAD_OWNER_ONLY.at_bank(bank)[slot].load(Ordering::Acquire) != 0
+        {
+            continue;
+        }
+        *cursor = index;
+        return Some((bank, slot));
+    }
+    None
+}
+
+/// Runs thread `slot` of the process live in `bank` on this CPU of the
+/// runtime's loop, which runs nothing, until it blocks, is preempted, is
+/// kept for the owner, or exits. Its process's bank is this CPU's
+/// meanwhile; the thread's state goes to the saved record when it leaves,
+/// and the whole process's when this was the last CPU in the bank.
+fn run_linux_light_thread(cpu: usize, bank: usize, slot: usize) -> bool {
+    let instance = linux_execution_instance();
+    let pid = LINUX_BANK_PID[bank].load(Ordering::Acquire);
+    if pid == 0 {
+        return false;
+    }
+    LINUX_BANK_USERS[bank].fetch_add(1, Ordering::AcqRel);
+    linux_release_current_bank(cpu, instance, false);
+    linux_point_cpu_at_bank(cpu, instance, bank);
+    LINUX_LIGHT_RUNS[cpu].fetch_add(1, Ordering::Relaxed);
+    LINUX_LIGHT_THREAD_SLOT[cpu].store(slot as u8, Ordering::Release);
+    LINUX_LIGHT_THREAD_BANK[cpu].store(bank as u8, Ordering::Release);
+    LINUX_LIGHT_THREAD_YIELDED[cpu].store(false, Ordering::Release);
+    X86_RUNTIME
+        .LINUX_CURRENT_THREAD_SLOT
+        .store(LINUX_THREAD_SLOT_NONE, Ordering::SeqCst);
+    LINUX_PROCESS_SLICE[cpu].store(0, Ordering::SeqCst);
+    linux_process::start_live_process_cpu(timer::timestamp_counter());
+    let ran = run_linux_light_thread_here(cpu, bank, pid, slot);
+    if !ran {
+        // Not run: left to the owner rather than tried again at once.
+        X86_RUNTIME.LINUX_THREAD_OWNER_ONLY[slot].store(1, Ordering::SeqCst);
+    }
+    linux_process::charge_live_process_cpu(pid, timer::timestamp_counter());
+    LINUX_LIGHT_THREAD_BANK[cpu].store(LINUX_BANK_NONE, Ordering::Release);
+    LINUX_LIGHT_THREAD_SLOT[cpu].store(LINUX_THREAD_SLOT_NONE, Ordering::Release);
+    X86_RUNTIME
+        .LINUX_CURRENT_THREAD_SLOT
+        .store(LINUX_THREAD_SLOT_NONE, Ordering::SeqCst);
+    let live = linux_process::live_process_status(pid)
+        .is_some_and(|status| status.state != linux_process::LiveProcessState::Zombie);
+    if live && !LINUX_BANK_DYING[bank].load(Ordering::Acquire) {
+        if LINUX_BANK_USERS[bank].load(Ordering::Acquire) == 1 {
+            // The last CPU in the bank: the saved state becomes the
+            // process's state, as the owner's save makes it. A record a
+            // fork transaction staged keeps what the staging set, and its
+            // descriptors stay retained.
+            let registry_thread = LINUX_BANK_REGISTRY_THREAD[bank].load(Ordering::Acquire);
+            let staged = LINUX_BANK_STAGED[bank].load(Ordering::Acquire);
+            if let (Some(mut state), Some(destination)) = (
+                capture_linux_process_runtime_state_for(registry_thread),
+                linux_process_runtime_state(pid),
+            ) {
+                if staged {
+                    state.active = true;
+                    state.completed = false;
+                    state.exit_status = 0;
+                    state.termination_signal = 0;
+                    if retain_linux_descriptor_runtime_state(&state.descriptors) {
+                        release_linux_descriptor_runtime_state(&destination.descriptors);
+                    }
+                }
+                *destination = state;
+            }
+        } else if let Some(threads) = linux_process_thread_runtime_state(pid) {
+            threads[slot] = capture_linux_thread_runtime_state(slot);
+        }
+    }
+    leave_linux_process_bank(false);
+    ran
+}
+
+/// `run_linux_light_thread` with the bank attached.
+fn run_linux_light_thread_here(cpu: usize, bank: usize, pid: u32, slot: usize) -> bool {
+    let Some(root) = linux_process::live_process_root(pid) else {
+        return false;
+    };
+    loop {
+        let kernel_entry = crate::sync::kernel_entry_lock();
+        if LINUX_BANK_DYING[bank].load(Ordering::Acquire) {
+            return true;
+        }
+        let Some(handle) = linux_thread_handle(slot) else {
+            return true;
+        };
+        if X86_RUNTIME.LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) != LINUX_THREAD_READY {
+            return true;
+        }
+        let Some(context) = linux_thread_return_context(handle) else {
+            return false;
+        };
+        if !switch_linux_thread(handle) {
+            return false;
+        }
+        let Some(general) = linux_thread_resume_general(handle, context) else {
+            return false;
+        };
+        X86_RUNTIME.LINUX_THREAD_OWNER_ONLY[slot].store(0, Ordering::SeqCst);
+        LINUX_LIGHT_THREAD_YIELDED[cpu].store(false, Ordering::Release);
+        let entered = address_space::resume_live_linux_process(
+            root,
+            context.rip,
+            context.rsp,
+            context.fs_base,
+            general,
+            context.rflags,
+        );
+        if !entered {
+            // Not entered: the thread is as it was, ready.
+            X86_RUNTIME.LINUX_THREAD_STATES[slot].store(LINUX_THREAD_READY, Ordering::SeqCst);
+            X86_RUNTIME
+                .LINUX_CURRENT_THREAD_SLOT
+                .store(LINUX_THREAD_SLOT_NONE, Ordering::SeqCst);
+            serial_write("ginux: light thread entry failed pid/slot/cpu: ");
+            serial_write_u64(u64::from(pid));
+            serial_write(" ");
+            serial_write_u64(slot as u64);
+            serial_write(" ");
+            serial_write_u64(cpu as u64);
+            serial_write("\r\n");
+            return false;
+        }
+        // The thread left the CPU: blocked, exited, preempted, kept for
+        // the owner, or woken again already.
+        let state = X86_RUNTIME.LINUX_THREAD_STATES[slot].load(Ordering::SeqCst);
+        if state == LINUX_THREAD_RUNNING {
+            // Returned to the kernel without leaving the thread: its
+            // process is ending (nothing of its context is needed) or a
+            // kernel error dropped it.
+            X86_RUNTIME
+                .LINUX_CURRENT_THREAD_SLOT
+                .store(LINUX_THREAD_SLOT_NONE, Ordering::SeqCst);
+            if LINUX_BANK_DYING[bank].load(Ordering::Acquire)
+                || !X86_RUNTIME.ELF_PROBE_ACTIVE.load(Ordering::SeqCst)
+            {
+                return true;
+            }
+            serial_write("ginux: light thread dropped pid/slot/cpu: ");
+            serial_write_u64(u64::from(pid));
+            serial_write(" ");
+            serial_write_u64(slot as u64);
+            serial_write(" ");
+            serial_write_u64(cpu as u64);
+            serial_write("\r\n");
+            return false;
+        }
+        drop(kernel_entry);
+        if state == LINUX_THREAD_READY && !LINUX_LIGHT_THREAD_YIELDED[cpu].load(Ordering::Acquire) {
+            continue;
+        }
+        return true;
+    }
+}
+
+/// The light thread on this CPU leaves it, with `context` to go on from
+/// later: kept for the process's owner (`owner_only`: a system call only
+/// the owner's path runs), else for any CPU of the loop.
+fn park_linux_light_thread(
+    handle: LinuxThreadHandle,
+    context: LinuxUserContext,
+    owner_only: bool,
+) -> u64 {
+    let Some(cpu) = current_cpu_index_checked().filter(|cpu| *cpu < CPU_ENTRY_STATE_LIMIT) else {
+        return LINUX_EINVAL;
+    };
+    let slot = usize::from(handle.slot);
+    if !save_linux_thread_return_context(handle, context) {
+        serial_write("ginux: light thread context rejected pid/slot/rip/rsp: ");
+        for value in [
+            u64::from(current_linux_process_pid()),
+            slot as u64,
+            context.rip,
+            context.rsp,
+        ] {
+            serial_write_u64(value);
+            serial_write(" ");
+        }
+        serial_write("\r\n");
+        return LINUX_EINVAL;
+    }
+    let _ = save_linux_thread_extended_state(current_linux_process_pid(), slot);
+    X86_RUNTIME.LINUX_THREAD_OWNER_ONLY[slot].store(u8::from(owner_only), Ordering::SeqCst);
+    X86_RUNTIME.LINUX_THREAD_STATES[slot].store(LINUX_THREAD_READY, Ordering::SeqCst);
+    X86_RUNTIME
+        .LINUX_CURRENT_THREAD_SLOT
+        .store(LINUX_THREAD_SLOT_NONE, Ordering::SeqCst);
+    LINUX_LIGHT_THREAD_YIELDED[cpu].store(true, Ordering::Release);
+    LINUX_RETURN_TO_KERNEL
+}
+
+/// `park_linux_light_thread` with the exact registers the timer or a fault
+/// interrupted the thread at (rcx and r11 live, not a system call's).
+fn park_linux_light_thread_exact(
+    handle: LinuxThreadHandle,
+    general: [u64; 15],
+    rip: u64,
+    rsp: u64,
+    rflags: u64,
+    owner_only: bool,
+) -> u64 {
+    let context = LinuxUserContext {
+        registers: LinuxSyscallFrame {
+            r15: general[14],
+            r14: general[13],
+            r13: general[12],
+            r12: general[11],
+            rbp: general[6],
+            rbx: general[1],
+            r10: general[9],
+            r9: general[8],
+            r8: general[7],
+            rdx: general[3],
+            rsi: general[4],
+            rdi: general[5],
+        },
+        rip,
+        rsp,
+        rflags,
+        rax: general[0],
+        fs_base: active_fs_base(),
+    };
+    let result = park_linux_light_thread(handle, context, owner_only);
+    if result == LINUX_RETURN_TO_KERNEL {
+        let slot = usize::from(handle.slot);
+        X86_RUNTIME.LINUX_THREAD_RCXS[slot].store(general[2], Ordering::SeqCst);
+        X86_RUNTIME.LINUX_THREAD_R11S[slot].store(general[10], Ordering::SeqCst);
+    }
+    result
+}
+
+/// A system call the light path does not run: the thread's call is put back
+/// for the process's owner, which runs it as the registry dispatched the
+/// process (process creation, exec, exit of the process, waits for children
+/// and the descriptor waits that run other processes meanwhile, signals).
+fn migrate_current_linux_thread_to_owner(caller: LinuxUserContext, number: u64) -> u64 {
+    let Some((_, slot)) = linux_light_thread_here() else {
+        return LINUX_EINVAL;
+    };
+    if let Some(cpu) = current_cpu_index_checked().filter(|cpu| *cpu < CPU_ENTRY_STATE_LIMIT) {
+        LINUX_LIGHT_MIGRATIONS[cpu].fetch_add(1, Ordering::Relaxed);
+        LINUX_LIGHT_LAST_MIGRATION[cpu].store(number as u32, Ordering::Relaxed);
+    }
+    let Some(handle) = linux_thread_handle(slot) else {
+        return LINUX_RETURN_TO_KERNEL;
+    };
+    let mut restart = caller;
+    restart.rip = caller.rip.wrapping_sub(LINUX_SYSCALL_INSTRUCTION_SIZE);
+    restart.rax = number;
+    park_linux_light_thread(handle, restart, true)
+}
+
+/// Whether the light path runs system call `number` itself. The rest go to
+/// the owner (`migrate_current_linux_thread_to_owner`): calls that create
+/// or replace the process, end it, wait for its children, deliver or wait
+/// for signals, change its identity or namespaces, or wait for descriptors
+/// by running other processes meanwhile.
+fn linux_light_syscall_allowed(number: u64, registers: LinuxSyscallFrame) -> bool {
+    if matches!(
+        number,
+        LINUX_FORK_SYSCALL
+            | LINUX_VFORK_SYSCALL
+            | LINUX_EXECVE_SYSCALL
+            | LINUX_EXECVEAT_SYSCALL
+            | LINUX_EXIT_GROUP_SYSCALL
+            | LINUX_WAIT4_SYSCALL
+            | LINUX_WAITID_SYSCALL
+            | LINUX_KILL_SYSCALL
+            | LINUX_TKILL_SYSCALL
+            | LINUX_TGKILL_SYSCALL
+            | LINUX_RT_SIGQUEUEINFO_SYSCALL
+            | LINUX_RT_TGSIGQUEUEINFO_SYSCALL
+            | LINUX_PIDFD_SEND_SIGNAL_SYSCALL
+            | LINUX_RT_SIGRETURN_SYSCALL
+            | LINUX_RT_SIGSUSPEND_SYSCALL
+            | LINUX_RT_SIGTIMEDWAIT_SYSCALL
+            | LINUX_PAUSE_SYSCALL
+            | LINUX_SIGNALFD_SYSCALL
+            | LINUX_SIGNALFD4_SYSCALL
+            | LINUX_POLL_SYSCALL
+            | LINUX_PPOLL_SYSCALL
+            | LINUX_SELECT_SYSCALL
+            | LINUX_PSELECT6_SYSCALL
+            | LINUX_EPOLL_WAIT_SYSCALL
+            | LINUX_EPOLL_PWAIT_SYSCALL
+            | LINUX_EPOLL_PWAIT2_SYSCALL
+            | LINUX_NANOSLEEP_SYSCALL
+            | LINUX_CLOCK_NANOSLEEP_SYSCALL
+            | LINUX_SETSID_SYSCALL
+            | LINUX_SETPGID_SYSCALL
+            | LINUX_SETUID_SYSCALL
+            | LINUX_SETGID_SYSCALL
+            | LINUX_SETREUID_SYSCALL
+            | LINUX_SETREGID_SYSCALL
+            | LINUX_SETRESUID_SYSCALL
+            | LINUX_SETRESGID_SYSCALL
+            | LINUX_SETFSUID_SYSCALL
+            | LINUX_SETFSGID_SYSCALL
+            | LINUX_SETGROUPS_SYSCALL
+            | LINUX_CAPSET_SYSCALL
+            | LINUX_UNSHARE_SYSCALL
+            | LINUX_SETNS_SYSCALL
+            | LINUX_MOUNT_SYSCALL
+            | LINUX_UMOUNT2_SYSCALL
+            | LINUX_CHROOT_SYSCALL
+            | LINUX_PIVOT_ROOT_SYSCALL
+            | LINUX_PTRACE_SYSCALL
+            | LINUX_REBOOT_SYSCALL
+            | LINUX_SECCOMP_SYSCALL
+            | LINUX_PERSONALITY_SYSCALL
+            | LINUX_VHANGUP_SYSCALL
+            | LINUX_PROCESS_VM_READV_SYSCALL
+            | LINUX_PROCESS_VM_WRITEV_SYSCALL
+            | LINUX_PIDFD_OPEN_SYSCALL
+            | LINUX_PIDFD_GETFD_SYSCALL
+    ) {
+        return false;
+    }
+    !linux_syscall_creates_process(number, registers.rdi, registers.rdi)
+}
+
+/// A light thread's fatal fault: `signal` goes to the process, which the
+/// owner delivers (a handler, or the end of the process); the thread is
+/// kept for the owner at the faulting instruction.
+fn fault_linux_light_thread(
+    frame: &UserFaultFrame,
+    fault: domain::FaultMetadata,
+    signal: u64,
+) -> u64 {
+    let Some((_, slot)) = linux_light_thread_here() else {
+        return u64::MAX;
+    };
+    let pid = current_linux_process_pid();
+    let _ = linux_queue_process_signal(pid, signal, LINUX_SI_KERNEL, Some(fault.address));
+    let Some(handle) = linux_thread_handle(slot) else {
+        return u64::MAX;
+    };
+    let context = frame.context();
+    let _ = park_linux_light_thread_exact(
+        handle,
+        [
+            context.rax,
+            context.rbx,
+            context.rcx,
+            context.rdx,
+            context.rsi,
+            context.rdi,
+            context.rbp,
+            context.r8,
+            context.r9,
+            context.r10,
+            context.r11,
+            context.r12,
+            context.r13,
+            context.r14,
+            context.r15,
+        ],
+        context.rip,
+        context.rsp,
+        context.rflags,
+        true,
+    );
+    u64::MAX
+}
+
+/// On a light thread's CPU the timer ends its slice (or the process is
+/// exiting): the thread goes to the vDSO's preemption entry, whose system
+/// call saves its exact context and lets the CPU look for other work.
+fn linux_preempt_light_thread_from_timer(cpu: usize, bank: usize, frame: &mut UserInterruptFrame) {
+    let Some(context) = frame.user_context(USER_CODE_SELECTOR, USER_DATA_SELECTOR) else {
+        return;
+    };
+    let ticks = LINUX_PROCESS_SLICE[cpu].fetch_add(1, Ordering::SeqCst) + 1;
+    let dying = LINUX_BANK_DYING[bank].load(Ordering::Acquire);
+    if ticks < LINUX_PROCESS_SLICE_TICKS && !dying {
+        return;
+    }
+    let Some(entry) = crate::linux_elf::vdso_preempt_entry() else {
+        return;
+    };
+    if (entry..entry + 9).contains(&context.rip) {
+        return;
+    }
+    let preempted = LinuxPreemptedContext {
+        pid: current_linux_process_pid(),
+        general: [
+            context.rax,
+            context.rbx,
+            context.rcx,
+            context.rdx,
+            context.rsi,
+            context.rdi,
+            context.rbp,
+            context.r8,
+            context.r9,
+            context.r10,
+            context.r11,
+            context.r12,
+            context.r13,
+            context.r14,
+            context.r15,
+        ],
+        rip: context.rip,
+        rsp: context.rsp,
+        rflags: context.rflags,
+        signal: false,
+    };
+    let mut redirected = context;
+    redirected.rip = entry;
+    if frame.restore_user_context(redirected, USER_CODE_SELECTOR, USER_DATA_SELECTOR) {
+        *LINUX_PREEMPTED_CONTEXT[cpu].lock() = Some(preempted);
+        LINUX_PROCESS_SLICE[cpu].store(0, Ordering::SeqCst);
+    }
+}
+
+/// Timed futex and sleep waits of threads in live banks this CPU is not
+/// in: their deadlines pass while no CPU of their process makes a system
+/// call (a process whose owner is away and whose other threads block).
+fn expire_linux_light_waits() -> u32 {
+    let instance = linux_execution_instance();
+    let mut expired = 0;
+    let Some(now) = linux_elapsed_nanoseconds() else {
+        return 0;
+    };
+    for bank in 0..LINUX_CPU_BANK_LIMIT {
+        if LINUX_BANK_USERS[bank].load(Ordering::Acquire) == 0
+            || LINUX_BANK_PID[bank].load(Ordering::Acquire) == 0
+            || usize::from(LINUX_BANK_INSTANCE[bank].load(Ordering::Acquire)) != instance
+            || LINUX_BANK_DYING[bank].load(Ordering::Acquire)
+            || !X86_RUNTIME
+                .LINUX_TIMED_WAITS_ACTIVE
+                .at_bank(bank)
+                .load(Ordering::Acquire)
+        {
+            continue;
+        }
+        for slot in 0..LINUX_THREAD_LIMIT {
+            let deadline = X86_RUNTIME.LINUX_THREAD_WAIT_DEADLINES[slot]
+                .at_bank(bank)
+                .load(Ordering::SeqCst);
+            if deadline == 0
+                || now < deadline
+                || X86_RUNTIME.LINUX_THREAD_STATES[slot]
+                    .at_bank(bank)
+                    .load(Ordering::SeqCst)
+                    != LINUX_THREAD_BLOCKED
+            {
+                continue;
+            }
+            let result = match X86_RUNTIME.LINUX_THREAD_WAIT_KINDS[slot]
+                .at_bank(bank)
+                .load(Ordering::SeqCst)
+            {
+                LINUX_THREAD_WAIT_FUTEX => LINUX_ETIMEDOUT,
+                LINUX_THREAD_WAIT_SLEEP => 0,
+                LINUX_THREAD_WAIT_RETRY => X86_RUNTIME.LINUX_THREAD_WAIT_KEYS[slot]
+                    .at_bank(bank)
+                    .load(Ordering::SeqCst),
+                _ => continue,
+            };
+            X86_RUNTIME.LINUX_THREAD_RAXS[slot]
+                .at_bank(bank)
+                .store(result, Ordering::SeqCst);
+            X86_RUNTIME.LINUX_THREAD_WAIT_KINDS[slot]
+                .at_bank(bank)
+                .store(LINUX_THREAD_WAIT_NONE, Ordering::SeqCst);
+            X86_RUNTIME.LINUX_THREAD_WAIT_KEYS[slot]
+                .at_bank(bank)
+                .store(0, Ordering::SeqCst);
+            X86_RUNTIME.LINUX_THREAD_WAIT_OUTPUTS[slot]
+                .at_bank(bank)
+                .store(0, Ordering::SeqCst);
+            X86_RUNTIME.LINUX_THREAD_WAIT_DEADLINES[slot]
+                .at_bank(bank)
+                .store(0, Ordering::SeqCst);
+            X86_RUNTIME.LINUX_THREAD_STATES[slot]
+                .at_bank(bank)
+                .store(LINUX_THREAD_READY, Ordering::SeqCst);
+            expired += 1;
+        }
+    }
+    expired
 }
 
 /// The domain instance, plus one, whose runtime lets the other CPUs it was
@@ -1629,6 +2628,7 @@ pub(crate) fn run_application_processor_runtime(cpu: usize) {
     let ticking = timer::arm_linux_cpu_tick();
     drop(guard);
     let mut after = 0;
+    let mut thread_cursor = 0;
     let mut idle_ticks = LINUX_SMP_IDLE_SPIN_TICKS;
     loop {
         let guard = crate::sync::kernel_entry_lock();
@@ -1637,6 +2637,22 @@ pub(crate) fn run_application_processor_runtime(cpu: usize) {
             || X86_RUNTIME.LINUX_RUNTIME_SUSPENDED.load(Ordering::Acquire)
         {
             break;
+        }
+        let _ = expire_linux_light_waits();
+        if let Some((bank, slot)) = pick_linux_light_thread(&mut thread_cursor) {
+            idle_ticks = LINUX_SMP_IDLE_SPIN_TICKS;
+            crate::cpu_time::add_run();
+            if !run_linux_light_thread(cpu, bank, slot) {
+                serial_write("ginux: application processor thread run failed cpu/bank/slot: ");
+                serial_write_u64(cpu as u64);
+                serial_write(" ");
+                serial_write_u64(bank as u64);
+                serial_write(" ");
+                serial_write_u64(slot as u64);
+                serial_write("\r\n");
+            }
+            drop(guard);
+            continue;
         }
         let picked = linux_process::ready_live_process_after(after, |pid| {
             pid != 1
@@ -1751,6 +2767,7 @@ fn run_linux_process_on_this_cpu(pid: u32) -> bool {
         Some(status) => settle_linux_process_exit(pid, status),
         None => linux_process::release_live_process(pid),
     };
+    leave_linux_process_bank(true);
     X86_RUNTIME
         .LINUX_CURRENT_PROCESS_PID
         .store(0, Ordering::SeqCst);
@@ -2035,8 +3052,8 @@ static X86_RUNTIME_BACKING_LINUX_CLONE_REUSE_VALIDATED: BankedAtomicBool =
     BankedAtomicBool::new(false);
 static X86_RUNTIME_BACKING_LINUX_CHILD_GETTID_COUNT: BankedAtomicU32 = BankedAtomicU32::new(0);
 static X86_RUNTIME_BACKING_LINUX_YIELD_SWITCH_COUNT: BankedAtomicU32 = BankedAtomicU32::new(0);
-static X86_RUNTIME_BACKING_LINUX_LAST_PREEMPTED_THREAD_SLOT: CpuBankedAtomicU8 =
-    CpuBankedAtomicU8::new(LINUX_THREAD_SLOT_NONE);
+static X86_RUNTIME_BACKING_LINUX_LAST_PREEMPTED_THREAD_SLOT: ThreadCpuAtomicU8 =
+    ThreadCpuAtomicU8::new(LINUX_THREAD_SLOT_NONE);
 static X86_RUNTIME_BACKING_LINUX_CLONE_BUSY_REJECTION_COUNT: BankedAtomicU32 =
     BankedAtomicU32::new(0);
 static X86_RUNTIME_BACKING_LINUX_CLONE_INVALID_REJECTION_COUNT: BankedAtomicU32 =
@@ -2054,8 +3071,8 @@ static X86_RUNTIME_BACKING_LINUX_SLEEP_INTERRUPT_COUNT: BankedAtomicU32 = Banked
 static X86_RUNTIME_BACKING_LINUX_TIMER_WAIT_EXPIRY_COUNT: BankedAtomicU32 = BankedAtomicU32::new(0);
 static X86_RUNTIME_BACKING_LINUX_TIMER_WAIT_PREEMPTION_COUNT: BankedAtomicU32 =
     BankedAtomicU32::new(0);
-static X86_RUNTIME_BACKING_LINUX_RUNTIME_PREEMPT_TICKS: CpuBankedAtomicU8 =
-    CpuBankedAtomicU8::new(0);
+static X86_RUNTIME_BACKING_LINUX_RUNTIME_PREEMPT_TICKS: ThreadCpuAtomicU8 =
+    ThreadCpuAtomicU8::new(0);
 static X86_RUNTIME_BACKING_LINUX_POLL_WAIT_BLOCK_COUNT: BankedAtomicU32 = BankedAtomicU32::new(0);
 static X86_RUNTIME_BACKING_LINUX_POLL_WAIT_WAKE_COUNT: BankedAtomicU32 = BankedAtomicU32::new(0);
 static X86_RUNTIME_BACKING_LINUX_POLL_WAIT_TIMEOUT_COUNT: BankedAtomicU32 = BankedAtomicU32::new(0);
@@ -2207,6 +3224,10 @@ const LINUX_THREAD_WAIT_RETRY: u8 = 17;
 const LINUX_SYSCALL_FRAME_REGISTERS: usize = 12;
 static X86_RUNTIME_BACKING_LINUX_THREAD_STATES: [CpuBankedAtomicU8; LINUX_THREAD_LIMIT] =
     [const { CpuBankedAtomicU8::new(LINUX_THREAD_FREE) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_OWNER_ONLY: CpuBankedAtomicArray<
+    AtomicU8,
+    LINUX_THREAD_LIMIT,
+> = CpuBankedAtomicArray::<AtomicU8, LINUX_THREAD_LIMIT>::new();
 static X86_RUNTIME_BACKING_LINUX_THREAD_GENERATIONS: [CpuBankedAtomicU32; LINUX_THREAD_LIMIT] =
     [const { CpuBankedAtomicU32::new(0) }; LINUX_THREAD_LIMIT];
 static X86_RUNTIME_BACKING_LINUX_THREAD_TIDS: [CpuBankedAtomicU32; LINUX_THREAD_LIMIT] =
@@ -2300,8 +3321,8 @@ static X86_RUNTIME_BACKING_LINUX_THREAD_IOV_ADDRESSES: [[CpuBankedAtomicU64; LIN
 static X86_RUNTIME_BACKING_LINUX_THREAD_IOV_LENGTHS: [[CpuBankedAtomicU64; LINUX_IOV_LIMIT];
     LINUX_THREAD_LIMIT] =
     [const { [const { CpuBankedAtomicU64::new(0) }; LINUX_IOV_LIMIT] }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_CURRENT_THREAD_SLOT: CpuBankedAtomicU8 =
-    CpuBankedAtomicU8::new(LINUX_THREAD_SLOT_NONE);
+static X86_RUNTIME_BACKING_LINUX_CURRENT_THREAD_SLOT: ThreadCpuAtomicU8 =
+    ThreadCpuAtomicU8::new(LINUX_THREAD_SLOT_NONE);
 static X86_RUNTIME_BACKING_LINUX_NEXT_TID: CpuBankedAtomicU32 = CpuBankedAtomicU32::new(1);
 static X86_RUNTIME_BACKING_ELF_PROBE_RELRO: CpuBankedAtomicU64 = CpuBankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_RELRO_SIZE: CpuBankedAtomicU64 = CpuBankedAtomicU64::new(0);
@@ -3388,6 +4409,16 @@ unsafe fn enter_linux_runtime_process(
         )
         .is_some();
     if !entered {
+        if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
+            && current_linux_runtime_cpu_index() == 0
+            && LINUX_PARK_REFUSALS.fetch_add(1, Ordering::Relaxed) < 8
+        {
+            serial_write("ginux: process entered without an activation pid/cpu: ");
+            serial_write_u64(u64::from(current_linux_process_pid()));
+            serial_write(" ");
+            serial_write_u64(current_cpu_index_checked().unwrap_or(99) as u64);
+            serial_write("\r\n");
+        }
         process_user_enter(entry, stack, general, rflags);
     }
     (*entry_state).return_stack = previous_return_stack;
@@ -7192,10 +8223,14 @@ fn switch_linux_thread(handle: LinuxThreadHandle) -> bool {
     if !install_linux_tls_context(context) {
         return false;
     }
-    X86_RUNTIME.ELF_PROBE_SIGNAL_MASK.store(
-        X86_RUNTIME.LINUX_THREAD_SIGNAL_MASKS[slot].load(Ordering::SeqCst),
-        Ordering::SeqCst,
-    );
+    if linux_light_thread_here().is_none() {
+        X86_RUNTIME.ELF_PROBE_SIGNAL_MASK.store(
+            X86_RUNTIME.LINUX_THREAD_SIGNAL_MASKS[slot].load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+    }
+    // Whatever call kept the thread for the owner runs now.
+    X86_RUNTIME.LINUX_THREAD_OWNER_ONLY[slot].store(0, Ordering::SeqCst);
     X86_RUNTIME.LINUX_THREAD_STATES[slot].store(LINUX_THREAD_RUNNING, Ordering::SeqCst);
     X86_RUNTIME
         .LINUX_CURRENT_THREAD_SLOT
@@ -7289,6 +8324,7 @@ fn clear_linux_thread_slot(slot: usize) {
     X86_RUNTIME.LINUX_THREAD_RSEQ_LENGTHS[slot].store(0, Ordering::SeqCst);
     X86_RUNTIME.LINUX_THREAD_RSEQ_SIGNATURES[slot].store(0, Ordering::SeqCst);
     X86_RUNTIME.LINUX_THREAD_SIGNAL_MASKS[slot].store(0, Ordering::SeqCst);
+    X86_RUNTIME.LINUX_THREAD_OWNER_ONLY[slot].store(0, Ordering::SeqCst);
     X86_RUNTIME.LINUX_THREAD_WAIT_KINDS[slot].store(LINUX_THREAD_WAIT_NONE, Ordering::SeqCst);
     X86_RUNTIME.LINUX_THREAD_WAIT_KEYS[slot].store(0, Ordering::SeqCst);
     X86_RUNTIME.LINUX_THREAD_WAIT_OUTPUTS[slot].store(0, Ordering::SeqCst);
@@ -7326,11 +8362,24 @@ fn current_linux_thread_slot() -> Option<usize> {
 }
 
 fn store_current_linux_signal_mask(mask: u64) {
-    X86_RUNTIME
-        .ELF_PROBE_SIGNAL_MASK
-        .store(mask, Ordering::SeqCst);
+    // The process-wide copy is the owner's thread's; a thread on the
+    // light path has only its slot's.
+    if linux_light_thread_here().is_none() {
+        X86_RUNTIME
+            .ELF_PROBE_SIGNAL_MASK
+            .store(mask, Ordering::SeqCst);
+    }
     if let Some(slot) = current_linux_thread_slot() {
         X86_RUNTIME.LINUX_THREAD_SIGNAL_MASKS[slot].store(mask, Ordering::SeqCst);
+    }
+}
+
+/// The current thread's signal mask: its slot's on the light path, else
+/// the process-wide copy the owner keeps for its thread.
+fn current_linux_signal_mask() -> u64 {
+    match (linux_light_thread_here(), current_linux_thread_slot()) {
+        (Some(_), Some(slot)) => X86_RUNTIME.LINUX_THREAD_SIGNAL_MASKS[slot].load(Ordering::SeqCst),
+        _ => X86_RUNTIME.ELF_PROBE_SIGNAL_MASK.load(Ordering::SeqCst),
     }
 }
 
@@ -7363,13 +8412,8 @@ fn linux_thread_handle_by_tid(tid: u64) -> Option<LinuxThreadHandle> {
 }
 
 fn ready_linux_thread_handle() -> Option<LinuxThreadHandle> {
-    if current_linux_runtime_cpu_index() != 0 {
-        let slot = crate::arch::x86_64::smp::linux_runtime_thread_slot()?;
-        return (X86_RUNTIME.LINUX_THREAD_STATES[slot].load(Ordering::SeqCst)
-            == LINUX_THREAD_READY)
-            .then(|| linux_thread_handle(slot))
-            .flatten()
-            .filter(|handle| linux_thread_return_context(*handle).is_some());
+    if linux_light_thread_here().is_some() {
+        return None;
     }
     let after = current_linux_thread_slot().unwrap_or_else(|| {
         usize::from(
@@ -7380,22 +8424,16 @@ fn ready_linux_thread_handle() -> Option<LinuxThreadHandle> {
     });
     (1..=LINUX_THREAD_LIMIT).find_map(|offset| {
         let slot = after.wrapping_add(offset) % LINUX_THREAD_LIMIT;
-        (X86_RUNTIME.LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) == LINUX_THREAD_READY
-            && !crate::arch::x86_64::smp::linux_runtime_thread_is_remote(slot))
-        .then(|| linux_thread_handle(slot))
-        .flatten()
-        .filter(|handle| linux_thread_return_context(*handle).is_some())
+        (X86_RUNTIME.LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) == LINUX_THREAD_READY)
+            .then(|| linux_thread_handle(slot))
+            .flatten()
+            .filter(|handle| linux_thread_return_context(*handle).is_some())
     })
 }
 
 fn yield_ready_linux_thread_handle() -> Option<LinuxThreadHandle> {
-    if current_linux_runtime_cpu_index() != 0 {
-        let slot = crate::arch::x86_64::smp::linux_runtime_thread_slot()?;
-        return (X86_RUNTIME.LINUX_THREAD_STATES[slot].load(Ordering::Acquire)
-            == LINUX_THREAD_READY)
-            .then(|| linux_thread_handle(slot))
-            .flatten()
-            .filter(|handle| linux_thread_return_context(*handle).is_some());
+    if linux_light_thread_here().is_some() {
+        return None;
     }
     // A timer-preempted thread has already consumed its current quantum.
     // Do not let a sibling's voluntary yield immediately hand the CPU back;
@@ -7410,11 +8448,10 @@ fn yield_ready_linux_thread_handle() -> Option<LinuxThreadHandle> {
     (1..=LINUX_THREAD_LIMIT).find_map(|offset| {
         let slot = after.wrapping_add(offset) % LINUX_THREAD_LIMIT;
         (slot != usize::from(last_preempted)
-            && X86_RUNTIME.LINUX_THREAD_STATES[slot].load(Ordering::Acquire) == LINUX_THREAD_READY
-            && !crate::arch::x86_64::smp::linux_runtime_thread_is_remote(slot))
-        .then(|| linux_thread_handle(slot))
-        .flatten()
-        .filter(|handle| linux_thread_return_context(*handle).is_some())
+            && X86_RUNTIME.LINUX_THREAD_STATES[slot].load(Ordering::Acquire) == LINUX_THREAD_READY)
+            .then(|| linux_thread_handle(slot))
+            .flatten()
+            .filter(|handle| linux_thread_return_context(*handle).is_some())
     })
 }
 
@@ -12931,41 +13968,16 @@ fn linux_schedule_new_thread(
     let Some(child_context) = linux_thread_return_context(child) else {
         return LINUX_EINVAL;
     };
-    // A new thread runs on an application processor only in a domain
-    // configured with more than one CPU (`cpu=N`). Domains run their
-    // processes nested on the boot CPU, and a thread left running elsewhere
-    // would see another process's state once its own process is switched out
-    // (see linux_remote_thread_running), so a single-CPU domain, the default,
-    // keeps all of its threads on the boot CPU.
-    if !cfg!(feature = "verification-boot")
-        && current_linux_runtime_cpu_index() == 0
-        && linux_available_cpu_count() > 1
-        && !linux_smp_runtime_active()
-    {
-        if let Some(root) = linux_process::live_process_root(current_linux_process_pid()) {
-            let Some(general) = linux_thread_resume_general(child, child_context) else {
-                return LINUX_EINVAL;
-            };
-            if crate::arch::x86_64::smp::begin_linux_runtime_thread(
-                root,
-                child.slot,
-                child.generation,
-                child.tid,
-                child_context.rip,
-                child_context.rsp,
-                child_context.fs_base,
-                general,
-                child_context.rflags,
-            ) {
-                X86_RUNTIME
-                    .LINUX_YIELD_SWITCH_COUNT
-                    .fetch_add(1, Ordering::SeqCst);
-                X86_RUNTIME
-                    .LINUX_LIVE_RETURN_VALIDATED
-                    .store(true, Ordering::SeqCst);
-                return parent_result;
-            }
-        }
+    // In a domain runtime with more than one CPU, the parent goes on and
+    // an idle CPU of the runtime's loop takes the new thread (its owner
+    // switches to it when none is idle and its own thread waits). A
+    // single-CPU domain switches to the child here.
+    if !cfg!(feature = "verification-boot") && linux_smp_runtime_active() {
+        adopt_linux_process_bank(current_linux_process_pid());
+        X86_RUNTIME
+            .LINUX_LIVE_RETURN_VALIDATED
+            .store(true, Ordering::SeqCst);
+        return parent_result;
     }
     if !switch_linux_thread(child) || !write_linux_thread_live_return(output, child, child_context)
     {
@@ -13078,11 +14090,31 @@ fn linux_exit_child_to_parent(output: *mut LinuxSyscallFrame, caller: LinuxUserC
     // current and other processes run. A yield restarts this exit, which has
     // nothing left to undo. A thread on an application processor just ends,
     // and so does one whose siblings run on other CPUs.
-    while current_linux_runtime_cpu_index() == 0
-        && crate::arch::x86_64::smp::linux_runtime_thread_slot().is_none()
-        && ready_linux_thread_handle().is_none()
-    {
+    while current_linux_runtime_cpu_index() == 0 && ready_linux_thread_handle().is_none() {
         let _ = expire_linux_waits();
+        // Its siblings all ended on other CPUs meanwhile: the process ends
+        // with this thread, as exit_group would end it.
+        if current_linux_thread_slot().is_some_and(|slot| {
+            (0..LINUX_THREAD_LIMIT).all(|other| {
+                other == slot
+                    || X86_RUNTIME.LINUX_THREAD_STATES[other].load(Ordering::SeqCst)
+                        == LINUX_THREAD_FREE
+            })
+        }) {
+            if !clear_current_linux_process_signal_queues() {
+                return LINUX_EIO;
+            }
+            X86_RUNTIME
+                .LINUX_PROCESS_CHILD_STATUS
+                .store(caller.registers.rdi as u8, Ordering::SeqCst);
+            X86_RUNTIME
+                .LINUX_PROCESS_CHILD_EXIT_PID
+                .store(current_linux_process_pid(), Ordering::SeqCst);
+            X86_RUNTIME
+                .LINUX_PROCESS_CHILD_EXITED
+                .store(true, Ordering::SeqCst);
+            return LINUX_RETURN_TO_KERNEL;
+        }
         if let Some(LinuxBlockedWait::Return(result)) =
             run_other_linux_processes(output, caller, LINUX_EXIT_SYSCALL)
         {
@@ -13134,95 +14166,6 @@ fn linux_exit_child_to_parent(output: *mut LinuxSyscallFrame, caller: LinuxUserC
         return LINUX_EINVAL;
     }
     LINUX_RETURN_FROM_IRET
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn begin_dispatched_linux_runtime_thread(
-    root: memory::FrameLease,
-    slot: u8,
-    generation: u32,
-    tid: u32,
-    entry: u64,
-    stack: u64,
-    fs_base: u64,
-    general: [u64; 15],
-    rflags: u64,
-) -> bool {
-    let handle = LinuxThreadHandle {
-        slot,
-        generation,
-        tid,
-    };
-    let Some(mut context) = linux_thread_return_context(handle) else {
-        return false;
-    };
-    let Some(initial_general) = linux_thread_resume_general(handle, context) else {
-        return false;
-    };
-    if context.rip != entry
-        || context.rsp != stack
-        || context.fs_base != fs_base
-        || context.rflags != rflags
-        || initial_general != general
-    {
-        return false;
-    }
-    let Some(saved_syscalls) = configure_linux_syscall() else {
-        return false;
-    };
-    let resumed = loop {
-        let selected_general = {
-            let _kernel_entry = crate::sync::kernel_entry_lock();
-            let selected = current_linux_runtime_cpu_index() != 0
-                && current_linux_thread_handle().is_none()
-                && linux_thread_handle(usize::from(slot)) == Some(handle)
-                && linux_thread_return_context(handle) == Some(context)
-                && switch_linux_thread(handle);
-            selected
-                .then(|| linux_thread_resume_general(handle, context))
-                .flatten()
-        };
-        let Some(resume_general) = selected_general else {
-            break false;
-        };
-        if !address_space::resume_live_linux_process(
-            root,
-            context.rip,
-            context.rsp,
-            context.fs_base,
-            resume_general,
-            context.rflags,
-        ) || current_linux_thread_handle().is_some()
-        {
-            break false;
-        }
-        loop {
-            let state = X86_RUNTIME.LINUX_THREAD_STATES[usize::from(slot)].load(Ordering::Acquire);
-            if state == LINUX_THREAD_FREE {
-                break;
-            }
-            if state == LINUX_THREAD_READY {
-                let Some(next) = linux_thread_return_context(handle) else {
-                    break;
-                };
-                context = next;
-                break;
-            }
-            if state != LINUX_THREAD_BLOCKED {
-                break;
-            }
-            core::hint::spin_loop();
-        }
-        let state = X86_RUNTIME.LINUX_THREAD_STATES[usize::from(slot)].load(Ordering::Acquire);
-        if state == LINUX_THREAD_FREE {
-            break true;
-        }
-        if state != LINUX_THREAD_READY {
-            break false;
-        }
-    };
-    let restored = restore_linux_syscall(saved_syscalls);
-    resumed && restored
 }
 
 fn current_linux_process_pid() -> u32 {
@@ -13806,13 +14749,6 @@ fn linux_wait_nohang_live_return(result: u64, caller: LinuxUserContext) -> u64 {
 /// to another process (or another domain) until the thread blocks or exits.
 /// A remote thread that is blocked keeps spinning on its slot, and gives the
 /// slot up if it sees another process's thread there.
-fn linux_remote_thread_running() -> bool {
-    crate::arch::x86_64::smp::any_linux_runtime_thread(|slot| {
-        slot >= LINUX_THREAD_LIMIT
-            || X86_RUNTIME.LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) != LINUX_THREAD_BLOCKED
-    })
-}
-
 /// Whether system call `number` (fork, vfork, clone or clone3, with clone
 /// flags `flags` or clone3 arguments at `arguments`) creates a process,
 /// which runs at once in place of its parent.
@@ -13850,18 +14786,18 @@ fn run_other_linux_processes(
 ) -> Option<LinuxBlockedWait> {
     // Processes run nested on the boot CPU's kernel stack; a thread on an
     // application processor has no process tree to run.
-    if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
-        || current_linux_runtime_cpu_index() != 0
-    {
+    if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
         return None;
     }
-    // While a sibling runs on another CPU, this process must stay current.
-    // The call starts again from user mode, which also lets that thread's
-    // own system calls take the kernel-entry lock in between.
-    if linux_remote_thread_running() {
-        return Some(LinuxBlockedWait::Return(linux_restart_syscall_live_return(
-            output, caller, number,
-        )));
+    // A thread on the light path waits as the owner's thread: the call
+    // goes to the owner.
+    if linux_light_thread_here().is_some() {
+        return Some(LinuxBlockedWait::Return(
+            migrate_current_linux_thread_to_owner(caller, number),
+        ));
+    }
+    if current_linux_runtime_cpu_index() != 0 {
+        return None;
     }
     // Descriptor waits made ready while another process ran complete here,
     // in this process's address space; a woken sibling thread runs instead.
@@ -13901,6 +14837,19 @@ fn run_other_linux_processes(
         // Waiting in the call: /proc shows it sleeping until dispatched.
         linux_process::set_live_process_waiting(pid, true);
         if !park_linux_process(pid) {
+            if LINUX_PARK_REFUSALS.fetch_add(1, Ordering::Relaxed) < 8 {
+                serial_write("ginux: process cannot park pid/cpu/call/activation: ");
+                for value in [
+                    u64::from(pid),
+                    current_cpu_index_checked().unwrap_or(99) as u64,
+                    number,
+                    u64::from(activation::is_running(linux_activation_owner(pid))),
+                ] {
+                    serial_write_u64(value);
+                    serial_write(" ");
+                }
+                serial_write("\r\n");
+            }
             return Some(LinuxBlockedWait::Return(LINUX_RETURN_TO_KERNEL));
         }
         // Resumed to be killed: SIGKILL ends the process from inside its
@@ -14267,8 +15216,15 @@ pub(crate) fn linux_application_processor_tick(frame: &mut UserInterruptFrame) {
         return;
     }
     let _kernel_entry = crate::sync::kernel_entry_lock();
-    if linux_smp_runtime_active() {
-        linux_preempt_process_from_timer(frame);
+    if !linux_smp_runtime_active() {
+        return;
+    }
+    match current_cpu_index_checked()
+        .filter(|cpu| *cpu < CPU_ENTRY_STATE_LIMIT)
+        .and_then(|cpu| linux_light_thread_here().map(|(bank, _)| (cpu, bank)))
+    {
+        Some((cpu, bank)) => linux_preempt_light_thread_from_timer(cpu, bank, frame),
+        None => linux_preempt_process_from_timer(frame),
     }
 }
 
@@ -14301,7 +15257,6 @@ fn linux_preempt_process_from_timer(frame: &mut UserInterruptFrame) {
     let nesting = X86_RUNTIME
         .LINUX_PROCESS_SCHEDULER_NESTING
         .load(Ordering::SeqCst);
-    let remote = linux_remote_thread_running();
     let signal = X86_RUNTIME.LINUX_SIGNAL_ACTIVE.load(Ordering::SeqCst);
     // Someone takes the yield: the scheduler that entered the process, or the
     // fork transaction running it as its child (once it has its own memory).
@@ -14311,8 +15266,7 @@ fn linux_preempt_process_from_timer(frame: &mut UserInterruptFrame) {
         == pid;
     let yieldable =
         (nesting != 0 || transaction_child) && !linux_process::live_process_shares_parent_vm(pid);
-    if remote
-        || (entry..entry + 9).contains(&context.rip)
+    if (entry..entry + 9).contains(&context.rip)
         || !signal_due && (pid == 1 || !yieldable || signal)
     {
         return;
@@ -14365,6 +15319,23 @@ fn linux_complete_timer_preemption(output: *mut LinuxSyscallFrame, user_rip: u64
         pending.filter(|preempted| preempted.pid == pid)?;
         pending.take()?
     };
+    if let Some((bank, slot)) = linux_light_thread_here() {
+        if LINUX_BANK_DYING[bank].load(Ordering::Acquire) {
+            X86_RUNTIME
+                .LINUX_CURRENT_THREAD_SLOT
+                .store(LINUX_THREAD_SLOT_NONE, Ordering::SeqCst);
+            return Some(LINUX_RETURN_TO_KERNEL);
+        }
+        let handle = linux_thread_handle(slot)?;
+        return Some(park_linux_light_thread_exact(
+            handle,
+            preempted.general,
+            preempted.rip,
+            preempted.rsp,
+            preempted.rflags,
+            false,
+        ));
+    }
     if preempted.signal {
         return Some(linux_deliver_signal_to_interrupted(output, &preempted));
     }
@@ -15422,10 +16393,12 @@ struct LinuxThreadRuntimeState {
     select_exception_set: [u64; LINUX_SELECT_WORD_LIMIT],
     iov_addresses: [u64; LINUX_IOV_LIMIT],
     iov_lengths: [u64; LINUX_IOV_LIMIT],
+    owner_only: u8,
 }
 
 impl LinuxThreadRuntimeState {
     const EMPTY: Self = Self {
+        owner_only: 0,
         state: LINUX_THREAD_FREE,
         generation: 0,
         tid: 0,
@@ -15782,6 +16755,7 @@ fn stage_linux_fork_parent_runtime_state(parent_pid: u32) -> Option<LinuxForkPar
     });
     let nice = state.nice;
     *linux_process_runtime_state(parent_pid)? = state;
+    LINUX_BANK_STAGED[linux_cpu_bank()].store(true, Ordering::Release);
     Some(LinuxForkParentRuntime {
         stack: parent_stack,
         nice,
@@ -15852,6 +16826,15 @@ fn save_current_linux_process_runtime_state(pid: u32) {
 fn save_current_linux_process_runtime_state_now(pid: u32) {
     let started = cfg!(feature = "linux-boot-profile").then(timer::timestamp_counter);
     linux_process::charge_live_process_cpu(pid, timer::timestamp_counter());
+    adopt_linux_process_bank(pid);
+    if !linux_bank_holds(linux_cpu_bank(), pid, linux_execution_instance()) {
+        // The bank holds another process: its state is not this one's.
+        LINUX_BANK_FOREIGN_SAVES.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    if linux_child_exited(pid) {
+        wait_for_linux_process_threads_to_leave(pid);
+    }
     if let (Some(state), Some(destination)) = (
         capture_linux_process_runtime_state(),
         linux_process_runtime_state(pid),
@@ -15880,7 +16863,28 @@ fn restore_saved_linux_process_runtime_state_now(pid: u32) -> bool {
     let Some(state) = linux_process_runtime_state(pid).filter(|state| state.valid) else {
         return false;
     };
+    let Some(attached) = attach_linux_process_bank(pid, true) else {
+        return false;
+    };
     linux_process::start_live_process_cpu(timer::timestamp_counter());
+    if attached == BankAttach::Live {
+        // Threads of the process run on other CPUs: the bank is its state,
+        // newer than what was saved. This CPU takes up the saved thread.
+        X86_RUNTIME
+            .LINUX_CURRENT_THREAD_SLOT
+            .store(state.current_thread_slot, Ordering::SeqCst);
+        X86_RUNTIME
+            .LINUX_LAST_PREEMPTED_THREAD_SLOT
+            .store(state.last_preempted_thread_slot, Ordering::SeqCst);
+        let thread_signal_mask = X86_RUNTIME
+            .LINUX_THREAD_SIGNAL_MASKS
+            .get(usize::from(state.current_thread_slot))
+            .map_or(0, |mask| mask.load(Ordering::SeqCst));
+        X86_RUNTIME
+            .ELF_PROBE_SIGNAL_MASK
+            .store(thread_signal_mask, Ordering::SeqCst);
+        return true;
+    }
     restore_linux_process_runtime_state(state);
     let Some(threads) = linux_process_thread_runtime_state(pid) else {
         return false;
@@ -15980,6 +16984,7 @@ fn capture_linux_thread_runtime_state(slot: usize) -> LinuxThreadRuntimeState {
         iov_lengths: core::array::from_fn(|index| {
             X86_RUNTIME.LINUX_THREAD_IOV_LENGTHS[slot][index].load(Ordering::SeqCst)
         }),
+        owner_only: X86_RUNTIME.LINUX_THREAD_OWNER_ONLY[slot].load(Ordering::SeqCst),
     }
 }
 
@@ -16024,6 +17029,7 @@ fn restore_linux_thread_runtime_state(
         X86_RUNTIME.LINUX_THREAD_RSEQ_SIGNATURES[slot]
             .store(state.rseq_signature, Ordering::SeqCst);
         X86_RUNTIME.LINUX_THREAD_SIGNAL_MASKS[slot].store(state.signal_mask, Ordering::SeqCst);
+        X86_RUNTIME.LINUX_THREAD_OWNER_ONLY[slot].store(state.owner_only, Ordering::SeqCst);
         X86_RUNTIME.LINUX_THREAD_WAIT_KINDS[slot].store(state.wait_kind, Ordering::SeqCst);
         X86_RUNTIME.LINUX_THREAD_WAIT_KEYS[slot].store(state.wait_key, Ordering::SeqCst);
         X86_RUNTIME.LINUX_THREAD_WAIT_OUTPUTS[slot].store(state.wait_output, Ordering::SeqCst);
@@ -16105,7 +17111,13 @@ fn restore_linux_thread_runtime_state(
 }
 
 fn capture_linux_process_runtime_state() -> Option<LinuxProcessRuntimeState> {
-    let thread_slot = current_linux_thread_slot()?;
+    capture_linux_process_runtime_state_for(current_linux_thread_slot()? as u8)
+}
+
+/// `capture_linux_process_runtime_state` with `thread_slot` as the thread
+/// the process resumes with: the current one, or, from a CPU running none
+/// of the process's threads, the one whose context the registry holds.
+fn capture_linux_process_runtime_state_for(thread_slot: u8) -> Option<LinuxProcessRuntimeState> {
     let pid = current_linux_process_pid();
     let threads = linux_process_thread_runtime_state(pid)?;
     for (slot, state) in threads.iter_mut().enumerate() {
@@ -16214,7 +17226,7 @@ fn capture_linux_process_runtime_state() -> Option<LinuxProcessRuntimeState> {
             X86_RUNTIME.ELF_PROBE_ALT_STACK_SIZE.load(Ordering::SeqCst),
         ],
         alternate_signal_stack_flags: X86_RUNTIME.ELF_PROBE_ALT_STACK_FLAGS.load(Ordering::SeqCst),
-        current_thread_slot: thread_slot as u8,
+        current_thread_slot: thread_slot,
         last_preempted_thread_slot: X86_RUNTIME
             .LINUX_LAST_PREEMPTED_THREAD_SLOT
             .load(Ordering::SeqCst),
@@ -35452,9 +36464,6 @@ fn linux_blocking_descriptor_io_live_return(
         return LINUX_ESRCH;
     };
     let Some(target) = ready_linux_thread_handle() else {
-        if current_linux_runtime_cpu_index() != 0 {
-            return LINUX_ENOSYS;
-        }
         return match run_other_linux_processes(output, caller, number) {
             Some(LinuxBlockedWait::Return(result)) => result,
             _ => linux_restart_syscall_live_return(output, caller, number),
@@ -35627,6 +36636,9 @@ fn linux_retry_later_live_return(
     caller: LinuxUserContext,
     number: u64,
 ) -> u64 {
+    if linux_light_thread_here().is_some() {
+        return migrate_current_linux_thread_to_owner(caller, number);
+    }
     let mut restart = caller;
     restart.rip = caller.rip.wrapping_sub(LINUX_SYSCALL_INSTRUCTION_SIZE);
     restart.rax = number;
@@ -36611,9 +37623,7 @@ fn linux_splice_live_return(
         LinuxSpliceStep::Done(LINUX_EPIPE) => linux_broken_pipe_live_return(output, caller),
         LinuxSpliceStep::Done(result) => result,
         LinuxSpliceStep::Blocked
-            if nonblocking
-                || !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::Acquire)
-                || current_linux_runtime_cpu_index() != 0 =>
+            if nonblocking || !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::Acquire) =>
         {
             LINUX_EAGAIN
         }
@@ -39773,7 +40783,10 @@ fn linux_sysrq_trigger_write(address: u64, count: u64) -> u64 {
     match key[0] {
         b't' => linux_show_task_states(),
         b'l' => crate::linux_profile::start(),
-        b'u' => crate::cpu_time::report(),
+        b'u' => {
+            crate::cpu_time::report();
+            linux_report_process_banks();
+        }
         _ => {}
     }
     count
@@ -39834,6 +40847,9 @@ fn linux_show_thread_state(thread: &LinuxThreadRuntimeState) {
         LINUX_THREAD_BLOCKED => " blocked",
         _ => " ?",
     });
+    if thread.owner_only != 0 {
+        serial_write(" (for the owner)");
+    }
     serial_write(" wait=");
     serial_write_u64(u64::from(thread.wait_kind));
     serial_write(" key=");
@@ -49923,9 +50939,16 @@ fn handle_user_fault(frame: *mut UserFaultFrame) -> u64 {
     if fault_domain.is_none()
         && X86_RUNTIME.ELF_PROBE_ACTIVE.load(Ordering::SeqCst)
         && memory::take_user_frames_refused()
-        && terminate_linux_process_out_of_memory()
     {
-        return u64::MAX;
+        if linux_light_thread_here().is_some() {
+            serial_write("ginux: out of memory in a thread of process ");
+            serial_write_u64(u64::from(current_linux_process_pid()));
+            serial_write("\r\n");
+            return fault_linux_light_thread(frame, fault_metadata, LINUX_SIGKILL);
+        }
+        if terminate_linux_process_out_of_memory() {
+            return u64::MAX;
+        }
     }
     if fault_domain.is_none() && X86_RUNTIME.ELF_PROBE_ACTIVE.load(Ordering::SeqCst) {
         serial_write("ginux: Linux user fault vector/error/address/rip:");
@@ -50077,6 +51100,13 @@ fn handle_user_fault(frame: *mut UserFaultFrame) -> u64 {
         }
         serial_write("\r\n");
         write_linux_runtime_syscall_trace();
+        if linux_light_thread_here().is_some() {
+            return fault_linux_light_thread(
+                frame,
+                fault_metadata,
+                linux_fault_signal(fault_metadata.vector),
+            );
+        }
         if deliver_linux_sigsegv(frame, fault_metadata) {
             return 0;
         }

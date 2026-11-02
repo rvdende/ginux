@@ -385,18 +385,70 @@ blocked. That needs the per-CPU loop of step 6.
 
 ### Several CPUs per domain (2026-11-02)
 
-A domain set `cpu=N` runs its processes on N CPUs: each application
-processor runs `run_application_processor_runtime`, claiming ready processes
-(not init) from the run queue, with its own timer tick for preemption. The
-kernel-entry lock is released while a CPU is in user mode, so only kernel
-work is serialized. Per-process kernel state is kept in per-CPU banks
-(`linux_cpu_bank()`), filled by capture/restore on each switch. TLB
-shootdowns interrupt only CPUs whose last loaded CR3 is the root being
-changed (`smp::note_active_root`); before that, every page-table change of a
-process on an AP waited on an NMI to CPU 0 and a 4-CPU domain ran
-compute-bound work five times slower than a 1-CPU one.
+A domain set `cpu=N` runs on N CPUs. The boot CPU runs init's runtime loop
+as before; each application processor runs `run_application_processor_runtime`,
+a loop that takes work under the kernel-entry lock and lets the lock go
+while its work runs in user mode (every CPU does: the lock is released on
+the way to user mode and taken again on the way back). Two kinds of work:
+
+- **A process as the registry dispatched it** (`run_linux_process_on_this_cpu`,
+  `claim_live_process`): the process's kernel activation runs on this CPU
+  until the process waits, yields, forks or exits. This CPU *owns* the
+  process meanwhile: the fork transaction, exec, exit, waits for children,
+  signal delivery and the waits that run other processes all happen here.
+- **A thread on the light path** (`run_linux_light_thread`): any ready
+  thread of a process whose bank is live (below), other than the one whose
+  context the registry holds. It runs on the CPU's own kernel stack with
+  no activation until it blocks (futex), is preempted by this CPU's timer
+  tick (`linux_preempt_light_thread_from_timer`, through the vDSO
+  preemption entry), exits, or makes a system call the light path does not
+  run (`linux_light_syscall_allowed`). Such a call is put back to be
+  restarted and the thread is marked for the owner
+  (`LINUX_THREAD_OWNER_ONLY`): the owner switches to it when its own thread
+  waits, as it switches between threads on one CPU. A thread that leaves
+  the light path saves its context in its thread slot, as a thread switch
+  on one CPU does, so any CPU can take it up next.
+
+**Process banks.** The per-process kernel state the runtime keeps in
+`X86_RUNTIME` (descriptors, threads, signal and address-space bookkeeping)
+lives in banks (`linux_cpu_bank`). A process live on any CPU has one bank,
+which every CPU running one of its threads uses; the boot CPU has a bank of
+its own per execution instance, each application processor one, and there
+are spares for a CPU whose own bank still holds a process other CPUs run
+threads of. `attach_linux_process_bank` (on restore) joins the bank the
+process is live in, or fills a free one from the process's saved record;
+`linux_release_current_bank` leaves it, and the last CPU out saves the
+record (the owner on its way out, or the last light thread,
+`capture_linux_process_runtime_state_for`). Per-CPU state (the current
+thread slot, preemption) stays in the CPU's own bank (`ThreadCpuAtomicU8`).
+A process's exit waits for its threads on other CPUs to leave
+(`LINUX_BANK_DYING`, `wait_for_linux_process_threads_to_leave`) before its
+memory goes. SysRq `u` lists the banks and the light-path counters.
+
+The futex coordinator spinning (`linux_remote_futex_wait_fast`) and the
+thread-by-interrupt dispatch (`begin_linux_runtime_thread`) that preceded
+this are gone: the owner blocks like any thread, and its process is
+resumed by whichever CPU claims it, since the bank follows the process.
+
+TLB shootdowns interrupt only CPUs whose last loaded CR3 is the root being
+changed (`smp::note_active_root`), and only for a leaf entry that was
+present (`invalidate_changed_runtime_translation`): a page mapped for the
+first time was in no TLB. Before the first, every page-table change of a
+process on an application processor waited on an NMI to CPU 0 and a 4-CPU
+domain ran compute-bound work five times slower than a 1-CPU one; before
+the second, four threads of one process touching fresh pages interrupted
+each other on every page and spent most of their time in the kernel-entry
+lock.
 
 Measured with cadrs_core's 87 reference tests (host: 6.5 s on 12 threads):
-1 CPU 19.1 s, 4 CPUs 20.2 s. The threads of one process still all run on one
-CPU. Next: index the per-process banks by process instead of by CPU, so CPUs
-running threads of the same process share one copy (step 5).
+1 CPU 19.1 s, 4 CPUs 20.2 s before threads could spread; see the commit
+log for after. `make test-multithread` checks four threads of one process
+on four CPUs, waits and wakes across CPUs, timed waits, a thread spawning
+processes, exit and a fault with threads elsewhere.
+
+Still per domain rather than per process: the mount namespace that is
+"current" (`linux_mount`), which CPUs running processes of different
+namespaces at once would see wrongly; and the alternate signal stack, kept
+per process. Next: a thread's wait in poll/epoll on the light path (today
+those calls go to the owner), and lighter rechecks of a parked process
+(each park refreshes the registry's mapping list).

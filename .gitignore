@@ -7,3 +7,4 @@
 /docs/paper/*.log
 /docs/paper/*.pdf
 /output/pdf/*.pdf
+/.claude/worktrees/

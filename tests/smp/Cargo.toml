@@ -20,3 +20,6 @@ name = "multicore"
 
 [[test]]
 name = "bigmem"
+
+[[test]]
+name = "multithread"
