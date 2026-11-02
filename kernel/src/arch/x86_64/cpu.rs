@@ -5298,7 +5298,7 @@ fn execute_deferred_live_fork() -> bool {
     }
     // Fork execution is recursive: a child may fork before returning to its
     // parent. Preserve the outer transaction's vfork/CLONE_VM exec policy.
-    let _exec_flag_guard = LinuxForkExecFlagGuard::capture();
+    let exec_flag_guard = LinuxForkExecFlagGuard::capture();
     let domain_exec = X86_RUNTIME
         .LINUX_DOMAIN_EXEC_INJECT
         .swap(false, Ordering::AcqRel);
@@ -5640,6 +5640,9 @@ fn execute_deferred_live_fork() -> bool {
         let Some(parent) = linux_process::resume_live_parent_after_child_exec(child.pid) else {
             return false;
         };
+        // The child runs on its own now; the parent resumes here, inside
+        // this transaction, and its own exec or exit goes to the outer one.
+        exec_flag_guard.resume_parent();
         X86_RUNTIME
             .LINUX_CURRENT_PROCESS_PID
             .store(parent_pid, Ordering::SeqCst);
@@ -5726,6 +5729,9 @@ fn execute_deferred_live_fork() -> bool {
     let profile_parent_started =
         cfg!(feature = "linux-boot-profile").then(timer::timestamp_counter);
     let parent_synced = sync_live_linux_process_address_space(parent_pid);
+    // The parent resumes inside this transaction: its own exec or exit goes
+    // to the outer one.
+    exec_flag_guard.resume_parent();
     let parent_resumed = parent_synced && run_dispatched_linux_process(&parent);
     let parent_resumed = if parent_resumed
         && !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
@@ -15642,8 +15648,18 @@ struct LinuxForkParentRuntime {
     nice: u8,
 }
 
+/// The outer fork transaction's exec policy and the process whose exec it
+/// waits for. A child that forks starts a nested transaction, which points
+/// the exec pid at the grandchild; when the child resumes inside that
+/// transaction (after the grandchild exits or execs), its own exec (a
+/// subshell that runs a pipeline, then execs its last command) must reach
+/// the outer transaction again.
 struct LinuxForkExecFlagGuard {
     previous: bool,
+    exec_pid: u32,
+    /// Whether `resume_parent` already gave the exec pid back: an exec the
+    /// parent reports after that must not be overwritten.
+    exec_pid_restored: core::cell::Cell<bool>,
 }
 
 /// Marks a domain-exec fork transaction as running. It re-runs only the
@@ -15675,6 +15691,10 @@ impl LinuxForkExecFlagGuard {
             previous: X86_RUNTIME
                 .LINUX_PROCESS_RELEASE_PARENT_ON_EXEC
                 .load(Ordering::SeqCst),
+            exec_pid: X86_RUNTIME
+                .LINUX_PROCESS_CHILD_EXEC_PID
+                .load(Ordering::SeqCst),
+            exec_pid_restored: core::cell::Cell::new(false),
         }
     }
 }
@@ -15684,6 +15704,19 @@ impl Drop for LinuxForkExecFlagGuard {
         X86_RUNTIME
             .LINUX_PROCESS_RELEASE_PARENT_ON_EXEC
             .store(self.previous, Ordering::SeqCst);
+        self.resume_parent();
+    }
+}
+
+impl LinuxForkExecFlagGuard {
+    /// Points the exec pid back at the outer transaction's child before the
+    /// parent resumes inside this transaction; once only.
+    fn resume_parent(&self) {
+        if !self.exec_pid_restored.replace(true) {
+            X86_RUNTIME
+                .LINUX_PROCESS_CHILD_EXEC_PID
+                .store(self.exec_pid, Ordering::SeqCst);
+        }
     }
 }
 
