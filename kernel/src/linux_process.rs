@@ -2997,6 +2997,28 @@ pub(crate) fn set_live_process_cpu_affinity(pid: u32, mask: u64) -> bool {
     })
 }
 
+/// Lets only CPU `cpu` run process `pid` (`Some`), or again the CPUs its
+/// affinity names (`None`): for a CPU that made the process ready but will
+/// switch back to it, such as the parent of the fork it runs, so that no
+/// other CPU takes it meanwhile. Its affinity as the process sees it does
+/// not change.
+pub(crate) fn pin_live_process(pid: u32, cpu: Option<usize>) -> bool {
+    let Some(table) = live_process_table_mut() else {
+        return false;
+    };
+    let Some(process) = table
+        .handle_by_pid(pid)
+        .and_then(|handle| table.process(handle))
+    else {
+        return false;
+    };
+    let mask = cpu.map_or(process.cpu_affinity, |cpu| 1_u64 << cpu);
+    process.scheduler_thread.is_none_or(|thread| {
+        scheduler::active_process_scheduler_workspace()
+            .is_some_and(|run_queue| run_queue.set_affinity(thread, mask))
+    })
+}
+
 pub(crate) fn set_live_process_scheduler_nice(pid: u32, nice: u8) -> bool {
     if nice > 39 {
         return false;
@@ -4186,6 +4208,140 @@ pub(crate) fn resume_live_parent_after_child_exec(pid: u32) -> Option<LiveProces
         return None;
     }
     table.dispatch(parent_handle)
+}
+
+/// Makes process `pid`, ready in the run queue, current on this CPU, which
+/// runs no process: another CPU of the domain taking it to run.
+pub(crate) fn claim_live_process(pid: u32) -> Option<LiveProcessDispatch> {
+    let table = live_process_table_mut()?;
+    let handle = table.handle_by_pid(pid)?;
+    let process = table.process(handle)?;
+    if process.state != ProcessState::Running {
+        return None;
+    }
+    let space = process.address_space.as_ref()?;
+    let context = process.context?.scheduler_context(space)?;
+    let thread = process.scheduler_thread?;
+    let run_queue = scheduler::active_process_scheduler_workspace()?;
+    let claimed = run_queue.claim(thread)?;
+    if claimed.context() != context {
+        // Put it back as it was.
+        let _ = run_queue.release(thread, claimed.context());
+        return None;
+    }
+    table.dispatch(handle)
+}
+
+/// After the last other scheduled process of the domain ended: process
+/// `pid`, current on this CPU and at the top of the tree, leaves the run queue
+/// and the queue is released, as when no fork had been scheduled. True too
+/// when other processes still run.
+pub(crate) fn retire_lone_live_process(pid: u32) -> bool {
+    let Some(table) = live_process_table_mut() else {
+        return false;
+    };
+    let Some(handle) = table.handle_by_pid(pid) else {
+        return false;
+    };
+    let lone = table
+        .process(handle)
+        .is_some_and(|process| process.parent.is_none() && process.scheduler_thread.is_some())
+        && table
+            .processes
+            .iter()
+            .flatten()
+            .filter(|process| process.scheduler_thread.is_some())
+            .count()
+            == 1;
+    if !lone {
+        return true;
+    }
+    let Some(run_queue) = scheduler::active_process_scheduler_workspace() else {
+        return false;
+    };
+    table.withdraw_from_scheduler(handle, run_queue)
+        && scheduler::release_process_scheduler_workspace()
+}
+
+/// Puts process `pid`, current on this CPU, back among the ready ones with
+/// the context its registry records, leaving the CPU with no process.
+pub(crate) fn release_live_process(pid: u32) -> bool {
+    let Some(table) = live_process_table_mut() else {
+        return false;
+    };
+    let Some(process) = table
+        .handle_by_pid(pid)
+        .and_then(|handle| table.process(handle))
+    else {
+        return false;
+    };
+    let (Some(space), Some(context), Some(thread)) = (
+        process.address_space.as_ref(),
+        process.context,
+        process.scheduler_thread,
+    ) else {
+        return false;
+    };
+    let (Some(context), Some(run_queue)) = (
+        context.scheduler_context(space),
+        scheduler::active_process_scheduler_workspace(),
+    ) else {
+        return false;
+    };
+    run_queue.release(thread, context)
+}
+
+/// The first live process after `after` (in pid order, wrapping) that is
+/// ready in the run queue, may run on this CPU and `accept` takes, for a CPU
+/// looking for one to run.
+pub(crate) fn ready_live_process_after(
+    after: u32,
+    mut accept: impl FnMut(u32) -> bool,
+) -> Option<u32> {
+    let table = live_process_table_mut()?;
+    let run_queue = scheduler::active_process_scheduler_workspace()?;
+    let mut ready: Vec<u32> = Vec::new();
+    for process in table.processes.iter().flatten() {
+        if process.state == ProcessState::Running
+            && process
+                .scheduler_thread
+                .is_some_and(|thread| run_queue.is_ready_here(thread))
+            && ready.try_reserve(1).is_ok()
+        {
+            ready.push(process.handle.pid);
+        }
+    }
+    ready.sort_unstable();
+    let start = ready.iter().position(|pid| *pid > after).unwrap_or(0);
+    (0..ready.len())
+        .map(|offset| ready[(start + offset) % ready.len()])
+        .find(|pid| accept(*pid))
+}
+
+/// Ends process `pid`, current on this CPU, with `status`: it leaves the
+/// run queue, its memory goes and it becomes a zombie for its parent to
+/// reap, which runs elsewhere or waits. The CPU is left with no process.
+pub(crate) fn complete_live_process_exit_detached(pid: u32, status: u8) -> bool {
+    let Some(table) = live_process_table_mut() else {
+        return false;
+    };
+    let Some(handle) = table.handle_by_pid(pid) else {
+        return false;
+    };
+    let Some(space) = table
+        .process(handle)
+        .filter(|process| process.state == ProcessState::Running)
+        .and_then(|process| process.address_space)
+    else {
+        return false;
+    };
+    let Some(run_queue) = scheduler::active_process_scheduler_workspace() else {
+        return false;
+    };
+    table.withdraw_from_scheduler(handle, run_queue)
+        && release_live_process_address_space(space)
+        && crate::linux_sysv_ipc::drop_process_attachments(pid).is_ok()
+        && table.exit_after_current_address_space_retired(handle, status)
 }
 
 pub(crate) fn switch_live_process(from_pid: u32, to_pid: u32) -> Option<LiveProcessDispatch> {

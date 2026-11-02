@@ -7,6 +7,7 @@ mod arch;
 mod bringup;
 mod capability;
 mod control_abi;
+mod cpu_time;
 mod crypto;
 mod domain;
 mod drivers;

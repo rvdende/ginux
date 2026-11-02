@@ -178,6 +178,13 @@ struct Activation {
     /// frame and user return context), which other activations overwrite
     /// while it waits.
     entry_state: CpuEntryState,
+    /// The kernel-entry depth of the context running this activation, when
+    /// it switched here.
+    base_depth: u32,
+    /// The kernel-entry entries a parked system call holds on its stack,
+    /// taken off its CPU while it waits and given to the CPU that resumes
+    /// it.
+    parked_depth: u32,
 }
 
 /// An activation's context: runs the process until one of its system calls
@@ -189,7 +196,7 @@ extern "sysv64" fn run_activation(argument: *mut c_void) -> ! {
     // entry stub records this stack as the return stack, so the process's
     // system calls run here too.
     unsafe {
-        super::ginux_process_user_enter(
+        super::process_user_enter(
             (*activation).entry,
             (*activation).user_stack,
             (*activation).general.as_ptr(),
@@ -210,6 +217,8 @@ extern "sysv64" fn run_activation(argument: *mut c_void) -> ! {
 unsafe fn run(activation: *mut Activation) -> Outcome {
     // SAFETY: as the caller promises; the record outlives the switch.
     let state = unsafe {
+        (*activation).base_depth = crate::sync::kernel_entry_depth();
+        crate::sync::kernel_entry_attach(core::mem::take(&mut (*activation).parked_depth));
         ginux_switch_stack(&raw mut (*activation).caller, (*activation).context);
         (*activation).state
     };
@@ -275,6 +284,8 @@ pub(super) unsafe fn enter_on_own_stack(
         context: 0,
         state: State::Running,
         entry_state: CpuEntryState::EMPTY,
+        base_depth: 0,
+        parked_depth: 0,
     });
     let activation: *mut Activation = &raw mut *record;
     // SAFETY: the stack is this activation's alone until it finishes.
@@ -311,15 +322,18 @@ pub(super) fn park(owner: u64) -> bool {
     let Some(activation) = activation else {
         return false;
     };
-    let entry_state = super::current_entry_state();
     // SAFETY: this is the running activation, on its own stack; its record
     // stays in ACTIVATIONS while it is parked. The CPU's entry state belongs
-    // to this system call and is put back before it continues.
+    // to this system call and is put back before it continues, into the
+    // entry state of the CPU that resumed it.
     unsafe {
-        (*activation).entry_state = *entry_state;
+        (*activation).entry_state = *super::current_entry_state();
         (*activation).state = State::Parked;
+        let own = crate::sync::kernel_entry_depth().saturating_sub((*activation).base_depth);
+        crate::sync::kernel_entry_detach(own);
+        (*activation).parked_depth = own;
         ginux_switch_stack(&raw mut (*activation).context, (*activation).caller);
-        *entry_state = (*activation).entry_state;
+        *super::current_entry_state() = (*activation).entry_state;
     }
     true
 }
@@ -343,6 +357,16 @@ pub(super) unsafe fn resume(owner: u64) -> Option<Outcome> {
         (*activation).state = State::Running;
         Some(run(activation))
     }
+}
+
+/// Process `owner` has an activation running on some CPU: its system call
+/// is in progress there (or it runs user code), so no other CPU may enter
+/// or resume it.
+pub(super) fn is_running(owner: u64) -> bool {
+    ACTIVATIONS
+        .lock()
+        .iter()
+        .any(|candidate| candidate.owner == owner && candidate.state == State::Running)
 }
 
 /// Process `owner` has a parked activation.

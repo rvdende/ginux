@@ -78,6 +78,9 @@ static LINUX_RUNTIME_THREAD_ACTIVE: [AtomicBool; CPU_LIMIT] =
 static LINUX_RUNTIME_THREAD_SLOTS: [AtomicU8; CPU_LIMIT] =
     [const { AtomicU8::new(u8::MAX) }; CPU_LIMIT];
 pub(super) static TLB_SHOOTDOWN_ADDRESS: AtomicU64 = AtomicU64::new(0);
+/// The page-table root each CPU last loaded into CR3 (0: not known yet), so
+/// that a shootdown interrupts only CPUs using the address space it changes.
+static ACTIVE_ROOTS: [AtomicU64; CPU_LIMIT] = [const { AtomicU64::new(0) }; CPU_LIMIT];
 pub(super) static TLB_SHOOTDOWN_ACKNOWLEDGED: AtomicU32 = AtomicU32::new(0);
 
 global_asm!(
@@ -171,6 +174,10 @@ ginux_ap_trampoline_end:
     .text
     .global ginux_ipi_entry
 ginux_ipi_entry:
+    test qword ptr [rsp + 8], 3
+    jz 1f
+    swapgs
+1:
     clac
     cld
     push rax
@@ -207,6 +214,10 @@ ginux_ipi_entry:
     pop rcx
     pop rbx
     pop rax
+    test qword ptr [rsp + 8], 3
+    jz 2f
+    swapgs
+2:
     iretq
 "#,
     mailbox_cr3 = sym MAILBOX_CR3,
@@ -341,6 +352,12 @@ pub(crate) fn begin_linux_runtime_thread(
         return false;
     }
     true
+}
+
+/// Wakes application processor `cpu` from its idle halt, without waiting:
+/// it looks for work (a domain runtime that wants it) when it wakes.
+pub(crate) fn wake_application_processor(cpu: usize) {
+    let _ = dispatch(cpu, COMMAND_PING, 0);
 }
 
 pub(crate) fn linux_runtime_thread_is_remote(slot: usize) -> bool {
@@ -513,6 +530,14 @@ fn saved_local_apic() -> Option<LocalApic> {
     LocalApic::from_saved(0, mode, APIC_BASE.load(Ordering::Acquire))
 }
 
+/// Records that this CPU is about to load `root` into CR3. Called before the
+/// load, so a CPU changing that root's tables from now on interrupts this one.
+pub(crate) fn note_active_root(root: u64) {
+    if let Some(slot) = ACTIVE_ROOTS.get(cpu::current_cpu_index()) {
+        slot.store(root & 0x000f_ffff_ffff_f000, Ordering::SeqCst);
+    }
+}
+
 pub(crate) fn invalidate_runtime_translation(address: u64) -> bool {
     if address == 0 || !address.is_multiple_of(4096) {
         return false;
@@ -529,8 +554,21 @@ pub(crate) fn invalidate_runtime_translation(address: u64) -> bool {
         TLB_SHOOTDOWN_ADDRESS.store(0, Ordering::Release);
         return false;
     };
+    let root: u64;
+    // SAFETY: reading CR3 has no side effects.
+    unsafe { asm!("mov {}, cr3", out(reg) root, options(nomem, nostack, preserves_flags)) };
+    let root = root & 0x000f_ffff_ffff_f000;
+    // The table write happens before the roots are read, so a CPU that
+    // records this root after the read loads the new entry.
+    core::sync::atomic::fence(Ordering::SeqCst);
     let mut targets = 0_u32;
     for target in 0..online_count() {
+        // A CPU known to be on another address space caches none of this
+        // one's translations: it flushed them when it loaded its own root.
+        let active = ACTIVE_ROOTS[target].load(Ordering::SeqCst);
+        if active != 0 && active != root {
+            continue;
+        }
         // Only a CPU that can be using a user translation needs the
         // shootdown: the boot CPU, and an application processor while it
         // runs a Linux thread or process job. An idle one reloads CR3, which
@@ -539,7 +577,8 @@ pub(crate) fn invalidate_runtime_translation(address: u64) -> bool {
         // times slower.
         if target == current
             || !ONLINE[target].load(Ordering::Acquire)
-            || target != 0
+            || active == 0
+                && target != 0
                 && !LINUX_RUNTIME_THREAD_ACTIVE[target].load(Ordering::Acquire)
                 && LINUX_PROCESS_RESULTS[target].load(Ordering::Acquire) != LINUX_RESULT_PENDING
         {
@@ -661,6 +700,11 @@ extern "sysv64" fn application_processor_main(cpu_index: u32) -> ! {
     ONLINE[cpu].store(true, Ordering::Release);
     ONLINE_COUNT.fetch_add(1, Ordering::AcqRel);
     loop {
-        unsafe { asm!("sti; hlt", options(nomem, nostack)) };
+        // A domain runtime given more than one CPU runs its processes here
+        // too; the IPI that wakes this halt says so.
+        if cpu::linux_runtime_wants_cpu(cpu) {
+            cpu::run_application_processor_runtime(cpu);
+        }
+        unsafe { asm!("sti; hlt; cli", options(nomem, nostack)) };
     }
 }

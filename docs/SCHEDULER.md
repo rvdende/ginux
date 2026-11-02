@@ -382,3 +382,21 @@ Multi-CPU domains still cannot run an application next to its compositor: a
 process whose threads run on application processors cannot be switched out
 until they block, and the remote futex wait spins without marking its thread
 blocked. That needs the per-CPU loop of step 6.
+
+### Several CPUs per domain (2026-11-02)
+
+A domain set `cpu=N` runs its processes on N CPUs: each application
+processor runs `run_application_processor_runtime`, claiming ready processes
+(not init) from the run queue, with its own timer tick for preemption. The
+kernel-entry lock is released while a CPU is in user mode, so only kernel
+work is serialized. Per-process kernel state is kept in per-CPU banks
+(`linux_cpu_bank()`), filled by capture/restore on each switch. TLB
+shootdowns interrupt only CPUs whose last loaded CR3 is the root being
+changed (`smp::note_active_root`); before that, every page-table change of a
+process on an AP waited on an NMI to CPU 0 and a 4-CPU domain ran
+compute-bound work five times slower than a 1-CPU one.
+
+Measured with cadrs_core's 87 reference tests (host: 6.5 s on 12 threads):
+1 CPU 19.1 s, 4 CPUs 20.2 s. The threads of one process still all run on one
+CPU. Next: index the per-process banks by process instead of by CPU, so CPUs
+running threads of the same process share one copy (step 5).

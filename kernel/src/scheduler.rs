@@ -1214,6 +1214,63 @@ impl ProcessScheduler {
         Some(selected)
     }
 
+    /// Makes `target`, which is ready, current on this CPU while it runs
+    /// nothing: an idle CPU taking a process.
+    pub(crate) fn claim(&mut self, target: ProcessThreadHandle) -> Option<ScheduledProcess> {
+        let cpu = crate::arch::x86_64::cpu::current_cpu_index();
+        if cpu >= PROCESS_CPU_LIMIT || self.current_by_cpu[cpu].is_some() {
+            return None;
+        }
+        let thread = self.scheduler.thread_mut(target.0)?;
+        if thread.state != State::Ready || thread.affinity & (1_u64 << cpu) == 0 {
+            return None;
+        }
+        thread.state = State::Running;
+        let context = thread.context;
+        self.current_by_cpu[cpu] = Some(target.0);
+        self.dispatches[cpu] = self.dispatches[cpu].saturating_add(1);
+        Some(ScheduledProcess {
+            handle: target,
+            context: ProcessSchedulerContext(context),
+        })
+    }
+
+    /// Puts this CPU's current process back among the ready ones with
+    /// `context`, leaving the CPU with none.
+    pub(crate) fn release(
+        &mut self,
+        handle: ProcessThreadHandle,
+        context: ProcessSchedulerContext,
+    ) -> bool {
+        let cpu = crate::arch::x86_64::cpu::current_cpu_index();
+        if cpu >= PROCESS_CPU_LIMIT
+            || self.current_by_cpu[cpu] != Some(handle.0)
+            || !context.0.is_valid()
+        {
+            return false;
+        }
+        let Some(thread) = self
+            .scheduler
+            .thread_mut(handle.0)
+            .filter(|thread| thread.state == State::Running)
+        else {
+            return false;
+        };
+        thread.context = context.0;
+        thread.state = State::Ready;
+        self.current_by_cpu[cpu] = None;
+        true
+    }
+
+    /// Whether `handle` is ready (runnable and current on no CPU) and may
+    /// run on this CPU.
+    pub(crate) fn is_ready_here(&self, handle: ProcessThreadHandle) -> bool {
+        let cpu = crate::arch::x86_64::cpu::current_cpu_index();
+        self.scheduler.thread(handle.0).is_some_and(|thread| {
+            thread.state == State::Ready && cpu < 64 && thread.affinity & (1_u64 << cpu) != 0
+        })
+    }
+
     pub(crate) fn retire(&mut self, handle: ProcessThreadHandle) -> bool {
         let Some(thread) = self.scheduler.thread(handle.0).copied() else {
             return false;

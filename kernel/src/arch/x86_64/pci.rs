@@ -148,6 +148,10 @@ global_asm!(
     .text
     .global ginux_virtio_interrupt_entry
 ginux_virtio_interrupt_entry:
+    test qword ptr [rsp + 8], 3
+    jz 1f
+    swapgs
+1:
     clac
     cld
     push rax
@@ -185,6 +189,10 @@ ginux_virtio_interrupt_entry:
     pop rcx
     pop rbx
     pop rax
+    test qword ptr [rsp + 8], 3
+    jz 2f
+    swapgs
+2:
     iretq
 "#,
     interrupt_handler = sym virtio_interrupt_handler,

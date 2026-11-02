@@ -443,6 +443,7 @@ interior-mutable	kernel/src/arch/x86_64/smp.rs	MAILBOX_CR3	per-cpu-arch	allowlis
 interior-mutable	kernel/src/arch/x86_64/smp.rs	MAILBOX_ENTRY	per-cpu-arch	allowlist	none	sequential-ap-startup-mailbox
 interior-mutable	kernel/src/arch/x86_64/smp.rs	MAILBOX_STACK	per-cpu-arch	allowlist	none	sequential-ap-startup-mailbox
 interior-mutable	kernel/src/arch/x86_64/smp.rs	TLB_SHOOTDOWN_ADDRESS	per-cpu-arch	allowlist	none	serialized-cross-cpu-translation-mailbox
+interior-mutable	kernel/src/arch/x86_64/smp.rs	ACTIVE_ROOTS	per-cpu-arch	allowlist	none	per-cpu-loaded-page-table-root
 interior-mutable	kernel/src/arch/x86_64/smp.rs	TLB_SHOOTDOWN_ACKNOWLEDGED	per-cpu-arch	allowlist	none	serialized-cross-cpu-translation-acknowledgement
 interior-mutable	kernel/src/arch/x86_64/timer.rs	TIMER	platform-device	allowlist	none	explicit-host-timer-owner-root
 interior-mutable	kernel/src/domain.rs	DOMAIN_RUNTIME	shared-runtime	allowlist	none	explicit-lifecycle-owner-root
@@ -577,3 +578,12 @@ interior-mutable	kernel/src/linux_strace.rs	TRACED	domain-runtime	allowlist	none
 interior-mutable	kernel/src/linux_strace.rs	NEXT	domain-runtime	allowlist	none	atomic-diagnostic-trace
 interior-mutable	kernel/src/linux_strace.rs	ACTIVE	domain-runtime	allowlist	none	atomic-diagnostic-trace
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_MAKING_DEV_NODES	domain-runtime	allowlist	none	atomic-reentrancy-guard
+interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_SMP_RUNTIME_INSTANCE	domain-runtime	allowlist	none	atomic-multi-cpu-runtime-gate
+interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_SMP_LOOP_ACTIVE	per-cpu-arch	allowlist	none	atomic-per-cpu-runtime-loop-flag
+interior-mutable	kernel/src/cpu_time.rs	USER	per-cpu-arch	allowlist	none	atomic-per-cpu-time-accounting
+interior-mutable	kernel/src/cpu_time.rs	IDLE	per-cpu-arch	allowlist	none	atomic-per-cpu-time-accounting
+interior-mutable	kernel/src/cpu_time.rs	LOCK_WAIT	per-cpu-arch	allowlist	none	atomic-per-cpu-time-accounting
+interior-mutable	kernel/src/cpu_time.rs	USER_SINCE	per-cpu-arch	allowlist	none	atomic-per-cpu-time-accounting
+interior-mutable	kernel/src/cpu_time.rs	STARTED	per-cpu-arch	allowlist	none	atomic-per-cpu-time-accounting
+interior-mutable	kernel/src/cpu_time.rs	RUNS	per-cpu-arch	allowlist	none	atomic-per-cpu-time-accounting
+interior-mutable	kernel/src/arch/x86_64/cpu/architecture.rs	CPU_INDEX_SOURCE	bootstrap-init	allowlist	none	atomic-boot-selected-cpu-index-source

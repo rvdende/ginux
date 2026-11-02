@@ -211,18 +211,125 @@ pub(crate) fn kernel_entry_lock() -> KernelEntryGuard {
     KERNEL_ENTRY_LOCK.lock()
 }
 
+/// Called just before this CPU returns to a Linux process's user mode:
+/// releases the kernel-entry lock, keeping its depth (the entries of the
+/// calls this CPU is nested in) for `kernel_entry_return_from_user`. User
+/// code never holds the lock, so other CPUs enter the kernel while it runs.
+/// Interrupts must be off.
+pub(crate) fn kernel_entry_leave_to_user() {
+    let lock = &KERNEL_ENTRY_LOCK;
+    let cpu = cpu_slot();
+    if lock.cpu_owner.load(Ordering::Acquire) != cpu as u16 + 1 {
+        return;
+    }
+    let depth = lock.depths[cpu].swap(0, Ordering::AcqRel);
+    lock.user_depths[cpu].store(depth, Ordering::Release);
+    lock.release(cpu);
+}
+
+/// Called when this CPU enters the kernel from a Linux process's user mode
+/// by a system call or fault, which may return to the kernel instead of the
+/// process: takes the lock back with the depth `kernel_entry_leave_to_user`
+/// kept. Interrupts must be off.
+pub(crate) fn kernel_entry_return_from_user() {
+    let lock = &KERNEL_ENTRY_LOCK;
+    let cpu = cpu_slot();
+    if lock.cpu_owner.load(Ordering::Acquire) == cpu as u16 + 1 {
+        return;
+    }
+    let depth = lock.user_depths[cpu].swap(0, Ordering::AcqRel);
+    if depth != 0 {
+        lock.acquire(cpu, depth);
+    }
+}
+
+/// Lets the CPUs waiting for the kernel-entry lock have it before this one
+/// goes on: a scheduling loop that holds it round after round (resuming
+/// parked calls that only check their waits again) never reaches user mode
+/// or a halt, where it would let go, and starved the other CPUs' system
+/// calls.
+pub(crate) fn kernel_entry_yield() {
+    let lock = &KERNEL_ENTRY_LOCK;
+    let cpu = cpu_slot();
+    if lock.cpu_owner.load(Ordering::Acquire) != cpu as u16 + 1
+        || lock.next.load(Ordering::Acquire) == lock.owner.load(Ordering::Acquire).wrapping_add(1)
+    {
+        return;
+    }
+    kernel_entry_leave_to_user();
+    spin_loop();
+    kernel_entry_return_from_user();
+}
+
+/// This CPU's depth in the kernel-entry lock: 0 unless it holds it.
+pub(crate) fn kernel_entry_depth() -> u32 {
+    let lock = &KERNEL_ENTRY_LOCK;
+    let cpu = cpu_slot();
+    if lock.cpu_owner.load(Ordering::Acquire) == cpu as u16 + 1 {
+        lock.depths[cpu].load(Ordering::Acquire)
+    } else {
+        0
+    }
+}
+
+/// Takes `count` entries off this CPU's depth: those of a system call that
+/// parks (see `cpu::activation`), whose frames wait on its own stack while
+/// this CPU goes on with others. The CPU keeps at least its own entry.
+pub(crate) fn kernel_entry_detach(count: u32) {
+    let lock = &KERNEL_ENTRY_LOCK;
+    let cpu = cpu_slot();
+    if count == 0 {
+        return;
+    }
+    if lock.cpu_owner.load(Ordering::Acquire) != cpu as u16 + 1
+        || lock.depths[cpu].load(Ordering::Acquire) <= count
+    {
+        crate::serial_write("ginux: kernel-entry detach cpu/owner/depth/count: ");
+        for value in [
+            cpu as u64,
+            u64::from(lock.cpu_owner.load(Ordering::Acquire)),
+            u64::from(lock.depths[cpu].load(Ordering::Acquire)),
+            u64::from(count),
+        ] {
+            crate::serial_write_u64(value);
+            crate::serial_write(" ");
+        }
+        crate::serial_write("\r\n");
+        crate::kernel_fail("ginux: invalid kernel-entry detach\r\n");
+    }
+    lock.depths[cpu].fetch_sub(count, Ordering::AcqRel);
+}
+
+/// Adds the `count` entries a parked system call took off its CPU's depth
+/// (`kernel_entry_detach`) to this CPU's, which resumes the call, on
+/// whichever CPU that is.
+pub(crate) fn kernel_entry_attach(count: u32) {
+    let lock = &KERNEL_ENTRY_LOCK;
+    let cpu = cpu_slot();
+    if count == 0 {
+        return;
+    }
+    if lock.cpu_owner.load(Ordering::Acquire) != cpu as u16 + 1 {
+        crate::kernel_fail("ginux: invalid kernel-entry attach\r\n");
+    }
+    lock.depths[cpu].fetch_add(count, Ordering::AcqRel);
+}
+
 /// The kernel-entry lock serializes kernel work across CPUs. It is
 /// recursive per CPU: each entry on the owning CPU adds to its depth, and
 /// the lock is released when the depth returns to zero, whichever entry
 /// leaves last. Entries need not leave in the order they came: a system
-/// call parked on its own stack (see `cpu::activation`) keeps its entry
-/// while others start and finish theirs, as Linux's tasks did with the big
-/// kernel lock held across a sleep.
+/// call parked on its own stack (see `cpu::activation`) takes its entries
+/// with it and gives them to the CPU that resumes it. A CPU running user
+/// code holds no lock: it releases it on the way out to user mode and takes
+/// it back, at the same depth, when a system call or fault comes in.
 struct KernelEntryLock {
     next: AtomicU32,
     owner: AtomicU32,
     cpu_owner: AtomicU16,
     depths: [AtomicU32; CPU_SLOT_LIMIT],
+    /// Each CPU's depth while it runs user code.
+    user_depths: [AtomicU32; CPU_SLOT_LIMIT],
     /// The lock rank each CPU held before it took the lock, put back when
     /// it releases it.
     previous_ranks: [AtomicU16; CPU_SLOT_LIMIT],
@@ -235,6 +342,7 @@ impl KernelEntryLock {
             owner: AtomicU32::new(0),
             cpu_owner: AtomicU16::new(0),
             depths: [const { AtomicU32::new(0) }; CPU_SLOT_LIMIT],
+            user_depths: [const { AtomicU32::new(0) }; CPU_SLOT_LIMIT],
             previous_ranks: [const { AtomicU16::new(0) }; CPU_SLOT_LIMIT],
         }
     }
@@ -242,55 +350,70 @@ impl KernelEntryLock {
     fn lock(&'static self) -> KernelEntryGuard {
         let interrupt_state = disable_interrupts();
         let cpu = cpu_slot();
-        let encoded_cpu = cpu as u16 + 1;
-        if self.cpu_owner.load(Ordering::Acquire) == encoded_cpu {
+        if self.cpu_owner.load(Ordering::Acquire) == cpu as u16 + 1 {
             let previous = self.depths[cpu].fetch_add(1, Ordering::AcqRel);
             if previous == 0 {
                 crate::kernel_fail("ginux: invalid recursive kernel-entry depth\r\n");
             }
             return KernelEntryGuard {
                 lock: self,
-                cpu,
                 interrupt_state,
             };
         }
-
-        let previous_rank = enter_rank(LockRank::ARCHITECTURE);
-        let ticket = self.next.fetch_add(1, Ordering::Relaxed);
-        while self.owner.load(Ordering::Acquire) != ticket {
-            spin_loop();
-        }
-        self.previous_ranks[cpu].store(previous_rank, Ordering::Release);
-        self.depths[cpu].store(1, Ordering::Release);
-        self.cpu_owner.store(encoded_cpu, Ordering::Release);
+        self.acquire(cpu, 1);
         KernelEntryGuard {
             lock: self,
-            cpu,
             interrupt_state,
         }
     }
+
+    /// Takes the lock for `cpu` (this CPU) at `depth`.
+    fn acquire(&'static self, cpu: usize, depth: u32) {
+        let previous_rank = enter_rank(LockRank::ARCHITECTURE);
+        let ticket = self.next.fetch_add(1, Ordering::Relaxed);
+        if self.owner.load(Ordering::Acquire) != ticket {
+            let started = crate::arch::x86_64::timer::timestamp_counter();
+            while self.owner.load(Ordering::Acquire) != ticket {
+                spin_loop();
+            }
+            crate::cpu_time::add_lock_wait(
+                crate::arch::x86_64::timer::timestamp_counter().saturating_sub(started),
+            );
+        }
+        self.previous_ranks[cpu].store(previous_rank, Ordering::Release);
+        self.depths[cpu].store(depth, Ordering::Release);
+        self.cpu_owner.store(cpu as u16 + 1, Ordering::Release);
+    }
+
+    /// Lets the next CPU in; `cpu` (this CPU) held the lock.
+    fn release(&'static self, cpu: usize) {
+        self.cpu_owner.store(0, Ordering::Release);
+        leave_rank(
+            LockRank::ARCHITECTURE,
+            self.previous_ranks[cpu].load(Ordering::Acquire),
+        );
+        self.owner.fetch_add(1, Ordering::Release);
+    }
 }
 
+/// An entry into the kernel-entry lock. It counts against the CPU that drops
+/// it, which for a parked system call resumed elsewhere is not the one that
+/// took it.
 pub(crate) struct KernelEntryGuard {
     lock: &'static KernelEntryLock,
-    cpu: usize,
     interrupt_state: InterruptState,
 }
 
 impl Drop for KernelEntryGuard {
     fn drop(&mut self) {
-        let previous = self.lock.depths[self.cpu].fetch_sub(1, Ordering::AcqRel);
+        let cpu = cpu_slot();
+        let previous = self.lock.depths[cpu].fetch_sub(1, Ordering::AcqRel);
         if previous == 0 {
             crate::kernel_fail("ginux: invalid kernel-entry release depth\r\n");
         }
         // The last entry on this CPU to leave releases the lock.
         if previous == 1 {
-            self.lock.cpu_owner.store(0, Ordering::Release);
-            leave_rank(
-                LockRank::ARCHITECTURE,
-                self.lock.previous_ranks[self.cpu].load(Ordering::Acquire),
-            );
-            self.lock.owner.fetch_add(1, Ordering::Release);
+            self.lock.release(cpu);
         }
         restore_interrupts(self.interrupt_state);
     }

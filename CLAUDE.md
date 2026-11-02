@@ -77,6 +77,9 @@ through a Linux ABI personality. It is not a rewrite of Linux:
 - `make check` needs ripgrep (`rg`) for the architecture checks; it is not
   installed system-wide, so put VS Code's copy on PATH:
   `PATH=/usr/share/code/resources/app/node_modules.asar.unpacked/@vscode/ripgrep-universal/bin/linux-x64:$PATH`.
+- Quick gate before committing: `make test-quick` (about 2 minutes: check,
+  the all-Rust userland, the 4-CPU multicore test). The full suites and LTP
+  take half an hour; run them for wide changes, not every commit.
 - Key suites: `make check`, `make userland-check`, `make test-alpine`,
   `tests/qemu/rust-workloads.sh` (cargo builds serde inside Ginux),
   `make test-rust-userland`, `make test-desktop`,

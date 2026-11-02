@@ -17,7 +17,7 @@ SYSTEM_PROFILE := profiles/minimal-system-v0/profile.tsv
 
 .DEFAULT_GOAL := help
 
-.PHONY: help doctor manifest system-image test-alpine test-rocky-shell test-rocky-dnf test-multi-domain test-multi-domain-detached test-linux-abi test-linux-runtime test-storage test-oci-cache test-smp test-rocky-smp-futex test-rocky-smp-shared-page test-rocky-smp-thread-context probe-rocky-systemd test-rocky-systemd test-rocky-detached test-domain-responsiveness benchmark-rocky-systemd benchmark-prepare-linux benchmark-prepare-ginux benchmark-linux-comparison benchmark-ginux-boot benchmark-boot-comparison benchmark-ginux-sysbench benchmark-compare benchmark-topology-matrix benchmark-topology-compare profile-rocky-systemd rocky-image rocky-image-check linux-probe controller-runtime network-service protocol-service volume-service abi-conformance architecture-check linux-compat-check build build-verification build-linux-profile run reset-storage boot-media test-boot-media test-hardware-profile test-rust-workloads test-desktop test-desktop-virtio-gpu test-rust-userlandrust-rootfs userland userland-check ltp test-ltp ltp-check test test-c1 test-c2 fmt gate clean
+.PHONY: help doctor manifest system-image test-alpine test-rocky-shell test-rocky-dnf test-multi-domain test-multi-domain-detached test-linux-abi test-linux-runtime test-storage test-oci-cache test-smp test-rocky-smp-futex test-rocky-smp-shared-page test-rocky-smp-thread-context probe-rocky-systemd test-rocky-systemd test-rocky-detached test-domain-responsiveness benchmark-rocky-systemd benchmark-prepare-linux benchmark-prepare-ginux benchmark-linux-comparison benchmark-ginux-boot benchmark-boot-comparison benchmark-ginux-sysbench benchmark-compare benchmark-topology-matrix benchmark-topology-compare profile-rocky-systemd rocky-image rocky-image-check linux-probe controller-runtime network-service protocol-service volume-service abi-conformance architecture-check linux-compat-check build build-verification build-linux-profile run reset-storage boot-media test-boot-media test-hardware-profile test-rust-workloads test-desktop test-desktop-virtio-gpu test-multicore test-quick test-rust-userland rust-rootfs userland userland-check ltp test-ltp ltp-check test test-c1 test-c2 fmt gate clean
 
 help:
 	@echo "Ginux development targets"
@@ -33,6 +33,8 @@ help:
 	@echo "  make test-rust-userland  Boot a builtin://rust domain and run its brush/uutils test"
 	@echo "  make test-desktop        Run the Wayland compositor and terminal on /dev/fb0, all-Rust userland"
 	@echo "  make test-desktop-virtio-gpu  The same desktop on a virtio-gpu display (no VGA)"
+	@echo "  make test-multicore      Four CPU-bound processes run at once in a 4-CPU domain"
+	@echo "  make test-quick          Quick gate (~2 min): check, all-Rust userland, multicore"
 	@echo "  make ltp                 Build the LTP syscall tests statically for musl (Docker)"
 	@echo "  make test-ltp            Run the LTP syscall tests in an Alpine domain (docs/LTP.md)"
 	@echo "  make ltp-check           Check the LTP harness (tests/ltp): fmt, clippy, unit tests"
@@ -287,6 +289,13 @@ test-desktop: rust-rootfs build
 # the host picks (not the firmware's 1280x800).
 test-desktop-virtio-gpu: rust-rootfs build
 	@GINUX_QEMU_GPU=virtio GINUX_QEMU_GPU_SIZE=1024x768 tests/qemu/wayland-desktop.sh
+
+# A domain given four CPUs runs four CPU-bound processes at once (tests/smp).
+test-multicore: rust-rootfs build
+	@cargo test --manifest-path tests/smp/Cargo.toml multicore -- --nocapture
+
+# The quick gate before a commit: the full suites and LTP take half an hour.
+test-quick: check test-rust-userland test-multicore
 
 test-storage: build
 	@tests/qemu/persistent-storage.sh

@@ -14404,6 +14404,7 @@ fn current_root() -> u64 {
 }
 
 unsafe fn activate(root: u64) {
+    crate::arch::x86_64::smp::note_active_root(root);
     asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
 }
 

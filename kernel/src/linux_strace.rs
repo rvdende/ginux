@@ -91,8 +91,15 @@ pub(crate) struct Call {
     pub(crate) tid: u32,
     pub(crate) number: u64,
     pub(crate) arguments: [u64; 4],
-    pub(crate) path: [u8; 128],
+    /// The path argument, or the first bytes a write passes.
+    pub(crate) path: [u8; 512],
     pub(crate) path_length: usize,
+}
+
+/// System call `number` writes data from a buffer (write, pwrite64): its
+/// first bytes go in the trace line.
+pub(crate) fn writes_buffer(number: u64) -> bool {
+    matches!(number, 1 | 18)
 }
 
 impl Call {
@@ -112,7 +119,17 @@ impl Call {
         }
         if self.path_length != 0 {
             crate::serial_write(", \"");
-            crate::serial_write_bytes(&self.path[..self.path_length]);
+            // Control characters as '.', so a written buffer stays on one
+            // line.
+            let mut text = [0_u8; 512];
+            for (shown, byte) in text.iter_mut().zip(&self.path[..self.path_length]) {
+                *shown = if byte.is_ascii_graphic() || *byte == b' ' {
+                    *byte
+                } else {
+                    b'.'
+                };
+            }
+            crate::serial_write_bytes(&text[..self.path_length]);
             crate::serial_write("\"");
         }
         crate::serial_write(")");

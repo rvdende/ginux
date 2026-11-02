@@ -29,10 +29,21 @@ fn write_linux_syscall_heartbeat(count: u64, number: u64, registers: &LinuxSysca
     serial_write(")\r\n");
 }
 
-/// System call entries, fast paths included: a count that moves whenever a
-/// process gets past a wait and runs, which the runtime loop watches to
-/// tell progress from parked calls rechecking their waits.
-pub(super) static LINUX_SYSCALL_ENTRIES: AtomicU64 = AtomicU64::new(0);
+/// System call entries per CPU, fast paths included: a count that moves
+/// whenever a process gets past a wait and runs, which the runtime loop
+/// watches to tell progress from parked calls rechecking their waits.
+pub(super) static LINUX_SYSCALL_ENTRIES: [AtomicU64; CPU_ENTRY_STATE_LIMIT] =
+    [const { AtomicU64::new(0) }; CPU_ENTRY_STATE_LIMIT];
+
+/// System call entries on this CPU (see `LINUX_SYSCALL_ENTRIES`): a CPU's
+/// scheduling loop measures the progress of the processes it runs, not of
+/// those other CPUs run.
+pub(super) fn linux_syscall_entries_here() -> &'static AtomicU64 {
+    let cpu = current_cpu_index_checked()
+        .filter(|cpu| *cpu < CPU_ENTRY_STATE_LIMIT)
+        .unwrap_or(0);
+    &LINUX_SYSCALL_ENTRIES[cpu]
+}
 
 pub(super) extern "sysv64" fn linux_syscall_handler(
     number: u64,
@@ -41,13 +52,21 @@ pub(super) extern "sysv64" fn linux_syscall_handler(
     user_rip: u64,
     user_rflags: u64,
 ) -> u64 {
-    LINUX_SYSCALL_ENTRIES.fetch_add(1, Ordering::Relaxed);
+    // Back in the kernel at the depth this CPU had when it left for user
+    // mode, in case the call returns to the kernel.
+    crate::cpu_time::back_from_user();
+    crate::sync::kernel_entry_return_from_user();
+    linux_syscall_entries_here().fetch_add(1, Ordering::Relaxed);
     let traced = linux_strace_call(number, registers);
     let started = timer::timestamp_counter();
     let result = linux_syscall_dispatch(number, registers, user_stack, user_rip, user_rflags);
     crate::linux_profile::time_syscall(number, timer::timestamp_counter().wrapping_sub(started));
     if let Some(call) = traced.filter(|call| !crate::linux_strace::logged_before(call.number)) {
         call.log(Some(result));
+    }
+    if result != LINUX_RETURN_TO_KERNEL {
+        crate::sync::kernel_entry_leave_to_user();
+        crate::cpu_time::leave_for_user();
     }
     result
 }
@@ -93,10 +112,17 @@ fn linux_strace_call(
         tid: current_linux_tid().unwrap_or(0),
         number,
         arguments,
-        path: [0; 128],
+        path: [0; 512],
         path_length: 0,
     };
-    if let Some(index) = crate::linux_strace::path_argument(number) {
+    if crate::linux_strace::writes_buffer(number) {
+        let length = usize::try_from(arguments[2])
+            .unwrap_or(usize::MAX)
+            .min(call.path.len());
+        if copy_from_linux_user(arguments[1], &mut call.path[..length]) {
+            call.path_length = length;
+        }
+    } else if let Some(index) = crate::linux_strace::path_argument(number) {
         let mut path = [0_u8; LINUX_PATH_MAX];
         if let Ok(length) = copy_linux_c_string(arguments[index], &mut path) {
             call.path_length = length.min(call.path.len());

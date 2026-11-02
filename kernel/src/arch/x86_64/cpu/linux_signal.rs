@@ -1668,7 +1668,7 @@ pub(super) fn linux_kill_current(
     }
     // SAFETY: syscall entry is serialized with interrupts disabled until its
     // return context enters the handler.
-    unsafe { X86_MUTABLE_RUNTIME.signal_context.get().write(context) };
+    unsafe { linux_signal_context().get().write(context) };
     linux_apply_delivered_signal_action(index, signal_bit, old_mask, flags);
     if use_alt_stack {
         if old_alt_stack_flags & LINUX_SS_AUTODISARM != 0 {
@@ -1984,7 +1984,7 @@ pub(super) fn linux_deliver_signal_to_blocked_wait(
     }
     // SAFETY: the switch above made the target the sole running Linux thread,
     // and the live return already names its validated handler context.
-    unsafe { X86_MUTABLE_RUNTIME.signal_context.get().write(context) };
+    unsafe { linux_signal_context().get().write(context) };
     linux_apply_delivered_signal_action(index, signal_bit, restored_mask, flags);
     if use_alt_stack {
         if old_alt_stack_flags & LINUX_SS_AUTODISARM != 0 {
@@ -2540,7 +2540,7 @@ pub(super) fn deliver_linux_sigsegv(
     }
     // SAFETY: interrupts are disabled from exception entry through IRETQ, and
     // only one bounded Linux signal frame may be active at a time.
-    unsafe { X86_MUTABLE_RUNTIME.signal_context.get().write(context) };
+    unsafe { linux_signal_context().get().write(context) };
     linux_apply_delivered_signal_action(index, signal_bit, old_mask, flags);
     if use_alt_stack {
         if old_alt_stack_flags & LINUX_SS_AUTODISARM != 0 {
@@ -2574,7 +2574,7 @@ pub(super) fn linux_rt_sigreturn(output: *mut LinuxSyscallFrame, user_stack: u64
     }
     // SAFETY: signal delivery serializes this context while interrupts remain
     // disabled; active is cleared before another delivery can publish state.
-    let context = unsafe { X86_MUTABLE_RUNTIME.signal_context.get().cast_const().read() };
+    let context = unsafe { linux_signal_context().get().cast_const().read() };
     if context.signal_stack.checked_add(8) != Some(user_stack) {
         return LINUX_EINVAL;
     }
@@ -2590,12 +2590,7 @@ pub(super) fn linux_rt_sigreturn(output: *mut LinuxSyscallFrame, user_stack: u64
     }
     // SAFETY: this serialized return consumes the sole active record before
     // checking whether another unblocked pending signal should replace it.
-    unsafe {
-        X86_MUTABLE_RUNTIME
-            .signal_context
-            .get()
-            .write(LinuxSignalContext::ZERO)
-    };
+    unsafe { linux_signal_context().get().write(LinuxSignalContext::ZERO) };
     store_current_linux_signal_mask(restored.signal_mask);
     X86_RUNTIME
         .ELF_PROBE_ALT_STACK_POINTER
@@ -2635,7 +2630,7 @@ pub(super) fn abort_linux_signal() {
     {
         // SAFETY: the active context is exclusively owned by this serialized
         // Linux execution while interrupts remain disabled.
-        let context = unsafe { X86_MUTABLE_RUNTIME.signal_context.get().cast_const().read() };
+        let context = unsafe { linux_signal_context().get().cast_const().read() };
         store_current_linux_signal_mask(context.signal_mask);
         X86_RUNTIME
             .ELF_PROBE_ALT_STACK_POINTER
@@ -2646,11 +2641,6 @@ pub(super) fn abort_linux_signal() {
         X86_RUNTIME
             .ELF_PROBE_ALT_STACK_FLAGS
             .store(context.alt_stack_flags, Ordering::SeqCst);
-        unsafe {
-            X86_MUTABLE_RUNTIME
-                .signal_context
-                .get()
-                .write(LinuxSignalContext::ZERO)
-        };
+        unsafe { linux_signal_context().get().write(LinuxSignalContext::ZERO) };
     }
 }

@@ -191,29 +191,30 @@ struct X86RuntimeOwner {
         [[AtomicU8; control_abi::DOMAIN_MAX_PERSONALITY_SIZE]; control_abi::DOMAIN_LIMIT],
     >,
     DOMAIN_PERSONALITY_SIZES: RuntimeRef<[AtomicU8; control_abi::DOMAIN_LIMIT]>,
-    ELF_PROBE_ACTIVE: RuntimeRef<BankedAtomicBool>,
+    ELF_PROBE_ACTIVE: RuntimeRef<CpuBankedAtomicBool>,
     ELF_PROBE_ACTIVE_IMAGE_ADDRESSES:
         RuntimeRef<[BankedAtomicU64; LINUX_ACTIVE_IMAGE_MAPPING_LIMIT]>,
     ELF_PROBE_ACTIVE_IMAGE_COUNT: RuntimeRef<BankedAtomicU16>,
-    ELF_PROBE_ACTIVE_IMAGE_FLAGS: RuntimeRef<[BankedAtomicU8; LINUX_ACTIVE_IMAGE_MAPPING_LIMIT]>,
-    ELF_PROBE_ACTIVE_IMAGE_FRAMES: RuntimeRef<[BankedAtomicU64; LINUX_ACTIVE_IMAGE_MAPPING_LIMIT]>,
+    ELF_PROBE_ACTIVE_IMAGE_FLAGS: RuntimeRef<[CpuBankedAtomicU8; LINUX_ACTIVE_IMAGE_MAPPING_LIMIT]>,
+    ELF_PROBE_ACTIVE_IMAGE_FRAMES:
+        RuntimeRef<[CpuBankedAtomicU64; LINUX_ACTIVE_IMAGE_MAPPING_LIMIT]>,
     ELF_PROBE_ACTIVE_IMAGE_GENERATIONS:
-        RuntimeRef<[BankedAtomicU32; LINUX_ACTIVE_IMAGE_MAPPING_LIMIT]>,
-    ELF_PROBE_ALT_STACK_FLAGS: RuntimeRef<BankedAtomicU32>,
-    ELF_PROBE_ALT_STACK_POINTER: RuntimeRef<BankedAtomicU64>,
-    ELF_PROBE_ALT_STACK_SIZE: RuntimeRef<BankedAtomicU64>,
-    ELF_PROBE_BRK: RuntimeRef<BankedAtomicU64>,
+        RuntimeRef<[CpuBankedAtomicU32; LINUX_ACTIVE_IMAGE_MAPPING_LIMIT]>,
+    ELF_PROBE_ALT_STACK_FLAGS: RuntimeRef<CpuBankedAtomicU32>,
+    ELF_PROBE_ALT_STACK_POINTER: RuntimeRef<CpuBankedAtomicU64>,
+    ELF_PROBE_ALT_STACK_SIZE: RuntimeRef<CpuBankedAtomicU64>,
+    ELF_PROBE_BRK: RuntimeRef<CpuBankedAtomicU64>,
     ELF_PROBE_BRK_LIMIT: RuntimeRef<BankedAtomicU64>,
     ELF_PROBE_CLOCK_EPOCH: RuntimeRef<BankedAtomicU64>,
     ELF_PROBE_CLOCK_FREQUENCY: RuntimeRef<BankedAtomicU64>,
-    ELF_PROBE_CODE_BASE: RuntimeRef<BankedAtomicU64>,
-    ELF_PROBE_CODE_SIZE: RuntimeRef<BankedAtomicU64>,
-    ELF_PROBE_COMPLETED: RuntimeRef<BankedAtomicBool>,
-    ELF_PROBE_CONSOLE_CLOEXEC: RuntimeRef<[BankedAtomicU64; LINUX_DESCRIPTOR_FLAG_WORD_COUNT]>,
-    ELF_PROBE_CONSOLE_DESCRIPTORS: RuntimeRef<BankedAtomicU8>,
-    ELF_PROBE_CWD: RuntimeRef<BankedAtomicU16>,
-    ELF_PROBE_DATA: RuntimeRef<BankedAtomicU64>,
-    ELF_PROBE_DATA_SIZE: RuntimeRef<BankedAtomicU64>,
+    ELF_PROBE_CODE_BASE: RuntimeRef<CpuBankedAtomicU64>,
+    ELF_PROBE_CODE_SIZE: RuntimeRef<CpuBankedAtomicU64>,
+    ELF_PROBE_COMPLETED: RuntimeRef<CpuBankedAtomicBool>,
+    ELF_PROBE_CONSOLE_CLOEXEC: RuntimeRef<[CpuBankedAtomicU64; LINUX_DESCRIPTOR_FLAG_WORD_COUNT]>,
+    ELF_PROBE_CONSOLE_DESCRIPTORS: RuntimeRef<CpuBankedAtomicU8>,
+    ELF_PROBE_CWD: RuntimeRef<CpuBankedAtomicU16>,
+    ELF_PROBE_DATA: RuntimeRef<CpuBankedAtomicU64>,
+    ELF_PROBE_DATA_SIZE: RuntimeRef<CpuBankedAtomicU64>,
     ELF_PROBE_DEPENDENCY_BASE_END: RuntimeRef<[BankedAtomicU64; LINUX_DEPENDENCY_COUNT]>,
     ELF_PROBE_DEPENDENCY_BASE_MIN: RuntimeRef<[BankedAtomicU64; LINUX_DEPENDENCY_COUNT]>,
     ELF_PROBE_DEPENDENCY_FILE_SIZES: RuntimeRef<[BankedAtomicU64; LINUX_DEPENDENCY_STATE_COUNT]>,
@@ -225,34 +226,34 @@ struct X86RuntimeOwner {
     ELF_PROBE_DEPENDENCY_RELATIVES: RuntimeRef<[BankedAtomicU64; LINUX_DEPENDENCY_STATE_COUNT]>,
     ELF_PROBE_DEPENDENCY_SELECTED_BASE: RuntimeRef<[BankedAtomicU64; LINUX_DEPENDENCY_COUNT]>,
     ELF_PROBE_DESCRIPTOR_OFFSETS:
-        RuntimeRef<BankedAtomicArray<AtomicU64, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
+        RuntimeRef<CpuBankedAtomicArray<AtomicU64, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
     ELF_PROBE_DEVICE_DESCRIPTORS:
-        RuntimeRef<BankedAtomicArray<AtomicU16, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
-    ELF_PROBE_DUMPABLE: RuntimeRef<BankedAtomicBool>,
+        RuntimeRef<CpuBankedAtomicArray<AtomicU16, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
+    ELF_PROBE_DUMPABLE: RuntimeRef<CpuBankedAtomicBool>,
     ELF_PROBE_EPOLL_DATA:
-        RuntimeRef<BankedAtomicArray<AtomicU64, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>>,
-    ELF_PROBE_EPOLL_DESCRIPTOR: RuntimeRef<BankedAtomicU16>,
+        RuntimeRef<CpuBankedAtomicArray<AtomicU64, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>>,
+    ELF_PROBE_EPOLL_DESCRIPTOR: RuntimeRef<CpuBankedAtomicU16>,
     ELF_PROBE_EPOLL_EVENTS:
-        RuntimeRef<BankedAtomicArray<AtomicU32, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>>,
+        RuntimeRef<CpuBankedAtomicArray<AtomicU32, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>>,
     ELF_PROBE_EVENTFD_COUNTER: RuntimeRef<BankedAtomicU64>,
     ELF_PROBE_EVENTFD_DESCRIPTOR: RuntimeRef<BankedAtomicU16>,
     ELF_PROBE_EVENTFD_FLAGS: RuntimeRef<BankedAtomicU32>,
     ELF_PROBE_EXEC_ENTRY: RuntimeRef<BankedAtomicU64>,
-    ELF_PROBE_EXEC_IGNORED_SIGNALS: RuntimeRef<BankedAtomicU64>,
+    ELF_PROBE_EXEC_IGNORED_SIGNALS: RuntimeRef<CpuBankedAtomicU64>,
     ELF_PROBE_EXEC_MAPPING_ADDRESSES: RuntimeRef<[BankedAtomicU64; LINUX_EXEC_MAPPING_LIMIT]>,
     ELF_PROBE_EXEC_MAPPING_FLAGS: RuntimeRef<[BankedAtomicU8; LINUX_EXEC_MAPPING_LIMIT]>,
-    ELF_PROBE_EXEC_MAPPING_FRAMES: RuntimeRef<[BankedAtomicU64; LINUX_EXEC_MAPPING_LIMIT]>,
-    ELF_PROBE_EXEC_MAPPING_GENERATIONS: RuntimeRef<[BankedAtomicU32; LINUX_EXEC_MAPPING_LIMIT]>,
+    ELF_PROBE_EXEC_MAPPING_FRAMES: RuntimeRef<[CpuBankedAtomicU64; LINUX_EXEC_MAPPING_LIMIT]>,
+    ELF_PROBE_EXEC_MAPPING_GENERATIONS: RuntimeRef<[CpuBankedAtomicU32; LINUX_EXEC_MAPPING_LIMIT]>,
     ELF_PROBE_EXEC_NODE: RuntimeRef<BankedAtomicU8>,
     ELF_PROBE_EXEC_REPLACED: RuntimeRef<BankedAtomicBool>,
     ELF_PROBE_EXITED_CLEAR_CHILD_TID: RuntimeRef<BankedAtomicU64>,
     ELF_PROBE_EXITED_ROBUST_LIST: RuntimeRef<BankedAtomicU64>,
-    ELF_PROBE_EXIT_STATUS: RuntimeRef<BankedAtomicU64>,
-    ELF_PROBE_HEAP_FRAME: RuntimeRef<BankedAtomicU64>,
-    ELF_PROBE_HEAP_GENERATION: RuntimeRef<BankedAtomicU32>,
-    ELF_PROBE_IOPRIO: RuntimeRef<BankedAtomicU16>,
-    ELF_PROBE_LOADER_CODE_BASE: RuntimeRef<BankedAtomicU64>,
-    ELF_PROBE_LOADER_CODE_SIZE: RuntimeRef<BankedAtomicU64>,
+    ELF_PROBE_EXIT_STATUS: RuntimeRef<CpuBankedAtomicU64>,
+    ELF_PROBE_HEAP_FRAME: RuntimeRef<CpuBankedAtomicU64>,
+    ELF_PROBE_HEAP_GENERATION: RuntimeRef<CpuBankedAtomicU32>,
+    ELF_PROBE_IOPRIO: RuntimeRef<CpuBankedAtomicU16>,
+    ELF_PROBE_LOADER_CODE_BASE: RuntimeRef<CpuBankedAtomicU64>,
+    ELF_PROBE_LOADER_CODE_SIZE: RuntimeRef<CpuBankedAtomicU64>,
     ELF_PROBE_MAIN_ADDRESSES: RuntimeRef<[BankedAtomicU64; LINUX_MAIN_MAPPING_COUNT]>,
     ELF_PROBE_MAIN_FILE_SIZES: RuntimeRef<[BankedAtomicU64; LINUX_MAIN_MAPPING_COUNT]>,
     ELF_PROBE_MAIN_FRAMES: RuntimeRef<[BankedAtomicU64; LINUX_MAIN_MAPPING_COUNT]>,
@@ -260,27 +261,27 @@ struct X86RuntimeOwner {
     ELF_PROBE_MAIN_MAPPINGS: RuntimeRef<BankedAtomicU8>,
     ELF_PROBE_MAIN_OFFSETS: RuntimeRef<[BankedAtomicU64; LINUX_MAIN_MAPPING_COUNT]>,
     ELF_PROBE_MAIN_PROTECTIONS: RuntimeRef<[BankedAtomicU8; LINUX_MAIN_MAPPING_COUNT]>,
-    ELF_PROBE_MEMBARRIER_REGISTRATIONS: RuntimeRef<BankedAtomicU32>,
-    ELF_PROBE_MMAP: RuntimeRef<BankedAtomicU64>,
-    ELF_PROBE_MMAP_FILE: RuntimeRef<[BankedAtomicU8; LINUX_RUNTIME_MMAP_SLOT_COUNT]>,
-    ELF_PROBE_MMAP_FRAMES: RuntimeRef<[BankedAtomicU64; LINUX_RUNTIME_MMAP_SLOT_COUNT]>,
-    ELF_PROBE_MMAP_GENERATIONS: RuntimeRef<[BankedAtomicU32; LINUX_RUNTIME_MMAP_SLOT_COUNT]>,
-    ELF_PROBE_MMAP_NEXT: RuntimeRef<BankedAtomicU64>,
-    ELF_PROBE_MMAP_PAGES: RuntimeRef<[BankedAtomicU8; LINUX_RUNTIME_MMAP_SLOT_COUNT]>,
-    ELF_PROBE_MMAP_PROTECTION: RuntimeRef<[BankedAtomicU8; LINUX_RUNTIME_MMAP_SLOT_COUNT]>,
-    ELF_PROBE_MMAP_SEALED: RuntimeRef<[BankedAtomicBool; LINUX_RUNTIME_MMAP_SLOT_COUNT]>,
-    ELF_PROBE_NICE: RuntimeRef<BankedAtomicU8>,
-    ELF_PROBE_NO_NEW_PRIVS: RuntimeRef<BankedAtomicBool>,
+    ELF_PROBE_MEMBARRIER_REGISTRATIONS: RuntimeRef<CpuBankedAtomicU32>,
+    ELF_PROBE_MMAP: RuntimeRef<CpuBankedAtomicU64>,
+    ELF_PROBE_MMAP_FILE: RuntimeRef<[CpuBankedAtomicU8; LINUX_RUNTIME_MMAP_SLOT_COUNT]>,
+    ELF_PROBE_MMAP_FRAMES: RuntimeRef<[CpuBankedAtomicU64; LINUX_RUNTIME_MMAP_SLOT_COUNT]>,
+    ELF_PROBE_MMAP_GENERATIONS: RuntimeRef<[CpuBankedAtomicU32; LINUX_RUNTIME_MMAP_SLOT_COUNT]>,
+    ELF_PROBE_MMAP_NEXT: RuntimeRef<CpuBankedAtomicU64>,
+    ELF_PROBE_MMAP_PAGES: RuntimeRef<[CpuBankedAtomicU8; LINUX_RUNTIME_MMAP_SLOT_COUNT]>,
+    ELF_PROBE_MMAP_PROTECTION: RuntimeRef<[CpuBankedAtomicU8; LINUX_RUNTIME_MMAP_SLOT_COUNT]>,
+    ELF_PROBE_MMAP_SEALED: RuntimeRef<[CpuBankedAtomicBool; LINUX_RUNTIME_MMAP_SLOT_COUNT]>,
+    ELF_PROBE_NICE: RuntimeRef<CpuBankedAtomicU8>,
+    ELF_PROBE_NO_NEW_PRIVS: RuntimeRef<CpuBankedAtomicBool>,
     ELF_PROBE_OPEN_FILE_IDS:
-        RuntimeRef<BankedAtomicArray<AtomicU64, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
-    ELF_PROBE_OVERLAY_CWD: RuntimeRef<BankedAtomicU32>,
-    ELF_PROBE_PAGE_TABLE_FRAMES: RuntimeRef<[BankedAtomicU64; 6]>,
-    ELF_PROBE_PAGE_TABLE_GENERATIONS: RuntimeRef<[BankedAtomicU32; 6]>,
-    ELF_PROBE_PARENT_DEATH_SIGNAL: RuntimeRef<BankedAtomicU32>,
-    ELF_PROBE_PENDING_SIGNALS: RuntimeRef<BankedAtomicU64>,
-    ELF_PROBE_PENDING_SIGNAL_CODES: RuntimeRef<[BankedAtomicU32; LINUX_SIGNAL_COUNT]>,
-    ELF_PROBE_PENDING_SIGNAL_VALUES: RuntimeRef<[BankedAtomicU64; LINUX_SIGNAL_COUNT]>,
-    ELF_PROBE_PERSONALITY: RuntimeRef<BankedAtomicU32>,
+        RuntimeRef<CpuBankedAtomicArray<AtomicU64, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
+    ELF_PROBE_OVERLAY_CWD: RuntimeRef<CpuBankedAtomicU32>,
+    ELF_PROBE_PAGE_TABLE_FRAMES: RuntimeRef<[CpuBankedAtomicU64; 6]>,
+    ELF_PROBE_PAGE_TABLE_GENERATIONS: RuntimeRef<[CpuBankedAtomicU32; 6]>,
+    ELF_PROBE_PARENT_DEATH_SIGNAL: RuntimeRef<CpuBankedAtomicU32>,
+    ELF_PROBE_PENDING_SIGNALS: RuntimeRef<CpuBankedAtomicU64>,
+    ELF_PROBE_PENDING_SIGNAL_CODES: RuntimeRef<[CpuBankedAtomicU32; LINUX_SIGNAL_COUNT]>,
+    ELF_PROBE_PENDING_SIGNAL_VALUES: RuntimeRef<[CpuBankedAtomicU64; LINUX_SIGNAL_COUNT]>,
+    ELF_PROBE_PERSONALITY: RuntimeRef<CpuBankedAtomicU32>,
     ELF_PROBE_PIPE_BUFFER: RuntimeRef<[BankedAtomicU8; LINUX_PIPE_CAPACITY]>,
     ELF_PROBE_PIPE_LENGTH: RuntimeRef<BankedAtomicU32>,
     ELF_PROBE_PIPE_READ_DESCRIPTOR: RuntimeRef<BankedAtomicU16>,
@@ -291,11 +292,11 @@ struct X86RuntimeOwner {
     ELF_PROBE_POSIX_TIMER_ACTIVE: RuntimeRef<BankedAtomicBool>,
     ELF_PROBE_POSIX_TIMER_DEADLINE: RuntimeRef<BankedAtomicU64>,
     ELF_PROBE_POSIX_TIMER_INTERVAL: RuntimeRef<BankedAtomicU64>,
-    ELF_PROBE_PROCESS_NAME_HIGH: RuntimeRef<BankedAtomicU64>,
-    ELF_PROBE_PROCESS_NAME_LOW: RuntimeRef<BankedAtomicU64>,
+    ELF_PROBE_PROCESS_NAME_HIGH: RuntimeRef<CpuBankedAtomicU64>,
+    ELF_PROBE_PROCESS_NAME_LOW: RuntimeRef<CpuBankedAtomicU64>,
     ELF_PROBE_READ_ONLY_DATA_PAGE: RuntimeRef<BankedAtomicU64>,
-    ELF_PROBE_REAL_TIMER_DEADLINE: RuntimeRef<BankedAtomicU64>,
-    ELF_PROBE_REAL_TIMER_INTERVAL: RuntimeRef<BankedAtomicU64>,
+    ELF_PROBE_REAL_TIMER_DEADLINE: RuntimeRef<CpuBankedAtomicU64>,
+    ELF_PROBE_REAL_TIMER_INTERVAL: RuntimeRef<CpuBankedAtomicU64>,
     ELF_PROBE_RECLAIM_HEAP_FRAME: RuntimeRef<BankedAtomicU64>,
     ELF_PROBE_RECLAIM_HEAP_GENERATION: RuntimeRef<BankedAtomicU32>,
     ELF_PROBE_RECLAIM_PAGE_TABLE_FRAMES: RuntimeRef<[BankedAtomicU64; 6]>,
@@ -304,8 +305,8 @@ struct X86RuntimeOwner {
     ELF_PROBE_RECLAIM_SIBLING_STACK_GENERATION: RuntimeRef<BankedAtomicU32>,
     ELF_PROBE_RECLAIM_TLS_FRAMES: RuntimeRef<[BankedAtomicU64; 2]>,
     ELF_PROBE_RECLAIM_TLS_GENERATIONS: RuntimeRef<[BankedAtomicU32; 2]>,
-    ELF_PROBE_RELRO: RuntimeRef<BankedAtomicU64>,
-    ELF_PROBE_RELRO_SIZE: RuntimeRef<BankedAtomicU64>,
+    ELF_PROBE_RELRO: RuntimeRef<CpuBankedAtomicU64>,
+    ELF_PROBE_RELRO_SIZE: RuntimeRef<CpuBankedAtomicU64>,
     ELF_PROBE_RETIRED_IMAGE_ADDRESSES:
         RuntimeRef<[BankedAtomicU64; LINUX_ACTIVE_IMAGE_MAPPING_LIMIT]>,
     ELF_PROBE_RETIRED_IMAGE_COUNT: RuntimeRef<BankedAtomicU8>,
@@ -313,38 +314,40 @@ struct X86RuntimeOwner {
     ELF_PROBE_RETIRED_IMAGE_FRAMES: RuntimeRef<[BankedAtomicU64; LINUX_ACTIVE_IMAGE_MAPPING_LIMIT]>,
     ELF_PROBE_RETIRED_IMAGE_GENERATIONS:
         RuntimeRef<[BankedAtomicU32; LINUX_ACTIVE_IMAGE_MAPPING_LIMIT]>,
-    ELF_PROBE_RLIMITS: RuntimeRef<[BankedAtomicU64; LINUX_RLIMIT_WORDS]>,
-    ELF_PROBE_ROOTFS_CWD: RuntimeRef<BankedAtomicU16>,
+    ELF_PROBE_RLIMITS: RuntimeRef<[CpuBankedAtomicU64; LINUX_RLIMIT_WORDS]>,
+    ELF_PROBE_ROOTFS_CWD: RuntimeRef<CpuBankedAtomicU16>,
     ELF_PROBE_ROOTFS_DESCRIPTORS:
-        RuntimeRef<BankedAtomicArray<AtomicU16, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
-    ELF_PROBE_SECCOMP_STRICT: RuntimeRef<BankedAtomicBool>,
-    ELF_PROBE_SECUREBITS: RuntimeRef<BankedAtomicU32>,
+        RuntimeRef<CpuBankedAtomicArray<AtomicU16, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
+    ELF_PROBE_SECCOMP_STRICT: RuntimeRef<CpuBankedAtomicBool>,
+    ELF_PROBE_SECUREBITS: RuntimeRef<CpuBankedAtomicU32>,
     ELF_PROBE_SIBLING_FS_BASE: RuntimeRef<BankedAtomicU64>,
     ELF_PROBE_SIBLING_STACK: RuntimeRef<BankedAtomicU64>,
     ELF_PROBE_SIBLING_STACK_FRAME: RuntimeRef<BankedAtomicU64>,
     ELF_PROBE_SIBLING_STACK_GENERATION: RuntimeRef<BankedAtomicU32>,
     ELF_PROBE_SIBLING_TLS: RuntimeRef<BankedAtomicU64>,
-    ELF_PROBE_SIGNAL_ACTION_MASKS: RuntimeRef<[BankedAtomicU64; LINUX_SIGNAL_COUNT]>,
-    ELF_PROBE_SIGNAL_FLAGS: RuntimeRef<[BankedAtomicU64; LINUX_SIGNAL_COUNT]>,
-    ELF_PROBE_SIGNAL_HANDLERS: RuntimeRef<[BankedAtomicU64; LINUX_SIGNAL_COUNT]>,
-    ELF_PROBE_SIGNAL_MASK: RuntimeRef<BankedAtomicU64>,
-    ELF_PROBE_SIGNAL_RESTORERS: RuntimeRef<[BankedAtomicU64; LINUX_SIGNAL_COUNT]>,
-    ELF_PROBE_SOCKET_FLAGS: RuntimeRef<BankedAtomicArray<AtomicU32, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
-    ELF_PROBE_SOCKET_SLOTS: RuntimeRef<BankedAtomicArray<AtomicU16, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
+    ELF_PROBE_SIGNAL_ACTION_MASKS: RuntimeRef<[CpuBankedAtomicU64; LINUX_SIGNAL_COUNT]>,
+    ELF_PROBE_SIGNAL_FLAGS: RuntimeRef<[CpuBankedAtomicU64; LINUX_SIGNAL_COUNT]>,
+    ELF_PROBE_SIGNAL_HANDLERS: RuntimeRef<[CpuBankedAtomicU64; LINUX_SIGNAL_COUNT]>,
+    ELF_PROBE_SIGNAL_MASK: RuntimeRef<CpuBankedAtomicU64>,
+    ELF_PROBE_SIGNAL_RESTORERS: RuntimeRef<[CpuBankedAtomicU64; LINUX_SIGNAL_COUNT]>,
+    ELF_PROBE_SOCKET_FLAGS:
+        RuntimeRef<CpuBankedAtomicArray<AtomicU32, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
+    ELF_PROBE_SOCKET_SLOTS:
+        RuntimeRef<CpuBankedAtomicArray<AtomicU16, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
     ELF_PROBE_STACK: RuntimeRef<BankedAtomicU64>,
-    ELF_PROBE_STACK_FRAME: RuntimeRef<BankedAtomicU64>,
-    ELF_PROBE_STACK_GENERATION: RuntimeRef<BankedAtomicU32>,
-    ELF_PROBE_STACK_LOW: RuntimeRef<BankedAtomicU64>,
-    ELF_PROBE_STDERR_OPEN: RuntimeRef<BankedAtomicBool>,
-    ELF_PROBE_STDIO_DEVICE_DESCRIPTORS: RuntimeRef<[BankedAtomicU16; 3]>,
-    ELF_PROBE_STDIO_OFFSETS: RuntimeRef<BankedAtomicArray<AtomicU64, 3>>,
-    ELF_PROBE_STDIO_OPEN_FILE_IDS: RuntimeRef<BankedAtomicArray<AtomicU64, 3>>,
-    ELF_PROBE_STDIO_ROOTFS_DESCRIPTORS: RuntimeRef<[BankedAtomicU16; 3]>,
-    ELF_PROBE_STDIO_SOCKET_FLAGS: RuntimeRef<BankedAtomicArray<AtomicU32, 3>>,
-    ELF_PROBE_STDIO_SOCKET_SLOTS: RuntimeRef<[BankedAtomicU16; 3]>,
-    ELF_PROBE_STDIO_TMP_FILE_GENERATIONS: RuntimeRef<BankedAtomicArray<AtomicU32, 3>>,
+    ELF_PROBE_STACK_FRAME: RuntimeRef<CpuBankedAtomicU64>,
+    ELF_PROBE_STACK_GENERATION: RuntimeRef<CpuBankedAtomicU32>,
+    ELF_PROBE_STACK_LOW: RuntimeRef<CpuBankedAtomicU64>,
+    ELF_PROBE_STDERR_OPEN: RuntimeRef<CpuBankedAtomicBool>,
+    ELF_PROBE_STDIO_DEVICE_DESCRIPTORS: RuntimeRef<[CpuBankedAtomicU16; 3]>,
+    ELF_PROBE_STDIO_OFFSETS: RuntimeRef<CpuBankedAtomicArray<AtomicU64, 3>>,
+    ELF_PROBE_STDIO_OPEN_FILE_IDS: RuntimeRef<CpuBankedAtomicArray<AtomicU64, 3>>,
+    ELF_PROBE_STDIO_ROOTFS_DESCRIPTORS: RuntimeRef<[CpuBankedAtomicU16; 3]>,
+    ELF_PROBE_STDIO_SOCKET_FLAGS: RuntimeRef<CpuBankedAtomicArray<AtomicU32, 3>>,
+    ELF_PROBE_STDIO_SOCKET_SLOTS: RuntimeRef<[CpuBankedAtomicU16; 3]>,
+    ELF_PROBE_STDIO_TMP_FILE_GENERATIONS: RuntimeRef<CpuBankedAtomicArray<AtomicU32, 3>>,
     ELF_PROBE_SYSTEM_INIT: RuntimeRef<AtomicBool>,
-    ELF_PROBE_TERMINATION_SIGNAL: RuntimeRef<BankedAtomicU32>,
+    ELF_PROBE_TERMINATION_SIGNAL: RuntimeRef<CpuBankedAtomicU32>,
     ELF_PROBE_TIMERFD_CLOCK: RuntimeRef<BankedAtomicU8>,
     ELF_PROBE_TIMERFD_DEADLINE: RuntimeRef<BankedAtomicU64>,
     ELF_PROBE_TIMERFD_DESCRIPTOR: RuntimeRef<BankedAtomicU16>,
@@ -355,8 +358,8 @@ struct X86RuntimeOwner {
     ELF_PROBE_TLS_GENERATIONS: RuntimeRef<[BankedAtomicU32; 2]>,
     ELF_PROBE_TLS_SIZE: RuntimeRef<BankedAtomicU64>,
     ELF_PROBE_TMP_FILE_GENERATIONS:
-        RuntimeRef<BankedAtomicArray<AtomicU32, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
-    ELF_PROBE_UMASK: RuntimeRef<BankedAtomicU64>,
+        RuntimeRef<CpuBankedAtomicArray<AtomicU32, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
+    ELF_PROBE_UMASK: RuntimeRef<CpuBankedAtomicU64>,
     LINUX_BOOT_ID: RuntimeRef<LinuxBootIdCell>,
     LINUX_BOOT_ID_STATE: RuntimeRef<AtomicU8>,
     LINUX_BOOT_PROFILE_LIFECYCLE_COUNTS:
@@ -384,9 +387,9 @@ struct X86RuntimeOwner {
     LINUX_CONTROLLER_NETWORK: RuntimeRef<AtomicU64>,
     LINUX_CONTROLLER_ROOT: RuntimeRef<AtomicU64>,
     LINUX_CROSS_PROCESS_PRLIMIT_VALIDATED: RuntimeRef<BankedAtomicBool>,
-    LINUX_CURRENT_PROCESS_PID: RuntimeRef<BankedAtomicU32>,
+    LINUX_CURRENT_PROCESS_PID: RuntimeRef<CpuBankedAtomicU32>,
     LINUX_CURRENT_THREAD_SLOT: RuntimeRef<CpuBankedAtomicU8>,
-    LINUX_DESCRIPTOR_WAITS_ACTIVE: RuntimeRef<BankedAtomicBool>,
+    LINUX_DESCRIPTOR_WAITS_ACTIVE: RuntimeRef<CpuBankedAtomicBool>,
     LINUX_DOMAIN_EXEC_INJECT: RuntimeRef<AtomicBool>,
     LINUX_EPOLL_LAST_READY_DESCRIPTOR: RuntimeRef<BankedAtomicU64>,
     LINUX_EPOLL_LAST_READY_EVENTS: RuntimeRef<BankedAtomicU64>,
@@ -403,23 +406,23 @@ struct X86RuntimeOwner {
     LINUX_EVENTFD_WRITE_BLOCK_COUNT: RuntimeRef<BankedAtomicU32>,
     LINUX_EVENTFD_WRITE_INTERRUPT_COUNT: RuntimeRef<BankedAtomicU32>,
     LINUX_EVENTFD_WRITE_WAKE_COUNT: RuntimeRef<BankedAtomicU32>,
-    LINUX_EXECUTION_INSTANCE: RuntimeRef<AtomicU8>,
+    LINUX_EXECUTION_INSTANCE: RuntimeRef<PerCpuAtomicU8>,
     LINUX_FANOTIFY_MARK_MASKS: RuntimeRef<[BankedAtomicU64; LINUX_FANOTIFY_MARK_LIMIT]>,
     LINUX_FANOTIFY_MARK_PATHS: RuntimeRef<[BankedAtomicU64; LINUX_FANOTIFY_MARK_LIMIT]>,
     LINUX_FANOTIFY_PENDING_DESCRIPTOR: RuntimeRef<BankedAtomicU64>,
     LINUX_FANOTIFY_PENDING_MASK: RuntimeRef<BankedAtomicU64>,
     LINUX_FANOTIFY_REFS: RuntimeRef<BankedAtomicU16>,
-    LINUX_FIRST_CHILD_TID: RuntimeRef<BankedAtomicU32>,
-    LINUX_FORK_CGROUP_GENERATION: RuntimeRef<BankedAtomicU32>,
-    LINUX_FORK_CHILD_STACK: RuntimeRef<BankedAtomicU64>,
-    LINUX_FORK_SHARE_VM: RuntimeRef<BankedAtomicBool>,
-    LINUX_FORK_CHILD_TID_ADDRESS: RuntimeRef<BankedAtomicU64>,
-    LINUX_FORK_CLEAR_SIGHAND: RuntimeRef<BankedAtomicBool>,
-    LINUX_FORK_NEW_MOUNT_NAMESPACE: RuntimeRef<BankedAtomicBool>,
-    LINUX_FORK_NEW_USER_NAMESPACE: RuntimeRef<BankedAtomicBool>,
-    LINUX_FORK_PIDFD_ADDRESS: RuntimeRef<BankedAtomicU64>,
-    LINUX_FORK_REQUESTED: RuntimeRef<BankedAtomicBool>,
-    LINUX_FSIZE_LIMIT_HIT: RuntimeRef<BankedAtomicBool>,
+    LINUX_FIRST_CHILD_TID: RuntimeRef<CpuBankedAtomicU32>,
+    LINUX_FORK_CGROUP_GENERATION: RuntimeRef<CpuBankedAtomicU32>,
+    LINUX_FORK_CHILD_STACK: RuntimeRef<CpuBankedAtomicU64>,
+    LINUX_FORK_SHARE_VM: RuntimeRef<CpuBankedAtomicBool>,
+    LINUX_FORK_CHILD_TID_ADDRESS: RuntimeRef<CpuBankedAtomicU64>,
+    LINUX_FORK_CLEAR_SIGHAND: RuntimeRef<CpuBankedAtomicBool>,
+    LINUX_FORK_NEW_MOUNT_NAMESPACE: RuntimeRef<CpuBankedAtomicBool>,
+    LINUX_FORK_NEW_USER_NAMESPACE: RuntimeRef<CpuBankedAtomicBool>,
+    LINUX_FORK_PIDFD_ADDRESS: RuntimeRef<CpuBankedAtomicU64>,
+    LINUX_FORK_REQUESTED: RuntimeRef<CpuBankedAtomicBool>,
+    LINUX_FSIZE_LIMIT_HIT: RuntimeRef<CpuBankedAtomicBool>,
     LINUX_FUTEX_EXIT_WAKE_COUNT: RuntimeRef<BankedAtomicU32>,
     LINUX_FUTEX_EXPLICIT_WAKE_COUNT: RuntimeRef<BankedAtomicU32>,
     LINUX_FUTEX_WAIT_BLOCK_COUNT: RuntimeRef<BankedAtomicU32>,
@@ -437,11 +440,11 @@ struct X86RuntimeOwner {
     LINUX_IO_URING_SQES: RuntimeRef<BankedAtomicU64>,
     LINUX_IO_URING_SQ_RING: RuntimeRef<BankedAtomicU64>,
     LINUX_LAST_PREEMPTED_THREAD_SLOT: RuntimeRef<CpuBankedAtomicU8>,
-    LINUX_LIVE_RETURN_VALIDATED: RuntimeRef<BankedAtomicBool>,
+    LINUX_LIVE_RETURN_VALIDATED: RuntimeRef<CpuBankedAtomicBool>,
     LINUX_MASKED_WAIT_INTERRUPT_COUNT: RuntimeRef<BankedAtomicU32>,
     LINUX_NEXT_OPEN_FILE_ID: RuntimeRef<BankedAtomicU64>,
-    LINUX_NEXT_TID: RuntimeRef<BankedAtomicU32>,
-    LINUX_PARENT_RESUMED: RuntimeRef<BankedAtomicBool>,
+    LINUX_NEXT_TID: RuntimeRef<CpuBankedAtomicU32>,
+    LINUX_PARENT_RESUMED: RuntimeRef<CpuBankedAtomicBool>,
     LINUX_PIPE_READ_BLOCK_COUNT: RuntimeRef<BankedAtomicU32>,
     LINUX_PIPE_READ_INTERRUPT_COUNT: RuntimeRef<BankedAtomicU32>,
     LINUX_PIPE_READ_WAKE_COUNT: RuntimeRef<BankedAtomicU32>,
@@ -457,20 +460,20 @@ struct X86RuntimeOwner {
     LINUX_PPOLL_WAIT_WAKE_COUNT: RuntimeRef<BankedAtomicU32>,
     LINUX_PROCESS_CGROUP_GENERATIONS:
         RuntimeRef<[BankedAtomicU32; linux_process::PROCESS_RUNTIME_LIMIT]>,
-    LINUX_PROCESS_CHILD_EXECUTED: RuntimeRef<BankedAtomicBool>,
-    LINUX_PROCESS_CHILD_EXEC_PID: RuntimeRef<BankedAtomicU32>,
-    LINUX_PROCESS_CHILD_EXITED: RuntimeRef<BankedAtomicBool>,
-    LINUX_PROCESS_CHILD_EXIT_PID: RuntimeRef<BankedAtomicU32>,
-    LINUX_PROCESS_CHILD_STATUS: RuntimeRef<BankedAtomicU8>,
-    LINUX_PROCESS_CHILD_YIELDED: RuntimeRef<BankedAtomicBool>,
-    LINUX_PROCESS_CHILD_YIELD_PID: RuntimeRef<BankedAtomicU32>,
-    LINUX_PROCESS_LAST_BLOCKED_PID: RuntimeRef<BankedAtomicU32>,
-    LINUX_DOMAIN_EXEC_DEPTH: RuntimeRef<BankedAtomicU32>,
-    LINUX_PROCESS_RELEASE_PARENT_ON_EXEC: RuntimeRef<BankedAtomicBool>,
-    LINUX_PROCESS_SCHEDULER_NESTING: RuntimeRef<BankedAtomicU32>,
+    LINUX_PROCESS_CHILD_EXECUTED: RuntimeRef<CpuBankedAtomicBool>,
+    LINUX_PROCESS_CHILD_EXEC_PID: RuntimeRef<CpuBankedAtomicU32>,
+    LINUX_PROCESS_CHILD_EXITED: RuntimeRef<CpuBankedAtomicBool>,
+    LINUX_PROCESS_CHILD_EXIT_PID: RuntimeRef<CpuBankedAtomicU32>,
+    LINUX_PROCESS_CHILD_STATUS: RuntimeRef<CpuBankedAtomicU8>,
+    LINUX_PROCESS_CHILD_YIELDED: RuntimeRef<CpuBankedAtomicBool>,
+    LINUX_PROCESS_CHILD_YIELD_PID: RuntimeRef<CpuBankedAtomicU32>,
+    LINUX_PROCESS_LAST_BLOCKED_PID: RuntimeRef<CpuBankedAtomicU32>,
+    LINUX_DOMAIN_EXEC_DEPTH: RuntimeRef<CpuBankedAtomicU32>,
+    LINUX_PROCESS_RELEASE_PARENT_ON_EXEC: RuntimeRef<CpuBankedAtomicBool>,
+    LINUX_PROCESS_SCHEDULER_NESTING: RuntimeRef<CpuBankedAtomicU32>,
     LINUX_PROCESS_SNAPSHOT_SCRATCH: RuntimeRef<LinuxProcessSnapshotScratch>,
-    LINUX_PROCESS_SNAPSHOT_STAGE: RuntimeRef<BankedAtomicU8>,
-    LINUX_PROCESS_SNAPSHOT_VALIDATED: RuntimeRef<BankedAtomicBool>,
+    LINUX_PROCESS_SNAPSHOT_STAGE: RuntimeRef<CpuBankedAtomicU8>,
+    LINUX_PROCESS_SNAPSHOT_VALIDATED: RuntimeRef<CpuBankedAtomicBool>,
     LINUX_PROCESS_WAIT_COUNT: RuntimeRef<BankedAtomicU32>,
     LINUX_RUNTIME_BACKGROUND_QUANTA: RuntimeRef<AtomicU32>,
     LINUX_RUNTIME_BACKGROUND_SUSPENDED: RuntimeRef<BankedAtomicBool>,
@@ -479,15 +482,15 @@ struct X86RuntimeOwner {
     LINUX_RUNTIME_CONSOLE_TIMING_WRITTEN: RuntimeRef<BankedAtomicBool>,
     LINUX_RUNTIME_EINVAL_SYSCALLS: RuntimeRef<[BankedAtomicU64; LINUX_RUNTIME_UNSUPPORTED_WORDS]>,
     LINUX_RUNTIME_EPOLL_ACTIVE:
-        RuntimeRef<BankedAtomicArray<AtomicU8, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
+        RuntimeRef<CpuBankedAtomicArray<AtomicU8, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
     LINUX_RUNTIME_EPOLL_ALIASES:
-        RuntimeRef<BankedAtomicArray<AtomicU16, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
+        RuntimeRef<CpuBankedAtomicArray<AtomicU16, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
     LINUX_RUNTIME_EPOLL_WATCH_EPOLL:
-        RuntimeRef<BankedAtomicArray<AtomicU16, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>>,
+        RuntimeRef<CpuBankedAtomicArray<AtomicU16, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>>,
     LINUX_RUNTIME_EPOLL_WATCH_TARGET:
-        RuntimeRef<BankedAtomicArray<AtomicU16, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>>,
+        RuntimeRef<CpuBankedAtomicArray<AtomicU16, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>>,
     LINUX_RUNTIME_EVENTFD_ACTIVE:
-        RuntimeRef<BankedAtomicArray<AtomicU8, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
+        RuntimeRef<CpuBankedAtomicArray<AtomicU8, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
     LINUX_RUNTIME_EXIT_STATUS: RuntimeRef<BankedAtomicU64>,
     LINUX_RUNTIME_FIRST_UNSUPPORTED_SYSCALL: RuntimeRef<BankedAtomicU64>,
     LINUX_RUNTIME_LATE_DIAGNOSTIC_WRITTEN: RuntimeRef<BankedAtomicBool>,
@@ -511,10 +514,10 @@ struct X86RuntimeOwner {
     LINUX_RUNTIME_SYSCALL_TRACE: RuntimeRef<[BankedAtomicU64; LINUX_RUNTIME_SYSCALL_TRACE_LIMIT]>,
     LINUX_RUNTIME_SYSCALL_TRACE_COUNT: RuntimeRef<BankedAtomicU64>,
     LINUX_RUNTIME_TIMERFD_ACTIVE:
-        RuntimeRef<BankedAtomicArray<AtomicU8, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
+        RuntimeRef<CpuBankedAtomicArray<AtomicU8, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
     LINUX_RUNTIME_UNSUPPORTED_SYSCALLS:
         RuntimeRef<[BankedAtomicU64; LINUX_RUNTIME_UNSUPPORTED_WORDS]>,
-    LINUX_SIGNAL_ACTIVE: RuntimeRef<BankedAtomicBool>,
+    LINUX_SIGNAL_ACTIVE: RuntimeRef<CpuBankedAtomicBool>,
     LINUX_SIGNAL_DELIVERY_COUNT: RuntimeRef<BankedAtomicU64>,
     LINUX_SIGNAL_RETURN_COUNT: RuntimeRef<BankedAtomicU64>,
     LINUX_SIGNAL_WAIT_BLOCK_COUNT: RuntimeRef<BankedAtomicU32>,
@@ -527,51 +530,52 @@ struct X86RuntimeOwner {
     LINUX_SOCKET_SINGLE_ATTEMPT: RuntimeRef<AtomicBool>,
     LINUX_SYSTEM_SUPERVISOR_SHUTDOWN_COUNT: RuntimeRef<BankedAtomicU32>,
     LINUX_SYSTEM_SUPERVISOR_WAIT_COUNT: RuntimeRef<BankedAtomicU32>,
-    LINUX_THREAD_CLEAR_CHILD_TIDS: RuntimeRef<[BankedAtomicU64; LINUX_THREAD_LIMIT]>,
-    LINUX_THREAD_GENERATIONS: RuntimeRef<[BankedAtomicU32; LINUX_THREAD_LIMIT]>,
+    LINUX_THREAD_CLEAR_CHILD_TIDS: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
+    LINUX_THREAD_GENERATIONS: RuntimeRef<[CpuBankedAtomicU32; LINUX_THREAD_LIMIT]>,
     LINUX_THREAD_IOV_ADDRESSES:
-        RuntimeRef<[[BankedAtomicU64; LINUX_IOV_LIMIT]; LINUX_THREAD_LIMIT]>,
-    LINUX_THREAD_IOV_LENGTHS: RuntimeRef<[[BankedAtomicU64; LINUX_IOV_LIMIT]; LINUX_THREAD_LIMIT]>,
-    LINUX_THREAD_POINTERS: RuntimeRef<[BankedAtomicU64; LINUX_THREAD_LIMIT]>,
+        RuntimeRef<[[CpuBankedAtomicU64; LINUX_IOV_LIMIT]; LINUX_THREAD_LIMIT]>,
+    LINUX_THREAD_IOV_LENGTHS:
+        RuntimeRef<[[CpuBankedAtomicU64; LINUX_IOV_LIMIT]; LINUX_THREAD_LIMIT]>,
+    LINUX_THREAD_POINTERS: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
     LINUX_THREAD_POLL_DESCRIPTORS:
-        RuntimeRef<[[BankedAtomicU32; LINUX_POLLFD_LIMIT]; LINUX_THREAD_LIMIT]>,
+        RuntimeRef<[[CpuBankedAtomicU32; LINUX_POLLFD_LIMIT]; LINUX_THREAD_LIMIT]>,
     LINUX_THREAD_POLL_EVENTS:
-        RuntimeRef<[[BankedAtomicU16; LINUX_POLLFD_LIMIT]; LINUX_THREAD_LIMIT]>,
-    LINUX_THREAD_R11S: RuntimeRef<[BankedAtomicU64; LINUX_THREAD_LIMIT]>,
-    LINUX_THREAD_RAXS: RuntimeRef<[BankedAtomicU64; LINUX_THREAD_LIMIT]>,
-    LINUX_THREAD_RCXS: RuntimeRef<[BankedAtomicU64; LINUX_THREAD_LIMIT]>,
+        RuntimeRef<[[CpuBankedAtomicU16; LINUX_POLLFD_LIMIT]; LINUX_THREAD_LIMIT]>,
+    LINUX_THREAD_R11S: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
+    LINUX_THREAD_RAXS: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
+    LINUX_THREAD_RCXS: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
     LINUX_THREAD_REGISTERS:
-        RuntimeRef<[[BankedAtomicU64; LINUX_SYSCALL_FRAME_REGISTERS]; LINUX_THREAD_LIMIT]>,
-    LINUX_THREAD_RFLAGS: RuntimeRef<[BankedAtomicU64; LINUX_THREAD_LIMIT]>,
-    LINUX_THREAD_RIPS: RuntimeRef<[BankedAtomicU64; LINUX_THREAD_LIMIT]>,
-    LINUX_THREAD_ROBUST_LISTS: RuntimeRef<[BankedAtomicU64; LINUX_THREAD_LIMIT]>,
-    LINUX_THREAD_RSEQ_LENGTHS: RuntimeRef<[BankedAtomicU32; LINUX_THREAD_LIMIT]>,
-    LINUX_THREAD_RSEQ_POINTERS: RuntimeRef<[BankedAtomicU64; LINUX_THREAD_LIMIT]>,
-    LINUX_THREAD_RSEQ_SIGNATURES: RuntimeRef<[BankedAtomicU32; LINUX_THREAD_LIMIT]>,
-    LINUX_THREAD_RSPS: RuntimeRef<[BankedAtomicU64; LINUX_THREAD_LIMIT]>,
-    LINUX_THREAD_SELECT_EXCEPTION_ADDRESSES: RuntimeRef<[BankedAtomicU64; LINUX_THREAD_LIMIT]>,
+        RuntimeRef<[[CpuBankedAtomicU64; LINUX_SYSCALL_FRAME_REGISTERS]; LINUX_THREAD_LIMIT]>,
+    LINUX_THREAD_RFLAGS: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
+    LINUX_THREAD_RIPS: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
+    LINUX_THREAD_ROBUST_LISTS: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
+    LINUX_THREAD_RSEQ_LENGTHS: RuntimeRef<[CpuBankedAtomicU32; LINUX_THREAD_LIMIT]>,
+    LINUX_THREAD_RSEQ_POINTERS: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
+    LINUX_THREAD_RSEQ_SIGNATURES: RuntimeRef<[CpuBankedAtomicU32; LINUX_THREAD_LIMIT]>,
+    LINUX_THREAD_RSPS: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
+    LINUX_THREAD_SELECT_EXCEPTION_ADDRESSES: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
     LINUX_THREAD_SELECT_EXCEPTION_SETS:
-        RuntimeRef<[[BankedAtomicU64; LINUX_SELECT_WORD_LIMIT]; LINUX_THREAD_LIMIT]>,
-    LINUX_THREAD_SELECT_READ_ADDRESSES: RuntimeRef<[BankedAtomicU64; LINUX_THREAD_LIMIT]>,
+        RuntimeRef<[[CpuBankedAtomicU64; LINUX_SELECT_WORD_LIMIT]; LINUX_THREAD_LIMIT]>,
+    LINUX_THREAD_SELECT_READ_ADDRESSES: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
     LINUX_THREAD_SELECT_READ_SETS:
-        RuntimeRef<[[BankedAtomicU64; LINUX_SELECT_WORD_LIMIT]; LINUX_THREAD_LIMIT]>,
-    LINUX_THREAD_SELECT_TIMEOUT_ADDRESSES: RuntimeRef<[BankedAtomicU64; LINUX_THREAD_LIMIT]>,
-    LINUX_THREAD_SELECT_WRITE_ADDRESSES: RuntimeRef<[BankedAtomicU64; LINUX_THREAD_LIMIT]>,
+        RuntimeRef<[[CpuBankedAtomicU64; LINUX_SELECT_WORD_LIMIT]; LINUX_THREAD_LIMIT]>,
+    LINUX_THREAD_SELECT_TIMEOUT_ADDRESSES: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
+    LINUX_THREAD_SELECT_WRITE_ADDRESSES: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
     LINUX_THREAD_SELECT_WRITE_SETS:
-        RuntimeRef<[[BankedAtomicU64; LINUX_SELECT_WORD_LIMIT]; LINUX_THREAD_LIMIT]>,
-    LINUX_THREAD_SIGNAL_MASKS: RuntimeRef<[BankedAtomicU64; LINUX_THREAD_LIMIT]>,
-    LINUX_THREAD_STACK_BASES: RuntimeRef<[BankedAtomicU64; LINUX_THREAD_LIMIT]>,
-    LINUX_THREAD_STACK_SIZES: RuntimeRef<[BankedAtomicU64; LINUX_THREAD_LIMIT]>,
-    LINUX_THREAD_STATES: RuntimeRef<[BankedAtomicU8; LINUX_THREAD_LIMIT]>,
-    LINUX_THREAD_TIDS: RuntimeRef<[BankedAtomicU32; LINUX_THREAD_LIMIT]>,
-    LINUX_THREAD_TLS_EXTENTS: RuntimeRef<[BankedAtomicU64; LINUX_THREAD_LIMIT]>,
-    LINUX_THREAD_TLS_SIZES: RuntimeRef<[BankedAtomicU64; LINUX_THREAD_LIMIT]>,
-    LINUX_THREAD_WAIT_DEADLINES: RuntimeRef<[BankedAtomicU64; LINUX_THREAD_LIMIT]>,
-    LINUX_THREAD_WAIT_KEYS: RuntimeRef<[BankedAtomicU64; LINUX_THREAD_LIMIT]>,
-    LINUX_THREAD_WAIT_KINDS: RuntimeRef<[BankedAtomicU8; LINUX_THREAD_LIMIT]>,
-    LINUX_THREAD_WAIT_OUTPUTS: RuntimeRef<[BankedAtomicU64; LINUX_THREAD_LIMIT]>,
-    LINUX_THREAD_WAIT_PRIOR_SIGNAL_MASKS: RuntimeRef<[BankedAtomicU64; LINUX_THREAD_LIMIT]>,
-    LINUX_TIMED_WAITS_ACTIVE: RuntimeRef<BankedAtomicBool>,
+        RuntimeRef<[[CpuBankedAtomicU64; LINUX_SELECT_WORD_LIMIT]; LINUX_THREAD_LIMIT]>,
+    LINUX_THREAD_SIGNAL_MASKS: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
+    LINUX_THREAD_STACK_BASES: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
+    LINUX_THREAD_STACK_SIZES: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
+    LINUX_THREAD_STATES: RuntimeRef<[CpuBankedAtomicU8; LINUX_THREAD_LIMIT]>,
+    LINUX_THREAD_TIDS: RuntimeRef<[CpuBankedAtomicU32; LINUX_THREAD_LIMIT]>,
+    LINUX_THREAD_TLS_EXTENTS: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
+    LINUX_THREAD_TLS_SIZES: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
+    LINUX_THREAD_WAIT_DEADLINES: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
+    LINUX_THREAD_WAIT_KEYS: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
+    LINUX_THREAD_WAIT_KINDS: RuntimeRef<[CpuBankedAtomicU8; LINUX_THREAD_LIMIT]>,
+    LINUX_THREAD_WAIT_OUTPUTS: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
+    LINUX_THREAD_WAIT_PRIOR_SIGNAL_MASKS: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
+    LINUX_TIMED_WAITS_ACTIVE: RuntimeRef<CpuBankedAtomicBool>,
     LINUX_TIMERFD_READ_BLOCK_COUNT: RuntimeRef<BankedAtomicU32>,
     LINUX_TIMERFD_READ_INTERRUPT_COUNT: RuntimeRef<BankedAtomicU32>,
     LINUX_TIMERFD_READ_WAKE_COUNT: RuntimeRef<BankedAtomicU32>,
@@ -1179,8 +1183,44 @@ static X86_RUNTIME_BACKING_LINUX_CONTROLLER_NETWORK: AtomicU64 = AtomicU64::new(
 
 const LINUX_RUNTIME_HOST_INSTANCE: u8 = control_abi::DOMAIN_LIMIT as u8;
 const LINUX_RUNTIME_INSTANCE_LIMIT: usize = control_abi::DOMAIN_LIMIT + 1;
-static X86_RUNTIME_BACKING_LINUX_EXECUTION_INSTANCE: AtomicU8 =
-    AtomicU8::new(LINUX_RUNTIME_HOST_INSTANCE);
+static X86_RUNTIME_BACKING_LINUX_EXECUTION_INSTANCE: PerCpuAtomicU8 =
+    PerCpuAtomicU8::new(LINUX_RUNTIME_HOST_INSTANCE);
+
+/// A value each CPU keeps for itself, such as the domain instance whose
+/// processes it runs.
+struct PerCpuAtomicU8([AtomicU8; CPU_ENTRY_STATE_LIMIT]);
+
+#[allow(dead_code)]
+impl PerCpuAtomicU8 {
+    const fn new(value: u8) -> Self {
+        let mut values = [const { AtomicU8::new(0) }; CPU_ENTRY_STATE_LIMIT];
+        let mut cpu = 0;
+        while cpu < CPU_ENTRY_STATE_LIMIT {
+            values[cpu] = AtomicU8::new(value);
+            cpu += 1;
+        }
+        Self(values)
+    }
+
+    fn current(&self) -> &AtomicU8 {
+        let cpu = current_cpu_index_checked()
+            .filter(|cpu| *cpu < CPU_ENTRY_STATE_LIMIT)
+            .unwrap_or(0);
+        &self.0[cpu]
+    }
+
+    fn load(&self, order: Ordering) -> u8 {
+        self.current().load(order)
+    }
+
+    fn store(&self, value: u8, order: Ordering) {
+        self.current().store(value, order);
+    }
+
+    fn swap(&self, value: u8, order: Ordering) -> u8 {
+        self.current().swap(value, order)
+    }
+}
 
 fn linux_execution_instance() -> usize {
     let instance = usize::from(X86_RUNTIME.LINUX_EXECUTION_INSTANCE.load(Ordering::Relaxed));
@@ -1195,11 +1235,34 @@ pub(crate) fn current_linux_execution_instance() -> usize {
     linux_execution_instance()
 }
 
+/// Banks of state each CPU keeps for itself in every execution instance:
+/// the running process's (its descriptors, threads, signal and address
+/// space state) and that of the fork or exec it is in. CPUs running
+/// different processes of one domain at once each have theirs; state the
+/// domain's processes share stays banked per instance only.
+const LINUX_CPU_BANK_LIMIT: usize = LINUX_RUNTIME_INSTANCE_LIMIT * CPU_ENTRY_STATE_LIMIT;
+
+fn linux_cpu_bank() -> usize {
+    let cpu = current_cpu_index_checked()
+        .filter(|cpu| *cpu < CPU_ENTRY_STATE_LIMIT)
+        .unwrap_or(0);
+    cpu * LINUX_RUNTIME_INSTANCE_LIMIT + linux_execution_instance()
+}
+
 macro_rules! banked_atomic_integer {
     ($name:ident, $atomic:ty, $value:ty) => {
+        banked_atomic_integer!(
+            $name,
+            $atomic,
+            $value,
+            LINUX_RUNTIME_INSTANCE_LIMIT,
+            linux_execution_instance
+        );
+    };
+    ($name:ident, $atomic:ty, $value:ty, $banks:expr, $bank:path) => {
         struct $name {
-            values: [$atomic; LINUX_RUNTIME_INSTANCE_LIMIT],
-            states: [AtomicU8; LINUX_RUNTIME_INSTANCE_LIMIT],
+            values: [$atomic; $banks],
+            states: [AtomicU8; $banks],
             initial: $value,
         }
 
@@ -1207,14 +1270,14 @@ macro_rules! banked_atomic_integer {
         impl $name {
             const fn new(value: $value) -> Self {
                 Self {
-                    values: [const { <$atomic>::new(0) }; LINUX_RUNTIME_INSTANCE_LIMIT],
-                    states: [const { AtomicU8::new(0) }; LINUX_RUNTIME_INSTANCE_LIMIT],
+                    values: [const { <$atomic>::new(0) }; $banks],
+                    states: [const { AtomicU8::new(0) }; $banks],
                     initial: value,
                 }
             }
 
             fn current(&self) -> &$atomic {
-                let instance = linux_execution_instance();
+                let instance = $bank();
                 if self.states[instance].load(Ordering::Acquire) != 2 {
                     if self.states[instance]
                         .compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire)
@@ -1269,71 +1332,82 @@ macro_rules! banked_atomic_integer {
     };
 }
 
-struct BankedAtomicBool {
-    values: [AtomicBool; LINUX_RUNTIME_INSTANCE_LIMIT],
-    states: [AtomicU8; LINUX_RUNTIME_INSTANCE_LIMIT],
-    initial: bool,
-}
-
-#[allow(dead_code)]
-impl BankedAtomicBool {
-    const fn new(value: bool) -> Self {
-        Self {
-            values: [const { AtomicBool::new(false) }; LINUX_RUNTIME_INSTANCE_LIMIT],
-            states: [const { AtomicU8::new(0) }; LINUX_RUNTIME_INSTANCE_LIMIT],
-            initial: value,
+macro_rules! banked_atomic_bool {
+    ($name:ident, $banks:expr, $bank:path) => {
+        struct $name {
+            values: [AtomicBool; $banks],
+            states: [AtomicU8; $banks],
+            initial: bool,
         }
-    }
 
-    fn current(&self) -> &AtomicBool {
-        let instance = linux_execution_instance();
-        if self.states[instance].load(Ordering::Acquire) != 2 {
-            if self.states[instance]
-                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire)
-                .is_ok()
-            {
-                self.values[instance].store(self.initial, Ordering::Relaxed);
-                self.states[instance].store(2, Ordering::Release);
-            } else {
-                while self.states[instance].load(Ordering::Acquire) != 2 {
-                    core::hint::spin_loop();
+        #[allow(dead_code)]
+        impl $name {
+            const fn new(value: bool) -> Self {
+                Self {
+                    values: [const { AtomicBool::new(false) }; $banks],
+                    states: [const { AtomicU8::new(0) }; $banks],
+                    initial: value,
                 }
             }
+
+            fn current(&self) -> &AtomicBool {
+                let instance = $bank();
+                if self.states[instance].load(Ordering::Acquire) != 2 {
+                    if self.states[instance]
+                        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        self.values[instance].store(self.initial, Ordering::Relaxed);
+                        self.states[instance].store(2, Ordering::Release);
+                    } else {
+                        while self.states[instance].load(Ordering::Acquire) != 2 {
+                            core::hint::spin_loop();
+                        }
+                    }
+                }
+                &self.values[instance]
+            }
+
+            fn load(&self, order: Ordering) -> bool {
+                self.current().load(order)
+            }
+
+            fn store(&self, value: bool, order: Ordering) {
+                self.current().store(value, order);
+            }
+
+            fn swap(&self, value: bool, order: Ordering) -> bool {
+                self.current().swap(value, order)
+            }
+
+            fn fetch_and(&self, value: bool, order: Ordering) -> bool {
+                self.current().fetch_and(value, order)
+            }
+
+            fn fetch_or(&self, value: bool, order: Ordering) -> bool {
+                self.current().fetch_or(value, order)
+            }
+
+            fn compare_exchange(
+                &self,
+                current: bool,
+                new: bool,
+                success: Ordering,
+                failure: Ordering,
+            ) -> Result<bool, bool> {
+                self.current()
+                    .compare_exchange(current, new, success, failure)
+            }
         }
-        &self.values[instance]
-    }
-
-    fn load(&self, order: Ordering) -> bool {
-        self.current().load(order)
-    }
-
-    fn store(&self, value: bool, order: Ordering) {
-        self.current().store(value, order);
-    }
-
-    fn swap(&self, value: bool, order: Ordering) -> bool {
-        self.current().swap(value, order)
-    }
-
-    fn fetch_and(&self, value: bool, order: Ordering) -> bool {
-        self.current().fetch_and(value, order)
-    }
-
-    fn fetch_or(&self, value: bool, order: Ordering) -> bool {
-        self.current().fetch_or(value, order)
-    }
-
-    fn compare_exchange(
-        &self,
-        current: bool,
-        new: bool,
-        success: Ordering,
-        failure: Ordering,
-    ) -> Result<bool, bool> {
-        self.current()
-            .compare_exchange(current, new, success, failure)
-    }
+    };
 }
+
+banked_atomic_bool!(
+    BankedAtomicBool,
+    LINUX_RUNTIME_INSTANCE_LIMIT,
+    linux_execution_instance
+);
+banked_atomic_bool!(CpuBankedAtomicBool, LINUX_CPU_BANK_LIMIT, linux_cpu_bank);
 
 /// A table banked per execution instance and laid out instance by instance,
 /// so the current instance's table is one contiguous array: a process switch
@@ -1385,77 +1459,335 @@ macro_rules! banked_array {
 
 banked_array!(AtomicU8 => u8, AtomicU16 => u16, AtomicU32 => u32, AtomicU64 => u64);
 
+/// A `BankedAtomicArray` banked per CPU as well (see `linux_cpu_bank`): the
+/// tables of the process each CPU runs.
+struct CpuBankedAtomicArray<A, const N: usize>([[A; N]; LINUX_CPU_BANK_LIMIT]);
+
+impl<A, const N: usize> core::ops::Deref for CpuBankedAtomicArray<A, N> {
+    type Target = [A; N];
+    fn deref(&self) -> &[A; N] {
+        &self.0[linux_cpu_bank()]
+    }
+}
+
+impl<'a, A, const N: usize> IntoIterator for &'a RuntimeRef<CpuBankedAtomicArray<A, N>> {
+    type Item = &'a A;
+    type IntoIter = core::slice::Iter<'a, A>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+macro_rules! cpu_banked_array {
+    ($($atomic:ty => $value:ty),*) => {$(
+        #[allow(dead_code)]
+        impl<const N: usize> CpuBankedAtomicArray<$atomic, N> {
+            const fn new() -> Self {
+                Self([const { [const { <$atomic>::new(0) }; N] }; LINUX_CPU_BANK_LIMIT])
+            }
+
+            /// The current bank's table, read in one pass with relaxed
+            /// loads (the caller orders the pass as a whole).
+            fn snapshot(&self) -> [$value; N] {
+                let table: &[$atomic; N] = self;
+                core::array::from_fn(|index| table[index].load(Ordering::Relaxed))
+            }
+
+            /// Overwrites the current bank's table with relaxed stores.
+            fn install(&self, values: &[$value; N]) {
+                let table: &[$atomic; N] = self;
+                for (cell, value) in table.iter().zip(values) {
+                    cell.store(*value, Ordering::Relaxed);
+                }
+            }
+        }
+    )*};
+}
+
+cpu_banked_array!(AtomicU8 => u8, AtomicU16 => u16, AtomicU32 => u32, AtomicU64 => u64);
+
 banked_atomic_integer!(BankedAtomicU8, AtomicU8, u8);
 banked_atomic_integer!(BankedAtomicU16, AtomicU16, u16);
 banked_atomic_integer!(BankedAtomicU32, AtomicU32, u32);
 banked_atomic_integer!(BankedAtomicU64, AtomicU64, u64);
 
-struct CpuBankedAtomicU8 {
-    values: [[AtomicU8; CPU_ENTRY_STATE_LIMIT]; LINUX_RUNTIME_INSTANCE_LIMIT],
-    states: [[AtomicU8; CPU_ENTRY_STATE_LIMIT]; LINUX_RUNTIME_INSTANCE_LIMIT],
-    initial: u8,
-}
+banked_atomic_integer!(
+    CpuBankedAtomicU8,
+    AtomicU8,
+    u8,
+    LINUX_CPU_BANK_LIMIT,
+    linux_cpu_bank
+);
+banked_atomic_integer!(
+    CpuBankedAtomicU16,
+    AtomicU16,
+    u16,
+    LINUX_CPU_BANK_LIMIT,
+    linux_cpu_bank
+);
+banked_atomic_integer!(
+    CpuBankedAtomicU32,
+    AtomicU32,
+    u32,
+    LINUX_CPU_BANK_LIMIT,
+    linux_cpu_bank
+);
+banked_atomic_integer!(
+    CpuBankedAtomicU64,
+    AtomicU64,
+    u64,
+    LINUX_CPU_BANK_LIMIT,
+    linux_cpu_bank
+);
 
-impl CpuBankedAtomicU8 {
-    const fn new(value: u8) -> Self {
-        Self {
-            values: [const { [const { AtomicU8::new(0) }; CPU_ENTRY_STATE_LIMIT] };
-                LINUX_RUNTIME_INSTANCE_LIMIT],
-            states: [const { [const { AtomicU8::new(0) }; CPU_ENTRY_STATE_LIMIT] };
-                LINUX_RUNTIME_INSTANCE_LIMIT],
-            initial: value,
-        }
-    }
-
-    fn current(&self) -> &AtomicU8 {
-        let instance = linux_execution_instance();
-        let cpu = current_cpu_index_checked().unwrap_or(0);
-        if self.states[instance][cpu].load(Ordering::Acquire) != 2 {
-            if self.states[instance][cpu]
-                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire)
-                .is_ok()
-            {
-                self.values[instance][cpu].store(self.initial, Ordering::Relaxed);
-                self.states[instance][cpu].store(2, Ordering::Release);
-            } else {
-                while self.states[instance][cpu].load(Ordering::Acquire) != 2 {
-                    core::hint::spin_loop();
-                }
-            }
-        }
-        &self.values[instance][cpu]
-    }
-
-    fn load(&self, order: Ordering) -> u8 {
-        self.current().load(order)
-    }
-
-    fn store(&self, value: u8, order: Ordering) {
-        self.current().store(value, order);
-    }
-
-    fn swap(&self, value: u8, order: Ordering) -> u8 {
-        self.current().swap(value, order)
-    }
-
-    fn fetch_add(&self, value: u8, order: Ordering) -> u8 {
-        self.current().fetch_add(value, order)
-    }
-
-    fn compare_exchange(
-        &self,
-        current: u8,
-        new: u8,
-        success: Ordering,
-        failure: Ordering,
-    ) -> Result<u8, u8> {
-        self.current()
-            .compare_exchange(current, new, success, failure)
-    }
-}
-
+/// The CPU as the runtime's thread model sees it: 0 on every CPU that runs
+/// processes whole (the boot CPU, and an application processor in a domain
+/// runtime's loop, see `run_application_processor_runtime`), the CPU's own
+/// index on an application processor running one thread of the process the
+/// boot CPU runs.
 fn current_linux_runtime_cpu_index() -> usize {
-    current_cpu_index_checked().unwrap_or(0)
+    let cpu = current_cpu_index_checked().unwrap_or(0);
+    if cpu < CPU_ENTRY_STATE_LIMIT && LINUX_SMP_LOOP_ACTIVE[cpu].load(Ordering::Acquire) {
+        0
+    } else {
+        cpu
+    }
+}
+
+/// The domain instance, plus one, whose runtime lets the other CPUs it was
+/// given run its processes; 0 while none does.
+static LINUX_SMP_RUNTIME_INSTANCE: AtomicU8 = AtomicU8::new(0);
+/// Application processors in a domain runtime's loop.
+static LINUX_SMP_LOOP_ACTIVE: [AtomicBool; CPU_ENTRY_STATE_LIMIT] =
+    [const { AtomicBool::new(false) }; CPU_ENTRY_STATE_LIMIT];
+
+/// Whether a domain runtime is running its processes on more than one CPU.
+fn linux_smp_runtime_active() -> bool {
+    LINUX_SMP_RUNTIME_INSTANCE.load(Ordering::Acquire) != 0
+}
+
+/// Lets the domain's other CPUs (its `cpu=N` setting) run its processes
+/// while the boot CPU's runtime loop runs.
+fn start_linux_smp_runtime() {
+    let cpus = linux_available_cpu_count().min(CPU_ENTRY_STATE_LIMIT);
+    if cpus < 2 || cfg!(feature = "verification-boot") {
+        return;
+    }
+    LINUX_SMP_RUNTIME_INSTANCE.store(linux_execution_instance() as u8 + 1, Ordering::Release);
+    for cpu in 1..cpus {
+        crate::arch::x86_64::smp::wake_application_processor(cpu);
+    }
+}
+
+/// Ends `start_linux_smp_runtime`: the other CPUs finish the process they
+/// run and leave the runtime, before the boot CPU suspends or tears it down.
+/// The kernel-entry lock is let go while they do. Whether it had started.
+fn stop_linux_smp_runtime() -> bool {
+    if LINUX_SMP_RUNTIME_INSTANCE.swap(0, Ordering::AcqRel) == 0 {
+        return false;
+    }
+    while LINUX_SMP_LOOP_ACTIVE
+        .iter()
+        .any(|active| active.load(Ordering::Acquire))
+    {
+        crate::sync::kernel_entry_leave_to_user();
+        core::hint::spin_loop();
+        crate::sync::kernel_entry_return_from_user();
+    }
+    true
+}
+
+/// Whether an idle application processor `cpu` should join a domain
+/// runtime's loop.
+pub(crate) fn linux_runtime_wants_cpu(cpu: usize) -> bool {
+    cpu != 0
+        && cpu < CPU_ENTRY_STATE_LIMIT
+        && LINUX_SMP_RUNTIME_INSTANCE.load(Ordering::Acquire) != 0
+}
+
+/// An application processor's runtime loop: while the domain's runtime lets
+/// it, takes ready processes no other CPU runs and runs each until it waits,
+/// yields or exits, as the boot CPU's loop runs the others. Processes that
+/// sleep in a wait are left to the boot CPU's loop, which looks at their
+/// waits again; this one takes the runnable ones.
+pub(crate) fn run_application_processor_runtime(cpu: usize) {
+    let instance = LINUX_SMP_RUNTIME_INSTANCE.load(Ordering::Acquire);
+    if instance == 0 || cpu == 0 || cpu >= CPU_ENTRY_STATE_LIMIT {
+        return;
+    }
+    let guard = crate::sync::kernel_entry_lock();
+    if LINUX_SMP_RUNTIME_INSTANCE.load(Ordering::Acquire) != instance {
+        return;
+    }
+    let Some(saved_msrs) = configure_linux_syscall() else {
+        return;
+    };
+    let previous_instance = X86_RUNTIME
+        .LINUX_EXECUTION_INSTANCE
+        .swap(instance - 1, Ordering::AcqRel);
+    LINUX_SMP_LOOP_ACTIVE[cpu].store(true, Ordering::Release);
+    let ticking = timer::arm_linux_cpu_tick();
+    drop(guard);
+    let mut after = 0;
+    let mut idle_ticks = LINUX_SMP_IDLE_SPIN_TICKS;
+    loop {
+        let guard = crate::sync::kernel_entry_lock();
+        if LINUX_SMP_RUNTIME_INSTANCE.load(Ordering::Acquire) != instance
+            || !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::Acquire)
+            || X86_RUNTIME.LINUX_RUNTIME_SUSPENDED.load(Ordering::Acquire)
+        {
+            break;
+        }
+        let picked = linux_process::ready_live_process_after(after, |pid| {
+            pid != 1
+                && linux_process::live_process_status(pid)
+                    .is_some_and(|status| status.state == linux_process::LiveProcessState::Running)
+                && !activation::is_running(linux_activation_owner(pid))
+        });
+        if let Some(pid) = picked {
+            after = pid;
+            idle_ticks = LINUX_SMP_IDLE_SPIN_TICKS;
+            crate::cpu_time::add_run();
+            if !run_linux_process_on_this_cpu(pid) {
+                serial_write("ginux: application processor run failed cpu/pid: ");
+                serial_write_u64(cpu as u64);
+                serial_write(" ");
+                serial_write_u64(u64::from(pid));
+                serial_write("\r\n");
+            }
+            drop(guard);
+            continue;
+        }
+        drop(guard);
+        // Nothing to run: leave the kernel to the other CPUs for a while,
+        // longer each time nothing turns up (up to about a millisecond), so
+        // idle CPUs do not hold up busy ones' system calls.
+        let started = timer::timestamp_counter();
+        let until = started.wrapping_add(idle_ticks);
+        while timer::timestamp_counter() < until {
+            core::hint::spin_loop();
+        }
+        crate::cpu_time::add_idle(timer::timestamp_counter().saturating_sub(started));
+        idle_ticks = (idle_ticks * 2).min(LINUX_SMP_IDLE_SPIN_TICKS * 64);
+    }
+    if ticking {
+        timer::disarm_linux_cpu_tick();
+    }
+    let _ = restore_linux_syscall(saved_msrs);
+    X86_RUNTIME
+        .LINUX_EXECUTION_INSTANCE
+        .store(previous_instance, Ordering::Release);
+    LINUX_SMP_LOOP_ACTIVE[cpu].store(false, Ordering::Release);
+}
+
+/// Keeps process `pid` on this CPU while it lives: the CPU made the process
+/// ready but switches back to it (the parent of a fork it runs, or the
+/// process a scheduling frame runs others from), so no other CPU of a
+/// multi-CPU runtime may take it meanwhile.
+struct LinuxProcessPin(Option<u32>);
+
+impl LinuxProcessPin {
+    fn new(pid: u32) -> Self {
+        let pinned = linux_smp_runtime_active()
+            && linux_process::pin_live_process(pid, current_cpu_index_checked());
+        Self(pinned.then_some(pid))
+    }
+}
+
+impl Drop for LinuxProcessPin {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            let _ = linux_process::pin_live_process(pid, None);
+        }
+    }
+}
+
+/// Timestamp-counter ticks an idle application processor waits before it
+/// looks for a process again (application processors have no timer tick
+/// yet).
+const LINUX_SMP_IDLE_SPIN_TICKS: u64 = 50_000;
+
+/// Runs process `pid`, ready and run by no other CPU, on this CPU, which
+/// runs no process, until it waits, yields or exits; then settles it as
+/// `run_scheduled_linux_process` does and leaves the CPU with no process.
+fn run_linux_process_on_this_cpu(pid: u32) -> bool {
+    let Some(selected) = linux_process::claim_live_process(pid) else {
+        return false;
+    };
+    if !restore_saved_linux_process_runtime_state(pid) || !restore_linux_process_extended_state(pid)
+    {
+        let _ = linux_process::release_live_process(pid);
+        return false;
+    }
+    X86_RUNTIME
+        .LINUX_CURRENT_PROCESS_PID
+        .store(pid, Ordering::SeqCst);
+    let pending_sigkill = linux_peek_dynamic_signal(1 << (LINUX_SIGKILL - 1))
+        .is_some_and(|(_, pending)| u64::from(pending.signal) == LINUX_SIGKILL)
+        && !activation::is_parked(linux_activation_owner(pid));
+    let mut resumed = if pending_sigkill {
+        linux_terminate_by_default_signal(LINUX_SIGKILL) == LINUX_RETURN_TO_KERNEL
+    } else {
+        X86_RUNTIME
+            .LINUX_PROCESS_SCHEDULER_NESTING
+            .fetch_add(1, Ordering::SeqCst);
+        let resumed =
+            sync_live_linux_process_address_space(pid) && run_dispatched_linux_process(&selected);
+        let nesting = X86_RUNTIME
+            .LINUX_PROCESS_SCHEDULER_NESTING
+            .load(Ordering::SeqCst);
+        X86_RUNTIME
+            .LINUX_PROCESS_SCHEDULER_NESTING
+            .store(nesting.saturating_sub(1), Ordering::SeqCst);
+        resumed
+    };
+    while resumed && X86_RUNTIME.LINUX_FORK_REQUESTED.load(Ordering::SeqCst) {
+        resumed = execute_deferred_live_fork();
+    }
+    save_current_linux_process_runtime_state(pid);
+    let saved = save_linux_process_extended_state(pid);
+    let _ = take_linux_child_yield(pid);
+    let settled = match take_linux_child_exit(pid) {
+        Some(status) => settle_linux_process_exit(pid, status),
+        None => linux_process::release_live_process(pid),
+    };
+    X86_RUNTIME
+        .LINUX_CURRENT_PROCESS_PID
+        .store(0, Ordering::SeqCst);
+    resumed && saved && settled
+}
+
+/// Ends process `pid`, current on this CPU, which exited with `status`: its
+/// parent gets SIGCHLD and a zombie to reap, and everything it held goes.
+/// The CPU is left with no process.
+fn settle_linux_process_exit(pid: u32, status: u8) -> bool {
+    let process_slot = linux_process::live_process_slot(pid);
+    let parent = linux_process::live_process_parent_pid(pid);
+    let signals_cleared = process_slot
+        .is_some_and(|slot| clear_linux_signal_queues_for_process(linux_signal_instance(), slot));
+    let child_signal_queued = parent.is_some_and(|parent| {
+        linux_queue_process_signal(
+            parent,
+            LINUX_SIGCHLD,
+            LINUX_CLD_EXITED,
+            Some(u64::from(status)),
+        ) == 0
+    });
+    let exited = signals_cleared
+        && child_signal_queued
+        && linux_process::complete_live_process_exit_detached(pid, status);
+    linux_release_process_cgroup(pid);
+    release_linux_process_shared_mappings(pid);
+    if let Some(state) = linux_process_runtime_state(pid) {
+        release_linux_descriptor_runtime_state(&state.descriptors);
+        *state = LinuxProcessRuntimeState::EMPTY;
+    }
+    if let Some(threads) = linux_process_thread_runtime_state(pid) {
+        threads.fill(LinuxThreadRuntimeState::EMPTY);
+    }
+    discard_linux_process_extended_state(pid);
+    wake_linux_descriptor_waits();
+    exited && linux_process::release_live_process_runtime_slot(pid)
 }
 
 pub(crate) fn linux_startup_random() -> Option<[u8; 16]> {
@@ -1606,42 +1938,54 @@ static X86_RUNTIME_BACKING_PROCESS_CHILD_EXPECTED_REGISTERS: [[AtomicU64; 15];
     CPU_ENTRY_STATE_LIMIT] = [const { [const { AtomicU64::new(0) }; 15] }; CPU_ENTRY_STATE_LIMIT];
 static X86_RUNTIME_BACKING_PROCESS_CHILD_EXPECTED_FS_BASE: [AtomicU64; CPU_ENTRY_STATE_LIMIT] =
     [const { AtomicU64::new(0) }; CPU_ENTRY_STATE_LIMIT];
-static X86_RUNTIME_BACKING_ELF_PROBE_ACTIVE: BankedAtomicBool = BankedAtomicBool::new(false);
+static X86_RUNTIME_BACKING_ELF_PROBE_ACTIVE: CpuBankedAtomicBool = CpuBankedAtomicBool::new(false);
 // Execution mode describes the currently running CPU context, not persistent
 // per-domain state. Keeping it in a domain bank can strand the temporary
 // runtime value when a verification helper changes the active instance.
 static X86_RUNTIME_BACKING_LINUX_RUNTIME_MODE: AtomicBool = AtomicBool::new(false);
-static X86_RUNTIME_BACKING_ELF_PROBE_COMPLETED: BankedAtomicBool = BankedAtomicBool::new(false);
-static X86_RUNTIME_BACKING_ELF_PROBE_EXIT_STATUS: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_TERMINATION_SIGNAL: BankedAtomicU32 = BankedAtomicU32::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_PARENT_DEATH_SIGNAL: BankedAtomicU32 = BankedAtomicU32::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_COMPLETED: CpuBankedAtomicBool =
+    CpuBankedAtomicBool::new(false);
+static X86_RUNTIME_BACKING_ELF_PROBE_EXIT_STATUS: CpuBankedAtomicU64 = CpuBankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_TERMINATION_SIGNAL: CpuBankedAtomicU32 =
+    CpuBankedAtomicU32::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_PARENT_DEATH_SIGNAL: CpuBankedAtomicU32 =
+    CpuBankedAtomicU32::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_EXEC_REPLACED: BankedAtomicBool = BankedAtomicBool::new(false);
 static X86_RUNTIME_BACKING_ELF_PROBE_EXEC_NODE: BankedAtomicU8 = BankedAtomicU8::new(0);
-static X86_RUNTIME_BACKING_LINUX_LIVE_RETURN_VALIDATED: BankedAtomicBool =
-    BankedAtomicBool::new(false);
+static X86_RUNTIME_BACKING_LINUX_LIVE_RETURN_VALIDATED: CpuBankedAtomicBool =
+    CpuBankedAtomicBool::new(false);
 static X86_RUNTIME_BACKING_LINUX_CHILD_EXIT_COUNT: BankedAtomicU32 = BankedAtomicU32::new(0);
-static X86_RUNTIME_BACKING_LINUX_PARENT_RESUMED: BankedAtomicBool = BankedAtomicBool::new(false);
-static X86_RUNTIME_BACKING_LINUX_FORK_REQUESTED: BankedAtomicBool = BankedAtomicBool::new(false);
-static X86_RUNTIME_BACKING_LINUX_FORK_NEW_MOUNT_NAMESPACE: BankedAtomicBool =
-    BankedAtomicBool::new(false);
-static X86_RUNTIME_BACKING_LINUX_FORK_NEW_USER_NAMESPACE: BankedAtomicBool =
-    BankedAtomicBool::new(false);
-static X86_RUNTIME_BACKING_LINUX_FORK_CHILD_TID_ADDRESS: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_LINUX_FORK_CHILD_STACK: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_LINUX_FORK_SHARE_VM: BankedAtomicBool = BankedAtomicBool::new(false);
-static X86_RUNTIME_BACKING_LINUX_FORK_PIDFD_ADDRESS: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_LINUX_FORK_CGROUP_GENERATION: BankedAtomicU32 = BankedAtomicU32::new(0);
-static X86_RUNTIME_BACKING_LINUX_FORK_CLEAR_SIGHAND: BankedAtomicBool =
-    BankedAtomicBool::new(false);
-static X86_RUNTIME_BACKING_LINUX_PROCESS_CHILD_EXITED: BankedAtomicBool =
-    BankedAtomicBool::new(false);
-static X86_RUNTIME_BACKING_LINUX_PROCESS_CHILD_EXECUTED: BankedAtomicBool =
-    BankedAtomicBool::new(false);
-static X86_RUNTIME_BACKING_LINUX_PROCESS_CHILD_YIELDED: BankedAtomicBool =
-    BankedAtomicBool::new(false);
-static X86_RUNTIME_BACKING_LINUX_PROCESS_CHILD_EXIT_PID: BankedAtomicU32 = BankedAtomicU32::new(0);
-static X86_RUNTIME_BACKING_LINUX_PROCESS_CHILD_EXEC_PID: BankedAtomicU32 = BankedAtomicU32::new(0);
-static X86_RUNTIME_BACKING_LINUX_PROCESS_CHILD_YIELD_PID: BankedAtomicU32 = BankedAtomicU32::new(0);
+static X86_RUNTIME_BACKING_LINUX_PARENT_RESUMED: CpuBankedAtomicBool =
+    CpuBankedAtomicBool::new(false);
+static X86_RUNTIME_BACKING_LINUX_FORK_REQUESTED: CpuBankedAtomicBool =
+    CpuBankedAtomicBool::new(false);
+static X86_RUNTIME_BACKING_LINUX_FORK_NEW_MOUNT_NAMESPACE: CpuBankedAtomicBool =
+    CpuBankedAtomicBool::new(false);
+static X86_RUNTIME_BACKING_LINUX_FORK_NEW_USER_NAMESPACE: CpuBankedAtomicBool =
+    CpuBankedAtomicBool::new(false);
+static X86_RUNTIME_BACKING_LINUX_FORK_CHILD_TID_ADDRESS: CpuBankedAtomicU64 =
+    CpuBankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_LINUX_FORK_CHILD_STACK: CpuBankedAtomicU64 = CpuBankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_LINUX_FORK_SHARE_VM: CpuBankedAtomicBool =
+    CpuBankedAtomicBool::new(false);
+static X86_RUNTIME_BACKING_LINUX_FORK_PIDFD_ADDRESS: CpuBankedAtomicU64 =
+    CpuBankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_LINUX_FORK_CGROUP_GENERATION: CpuBankedAtomicU32 =
+    CpuBankedAtomicU32::new(0);
+static X86_RUNTIME_BACKING_LINUX_FORK_CLEAR_SIGHAND: CpuBankedAtomicBool =
+    CpuBankedAtomicBool::new(false);
+static X86_RUNTIME_BACKING_LINUX_PROCESS_CHILD_EXITED: CpuBankedAtomicBool =
+    CpuBankedAtomicBool::new(false);
+static X86_RUNTIME_BACKING_LINUX_PROCESS_CHILD_EXECUTED: CpuBankedAtomicBool =
+    CpuBankedAtomicBool::new(false);
+static X86_RUNTIME_BACKING_LINUX_PROCESS_CHILD_YIELDED: CpuBankedAtomicBool =
+    CpuBankedAtomicBool::new(false);
+static X86_RUNTIME_BACKING_LINUX_PROCESS_CHILD_EXIT_PID: CpuBankedAtomicU32 =
+    CpuBankedAtomicU32::new(0);
+static X86_RUNTIME_BACKING_LINUX_PROCESS_CHILD_EXEC_PID: CpuBankedAtomicU32 =
+    CpuBankedAtomicU32::new(0);
+static X86_RUNTIME_BACKING_LINUX_PROCESS_CHILD_YIELD_PID: CpuBankedAtomicU32 =
+    CpuBankedAtomicU32::new(0);
 /// Times a domain's init exit has waited for the processes it killed.
 static X86_RUNTIME_BACKING_LINUX_INIT_EXIT_KILL_ROUNDS: BankedAtomicU32 = BankedAtomicU32::new(0);
 const LINUX_INIT_EXIT_KILL_ROUND_LIMIT: u32 = 10_000;
@@ -1649,20 +1993,22 @@ const LINUX_INIT_EXIT_KILL_ROUND_LIMIT: u32 = 10_000;
 const LINUX_INIT_EXIT_FORCE_ROUND: u32 = 100;
 /// The process that most recently yielded because it could not make
 /// progress; see run_other_linux_processes.
-static X86_RUNTIME_BACKING_LINUX_PROCESS_LAST_BLOCKED_PID: BankedAtomicU32 =
-    BankedAtomicU32::new(0);
+static X86_RUNTIME_BACKING_LINUX_PROCESS_LAST_BLOCKED_PID: CpuBankedAtomicU32 =
+    CpuBankedAtomicU32::new(0);
 /// How many domain-exec fork transactions are running; see
 /// LinuxDomainExecGuard.
-static X86_RUNTIME_BACKING_LINUX_DOMAIN_EXEC_DEPTH: BankedAtomicU32 = BankedAtomicU32::new(0);
-static X86_RUNTIME_BACKING_LINUX_PROCESS_RELEASE_PARENT_ON_EXEC: BankedAtomicBool =
-    BankedAtomicBool::new(false);
-static X86_RUNTIME_BACKING_LINUX_PROCESS_CHILD_STATUS: BankedAtomicU8 = BankedAtomicU8::new(0);
-static X86_RUNTIME_BACKING_LINUX_CURRENT_PROCESS_PID: BankedAtomicU32 = BankedAtomicU32::new(1);
+static X86_RUNTIME_BACKING_LINUX_DOMAIN_EXEC_DEPTH: CpuBankedAtomicU32 = CpuBankedAtomicU32::new(0);
+static X86_RUNTIME_BACKING_LINUX_PROCESS_RELEASE_PARENT_ON_EXEC: CpuBankedAtomicBool =
+    CpuBankedAtomicBool::new(false);
+static X86_RUNTIME_BACKING_LINUX_PROCESS_CHILD_STATUS: CpuBankedAtomicU8 =
+    CpuBankedAtomicU8::new(0);
+static X86_RUNTIME_BACKING_LINUX_CURRENT_PROCESS_PID: CpuBankedAtomicU32 =
+    CpuBankedAtomicU32::new(1);
 static X86_RUNTIME_BACKING_LINUX_PROCESS_CGROUP_GENERATIONS: [BankedAtomicU32;
     linux_process::PROCESS_RUNTIME_LIMIT] =
     [const { BankedAtomicU32::new(0) }; linux_process::PROCESS_RUNTIME_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_PROCESS_SCHEDULER_NESTING: BankedAtomicU32 =
-    BankedAtomicU32::new(0);
+static X86_RUNTIME_BACKING_LINUX_PROCESS_SCHEDULER_NESTING: CpuBankedAtomicU32 =
+    CpuBankedAtomicU32::new(0);
 static X86_RUNTIME_BACKING_LINUX_PROCESS_WAIT_COUNT: BankedAtomicU32 = BankedAtomicU32::new(0);
 static X86_RUNTIME_BACKING_LINUX_TTY_SESSION: BankedAtomicU32 = BankedAtomicU32::new(0);
 static X86_RUNTIME_BACKING_LINUX_TTY_FOREGROUND_GROUP: BankedAtomicU32 = BankedAtomicU32::new(0);
@@ -1679,11 +2025,12 @@ const LINUX_TTY_DEFAULT_CONTROL_CHARACTERS: [u8; 19] = [
     3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 18, 15, 23, 22, 0, 0, 0,
 ];
 static X86_RUNTIME_BACKING_LIVE_FORK_PUBLIC_DIAGNOSTIC: BankedAtomicU8 = BankedAtomicU8::new(0);
-static X86_RUNTIME_BACKING_LINUX_PROCESS_SNAPSHOT_VALIDATED: BankedAtomicBool =
-    BankedAtomicBool::new(false);
-static X86_RUNTIME_BACKING_LINUX_PROCESS_SNAPSHOT_STAGE: BankedAtomicU8 = BankedAtomicU8::new(0);
+static X86_RUNTIME_BACKING_LINUX_PROCESS_SNAPSHOT_VALIDATED: CpuBankedAtomicBool =
+    CpuBankedAtomicBool::new(false);
+static X86_RUNTIME_BACKING_LINUX_PROCESS_SNAPSHOT_STAGE: CpuBankedAtomicU8 =
+    CpuBankedAtomicU8::new(0);
 static X86_RUNTIME_BACKING_LINUX_CLONE_DISPATCH_COUNT: BankedAtomicU32 = BankedAtomicU32::new(0);
-static X86_RUNTIME_BACKING_LINUX_FIRST_CHILD_TID: BankedAtomicU32 = BankedAtomicU32::new(0);
+static X86_RUNTIME_BACKING_LINUX_FIRST_CHILD_TID: CpuBankedAtomicU32 = CpuBankedAtomicU32::new(0);
 static X86_RUNTIME_BACKING_LINUX_CLONE_REUSE_VALIDATED: BankedAtomicBool =
     BankedAtomicBool::new(false);
 static X86_RUNTIME_BACKING_LINUX_CHILD_GETTID_COUNT: BankedAtomicU32 = BankedAtomicU32::new(0);
@@ -1757,41 +2104,45 @@ static X86_RUNTIME_BACKING_LINUX_MASKED_WAIT_INTERRUPT_COUNT: BankedAtomicU32 =
 static X86_RUNTIME_BACKING_LINUX_SIGNAL_WAIT_INTERRUPT_COUNT: BankedAtomicU32 =
     BankedAtomicU32::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_STACK: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_STACK_LOW: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_STACK_FRAME: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_STACK_GENERATION: BankedAtomicU32 = BankedAtomicU32::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_HEAP_FRAME: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_HEAP_GENERATION: BankedAtomicU32 = BankedAtomicU32::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_STACK_LOW: CpuBankedAtomicU64 = CpuBankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_STACK_FRAME: CpuBankedAtomicU64 = CpuBankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_STACK_GENERATION: CpuBankedAtomicU32 =
+    CpuBankedAtomicU32::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_HEAP_FRAME: CpuBankedAtomicU64 = CpuBankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_HEAP_GENERATION: CpuBankedAtomicU32 =
+    CpuBankedAtomicU32::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_RECLAIM_HEAP_FRAME: BankedAtomicU64 = BankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_RECLAIM_HEAP_GENERATION: BankedAtomicU32 =
     BankedAtomicU32::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_CODE_BASE: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_CODE_SIZE: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_LOADER_CODE_BASE: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_LOADER_CODE_SIZE: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_DATA: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_DATA_SIZE: BankedAtomicU64 = BankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_CODE_BASE: CpuBankedAtomicU64 = CpuBankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_CODE_SIZE: CpuBankedAtomicU64 = CpuBankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_LOADER_CODE_BASE: CpuBankedAtomicU64 =
+    CpuBankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_LOADER_CODE_SIZE: CpuBankedAtomicU64 =
+    CpuBankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_DATA: CpuBankedAtomicU64 = CpuBankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_DATA_SIZE: CpuBankedAtomicU64 = CpuBankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_EXEC_ENTRY: BankedAtomicU64 = BankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_EXEC_MAPPING_ADDRESSES: [BankedAtomicU64;
     LINUX_EXEC_MAPPING_LIMIT] = [const { BankedAtomicU64::new(0) }; LINUX_EXEC_MAPPING_LIMIT];
-static X86_RUNTIME_BACKING_ELF_PROBE_EXEC_MAPPING_FRAMES: [BankedAtomicU64;
-    LINUX_EXEC_MAPPING_LIMIT] = [const { BankedAtomicU64::new(0) }; LINUX_EXEC_MAPPING_LIMIT];
-static X86_RUNTIME_BACKING_ELF_PROBE_EXEC_MAPPING_GENERATIONS: [BankedAtomicU32;
-    LINUX_EXEC_MAPPING_LIMIT] = [const { BankedAtomicU32::new(0) }; LINUX_EXEC_MAPPING_LIMIT];
+static X86_RUNTIME_BACKING_ELF_PROBE_EXEC_MAPPING_FRAMES: [CpuBankedAtomicU64;
+    LINUX_EXEC_MAPPING_LIMIT] = [const { CpuBankedAtomicU64::new(0) }; LINUX_EXEC_MAPPING_LIMIT];
+static X86_RUNTIME_BACKING_ELF_PROBE_EXEC_MAPPING_GENERATIONS: [CpuBankedAtomicU32;
+    LINUX_EXEC_MAPPING_LIMIT] = [const { CpuBankedAtomicU32::new(0) }; LINUX_EXEC_MAPPING_LIMIT];
 static X86_RUNTIME_BACKING_ELF_PROBE_EXEC_MAPPING_FLAGS: [BankedAtomicU8;
     LINUX_EXEC_MAPPING_LIMIT] = [const { BankedAtomicU8::new(0) }; LINUX_EXEC_MAPPING_LIMIT];
 static X86_RUNTIME_BACKING_ELF_PROBE_ACTIVE_IMAGE_ADDRESSES: [BankedAtomicU64;
     LINUX_ACTIVE_IMAGE_MAPPING_LIMIT] =
     [const { BankedAtomicU64::new(0) }; LINUX_ACTIVE_IMAGE_MAPPING_LIMIT];
-static X86_RUNTIME_BACKING_ELF_PROBE_ACTIVE_IMAGE_FRAMES: [BankedAtomicU64;
+static X86_RUNTIME_BACKING_ELF_PROBE_ACTIVE_IMAGE_FRAMES: [CpuBankedAtomicU64;
     LINUX_ACTIVE_IMAGE_MAPPING_LIMIT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_ACTIVE_IMAGE_MAPPING_LIMIT];
-static X86_RUNTIME_BACKING_ELF_PROBE_ACTIVE_IMAGE_GENERATIONS: [BankedAtomicU32;
+    [const { CpuBankedAtomicU64::new(0) }; LINUX_ACTIVE_IMAGE_MAPPING_LIMIT];
+static X86_RUNTIME_BACKING_ELF_PROBE_ACTIVE_IMAGE_GENERATIONS: [CpuBankedAtomicU32;
     LINUX_ACTIVE_IMAGE_MAPPING_LIMIT] =
-    [const { BankedAtomicU32::new(0) }; LINUX_ACTIVE_IMAGE_MAPPING_LIMIT];
-static X86_RUNTIME_BACKING_ELF_PROBE_ACTIVE_IMAGE_FLAGS: [BankedAtomicU8;
+    [const { CpuBankedAtomicU32::new(0) }; LINUX_ACTIVE_IMAGE_MAPPING_LIMIT];
+static X86_RUNTIME_BACKING_ELF_PROBE_ACTIVE_IMAGE_FLAGS: [CpuBankedAtomicU8;
     LINUX_ACTIVE_IMAGE_MAPPING_LIMIT] =
-    [const { BankedAtomicU8::new(0) }; LINUX_ACTIVE_IMAGE_MAPPING_LIMIT];
+    [const { CpuBankedAtomicU8::new(0) }; LINUX_ACTIVE_IMAGE_MAPPING_LIMIT];
 static X86_RUNTIME_BACKING_ELF_PROBE_ACTIVE_IMAGE_COUNT: BankedAtomicU16 = BankedAtomicU16::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_RETIRED_IMAGE_ADDRESSES: [BankedAtomicU64;
     LINUX_ACTIVE_IMAGE_MAPPING_LIMIT] =
@@ -1854,60 +2205,61 @@ const LINUX_THREAD_WAIT_PSELECT: u8 = 16;
 /// their own, such as a record lock another thread holds.
 const LINUX_THREAD_WAIT_RETRY: u8 = 17;
 const LINUX_SYSCALL_FRAME_REGISTERS: usize = 12;
-static X86_RUNTIME_BACKING_LINUX_THREAD_STATES: [BankedAtomicU8; LINUX_THREAD_LIMIT] =
-    [const { BankedAtomicU8::new(LINUX_THREAD_FREE) }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_GENERATIONS: [BankedAtomicU32; LINUX_THREAD_LIMIT] =
-    [const { BankedAtomicU32::new(0) }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_TIDS: [BankedAtomicU32; LINUX_THREAD_LIMIT] =
-    [const { BankedAtomicU32::new(0) }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_POINTERS: [BankedAtomicU64; LINUX_THREAD_LIMIT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_TLS_EXTENTS: [BankedAtomicU64; LINUX_THREAD_LIMIT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_TLS_SIZES: [BankedAtomicU64; LINUX_THREAD_LIMIT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_STACK_BASES: [BankedAtomicU64; LINUX_THREAD_LIMIT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_STACK_SIZES: [BankedAtomicU64; LINUX_THREAD_LIMIT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_RIPS: [BankedAtomicU64; LINUX_THREAD_LIMIT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_RSPS: [BankedAtomicU64; LINUX_THREAD_LIMIT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_RFLAGS: [BankedAtomicU64; LINUX_THREAD_LIMIT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_RAXS: [BankedAtomicU64; LINUX_THREAD_LIMIT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_RCXS: [BankedAtomicU64; LINUX_THREAD_LIMIT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_R11S: [BankedAtomicU64; LINUX_THREAD_LIMIT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_REGISTERS: [[BankedAtomicU64;
+static X86_RUNTIME_BACKING_LINUX_THREAD_STATES: [CpuBankedAtomicU8; LINUX_THREAD_LIMIT] =
+    [const { CpuBankedAtomicU8::new(LINUX_THREAD_FREE) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_GENERATIONS: [CpuBankedAtomicU32; LINUX_THREAD_LIMIT] =
+    [const { CpuBankedAtomicU32::new(0) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_TIDS: [CpuBankedAtomicU32; LINUX_THREAD_LIMIT] =
+    [const { CpuBankedAtomicU32::new(0) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_POINTERS: [CpuBankedAtomicU64; LINUX_THREAD_LIMIT] =
+    [const { CpuBankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_TLS_EXTENTS: [CpuBankedAtomicU64; LINUX_THREAD_LIMIT] =
+    [const { CpuBankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_TLS_SIZES: [CpuBankedAtomicU64; LINUX_THREAD_LIMIT] =
+    [const { CpuBankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_STACK_BASES: [CpuBankedAtomicU64; LINUX_THREAD_LIMIT] =
+    [const { CpuBankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_STACK_SIZES: [CpuBankedAtomicU64; LINUX_THREAD_LIMIT] =
+    [const { CpuBankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_RIPS: [CpuBankedAtomicU64; LINUX_THREAD_LIMIT] =
+    [const { CpuBankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_RSPS: [CpuBankedAtomicU64; LINUX_THREAD_LIMIT] =
+    [const { CpuBankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_RFLAGS: [CpuBankedAtomicU64; LINUX_THREAD_LIMIT] =
+    [const { CpuBankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_RAXS: [CpuBankedAtomicU64; LINUX_THREAD_LIMIT] =
+    [const { CpuBankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_RCXS: [CpuBankedAtomicU64; LINUX_THREAD_LIMIT] =
+    [const { CpuBankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_R11S: [CpuBankedAtomicU64; LINUX_THREAD_LIMIT] =
+    [const { CpuBankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_REGISTERS: [[CpuBankedAtomicU64;
     LINUX_SYSCALL_FRAME_REGISTERS];
-    LINUX_THREAD_LIMIT] = [const { [const { BankedAtomicU64::new(0) }; LINUX_SYSCALL_FRAME_REGISTERS] };
-    LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_CLEAR_CHILD_TIDS: [BankedAtomicU64; LINUX_THREAD_LIMIT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_ROBUST_LISTS: [BankedAtomicU64; LINUX_THREAD_LIMIT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_RSEQ_POINTERS: [BankedAtomicU64; LINUX_THREAD_LIMIT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_RSEQ_LENGTHS: [BankedAtomicU32; LINUX_THREAD_LIMIT] =
-    [const { BankedAtomicU32::new(0) }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_RSEQ_SIGNATURES: [BankedAtomicU32; LINUX_THREAD_LIMIT] =
-    [const { BankedAtomicU32::new(0) }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_SIGNAL_MASKS: [BankedAtomicU64; LINUX_THREAD_LIMIT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_WAIT_KINDS: [BankedAtomicU8; LINUX_THREAD_LIMIT] =
-    [const { BankedAtomicU8::new(LINUX_THREAD_WAIT_NONE) }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_WAIT_KEYS: [BankedAtomicU64; LINUX_THREAD_LIMIT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_WAIT_OUTPUTS: [BankedAtomicU64; LINUX_THREAD_LIMIT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_WAIT_DEADLINES: [BankedAtomicU64; LINUX_THREAD_LIMIT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_WAIT_PRIOR_SIGNAL_MASKS: [BankedAtomicU64;
-    LINUX_THREAD_LIMIT] = [const { BankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
+    LINUX_THREAD_LIMIT] =
+    [const { [const { CpuBankedAtomicU64::new(0) }; LINUX_SYSCALL_FRAME_REGISTERS] };
+        LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_CLEAR_CHILD_TIDS: [CpuBankedAtomicU64; LINUX_THREAD_LIMIT] =
+    [const { CpuBankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_ROBUST_LISTS: [CpuBankedAtomicU64; LINUX_THREAD_LIMIT] =
+    [const { CpuBankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_RSEQ_POINTERS: [CpuBankedAtomicU64; LINUX_THREAD_LIMIT] =
+    [const { CpuBankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_RSEQ_LENGTHS: [CpuBankedAtomicU32; LINUX_THREAD_LIMIT] =
+    [const { CpuBankedAtomicU32::new(0) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_RSEQ_SIGNATURES: [CpuBankedAtomicU32; LINUX_THREAD_LIMIT] =
+    [const { CpuBankedAtomicU32::new(0) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_SIGNAL_MASKS: [CpuBankedAtomicU64; LINUX_THREAD_LIMIT] =
+    [const { CpuBankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_WAIT_KINDS: [CpuBankedAtomicU8; LINUX_THREAD_LIMIT] =
+    [const { CpuBankedAtomicU8::new(LINUX_THREAD_WAIT_NONE) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_WAIT_KEYS: [CpuBankedAtomicU64; LINUX_THREAD_LIMIT] =
+    [const { CpuBankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_WAIT_OUTPUTS: [CpuBankedAtomicU64; LINUX_THREAD_LIMIT] =
+    [const { CpuBankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_WAIT_DEADLINES: [CpuBankedAtomicU64; LINUX_THREAD_LIMIT] =
+    [const { CpuBankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_WAIT_PRIOR_SIGNAL_MASKS: [CpuBankedAtomicU64;
+    LINUX_THREAD_LIMIT] = [const { CpuBankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
 static LINUX_FUTEX_COORDINATION: crate::sync::SpinLock<Vec<LinuxProcessFutexWait>> =
     crate::sync::SpinLock::new(crate::sync::LockRank::FUTEX_COORDINATION, Vec::new());
 /// Absolute deadlines of timed waits (poll, nanosleep, epoll_wait) whose
@@ -1915,70 +2267,73 @@ static LINUX_FUTEX_COORDINATION: crate::sync::SpinLock<Vec<LinuxProcessFutexWait
 /// restarted call keeps its deadline instead of starting a new timeout.
 static LINUX_RESTART_DEADLINES: crate::sync::SpinLock<Vec<LinuxRestartDeadline>> =
     crate::sync::SpinLock::new(crate::sync::LockRank::RESTART_DEADLINES, Vec::new());
-static X86_RUNTIME_BACKING_LINUX_THREAD_POLL_DESCRIPTORS: [[BankedAtomicU32; LINUX_POLLFD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_POLL_DESCRIPTORS: [[CpuBankedAtomicU32;
+    LINUX_POLLFD_LIMIT];
     LINUX_THREAD_LIMIT] =
-    [const { [const { BankedAtomicU32::new(0) }; LINUX_POLLFD_LIMIT] }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_POLL_EVENTS: [[BankedAtomicU16; LINUX_POLLFD_LIMIT];
+    [const { [const { CpuBankedAtomicU32::new(0) }; LINUX_POLLFD_LIMIT] }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_POLL_EVENTS: [[CpuBankedAtomicU16; LINUX_POLLFD_LIMIT];
     LINUX_THREAD_LIMIT] =
-    [const { [const { BankedAtomicU16::new(0) }; LINUX_POLLFD_LIMIT] }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_SELECT_READ_ADDRESSES: [BankedAtomicU64;
-    LINUX_THREAD_LIMIT] = [const { BankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_SELECT_WRITE_ADDRESSES: [BankedAtomicU64;
-    LINUX_THREAD_LIMIT] = [const { BankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_SELECT_EXCEPTION_ADDRESSES: [BankedAtomicU64;
-    LINUX_THREAD_LIMIT] = [const { BankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_SELECT_TIMEOUT_ADDRESSES: [BankedAtomicU64;
-    LINUX_THREAD_LIMIT] = [const { BankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_SELECT_READ_SETS: [[BankedAtomicU64;
+    [const { [const { CpuBankedAtomicU16::new(0) }; LINUX_POLLFD_LIMIT] }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_SELECT_READ_ADDRESSES: [CpuBankedAtomicU64;
+    LINUX_THREAD_LIMIT] = [const { CpuBankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_SELECT_WRITE_ADDRESSES: [CpuBankedAtomicU64;
+    LINUX_THREAD_LIMIT] = [const { CpuBankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_SELECT_EXCEPTION_ADDRESSES: [CpuBankedAtomicU64;
+    LINUX_THREAD_LIMIT] = [const { CpuBankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_SELECT_TIMEOUT_ADDRESSES: [CpuBankedAtomicU64;
+    LINUX_THREAD_LIMIT] = [const { CpuBankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_SELECT_READ_SETS: [[CpuBankedAtomicU64;
     LINUX_SELECT_WORD_LIMIT];
     LINUX_THREAD_LIMIT] =
-    [const { [const { BankedAtomicU64::new(0) }; LINUX_SELECT_WORD_LIMIT] }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_SELECT_WRITE_SETS: [[BankedAtomicU64;
+    [const { [const { CpuBankedAtomicU64::new(0) }; LINUX_SELECT_WORD_LIMIT] }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_SELECT_WRITE_SETS: [[CpuBankedAtomicU64;
     LINUX_SELECT_WORD_LIMIT];
     LINUX_THREAD_LIMIT] =
-    [const { [const { BankedAtomicU64::new(0) }; LINUX_SELECT_WORD_LIMIT] }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_SELECT_EXCEPTION_SETS: [[BankedAtomicU64;
+    [const { [const { CpuBankedAtomicU64::new(0) }; LINUX_SELECT_WORD_LIMIT] }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_SELECT_EXCEPTION_SETS: [[CpuBankedAtomicU64;
     LINUX_SELECT_WORD_LIMIT];
     LINUX_THREAD_LIMIT] =
-    [const { [const { BankedAtomicU64::new(0) }; LINUX_SELECT_WORD_LIMIT] }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_IOV_ADDRESSES: [[BankedAtomicU64; LINUX_IOV_LIMIT];
+    [const { [const { CpuBankedAtomicU64::new(0) }; LINUX_SELECT_WORD_LIMIT] }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_IOV_ADDRESSES: [[CpuBankedAtomicU64; LINUX_IOV_LIMIT];
     LINUX_THREAD_LIMIT] =
-    [const { [const { BankedAtomicU64::new(0) }; LINUX_IOV_LIMIT] }; LINUX_THREAD_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_THREAD_IOV_LENGTHS: [[BankedAtomicU64; LINUX_IOV_LIMIT];
+    [const { [const { CpuBankedAtomicU64::new(0) }; LINUX_IOV_LIMIT] }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_IOV_LENGTHS: [[CpuBankedAtomicU64; LINUX_IOV_LIMIT];
     LINUX_THREAD_LIMIT] =
-    [const { [const { BankedAtomicU64::new(0) }; LINUX_IOV_LIMIT] }; LINUX_THREAD_LIMIT];
+    [const { [const { CpuBankedAtomicU64::new(0) }; LINUX_IOV_LIMIT] }; LINUX_THREAD_LIMIT];
 static X86_RUNTIME_BACKING_LINUX_CURRENT_THREAD_SLOT: CpuBankedAtomicU8 =
     CpuBankedAtomicU8::new(LINUX_THREAD_SLOT_NONE);
-static X86_RUNTIME_BACKING_LINUX_NEXT_TID: BankedAtomicU32 = BankedAtomicU32::new(1);
-static X86_RUNTIME_BACKING_ELF_PROBE_RELRO: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_RELRO_SIZE: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_BRK: BankedAtomicU64 = BankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_LINUX_NEXT_TID: CpuBankedAtomicU32 = CpuBankedAtomicU32::new(1);
+static X86_RUNTIME_BACKING_ELF_PROBE_RELRO: CpuBankedAtomicU64 = CpuBankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_RELRO_SIZE: CpuBankedAtomicU64 = CpuBankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_BRK: CpuBankedAtomicU64 = CpuBankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_BRK_LIMIT: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_MMAP: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_MMAP_NEXT: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_MMAP_FRAMES: [BankedAtomicU64; LINUX_RUNTIME_MMAP_SLOT_COUNT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_RUNTIME_MMAP_SLOT_COUNT];
-static X86_RUNTIME_BACKING_ELF_PROBE_MMAP_GENERATIONS: [BankedAtomicU32;
+static X86_RUNTIME_BACKING_ELF_PROBE_MMAP: CpuBankedAtomicU64 = CpuBankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_MMAP_NEXT: CpuBankedAtomicU64 = CpuBankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_MMAP_FRAMES: [CpuBankedAtomicU64;
     LINUX_RUNTIME_MMAP_SLOT_COUNT] =
-    [const { BankedAtomicU32::new(0) }; LINUX_RUNTIME_MMAP_SLOT_COUNT];
-static X86_RUNTIME_BACKING_ELF_PROBE_PAGE_TABLE_FRAMES: [BankedAtomicU64; 6] =
-    [const { BankedAtomicU64::new(0) }; 6];
-static X86_RUNTIME_BACKING_ELF_PROBE_PAGE_TABLE_GENERATIONS: [BankedAtomicU32; 6] =
-    [const { BankedAtomicU32::new(0) }; 6];
+    [const { CpuBankedAtomicU64::new(0) }; LINUX_RUNTIME_MMAP_SLOT_COUNT];
+static X86_RUNTIME_BACKING_ELF_PROBE_MMAP_GENERATIONS: [CpuBankedAtomicU32;
+    LINUX_RUNTIME_MMAP_SLOT_COUNT] =
+    [const { CpuBankedAtomicU32::new(0) }; LINUX_RUNTIME_MMAP_SLOT_COUNT];
+static X86_RUNTIME_BACKING_ELF_PROBE_PAGE_TABLE_FRAMES: [CpuBankedAtomicU64; 6] =
+    [const { CpuBankedAtomicU64::new(0) }; 6];
+static X86_RUNTIME_BACKING_ELF_PROBE_PAGE_TABLE_GENERATIONS: [CpuBankedAtomicU32; 6] =
+    [const { CpuBankedAtomicU32::new(0) }; 6];
 static X86_RUNTIME_BACKING_ELF_PROBE_RECLAIM_PAGE_TABLE_FRAMES: [BankedAtomicU64; 6] =
     [const { BankedAtomicU64::new(0) }; 6];
 static X86_RUNTIME_BACKING_ELF_PROBE_RECLAIM_PAGE_TABLE_GENERATIONS: [BankedAtomicU32; 6] =
     [const { BankedAtomicU32::new(0) }; 6];
-static X86_RUNTIME_BACKING_ELF_PROBE_MMAP_PAGES: [BankedAtomicU8; LINUX_RUNTIME_MMAP_SLOT_COUNT] =
-    [const { BankedAtomicU8::new(0) }; LINUX_RUNTIME_MMAP_SLOT_COUNT];
-static X86_RUNTIME_BACKING_ELF_PROBE_MMAP_PROTECTION: [BankedAtomicU8;
+static X86_RUNTIME_BACKING_ELF_PROBE_MMAP_PAGES: [CpuBankedAtomicU8;
     LINUX_RUNTIME_MMAP_SLOT_COUNT] =
-    [const { BankedAtomicU8::new(0) }; LINUX_RUNTIME_MMAP_SLOT_COUNT];
-static X86_RUNTIME_BACKING_ELF_PROBE_MMAP_FILE: [BankedAtomicU8; LINUX_RUNTIME_MMAP_SLOT_COUNT] =
-    [const { BankedAtomicU8::new(0) }; LINUX_RUNTIME_MMAP_SLOT_COUNT];
-static X86_RUNTIME_BACKING_ELF_PROBE_MMAP_SEALED: [BankedAtomicBool;
+    [const { CpuBankedAtomicU8::new(0) }; LINUX_RUNTIME_MMAP_SLOT_COUNT];
+static X86_RUNTIME_BACKING_ELF_PROBE_MMAP_PROTECTION: [CpuBankedAtomicU8;
     LINUX_RUNTIME_MMAP_SLOT_COUNT] =
-    [const { BankedAtomicBool::new(false) }; LINUX_RUNTIME_MMAP_SLOT_COUNT];
+    [const { CpuBankedAtomicU8::new(0) }; LINUX_RUNTIME_MMAP_SLOT_COUNT];
+static X86_RUNTIME_BACKING_ELF_PROBE_MMAP_FILE: [CpuBankedAtomicU8; LINUX_RUNTIME_MMAP_SLOT_COUNT] =
+    [const { CpuBankedAtomicU8::new(0) }; LINUX_RUNTIME_MMAP_SLOT_COUNT];
+static X86_RUNTIME_BACKING_ELF_PROBE_MMAP_SEALED: [CpuBankedAtomicBool;
+    LINUX_RUNTIME_MMAP_SLOT_COUNT] =
+    [const { CpuBankedAtomicBool::new(false) }; LINUX_RUNTIME_MMAP_SLOT_COUNT];
 static X86_RUNTIME_BACKING_ELF_PROBE_MAIN_ADDRESSES: [BankedAtomicU64; LINUX_MAIN_MAPPING_COUNT] =
     [const { BankedAtomicU64::new(0) }; LINUX_MAIN_MAPPING_COUNT];
 static X86_RUNTIME_BACKING_ELF_PROBE_MAIN_FRAMES: [BankedAtomicU64; LINUX_MAIN_MAPPING_COUNT] =
@@ -2022,42 +2377,45 @@ static X86_RUNTIME_BACKING_ELF_PROBE_EXITED_CLEAR_CHILD_TID: BankedAtomicU64 =
     BankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_EXITED_ROBUST_LIST: BankedAtomicU64 = BankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_READ_ONLY_DATA_PAGE: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_UMASK: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_RLIMITS: [BankedAtomicU64; LINUX_RLIMIT_WORDS] =
-    [const { BankedAtomicU64::new(0) }; LINUX_RLIMIT_WORDS];
+static X86_RUNTIME_BACKING_ELF_PROBE_UMASK: CpuBankedAtomicU64 = CpuBankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_RLIMITS: [CpuBankedAtomicU64; LINUX_RLIMIT_WORDS] =
+    [const { CpuBankedAtomicU64::new(0) }; LINUX_RLIMIT_WORDS];
 static X86_RUNTIME_BACKING_ELF_PROBE_POSIX_MQ_BYTES: BankedAtomicU64 = BankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_LINUX_CROSS_PROCESS_PRLIMIT_VALIDATED: BankedAtomicBool =
     BankedAtomicBool::new(false);
-static X86_RUNTIME_BACKING_LINUX_FSIZE_LIMIT_HIT: BankedAtomicBool = BankedAtomicBool::new(false);
-static X86_RUNTIME_BACKING_ELF_PROBE_CONSOLE_DESCRIPTORS: BankedAtomicU8 = BankedAtomicU8::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_STDERR_OPEN: BankedAtomicBool = BankedAtomicBool::new(false);
-static X86_RUNTIME_BACKING_ELF_PROBE_CONSOLE_CLOEXEC: [BankedAtomicU64;
+static X86_RUNTIME_BACKING_LINUX_FSIZE_LIMIT_HIT: CpuBankedAtomicBool =
+    CpuBankedAtomicBool::new(false);
+static X86_RUNTIME_BACKING_ELF_PROBE_CONSOLE_DESCRIPTORS: CpuBankedAtomicU8 =
+    CpuBankedAtomicU8::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_STDERR_OPEN: CpuBankedAtomicBool =
+    CpuBankedAtomicBool::new(false);
+static X86_RUNTIME_BACKING_ELF_PROBE_CONSOLE_CLOEXEC: [CpuBankedAtomicU64;
     LINUX_DESCRIPTOR_FLAG_WORD_COUNT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_DESCRIPTOR_FLAG_WORD_COUNT];
-static X86_RUNTIME_BACKING_ELF_PROBE_DEVICE_DESCRIPTORS: BankedAtomicArray<
+    [const { CpuBankedAtomicU64::new(0) }; LINUX_DESCRIPTOR_FLAG_WORD_COUNT];
+static X86_RUNTIME_BACKING_ELF_PROBE_DEVICE_DESCRIPTORS: CpuBankedAtomicArray<
     AtomicU16,
     LINUX_DEVICE_DESCRIPTOR_COUNT,
-> = BankedAtomicArray::<AtomicU16, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
-static X86_RUNTIME_BACKING_ELF_PROBE_ROOTFS_DESCRIPTORS: BankedAtomicArray<
+> = CpuBankedAtomicArray::<AtomicU16, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
+static X86_RUNTIME_BACKING_ELF_PROBE_ROOTFS_DESCRIPTORS: CpuBankedAtomicArray<
     AtomicU16,
     LINUX_DEVICE_DESCRIPTOR_COUNT,
-> = BankedAtomicArray::<AtomicU16, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
-static X86_RUNTIME_BACKING_ELF_PROBE_SOCKET_SLOTS: BankedAtomicArray<
+> = CpuBankedAtomicArray::<AtomicU16, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
+static X86_RUNTIME_BACKING_ELF_PROBE_SOCKET_SLOTS: CpuBankedAtomicArray<
     AtomicU16,
     LINUX_DEVICE_DESCRIPTOR_COUNT,
-> = BankedAtomicArray::<AtomicU16, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
-static X86_RUNTIME_BACKING_ELF_PROBE_SOCKET_FLAGS: BankedAtomicArray<
+> = CpuBankedAtomicArray::<AtomicU16, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
+static X86_RUNTIME_BACKING_ELF_PROBE_SOCKET_FLAGS: CpuBankedAtomicArray<
     AtomicU32,
     LINUX_DEVICE_DESCRIPTOR_COUNT,
-> = BankedAtomicArray::<AtomicU32, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
-static X86_RUNTIME_BACKING_ELF_PROBE_STDIO_SOCKET_SLOTS: [BankedAtomicU16; 3] =
-    [const { BankedAtomicU16::new(0) }; 3];
-static X86_RUNTIME_BACKING_ELF_PROBE_STDIO_SOCKET_FLAGS: BankedAtomicArray<AtomicU32, 3> =
-    BankedAtomicArray::<AtomicU32, 3>::new();
-static X86_RUNTIME_BACKING_ELF_PROBE_TMP_FILE_GENERATIONS: BankedAtomicArray<
+> = CpuBankedAtomicArray::<AtomicU32, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
+static X86_RUNTIME_BACKING_ELF_PROBE_STDIO_SOCKET_SLOTS: [CpuBankedAtomicU16; 3] =
+    [const { CpuBankedAtomicU16::new(0) }; 3];
+static X86_RUNTIME_BACKING_ELF_PROBE_STDIO_SOCKET_FLAGS: CpuBankedAtomicArray<AtomicU32, 3> =
+    CpuBankedAtomicArray::<AtomicU32, 3>::new();
+static X86_RUNTIME_BACKING_ELF_PROBE_TMP_FILE_GENERATIONS: CpuBankedAtomicArray<
     AtomicU32,
     LINUX_DEVICE_DESCRIPTOR_COUNT,
-> = BankedAtomicArray::<AtomicU32, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
+> = CpuBankedAtomicArray::<AtomicU32, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
 static X86_RUNTIME_BACKING_LINUX_INOTIFY_WATCH_OWNERS: [AtomicU16; LINUX_INOTIFY_WATCH_SLOT_COUNT] =
     [const { AtomicU16::new(0) }; LINUX_INOTIFY_WATCH_SLOT_COUNT];
 static X86_RUNTIME_BACKING_LINUX_INOTIFY_WATCH_PATHS: [AtomicU64; LINUX_INOTIFY_WATCH_SLOT_COUNT] =
@@ -2082,80 +2440,85 @@ static X86_RUNTIME_BACKING_LINUX_IO_URING_CQ_ENTRIES: BankedAtomicU32 = BankedAt
 static X86_RUNTIME_BACKING_LINUX_IO_URING_SQ_RING: BankedAtomicU64 = BankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_LINUX_IO_URING_CQ_RING: BankedAtomicU64 = BankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_LINUX_IO_URING_SQES: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_STDIO_DEVICE_DESCRIPTORS: [BankedAtomicU16; 3] =
-    [const { BankedAtomicU16::new(0) }; 3];
-static X86_RUNTIME_BACKING_ELF_PROBE_STDIO_ROOTFS_DESCRIPTORS: [BankedAtomicU16; 3] =
-    [const { BankedAtomicU16::new(0) }; 3];
-static X86_RUNTIME_BACKING_ELF_PROBE_STDIO_TMP_FILE_GENERATIONS: BankedAtomicArray<AtomicU32, 3> =
-    BankedAtomicArray::<AtomicU32, 3>::new();
-static X86_RUNTIME_BACKING_ELF_PROBE_STDIO_OFFSETS: BankedAtomicArray<AtomicU64, 3> =
-    BankedAtomicArray::<AtomicU64, 3>::new();
-static X86_RUNTIME_BACKING_ELF_PROBE_STDIO_OPEN_FILE_IDS: BankedAtomicArray<AtomicU64, 3> =
-    BankedAtomicArray::<AtomicU64, 3>::new();
-static X86_RUNTIME_BACKING_ELF_PROBE_OPEN_FILE_IDS: BankedAtomicArray<
+static X86_RUNTIME_BACKING_ELF_PROBE_STDIO_DEVICE_DESCRIPTORS: [CpuBankedAtomicU16; 3] =
+    [const { CpuBankedAtomicU16::new(0) }; 3];
+static X86_RUNTIME_BACKING_ELF_PROBE_STDIO_ROOTFS_DESCRIPTORS: [CpuBankedAtomicU16; 3] =
+    [const { CpuBankedAtomicU16::new(0) }; 3];
+static X86_RUNTIME_BACKING_ELF_PROBE_STDIO_TMP_FILE_GENERATIONS: CpuBankedAtomicArray<
+    AtomicU32,
+    3,
+> = CpuBankedAtomicArray::<AtomicU32, 3>::new();
+static X86_RUNTIME_BACKING_ELF_PROBE_STDIO_OFFSETS: CpuBankedAtomicArray<AtomicU64, 3> =
+    CpuBankedAtomicArray::<AtomicU64, 3>::new();
+static X86_RUNTIME_BACKING_ELF_PROBE_STDIO_OPEN_FILE_IDS: CpuBankedAtomicArray<AtomicU64, 3> =
+    CpuBankedAtomicArray::<AtomicU64, 3>::new();
+static X86_RUNTIME_BACKING_ELF_PROBE_OPEN_FILE_IDS: CpuBankedAtomicArray<
     AtomicU64,
     LINUX_DEVICE_DESCRIPTOR_COUNT,
-> = BankedAtomicArray::<AtomicU64, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
+> = CpuBankedAtomicArray::<AtomicU64, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
 static X86_RUNTIME_BACKING_LINUX_NEXT_OPEN_FILE_ID: BankedAtomicU64 = BankedAtomicU64::new(1);
-static X86_RUNTIME_BACKING_ELF_PROBE_CWD: BankedAtomicU16 =
-    BankedAtomicU16::new(LINUX_ROOT_DIRECTORY);
-static X86_RUNTIME_BACKING_ELF_PROBE_ROOTFS_CWD: BankedAtomicU16 =
-    BankedAtomicU16::new(crate::published_rootfs::ROOT_HANDLE);
-static X86_RUNTIME_BACKING_ELF_PROBE_OVERLAY_CWD: BankedAtomicU32 = BankedAtomicU32::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_EPOLL_DESCRIPTOR: BankedAtomicU16 = BankedAtomicU16::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_EPOLL_EVENTS: BankedAtomicArray<
+static X86_RUNTIME_BACKING_ELF_PROBE_CWD: CpuBankedAtomicU16 =
+    CpuBankedAtomicU16::new(LINUX_ROOT_DIRECTORY);
+static X86_RUNTIME_BACKING_ELF_PROBE_ROOTFS_CWD: CpuBankedAtomicU16 =
+    CpuBankedAtomicU16::new(crate::published_rootfs::ROOT_HANDLE);
+static X86_RUNTIME_BACKING_ELF_PROBE_OVERLAY_CWD: CpuBankedAtomicU32 = CpuBankedAtomicU32::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_EPOLL_DESCRIPTOR: CpuBankedAtomicU16 =
+    CpuBankedAtomicU16::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_EPOLL_EVENTS: CpuBankedAtomicArray<
     AtomicU32,
     { LINUX_DESCRIPTOR_TABLE_LIMIT as usize },
-> = BankedAtomicArray::<AtomicU32, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>::new();
-static X86_RUNTIME_BACKING_ELF_PROBE_EPOLL_DATA: BankedAtomicArray<
+> = CpuBankedAtomicArray::<AtomicU32, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>::new();
+static X86_RUNTIME_BACKING_ELF_PROBE_EPOLL_DATA: CpuBankedAtomicArray<
     AtomicU64,
     { LINUX_DESCRIPTOR_TABLE_LIMIT as usize },
-> = BankedAtomicArray::<AtomicU64, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>::new();
-static X86_RUNTIME_BACKING_LINUX_RUNTIME_EPOLL_ACTIVE: BankedAtomicArray<
+> = CpuBankedAtomicArray::<AtomicU64, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>::new();
+static X86_RUNTIME_BACKING_LINUX_RUNTIME_EPOLL_ACTIVE: CpuBankedAtomicArray<
     AtomicU8,
     LINUX_DEVICE_DESCRIPTOR_COUNT,
-> = BankedAtomicArray::<AtomicU8, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
+> = CpuBankedAtomicArray::<AtomicU8, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
 /// For an epoll descriptor duplicated from another, the descriptor (+ 1)
 /// that owns the shared instance's watches; 0 when it owns them itself.
-static X86_RUNTIME_BACKING_LINUX_RUNTIME_EPOLL_ALIASES: BankedAtomicArray<
+static X86_RUNTIME_BACKING_LINUX_RUNTIME_EPOLL_ALIASES: CpuBankedAtomicArray<
     AtomicU16,
     LINUX_DEVICE_DESCRIPTOR_COUNT,
-> = BankedAtomicArray::<AtomicU16, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
+> = CpuBankedAtomicArray::<AtomicU16, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
 /// Set while a blocking call on a local socket makes its single attempt, so
 /// the socket layer reports EAGAIN instead of spinning.
 static X86_RUNTIME_BACKING_LINUX_SOCKET_SINGLE_ATTEMPT: AtomicBool = AtomicBool::new(false);
-static X86_RUNTIME_BACKING_LINUX_RUNTIME_EPOLL_WATCH_EPOLL: BankedAtomicArray<
+static X86_RUNTIME_BACKING_LINUX_RUNTIME_EPOLL_WATCH_EPOLL: CpuBankedAtomicArray<
     AtomicU16,
     { LINUX_DESCRIPTOR_TABLE_LIMIT as usize },
-> = BankedAtomicArray::<AtomicU16, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>::new();
-static X86_RUNTIME_BACKING_LINUX_RUNTIME_EPOLL_WATCH_TARGET: BankedAtomicArray<
+> = CpuBankedAtomicArray::<AtomicU16, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>::new();
+static X86_RUNTIME_BACKING_LINUX_RUNTIME_EPOLL_WATCH_TARGET: CpuBankedAtomicArray<
     AtomicU16,
     { LINUX_DESCRIPTOR_TABLE_LIMIT as usize },
-> = BankedAtomicArray::<AtomicU16, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>::new();
+> = CpuBankedAtomicArray::<AtomicU16, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>::new();
 static X86_RUNTIME_BACKING_ELF_PROBE_EVENTFD_DESCRIPTOR: BankedAtomicU16 = BankedAtomicU16::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_EVENTFD_COUNTER: BankedAtomicU64 = BankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_EVENTFD_FLAGS: BankedAtomicU32 = BankedAtomicU32::new(0);
-static X86_RUNTIME_BACKING_LINUX_RUNTIME_EVENTFD_ACTIVE: BankedAtomicArray<
+static X86_RUNTIME_BACKING_LINUX_RUNTIME_EVENTFD_ACTIVE: CpuBankedAtomicArray<
     AtomicU8,
     LINUX_DEVICE_DESCRIPTOR_COUNT,
-> = BankedAtomicArray::<AtomicU8, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
+> = CpuBankedAtomicArray::<AtomicU8, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
 static X86_RUNTIME_BACKING_ELF_PROBE_TIMERFD_DESCRIPTOR: BankedAtomicU16 = BankedAtomicU16::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_TIMERFD_CLOCK: BankedAtomicU8 = BankedAtomicU8::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_TIMERFD_FLAGS: BankedAtomicU32 = BankedAtomicU32::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_TIMERFD_INTERVAL: BankedAtomicU64 = BankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_TIMERFD_DEADLINE: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_LINUX_RUNTIME_TIMERFD_ACTIVE: BankedAtomicArray<
+static X86_RUNTIME_BACKING_LINUX_RUNTIME_TIMERFD_ACTIVE: CpuBankedAtomicArray<
     AtomicU8,
     LINUX_DEVICE_DESCRIPTOR_COUNT,
-> = BankedAtomicArray::<AtomicU8, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
+> = CpuBankedAtomicArray::<AtomicU8, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
 static X86_RUNTIME_BACKING_ELF_PROBE_POSIX_TIMER_ACTIVE: BankedAtomicBool =
     BankedAtomicBool::new(false);
 static X86_RUNTIME_BACKING_ELF_PROBE_POSIX_TIMER_INTERVAL: BankedAtomicU64 =
     BankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_POSIX_TIMER_DEADLINE: BankedAtomicU64 =
     BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_REAL_TIMER_INTERVAL: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_REAL_TIMER_DEADLINE: BankedAtomicU64 = BankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_REAL_TIMER_INTERVAL: CpuBankedAtomicU64 =
+    CpuBankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_REAL_TIMER_DEADLINE: CpuBankedAtomicU64 =
+    CpuBankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_PIPE_READ_DESCRIPTOR: BankedAtomicU16 =
     BankedAtomicU16::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_PIPE_WRITE_DESCRIPTOR: BankedAtomicU16 =
@@ -2165,22 +2528,24 @@ static X86_RUNTIME_BACKING_ELF_PROBE_PIPE_WRITE_FLAGS: BankedAtomicU32 = BankedA
 static X86_RUNTIME_BACKING_ELF_PROBE_PIPE_LENGTH: BankedAtomicU32 = BankedAtomicU32::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_PIPE_BUFFER: [BankedAtomicU8; LINUX_PIPE_CAPACITY] =
     [const { BankedAtomicU8::new(0) }; LINUX_PIPE_CAPACITY];
-static X86_RUNTIME_BACKING_ELF_PROBE_DESCRIPTOR_OFFSETS: BankedAtomicArray<
+static X86_RUNTIME_BACKING_ELF_PROBE_DESCRIPTOR_OFFSETS: CpuBankedAtomicArray<
     AtomicU64,
     LINUX_DEVICE_DESCRIPTOR_COUNT,
-> = BankedAtomicArray::<AtomicU64, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
+> = CpuBankedAtomicArray::<AtomicU64, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
 static X86_RUNTIME_BACKING_ELF_PROBE_CLOCK_EPOCH: BankedAtomicU64 = BankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_CLOCK_FREQUENCY: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_PROCESS_NAME_LOW: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_PROCESS_NAME_HIGH: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_DUMPABLE: BankedAtomicBool = BankedAtomicBool::new(true);
-static X86_RUNTIME_BACKING_ELF_PROBE_SECUREBITS: BankedAtomicU32 = BankedAtomicU32::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_PERSONALITY: BankedAtomicU32 = BankedAtomicU32::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_PROCESS_NAME_LOW: CpuBankedAtomicU64 =
+    CpuBankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_PROCESS_NAME_HIGH: CpuBankedAtomicU64 =
+    CpuBankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_DUMPABLE: CpuBankedAtomicBool = CpuBankedAtomicBool::new(true);
+static X86_RUNTIME_BACKING_ELF_PROBE_SECUREBITS: CpuBankedAtomicU32 = CpuBankedAtomicU32::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_PERSONALITY: CpuBankedAtomicU32 = CpuBankedAtomicU32::new(0);
 // Linux exposes nice values in the signed range -20..=19. Store nice + 20 so
 // the per-domain bank can use the same compact atomic machinery as other
 // process runtime state.
-static X86_RUNTIME_BACKING_ELF_PROBE_NICE: BankedAtomicU8 = BankedAtomicU8::new(20);
-static X86_RUNTIME_BACKING_ELF_PROBE_IOPRIO: BankedAtomicU16 = BankedAtomicU16::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_NICE: CpuBankedAtomicU8 = CpuBankedAtomicU8::new(20);
+static X86_RUNTIME_BACKING_ELF_PROBE_IOPRIO: CpuBankedAtomicU16 = CpuBankedAtomicU16::new(0);
 static X86_RUNTIME_BACKING_LINUX_RUNTIME_EXIT_STATUS: BankedAtomicU64 =
     BankedAtomicU64::new(u64::MAX);
 static X86_RUNTIME_BACKING_LINUX_RUNTIME_FIRST_UNSUPPORTED_SYSCALL: BankedAtomicU64 =
@@ -2216,10 +2581,10 @@ static X86_RUNTIME_BACKING_LINUX_BOOT_PROFILE_LIFECYCLE_TICKS: [BankedAtomicU64;
     [const { BankedAtomicU64::new(0) }; LINUX_BOOT_PROFILE_LIFECYCLE_PHASES];
 static X86_RUNTIME_BACKING_LINUX_RUNTIME_CONSOLE_TIMING_WRITTEN: BankedAtomicBool =
     BankedAtomicBool::new(false);
-static X86_RUNTIME_BACKING_LINUX_TIMED_WAITS_ACTIVE: BankedAtomicBool =
-    BankedAtomicBool::new(false);
-static X86_RUNTIME_BACKING_LINUX_DESCRIPTOR_WAITS_ACTIVE: BankedAtomicBool =
-    BankedAtomicBool::new(false);
+static X86_RUNTIME_BACKING_LINUX_TIMED_WAITS_ACTIVE: CpuBankedAtomicBool =
+    CpuBankedAtomicBool::new(false);
+static X86_RUNTIME_BACKING_LINUX_DESCRIPTOR_WAITS_ACTIVE: CpuBankedAtomicBool =
+    CpuBankedAtomicBool::new(false);
 static X86_RUNTIME_BACKING_LINUX_RUNTIME_SLOW_DIAGNOSTIC_WRITTEN: BankedAtomicBool =
     BankedAtomicBool::new(false);
 static X86_RUNTIME_BACKING_LINUX_RUNTIME_LATE_DIAGNOSTIC_WRITTEN: BankedAtomicBool =
@@ -2236,32 +2601,37 @@ static X86_RUNTIME_BACKING_LINUX_RUNTIME_UNSUPPORTED_SYSCALLS: [BankedAtomicU64;
 static X86_RUNTIME_BACKING_LINUX_RUNTIME_EINVAL_SYSCALLS: [BankedAtomicU64;
     LINUX_RUNTIME_UNSUPPORTED_WORDS] =
     [const { BankedAtomicU64::new(0) }; LINUX_RUNTIME_UNSUPPORTED_WORDS];
-static X86_RUNTIME_BACKING_ELF_PROBE_NO_NEW_PRIVS: BankedAtomicBool = BankedAtomicBool::new(false);
-static X86_RUNTIME_BACKING_ELF_PROBE_SECCOMP_STRICT: BankedAtomicBool =
-    BankedAtomicBool::new(false);
-static X86_RUNTIME_BACKING_ELF_PROBE_MEMBARRIER_REGISTRATIONS: BankedAtomicU32 =
-    BankedAtomicU32::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_SIGNAL_MASK: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_PENDING_SIGNALS: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_PENDING_SIGNAL_CODES: [BankedAtomicU32; LINUX_SIGNAL_COUNT] =
-    [const { BankedAtomicU32::new(0) }; LINUX_SIGNAL_COUNT];
-static X86_RUNTIME_BACKING_ELF_PROBE_PENDING_SIGNAL_VALUES: [BankedAtomicU64; LINUX_SIGNAL_COUNT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_SIGNAL_COUNT];
-static X86_RUNTIME_BACKING_ELF_PROBE_EXEC_IGNORED_SIGNALS: BankedAtomicU64 =
-    BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_SIGNAL_HANDLERS: [BankedAtomicU64; LINUX_SIGNAL_COUNT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_SIGNAL_COUNT];
-static X86_RUNTIME_BACKING_ELF_PROBE_SIGNAL_FLAGS: [BankedAtomicU64; LINUX_SIGNAL_COUNT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_SIGNAL_COUNT];
-static X86_RUNTIME_BACKING_ELF_PROBE_SIGNAL_RESTORERS: [BankedAtomicU64; LINUX_SIGNAL_COUNT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_SIGNAL_COUNT];
-static X86_RUNTIME_BACKING_ELF_PROBE_SIGNAL_ACTION_MASKS: [BankedAtomicU64; LINUX_SIGNAL_COUNT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_SIGNAL_COUNT];
-static X86_RUNTIME_BACKING_ELF_PROBE_ALT_STACK_POINTER: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_ALT_STACK_SIZE: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_ALT_STACK_FLAGS: BankedAtomicU32 =
-    BankedAtomicU32::new(LINUX_SS_DISABLE);
-static X86_RUNTIME_BACKING_LINUX_SIGNAL_ACTIVE: BankedAtomicBool = BankedAtomicBool::new(false);
+static X86_RUNTIME_BACKING_ELF_PROBE_NO_NEW_PRIVS: CpuBankedAtomicBool =
+    CpuBankedAtomicBool::new(false);
+static X86_RUNTIME_BACKING_ELF_PROBE_SECCOMP_STRICT: CpuBankedAtomicBool =
+    CpuBankedAtomicBool::new(false);
+static X86_RUNTIME_BACKING_ELF_PROBE_MEMBARRIER_REGISTRATIONS: CpuBankedAtomicU32 =
+    CpuBankedAtomicU32::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_SIGNAL_MASK: CpuBankedAtomicU64 = CpuBankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_PENDING_SIGNALS: CpuBankedAtomicU64 =
+    CpuBankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_PENDING_SIGNAL_CODES: [CpuBankedAtomicU32;
+    LINUX_SIGNAL_COUNT] = [const { CpuBankedAtomicU32::new(0) }; LINUX_SIGNAL_COUNT];
+static X86_RUNTIME_BACKING_ELF_PROBE_PENDING_SIGNAL_VALUES: [CpuBankedAtomicU64;
+    LINUX_SIGNAL_COUNT] = [const { CpuBankedAtomicU64::new(0) }; LINUX_SIGNAL_COUNT];
+static X86_RUNTIME_BACKING_ELF_PROBE_EXEC_IGNORED_SIGNALS: CpuBankedAtomicU64 =
+    CpuBankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_SIGNAL_HANDLERS: [CpuBankedAtomicU64; LINUX_SIGNAL_COUNT] =
+    [const { CpuBankedAtomicU64::new(0) }; LINUX_SIGNAL_COUNT];
+static X86_RUNTIME_BACKING_ELF_PROBE_SIGNAL_FLAGS: [CpuBankedAtomicU64; LINUX_SIGNAL_COUNT] =
+    [const { CpuBankedAtomicU64::new(0) }; LINUX_SIGNAL_COUNT];
+static X86_RUNTIME_BACKING_ELF_PROBE_SIGNAL_RESTORERS: [CpuBankedAtomicU64; LINUX_SIGNAL_COUNT] =
+    [const { CpuBankedAtomicU64::new(0) }; LINUX_SIGNAL_COUNT];
+static X86_RUNTIME_BACKING_ELF_PROBE_SIGNAL_ACTION_MASKS: [CpuBankedAtomicU64; LINUX_SIGNAL_COUNT] =
+    [const { CpuBankedAtomicU64::new(0) }; LINUX_SIGNAL_COUNT];
+static X86_RUNTIME_BACKING_ELF_PROBE_ALT_STACK_POINTER: CpuBankedAtomicU64 =
+    CpuBankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_ALT_STACK_SIZE: CpuBankedAtomicU64 =
+    CpuBankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_ALT_STACK_FLAGS: CpuBankedAtomicU32 =
+    CpuBankedAtomicU32::new(LINUX_SS_DISABLE);
+static X86_RUNTIME_BACKING_LINUX_SIGNAL_ACTIVE: CpuBankedAtomicBool =
+    CpuBankedAtomicBool::new(false);
 static X86_RUNTIME_BACKING_LINUX_SIGNAL_DELIVERY_COUNT: BankedAtomicU64 = BankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_LINUX_SIGNAL_RETURN_COUNT: BankedAtomicU64 = BankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_LINUX_SIGNAL_WAIT_BLOCK_COUNT: BankedAtomicU32 = BankedAtomicU32::new(0);
@@ -2968,8 +3338,30 @@ extern "C" {
 unsafe fn enter_linux_process(entry: usize, stack: usize, general: *const u64, rflags: u64) {
     let entry_state = current_entry_state();
     let previous_return_stack = (*entry_state).return_stack;
-    ginux_process_user_enter(entry, stack, general, rflags);
+    process_user_enter(entry, stack, general, rflags);
     (*entry_state).return_stack = previous_return_stack;
+}
+
+/// Enters a Linux process's user mode until it returns to the kernel. The
+/// kernel-entry lock is released while it runs user code and held again on
+/// the way back (`sync::kernel_entry_leave_to_user`).
+///
+/// # Safety
+///
+/// As for `ginux_process_user_enter`.
+pub(super) unsafe fn process_user_enter(
+    entry: usize,
+    stack: usize,
+    general: *const u64,
+    rflags: u64,
+) {
+    crate::sync::kernel_entry_leave_to_user();
+    crate::cpu_time::leave_for_user();
+    ginux_process_user_enter(entry, stack, general, rflags);
+    // A return the entry stub refused (a non-canonical user address) comes
+    // back here without passing the system call's lock re-entry.
+    crate::cpu_time::back_from_user();
+    crate::sync::kernel_entry_return_from_user();
 }
 
 /// Enters the current Linux runtime process. On the boot CPU its activation
@@ -2984,7 +3376,7 @@ unsafe fn enter_linux_runtime_process(
 ) {
     let entry_state = current_entry_state();
     let previous_return_stack = (*entry_state).return_stack;
-    LINUX_PROCESS_SLICE.store(0, Ordering::SeqCst);
+    LINUX_PROCESS_SLICE[linux_cpu_slot()].store(0, Ordering::SeqCst);
     let entered = X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
         && current_linux_runtime_cpu_index() == 0
         && activation::enter_on_own_stack(
@@ -2996,7 +3388,7 @@ unsafe fn enter_linux_runtime_process(
         )
         .is_some();
     if !entered {
-        ginux_process_user_enter(entry, stack, general, rflags);
+        process_user_enter(entry, stack, general, rflags);
     }
     (*entry_state).return_stack = previous_return_stack;
 }
@@ -4783,6 +5175,13 @@ fn sync_live_linux_process_address_space(pid: u32) -> bool {
             .store(mapping.frame.address(), Ordering::SeqCst);
         X86_RUNTIME.ELF_PROBE_ACTIVE_IMAGE_GENERATIONS[index]
             .store(mapping.frame.generation(), Ordering::SeqCst);
+        // What the page allows, as this process mapped it: exec writes
+        // these for the program it loads, so another process's exec must
+        // not decide them.
+        X86_RUNTIME.ELF_PROBE_ACTIVE_IMAGE_FLAGS[index].store(
+            u8::from(mapping.writable) | (u8::from(mapping.executable) << 1),
+            Ordering::SeqCst,
+        );
     }
     for index in 0..LINUX_EXEC_MAPPING_LIMIT {
         let address =
@@ -4914,6 +5313,8 @@ fn execute_deferred_live_fork() -> bool {
         .LINUX_FORK_NEW_USER_NAMESPACE
         .swap(false, Ordering::SeqCst);
     let parent_pid = current_linux_process_pid();
+    // The transaction switches back to the parent: no other CPU takes it.
+    let _pin = LinuxProcessPin::new(parent_pid);
     let Some(parent_runtime) = stage_linux_fork_parent_runtime_state(parent_pid) else {
         return false;
     };
@@ -7582,6 +7983,9 @@ pub(crate) fn take_linux_exec_page_table_frames() -> [Option<memory::FrameLease>
 
 #[inline(never)]
 pub(crate) fn verify_linux_elf_entry(execution: &LinuxElfExecution<'_>) -> LinuxElfResult {
+    // The runtime's own kernel work (its loop, forks, teardown) holds the
+    // kernel-entry lock; the processes it enters release it in user mode.
+    let _kernel_entry = crate::sync::kernel_entry_lock();
     if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
         serial_write("ginux: Linux ELF verifier rejected active runtime mode\r\n");
         return LinuxElfResult::FAILED;
@@ -8975,12 +9379,7 @@ pub(crate) fn verify_linux_elf_entry(execution: &LinuxElfExecution<'_>) -> Linux
     X86_RUNTIME
         .LINUX_SIGNAL_RETURN_COUNT
         .store(0, Ordering::SeqCst);
-    unsafe {
-        X86_MUTABLE_RUNTIME
-            .signal_context
-            .get()
-            .write(LinuxSignalContext::ZERO)
-    };
+    unsafe { linux_signal_context().get().write(LinuxSignalContext::ZERO) };
     let linux_clone_publication_valid = if execution.tls_size == 0 {
         true
     } else {
@@ -9503,9 +9902,7 @@ pub(crate) fn verify_linux_elf_entry(execution: &LinuxElfExecution<'_>) -> Linux
         .swap(false, Ordering::SeqCst)
         && signal_delivery_count == expected_signal_count
         && signal_return_count == expected_signal_count
-        && unsafe {
-            X86_MUTABLE_RUNTIME.signal_context.get().cast_const().read() == LinuxSignalContext::ZERO
-        };
+        && unsafe { linux_signal_context().get().cast_const().read() == LinuxSignalContext::ZERO };
     let system_supervisor_valid = if system_init {
         system_supervisor_wait_count == 1 && system_supervisor_shutdown_count == 1
     } else {
@@ -12469,6 +12866,7 @@ fn linux_schedule_new_thread(
     if !cfg!(feature = "verification-boot")
         && current_linux_runtime_cpu_index() == 0
         && linux_available_cpu_count() > 1
+        && !linux_smp_runtime_active()
     {
         if let Some(root) = linux_process::live_process_root(current_linux_process_pid()) {
             let Some(general) = linux_thread_resume_general(child, child_context) else {
@@ -12833,10 +13231,23 @@ fn take_linux_child_yield(pid: u32) -> bool {
 /// Lets interrupts in and halts until the next one (a timer tick or a
 /// device), then turns them off again.
 pub(super) fn linux_wait_for_interrupt() {
-    // SAFETY: interrupts are enabled only around the halt; their handlers
-    // save and restore the state they touch, and `cli` ends the window
-    // before this returns, so the caller's interrupt-off invariants hold.
-    unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) };
+    let started = timer::timestamp_counter();
+    // Other CPUs enter the kernel while this one waits.
+    crate::sync::kernel_entry_leave_to_user();
+    if current_cpu_index_checked().is_some_and(|cpu| cpu != 0) {
+        let until = timer::timestamp_counter().wrapping_add(LINUX_SMP_IDLE_SPIN_TICKS);
+        while timer::timestamp_counter() < until {
+            core::hint::spin_loop();
+        }
+    } else {
+        // SAFETY: interrupts are enabled only around the halt; their
+        // handlers save and restore the state they touch, and `cli` ends the
+        // window before this returns, so the caller's interrupt-off
+        // invariants hold.
+        unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) };
+    }
+    crate::cpu_time::add_idle(timer::timestamp_counter().saturating_sub(started));
+    crate::sync::kernel_entry_return_from_user();
 }
 
 fn current_linux_user_namespace() -> Option<linux_user::UserNamespaceHandle> {
@@ -13547,7 +13958,7 @@ fn resume_parked_linux_process(pid: u32) -> bool {
     // SAFETY: the entry state is this CPU's; the resumed call installs its
     // own while it runs, and the runtime's is put back after.
     let previous_return_stack = unsafe { (*entry_state).return_stack };
-    LINUX_PROCESS_SLICE.store(0, Ordering::SeqCst);
+    LINUX_PROCESS_SLICE[linux_cpu_slot()].store(0, Ordering::SeqCst);
     // SAFETY: `pid` is current again: everything that ran while it was
     // parked ran nested as its child, which put its kernel state back.
     let resumed = unsafe { activation::resume(linux_activation_owner(pid)) }.is_some();
@@ -13749,10 +14160,43 @@ fn linux_signal_due_from_timer(check_queues: bool) -> bool {
         || check_queues && linux_peek_dynamic_signal(requested).is_some()
 }
 
-static LINUX_PREEMPTED_CONTEXT: crate::sync::IrqSpinLock<Option<LinuxPreemptedContext>> =
-    crate::sync::IrqSpinLock::new(crate::sync::LockRank::SCHEDULER, None);
-/// Timer ticks the current process has run since it was last entered.
-static LINUX_PROCESS_SLICE: AtomicU32 = AtomicU32::new(0);
+/// Per CPU, the context of the process its timer just sent to the vDSO's
+/// preemption entry, which that process's next system call there (on the
+/// same CPU) takes.
+static LINUX_PREEMPTED_CONTEXT: [crate::sync::IrqSpinLock<Option<LinuxPreemptedContext>>;
+    CPU_ENTRY_STATE_LIMIT] =
+    [const { crate::sync::IrqSpinLock::new(crate::sync::LockRank::SCHEDULER, None) };
+        CPU_ENTRY_STATE_LIMIT];
+/// Per CPU, the timer ticks its current process has run since it was last
+/// entered.
+static LINUX_PROCESS_SLICE: [AtomicU32; CPU_ENTRY_STATE_LIMIT] =
+    [const { AtomicU32::new(0) }; CPU_ENTRY_STATE_LIMIT];
+
+/// This CPU's entry in a per-CPU table.
+fn linux_cpu_slot() -> usize {
+    current_cpu_index_checked()
+        .filter(|cpu| *cpu < CPU_ENTRY_STATE_LIMIT)
+        .unwrap_or(0)
+}
+
+/// An application processor's timer tick (its own local APIC, armed while it
+/// runs a domain runtime's processes): the boot CPU's tick does the
+/// domain's timekeeping; this one only preempts the process this CPU runs
+/// once its slice is used, so a CPU-bound process here gives the CPU up
+/// as it would on the boot CPU (a forked child running inside its parent's
+/// fork lets the parent go on).
+pub(crate) fn linux_application_processor_tick(frame: &mut UserInterruptFrame) {
+    if frame
+        .user_context(USER_CODE_SELECTOR, USER_DATA_SELECTOR)
+        .is_none()
+    {
+        return;
+    }
+    let _kernel_entry = crate::sync::kernel_entry_lock();
+    if linux_smp_runtime_active() {
+        linux_preempt_process_from_timer(frame);
+    }
+}
 
 /// Called on a timer tick that interrupted user mode: when a process other
 /// than init has used its slice and was entered by the scheduler (so a
@@ -13770,7 +14214,7 @@ fn linux_preempt_process_from_timer(frame: &mut UserInterruptFrame) {
     let Some(mut context) = frame.user_context(USER_CODE_SELECTOR, USER_DATA_SELECTOR) else {
         return;
     };
-    let ticks = LINUX_PROCESS_SLICE.fetch_add(1, Ordering::SeqCst) + 1;
+    let ticks = LINUX_PROCESS_SLICE[linux_cpu_slot()].fetch_add(1, Ordering::SeqCst) + 1;
     let signal_due = !X86_RUNTIME.LINUX_SIGNAL_ACTIVE.load(Ordering::SeqCst)
         && linux_signal_due_from_timer(ticks.is_multiple_of(LINUX_SIGNAL_QUEUE_CHECK_TICKS));
     if ticks < LINUX_PROCESS_SLICE_TICKS && !signal_due {
@@ -13825,9 +14269,9 @@ fn linux_preempt_process_from_timer(frame: &mut UserInterruptFrame) {
     };
     context.rip = entry;
     if frame.restore_user_context(context, USER_CODE_SELECTOR, USER_DATA_SELECTOR) {
-        *LINUX_PREEMPTED_CONTEXT.lock() = Some(preempted);
+        *LINUX_PREEMPTED_CONTEXT[linux_cpu_slot()].lock() = Some(preempted);
         if !signal_due {
-            LINUX_PROCESS_SLICE.store(0, Ordering::SeqCst);
+            LINUX_PROCESS_SLICE[linux_cpu_slot()].store(0, Ordering::SeqCst);
         }
     }
 }
@@ -13843,7 +14287,7 @@ fn linux_complete_timer_preemption(output: *mut LinuxSyscallFrame, user_rip: u64
     }
     let pid = current_linux_process_pid();
     let preempted = {
-        let mut pending = LINUX_PREEMPTED_CONTEXT.lock();
+        let mut pending = LINUX_PREEMPTED_CONTEXT[linux_cpu_slot()].lock();
         pending.filter(|preempted| preempted.pid == pid)?;
         pending.take()?
     };
@@ -14022,16 +14466,53 @@ fn run_dispatched_linux_process(process: &linux_process::LiveProcessDispatch) ->
     if activation::is_parked(linux_activation_owner(process.pid)) {
         let previous_root = address_space::current_root_address();
         let resumed = resume_parked_linux_process(process.pid);
-        return address_space::restore_root_after_resume(previous_root) && resumed;
+        let restored = address_space::restore_root_after_resume(previous_root);
+        if !(resumed && restored) {
+            serial_write("ginux: parked process resume failed pid/cpu/resumed/restored: ");
+            for value in [
+                u64::from(process.pid),
+                current_cpu_index_checked().unwrap_or(99) as u64,
+                u64::from(resumed),
+                u64::from(restored),
+            ] {
+                serial_write_u64(value);
+                serial_write(" ");
+            }
+            serial_write("\r\n");
+        }
+        return restored && resumed;
     }
-    address_space::resume_live_linux_process(
+    if activation::is_running(linux_activation_owner(process.pid)) {
+        serial_write("ginux: entering a process whose activation runs pid/cpu: ");
+        serial_write_u64(u64::from(process.pid));
+        serial_write(" ");
+        serial_write_u64(current_cpu_index_checked().unwrap_or(99) as u64);
+        serial_write("\r\n");
+    }
+    let entered = address_space::resume_live_linux_process(
         process.root,
         process.rip,
         process.rsp,
         process.fs_base,
         process.general,
         process.rflags,
-    )
+    );
+    if !entered {
+        serial_write("ginux: process entry failed pid/cpu/root/rip/rsp/current-root: ");
+        for value in [
+            u64::from(process.pid),
+            current_cpu_index_checked().unwrap_or(99) as u64,
+            process.root.address(),
+            process.rip,
+            process.rsp,
+            address_space::current_root_address(),
+        ] {
+            serial_write_u64(value);
+            serial_write(" ");
+        }
+        serial_write("\r\n");
+    }
+    entered
 }
 
 fn restore_linux_process_live_return(output: *mut LinuxSyscallFrame, pid: u32) -> bool {
@@ -14121,6 +14602,7 @@ fn save_suspended_linux_runtime(
 }
 
 pub(crate) fn resume_suspended_linux_runtime(mmap: u64) -> LinuxElfResult {
+    let _kernel_entry = crate::sync::kernel_entry_lock();
     if !X86_RUNTIME.LINUX_RUNTIME_SUSPENDED.load(Ordering::Acquire) {
         return LinuxElfResult::FAILED;
     }
@@ -14382,7 +14864,7 @@ pub(crate) fn resume_suspended_linux_runtime(mmap: u64) -> LinuxElfResult {
 /// has finished (init exited, the runtime is suspending, or it forked,
 /// which the loop completes first).
 fn run_linux_runtime_loop() -> bool {
-    let mut entries = linux_syscall::LINUX_SYSCALL_ENTRIES.load(Ordering::Relaxed);
+    let mut entries = linux_syscall::linux_syscall_entries_here().load(Ordering::Relaxed);
     let mut idle_rounds = 0_usize;
     loop {
         while X86_RUNTIME.LINUX_FORK_REQUESTED.load(Ordering::SeqCst) {
@@ -14407,18 +14889,25 @@ fn run_linux_runtime_loop() -> bool {
         // again make no system call. Once every process has had such a round
         // in a row, nothing changes until an interrupt (the tick, a device)
         // does: wait for one instead of going round again.
-        let now = linux_syscall::LINUX_SYSCALL_ENTRIES.load(Ordering::Relaxed);
+        let now = linux_syscall::linux_syscall_entries_here().load(Ordering::Relaxed);
         idle_rounds = if now == entries { idle_rounds + 1 } else { 0 };
         if idle_rounds > usize::from(linux_process::live_process_count().unwrap_or(1)) {
             linux_wait_for_interrupt();
             idle_rounds = 0;
         }
-        entries = linux_syscall::LINUX_SYSCALL_ENTRIES.load(Ordering::Relaxed);
+        entries = linux_syscall::linux_syscall_entries_here().load(Ordering::Relaxed);
+        // Other CPUs' system calls go first.
+        crate::sync::kernel_entry_yield();
     }
 }
 
 fn finish_linux_runtime(mmap: u64, saved_msrs: [u64; 5]) -> LinuxElfResult {
-    let forks_completed = run_linux_runtime_loop();
+    start_linux_smp_runtime();
+    let mut forks_completed = run_linux_runtime_loop();
+    if stop_linux_smp_runtime() && !X86_RUNTIME.LINUX_RUNTIME_SUSPENDED.load(Ordering::Acquire) {
+        // Children that ended on other CPUs left init in the run queue.
+        forks_completed &= linux_process::retire_lone_live_process(1);
+    }
     if forks_completed && X86_RUNTIME.LINUX_RUNTIME_SUSPENDED.load(Ordering::Acquire) {
         let state_saved = save_container_extended_state();
         let registry_suspended = state_saved && linux_process::suspend_runtime_process_registry();
@@ -14513,7 +15002,7 @@ fn linux_user_stack_pointer_valid(user_stack: u64) -> bool {
     }
     // SAFETY: active signal delivery owns this context until the serialized
     // rt_sigreturn or abort path clears active and the record.
-    let signal = unsafe { X86_MUTABLE_RUNTIME.signal_context.get().cast_const().read() };
+    let signal = unsafe { linux_signal_context().get().cast_const().read() };
     let alt_base = signal.alt_stack_pointer;
     let alt_size = signal.alt_stack_size;
     let frame_uses_alt_stack = alt_base != 0
@@ -15018,7 +15507,9 @@ struct X86MutableRuntimeOwner {
     /// time a process occupies its slot instead of being reserved in the
     /// kernel image for every slot of every domain.
     process_records: UnsafeCell<[*mut LinuxProcessRecord; LINUX_PROCESS_RECORD_COUNT]>,
-    signal_context: UnsafeCell<LinuxSignalContext>,
+    /// The running process's signal context, per CPU (`linux_cpu_bank`):
+    /// CPUs run different processes, each with its handler's saved context.
+    signal_context: [UnsafeCell<LinuxSignalContext>; LINUX_CPU_BANK_LIMIT],
 }
 
 // SAFETY: Gate 5 centralizes the legacy mutable runtime banks behind this
@@ -15030,8 +15521,13 @@ static X86_MUTABLE_RUNTIME: X86MutableRuntimeOwner = X86MutableRuntimeOwner {
         [ExtendedState([0; EXTENDED_STATE_SIZE]); control_abi::DOMAIN_LIMIT],
     ),
     process_records: UnsafeCell::new([core::ptr::null_mut(); LINUX_PROCESS_RECORD_COUNT]),
-    signal_context: UnsafeCell::new(LinuxSignalContext::ZERO),
+    signal_context: [const { UnsafeCell::new(LinuxSignalContext::ZERO) }; LINUX_CPU_BANK_LIMIT],
 };
+
+/// This CPU's running process's signal context.
+fn linux_signal_context() -> &'static UnsafeCell<LinuxSignalContext> {
+    &X86_MUTABLE_RUNTIME.signal_context[linux_cpu_bank()]
+}
 
 /// The record for process slot `slot` of domain instance `instance`,
 /// allocated on first use.
@@ -15621,7 +16117,7 @@ fn capture_linux_process_runtime_state() -> Option<LinuxProcessRuntimeState> {
             X86_RUNTIME.ELF_PROBE_PENDING_SIGNAL_VALUES[signal].load(Ordering::SeqCst)
         }),
         signal_active: X86_RUNTIME.LINUX_SIGNAL_ACTIVE.load(Ordering::SeqCst),
-        signal_context: unsafe { X86_MUTABLE_RUNTIME.signal_context.get().cast_const().read() },
+        signal_context: unsafe { linux_signal_context().get().cast_const().read() },
         exec_ignored_signals: X86_RUNTIME
             .ELF_PROBE_EXEC_IGNORED_SIGNALS
             .load(Ordering::SeqCst),
@@ -15752,10 +16248,7 @@ fn restore_linux_process_runtime_state(state: &LinuxProcessRuntimeState) {
         .LINUX_SIGNAL_ACTIVE
         .store(state.signal_active, Ordering::SeqCst);
     unsafe {
-        X86_MUTABLE_RUNTIME
-            .signal_context
-            .get()
-            .write(state.signal_context);
+        linux_signal_context().get().write(state.signal_context);
     }
     X86_RUNTIME
         .ELF_PROBE_EXEC_IGNORED_SIGNALS
@@ -18511,11 +19004,11 @@ fn verify_linux_cpu_topology_files(mapping: u64) -> bool {
             == prefix.len() as u64
             && copy_from_linux_user(mapping, &mut prefix)
             && prefix.starts_with(b"processor\t: 1\n");
-    let mut expected_stat = [0_u8; 512];
+    let mut expected_stat = [0_u8; 2048];
     let Some(stat_size) = linux_proc_stat_file(&mut expected_stat) else {
         return false;
     };
-    let mut observed_stat = [0_u8; 512];
+    let mut observed_stat = [0_u8; 2048];
     let stat = linux_proc_stat_read(mapping, stat_size as u64, 0) == stat_size as u64
         && copy_from_linux_user(mapping, &mut observed_stat[..stat_size])
         && observed_stat[..stat_size] == expected_stat[..stat_size];
@@ -27174,12 +27667,7 @@ fn reset_linux_signal_state_after_exec() {
     X86_RUNTIME
         .LINUX_SIGNAL_ACTIVE
         .store(false, Ordering::SeqCst);
-    unsafe {
-        X86_MUTABLE_RUNTIME
-            .signal_context
-            .get()
-            .write(LinuxSignalContext::ZERO)
-    };
+    unsafe { linux_signal_context().get().write(LinuxSignalContext::ZERO) };
 }
 
 fn linux_root_directory_inode(kind: u16) -> Option<u64> {
@@ -33550,24 +34038,41 @@ fn linux_proc_cpuinfo_read(address: u64, count: u64, offset: u64) -> u64 {
     copied as u64
 }
 
+/// `/proc/stat`: per CPU, the time spent in user code, in the kernel and
+/// idle (`crate::cpu_time`), in USER_HZ (100 per second) units as Linux
+/// reports them, and their sum on the `cpu` line.
 fn linux_proc_stat_file(output: &mut [u8]) -> Option<usize> {
+    const USER_HZ: u64 = 100;
     let cpu_count = linux_available_cpu_count();
+    let frequency = timer::monotonic_frequency().unwrap_or(1).max(1);
+    let ticks =
+        |cycles: u64| (u128::from(cycles) * u128::from(USER_HZ) / u128::from(frequency)) as u64;
+    let rows: [[u64; 3]; CPU_ENTRY_STATE_LIMIT] = core::array::from_fn(|cpu| {
+        crate::cpu_time::times(cpu).map_or([0; 3], |[total, user, idle, _]| {
+            let kernel = total.saturating_sub(user).saturating_sub(idle);
+            [ticks(user), ticks(kernel), ticks(idle)]
+        })
+    });
+    let shown = cpu_count.min(CPU_ENTRY_STATE_LIMIT);
+    let sum = |field: usize| rows[..shown].iter().map(|row| row[field]).sum::<u64>();
     let mut used = 0;
-    let generated = append_linux_bytes(output, &mut used, b"cpu  ")
-        && append_linux_decimal(output, &mut used, cpu_count as u64)
-        && append_linux_bytes(output, &mut used, b" 0 ")
-        && append_linux_decimal(output, &mut used, cpu_count as u64)
-        && append_linux_bytes(output, &mut used, b" ")
-        && append_linux_decimal(output, &mut used, (cpu_count * 100) as u64)
-        && append_linux_bytes(output, &mut used, b" 0 0 0 0 0 0\n");
-    if !generated {
+    let line =
+        |output: &mut [u8], used: &mut usize, label: &[u8], cpu: Option<u64>, row: [u64; 3]| {
+            append_linux_bytes(output, used, label)
+                && cpu.is_none_or(|cpu| append_linux_decimal(output, used, cpu))
+                && append_linux_bytes(output, used, b" ")
+                && append_linux_decimal(output, used, row[0])
+                && append_linux_bytes(output, used, b" 0 ")
+                && append_linux_decimal(output, used, row[1])
+                && append_linux_bytes(output, used, b" ")
+                && append_linux_decimal(output, used, row[2])
+                && append_linux_bytes(output, used, b" 0 0 0 0 0 0\n")
+        };
+    if !line(output, &mut used, b"cpu ", None, [sum(0), sum(1), sum(2)]) {
         return None;
     }
-    for cpu in 0..cpu_count {
-        if !append_linux_bytes(output, &mut used, b"cpu")
-            || !append_linux_decimal(output, &mut used, cpu as u64)
-            || !append_linux_bytes(output, &mut used, b" 1 0 1 100 0 0 0 0 0 0\n")
-        {
+    for (cpu, row) in rows[..shown].iter().enumerate() {
+        if !line(output, &mut used, b"cpu", Some(cpu as u64), *row) {
             return None;
         }
     }
@@ -33584,7 +34089,7 @@ fn linux_proc_stat_read(address: u64, count: u64, offset: u64) -> u64 {
     let Ok(offset) = usize::try_from(offset) else {
         return 0;
     };
-    let mut file = [0_u8; 512];
+    let mut file = [0_u8; 2048];
     let Some(used) = linux_proc_stat_file(&mut file) else {
         return LINUX_EIO;
     };
@@ -37202,6 +37707,21 @@ fn wake_linux_descriptor_waits() -> u32 {
     {
         return 0;
     }
+    // Completing a wait copies its result into the waiting thread's memory:
+    // the live thread table's process, whose address space is not always
+    // the active one (a fork transaction wakes the parent's waits once its
+    // child has gone, and the child's exit is what made them ready).
+    match linux_process::live_process_root(current_linux_process_pid()) {
+        Some(root) if root.address() != address_space::current_root_address() => {
+            address_space::with_live_linux_process_root(root, wake_linux_descriptor_waits_here)
+                .unwrap_or(0)
+        }
+        _ => wake_linux_descriptor_waits_here(),
+    }
+}
+
+/// `wake_linux_descriptor_waits` in the active address space.
+fn wake_linux_descriptor_waits_here() -> u32 {
     let woken = wake_linux_poll_waits()
         + wake_linux_select_waits()
         + wake_linux_epoll_waits()
@@ -37247,6 +37767,7 @@ struct LinuxSignalMaskInput {
 }
 
 fn run_scheduled_linux_process(parent_pid: u32, target_pid: Option<u32>) -> bool {
+    let _pin = LinuxProcessPin::new(parent_pid);
     let profile_started = cfg!(feature = "linux-boot-profile").then(timer::timestamp_counter);
     save_current_linux_process_runtime_state(parent_pid);
     if !save_linux_process_extended_state(parent_pid) {
@@ -37299,41 +37820,11 @@ fn run_scheduled_linux_process(parent_pid: u32, target_pid: Option<u32>) -> bool
     let _ = take_linux_child_yield(selected.pid);
     let exit = take_linux_child_exit(selected.pid);
     let returned = if let Some(status) = exit {
-        let process_slot = linux_process::live_process_slot(selected.pid);
-        let selected_parent = linux_process::live_process_parent_pid(selected.pid);
-        let signals_cleared = process_slot.is_some_and(|slot| {
-            clear_linux_signal_queues_for_process(linux_signal_instance(), slot)
-        });
-        let child_signal_queued = selected_parent.is_some_and(|pid| {
-            linux_queue_process_signal(
-                pid,
-                LINUX_SIGCHLD,
-                LINUX_CLD_EXITED,
-                Some(u64::from(status)),
-            ) == 0
-        });
-        let parent = (signals_cleared && child_signal_queued)
-            .then(|| linux_process::complete_live_child_exit(selected.pid, status))
-            .flatten();
-        linux_release_process_cgroup(selected.pid);
-        release_linux_process_shared_mappings(selected.pid);
-        if let Some(state) = linux_process_runtime_state(selected.pid) {
-            release_linux_descriptor_runtime_state(&state.descriptors);
-            *state = LinuxProcessRuntimeState::EMPTY;
-        }
-        if let Some(threads) = linux_process_thread_runtime_state(selected.pid) {
-            threads.fill(LinuxThreadRuntimeState::EMPTY);
-        }
-        discard_linux_process_extended_state(selected.pid);
-        let scheduler_restored = parent.is_some_and(|dispatch| {
-            dispatch.pid == parent_pid
-                || linux_process::switch_live_process(dispatch.pid, parent_pid)
-                    .is_some_and(|restored| restored.pid == parent_pid)
-        });
-        wake_linux_descriptor_waits();
-        signals_cleared
-            && scheduler_restored
-            && linux_process::release_live_process_runtime_slot(selected.pid)
+        // The parent that reaps it may run on another CPU, so it is not made
+        // current here; this loop's own process is.
+        settle_linux_process_exit(selected.pid, status)
+            && linux_process::claim_live_process(parent_pid).is_some()
+            && linux_process::retire_lone_live_process(parent_pid)
     } else {
         let parent = resumed
             .then(|| linux_process::switch_live_process(selected.pid, parent_pid))
@@ -39194,7 +39685,8 @@ fn linux_bounded_console_write(address: u64, count: u64) -> u64 {
 /// surrounding whitespace is ignored and the value must lie in -1000..=1000.
 /// A write to `/proc/sysrq-trigger`: its first byte names the request, as
 /// on Linux. `t` (show task states) lists every task of the domain in the
-/// kernel log and `l` profiles the runtime CPU (`crate::linux_profile`);
+/// kernel log, `l` profiles the runtime CPU (`crate::linux_profile`) and `u`
+/// reports each CPU's user, kernel, idle and lock-wait time (`cpu_time`);
 /// keys Ginux has no handler for are accepted and ignored.
 fn linux_sysrq_trigger_write(address: u64, count: u64) -> u64 {
     if count == 0 {
@@ -39207,6 +39699,7 @@ fn linux_sysrq_trigger_write(address: u64, count: u64) -> u64 {
     match key[0] {
         b't' => linux_show_task_states(),
         b'l' => crate::linux_profile::start(),
+        b'u' => crate::cpu_time::report(),
         _ => {}
     }
     count
@@ -45051,7 +45544,7 @@ fn linux_file_size(state: u16) -> u64 {
         }
         size
     } else if state & !3 == LINUX_FILE_PROC_STAT {
-        let mut file = [0_u8; 512];
+        let mut file = [0_u8; 2048];
         linux_proc_stat_file(&mut file).unwrap_or(0) as u64
     } else if state & !3 == LINUX_FILE_PROC_FDINFO {
         64
@@ -49295,9 +49788,17 @@ fn exit_result(caller_domain: u64, frame: *mut UserTrapFrame) -> u64 {
 }
 
 extern "sysv64" fn user_fault_handler(frame: *mut UserFaultFrame) -> u64 {
-    crate::linux_profile::span(crate::linux_profile::Span::UserFault, || {
+    crate::cpu_time::back_from_user();
+    crate::sync::kernel_entry_return_from_user();
+    let result = crate::linux_profile::span(crate::linux_profile::Span::UserFault, || {
         handle_user_fault(frame)
-    })
+    });
+    // Back to user mode unless the fault returns to the kernel.
+    if result != u64::MAX {
+        crate::sync::kernel_entry_leave_to_user();
+        crate::cpu_time::leave_for_user();
+    }
+    result
 }
 
 fn handle_user_fault(frame: *mut UserFaultFrame) -> u64 {
@@ -50018,6 +50519,7 @@ pub(crate) fn activate_user_root(root: u64) -> bool {
         return false;
     }
     let active: u64;
+    super::smp::note_active_root(root);
     unsafe {
         asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
         asm!("mov {}, cr3", out(reg) active, options(nomem, nostack, preserves_flags));

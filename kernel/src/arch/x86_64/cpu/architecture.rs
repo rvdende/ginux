@@ -1,4 +1,9 @@
-use core::{arch::asm, cell::UnsafeCell, mem::size_of, sync::atomic::AtomicBool};
+use core::{
+    arch::asm,
+    cell::UnsafeCell,
+    mem::size_of,
+    sync::atomic::{AtomicBool, AtomicU8, Ordering},
+};
 
 use super::{
     ginux_exception_entries, read_msr, write_msr, BOOT_CPU_INDEX, CPU_ENTRY_STATE_LIMIT,
@@ -175,7 +180,11 @@ pub(super) static CPU_STACKS: CpuStackOwner = CpuStackOwner {
 };
 
 pub(crate) fn install() -> bool {
-    install_for_cpu(BOOT_CPU_INDEX)
+    let installed = install_for_cpu(BOOT_CPU_INDEX);
+    if installed {
+        enable_fast_cpu_index();
+    }
+    installed
 }
 
 pub(crate) fn install_for_cpu(cpu: usize) -> bool {
@@ -196,6 +205,10 @@ pub(crate) fn install_for_cpu(cpu: usize) -> bool {
         // and user-fault entry use SWAPGS to recover this CPU's private entry
         // state without exposing it through ordinary userspace GS accesses.
         write_msr(KERNEL_GS_BASE_MSR, 0);
+        // The CPU number as Linux keeps it here (node 0), which RDPID and
+        // RDTSCP read back far faster than GS_BASE (see
+        // current_cpu_index_checked).
+        write_msr(TSC_AUX_MSR, cpu as u64);
         install_gdt_and_tss(cpu);
         install_idt(cpu);
     }
@@ -224,7 +237,47 @@ pub(crate) fn current_cpu_index() -> usize {
     current_cpu_index_checked().expect("CPU entry state is installed")
 }
 
+const TSC_AUX_MSR: u32 = 0xc000_0103;
+/// How this CPU's index is read: 0 from GS_BASE (an RDMSR, about a hundred
+/// cycles, and the kernel reads the index for every banked runtime field),
+/// 1 with RDPID, 2 with RDTSCP, both from IA32_TSC_AUX.
+static CPU_INDEX_SOURCE: AtomicU8 = AtomicU8::new(0);
+
+/// Reads CPU indexes from IA32_TSC_AUX from now on where the CPU can: every
+/// CPU sets it as it installs its entry state, application processors before
+/// anything else.
+pub(crate) fn enable_fast_cpu_index() {
+    let leaf_7 = core::arch::x86_64::__cpuid_count(7, 0);
+    let extended = core::arch::x86_64::__cpuid(0x8000_0001);
+    let source = if leaf_7.ecx & (1 << 22) != 0 {
+        1
+    } else if extended.edx & (1 << 27) != 0 {
+        2
+    } else {
+        0
+    };
+    CPU_INDEX_SOURCE.store(source, Ordering::Release);
+}
+
 pub(crate) fn current_cpu_index_checked() -> Option<usize> {
+    match CPU_INDEX_SOURCE.load(Ordering::Relaxed) {
+        1 => {
+            let index: u64;
+            // SAFETY: RDPID only reads IA32_TSC_AUX, which install_for_cpu set.
+            unsafe { asm!("rdpid {}", out(reg) index, options(nomem, nostack, preserves_flags)) };
+            return Some(index as usize & 0xfff);
+        }
+        2 => {
+            let index: u32;
+            // SAFETY: RDTSCP only reads the timestamp counter and IA32_TSC_AUX.
+            unsafe {
+                asm!("rdtscp", out("ecx") index, out("eax") _, out("edx") _,
+                    options(nomem, nostack, preserves_flags));
+            }
+            return Some(index as usize & 0xfff);
+        }
+        _ => {}
+    }
     let base = current_entry_state() as usize;
     let states = CPU_ARCHITECTURE
         .entry_states

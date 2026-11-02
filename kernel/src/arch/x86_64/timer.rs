@@ -99,6 +99,10 @@ global_asm!(
     .text
     .global ginux_apic_timer_entry
 ginux_apic_timer_entry:
+    test qword ptr [rsp + 8], 3
+    jz 1f
+    swapgs
+1:
     clac
     cld
     push rax
@@ -136,6 +140,10 @@ ginux_apic_timer_entry:
     pop rcx
     pop rbx
     pop rax
+    test qword ptr [rsp + 8], 3
+    jz 2f
+    swapgs
+2:
     iretq
 
     .global ginux_apic_spurious_entry
@@ -484,6 +492,47 @@ pub(crate) fn arm_linux_wait_timer() -> bool {
     true
 }
 
+/// Arms this application processor's own local APIC timer for the Linux
+/// tick (see `cpu::linux_application_processor_tick`), at the boot CPU's
+/// rate; false while the boot CPU's tick is not armed.
+pub(crate) fn arm_linux_cpu_tick() -> bool {
+    let reload = TIMER.linux_wait_reload.load(Ordering::SeqCst);
+    if reload == 0 || !TIMER.linux_wait_armed.load(Ordering::SeqCst) {
+        return false;
+    }
+    let Some(apic) = linux_tick_apic() else {
+        return false;
+    };
+    // SAFETY: each CPU reaches its own local APIC at the saved base; this
+    // CPU's timer is unused while it runs a domain runtime's processes.
+    unsafe {
+        apic.write(APIC_DIVIDE_CONFIGURATION, APIC_DIVIDE_BY_16);
+        apic.write(APIC_LVT_TIMER, u32::from(TIMER_VECTOR));
+        apic.write(APIC_INITIAL_COUNT, reload);
+    }
+    true
+}
+
+/// Stops this application processor's Linux tick.
+pub(crate) fn disarm_linux_cpu_tick() {
+    if let Some(apic) = linux_tick_apic() {
+        // SAFETY: as in arm_linux_cpu_tick; masking stops this CPU's timer.
+        unsafe {
+            apic.write(APIC_LVT_TIMER, APIC_TIMER_MASKED | u32::from(TIMER_VECTOR));
+            apic.write(APIC_INITIAL_COUNT, 0);
+        }
+    }
+}
+
+fn linux_tick_apic() -> Option<LocalApic> {
+    let mode = if TIMER.interrupt_apic_mode.load(Ordering::SeqCst) == 1 {
+        Mode::X2Apic
+    } else {
+        Mode::XApic
+    };
+    LocalApic::from_saved(0, mode, TIMER.interrupt_apic_base.load(Ordering::SeqCst))
+}
+
 /// The APIC count for `nanoseconds` of the Linux tick's clock, at least one
 /// and at most a full tick.
 fn linux_tick_count_for(nanoseconds: u64) -> u32 {
@@ -730,6 +779,24 @@ pub(crate) unsafe fn verify_device_wait_timeout_interrupt() -> bool {
 }
 
 extern "sysv64" fn timer_interrupt_handler(frame: *mut UserInterruptFrame) {
+    // An application processor's own tick: end it, count the next one and
+    // let the runtime preempt what this CPU runs.
+    if cpu::current_cpu_index_checked().is_some_and(|cpu| cpu != 0) {
+        if let Some(apic) = linux_tick_apic() {
+            let reload = TIMER.linux_wait_reload.load(Ordering::SeqCst);
+            // SAFETY: this CPU's local APIC; its timer is the Linux tick.
+            unsafe {
+                apic.write(APIC_EOI, 0);
+                if reload != 0 {
+                    apic.write(APIC_INITIAL_COUNT, reload);
+                }
+            }
+        }
+        if let Some(frame) = unsafe { frame.as_mut() } {
+            cpu::linux_application_processor_tick(frame);
+        }
+        return;
+    }
     // A SysRq `l` profile samples every tick, before the tick waits for
     // the kernel entry lock, so a CPU holding that lock shows up too.
     crate::linux_profile::tick();
