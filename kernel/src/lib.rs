@@ -4727,6 +4727,19 @@ pub(crate) fn serial_input_ready() -> bool {
     serial_byte_waiting() || linux_input::console_byte_ready()
 }
 
+/// O_NONBLOCK of the console's open file, which every descriptor of the
+/// attached console shares as Linux's terminal does: a read with nothing
+/// typed then fails with EAGAIN instead of waiting.
+static CONSOLE_NONBLOCKING: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn console_nonblocking() -> bool {
+    CONSOLE_NONBLOCKING.load(Ordering::Acquire)
+}
+
+pub(crate) fn set_console_nonblocking(nonblocking: bool) {
+    CONSOLE_NONBLOCKING.store(nonblocking, Ordering::Release);
+}
+
 fn serial_byte_waiting() -> bool {
     SERIAL_PRESENT.load(Ordering::Acquire) && (unsafe { inb(COM1 + 5) } & 0x01) != 0
 }

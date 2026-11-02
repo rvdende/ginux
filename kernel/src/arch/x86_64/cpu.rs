@@ -35106,6 +35106,9 @@ fn linux_descriptor_read_live_return(
             X86_RUNTIME.CONTAINER_CONSOLE_ATTACHED[slot].load(Ordering::Acquire)
         })
     {
+        if crate::console_nonblocking() && !crate::serial_input_ready() {
+            return LINUX_EAGAIN;
+        }
         while !crate::serial_input_ready() {
             if ready_linux_thread_handle().is_some() || current_linux_runtime_cpu_index() != 0 {
                 return linux_retry_later_live_return(output, caller, LINUX_READ_SYSCALL);
@@ -42022,10 +42025,26 @@ fn linux_console_fcntl(descriptor: u64, command: u64, argument: u64) -> u64 {
             );
             0
         }
-        LINUX_F_GETFL if u16::from(state) == LINUX_DESCRIPTOR_INPUT => 0,
-        LINUX_F_GETFL if u16::from(state) == LINUX_DESCRIPTOR_OUTPUT => 1,
+        LINUX_F_GETFL if u16::from(state) == LINUX_DESCRIPTOR_INPUT => linux_console_status(0),
+        LINUX_F_GETFL if u16::from(state) == LINUX_DESCRIPTOR_OUTPUT => linux_console_status(1),
+        // apt sets O_NONBLOCK on its terminal to drain typed-ahead input
+        // before dpkg runs, and exits if the terminal refuses.
+        LINUX_F_SETFL => {
+            crate::set_console_nonblocking(argument & LINUX_O_NONBLOCK != 0);
+            0
+        }
         _ => LINUX_EINVAL,
     }
+}
+
+/// F_GETFL of a console descriptor: its access mode and O_NONBLOCK.
+fn linux_console_status(access: u64) -> u64 {
+    access
+        | if crate::console_nonblocking() {
+            LINUX_O_NONBLOCK
+        } else {
+            0
+        }
 }
 
 fn linux_fcntl_descriptor_flags(descriptor: u64, command: u64, argument: u64) -> u64 {

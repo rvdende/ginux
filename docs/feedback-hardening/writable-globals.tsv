@@ -451,6 +451,7 @@ interior-mutable	kernel/src/image_store.rs	IMAGE_STORE	platform-device	allowlist
 interior-mutable	kernel/src/initramfs.rs	PUBLISHED_ROOT	platform-device	allowlist	none	explicit-host-initramfs-owner-root
 interior-mutable	kernel/src/ipc.rs	CONTROL_CHANNEL	shared-runtime	allowlist	none	explicit-lifecycle-owner-root
 interior-mutable	kernel/src/lib.rs	HOST_CONTROL	platform-device	allowlist	none	explicit-host-control-owner-root
+interior-mutable	kernel/src/lib.rs	CONSOLE_NONBLOCKING	domain-runtime	allowlist	none	atomic-console-file-status-flag
 static-mut	kernel/src/lib.rs	KERNEL_STACK	bootstrap-init	allowlist	none	explicit-bootstrap-kernel-stack-owner-root
 interior-mutable	kernel/src/linux_aio.rs	AIO_RUNTIME	domain-runtime	allowlist	none	explicit-domain-aio-runtime-owner-root
 interior-mutable	kernel/src/linux_file_cache.rs	FILE_CACHE_RUNTIME	domain-runtime	allowlist	none	explicit-domain-file-cache-owner-root
