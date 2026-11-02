@@ -26780,9 +26780,18 @@ fn build_linux_exec_stack_image(
     } else {
         linux_exec_vector_length(arguments_address, true)?
     };
-    let argument_count = launch_arguments
-        .count
-        .checked_add(original_argument_count.saturating_sub(1))
+    // A program (not a script) gets the caller's argv[0], as in Linux:
+    // rustup's proxies (cargo -> rustup) and clang++ -> clang tell what to
+    // be from it. The path that runs is only AT_EXECFN then.
+    let keep_argument_zero =
+        launch_arguments.count == 1 && domain_exec_slot.is_none() && original_argument_count >= 1;
+    let (launch_count, first_original) = if keep_argument_zero {
+        (0, 0)
+    } else {
+        (launch_arguments.count, 1)
+    };
+    let argument_count = launch_count
+        .checked_add(original_argument_count.saturating_sub(first_original))
         .filter(|count| *count <= LINUX_EXEC_ARGUMENT_LIMIT)
         .ok_or(LINUX_E2BIG)?;
     let environment_count = if domain_exec_slot.is_some() {
@@ -26817,7 +26826,7 @@ fn build_linux_exec_stack_image(
     let mut execfn_offset = None;
     for index in 0..argument_count {
         let remaining = &mut buffer[cursor..];
-        let length = if index < launch_arguments.count {
+        let length = if index < launch_count {
             let value = launch_arguments.values[index];
             let output = remaining.get_mut(..=value.len()).ok_or(LINUX_E2BIG)?;
             output[..value.len()].copy_from_slice(value);
@@ -26839,15 +26848,25 @@ fn build_linux_exec_stack_image(
             output[length] = 0;
             length
         } else {
-            let original_index = 1 + index - launch_arguments.count;
+            let original_index = first_original + index - launch_count;
             let pointer = linux_exec_vector_entry(arguments_address, original_index)?;
             copy_linux_c_string(pointer, remaining).map_err(string_error)?
         };
-        if index == launch_arguments.execfn {
+        if index == launch_arguments.execfn && !keep_argument_zero {
             execfn_offset = Some(cursor);
         }
         write_word(buffer, 1 + index, cursor as u64);
         cursor += length + 1;
+    }
+    if keep_argument_zero {
+        let value = launch_arguments.values[0];
+        let output = buffer
+            .get_mut(cursor..=cursor + value.len())
+            .ok_or(LINUX_E2BIG)?;
+        output[..value.len()].copy_from_slice(value);
+        output[value.len()] = 0;
+        execfn_offset = Some(cursor);
+        cursor += value.len() + 1;
     }
     let execfn_offset = execfn_offset.ok_or(LINUX_ENOEXEC)?;
     for index in 0..environment_count {
