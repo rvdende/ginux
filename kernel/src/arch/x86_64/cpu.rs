@@ -26017,6 +26017,14 @@ fn linux_rootfs_execve_source(
         }
         _ => path,
     };
+    // A symlink written at runtime (dpkg installs clang-21 -> clang) leads
+    // to the file that runs, in the overlay or the image.
+    let mut followed = [0_u8; crate::linux_overlay::PATH_CAPACITY + 1];
+    let path = match linux_exec_follow_overlay_links(path, &mut followed) {
+        Ok(Some(length)) if domain_exec_slot.is_none() => &followed[..length],
+        Err(error) if domain_exec_slot.is_none() => return error,
+        _ => path,
+    };
     let mut overlay_image = None;
     let mut exec_file = None;
     if domain_exec_slot.is_none() {
@@ -26582,6 +26590,30 @@ fn linux_absolute_exec_path(
     output[0] = b'/';
     output[1..=length].copy_from_slice(&canonical[..length]);
     Ok(length + 1)
+}
+
+/// The absolute path the overlay's symlinks at absolute `path` lead to,
+/// written to `output`, or `None` when the overlay has no symlink there.
+fn linux_exec_follow_overlay_links(
+    path: &[u8],
+    output: &mut [u8; crate::linux_overlay::PATH_CAPACITY + 1],
+) -> Result<Option<usize>, u64> {
+    let Some(relative) = path.strip_prefix(b"/") else {
+        return Ok(None);
+    };
+    let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    let Some(start) = canonical.get_mut(..relative.len()) else {
+        return Ok(None);
+    };
+    start.copy_from_slice(relative);
+    let (length, followed, _) =
+        linux_overlay_lookup_following(&mut canonical, relative.len(), true)?;
+    if !followed {
+        return Ok(None);
+    }
+    output[0] = b'/';
+    output[1..=length].copy_from_slice(&canonical[..length]);
+    Ok(Some(length + 1))
 }
 
 /// Reads an executable written at runtime into a kernel extent. Returns the
