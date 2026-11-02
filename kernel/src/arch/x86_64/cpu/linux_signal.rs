@@ -446,16 +446,27 @@ pub(super) fn linux_rt_sigtimedwait(
         }
         seconds == 0 && nanoseconds == 0
     };
+    linux_take_requested_signal(requested, information).unwrap_or(if polls {
+        LINUX_EAGAIN
+    } else {
+        LINUX_ENOSYS
+    })
+}
+
+/// Takes a pending signal of `requested` as sigtimedwait does, writing its
+/// information to `information` (if nonzero): the signal's number, or an
+/// error; None with none pending.
+fn linux_take_requested_signal(requested: u64, information: u64) -> Option<u64> {
     let dynamic = linux_dynamic_pending_masks().map_or(0, |(process, thread)| process | thread);
     let matching =
         (X86_RUNTIME.ELF_PROBE_PENDING_SIGNALS.load(Ordering::SeqCst) | dynamic) & requested;
     if matching == 0 {
-        return if polls { LINUX_EAGAIN } else { LINUX_ENOSYS };
+        return None;
     }
     if information != 0
         && !linux_writable_user_range_contains(information, size_of::<LinuxSignalInformation>())
     {
-        return LINUX_EFAULT;
+        return Some(LINUX_EFAULT);
     }
     let dynamic_candidate = linux_peek_dynamic_signal(requested);
     let legacy_signal = u64::from(matching.trailing_zeros()) + 1;
@@ -471,19 +482,16 @@ pub(super) fn linux_rt_sigtimedwait(
         .map_or_else(linux_signal_sender, |(_, pending)| {
             (pending.sender_pid, pending.sender_uid)
         });
-    let signal_information = LinuxSignalInformation::queued_from(
-        signal,
-        dynamic_signal.map_or_else(
-            || X86_RUNTIME.ELF_PROBE_PENDING_SIGNAL_CODES[index].load(Ordering::SeqCst) as i32,
-            |(_, pending)| pending.code,
-        ),
-        dynamic_signal.map_or_else(
-            || X86_RUNTIME.ELF_PROBE_PENDING_SIGNAL_VALUES[index].load(Ordering::SeqCst),
-            |(_, pending)| pending.value,
-        ),
-        sender_pid,
-        sender_uid,
+    let code = dynamic_signal.map_or_else(
+        || X86_RUNTIME.ELF_PROBE_PENDING_SIGNAL_CODES[index].load(Ordering::SeqCst) as i32,
+        |(_, pending)| pending.code,
     );
+    let value = dynamic_signal.map_or_else(
+        || X86_RUNTIME.ELF_PROBE_PENDING_SIGNAL_VALUES[index].load(Ordering::SeqCst),
+        |(_, pending)| pending.value,
+    );
+    let signal_information =
+        LinuxSignalInformation::queued_from(signal, code, value, sender_pid, sender_uid);
     if information != 0 {
         // SAFETY: every byte in this repr(C) value is initialized, including
         // padding and the complete signal-specific payload.
@@ -494,7 +502,7 @@ pub(super) fn linux_rt_sigtimedwait(
             )
         };
         if !copy_to_linux_user(information, bytes) {
-            return LINUX_EFAULT;
+            return Some(LINUX_EFAULT);
         }
     }
     if let Some((scope, _)) = dynamic_signal {
@@ -506,7 +514,16 @@ pub(super) fn linux_rt_sigtimedwait(
         X86_RUNTIME.ELF_PROBE_PENDING_SIGNAL_CODES[index].store(0, Ordering::SeqCst);
         X86_RUNTIME.ELF_PROBE_PENDING_SIGNAL_VALUES[index].store(0, Ordering::SeqCst);
     }
-    signal
+    linux_note_timer_signal_delivery(signal, code, value);
+    Some(signal)
+}
+
+/// A POSIX timer's signal taken by the process: its timer's overrun is
+/// frozen for timer_getoverrun.
+fn linux_note_timer_signal_delivery(signal: u64, code: i32, value: u64) {
+    if code == LINUX_SI_TIMER {
+        linux_process::note_posix_timer_delivery(current_linux_process_pid(), signal as u8, value);
+    }
 }
 
 pub(super) fn linux_rt_sigtimedwait_live_return(
@@ -543,9 +560,6 @@ pub(super) fn linux_rt_sigtimedwait_live_return(
         return LINUX_EFAULT;
     }
     let requested = u64::from_ne_bytes(set_bytes) & !LINUX_UNBLOCKABLE_SIGNALS;
-    if requested == 0 {
-        return LINUX_ENOSYS;
-    }
     if information != 0
         && !linux_writable_user_range_contains(information, size_of::<LinuxSignalInformation>())
     {
@@ -580,9 +594,64 @@ pub(super) fn linux_rt_sigtimedwait_live_return(
             .fetch_add(1, Ordering::SeqCst);
         return LINUX_RETURN_TO_KERNEL;
     }
-    let Some(target) = ready_linux_thread_handle() else {
-        return LINUX_ENOSYS;
+    let target = 'target: {
+        if let Some(target) = ready_linux_thread_handle() {
+            break 'target target;
+        }
+        // A lone thread waits in the call as pause does: other processes
+        // run until a requested signal is pending (taken here, handler or
+        // not, as Linux's sigtimedwait takes it before delivery), another
+        // signal interrupts the call (EINTR), or the deadline passes
+        // (EAGAIN). A yield that restarts the call keeps its deadline. A
+        // sibling thread made ready meanwhile takes over below.
+        let deadline =
+            take_linux_restart_deadline(caller.rip).or((deadline != 0).then_some(deadline));
+        // The requested signals are blocked meanwhile so the wait, not a
+        // handler, takes one that arrives; a handler for another signal
+        // restores the mask from before.
+        let slot = usize::from(current.slot);
+        let prior = begin_linux_lone_masked_wait(
+            slot,
+            LINUX_THREAD_WAIT_SIGNAL,
+            current_linux_signal_mask() | requested,
+        );
+        let ended = loop {
+            if let Some(result) = linux_take_requested_signal(requested, information) {
+                break Ok(result);
+            }
+            if deadline.is_some_and(|deadline| {
+                linux_elapsed_nanoseconds().is_some_and(|now| now >= deadline)
+            }) {
+                break Ok(LINUX_EAGAIN);
+            }
+            let turn = linux_timed_wait_run_others(
+                output,
+                caller,
+                LINUX_RT_SIGTIMEDWAIT_SYSCALL,
+                deadline,
+            );
+            if let LinuxWaitTurn::Done(result) = turn {
+                break Ok(result);
+            }
+            if let Some(target) = ready_linux_thread_handle() {
+                break Err(target);
+            }
+            if let Some((deadline, now)) = deadline.zip(linux_elapsed_nanoseconds()) {
+                timer::request_linux_tick_within(deadline.saturating_sub(now));
+            }
+            if let LinuxWaitTurn::Idle = turn {
+                linux_wait_for_interrupt();
+            }
+        };
+        end_linux_lone_masked_wait(slot, prior);
+        match ended {
+            Ok(result) => return result,
+            Err(target) => break 'target target,
+        }
     };
+    if requested == 0 {
+        return LINUX_ENOSYS;
+    }
     let Some(tls) = linux_thread_context(current) else {
         return LINUX_ESRCH;
     };
@@ -1285,6 +1354,46 @@ pub(super) fn linux_default_signal_ignored(signal: u64) -> bool {
     matches!(signal, LINUX_SIGCHLD | 18 | 23 | 28)
 }
 
+/// SIGSTOP, SIGTSTP, SIGTTIN and SIGTTOU stop the process by default.
+pub(super) fn linux_default_signal_stops(signal: u64) -> bool {
+    matches!(signal, 19..=22)
+}
+
+/// Stops the current process with stop signal `signal` (no handler): its
+/// parent is told (SIGCHLD, a wait with WUNTRACED) and the process leaves
+/// the CPU with `resume` as its context, which the scheduler, dispatching
+/// running processes only, resumes once SIGCONT continues it. ENOSYS where
+/// it cannot leave the CPU so: init, a thread on the light path, or a call
+/// with no frame to return through.
+fn linux_stop_current(
+    signal: u64,
+    output: *mut LinuxSyscallFrame,
+    resume: LinuxUserContext,
+) -> u64 {
+    let pid = current_linux_process_pid();
+    if pid == 1 || output.is_null() || linux_light_thread_here().is_some() {
+        return LINUX_ENOSYS;
+    }
+    if linux_process::live_process_status(pid)
+        .is_none_or(|status| status.state == linux_process::LiveProcessState::Stopped)
+    {
+        // Stopped already, or gone: nothing more to do.
+        return 0;
+    }
+    // The context is recorded while the process still counts as running
+    // (the registry refresh refuses a stopped one); then it stops.
+    if !yield_current_linux_process(resume, resume.rax) {
+        return LINUX_ENOSYS;
+    }
+    if linux_process::stop_live_process(pid, signal as u8, false) {
+        if let Some(parent) = linux_process::live_process_parent_pid(pid) {
+            let _ =
+                linux_queue_process_signal(parent, LINUX_SIGCHLD, LINUX_CLD_STOPPED, Some(signal));
+        }
+    }
+    LINUX_RETURN_TO_KERNEL
+}
+
 pub(super) fn verify_linux_default_signal_dispositions() -> bool {
     (1..=LINUX_SIGNAL_COUNT as u64).all(|signal| {
         let terminates = matches!(signal, 1..=16 | 24..=27 | 29..=64);
@@ -1437,11 +1546,10 @@ pub(super) fn linux_target_signal_ignored(target: u32, signal: u64) -> bool {
                 (state.signal_handlers[index], mask)
             })
     };
-    handler == 1
-        || handler == 0
-            && signal != LINUX_SIGCHLD
-            && linux_default_signal_ignored(signal)
-            && mask & (1 << index) == 0
+    // A blocked signal is never discarded as ignored (rt_sigtimedwait01).
+    mask & (1 << index) == 0
+        && (handler == 1
+            || handler == 0 && signal != LINUX_SIGCHLD && linux_default_signal_ignored(signal))
 }
 
 pub(super) fn linux_queue_process_signal(
@@ -1450,6 +1558,18 @@ pub(super) fn linux_queue_process_signal(
     signal_code: i32,
     signal_value: Option<u64>,
 ) -> u64 {
+    // SIGCONT continues a stopped process as it is sent, whatever its
+    // disposition (ignored by default); the parent's wait (WCONTINUED) is told.
+    if signal == LINUX_SIGCONT && linux_process::continue_live_process(target) {
+        if let Some(parent) = linux_process::live_process_parent_pid(target) {
+            let _ = linux_queue_process_signal(
+                parent,
+                LINUX_SIGCHLD,
+                LINUX_CLD_CONTINUED,
+                Some(LINUX_SIGCONT),
+            );
+        }
+    }
     if linux_target_signal_ignored(target, signal)
         || linux_process::live_process_status(target)
             .is_some_and(|status| status.state == linux_process::LiveProcessState::Zombie)
@@ -1520,6 +1640,14 @@ pub(super) fn linux_kill(
     if signal == 0 || !current {
         return 0;
     }
+    // A stop signal the caller sends itself with no handler and unblocked
+    // stops it in this call (kill(getpid(), SIGSTOP), waitid07).
+    if linux_default_signal_stops(signal)
+        && X86_RUNTIME.ELF_PROBE_SIGNAL_HANDLERS[signal as usize - 1].load(Ordering::SeqCst) == 0
+        && current_linux_signal_mask() & (1 << (signal - 1)) == 0
+    {
+        return linux_stop_in_call(signal, output, interrupted);
+    }
     linux_kill_current(
         (signal, signal_code, signal_value),
         Some(linux_signal_sender()),
@@ -1527,6 +1655,57 @@ pub(super) fn linux_kill(
         interrupted,
         return_registers,
     )
+}
+
+/// Stops the current process in its kill call `caller`: its parent is told
+/// (SIGCHLD with CLD_STOPPED, a wait with WUNTRACED) and the call waits as
+/// pause does, other processes running, until SIGCONT continues it, when
+/// it returns 0. Only SIGKILL and SIGCONT reach the process meanwhile; the
+/// rest wait for its mask to come back. ENOSYS for init and a thread on
+/// the light path.
+fn linux_stop_in_call(
+    signal: u64,
+    output: *mut LinuxSyscallFrame,
+    caller: LinuxUserContext,
+) -> u64 {
+    let pid = current_linux_process_pid();
+    if pid == 1
+        || output.is_null()
+        || linux_light_thread_here().is_some()
+        || !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
+    {
+        return LINUX_ENOSYS;
+    }
+    if linux_process::stop_live_process(pid, signal as u8, true) {
+        if let Some(parent) = linux_process::live_process_parent_pid(pid) {
+            let _ =
+                linux_queue_process_signal(parent, LINUX_SIGCHLD, LINUX_CLD_STOPPED, Some(signal));
+        }
+    } else if !linux_process::live_process_stopped(pid) {
+        return 0;
+    }
+    let slot = current_linux_thread_slot();
+    let prior = slot.map(|slot| {
+        begin_linux_lone_masked_wait(
+            slot,
+            LINUX_THREAD_WAIT_STOPPED,
+            !(1 << (LINUX_SIGKILL - 1) | 1 << (LINUX_SIGCONT - 1)),
+        )
+    });
+    let result = loop {
+        if !linux_process::live_process_stopped(pid) {
+            break 0;
+        }
+        match run_other_linux_processes_deferring(output, caller, LINUX_KILL_SYSCALL, false) {
+            Some(LinuxBlockedWait::Return(result)) => break result,
+            Some(LinuxBlockedWait::Recheck) => {}
+            None => linux_wait_for_interrupt(),
+        }
+    };
+    if let (Some(slot), Some(prior)) = (slot, prior) {
+        end_linux_lone_masked_wait(slot, prior);
+    }
+    result
 }
 
 pub(super) fn linux_kill_current(
@@ -1543,10 +1722,14 @@ pub(super) fn linux_kill_current(
         return 0;
     }
     let handler = X86_RUNTIME.ELF_PROBE_SIGNAL_HANDLERS[index].load(Ordering::SeqCst);
-    if handler == 1 || handler == 0 && linux_default_signal_ignored(signal) {
+    let old_mask = X86_RUNTIME.ELF_PROBE_SIGNAL_MASK.load(Ordering::SeqCst);
+    // A blocked signal is never discarded as ignored: the disposition may
+    // change before it is unblocked, and sigtimedwait takes it.
+    if (handler == 1 || handler == 0 && linux_default_signal_ignored(signal))
+        && old_mask & signal_bit == 0
+    {
         return 0;
     }
-    let old_mask = X86_RUNTIME.ELF_PROBE_SIGNAL_MASK.load(Ordering::SeqCst);
     if old_mask & signal_bit != 0 {
         if signal >= 32 {
             let Some(process) = linux_process::live_process_slot(current_linux_process_pid())
@@ -1588,9 +1771,9 @@ pub(super) fn linux_kill_current(
             && !X86_RUNTIME.LINUX_SIGNAL_ACTIVE.load(Ordering::SeqCst)
         {
             linux_terminate_by_default_signal(signal)
+        } else if linux_default_signal_stops(signal) {
+            linux_stop_current(signal, output, interrupted)
         } else {
-            // SIGSTOP, SIGTSTP, SIGTTIN, and SIGTTOU require the pending
-            // scheduler-visible stopped-process model.
             LINUX_ENOSYS
         };
     }
@@ -1623,11 +1806,13 @@ pub(super) fn linux_kill_current(
     let Some(signal_stack) = linux_signal_stack(stack_top, use_alt_stack) else {
         return LINUX_EFAULT;
     };
+    // A lone thread waiting under a temporary mask (sigtimedwait,
+    // sigsuspend) has the handler's frame restore the mask from before.
     let context = LinuxSignalContext::from_syscall(
         interrupted,
         return_registers,
         (signal_stack, restorer),
-        old_mask,
+        linux_lone_wait_prior_mask().unwrap_or(old_mask),
         old_alt_stack_flags,
     );
     if !context.user_context().is_valid() {
@@ -2402,6 +2587,16 @@ pub(super) fn linux_deliver_pending_signal_restarting(
         interrupted.rax = number;
         interrupted.rip = interrupted.rip.wrapping_sub(LINUX_SYSCALL_INSTRUCTION_SIZE);
     }
+    // A stop signal with no handler restarts the interrupted call once the
+    // process is continued, as Linux does: no handler ran to see EINTR.
+    if let Some(number) = restart.filter(|_| {
+        interrupted.rax == LINUX_EINTR
+            && X86_RUNTIME.ELF_PROBE_SIGNAL_HANDLERS[index].load(Ordering::SeqCst) == 0
+            && linux_default_signal_stops(signal)
+    }) {
+        interrupted.rax = number;
+        interrupted.rip = interrupted.rip.wrapping_sub(LINUX_SYSCALL_INSTRUCTION_SIZE);
+    }
     let code = dynamic.map_or_else(
         || X86_RUNTIME.ELF_PROBE_PENDING_SIGNAL_CODES[index].load(Ordering::SeqCst) as i32,
         |(_, pending)| pending.code,
@@ -2427,6 +2622,7 @@ pub(super) fn linux_deliver_pending_signal_restarting(
             X86_RUNTIME.ELF_PROBE_PENDING_SIGNAL_CODES[index].store(0, Ordering::SeqCst);
             X86_RUNTIME.ELF_PROBE_PENDING_SIGNAL_VALUES[index].store(0, Ordering::SeqCst);
         }
+        linux_note_timer_signal_delivery(signal, code, value);
     }
     result
 }

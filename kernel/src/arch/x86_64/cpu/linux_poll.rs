@@ -839,24 +839,43 @@ pub(super) fn linux_poll_wait_live_return(
         {
             return LINUX_RETURN_TO_KERNEL;
         }
-        // pause waits in the call, as a timed wait with no deadline, until
-        // a signal ends it: resumed for anything else, it waits again, as a
-        // thread wait once a sibling thread is ready.
-        if wait_kind == LINUX_THREAD_WAIT_PAUSE
-            && X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
+        // pause and sigsuspend wait in the call, as a timed wait with no
+        // deadline, until a signal ends it: resumed for anything else, it
+        // waits again, as a thread wait once a sibling thread is ready.
+        // sigsuspend waits under its temporary mask, which a handler's
+        // frame and the call's end put back (sigsuspend01).
+        if matches!(
+            wait_kind,
+            LINUX_THREAD_WAIT_PAUSE | LINUX_THREAD_WAIT_SIGSUSPEND
+        ) && X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
             && current_linux_process_pid() != 1
         {
-            loop {
-                let turn = linux_timed_wait_run_others(output, caller, LINUX_PAUSE_SYSCALL, None);
+            let slot = usize::from(current.slot);
+            let number = if wait_kind == LINUX_THREAD_WAIT_PAUSE {
+                LINUX_PAUSE_SYSCALL
+            } else {
+                LINUX_RT_SIGSUSPEND_SYSCALL
+            };
+            let prior = temporary_signal_mask
+                .map(|mask| begin_linux_lone_masked_wait(slot, LINUX_THREAD_WAIT_SIGSUSPEND, mask));
+            let ended = loop {
+                let turn = linux_timed_wait_run_others(output, caller, number, None);
                 if let LinuxWaitTurn::Done(result) = turn {
-                    return result;
+                    break Ok(result);
                 }
                 if let Some(target) = ready_linux_thread_handle() {
-                    break 'target target;
+                    break Err(target);
                 }
                 if let LinuxWaitTurn::Idle = turn {
                     linux_wait_for_interrupt();
                 }
+            };
+            if let Some(prior) = prior {
+                end_linux_lone_masked_wait(slot, prior);
+            }
+            match ended {
+                Ok(result) => return result,
+                Err(target) => break 'target target,
             }
         }
         if matches!(

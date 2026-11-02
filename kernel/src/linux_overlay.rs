@@ -1191,6 +1191,28 @@ pub(crate) fn truncate(handle: Handle, size: usize) -> bool {
         node.page_count = 0;
         node.cached_page = FrameLease::EMPTY;
         node.cached_page_index = 0;
+    } else if size < node.size {
+        // The cut-off bytes are zeroed so the file reads back as zeros if
+        // it grows again (ftruncate01).
+        let mut page = node.first_page;
+        let mut page_index = 0;
+        let mut position = size;
+        while position < node.size {
+            while page_index < position / DATA_CAPACITY {
+                let Some(data) = data_page(page) else {
+                    return false;
+                };
+                page = data.next;
+                page_index += 1;
+            }
+            let Some(data) = data_page_mut(page) else {
+                return false;
+            };
+            let within = position % DATA_CAPACITY;
+            let length = (node.size - position).min(DATA_CAPACITY - within);
+            data.bytes[within..within + length].fill(0);
+            position += length;
+        }
     }
     node.size = size;
     true

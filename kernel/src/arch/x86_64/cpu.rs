@@ -290,7 +290,10 @@ struct X86RuntimeOwner {
     ELF_PROBE_PIPE_WRITE_FLAGS: RuntimeRef<BankedAtomicU32>,
     ELF_PROBE_POSIX_MQ_BYTES: RuntimeRef<BankedAtomicU64>,
     ELF_PROBE_POSIX_TIMER_ACTIVE: RuntimeRef<BankedAtomicBool>,
-    ELF_PROBE_POSIX_TIMER_DEADLINE: RuntimeRef<BankedAtomicU64>,
+    /// The earliest armed POSIX timer deadline of the process (the tick's
+    /// check before the process table), kept per process bank like the
+    /// interval timer's and saved with the process's state.
+    ELF_PROBE_POSIX_TIMER_DEADLINE: RuntimeRef<CpuBankedAtomicU64>,
     ELF_PROBE_POSIX_TIMER_INTERVAL: RuntimeRef<BankedAtomicU64>,
     ELF_PROBE_PROCESS_NAME_HIGH: RuntimeRef<CpuBankedAtomicU64>,
     ELF_PROBE_PROCESS_NAME_LOW: RuntimeRef<CpuBankedAtomicU64>,
@@ -3271,6 +3274,8 @@ const LINUX_THREAD_WAIT_PSELECT: u8 = 16;
 /// is rewound to the `syscall` instruction): for waits with no waker of
 /// their own, such as a record lock another thread holds.
 const LINUX_THREAD_WAIT_RETRY: u8 = 17;
+/// Stopped by a stop signal in its kill call, until SIGCONT.
+const LINUX_THREAD_WAIT_STOPPED: u8 = 18;
 const LINUX_SYSCALL_FRAME_REGISTERS: usize = 12;
 static X86_RUNTIME_BACKING_LINUX_THREAD_STATES: [CpuBankedAtomicU8; LINUX_THREAD_LIMIT] =
     [const { CpuBankedAtomicU8::new(LINUX_THREAD_FREE) }; LINUX_THREAD_LIMIT];
@@ -3584,8 +3589,8 @@ static X86_RUNTIME_BACKING_ELF_PROBE_POSIX_TIMER_ACTIVE: BankedAtomicBool =
     BankedAtomicBool::new(false);
 static X86_RUNTIME_BACKING_ELF_PROBE_POSIX_TIMER_INTERVAL: BankedAtomicU64 =
     BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_POSIX_TIMER_DEADLINE: BankedAtomicU64 =
-    BankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_POSIX_TIMER_DEADLINE: CpuBankedAtomicU64 =
+    CpuBankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_REAL_TIMER_INTERVAL: CpuBankedAtomicU64 =
     CpuBankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_REAL_TIMER_DEADLINE: CpuBankedAtomicU64 =
@@ -8445,6 +8450,40 @@ fn store_current_linux_signal_mask(mask: u64) {
     if let Some(slot) = current_linux_thread_slot() {
         X86_RUNTIME.LINUX_THREAD_SIGNAL_MASKS[slot].store(mask, Ordering::SeqCst);
     }
+}
+
+/// Begins a lone thread's masked wait of `kind` (sigtimedwait, sigsuspend)
+/// in the owner's path: `mask` is the thread's mask while it waits; the
+/// one before is kept for a handler's frame to restore
+/// (`linux_lone_wait_prior_mask`) and for `end_linux_lone_masked_wait`.
+/// The thread stays running; its wait kind marks the wait.
+fn begin_linux_lone_masked_wait(slot: usize, kind: u8, mask: u64) -> u64 {
+    let prior = current_linux_signal_mask();
+    X86_RUNTIME.LINUX_THREAD_WAIT_PRIOR_SIGNAL_MASKS[slot].store(prior, Ordering::SeqCst);
+    X86_RUNTIME.LINUX_THREAD_WAIT_KINDS[slot].store(kind, Ordering::SeqCst);
+    store_current_linux_signal_mask(mask);
+    prior
+}
+
+/// Ends the wait `begin_linux_lone_masked_wait` began: the mask goes back
+/// to `prior`, unless a handler is active, whose frame restores it.
+fn end_linux_lone_masked_wait(slot: usize, prior: u64) {
+    X86_RUNTIME.LINUX_THREAD_WAIT_KINDS[slot].store(LINUX_THREAD_WAIT_NONE, Ordering::SeqCst);
+    X86_RUNTIME.LINUX_THREAD_WAIT_PRIOR_SIGNAL_MASKS[slot].store(0, Ordering::SeqCst);
+    if !X86_RUNTIME.LINUX_SIGNAL_ACTIVE.load(Ordering::SeqCst) {
+        store_current_linux_signal_mask(prior);
+    }
+}
+
+/// The mask a handler's frame restores for a lone thread in a masked wait
+/// (`begin_linux_lone_masked_wait`), else None.
+fn linux_lone_wait_prior_mask() -> Option<u64> {
+    let slot = current_linux_thread_slot()?;
+    matches!(
+        X86_RUNTIME.LINUX_THREAD_WAIT_KINDS[slot].load(Ordering::SeqCst),
+        LINUX_THREAD_WAIT_SIGNAL | LINUX_THREAD_WAIT_SIGSUSPEND | LINUX_THREAD_WAIT_STOPPED
+    )
+    .then(|| X86_RUNTIME.LINUX_THREAD_WAIT_PRIOR_SIGNAL_MASKS[slot].load(Ordering::SeqCst))
 }
 
 /// The current thread's signal mask: its slot's on the light path, else
@@ -15058,6 +15097,7 @@ fn park_linux_process(pid: u32) -> bool {
     // interrupts the wait.
     expire_linux_waits();
     let _ = refresh_linux_real_timer();
+    let _ = refresh_linux_posix_timers();
     true
 }
 
@@ -15265,12 +15305,21 @@ const LINUX_SIGNAL_QUEUE_CHECK_TICKS: u32 = 10;
 /// another system call (a busy loop waiting for SIGALRM, or one to stop with
 /// SIGINT).
 fn linux_signal_due_from_timer(check_queues: bool) -> bool {
-    let deadline = X86_RUNTIME
-        .ELF_PROBE_REAL_TIMER_DEADLINE
-        .load(Ordering::SeqCst);
+    // The interval timer's deadline and the earliest POSIX timer's: either
+    // passing means a signal to queue and deliver.
+    let timer_due = |deadline: u64| {
+        deadline != 0 && linux_elapsed_nanoseconds().is_some_and(|now| now >= deadline)
+    };
     let requested = !X86_RUNTIME.ELF_PROBE_SIGNAL_MASK.load(Ordering::SeqCst);
-    deadline != 0 && linux_elapsed_nanoseconds().is_some_and(|now| now >= deadline)
-        || X86_RUNTIME.ELF_PROBE_PENDING_SIGNALS.load(Ordering::SeqCst) & requested != 0
+    timer_due(
+        X86_RUNTIME
+            .ELF_PROBE_REAL_TIMER_DEADLINE
+            .load(Ordering::SeqCst),
+    ) || timer_due(
+        X86_RUNTIME
+            .ELF_PROBE_POSIX_TIMER_DEADLINE
+            .load(Ordering::SeqCst),
+    ) || X86_RUNTIME.ELF_PROBE_PENDING_SIGNALS.load(Ordering::SeqCst) & requested != 0
         || check_queues && linux_peek_dynamic_signal(requested).is_some()
 }
 
@@ -15480,6 +15529,7 @@ fn linux_deliver_signal_to_interrupted(
 ) -> u64 {
     let general = preempted.general;
     let _ = refresh_linux_real_timer();
+    let _ = refresh_linux_posix_timers();
     let interrupted = LinuxUserContext {
         registers: LinuxSyscallFrame {
             r15: general[14],
@@ -16560,6 +16610,8 @@ struct LinuxProcessRuntimeState {
     membarrier_registrations: u32,
     real_timer_interval: u64,
     real_timer_deadline: u64,
+    /// The earliest POSIX timer deadline (the tick's cache of the table).
+    posix_timer_deadline: u64,
     pending_signals: u64,
     pending_signal_codes: [u32; LINUX_SIGNAL_COUNT],
     pending_signal_values: [u64; LINUX_SIGNAL_COUNT],
@@ -16607,6 +16659,7 @@ impl LinuxProcessRuntimeState {
         membarrier_registrations: 0,
         real_timer_interval: 0,
         real_timer_deadline: 0,
+        posix_timer_deadline: 0,
         pending_signals: 0,
         pending_signal_codes: [0; LINUX_SIGNAL_COUNT],
         pending_signal_values: [0; LINUX_SIGNAL_COUNT],
@@ -16924,6 +16977,7 @@ fn stage_linux_fork_child_runtime_state(
         (*child).termination_signal = 0;
         (*child).real_timer_interval = 0;
         (*child).real_timer_deadline = 0;
+        (*child).posix_timer_deadline = 0;
         (*child).pending_signals = 0;
         (*child).pending_signal_codes.fill(0);
         (*child).pending_signal_values.fill(0);
@@ -17313,6 +17367,9 @@ fn capture_linux_process_runtime_state_for(thread_slot: u8) -> Option<LinuxProce
         real_timer_deadline: X86_RUNTIME
             .ELF_PROBE_REAL_TIMER_DEADLINE
             .load(Ordering::SeqCst),
+        posix_timer_deadline: X86_RUNTIME
+            .ELF_PROBE_POSIX_TIMER_DEADLINE
+            .load(Ordering::SeqCst),
         pending_signals: X86_RUNTIME.ELF_PROBE_PENDING_SIGNALS.load(Ordering::SeqCst),
         pending_signal_codes: core::array::from_fn(|signal| {
             X86_RUNTIME.ELF_PROBE_PENDING_SIGNAL_CODES[signal].load(Ordering::SeqCst)
@@ -17445,6 +17502,9 @@ fn restore_linux_process_runtime_state(state: &LinuxProcessRuntimeState) {
     X86_RUNTIME
         .ELF_PROBE_REAL_TIMER_DEADLINE
         .store(state.real_timer_deadline, Ordering::SeqCst);
+    X86_RUNTIME
+        .ELF_PROBE_POSIX_TIMER_DEADLINE
+        .store(state.posix_timer_deadline, Ordering::SeqCst);
     X86_RUNTIME
         .ELF_PROBE_PENDING_SIGNALS
         .store(state.pending_signals, Ordering::SeqCst);
@@ -20736,11 +20796,11 @@ fn verify_linux_memory_locking_syscalls() -> bool {
         return false;
     }
     let ranges = [
-        linux_memory_lock(u64::MAX, 0, 0),
-        linux_memory_lock(mapping + 1, PAGE_SIZE as u64, 0),
-        linux_memory_lock(mapping, PAGE_SIZE as u64 * 2, 1),
-        linux_memory_lock(mapping, PAGE_SIZE as u64, 2),
-        linux_memory_lock(mapping + PAGE_SIZE as u64 * 2, 1, 0),
+        linux_memory_lock(u64::MAX, 0, 0, true),
+        linux_memory_lock(mapping + 1, PAGE_SIZE as u64, 0, true),
+        linux_memory_lock(mapping, PAGE_SIZE as u64 * 2, 1, true),
+        linux_memory_lock(mapping, PAGE_SIZE as u64, 2, true),
+        linux_memory_lock(mapping + PAGE_SIZE as u64 * 2, 1, 0, true),
     ] == [0, 0, 0, LINUX_EINVAL, LINUX_ENOMEM];
     let all = ranges
         && [1_u64, 2, 3, 5, 6, 7]
@@ -35535,6 +35595,10 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
     if (offset as i64) < 0 {
         return LINUX_EINVAL;
     }
+    if linux_pipe_descriptor(descriptor) || linux_socket_slot(descriptor).is_some() {
+        // No position to read at (pread on a pipe or socket).
+        return LINUX_ESPIPE;
+    }
     if state & LINUX_DEVICE_DIRECTORY != 0 {
         return LINUX_EISDIR;
     }
@@ -35993,6 +36057,18 @@ fn append_linux_decimal(output: &mut [u8], used: &mut usize, value: u64) -> bool
     true
 }
 
+/// The offset pwrite to `descriptor` writes at: the end of the file for
+/// one opened with O_APPEND, as Linux's pwrite does (pwrite04), else
+/// `offset`.
+fn linux_pwrite_offset(descriptor: u64, offset: u64) -> u64 {
+    if !linux_socket_flags(descriptor).is_some_and(|flags| flags & LINUX_O_APPEND as u32 != 0) {
+        return offset;
+    }
+    linux_descriptor_stat(descriptor).map_or(offset, |stat| {
+        u64::from_ne_bytes(stat[48..56].try_into().unwrap())
+    })
+}
+
 fn linux_regular_file_write_at(descriptor: u64, address: u64, count: u64, offset: u64) -> u64 {
     let state = linux_device_descriptor(descriptor);
     if linux_path_descriptor(descriptor) {
@@ -36000,6 +36076,10 @@ fn linux_regular_file_write_at(descriptor: u64, address: u64, count: u64, offset
     }
     if (offset as i64) < 0 {
         return LINUX_EINVAL;
+    }
+    if linux_pipe_descriptor(descriptor) || linux_socket_slot(descriptor).is_some() {
+        // No position to write at (pwrite02, pwritev02, pwritev202).
+        return LINUX_ESPIPE;
     }
     if linux_secret_descriptor(descriptor) {
         return LINUX_EINVAL;
@@ -37679,55 +37759,141 @@ fn linux_timerfd_create(clock: u64, flags: u64) -> u64 {
     descriptor
 }
 
-fn linux_timer_create(clock: u64, event_address: u64, timer_address: u64) -> u64 {
-    const SIGEV_NONE: u32 = 1;
-    let clock = u64::from(clock as u32);
-    if clock != LINUX_CLOCK_MONOTONIC {
-        return LINUX_EINVAL;
-    }
-    if X86_RUNTIME
-        .ELF_PROBE_POSIX_TIMER_ACTIVE
-        .load(Ordering::SeqCst)
-    {
-        return LINUX_EAGAIN;
-    }
-    if event_address == 0 {
-        return LINUX_ENOSYS;
-    }
-    let mut event = [0_u8; 64];
-    if !copy_from_linux_user(event_address, &mut event) {
-        return LINUX_EFAULT;
-    }
-    if u32::from_ne_bytes(event[12..16].try_into().unwrap()) != SIGEV_NONE {
-        return LINUX_ENOSYS;
-    }
-    if !copy_to_linux_user(timer_address, &1_i32.to_ne_bytes()) {
-        return LINUX_EFAULT;
-    }
-    X86_RUNTIME
-        .ELF_PROBE_POSIX_TIMER_INTERVAL
-        .store(0, Ordering::SeqCst);
-    X86_RUNTIME
-        .ELF_PROBE_POSIX_TIMER_DEADLINE
-        .store(0, Ordering::SeqCst);
-    X86_RUNTIME
-        .ELF_PROBE_POSIX_TIMER_ACTIVE
-        .store(true, Ordering::SeqCst);
-    0
+/// The clocks a POSIX timer may follow: wall-clock ones are converted to
+/// the monotonic nanoseconds deadlines count in at timer_settime; the CPU
+/// time clocks run as the monotonic clock here.
+fn linux_posix_timer_clock_supported(clock: u64) -> bool {
+    matches!(
+        clock,
+        LINUX_CLOCK_REALTIME
+            | LINUX_CLOCK_MONOTONIC
+            | LINUX_CLOCK_PROCESS_CPUTIME_ID
+            | LINUX_CLOCK_THREAD_CPUTIME_ID
+            | LINUX_CLOCK_BOOTTIME
+            | LINUX_CLOCK_REALTIME_ALARM
+            | LINUX_CLOCK_BOOTTIME_ALARM
+    )
 }
 
-fn linux_timer_settime(timer: u64, flags: u64, new_address: u64, old_address: u64) -> u64 {
-    const TIMER_ABSTIME: u64 = 1;
-    let timer = u64::from(timer as u32);
-    let flags = u64::from(flags as u32);
-    if timer != 1
-        || !X86_RUNTIME
-            .ELF_PROBE_POSIX_TIMER_ACTIVE
-            .load(Ordering::SeqCst)
-    {
+/// Whether a timer's clock counts wall time, whose absolute values need
+/// converting to the monotonic clock.
+fn linux_posix_timer_clock_is_wall(clock: u32) -> bool {
+    matches!(
+        u64::from(clock),
+        LINUX_CLOCK_REALTIME | LINUX_CLOCK_REALTIME_ALARM
+    )
+}
+
+/// Keeps the banked earliest deadline, the check before the process table.
+fn linux_refresh_posix_timer_cache(pid: u32) {
+    X86_RUNTIME.ELF_PROBE_POSIX_TIMER_DEADLINE.store(
+        linux_process::earliest_posix_timer_deadline(pid),
+        Ordering::SeqCst,
+    );
+}
+
+/// timer_create(2): a timer of the calling process, numbered from 1. A
+/// null sigevent means SIGALRM with the timer's id as the value, as Linux.
+fn linux_timer_create(clock: u64, event_address: u64, timer_address: u64) -> u64 {
+    const SIGEV_SIGNAL: u32 = 0;
+    const SIGEV_NONE: u32 = 1;
+    const SIGEV_THREAD: u32 = 2;
+    const SIGEV_THREAD_ID: u32 = 4;
+    let clock = u64::from(clock as u32);
+    if !linux_posix_timer_clock_supported(clock) {
         return LINUX_EINVAL;
     }
+    if !linux_writable_user_range_contains(timer_address, size_of::<i32>()) {
+        return LINUX_EFAULT;
+    }
+    let pid = current_linux_process_pid();
+    let mut timer = linux_process::PosixTimer {
+        clock: clock as u32,
+        notify: SIGEV_SIGNAL,
+        signal: LINUX_SIGALRM as u8,
+        tid: 0,
+        value: 0,
+        deadline: 0,
+        interval: 0,
+        overrun: 0,
+        delivered_overrun: 0,
+    };
+    if event_address != 0 {
+        let mut event = [0_u8; 64];
+        if !copy_from_linux_user(event_address, &mut event) {
+            return LINUX_EFAULT;
+        }
+        let value = u64::from_ne_bytes(event[..8].try_into().unwrap());
+        let signal = i32::from_ne_bytes(event[8..12].try_into().unwrap());
+        let notify = u32::from_ne_bytes(event[12..16].try_into().unwrap());
+        let tid = i32::from_ne_bytes(event[16..20].try_into().unwrap());
+        // SIGEV_THREAD is the C library's own: it asks the kernel for a
+        // signal to a thread of its (SIGEV_THREAD_ID) or for none.
+        match notify {
+            SIGEV_NONE => {}
+            SIGEV_SIGNAL | SIGEV_THREAD => {
+                if !(1..=64).contains(&signal) {
+                    return LINUX_EINVAL;
+                }
+            }
+            SIGEV_THREAD_ID => {
+                if !(1..=64).contains(&signal)
+                    || u32::try_from(tid)
+                        .ok()
+                        .and_then(linux_thread_state_by_tid)
+                        .is_none_or(|(owner, _)| owner != pid)
+                {
+                    return LINUX_EINVAL;
+                }
+            }
+            _ => return LINUX_EINVAL,
+        }
+        timer.notify = if notify == SIGEV_THREAD {
+            SIGEV_SIGNAL
+        } else {
+            notify
+        };
+        timer.signal = if notify == SIGEV_NONE {
+            0
+        } else {
+            signal as u8
+        };
+        timer.tid = if notify == SIGEV_THREAD_ID {
+            tid as u32
+        } else {
+            0
+        };
+        timer.value = value;
+    }
+    let Some(id) = linux_process::create_posix_timer(pid, timer) else {
+        return LINUX_EAGAIN;
+    };
+    if event_address == 0 {
+        let _ = linux_process::update_posix_timer(pid, id, |timer| timer.value = u64::from(id));
+    }
+    if copy_to_linux_user(timer_address, &(id as i32).to_ne_bytes()) {
+        0
+    } else {
+        let _ = linux_process::delete_posix_timer(pid, id);
+        LINUX_EFAULT
+    }
+}
+
+/// timer_settime(2): arms a timer, or disarms it with a zero value; the
+/// time it had left and its interval go to `old_address`.
+fn linux_timer_settime(timer: u64, flags: u64, new_address: u64, old_address: u64) -> u64 {
+    const TIMER_ABSTIME: u64 = 1;
+    let id = timer as u32;
+    let flags = u64::from(flags as u32);
+    let pid = current_linux_process_pid();
+    let Some(current) = linux_process::posix_timer(pid, id) else {
+        return LINUX_EINVAL;
+    };
     if flags & !TIMER_ABSTIME != 0 {
+        return LINUX_EINVAL;
+    }
+    // No new value is EINVAL, as Linux; an unreadable one EFAULT.
+    if new_address == 0 {
         return LINUX_EINVAL;
     }
     if old_address != 0 && !linux_writable_user_range_contains(old_address, 32) {
@@ -37746,58 +37912,60 @@ fn linux_timer_settime(timer: u64, flags: u64, new_address: u64, old_address: u6
     let Some(now) = linux_elapsed_nanoseconds() else {
         return LINUX_ENOSYS;
     };
-    let old = linux_timer_specification(
-        X86_RUNTIME
-            .ELF_PROBE_POSIX_TIMER_INTERVAL
-            .load(Ordering::SeqCst),
-        X86_RUNTIME
-            .ELF_PROBE_POSIX_TIMER_DEADLINE
-            .load(Ordering::SeqCst),
-        now,
-    );
+    let old = linux_timer_specification(current.interval, current.deadline, now);
     let deadline = if value == 0 {
         0
-    } else if flags & TIMER_ABSTIME != 0 {
-        value
-    } else {
+    } else if flags & TIMER_ABSTIME == 0 {
         let Some(deadline) = now.checked_add(value) else {
             return LINUX_EINVAL;
         };
         deadline
+    } else if linux_posix_timer_clock_is_wall(current.clock) {
+        // An absolute wall time: as far ahead of (or behind) the monotonic
+        // clock as it is of the wall clock now. A past one fires at once,
+        // and keeps its distance so its overrun counts the intervals since
+        // (timer_settime03 expects that count saturated).
+        let Some((seconds, nanoseconds)) = linux_realtime_time() else {
+            return LINUX_ENOSYS;
+        };
+        let wall_now = seconds
+            .saturating_mul(NANOSECONDS_PER_SECOND)
+            .saturating_add(nanoseconds);
+        if value >= wall_now {
+            now.saturating_add(value - wall_now)
+        } else {
+            now.saturating_sub(wall_now - value).max(1)
+        }
+    } else {
+        value.max(1)
     };
     if old_address != 0 && !copy_to_linux_user(old_address, &old) {
         return LINUX_EFAULT;
     }
-    X86_RUNTIME
-        .ELF_PROBE_POSIX_TIMER_INTERVAL
-        .store(interval, Ordering::SeqCst);
-    X86_RUNTIME
-        .ELF_PROBE_POSIX_TIMER_DEADLINE
-        .store(deadline, Ordering::SeqCst);
-    0
-}
-
-fn linux_timer_gettime(timer: u64, address: u64) -> u64 {
-    let timer = u64::from(timer as u32);
-    if timer != 1
-        || !X86_RUNTIME
-            .ELF_PROBE_POSIX_TIMER_ACTIVE
-            .load(Ordering::SeqCst)
+    if linux_process::update_posix_timer(pid, id, |timer| {
+        timer.deadline = deadline;
+        timer.interval = interval;
+        timer.overrun = 0;
+        timer.delivered_overrun = 0;
+    })
+    .is_none()
     {
         return LINUX_EINVAL;
     }
+    linux_refresh_posix_timer_cache(pid);
+    0
+}
+
+/// timer_gettime(2): the time a timer has left and its interval.
+fn linux_timer_gettime(timer: u64, address: u64) -> u64 {
+    let pid = current_linux_process_pid();
+    let Some(current) = linux_process::posix_timer(pid, timer as u32) else {
+        return LINUX_EINVAL;
+    };
     let Some(now) = linux_elapsed_nanoseconds() else {
         return LINUX_ENOSYS;
     };
-    let specification = linux_timer_specification(
-        X86_RUNTIME
-            .ELF_PROBE_POSIX_TIMER_INTERVAL
-            .load(Ordering::SeqCst),
-        X86_RUNTIME
-            .ELF_PROBE_POSIX_TIMER_DEADLINE
-            .load(Ordering::SeqCst),
-        now,
-    );
+    let specification = linux_timer_specification(current.interval, current.deadline, now);
     if copy_to_linux_user(address, &specification) {
         0
     } else {
@@ -37805,35 +37973,72 @@ fn linux_timer_gettime(timer: u64, address: u64) -> u64 {
     }
 }
 
+/// timer_getoverrun(2): the expirations the last delivered signal stood
+/// for beyond its own, at most DELAYTIMER_MAX.
 fn linux_timer_getoverrun(timer: u64) -> u64 {
-    let timer = u64::from(timer as u32);
-    if timer == 1
-        && X86_RUNTIME
-            .ELF_PROBE_POSIX_TIMER_ACTIVE
-            .load(Ordering::SeqCst)
-    {
-        0
-    } else {
-        LINUX_EINVAL
+    let pid = current_linux_process_pid();
+    match linux_process::posix_timer(pid, timer as u32) {
+        Some(current) => u64::from(current.delivered_overrun.min(i32::MAX as u32)),
+        None => LINUX_EINVAL,
     }
 }
 
+/// timer_delete(2).
 fn linux_timer_delete(timer: u64) -> u64 {
-    let timer = u64::from(timer as u32);
-    if timer != 1
-        || !X86_RUNTIME
-            .ELF_PROBE_POSIX_TIMER_ACTIVE
-            .swap(false, Ordering::SeqCst)
-    {
+    let pid = current_linux_process_pid();
+    if !linux_process::delete_posix_timer(pid, timer as u32) {
         return LINUX_EINVAL;
     }
-    X86_RUNTIME
-        .ELF_PROBE_POSIX_TIMER_INTERVAL
-        .store(0, Ordering::SeqCst);
-    X86_RUNTIME
-        .ELF_PROBE_POSIX_TIMER_DEADLINE
-        .store(0, Ordering::SeqCst);
+    linux_refresh_posix_timer_cache(pid);
     0
+}
+
+/// Fires the current process's POSIX timers whose deadline passed: queues
+/// each one's signal (si_code SI_TIMER, si_value as created) and moves a
+/// periodic timer on. Checked where the interval timer is; the banked
+/// earliest deadline decides without the process table.
+pub(super) fn refresh_linux_posix_timers() -> bool {
+    const SIGEV_NONE: u32 = 1;
+    const SIGEV_THREAD_ID: u32 = 4;
+    let earliest = X86_RUNTIME
+        .ELF_PROBE_POSIX_TIMER_DEADLINE
+        .load(Ordering::SeqCst);
+    if earliest == 0 {
+        return false;
+    }
+    let Some(now) = linux_elapsed_nanoseconds() else {
+        return false;
+    };
+    if now < earliest {
+        return false;
+    }
+    let pid = current_linux_process_pid();
+    // Called in a system call, where the signal queues may be consulted.
+    let pending = X86_RUNTIME.ELF_PROBE_PENDING_SIGNALS.load(Ordering::SeqCst)
+        | linux_dynamic_pending_masks().map_or(0, |(process, thread)| process | thread);
+    let mut expiries = [linux_process::PosixTimerExpiry::NONE; linux_process::POSIX_TIMER_LIMIT];
+    let count = linux_process::expire_posix_timers(pid, now, pending, &mut expiries);
+    let mut queued = false;
+    for expiry in &expiries[..count] {
+        if expiry.notify == SIGEV_NONE || expiry.signal == 0 {
+            continue;
+        }
+        // A thread-directed signal reaches the process until threads have
+        // queues of their own a timer can reach; the thread is recorded.
+        let _thread = (expiry.notify == SIGEV_THREAD_ID).then_some(expiry.tid);
+        // Queued as kill queues a signal; its delivery freezes the overrun.
+        if linux_queue_process_signal(
+            pid,
+            u64::from(expiry.signal),
+            LINUX_SI_TIMER,
+            Some(expiry.value),
+        ) == 0
+        {
+            queued = true;
+        }
+    }
+    linux_refresh_posix_timer_cache(pid);
+    queued
 }
 
 fn linux_timerfd_settime(descriptor: u64, flags: u64, new_address: u64, old_address: u64) -> u64 {
@@ -41547,9 +41752,10 @@ fn linux_descriptor_readv(descriptor: u64, vectors: u64, count: u64) -> u64 {
 
 /// preadv/pwritev and their v2 forms. x86-64 passes the whole offset in the
 /// low word and Linux ignores the high one. Regular files never block and are
-/// written through, so the priority, sync and no-wait flags change nothing,
-/// and a positioned write already ignores O_APPEND, as RWF_NOAPPEND (which
-/// Rust's `write_at` passes) asks.
+/// written through, so the priority, sync and no-wait flags change nothing.
+/// A positioned write to a file opened with O_APPEND goes to its end, as
+/// Linux's does, unless RWF_NOAPPEND (which Rust's `write_at` passes) asks
+/// for the position.
 fn linux_positioned_iov(
     descriptor: u64,
     vectors: u64,
@@ -41587,6 +41793,8 @@ fn linux_positioned_iov(
             Some(stat) => u64::from_ne_bytes(stat[48..56].try_into().unwrap()),
             None => return LINUX_EBADF,
         }
+    } else if write && flags & LINUX_RWF_NOAPPEND == 0 {
+        linux_pwrite_offset(descriptor, offset)
     } else {
         offset
     };
@@ -45174,7 +45382,10 @@ fn linux_set_process_resource_limit(pid: u32, resource: u64, requested: [u64; 2]
     if requested[0] > requested[1] {
         return LINUX_EINVAL;
     }
-    if requested[1] > current[1] {
+    // Raising a hard limit takes CAP_SYS_RESOURCE: root here.
+    if requested[1] > current[1]
+        && !current_linux_credentials().is_some_and(|credentials| credentials.privileged())
+    {
         return LINUX_EPERM;
     }
     let index = resource as usize * 2;
@@ -45988,17 +46199,28 @@ fn linux_scheduler_process(pid: u64) -> Result<u32, u64> {
 }
 
 fn linux_sched_getscheduler(pid: u64) -> u64 {
-    linux_scheduler_process(pid).map_or_else(|error| error, |_| 0)
+    match linux_scheduler_process(pid) {
+        Ok(pid) => linux_process::live_process_scheduling(pid)
+            .map_or(LINUX_ESRCH, |(policy, _)| u64::from(policy)),
+        Err(error) => error,
+    }
 }
 
 fn linux_sched_getparam(pid: u64, address: u64) -> u64 {
     if (pid as i32) < 0 {
         return LINUX_EINVAL;
     }
-    if let Err(error) = linux_scheduler_process(pid) {
-        return error;
+    if address == 0 {
+        return LINUX_EINVAL;
     }
-    if copy_to_linux_user(address, &0_u32.to_ne_bytes()) {
+    let target = match linux_scheduler_process(pid) {
+        Ok(target) => target,
+        Err(error) => return error,
+    };
+    let Some((_, priority)) = linux_process::live_process_scheduling(target) else {
+        return LINUX_ESRCH;
+    };
+    if copy_to_linux_user(address, &u32::from(priority).to_ne_bytes()) {
         0
     } else {
         LINUX_EFAULT
@@ -46137,7 +46359,12 @@ fn linux_available_cpu_count() -> usize {
     online.min(domain_limit.max(1)).min(u64::BITS as usize)
 }
 
-fn linux_memory_lock(address: u64, length: u64, flags: u64) -> u64 {
+/// mlock, mlock2 (`lock`) and munlock. The range must be mapped (ENOMEM
+/// past the areas and present pages). An unprivileged caller (no
+/// CAP_IPC_LOCK) is bound by RLIMIT_MEMLOCK: a zero limit forbids locking
+/// (EPERM), a smaller one refuses the range (ENOMEM); Ginux keeps no count
+/// of locked pages, so each call is measured alone.
+fn linux_memory_lock(address: u64, length: u64, flags: u64, lock: bool) -> u64 {
     let flags = flags as u32;
     if flags & !1 != 0 {
         return LINUX_EINVAL;
@@ -46148,11 +46375,40 @@ fn linux_memory_lock(address: u64, length: u64, flags: u64) -> u64 {
     let Ok(length) = usize::try_from(length) else {
         return LINUX_ENOMEM;
     };
-    if (X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
-        && materialize_linux_runtime_user_range(address, length, false))
-        || (!X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
-            && address_space::current_linux_range_mapped(address, length, false))
-    {
+    if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
+        return if address_space::current_linux_range_mapped(address, length, false) {
+            0
+        } else {
+            LINUX_ENOMEM
+        };
+    }
+    let page_mask = !(PAGE_SIZE as u64 - 1);
+    let start = address & page_mask;
+    let Some(end) = address
+        .checked_add(length as u64)
+        .and_then(|end| end.checked_add(PAGE_SIZE as u64 - 1))
+        .map(|end| end & page_mask)
+    else {
+        return LINUX_ENOMEM;
+    };
+    let pid = current_linux_process_pid();
+    let mapped = crate::linux_areas::snapshot(linux_execution_instance(), pid)
+        .is_some_and(|areas| areas.covers(start, end))
+        || address_space::current_linux_range_mapped(address, length, false);
+    if !mapped {
+        return LINUX_ENOMEM;
+    }
+    if lock && current_linux_credentials().is_none_or(|credentials| !credentials.privileged()) {
+        let limit = linux_resource_limit_values(LINUX_RLIMIT_MEMLOCK, true)
+            .map_or(u64::MAX, |values| values[0]);
+        if limit == 0 {
+            return LINUX_EPERM;
+        }
+        if end - start > limit {
+            return LINUX_ENOMEM;
+        }
+    }
+    if materialize_linux_runtime_user_range(address, length, false) {
         // Ginux has no swapping or reclaim path: every mapped page is already
         // resident, so locking and unlocking do not require additional state.
         0
@@ -47041,7 +47297,14 @@ fn linux_statfs(path_address: u64, stat_address: u64) -> u64 {
     let canonical_length =
         match linux_canonical_path_at(u64::from(LINUX_AT_FDCWD), path, &mut canonical) {
             Ok(length) => Some(length),
-            Err(error) if error == LINUX_EACCES || error == LINUX_ENOTDIR => return error,
+            Err(error)
+                if matches!(
+                    error,
+                    LINUX_EACCES | LINUX_ENOTDIR | LINUX_ELOOP | LINUX_ENAMETOOLONG
+                ) =>
+            {
+                return error;
+            }
             Err(_) => None,
         };
     let canonical_is_proc = canonical_length.is_some_and(|length| {
@@ -47051,8 +47314,14 @@ fn linux_statfs(path_address: u64, stat_address: u64) -> u64 {
         &canonical[..length] == b"sys/fs/cgroup"
             || canonical[..length].starts_with(b"sys/fs/cgroup/")
     });
-    let overlay =
-        canonical_length.and_then(|length| crate::linux_overlay::lookup(&canonical[..length]));
+    // statfs follows a symlink at the last component (ELOOP for a loop).
+    let overlay = match canonical_length
+        .map(|length| linux_overlay_lookup_following(&mut canonical, length, true))
+    {
+        Some(Ok((_, _, metadata))) => metadata,
+        Some(Err(error)) => return error,
+        None => None,
+    };
     let virtual_path = linux_virtual_mount_path_at(u64::from(LINUX_AT_FDCWD), path);
     if overlay.is_none()
         && linux_rootfs_path_at(u64::from(LINUX_AT_FDCWD), path).is_none()
@@ -48486,26 +48755,69 @@ fn linux_capset(header_address: u64, data_address: u64) -> u64 {
     }
 }
 
+/// sched_setscheduler(2): SCHED_OTHER, BATCH and IDLE take priority 0 from
+/// anyone; FIFO and RR take 1..=99 from a privileged caller (CAP_SYS_NICE);
+/// SCHED_DEADLINE needs sched_setattr. The policy and priority are kept
+/// per process for sched_getscheduler and sched_getparam.
 fn linux_set_scheduler(pid: u64, policy: u64, parameter_address: u64) -> u64 {
-    let policy = u64::from(policy as u32);
-    if let Err(error) = linux_scheduler_process(pid) {
-        return error;
-    }
+    const SCHED_RESET_ON_FORK: u64 = 0x4000_0000;
+    let policy = u64::from(policy as u32) & !SCHED_RESET_ON_FORK;
     if !matches!(policy, 0 | 1 | 2 | 3 | 5 | 6) {
         return LINUX_EINVAL;
     }
-    if policy != 0 {
-        return LINUX_EPERM;
+    linux_set_scheduling(pid, policy as u8, parameter_address)
+}
+
+/// sched_setparam(2): a priority for the process's current policy.
+fn linux_sched_setparam(pid: u64, parameter_address: u64) -> u64 {
+    let target = match linux_scheduler_process(pid) {
+        Ok(target) => target,
+        Err(error) => return error,
+    };
+    let Some((policy, _)) = linux_process::live_process_scheduling(target) else {
+        return LINUX_ESRCH;
+    };
+    linux_set_scheduling(pid, policy, parameter_address)
+}
+
+fn linux_set_scheduling(pid: u64, policy: u8, parameter_address: u64) -> u64 {
+    const SCHED_FIFO: u8 = 1;
+    const SCHED_RR: u8 = 2;
+    const SCHED_DEADLINE: u8 = 6;
+    let target = match linux_scheduler_process(pid) {
+        Ok(target) => target,
+        Err(error) => return error,
+    };
+    if parameter_address == 0 {
+        return LINUX_EINVAL;
     }
     let mut priority = [0_u8; 4];
     if !copy_from_linux_user(parameter_address, &mut priority) {
         return LINUX_EFAULT;
     }
-    if priority == [0; 4] {
-        0
-    } else {
-        LINUX_EINVAL
+    let priority = i32::from_ne_bytes(priority);
+    let realtime = matches!(policy, SCHED_FIFO | SCHED_RR);
+    if policy == SCHED_DEADLINE
+        || realtime && !(1..=99).contains(&priority)
+        || !realtime && priority != 0
+    {
+        return LINUX_EINVAL;
     }
+    let Some(caller) = current_linux_credentials() else {
+        return LINUX_EPERM;
+    };
+    let other = target != current_linux_process_pid()
+        && !linux_process::live_process_credentials(target).is_some_and(|credentials| {
+            credentials.user.effective == caller.user.effective
+                || credentials.user.real == caller.user.effective
+        });
+    if (realtime || other) && !caller.privileged() {
+        return LINUX_EPERM;
+    }
+    if !linux_process::set_live_process_scheduling(target, policy, priority as u8) {
+        return LINUX_ESRCH;
+    }
+    0
 }
 
 fn linux_sched_setattr(pid: u64, attribute_address: u64, flags: u64) -> u64 {
@@ -48606,9 +48918,8 @@ fn linux_personality(requested: u64) -> u64 {
     if requested == LINUX_PERSONALITY_QUERY {
         return u64::from(current);
     }
-    if requested & !LINUX_PERSONALITY_UNAME26 != 0 {
-        return LINUX_EINVAL;
-    }
+    // Any personality is kept and read back, as Linux does; UNAME26 is the
+    // one with an effect here (uname's release).
     X86_RUNTIME
         .ELF_PROBE_PERSONALITY
         .store(requested, Ordering::SeqCst);
@@ -48709,6 +49020,19 @@ fn linux_prctl(option: u64, argument2: u64, argument3: u64, argument4: u64, argu
             u64::from(X86_RUNTIME.ELF_PROBE_NO_NEW_PRIVS.load(Ordering::SeqCst))
         }
         LINUX_PR_GET_NO_NEW_PRIVS => LINUX_EINVAL,
+        // The timer slack is kept per process for prctl to read back; the
+        // timers themselves fire on the tick (prctl08).
+        LINUX_PR_SET_TIMERSLACK => {
+            if linux_process::set_live_process_timer_slack(current_linux_process_pid(), argument2) {
+                0
+            } else {
+                LINUX_ESRCH
+            }
+        }
+        LINUX_PR_GET_TIMERSLACK => {
+            linux_process::live_process_timer_slack(current_linux_process_pid())
+                .unwrap_or(linux_process::DEFAULT_TIMER_SLACK)
+        }
         _ => LINUX_EINVAL,
     }
 }

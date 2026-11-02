@@ -331,6 +331,7 @@ fn linux_syscall_dispatch(
     }
     expire_linux_waits();
     let real_timer_expired = refresh_linux_real_timer();
+    let _ = refresh_linux_posix_timers();
     if X86_RUNTIME.ELF_PROBE_SECCOMP_STRICT.load(Ordering::SeqCst)
         && !linux_seccomp_strict_syscall_allowed(number)
     {
@@ -389,9 +390,12 @@ fn linux_syscall_dispatch(
         LINUX_PREAD64_SYSCALL => {
             linux_regular_file_read_at(first_argument, buffer, count, register(0))
         }
-        LINUX_PWRITE64_SYSCALL => {
-            linux_regular_file_write_at(first_argument, buffer, count, register(0))
-        }
+        LINUX_PWRITE64_SYSCALL => linux_regular_file_write_at(
+            first_argument,
+            buffer,
+            count,
+            linux_pwrite_offset(first_argument, register(0)),
+        ),
         LINUX_WRITE_SYSCALL => linux_descriptor_write_live_return(
             registers,
             syscall_return,
@@ -1058,10 +1062,13 @@ fn linux_syscall_dispatch(
             // refreshed in full first, and the child keeps running after
             // exec until it exits or blocks instead of the parent resuming
             // inside the fork.
+            // A plain clone(SIGCHLD, stack), as LTP's ltp_clone makes, is a
+            // fork whose child starts on that stack: the same request, with
+            // the child's pages its own copy as a fork's.
             let flags = saved_registers.rdi;
             let child_stack = saved_registers.rsi;
             if flags & !(0xff | LINUX_CLONE_VM | LINUX_CLONE_VFORK) != 0
-                || flags & LINUX_CLONE_VFORK == 0
+                || (flags & LINUX_CLONE_VM != 0 && flags & LINUX_CLONE_VFORK == 0)
                 || child_stack == 0
             {
                 LINUX_EINVAL
@@ -1289,7 +1296,7 @@ fn linux_syscall_dispatch(
         LINUX_CAPSET_SYSCALL => linux_capset(first_argument, buffer),
         LINUX_GETPRIORITY_SYSCALL => linux_getpriority(first_argument, buffer),
         LINUX_SETPRIORITY_SYSCALL => linux_setpriority(first_argument, buffer, count),
-        LINUX_SCHED_SETPARAM_SYSCALL => linux_set_scheduler(first_argument, 0, buffer),
+        LINUX_SCHED_SETPARAM_SYSCALL => linux_sched_setparam(first_argument, buffer),
         LINUX_SCHED_SETSCHEDULER_SYSCALL => linux_set_scheduler(first_argument, buffer, count),
         LINUX_SCHED_GETPARAM_SYSCALL => linux_sched_getparam(first_argument, buffer),
         LINUX_SCHED_GETSCHEDULER_SYSCALL => linux_sched_getscheduler(first_argument),
@@ -1304,8 +1311,9 @@ fn linux_syscall_dispatch(
         LINUX_SCHED_GETATTR_SYSCALL => {
             linux_sched_getattr(first_argument, buffer, count, register(0))
         }
-        LINUX_MLOCK_SYSCALL | LINUX_MUNLOCK_SYSCALL => linux_memory_lock(first_argument, buffer, 0),
-        LINUX_MLOCK2_SYSCALL => linux_memory_lock(first_argument, buffer, count),
+        LINUX_MLOCK_SYSCALL => linux_memory_lock(first_argument, buffer, 0, true),
+        LINUX_MUNLOCK_SYSCALL => linux_memory_lock(first_argument, buffer, 0, false),
+        LINUX_MLOCK2_SYSCALL => linux_memory_lock(first_argument, buffer, count, true),
         LINUX_MLOCKALL_SYSCALL => linux_mlockall(first_argument),
         LINUX_MUNLOCKALL_SYSCALL => 0,
         LINUX_PRCTL_SYSCALL => linux_prctl(first_argument, buffer, count, register(0), register(2)),

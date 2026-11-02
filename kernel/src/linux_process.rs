@@ -517,6 +517,20 @@ struct Process {
     context: Option<ProcessExecutionContext>,
     scheduler_thread: Option<scheduler::ProcessThreadHandle>,
     cpu_affinity: u64,
+    /// sched_setscheduler's policy and static priority, inherited across
+    /// fork and kept across exec (what sched_getscheduler and
+    /// sched_getparam report; the scheduler itself does not consult them).
+    scheduling: (u8, u8),
+    /// prctl's timer slack (current, default), in nanoseconds: a child's
+    /// both start as the parent's current one, and setting 0 restores the
+    /// default.
+    timer_slack: (u64, u64),
+    /// Stopped by a stop signal while waiting in its kill call: the call
+    /// parks until SIGCONT, so the state stays Running for the wait engine
+    /// and this marks the stop (what /proc and the parent's wait see).
+    stopped_in_call: bool,
+    /// POSIX timers (timer_create) by id - 1: none across fork and exec.
+    posix_timers: [Option<PosixTimer>; POSIX_TIMER_LIMIT],
     /// `/proc/PID/oom_score_adj`: inherited across fork, kept across exec.
     oom_score_adj: i16,
     /// The signal whose default action terminated the process, or 0.
@@ -1463,14 +1477,22 @@ impl ProcessTable {
         }
     }
 
-    fn stop(&mut self, handle: ProcessHandle, signal: u8) -> bool {
+    /// Stops a running process with stop signal `signal`: `in_call` for one
+    /// that parks in its kill call (its state stays Running for the wait
+    /// engine), else one that left the CPU and is not dispatched again
+    /// until continued.
+    fn stop(&mut self, handle: ProcessHandle, signal: u8, in_call: bool) -> bool {
         let Some(process) = self.process_mut(handle) else {
             return false;
         };
-        if process.state != ProcessState::Running || signal == 0 {
+        if process.state != ProcessState::Running || process.stopped_in_call || signal == 0 {
             return false;
         }
-        process.state = ProcessState::Stopped { signal };
+        if in_call {
+            process.stopped_in_call = true;
+        } else {
+            process.state = ProcessState::Stopped { signal };
+        }
         process.wait_event = Some(ProcessWaitEvent::Stopped { signal });
         true
     }
@@ -1479,10 +1501,13 @@ impl ProcessTable {
         let Some(process) = self.process_mut(handle) else {
             return false;
         };
-        if !matches!(process.state, ProcessState::Stopped { .. }) {
+        if process.stopped_in_call {
+            process.stopped_in_call = false;
+        } else if matches!(process.state, ProcessState::Stopped { .. }) {
+            process.state = ProcessState::Running;
+        } else {
             return false;
         }
-        process.state = ProcessState::Running;
         process.wait_event = Some(ProcessWaitEvent::Continued);
         true
     }
@@ -1628,19 +1653,25 @@ impl ProcessTable {
             generation,
             pid,
         };
-        let (process_group, session, cpu_affinity, oom_score_adj, credentials) =
+        let (process_group, session, cpu_affinity, scheduling, oom_score_adj, credentials) =
             parent.and_then(|parent| self.process(parent)).map_or(
-                (pid, pid, u64::MAX, 0, linux_user::Credentials::ROOT),
+                (pid, pid, u64::MAX, (0, 0), 0, linux_user::Credentials::ROOT),
                 |parent| {
                     (
                         parent.process_group,
                         parent.session,
                         parent.cpu_affinity,
+                        parent.scheduling,
                         parent.oom_score_adj,
                         parent.credentials,
                     )
                 },
             );
+        let timer_slack = parent
+            .and_then(|parent| self.process(parent))
+            .map_or((DEFAULT_TIMER_SLACK, DEFAULT_TIMER_SLACK), |parent| {
+                (parent.timer_slack.0, parent.timer_slack.0)
+            });
         // A new process's groups are its parent's; the first is in group 0.
         let inherited: &[u32] = match parent {
             Some(parent) => self.groups.get(usize::from(parent.slot))?,
@@ -1665,6 +1696,9 @@ impl ProcessTable {
             context,
             scheduler_thread: None,
             cpu_affinity,
+            scheduling,
+            timer_slack,
+            stopped_in_call: false,
             oom_score_adj,
             killed_by_signal: 0,
             state,
@@ -1672,6 +1706,7 @@ impl ProcessTable {
             shares_parent_vm: false,
             waiting: false,
             cpu_cycles: 0,
+            posix_timers: [None; POSIX_TIMER_LIMIT],
         });
         Some(handle)
     }
@@ -1766,6 +1801,7 @@ impl ProcessTable {
             return false;
         };
         process.executed = true;
+        process.posix_timers = [None; POSIX_TIMER_LIMIT];
         true
     }
 
@@ -1795,6 +1831,7 @@ impl ProcessTable {
         }
         process.context = Some(context);
         process.executed = true;
+        process.posix_timers = [None; POSIX_TIMER_LIMIT];
         process.shares_parent_vm = false;
         true
     }
@@ -2127,7 +2164,7 @@ pub(crate) fn verify_lifecycle_contract() -> bool {
     {
         return false;
     }
-    if !table.stop(first_child, 19)
+    if !table.stop(first_child, 19, false)
         || table.child_wait_state(init, Some(first_child.pid), false, false)
             != Some(ChildWaitState::Running)
         || table.child_wait_state(init, Some(first_child.pid), true, false)
@@ -2977,6 +3014,7 @@ pub(crate) fn live_process_status(pid: u32) -> Option<LiveProcessStatus> {
     let handle = table.handle_by_pid(pid)?;
     let process = table.process(handle)?;
     let state = match process.state {
+        ProcessState::Running if process.stopped_in_call => LiveProcessState::Stopped,
         ProcessState::Running if process.waiting => LiveProcessState::Sleeping,
         ProcessState::Running => LiveProcessState::Running,
         ProcessState::Stopped { .. } => LiveProcessState::Stopped,
@@ -3040,6 +3078,208 @@ pub(crate) fn set_live_process_waiting(pid: u32, waiting: bool) {
     }
 }
 
+/// POSIX timers per process (timer_create); Linux allows far more, this
+/// table is fixed like the rest of the process record.
+pub(crate) const POSIX_TIMER_LIMIT: usize = 16;
+
+/// A POSIX interval timer of a process. Deadlines are the monotonic
+/// nanoseconds `linux_elapsed_nanoseconds` counts (wall-clock values are
+/// converted at timer_settime), 0 while disarmed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PosixTimer {
+    pub(crate) clock: u32,
+    /// SIGEV_SIGNAL (0), SIGEV_NONE (1) or SIGEV_THREAD_ID (4).
+    pub(crate) notify: u32,
+    pub(crate) signal: u8,
+    /// The thread a SIGEV_THREAD_ID timer signals, else 0.
+    pub(crate) tid: u32,
+    /// sigev_value, delivered as si_value.
+    pub(crate) value: u64,
+    pub(crate) deadline: u64,
+    pub(crate) interval: u64,
+    /// Expirations the queued signal stands for beyond its own, counted on
+    /// while the signal stays pending (DELAYTIMER_MAX saturates it).
+    pub(crate) overrun: u32,
+    /// The overrun of the last signal delivered (timer_getoverrun).
+    pub(crate) delivered_overrun: u32,
+}
+
+/// Notes the delivery of `signal` with `value` to `pid`: the overrun the
+/// timer that queued it counted is what timer_getoverrun reports from now
+/// on, as Linux freezes it at delivery (timer_settime03 reads it in the
+/// handler).
+pub(crate) fn note_posix_timer_delivery(pid: u32, signal: u8, value: u64) {
+    let Some(table) = live_process_table_mut() else {
+        return;
+    };
+    let Some(process) = table
+        .handle_by_pid(pid)
+        .and_then(|handle| table.process_mut(handle))
+    else {
+        return;
+    };
+    for timer in process.posix_timers.iter_mut().flatten() {
+        if timer.signal == signal && timer.value == value {
+            timer.delivered_overrun = timer.overrun;
+        }
+    }
+}
+
+/// What an expired timer delivers.
+#[derive(Clone, Copy)]
+pub(crate) struct PosixTimerExpiry {
+    pub(crate) notify: u32,
+    pub(crate) signal: u8,
+    pub(crate) tid: u32,
+    pub(crate) value: u64,
+}
+
+impl PosixTimerExpiry {
+    pub(crate) const NONE: Self = Self {
+        notify: 0,
+        signal: 0,
+        tid: 0,
+        value: 0,
+    };
+}
+
+/// Creates a POSIX timer for `pid`: its id, from 1, the first free one.
+pub(crate) fn create_posix_timer(pid: u32, timer: PosixTimer) -> Option<u32> {
+    let table = live_process_table_mut()?;
+    let handle = table.handle_by_pid(pid)?;
+    let process = table.process_mut(handle)?;
+    let index = process.posix_timers.iter().position(Option::is_none)?;
+    process.posix_timers[index] = Some(timer);
+    Some(index as u32 + 1)
+}
+
+/// Timer `id` of `pid`.
+pub(crate) fn posix_timer(pid: u32, id: u32) -> Option<PosixTimer> {
+    let table = live_process_table_mut()?;
+    let handle = table.handle_by_pid(pid)?;
+    let process = table.process(handle)?;
+    let index = usize::try_from(id.checked_sub(1)?).ok()?;
+    process.posix_timers.get(index).copied().flatten()
+}
+
+/// Changes timer `id` of `pid` with `change`; None without such a timer.
+pub(crate) fn update_posix_timer(
+    pid: u32,
+    id: u32,
+    change: impl FnOnce(&mut PosixTimer),
+) -> Option<PosixTimer> {
+    let table = live_process_table_mut()?;
+    let handle = table.handle_by_pid(pid)?;
+    let process = table.process_mut(handle)?;
+    let index = usize::try_from(id.checked_sub(1)?).ok()?;
+    let timer = process.posix_timers.get_mut(index)?.as_mut()?;
+    change(timer);
+    Some(*timer)
+}
+
+/// Deletes timer `id` of `pid`.
+pub(crate) fn delete_posix_timer(pid: u32, id: u32) -> bool {
+    let Some(table) = live_process_table_mut() else {
+        return false;
+    };
+    let Some(process) = table
+        .handle_by_pid(pid)
+        .and_then(|handle| table.process_mut(handle))
+    else {
+        return false;
+    };
+    let Some(index) = id
+        .checked_sub(1)
+        .and_then(|index| usize::try_from(index).ok())
+    else {
+        return false;
+    };
+    match process.posix_timers.get_mut(index) {
+        Some(slot @ Some(_)) => {
+            *slot = None;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The earliest armed deadline among `pid`'s timers, 0 with none armed.
+pub(crate) fn earliest_posix_timer_deadline(pid: u32) -> u64 {
+    let Some(table) = live_process_table_mut() else {
+        return 0;
+    };
+    let Some(process) = table
+        .handle_by_pid(pid)
+        .and_then(|handle| table.process(handle))
+    else {
+        return 0;
+    };
+    process
+        .posix_timers
+        .iter()
+        .flatten()
+        .map(|timer| timer.deadline)
+        .filter(|deadline| *deadline != 0)
+        .min()
+        .unwrap_or(0)
+}
+
+/// Expires `pid`'s timers whose deadline passed by `now`: a periodic one
+/// moves on past `now` (the expirations in between are its overrun), a
+/// one-shot one disarms. Lists what each delivers. `pending` is the mask
+/// of signals the process has pending: a timer whose signal is still
+/// queued counts these expirations on its overrun instead of queueing
+/// again, as Linux does until the signal is delivered.
+pub(crate) fn expire_posix_timers(
+    pid: u32,
+    now: u64,
+    pending: u64,
+    expiries: &mut [PosixTimerExpiry; POSIX_TIMER_LIMIT],
+) -> usize {
+    let Some(table) = live_process_table_mut() else {
+        return 0;
+    };
+    let Some(process) = table
+        .handle_by_pid(pid)
+        .and_then(|handle| table.process_mut(handle))
+    else {
+        return 0;
+    };
+    let mut count = 0;
+    for timer in process.posix_timers.iter_mut().flatten() {
+        if timer.deadline == 0 || now < timer.deadline {
+            continue;
+        }
+        let expirations = match (now - timer.deadline).checked_div(timer.interval) {
+            // A one-shot timer (no interval) disarms.
+            None => {
+                timer.deadline = 0;
+                1
+            }
+            Some(missed) => {
+                timer.deadline = timer
+                    .deadline
+                    .saturating_add((missed + 1).saturating_mul(timer.interval));
+                missed + 1
+            }
+        };
+        let overrun = u32::try_from(expirations - 1).unwrap_or(u32::MAX);
+        if timer.signal != 0 && pending & (1_u64 << (timer.signal - 1)) != 0 {
+            timer.overrun = timer.overrun.saturating_add(overrun).saturating_add(1);
+            continue;
+        }
+        timer.overrun = overrun;
+        expiries[count] = PosixTimerExpiry {
+            notify: timer.notify,
+            signal: timer.signal,
+            tid: timer.tid,
+            value: timer.value,
+        };
+        count += 1;
+    }
+    count
+}
+
 pub(crate) fn live_process_cpu_affinity(pid: u32) -> Option<u64> {
     let table = live_process_table_mut()?;
     let handle = table.handle_by_pid(pid)?;
@@ -3049,6 +3289,108 @@ pub(crate) fn live_process_cpu_affinity(pid: u32) -> Option<u64> {
         ProcessState::Running | ProcessState::Stopped { .. } | ProcessState::Zombie { .. }
     )
     .then_some(process.cpu_affinity)
+}
+
+/// Stops process `pid` with stop signal `signal` (SIGSTOP, SIGTSTP, SIGTTIN
+/// or SIGTTOU): its parent's wait (WUNTRACED) reports it. `in_call` for a
+/// process parking in its kill call until SIGCONT; otherwise the scheduler
+/// no longer dispatches it. False unless it was running.
+pub(crate) fn stop_live_process(pid: u32, signal: u8, in_call: bool) -> bool {
+    let Some(table) = live_process_table_mut() else {
+        return false;
+    };
+    let Some(handle) = table.handle_by_pid(pid) else {
+        return false;
+    };
+    table.stop(handle, signal, in_call)
+}
+
+/// Whether process `pid` is stopped (by a stop signal, until SIGCONT).
+pub(crate) fn live_process_stopped(pid: u32) -> bool {
+    live_process_status(pid).is_some_and(|status| status.state == LiveProcessState::Stopped)
+}
+
+/// Continues stopped process `pid` (SIGCONT): it runs again, and its
+/// parent's wait (WCONTINUED) reports it. False unless it was stopped.
+pub(crate) fn continue_live_process(pid: u32) -> bool {
+    let Some(table) = live_process_table_mut() else {
+        return false;
+    };
+    let Some(handle) = table.handle_by_pid(pid) else {
+        return false;
+    };
+    table.continue_process(handle)
+}
+
+/// sched_getscheduler and sched_getparam: `pid`'s policy and priority.
+pub(crate) fn live_process_scheduling(pid: u32) -> Option<(u8, u8)> {
+    let table = live_process_table_mut()?;
+    let process = table.process(table.handle_by_pid(pid)?)?;
+    matches!(
+        process.state,
+        ProcessState::Running | ProcessState::Stopped { .. } | ProcessState::Zombie { .. }
+    )
+    .then_some(process.scheduling)
+}
+
+/// sched_setscheduler: gives `pid` `policy` and `priority`.
+pub(crate) fn set_live_process_scheduling(pid: u32, policy: u8, priority: u8) -> bool {
+    let Some(table) = live_process_table_mut() else {
+        return false;
+    };
+    let Some(process) = table
+        .handle_by_pid(pid)
+        .and_then(|handle| table.process_mut(handle))
+    else {
+        return false;
+    };
+    if !matches!(
+        process.state,
+        ProcessState::Running | ProcessState::Stopped { .. }
+    ) {
+        return false;
+    }
+    process.scheduling = (policy, priority);
+    true
+}
+
+/// Linux's timer slack for a new process, in nanoseconds.
+pub(crate) const DEFAULT_TIMER_SLACK: u64 = 50_000;
+
+/// prctl(PR_GET_TIMERSLACK): `pid`'s current timer slack.
+pub(crate) fn live_process_timer_slack(pid: u32) -> Option<u64> {
+    let table = live_process_table_mut()?;
+    let process = table.process(table.handle_by_pid(pid)?)?;
+    matches!(
+        process.state,
+        ProcessState::Running | ProcessState::Stopped { .. }
+    )
+    .then_some(process.timer_slack.0)
+}
+
+/// prctl(PR_SET_TIMERSLACK): 0 restores the process's default.
+pub(crate) fn set_live_process_timer_slack(pid: u32, slack: u64) -> bool {
+    let Some(table) = live_process_table_mut() else {
+        return false;
+    };
+    let Some(process) = table
+        .handle_by_pid(pid)
+        .and_then(|handle| table.process_mut(handle))
+    else {
+        return false;
+    };
+    if !matches!(
+        process.state,
+        ProcessState::Running | ProcessState::Stopped { .. }
+    ) {
+        return false;
+    }
+    process.timer_slack.0 = if slack == 0 {
+        process.timer_slack.1
+    } else {
+        slack
+    };
+    true
 }
 
 pub(crate) fn live_process_oom_score_adj(pid: u32) -> Option<i16> {
