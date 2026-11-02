@@ -136,8 +136,8 @@ dd if=/dev/zero of="$volume_image" bs=1048576 count=1 2>/dev/null
     wait_for 'Usage: apk'
     printf 'q'
     printf '%s\n' \
-        "test \"\$(uname -s)\" = Ginux && printf 'UNAME_SYSNAME_OK\\n'" \
-        "case \"\$(uname -a)\" in Ginux\\ *) printf 'UNAME_ALL_PREFIX_OK\\n';; esac"
+        "test \"\$(uname -s)\" = Linux && printf 'UNAME_SYSNAME_OK\\n'" \
+        "case \"\$(uname -a)\" in Linux\\ *-ginux.*) printf 'UNAME_ALL_PREFIX_OK\\n';; esac"
     wait_for_line 'UNAME_SYSNAME_OK'
     wait_for_line 'UNAME_ALL_PREFIX_OK'
     printf '%s\n' \

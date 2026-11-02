@@ -78,7 +78,10 @@ pub(super) fn linux_time(output_address: u64) -> u64 {
 
 pub(super) fn linux_uname_with_copy(address: u64, copy: impl FnOnce(u64, &[u8]) -> bool) -> u64 {
     let mut name = [0_u8; LINUX_UTSNAME_SIZE];
-    name[..6].copy_from_slice(b"Ginux\0");
+    // The Linux personality is "Linux", which rustup's installer, cmake,
+    // autoconf's config.guess and Node check before anything runs; the
+    // release ("...-ginux...") and node name still say Ginux.
+    name[..6].copy_from_slice(b"Linux\0");
     name[65..71].copy_from_slice(b"ginux\0");
     let release = if X86_RUNTIME.ELF_PROBE_PERSONALITY.load(Ordering::SeqCst)
         & LINUX_PERSONALITY_UNAME26
