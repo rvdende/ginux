@@ -29615,7 +29615,13 @@ fn linux_newfstatat(directory: u64, path_address: u64, stat_address: u64, flags:
         Err(error) => return error,
     };
     let path = &path[..path_length];
-    if path.is_empty() && flags & LINUX_AT_EMPTY_PATH != 0 {
+    // An empty pathname names nothing without AT_EMPTY_PATH, as in statx:
+    // std::filesystem::exists("") must be false (mold canonicalizes what
+    // exists).
+    if path.is_empty() && flags & LINUX_AT_EMPTY_PATH == 0 {
+        return LINUX_ENOENT;
+    }
+    if path.is_empty() {
         let Some(stat) = linux_descriptor_stat(directory) else {
             return LINUX_EBADF;
         };
