@@ -465,6 +465,7 @@ interior-mutable	kernel/src/linux_process.rs	PROCESS_RUNTIME	process-runtime	all
 interior-mutable	kernel/src/linux_process.rs	PROCESS_ADDRESS_SPACE_STORAGE	process-runtime	allowlist	none	demand-initialized-process-address-space-owner
 interior-mutable	kernel/src/linux_signal.rs	SIGNAL_RUNTIME	process-runtime	allowlist	none	explicit-process-signal-runtime-owner-root
 interior-mutable	kernel/src/linux_socket.rs	SOCKETS	domain-runtime	allowlist	none	ranked-socket-table
+interior-mutable	kernel/src/linux_socket.rs	CLOSING_PENDING	domain-runtime	allowlist	none	atomic-hint-checked-under-socket-lock
 interior-mutable	kernel/src/linux_sysv_ipc.rs	SYSV_IPC_RUNTIME	domain-runtime	allowlist	none	explicit-domain-sysv-ipc-owner-root
 interior-mutable	kernel/src/linux_tmpfs.rs	TMPFS_RUNTIME	domain-runtime	allowlist	none	explicit-domain-tmpfs-runtime-owner-root
 interior-mutable	kernel/src/linux_user.rs	USER_RUNTIME	domain-runtime	allowlist	none	explicit-domain-user-runtime-owner-root

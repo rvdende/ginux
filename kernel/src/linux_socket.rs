@@ -20,6 +20,7 @@ mod virtio_net;
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use smoltcp::{
     iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet},
@@ -33,6 +34,7 @@ use crate::{
         iommu::DeviceTranslationProfile,
         paging::MmioMapping,
         pci::{VirtioNetworkDevice, VirtioNetworkInitialization},
+        timer,
     },
     network,
     sync::{LockRank, SpinLock},
@@ -340,10 +342,55 @@ struct Runtime {
     interface: Interface,
     device: VirtioNet,
     sockets: SocketSet<'static>,
-    tick: i64,
+    /// smoltcp's clock in milliseconds: the monotonic clock, never moving
+    /// back (each CPU reads its own timestamp counter).
+    clock: i64,
+    /// TCP connections whose descriptors are closed but which still send
+    /// what was written and their FIN, as Linux's orphaned sockets do.
+    closing: Vec<Closing>,
     next_port: u16,
     local_address: u32,
 }
+
+impl Runtime {
+    /// Frees the closed connections that have finished (closed, or in
+    /// TIME-WAIT, which is not kept) and resets those past their deadline.
+    fn reap_closing(&mut self) {
+        let clock = self.clock;
+        let sockets = &mut self.sockets;
+        self.closing.retain_mut(|closing| {
+            let socket = sockets.get_mut::<tcp::Socket>(closing.handle);
+            let done = matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait);
+            if closing.polled && done {
+                sockets.remove(closing.handle);
+                return false;
+            }
+            if clock >= closing.deadline && !done {
+                socket.abort();
+            }
+            closing.polled = true;
+            true
+        });
+        CLOSING_PENDING.store(!self.closing.is_empty(), Ordering::Release);
+    }
+}
+
+/// A closed TCP connection that is still being shut down.
+struct Closing {
+    handle: SocketHandle,
+    /// When it is reset if it has not closed by then (smoltcp's clock).
+    deadline: i64,
+    /// Whether a poll has run since the close, which sends its FIN or reset.
+    polled: bool,
+}
+
+/// How long a closed connection may take to send what remains and finish
+/// its close: Linux's `tcp_fin_timeout`.
+const CLOSING_LIMIT_MS: i64 = 60_000;
+
+/// Whether closed TCP connections are still being shut down, so that the
+/// system call path keeps polling for them (`poll_closing`).
+static CLOSING_PENDING: AtomicBool = AtomicBool::new(false);
 
 struct Sockets {
     platform: Option<Platform>,
@@ -621,7 +668,8 @@ impl Sockets {
         let mut device = VirtioNet::start(&platform, ipv4).ok_or(Error::Unavailable)?;
         let mut config = InterfaceConfig::new(EthernetAddress(platform.initialization.mac).into());
         config.random_seed = u64::from(ipv4) << 32 | u64::from(gateway);
-        let mut interface = Interface::new(config, &mut device, Instant::from_millis(0));
+        let now = clock_milliseconds(0);
+        let mut interface = Interface::new(config, &mut device, Instant::from_millis(now));
         interface.update_ip_addrs(|addresses| {
             let _ = addresses.push(IpCidr::new(
                 IpAddress::Ipv4(Ipv4Address::from_octets(ipv4.to_be_bytes())),
@@ -644,7 +692,8 @@ impl Sockets {
             interface,
             device,
             sockets: SocketSet::new(Vec::new()),
-            tick: 0,
+            clock: now,
+            closing: Vec::new(),
             next_port: 49_152,
             local_address: ipv4,
         });
@@ -663,12 +712,14 @@ impl Sockets {
         let Some(runtime) = self.runtime.as_mut() else {
             return;
         };
+        // TCP's retransmission, delayed-ACK and keep-alive timers follow
+        // real time.
+        runtime.clock = clock_milliseconds(runtime.clock);
         // Frames sent to the interface's own addresses are received on the
         // next pass, so a loopback exchange completes within one poll.
         for _ in 0..LOOPBACK_FRAME_COUNT {
-            runtime.tick = runtime.tick.wrapping_add(1);
             let _ = runtime.interface.poll(
-                Instant::from_millis(runtime.tick),
+                Instant::from_millis(runtime.clock),
                 &mut runtime.device,
                 &mut runtime.sockets,
             );
@@ -676,6 +727,7 @@ impl Sockets {
                 break;
             }
         }
+        runtime.reap_closing();
         // A TCP socket shut down for reading discards what arrives.
         for state in self.slots.iter().flatten().filter(|state| {
             state.kind == Kind::Tcp
@@ -920,7 +972,25 @@ impl Sockets {
         let Some(handle) = state.handle else {
             return false;
         };
-        runtime.sockets.remove(handle);
+        let lingers = state.kind == Kind::Tcp && !state.listening;
+        if lingers && runtime.closing.try_reserve(1).is_ok() {
+            // As Linux: what was written is still sent, then a FIN; unread
+            // data makes the close a reset instead.
+            let socket = runtime.sockets.get_mut::<tcp::Socket>(handle);
+            if socket.can_recv() {
+                socket.abort();
+            } else {
+                socket.close();
+            }
+            runtime.closing.push(Closing {
+                handle,
+                deadline: runtime.clock.saturating_add(CLOSING_LIMIT_MS),
+                polled: false,
+            });
+            CLOSING_PENDING.store(true, Ordering::Release);
+        } else {
+            runtime.sockets.remove(handle);
+        }
         self.slots[index] = None;
         true
     }
@@ -2159,6 +2229,26 @@ pub(crate) fn close(id: SlotId) -> bool {
     SOCKETS.lock().close(id)
 }
 
+/// Polls the network while closed TCP connections still have data or a FIN
+/// to send, at most once a millisecond: called on every system call, so a
+/// connection finishes closing after the process that closed it has moved
+/// on or exited.
+pub(crate) fn poll_closing() {
+    if !CLOSING_PENDING.load(Ordering::Acquire) {
+        return;
+    }
+    let Some(mut sockets) = SOCKETS.try_lock() else {
+        return;
+    };
+    let due = sockets
+        .runtime
+        .as_ref()
+        .is_some_and(|runtime| clock_milliseconds(runtime.clock) > runtime.clock);
+    if due {
+        sockets.poll();
+    }
+}
+
 pub(crate) fn shutdown_socket(id: SlotId, how: u8) -> Result<(), Error> {
     SOCKETS.lock().shutdown_socket(id, how)
 }
@@ -2225,15 +2315,45 @@ pub(crate) fn timeout_option(id: SlotId, option: TimeoutOption) -> Result<u64, E
     SOCKETS.lock().timeout_option(id, option)
 }
 
-fn timeout_poll_limit(id: SlotId, option: TimeoutOption) -> Option<usize> {
-    timeout_option(id, option)
+/// The attempts a blocking call makes before it gives up (`WouldBlock`):
+/// until the socket's timeout for `option` passes on the monotonic clock,
+/// or `BLOCKING_POLL_LIMIT` attempts without one. The first attempt is
+/// always made.
+fn attempts(id: SlotId, option: TimeoutOption) -> impl Iterator<Item = ()> {
+    let deadline = timed_deadline(id, option);
+    let mut made = 0_usize;
+    core::iter::from_fn(move || {
+        made += 1;
+        let more = match deadline {
+            Some(deadline) => made == 1 || clock_microseconds().is_none_or(|now| now < deadline),
+            None => made <= BLOCKING_POLL_LIMIT,
+        };
+        more.then_some(())
+    })
+}
+
+/// When the socket's timeout for `option`, if it has one, passes.
+fn timed_deadline(id: SlotId, option: TimeoutOption) -> Option<u64> {
+    let microseconds = timeout_option(id, option)
         .ok()
-        .filter(|microseconds| *microseconds != 0)
-        .map(|microseconds| {
-            usize::try_from(microseconds.div_ceil(1_000))
-                .unwrap_or(usize::MAX)
-                .max(1)
-        })
+        .filter(|microseconds| *microseconds != 0)?;
+    Some(clock_microseconds()?.saturating_add(microseconds))
+}
+
+/// smoltcp's clock: the monotonic clock in milliseconds, at least `last`;
+/// one past `last` until the clock's frequency is known.
+fn clock_milliseconds(last: i64) -> i64 {
+    clock_microseconds()
+        .and_then(|microseconds| i64::try_from(microseconds / 1_000).ok())
+        .map_or(last.saturating_add(1), |now| now.max(last))
+}
+
+/// The monotonic clock (the timestamp counter) in microseconds, or `None`
+/// before its frequency is known.
+fn clock_microseconds() -> Option<u64> {
+    let frequency = timer::monotonic_frequency().filter(|frequency| *frequency != 0)?;
+    let ticks = u128::from(timer::timestamp_counter());
+    u64::try_from(ticks * 1_000_000 / u128::from(frequency)).ok()
 }
 
 pub(crate) fn bind(id: SlotId, address: u32, requested_port: u16) -> Result<u16, Error> {
@@ -2249,8 +2369,8 @@ pub(crate) fn accept(id: SlotId) -> Result<(SlotId, IpEndpoint), Error> {
 }
 
 pub(crate) fn accept_blocking(id: SlotId) -> Result<(SlotId, IpEndpoint), Error> {
-    if let Some(limit) = timeout_poll_limit(id, TimeoutOption::Receive) {
-        for _ in 0..limit {
+    if timeout_option(id, TimeoutOption::Receive).is_ok_and(|timeout| timeout != 0) {
+        for () in attempts(id, TimeoutOption::Receive) {
             match accept(id) {
                 Err(Error::WouldBlock | Error::InProgress) => core::hint::spin_loop(),
                 result => return result,
@@ -2282,8 +2402,7 @@ pub(crate) fn send_blocking(
     input: &[u8],
     remote: Option<IpEndpoint>,
 ) -> Result<usize, Error> {
-    let limit = timeout_poll_limit(id, TimeoutOption::Send).unwrap_or(BLOCKING_POLL_LIMIT);
-    for _ in 0..limit {
+    for () in attempts(id, TimeoutOption::Send) {
         match SOCKETS.lock().send_queued(id, input, remote, None) {
             Err(Error::WouldBlock | Error::InProgress) => core::hint::spin_loop(),
             result => return result,
@@ -2370,9 +2489,8 @@ pub(crate) fn recv_message_blocking(
     if output.is_empty() {
         return Ok((0, 0, None));
     }
-    let limit = timeout_poll_limit(id, TimeoutOption::Receive).unwrap_or(BLOCKING_POLL_LIMIT);
     if !wait_all || matches!(kind(id), Some(Kind::Udp | Kind::Icmp)) {
-        for _ in 0..limit {
+        for () in attempts(id, TimeoutOption::Receive) {
             match recv_message(id, output, peek_only) {
                 Err(Error::WouldBlock | Error::InProgress) => core::hint::spin_loop(),
                 result => return result,
@@ -2383,7 +2501,7 @@ pub(crate) fn recv_message_blocking(
     }
     if peek_only {
         let mut observed = 0;
-        for _ in 0..limit {
+        for () in attempts(id, TimeoutOption::Receive) {
             match recv_message(id, output, true) {
                 Ok((copied, _, endpoint)) if copied == output.len() || copied == 0 => {
                     return Ok((copied, copied, endpoint));
@@ -2407,7 +2525,7 @@ pub(crate) fn recv_message_blocking(
         };
     }
     let mut received = 0;
-    for _ in 0..limit {
+    for () in attempts(id, TimeoutOption::Receive) {
         match recv_message(id, &mut output[received..], false) {
             Ok((0, _, endpoint)) => return Ok((received, received, endpoint)),
             Ok((copied, _, endpoint)) => {
@@ -2438,8 +2556,7 @@ pub(crate) fn recv_blocking(
     id: SlotId,
     output: &mut [u8],
 ) -> Result<(usize, Option<IpEndpoint>), Error> {
-    let limit = timeout_poll_limit(id, TimeoutOption::Receive).unwrap_or(BLOCKING_POLL_LIMIT);
-    for _ in 0..limit {
+    for () in attempts(id, TimeoutOption::Receive) {
         match recv(id, output) {
             Err(Error::WouldBlock | Error::InProgress) => core::hint::spin_loop(),
             result => return result,
@@ -2450,8 +2567,7 @@ pub(crate) fn recv_blocking(
 }
 
 pub(crate) fn complete_connect(id: SlotId) -> Result<(), Error> {
-    let limit = timeout_poll_limit(id, TimeoutOption::Send).unwrap_or(BLOCKING_POLL_LIMIT);
-    for _ in 0..limit {
+    for () in attempts(id, TimeoutOption::Send) {
         let Some((_, writable, error)) = readiness(id) else {
             return Err(Error::Invalid);
         };

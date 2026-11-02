@@ -13248,6 +13248,8 @@ pub(super) fn linux_wait_for_interrupt() {
     }
     crate::cpu_time::add_idle(timer::timestamp_counter().saturating_sub(started));
     crate::sync::kernel_entry_return_from_user();
+    // Closed TCP connections finish sending while the domain waits.
+    crate::linux_socket::poll_closing();
 }
 
 fn current_linux_user_namespace() -> Option<linux_user::UserNamespaceHandle> {
