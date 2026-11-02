@@ -689,19 +689,55 @@ pub(super) const LINUX_FILE_PROC_MOUNTS: u16 = LINUX_FILE_MASK | LINUX_PROC_MOUN
 pub(super) const LINUX_PROC_SYSRQ_TRIGGER_NODE: u16 = 0xdc00;
 pub(super) const LINUX_FILE_PROC_SYSRQ_TRIGGER: u16 =
     LINUX_FILE_MASK | LINUX_PROC_SYSRQ_TRIGGER_NODE;
+/// `/proc/sysvipc/msg`, `shm` and `sem`: the domain's System V IPC objects,
+/// a header line then one line each (LTP counts the lines).
+pub(super) const LINUX_PROC_SYSVIPC_MSG_NODE: u16 = 0xcd00;
+pub(super) const LINUX_FILE_PROC_SYSVIPC_MSG: u16 = LINUX_FILE_MASK | LINUX_PROC_SYSVIPC_MSG_NODE;
+pub(super) const LINUX_PROC_SYSVIPC_SHM_NODE: u16 = 0xce00;
+pub(super) const LINUX_FILE_PROC_SYSVIPC_SHM: u16 = LINUX_FILE_MASK | LINUX_PROC_SYSVIPC_SHM_NODE;
+pub(super) const LINUX_PROC_SYSVIPC_SEM_NODE: u16 = 0xcf00;
+pub(super) const LINUX_FILE_PROC_SYSVIPC_SEM: u16 = LINUX_FILE_MASK | LINUX_PROC_SYSVIPC_SEM_NODE;
 /// Read-only `/proc/sys` values: node, path under `/proc`, contents. Values
 /// match what Ginux implements (four user namespaces). Leave out values that
 /// tests save and restore (io_uring_disabled): LTP skips a test when such a
 /// file exists but cannot be written, and runs it when the file is absent.
 /// `/proc/sys/fs/aio-max-nr`: the most events one io_setup context may hold.
 pub(super) const LINUX_AIO_MAX_NR: u64 = 65_536;
-pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 6] = [
+pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 25] = [
+    // System V IPC limits, Linux's defaults; tests read them to size runs.
+    (0xb000, b"sys/kernel/shmmni", b"4096\n"),
+    (0xb100, b"sys/kernel/shmmax", b"18446744073692774399\n"),
+    (0xb200, b"sys/kernel/shmall", b"18446744073692774399\n"),
+    (0xb300, b"sys/kernel/msgmax", b"8192\n"),
+    (0xb400, b"sys/kernel/msgmnb", b"16384\n"),
+    (
+        0xb500,
+        b"sys/kernel/sem",
+        b"32000\t1024000000\t500\t32000\n",
+    ),
+    // uname's fields, as /proc/sys/kernel shows them (linux_time::linux_uname).
+    (0xc800, b"sys/kernel/ostype", b"Linux\n"),
+    (0xc900, b"sys/kernel/version", b"#1\n"),
+    (0xca00, b"sys/kernel/domainname", b"localdomain\n"),
+    // The id the next created queue or segment gets once written (-1: the
+    // next free one); the kernel resets it to -1 when it uses it.
+    (0xcb00, b"sys/kernel/msg_next_id", b"-1\n"),
+    (0xcc00, b"sys/kernel/shm_next_id", b"-1\n"),
     (0xd700, b"sys/kernel/pid_max", b"4194304\n"),
     (0xd600, b"sys/kernel/tainted", b"0\n"),
     (0xd500, b"sys/user/max_user_namespaces", b"3\n"),
     (0xd400, b"sys/fs/pipe-max-size", b"1048576\n"),
     (0xd200, b"sys/fs/aio-max-nr", b"65536\n"),
     (0xd000, b"sys/fs/pipe-user-pages-soft", b"16384\n"),
+    // Values tests read to size themselves (nodes below the input range).
+    (0xc000, b"sys/kernel/osrelease", b"6.12.0-ginux.0.1\n"),
+    (0xc100, b"sys/kernel/msgmni", b"32000\n"),
+    (0xc200, b"sys/kernel/threads-max", b"126000\n"),
+    (0xc300, b"sys/fs/inotify/max_queued_events", b"16384\n"),
+    (0xc400, b"sys/fs/inotify/max_user_instances", b"128\n"),
+    (0xc500, b"sys/fs/inotify/max_user_watches", b"65536\n"),
+    (0xc600, b"sys/kernel/keys/root_maxkeys", b"1000000\n"),
+    (0xc700, b"sys/kernel/keys/root_maxbytes", b"25000000\n"),
 ];
 pub(super) const LINUX_PROC_CPUINFO_NODE: u16 = 0xf800;
 pub(super) const LINUX_FILE_PROC_CPUINFO: u16 = LINUX_FILE_MASK | LINUX_PROC_CPUINFO_NODE;
@@ -958,7 +994,10 @@ use super::{LINUX_RUNTIME_INSTANCE_LIMIT, PAGE_SIZE};
 /// The fixed file nodes and the `/proc/sys` nodes are distinct and clear of
 /// the `/dev/input/eventN` range, so no file is taken for another.
 const _: () = {
-    const NODES: [u16; 38] = [
+    const NODES: [u16; 41] = [
+        LINUX_PROC_SYSVIPC_MSG_NODE,
+        LINUX_PROC_SYSVIPC_SHM_NODE,
+        LINUX_PROC_SYSVIPC_SEM_NODE,
         LINUX_PROC_PID2_DIRECTORY_NODE,
         LINUX_PROC_FD_DIRECTORY_NODE,
         LINUX_PROC_PID2_STATUS_NODE,

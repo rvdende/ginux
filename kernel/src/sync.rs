@@ -210,6 +210,11 @@ pub(crate) fn kernel_entry_lock() -> KernelEntryGuard {
     KERNEL_ENTRY_LOCK.lock()
 }
 
+/// The kernel-entry lock if no CPU holds or waits for it (`try_lock`).
+pub(crate) fn kernel_entry_try_lock() -> Option<KernelEntryGuard> {
+    KERNEL_ENTRY_LOCK.try_lock()
+}
+
 /// Called just before this CPU returns to a Linux process's user mode:
 /// releases the kernel-entry lock, keeping its depth (the entries of the
 /// calls this CPU is nested in) for `kernel_entry_return_from_user`. User
@@ -364,6 +369,50 @@ impl KernelEntryLock {
             lock: self,
             interrupt_state,
         }
+    }
+
+    /// Takes the lock only when no CPU holds or waits for it, else None with
+    /// this CPU's interrupts as they were. The ticket serves waiters in
+    /// order, so an idle CPU that merely looks for work must not queue: three
+    /// idle application processors re-queuing after every look would take
+    /// three turns in four from the owner CPU's system calls.
+    fn try_lock(&'static self) -> Option<KernelEntryGuard> {
+        let interrupt_state = disable_interrupts();
+        let cpu = cpu_slot();
+        if self.cpu_owner.load(Ordering::Acquire) == cpu as u16 + 1 {
+            let previous = self.depths[cpu].fetch_add(1, Ordering::AcqRel);
+            if previous == 0 {
+                crate::kernel_fail("ginux: invalid recursive kernel-entry depth\r\n");
+            }
+            return Some(KernelEntryGuard {
+                lock: self,
+                interrupt_state,
+            });
+        }
+        // Free when the next ticket to hand out is the owner's: take exactly
+        // that ticket, or nothing.
+        let ticket = self.owner.load(Ordering::Acquire);
+        if self
+            .next
+            .compare_exchange(
+                ticket,
+                ticket.wrapping_add(1),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            restore_interrupts(interrupt_state);
+            return None;
+        }
+        let previous_rank = enter_rank(LockRank::ARCHITECTURE);
+        self.previous_ranks[cpu].store(previous_rank, Ordering::Release);
+        self.depths[cpu].store(1, Ordering::Release);
+        self.cpu_owner.store(cpu as u16 + 1, Ordering::Release);
+        Some(KernelEntryGuard {
+            lock: self,
+            interrupt_state,
+        })
     }
 
     /// Takes the lock for `cpu` (this CPU) at `depth`.

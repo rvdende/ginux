@@ -2080,6 +2080,7 @@ fn linux_thread_runs_elsewhere(slot: usize) -> bool {
 /// owner, and not the thread whose context the registry holds.
 fn pick_linux_light_thread(cursor: &mut usize) -> Option<(usize, usize)> {
     let instance = linux_execution_instance();
+    let cpu = current_linux_runtime_cpu_index();
     let total = LINUX_CPU_BANK_LIMIT * LINUX_THREAD_LIMIT;
     for step in 1..=total {
         let index = (*cursor + step) % total;
@@ -2094,6 +2095,13 @@ fn pick_linux_light_thread(cursor: &mut usize) -> Option<(usize, usize)> {
                 .load(Ordering::Acquire)
                 != LINUX_THREAD_READY
             || X86_RUNTIME.LINUX_THREAD_OWNER_ONLY.at_bank(bank)[slot].load(Ordering::Acquire) != 0
+        {
+            continue;
+        }
+        // A process sched_setaffinity pinned to other CPUs is not run here.
+        let pid = LINUX_BANK_PID[bank].load(Ordering::Acquire);
+        if linux_process::live_process_cpu_affinity(pid)
+            .is_some_and(|mask| mask & (1_u64 << cpu) == 0)
         {
             continue;
         }
@@ -2659,7 +2667,19 @@ pub(crate) fn run_application_processor_runtime(cpu: usize) {
     let mut thread_cursor = 0;
     let mut idle_ticks = LINUX_SMP_IDLE_SPIN_TICKS;
     loop {
-        let guard = crate::sync::kernel_entry_lock();
+        // Looking for work takes the kernel-entry lock only when it is free:
+        // a CPU with nothing to run must not queue for it behind the owner
+        // CPU's system calls (a fork storm retiring hundreds of children was
+        // slowed to a crawl by three idle CPUs taking turns on the lock).
+        let Some(guard) = crate::sync::kernel_entry_try_lock() else {
+            let started = timer::timestamp_counter();
+            let until = started.wrapping_add(LINUX_SMP_IDLE_SPIN_TICKS);
+            while timer::timestamp_counter() < until {
+                core::hint::spin_loop();
+            }
+            crate::cpu_time::add_lock_wait(timer::timestamp_counter().saturating_sub(started));
+            continue;
+        };
         if LINUX_SMP_RUNTIME_INSTANCE.load(Ordering::Acquire) != instance
             || !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::Acquire)
             || X86_RUNTIME.LINUX_RUNTIME_SUSPENDED.load(Ordering::Acquire)
@@ -3222,7 +3242,9 @@ static X86_RUNTIME_BACKING_ELF_PROBE_RECLAIM_SIBLING_STACK_FRAME: BankedAtomicU6
     BankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_RECLAIM_SIBLING_STACK_GENERATION: BankedAtomicU32 =
     BankedAtomicU32::new(0);
-const LINUX_THREAD_LIMIT: usize = 32;
+/// Threads per process. LTP sizes thread pools by the CPU count (fcntl36
+/// runs 9 per CPU, futex_wake02 55), so a cpu=4 domain needs well over 32.
+const LINUX_THREAD_LIMIT: usize = 128;
 const LINUX_THREAD_FREE: u8 = 0;
 const LINUX_THREAD_READY: u8 = 1;
 const LINUX_THREAD_RUNNING: u8 = 2;
@@ -18043,15 +18065,22 @@ fn linux_shmget(key: u64, size: u64, flags: u64) -> u64 {
         return LINUX_EINVAL;
     }
     let key = key as u32 as i32;
-    crate::linux_sysv_ipc::get_or_create(
+    let requested =
+        linux_proc_sysctl_value(b"sys/kernel/shm_next_id").and_then(|id| u32::try_from(id).ok());
+    let result = crate::linux_sysv_ipc::get_or_create(
         key,
         size,
         flags as u16,
         key == 0 || flags & IPC_CREAT != 0,
         flags & IPC_EXCL != 0,
         current_linux_process_pid(),
-    )
-    .map_or_else(linux_sysv_ipc_error, u64::from)
+        requested,
+    );
+    // shm_next_id is used up by the segment it named.
+    if requested.is_some_and(|id| result == Ok(id)) {
+        linux_proc_sysctl_set(b"sys/kernel/shm_next_id", -1);
+    }
+    result.map_or_else(linux_sysv_ipc_error, u64::from)
 }
 
 fn linux_shmat(id: u64, requested: u64, flags: u64) -> u64 {
@@ -18445,13 +18474,20 @@ fn linux_msgget(key: u64, flags: u64) -> u64 {
         return LINUX_EINVAL;
     }
     let key = key as u32 as i32;
-    crate::linux_sysv_ipc::message_get_or_create(
+    let requested =
+        linux_proc_sysctl_value(b"sys/kernel/msg_next_id").and_then(|id| u32::try_from(id).ok());
+    let result = crate::linux_sysv_ipc::message_get_or_create(
         key,
         flags as u16,
         key == 0 || flags & IPC_CREAT != 0,
         flags & IPC_EXCL != 0,
-    )
-    .map_or_else(linux_sysv_ipc_error, u64::from)
+        requested,
+    );
+    // msg_next_id is used up by the queue it named.
+    if requested.is_some_and(|id| result == Ok(id)) {
+        linux_proc_sysctl_set(b"sys/kernel/msg_next_id", -1);
+    }
+    result.map_or_else(linux_sysv_ipc_error, u64::from)
 }
 
 /// msgsnd and msgrcv: `attempt` runs the call once. Without IPC_NOWAIT a
@@ -26379,12 +26415,100 @@ fn linux_runtime_file_kind(path: &[u8]) -> Option<u16> {
     Some(kind | (u16::from(node) << LINUX_ROOT_NODE_SHIFT))
 }
 
-/// The contents of a read-only `/proc/sys` value file (`LINUX_PROC_SYSCTLS`).
+/// The contents of a `/proc/sys` value file (`LINUX_PROC_SYSCTLS`) as
+/// built in; a value the domain wrote is served by `linux_regular_file_read_at`.
 fn linux_proc_sysctl(state: u16) -> Option<&'static [u8]> {
     LINUX_PROC_SYSCTLS
         .iter()
         .find(|(node, ..)| state & !3 == LINUX_FILE_MASK | node)
         .map(|(.., contents)| *contents)
+}
+
+/// The index in `LINUX_PROC_SYSCTLS` of the value file a descriptor state names.
+fn linux_proc_sysctl_index(state: u16) -> Option<usize> {
+    LINUX_PROC_SYSCTLS
+        .iter()
+        .position(|(node, ..)| state & !3 == LINUX_FILE_MASK | node)
+}
+
+/// A domain has not written this `/proc/sys` value.
+const LINUX_SYSCTL_UNSET: i64 = i64::MIN;
+
+/// The `/proc/sys` values each domain wrote, by index in `LINUX_PROC_SYSCTLS`:
+/// reads then show the written number instead of the built-in text, and the
+/// kernel consults the ones it acts on (`linux_proc_sysctl_value`). Each
+/// domain has its own, as it has its own hostname.
+static LINUX_SYSCTL_OVERRIDES: [[core::sync::atomic::AtomicI64; LINUX_PROC_SYSCTLS.len()];
+    control_abi::DOMAIN_LIMIT] = [const {
+    [const { core::sync::atomic::AtomicI64::new(LINUX_SYSCTL_UNSET) }; LINUX_PROC_SYSCTLS.len()]
+}; control_abi::DOMAIN_LIMIT];
+
+/// The number the current domain wrote to `/proc/sys` value `index`, if any.
+fn linux_proc_sysctl_override(index: usize) -> Option<i64> {
+    let slot = current_container_slot()?;
+    let value = LINUX_SYSCTL_OVERRIDES[slot][index].load(Ordering::Acquire);
+    (value != LINUX_SYSCTL_UNSET).then_some(value)
+}
+
+/// The number the current domain wrote to the `/proc/sys` value at `path`
+/// (under `/proc`, as `LINUX_PROC_SYSCTLS` names it), for the values the
+/// kernel acts on: pipe-max-size, msg_next_id and shm_next_id.
+fn linux_proc_sysctl_value(path: &[u8]) -> Option<i64> {
+    let index = LINUX_PROC_SYSCTLS
+        .iter()
+        .position(|(_, name, _)| *name == path)?;
+    linux_proc_sysctl_override(index)
+}
+
+/// Sets the current domain's `/proc/sys` value at `path`: the kernel puts
+/// msg_next_id and shm_next_id back to -1 once a creation used them.
+fn linux_proc_sysctl_set(path: &[u8], value: i64) {
+    let Some(index) = LINUX_PROC_SYSCTLS
+        .iter()
+        .position(|(_, name, _)| *name == path)
+    else {
+        return;
+    };
+    let Some(slot) = current_container_slot() else {
+        return;
+    };
+    LINUX_SYSCTL_OVERRIDES[slot][index].store(value, Ordering::Release);
+}
+
+/// The largest pipe an unprivileged process of the current domain may ask
+/// for or get: `/proc/sys/fs/pipe-max-size` as written, else the built-in.
+fn linux_pipe_max_size() -> u64 {
+    linux_proc_sysctl_value(b"sys/fs/pipe-max-size")
+        .and_then(|value| u64::try_from(value).ok())
+        .unwrap_or(LINUX_PIPE_MAX_SIZE)
+}
+
+/// Writes a `/proc/sys` value: a number in Linux's integer syntax, from a
+/// process with root's effective user id, as Linux wants CAP_SYS_ADMIN.
+fn linux_proc_sysctl_write(device: u16, index: usize, address: u64, count: u64) -> u64 {
+    if device & 3 & LINUX_DESCRIPTOR_OUTPUT == 0 {
+        return LINUX_EBADF;
+    }
+    if current_linux_credentials().is_none_or(|credentials| credentials.user.effective != 0) {
+        return LINUX_EACCES;
+    }
+    let Some(slot) = current_container_slot() else {
+        return LINUX_EIO;
+    };
+    let mut text = [0_u8; 24];
+    let length = usize::try_from(count).map_or(text.len(), |count| count.min(text.len()));
+    if !copy_from_linux_user(address, &mut text[..length]) {
+        return LINUX_EFAULT;
+    }
+    let text = text[..length]
+        .split(|byte| *byte == 0)
+        .next()
+        .unwrap_or_default();
+    let Some(value) = linux_parse_kernel_integer(text.trim_ascii()) else {
+        return LINUX_EINVAL;
+    };
+    LINUX_SYSCTL_OVERRIDES[slot][index].store(value, Ordering::Release);
+    count
 }
 
 fn linux_proc_root_file_kind(name: &[u8]) -> Option<u16> {
@@ -26401,7 +26525,183 @@ fn linux_proc_root_file_kind(name: &[u8]) -> Option<u16> {
         b"filesystems" => Some(LINUX_FILE_PROC_FILESYSTEMS),
         b"cmdline" => Some(LINUX_FILE_PROC_CMDLINE),
         b"sysrq-trigger" => Some(LINUX_FILE_PROC_SYSRQ_TRIGGER),
+        b"sysvipc/msg" => Some(LINUX_FILE_PROC_SYSVIPC_MSG),
+        b"sysvipc/shm" => Some(LINUX_FILE_PROC_SYSVIPC_SHM),
+        b"sysvipc/sem" => Some(LINUX_FILE_PROC_SYSVIPC_SEM),
         _ => None,
+    }
+}
+
+/// Whether a descriptor state names one of the `/proc/sysvipc` listings.
+fn linux_proc_sysvipc_file(state: u16) -> bool {
+    matches!(
+        state & !3,
+        LINUX_FILE_PROC_SYSVIPC_MSG | LINUX_FILE_PROC_SYSVIPC_SHM | LINUX_FILE_PROC_SYSVIPC_SEM
+    )
+}
+
+/// Linux's header lines, which the listings start with.
+const LINUX_PROC_SYSVIPC_MSG_HEADER: &[u8] = b"       key      msqid perms      cbytes       qnum lspid lrpid   uid   gid  cuid  cgid      stime      rtime      ctime\n";
+const LINUX_PROC_SYSVIPC_SHM_HEADER: &[u8] = b"       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime                   rss                  swap\n";
+const LINUX_PROC_SYSVIPC_SEM_HEADER: &[u8] =
+    b"       key      semid perms      nsems   uid   gid  cuid  cgid      otime      ctime\n";
+/// Room for the listing: about sixty objects; a longer one is cut short.
+const LINUX_PROC_SYSVIPC_CAPACITY: usize = 4096;
+
+/// Appends `value` in octal, as `/proc/sysvipc` shows permissions.
+fn append_linux_octal(output: &mut [u8], used: &mut usize, value: u64) -> bool {
+    let mut digits = [0_u8; 22];
+    let mut length = 0;
+    let mut remaining = value;
+    loop {
+        digits[length] = b'0' + (remaining & 7) as u8;
+        length += 1;
+        remaining >>= 3;
+        if remaining == 0 {
+            break;
+        }
+    }
+    digits[..length].reverse();
+    append_linux_bytes(output, used, &digits[..length])
+}
+
+/// Appends a row of `/proc/sysvipc` fields: the signed key, then the
+/// octal permissions at `perms_index`, the rest in decimal, each after a
+/// space, and a newline.
+fn append_linux_sysvipc_row(
+    output: &mut [u8],
+    used: &mut usize,
+    key: i32,
+    fields: &[u64],
+    perms_index: usize,
+) -> bool {
+    let mut ok = (key >= 0 || append_linux_bytes(output, used, b"-"))
+        && append_linux_decimal(output, used, u64::from(key.unsigned_abs()));
+    for (index, value) in fields.iter().enumerate() {
+        ok = ok
+            && append_linux_bytes(output, used, b" ")
+            && if index == perms_index {
+                append_linux_octal(output, used, *value)
+            } else {
+                append_linux_decimal(output, used, *value)
+            };
+    }
+    ok && append_linux_bytes(output, used, b"\n")
+}
+
+/// Generates a `/proc/sysvipc` listing into `file`: the header, then one
+/// line per object of the domain, as far as `file` holds them.
+fn linux_proc_sysvipc_contents(state: u16, file: &mut [u8]) -> Option<usize> {
+    let mut used = 0;
+    let generated = match state & !3 {
+        LINUX_FILE_PROC_SYSVIPC_MSG => {
+            append_linux_bytes(file, &mut used, LINUX_PROC_SYSVIPC_MSG_HEADER)
+                && crate::linux_sysv_ipc::message_queues()
+                    .iter()
+                    .all(|(id, queue)| {
+                        append_linux_sysvipc_row(
+                            file,
+                            &mut used,
+                            queue.key,
+                            &[
+                                u64::from(*id),
+                                u64::from(queue.mode & 0o777),
+                                queue.bytes,
+                                queue.messages,
+                                u64::from(queue.last_sender),
+                                u64::from(queue.last_receiver),
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                            ],
+                            1,
+                        )
+                    })
+        }
+        LINUX_FILE_PROC_SYSVIPC_SHM => {
+            append_linux_bytes(file, &mut used, LINUX_PROC_SYSVIPC_SHM_HEADER)
+                && crate::linux_sysv_ipc::segments()
+                    .iter()
+                    .all(|(id, segment)| {
+                        append_linux_sysvipc_row(
+                            file,
+                            &mut used,
+                            segment.key,
+                            &[
+                                u64::from(*id),
+                                u64::from(segment.mode & 0o777),
+                                segment.size,
+                                u64::from(segment.creator_pid),
+                                u64::from(segment.last_pid),
+                                segment.attachments,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                segment.size,
+                                0,
+                            ],
+                            1,
+                        )
+                    })
+        }
+        LINUX_FILE_PROC_SYSVIPC_SEM => {
+            append_linux_bytes(file, &mut used, LINUX_PROC_SYSVIPC_SEM_HEADER)
+                && crate::linux_sysv_ipc::semaphore_sets()
+                    .iter()
+                    .all(|(id, set)| {
+                        append_linux_sysvipc_row(
+                            file,
+                            &mut used,
+                            set.key,
+                            &[
+                                u64::from(*id),
+                                u64::from(set.mode & 0o777),
+                                set.count,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                            ],
+                            1,
+                        )
+                    })
+        }
+        _ => return None,
+    };
+    // A listing the buffer could not hold ends at its last whole line.
+    let _ = generated;
+    Some(used)
+}
+
+/// Reads a `/proc/sysvipc` listing from `offset`.
+fn linux_proc_sysvipc_read(state: u16, address: u64, count: u64, offset: u64) -> u64 {
+    let mut file = [0_u8; LINUX_PROC_SYSVIPC_CAPACITY];
+    let Some(used) = linux_proc_sysvipc_contents(state, &mut file) else {
+        return LINUX_EIO;
+    };
+    let Ok(start) = usize::try_from(offset) else {
+        return 0;
+    };
+    if start >= used || count == 0 {
+        return 0;
+    }
+    let end = start
+        .saturating_add(usize::try_from(count).unwrap_or(usize::MAX))
+        .min(used);
+    if copy_to_linux_user(address, &file[start..end]) {
+        (end - start) as u64
+    } else {
+        LINUX_EFAULT
     }
 }
 
@@ -34867,13 +35167,17 @@ fn linux_descriptor_read(descriptor: u64, address: u64, count: u64) -> u64 {
         device & !3,
         LINUX_FILE_PROC_FDINFO
             | LINUX_FILE_PROC_CPUINFO
+            | LINUX_FILE_PROC_SYSVIPC_MSG
+            | LINUX_FILE_PROC_SYSVIPC_SHM
+            | LINUX_FILE_PROC_SYSVIPC_SEM
             | LINUX_FILE_PROC_STAT
             | LINUX_FILE_PROC_DYNAMIC_STAT
             | LINUX_FILE_PROC_DYNAMIC_STATUS
             | LINUX_FILE_PROC_DYNAMIC_STATM
             | LINUX_FILE_PROC_DYNAMIC_MAPS
             | LINUX_FILE_PROC_OOM_SCORE_ADJ
-    ) {
+    ) || linux_proc_sysctl_index(device).is_some()
+    {
         let offset = linux_descriptor_offset(descriptor).load(Ordering::SeqCst);
         let result = linux_regular_file_read_at(descriptor, address, count, offset);
         if result < LINUX_RETURN_TO_KERNEL {
@@ -34979,8 +35283,36 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
     if linux_secret_descriptor(descriptor) {
         return LINUX_EINVAL;
     }
+    // A /proc/sys value the domain wrote reads back as that number.
+    if let Some(value) = linux_proc_sysctl_index(state).and_then(linux_proc_sysctl_override) {
+        let mut file = [0_u8; 24];
+        let mut used = 0;
+        let generated = (value >= 0 || append_linux_bytes(&mut file, &mut used, b"-"))
+            && append_linux_decimal(&mut file, &mut used, value.unsigned_abs())
+            && append_linux_bytes(&mut file, &mut used, b"\n");
+        if !generated {
+            return LINUX_EIO;
+        }
+        let Ok(start) = usize::try_from(offset) else {
+            return 0;
+        };
+        if start >= used || count == 0 {
+            return 0;
+        }
+        let end = start
+            .saturating_add(usize::try_from(count).unwrap_or(usize::MAX))
+            .min(used);
+        return if copy_to_linux_user(address, &file[start..end]) {
+            (end - start) as u64
+        } else {
+            LINUX_EFAULT
+        };
+    }
     if state & !3 == LINUX_FILE_PROC_CPUINFO {
         return linux_proc_cpuinfo_read(address, count, offset);
+    }
+    if linux_proc_sysvipc_file(state) {
+        return linux_proc_sysvipc_read(state, address, count, offset);
     }
     if state & !3 == LINUX_FILE_PROC_STAT {
         return linux_proc_stat_read(address, count, offset);
@@ -38280,6 +38612,14 @@ fn linux_socket_pipe(
         Ok(pair) => pair,
         Err(error) => return linux_socket_error(error),
     };
+    // An unprivileged process gets no pipe larger than pipe-max-size: Linux
+    // caps the default capacity, not only F_SETPIPE_SZ requests.
+    if !current_linux_credentials().is_some_and(|value| value.user.effective == 0) {
+        let limit = linux_pipe_max_size() as usize;
+        if crate::linux_socket::local_capacity(reader).is_ok_and(|capacity| capacity > limit) {
+            let _ = crate::linux_socket::set_local_capacity(reader, limit);
+        }
+    }
     let mut output = [0_u8; 8];
     output[..4].copy_from_slice(&(descriptors[0] as u32).to_ne_bytes());
     output[4..].copy_from_slice(&(descriptors[1] as u32).to_ne_bytes());
@@ -40778,6 +41118,9 @@ fn linux_descriptor_write(descriptor: u64, address: u64, count: u64) -> u64 {
     if device & !3 == LINUX_FILE_PROC_OOM_SCORE_ADJ {
         return linux_proc_oom_score_adj_write(descriptor, device, address, count);
     }
+    if let Some(index) = linux_proc_sysctl_index(device) {
+        return linux_proc_sysctl_write(device, index, address, count);
+    }
     if device & !3 == LINUX_FILE_PROC_SYSRQ_TRIGGER {
         return linux_sysrq_trigger_write(address, count);
     }
@@ -41217,10 +41560,13 @@ fn linux_descriptor_writev(descriptor: u64, vectors: u64, count: u64) -> u64 {
         return result;
     }
     let device = linux_device_descriptor(descriptor);
+    // stdio flushes with writev, so a /proc value written with fprintf
+    // arrives here: these go through the descriptor's write handler.
     if linux_overlay_descriptor_handle(descriptor).is_some()
         || linux_tmp_file(device)
         || device & !3 == LINUX_FILE_PROC_OOM_SCORE_ADJ
         || device & !3 == LINUX_FILE_PROC_SYSRQ_TRIGGER
+        || linux_proc_sysctl_index(device).is_some()
     {
         let (ranges, vector_count) = match linux_socket_iov_ranges(vectors, count, false) {
             Ok(ranges) => ranges,
@@ -41977,6 +42323,9 @@ fn linux_proc_file(state: u16) -> bool {
             | LINUX_FILE_PROC_GID_MAP
             | LINUX_FILE_PROC_SETGROUPS
             | LINUX_FILE_PROC_CPUINFO
+            | LINUX_FILE_PROC_SYSVIPC_MSG
+            | LINUX_FILE_PROC_SYSVIPC_SHM
+            | LINUX_FILE_PROC_SYSVIPC_SEM
             | LINUX_FILE_PROC_MEMINFO
             | LINUX_FILE_PROC_STAT
             | LINUX_FILE_PROC_UPTIME
@@ -42020,7 +42369,7 @@ fn linux_writable_proc_file(state: u16) -> bool {
             | LINUX_FILE_PROC_UID_MAP
             | LINUX_FILE_PROC_GID_MAP
             | LINUX_FILE_PROC_SETGROUPS
-    )
+    ) || linux_proc_sysctl_index(state).is_some()
 }
 
 fn linux_user_namespace_file(state: u16) -> Option<&'static [u8]> {
@@ -42156,6 +42505,9 @@ fn linux_regular_file(state: u16) -> Option<&'static [u8]> {
     }
     match state & !3 {
         LINUX_FILE_PROC_CPUINFO => return Some(LINUX_PROC_CPUINFO),
+        LINUX_FILE_PROC_SYSVIPC_MSG => return Some(LINUX_PROC_SYSVIPC_MSG_HEADER),
+        LINUX_FILE_PROC_SYSVIPC_SHM => return Some(LINUX_PROC_SYSVIPC_SHM_HEADER),
+        LINUX_FILE_PROC_SYSVIPC_SEM => return Some(LINUX_PROC_SYSVIPC_SEM_HEADER),
         LINUX_FILE_PROC_MEMINFO => return Some(linux_proc_meminfo()),
         LINUX_FILE_PROC_STAT => return Some(LINUX_PROC_STAT),
         LINUX_FILE_PROC_UPTIME => return Some(linux_proc_uptime()),
@@ -42234,6 +42586,9 @@ fn linux_regular_file_inode(state: u16) -> Option<u64> {
     }
     match state & !3 {
         LINUX_FILE_PROC_CPUINFO => return Some(25),
+        LINUX_FILE_PROC_SYSVIPC_MSG => return Some(90),
+        LINUX_FILE_PROC_SYSVIPC_SHM => return Some(91),
+        LINUX_FILE_PROC_SYSVIPC_SEM => return Some(92),
         LINUX_FILE_PROC_MEMINFO => return Some(26),
         LINUX_FILE_PROC_STAT => return Some(27),
         LINUX_FILE_PROC_UPTIME => return Some(28),
@@ -43422,7 +43777,7 @@ fn linux_descriptor_fcntl(descriptor: u64, command: u64, argument: u64) -> u64 {
                 }),
             LINUX_F_SETPIPE_SZ if state & LINUX_DEVICE_PIPE != 0 => {
                 let requested = u64::from(argument as u32);
-                if requested > LINUX_PIPE_MAX_SIZE
+                if requested > linux_pipe_max_size()
                     && !current_linux_credentials().is_some_and(|value| value.user.effective == 0)
                 {
                     return LINUX_EPERM;
@@ -45380,6 +45735,55 @@ fn linux_sched_setaffinity(pid: u64, length: u64, address: u64) -> u64 {
     }
 }
 
+/// sched_setaffinity that leaves this CPU when the new mask excludes it: a
+/// thread on the light path is parked ready and a process on the owner
+/// yields, so a CPU the mask allows runs the thread next and getcpu() there
+/// reports one it was pinned to. The mask itself is stored either way.
+fn linux_sched_setaffinity_live_return(
+    pid: u64,
+    length: u64,
+    address: u64,
+    registers: LinuxSyscallFrame,
+    user_stack: u64,
+    user_rip: u64,
+    user_rflags: u64,
+) -> u64 {
+    let result = linux_sched_setaffinity(pid, length, address);
+    if result != 0 {
+        return result;
+    }
+    let Ok(target) = linux_affinity_process(pid) else {
+        return 0;
+    };
+    if target != current_linux_process_pid() {
+        return 0;
+    }
+    let cpu = current_linux_runtime_cpu_index();
+    let excluded = linux_process::live_process_cpu_affinity(target)
+        .is_some_and(|mask| mask & (1_u64 << cpu) == 0);
+    if !excluded {
+        return 0;
+    }
+    let Some(current) = current_linux_thread_handle() else {
+        return 0;
+    };
+    let Some(caller) = linux_thread_context(current).map(|tls| LinuxUserContext {
+        registers,
+        rip: user_rip,
+        rsp: user_stack,
+        rflags: user_rflags,
+        rax: 0,
+        fs_base: tls.thread_pointer as u64,
+    }) else {
+        return 0;
+    };
+    if yield_current_linux_process(caller, 0) {
+        LINUX_RETURN_TO_KERNEL
+    } else {
+        0
+    }
+}
+
 fn linux_available_cpu_mask() -> u64 {
     let count = linux_available_cpu_count();
     if count == u64::BITS as usize {
@@ -46964,6 +47368,9 @@ fn linux_regular_file_mode(state: u16) -> u32 {
 fn linux_file_size(state: u16) -> u64 {
     if state & !3 == LINUX_FILE_RESOLV_CONF {
         linux_resolv_conf().1 as u64
+    } else if linux_proc_sysvipc_file(state) {
+        let mut file = [0_u8; LINUX_PROC_SYSVIPC_CAPACITY];
+        linux_proc_sysvipc_contents(state, &mut file).unwrap_or(0) as u64
     } else if state & !3 == LINUX_FILE_PROC_CPUINFO {
         let count = linux_available_cpu_count();
         let mut record = [0_u8; 768];
@@ -46994,7 +47401,10 @@ fn copy_linux_cpu_location(cpu_address: u64, node_address: u64) -> bool {
     {
         return false;
     }
-    (cpu_address == 0 || copy_to_linux_user(cpu_address, &0_u32.to_ne_bytes()))
+    // The CPU this thread runs on right now (one NUMA node): a thread
+    // pinned with sched_setaffinity sees the CPU it was pinned to.
+    let cpu = current_linux_runtime_cpu_index() as u32;
+    (cpu_address == 0 || copy_to_linux_user(cpu_address, &cpu.to_ne_bytes()))
         && (node_address == 0 || copy_to_linux_user(node_address, &0_u32.to_ne_bytes()))
 }
 

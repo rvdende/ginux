@@ -447,6 +447,7 @@ pub(crate) fn get_or_create(
     create: bool,
     exclusive: bool,
     pid: u32,
+    requested: Option<u32>,
 ) -> Result<u32, Error> {
     let guard = Guard::acquire().ok_or(Error::Invalid)?;
     if key != 0 {
@@ -469,7 +470,20 @@ pub(crate) fn get_or_create(
     }
     let pages = usize::try_from(size.div_ceil(PAGE_SIZE as u64)).map_err(|_| Error::Invalid)?;
     let first = allocate_zeroed().ok_or(Error::NoMemory)?;
-    let id = SYSV_IPC_RUNTIME.next_ids[guard.instance].fetch_add(1, Ordering::AcqRel);
+    // A requested id (/proc/sys/kernel/shm_next_id) that is free is used, and
+    // the counter moves past it; otherwise the next free id.
+    let next = &SYSV_IPC_RUNTIME.next_ids[guard.instance];
+    let id = match requested.filter(|id| {
+        *id != 0 && *id <= i32::MAX as u32 && find_segment(guard.instance, *id).is_none()
+    }) {
+        Some(id) => {
+            if next.load(Ordering::Acquire) <= id {
+                next.store(id + 1, Ordering::Release);
+            }
+            id
+        }
+        None => next.fetch_add(1, Ordering::AcqRel),
+    };
     if id == 0 {
         let _ = memory::scrub_and_release_frames(memory::FrameOwner::KERNEL, &[first]);
         return Err(Error::NoMemory);
@@ -525,6 +539,102 @@ pub(crate) fn get_or_create(
         Some(first),
     );
     Ok(id)
+}
+
+/// Every segment of the current instance with its id, in creation order,
+/// for `/proc/sysvipc/shm`.
+pub(crate) fn segments() -> Vec<(u32, SegmentInfo)> {
+    let mut found = Vec::new();
+    let Some(guard) = Guard::acquire() else {
+        return found;
+    };
+    let mut current = root(
+        &SYSV_IPC_RUNTIME.root_addresses,
+        &SYSV_IPC_RUNTIME.root_generations,
+        guard.instance,
+    );
+    for _ in 0..WALK_LIMIT {
+        let Some(page) = current.and_then(segment_page) else {
+            break;
+        };
+        if found.try_reserve(1).is_err() {
+            break;
+        }
+        found.push((page.id, info(page)));
+        current = (page.next_segment != memory::FrameLease::EMPTY).then_some(page.next_segment);
+    }
+    found
+}
+
+/// Every System V message queue of the current instance with its id, in
+/// creation order, for `/proc/sysvipc/msg` (POSIX queues share the list and
+/// are left out).
+pub(crate) fn message_queues() -> Vec<(u32, MessageQueueInfo)> {
+    let mut found = Vec::new();
+    let Some(guard) = Guard::acquire() else {
+        return found;
+    };
+    let mut current = root(
+        &SYSV_IPC_RUNTIME.message_root_addresses,
+        &SYSV_IPC_RUNTIME.message_root_generations,
+        guard.instance,
+    );
+    for _ in 0..WALK_LIMIT {
+        let Some(queue) = current.and_then(message_queue) else {
+            break;
+        };
+        if queue.posix == 0 {
+            if found.try_reserve(1).is_err() {
+                break;
+            }
+            found.push((
+                queue.id,
+                MessageQueueInfo {
+                    key: queue.key,
+                    mode: queue.mode,
+                    bytes: queue.bytes,
+                    messages: queue.messages,
+                    byte_limit: queue.byte_limit,
+                    last_sender: queue.last_sender,
+                    last_receiver: queue.last_receiver,
+                },
+            ));
+        }
+        current = (queue.next_queue != memory::FrameLease::EMPTY).then_some(queue.next_queue);
+    }
+    found
+}
+
+/// Every semaphore set of the current instance with its id, in creation
+/// order, for `/proc/sysvipc/sem`.
+pub(crate) fn semaphore_sets() -> Vec<(u32, SemaphoreSetInfo)> {
+    let mut found = Vec::new();
+    let Some(guard) = Guard::acquire() else {
+        return found;
+    };
+    let mut current = root(
+        &SYSV_IPC_RUNTIME.semaphore_root_addresses,
+        &SYSV_IPC_RUNTIME.semaphore_root_generations,
+        guard.instance,
+    );
+    for _ in 0..WALK_LIMIT {
+        let Some(page) = current.and_then(semaphore_page) else {
+            break;
+        };
+        if found.try_reserve(1).is_err() {
+            break;
+        }
+        found.push((
+            page.id,
+            SemaphoreSetInfo {
+                key: page.key,
+                count: page.count,
+                mode: page.mode,
+            },
+        ));
+        current = (page.next_set != memory::FrameLease::EMPTY).then_some(page.next_set);
+    }
+    found
 }
 
 pub(crate) fn segment(id: u32) -> Result<SegmentInfo, Error> {
@@ -1416,6 +1526,7 @@ pub(crate) fn message_get_or_create(
     mode: u16,
     create: bool,
     exclusive: bool,
+    requested: Option<u32>,
 ) -> Result<u32, Error> {
     const DEFAULT_BYTE_LIMIT: u64 = 16_384;
     let guard = Guard::acquire().ok_or(Error::Invalid)?;
@@ -1432,7 +1543,20 @@ pub(crate) fn message_get_or_create(
         }
     }
     let frame = allocate_zeroed().ok_or(Error::NoMemory)?;
-    let id = SYSV_IPC_RUNTIME.next_message_ids[guard.instance].fetch_add(1, Ordering::AcqRel);
+    // A requested id (/proc/sys/kernel/msg_next_id) that is free is used, and
+    // the counter moves past it; otherwise the next free id.
+    let next = &SYSV_IPC_RUNTIME.next_message_ids[guard.instance];
+    let id = match requested.filter(|id| {
+        *id != 0 && *id <= i32::MAX as u32 && find_message_queue(guard.instance, *id).is_none()
+    }) {
+        Some(id) => {
+            if next.load(Ordering::Acquire) <= id {
+                next.store(id + 1, Ordering::Release);
+            }
+            id
+        }
+        None => next.fetch_add(1, Ordering::AcqRel),
+    };
     if id == 0 || id > i32::MAX as u32 {
         let _ = memory::scrub_and_release_frames(memory::FrameOwner::KERNEL, &[frame]);
         return Err(Error::NoMemory);
@@ -1869,7 +1993,7 @@ pub(crate) fn verify_message_queue_lifecycle() -> bool {
     let Some(before) = memory::owner_live_frame_count(memory::FrameOwner::KERNEL) else {
         return false;
     };
-    let Ok(id) = message_get_or_create(0x4d53_4751, 0o620, true, true) else {
+    let Ok(id) = message_get_or_create(0x4d53_4751, 0o620, true, true, None) else {
         return false;
     };
     let large_size = MESSAGE_CAPACITY + 37;
@@ -2032,7 +2156,15 @@ pub(crate) fn verify_shared_memory_lifecycle() -> bool {
     let Some(before) = memory::owner_live_frame_count(memory::FrameOwner::KERNEL) else {
         return false;
     };
-    let Ok(id) = get_or_create(0x4749_4e55, 2 * PAGE_SIZE as u64, 0o600, true, true, 1) else {
+    let Ok(id) = get_or_create(
+        0x4749_4e55,
+        2 * PAGE_SIZE as u64,
+        0o600,
+        true,
+        true,
+        1,
+        None,
+    ) else {
         return false;
     };
     let verified = (|| {
@@ -2071,5 +2203,5 @@ pub(crate) fn verify_shared_memory_lifecycle() -> bool {
     .is_some();
     verified
         && memory::owner_live_frame_count(memory::FrameOwner::KERNEL) == Some(before)
-        && get_or_create(0x4749_4e55, 0, 0, false, false, 1) == Err(Error::NoEntry)
+        && get_or_create(0x4749_4e55, 0, 0, false, false, 1, None) == Err(Error::NoEntry)
 }

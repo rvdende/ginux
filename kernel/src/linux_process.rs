@@ -878,22 +878,39 @@ impl ProcessTable {
         process_runtime()
             .fork_execution_stage
             .store(1132, Ordering::Release);
-        if parent.state != ProcessState::Running
-            || if share_vm {
-                !parent_space.hierarchy_is_owned()
-            } else {
-                !parent_space.is_owned()
-            }
-            || child_hierarchy.len() != parent_space.hierarchy().len()
-            || (!child_pages.is_empty()
-                && child_pages.len()
-                    != parent_space
-                        .mappings()
-                        .iter()
-                        .filter(|mapping| !mapping.dontfork && mapping_requires_fork_copy(mapping))
-                        .count())
-            || !self.resources_available(child_hierarchy, child_pages)
-        {
+        // Each reason the commit can refuse the prepared child has a stage
+        // of its own, so a fork that fails with EAGAIN names it in the log.
+        let parent_pid = parent.handle.pid;
+        let hierarchy_owned = if share_vm {
+            parent_space.hierarchy_is_owned()
+        } else {
+            parent_space.is_owned()
+        };
+        let copy_count = parent_space
+            .mappings()
+            .iter()
+            .filter(|mapping| !mapping.dontfork && mapping_requires_fork_copy(mapping))
+            .count();
+        let refused = if parent.state != ProcessState::Running {
+            Some(1191)
+        } else if !hierarchy_owned {
+            Some(1192)
+        } else if child_hierarchy.len() != parent_space.hierarchy().len() {
+            Some(1193)
+        } else if !child_pages.is_empty() && child_pages.len() != copy_count {
+            Some(1194)
+        } else {
+            None
+        };
+        if let Some(stage) = refused {
+            process_runtime()
+                .fork_execution_stage
+                .store(stage, Ordering::Release);
+            let _ = self.abort_fork(handle);
+            return false;
+        }
+        // Sets stages 1195..=1199 itself, one per check that can refuse.
+        if !self.resources_available(parent_pid, child_hierarchy, child_pages) {
             let _ = self.abort_fork(handle);
             return false;
         }
@@ -1068,6 +1085,7 @@ impl ProcessTable {
 
     fn resources_available(
         &self,
+        parent_pid: u32,
         hierarchy: &[memory::FrameLease],
         pages: &[memory::FrameLease],
     ) -> bool {
@@ -1081,12 +1099,25 @@ impl ProcessTable {
         {
             return false;
         }
-        candidates.extend(hierarchy.iter().chain(pages).map(|frame| frame.address()));
+        candidates.extend(
+            hierarchy
+                .iter()
+                .chain(pages)
+                .map(|frame| (frame.address(), frame.generation())),
+        );
         candidates.sort_unstable();
         // Distinct, within and between the two lists.
-        let unique = candidates.windows(2).all(|pair| pair[0] != pair[1]);
-        let candidate =
-            |frame: &memory::FrameLease| candidates.binary_search(&frame.address()).is_ok();
+        let unique = candidates.windows(2).all(|pair| pair[0].0 != pair[1].0);
+        // A process's registry lists are a snapshot that goes stale while it
+        // runs (a thread on another CPU frees page tables without a refresh):
+        // a lease behind the frame's current generation names a frame freed
+        // and reused since, not one still held. Only a lease of the same
+        // generation marks a frame as published.
+        let candidate = |frame: &memory::FrameLease| {
+            candidates
+                .binary_search(&(frame.address(), frame.generation()))
+                .is_ok()
+        };
         let unpublished = self.processes.iter().flatten().all(|process| {
             process.address_space.into_iter().all(|space| {
                 !space.hierarchy().iter().any(candidate)
@@ -1097,11 +1128,86 @@ impl ProcessTable {
                     })
             })
         });
-        hierarchy.len() >= 4
-            && memory::frames_owned_by(memory::FrameOwner::KERNEL, hierarchy)
-            && (pages.is_empty() || memory::frames_owned_by(memory::FrameOwner::KERNEL, pages))
-            && unique
-            && unpublished
+        let refuse = |stage: u32| {
+            process_runtime()
+                .fork_execution_stage
+                .store(stage, Ordering::Release);
+            false
+        };
+        if hierarchy.len() < 4 {
+            return refuse(1195);
+        }
+        if !memory::frames_owned_by(memory::FrameOwner::KERNEL, hierarchy) {
+            return refuse(1196);
+        }
+        if !(pages.is_empty() || memory::frames_owned_by(memory::FrameOwner::KERNEL, pages)) {
+            return refuse(1197);
+        }
+        if !unique {
+            return refuse(1198);
+        }
+        if !unpublished {
+            // Which process still lists a candidate frame, for the log: a
+            // child that exited on another CPU may not have dropped its list
+            // yet when the allocator hands its frames to this fork.
+            let listed = self.processes.iter().flatten().find_map(|process| {
+                let space = process.address_space.as_ref()?;
+                let in_hierarchy = space.hierarchy().iter().find(|frame| candidate(frame));
+                let in_mappings = space.mappings().iter().find(|mapping| {
+                    !mapping.shared
+                        && !memory::frame_lease_is_runtime(mapping.frame)
+                        && candidate(&mapping.frame)
+                });
+                match (in_hierarchy, in_mappings) {
+                    (Some(frame), _) => Some((process, frame.address(), 0_u64, 0_u64)),
+                    (None, Some(mapping)) => {
+                        Some((process, mapping.frame.address(), 1, mapping.address as u64))
+                    }
+                    (None, None) => None,
+                }
+            });
+            if let Some((process, frame, in_mapping, address)) = listed {
+                // The listing process's lease generation against the new
+                // allocation's: behind it, the frame was freed under that
+                // process and reused; equal, the allocator issued it twice.
+                let listed_generation = process
+                    .address_space
+                    .as_ref()
+                    .and_then(|space| {
+                        space
+                            .hierarchy()
+                            .iter()
+                            .copied()
+                            .chain(space.mappings().iter().map(|mapping| mapping.frame))
+                            .find(|lease| lease.address() == frame)
+                    })
+                    .map_or(0, |lease| u64::from(lease.generation()));
+                let new_generation = hierarchy
+                    .iter()
+                    .chain(pages)
+                    .find(|lease| lease.address() == frame)
+                    .map_or(0, |lease| u64::from(lease.generation()));
+                crate::serial_write(
+                    "ginux: fork frames still listed by pid/not-running/frame/in-mapping/address/its-generation/new-generation, forking parent: ",
+                );
+                for value in [
+                    u64::from(process.handle.pid),
+                    u64::from(process.state != ProcessState::Running),
+                    frame,
+                    in_mapping,
+                    address,
+                    listed_generation,
+                    new_generation,
+                    u64::from(parent_pid),
+                ] {
+                    crate::serial_write_u64(value);
+                    crate::serial_write(" ");
+                }
+                crate::serial_write("\r\n");
+            }
+            return refuse(1199);
+        }
+        true
     }
 
     fn abort_fork(&mut self, handle: ProcessHandle) -> bool {

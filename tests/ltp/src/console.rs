@@ -136,6 +136,7 @@ impl Qemu {
         command
             .env("GINUX_ESP_DIR", &config.esp_dir)
             .env("GINUX_MEMORY", &config.memory)
+            .env("GINUX_CPUS", config.domain_cpus.to_string())
             .env("GINUX_VOLUME_IMAGE", config.volume())
             .env("GINUX_QEMU_PID_FILE", config.pid_file())
             .stdin(Stdio::piped())

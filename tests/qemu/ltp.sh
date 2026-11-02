@@ -45,6 +45,7 @@ Options (and the environment variables they set):
   --max-boots N          stop after N boots (400)                   LTP_MAX_BOOTS
   --memory SIZE          QEMU memory (6G)                           GINUX_MEMORY
   --domain-memory-mib N  the domain's memory (4096)                 LTP_DOMAIN_MEMORY_MIB
+  --domain-cpus N        CPUs of the guest and domain, 1, 2 or 4 (4) LTP_DOMAIN_CPUS
   --image IMAGE          the domain's image (alpine:3.22)           LTP_IMAGE
   --baseline FILE        known failures (tests/ltp/baseline.txt)    LTP_BASELINE
   --strict               fail on every failure, baseline or not     LTP_STRICT=1
@@ -64,7 +65,7 @@ while (($# > 0)); do
     case $1 in
         --list | --tests | --filter | --variant | --esp-dir | --default-budget | --grace | \
             --between-tests | --setup-timeout | --max-boots | --memory | --domain-memory-mib | \
-            --image | --baseline)
+            --domain-cpus | --image | --baseline)
             if (($# < 2)); then
                 echo "ltp.sh: $1 needs a value" >&2
                 exit 2
@@ -82,6 +83,7 @@ while (($# > 0)); do
                 --max-boots) export LTP_MAX_BOOTS=$2 ;;
                 --memory) export GINUX_MEMORY=$2 ;;
                 --domain-memory-mib) export LTP_DOMAIN_MEMORY_MIB=$2 ;;
+                --domain-cpus) export LTP_DOMAIN_CPUS=$2 ;;
                 --image) export LTP_IMAGE=$2 ;;
                 --baseline) export LTP_BASELINE=$2 ;;
             esac

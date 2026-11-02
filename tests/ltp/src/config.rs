@@ -32,6 +32,10 @@ pub struct Config {
     pub memory: String,
     /// The domain's memory (`LTP_DOMAIN_MEMORY_MIB`).
     pub domain_memory_mib: u32,
+    /// CPUs the guest boots with and the domain runs on
+    /// (`LTP_DOMAIN_CPUS`; 1, 2 or 4): the tests run on an SMP domain by
+    /// default, so threads and processes spread over every CPU.
+    pub domain_cpus: u32,
     /// The domain's image (`LTP_IMAGE`).
     pub image: String,
     /// The LTP build to use, `build/ltp-VARIANT`, which also suffixes the
@@ -87,6 +91,7 @@ impl Config {
             max_boots: number("LTP_MAX_BOOTS", 400)?,
             memory: var("GINUX_MEMORY").unwrap_or_else(|| "6G".to_string()),
             domain_memory_mib: number("LTP_DOMAIN_MEMORY_MIB", 4096)?,
+            domain_cpus: number("LTP_DOMAIN_CPUS", 4)?,
             image: var("LTP_IMAGE").unwrap_or_else(|| "alpine:3.22".to_string()),
             variant: var("LTP_VARIANT").unwrap_or_default(),
             esp_dir: path("GINUX_ESP_DIR", "build/esp"),

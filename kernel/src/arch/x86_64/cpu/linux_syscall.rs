@@ -512,6 +512,15 @@ fn linux_syscall_dispatch(
         LINUX_GETSOCKOPT_SYSCALL => {
             linux_socket_getsockopt(first_argument, buffer, count, register(0), register(2))
         }
+        LINUX_SCHED_SETAFFINITY_SYSCALL => linux_sched_setaffinity_live_return(
+            first_argument,
+            buffer,
+            count,
+            saved_registers,
+            user_stack,
+            user_rip,
+            user_rflags,
+        ),
         LINUX_SCHED_YIELD_SYSCALL => linux_sched_yield_live_return(
             registers,
             saved_registers,
@@ -1608,7 +1617,6 @@ fn linux_syscall_dispatch(
         }
         LINUX_USERFAULTFD_SYSCALL => linux_userfaultfd(first_argument),
         LINUX_PRLIMIT64_SYSCALL => linux_prlimit64(first_argument, buffer, count, register(0)),
-        LINUX_SCHED_SETAFFINITY_SYSCALL => linux_sched_setaffinity(first_argument, buffer, count),
         LINUX_SCHED_GETAFFINITY_SYSCALL => linux_sched_getaffinity(first_argument, buffer, count),
         LINUX_GETCPU_SYSCALL => {
             if !copy_linux_cpu_location(first_argument, buffer) {
