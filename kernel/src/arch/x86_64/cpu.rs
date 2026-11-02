@@ -25369,7 +25369,7 @@ fn linux_proc_pid_file_kind(pid: u32, name: &[u8]) -> Option<u16> {
         (1, b"status") => Some(LINUX_FILE_PROC_STATUS),
         (1, b"stat") => Some(LINUX_FILE_PROC_PID1_STAT),
         (1, b"statm") => Some(LINUX_FILE_PROC_PID1_STATM),
-        (1, b"mountinfo") => Some(LINUX_FILE_PROC_MOUNTINFO),
+        (_, b"mountinfo") => Some(LINUX_FILE_PROC_MOUNTINFO),
         (_, b"uid_map") => Some(LINUX_FILE_PROC_UID_MAP),
         (_, b"gid_map") => Some(LINUX_FILE_PROC_GID_MAP),
         (_, b"setgroups") => Some(LINUX_FILE_PROC_SETGROUPS),
