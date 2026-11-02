@@ -57,6 +57,7 @@ pub(super) extern "sysv64" fn linux_syscall_handler(
     crate::cpu_time::back_from_user();
     crate::sync::kernel_entry_return_from_user();
     linux_syscall_entries_here().fetch_add(1, Ordering::Relaxed);
+    crate::linux_socket::poll_closing();
     let traced = linux_strace_call(number, registers);
     let started = timer::timestamp_counter();
     let result = linux_syscall_dispatch(number, registers, user_stack, user_rip, user_rflags);

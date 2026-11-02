@@ -3,6 +3,7 @@ use crate::{
     control_abi,
     memory::{self, FrameLease, FrameOwner},
 };
+use alloc::collections::BTreeMap;
 use core::cell::UnsafeCell;
 
 const PAGE_SIZE: usize = 4096;
@@ -488,18 +489,49 @@ static OVERLAY_RUNTIME: OverlayRuntimeOwner =
 
 pub(crate) fn lookup(path: &[u8]) -> Option<Metadata> {
     valid_path(path)?;
-    let overlay = live()?;
-    let named = for_each_node(overlay, |node| {
-        (node.linked && !node.whiteout && node.path() == path).then_some(node)
-    })?;
+    let named = linked_node(path, false)?;
     match named.alias_of {
         Some(file) => metadata(file),
         None => Some(named.metadata()),
     }
 }
 
+/// The node linked at `path` (a whiteout too when `whiteouts`), found by
+/// the path hints first.
+fn linked_node(path: &[u8], whiteouts: bool) -> Option<&'static mut Node> {
+    let wanted = |node: &Node| {
+        node.active && node.linked && (whiteouts || !node.whiteout) && node.path() == path
+    };
+    let hints = path_hints();
+    let hint = *hints.get(&path_key(path))?;
+    // SAFETY: as in `node_mut`: hints point into live node pages.
+    if let Some(node) = (hint != 0).then(|| unsafe { &mut *(hint as *mut Node) }) {
+        if wanted(node) {
+            return Some(node);
+        }
+    }
+    let overlay = live_mut();
+    let mut page = overlay.first_node_page;
+    while page != FrameLease::EMPTY {
+        let nodes = node_page_mut(page)?;
+        if let Some(index) = nodes.nodes.iter().position(&wanted) {
+            let node = nodes.nodes.get_mut(index)?;
+            hints.insert(path_key(path), core::ptr::from_mut(node) as usize);
+            return Some(node);
+        }
+        page = nodes.next;
+    }
+    None
+}
+
 pub(crate) fn hidden(path: &[u8]) -> bool {
-    valid_path(path).is_some()
+    // Only a path or ancestor some node was ever given can be hidden.
+    let hints = path_hints();
+    let named = (0..=path.len())
+        .filter(|end| *end == path.len() || path.get(*end) == Some(&b'/'))
+        .any(|end| hints.contains_key(&path_key(&path[..end])));
+    named
+        && valid_path(path).is_some()
         && live().is_some_and(|overlay| {
             for_each_node(overlay, |node| {
                 (node.linked
@@ -525,10 +557,7 @@ pub(crate) fn generation(handle: Handle) -> u32 {
 }
 
 pub(crate) fn metadata(handle: Handle) -> Option<Metadata> {
-    let overlay = live()?;
-    for_each_node(overlay, |node| {
-        (node.handle == handle).then_some(node.metadata())
-    })
+    node(handle).map(Node::metadata)
 }
 
 pub(crate) fn configure_memfd(handle: Handle, allow_sealing: bool) -> bool {
@@ -617,6 +646,7 @@ pub(crate) fn link_unnamed(path: &[u8], handle: Handle) -> Result<(), LinkError>
         *whiteout = Node::EMPTY;
     }
     let node = node_mut(handle).ok_or(LinkError::Gone)?;
+    note_path(path);
     node.path = [0; PATH_CAPACITY];
     node.path[..path.len()].copy_from_slice(path);
     node.path_length = path.len() as u16;
@@ -923,6 +953,7 @@ fn create(path: &[u8], kind: NodeKind, mode: u32, initial: &[u8]) -> Option<Hand
         ctime: (0, 0),
         path: stored_path,
     };
+    note_path(path);
     overlay.next_generation = generation;
     overlay.next_inode = inode;
     if kind == NodeKind::Symlink {
@@ -1000,6 +1031,7 @@ pub(crate) fn whiteout(path: &[u8]) -> bool {
         ctime: (0, 0),
         path: stored_path,
     };
+    note_path(path);
     overlay.next_generation = generation;
     overlay.next_inode = inode;
     true
@@ -1369,6 +1401,7 @@ pub(crate) fn rename(handle: Handle, path: &[u8]) -> bool {
             let mut destination = [0_u8; PATH_CAPACITY];
             destination[..path.len()].copy_from_slice(path);
             destination[path.len()..new_length].copy_from_slice(suffix);
+            note_path(&destination[..new_length]);
             candidate.path = destination;
             candidate.path_length = new_length as u16;
         }
@@ -1417,6 +1450,7 @@ pub(crate) fn create_link(path: &[u8], target: Handle) -> bool {
         path: stored_path,
         ..Node::EMPTY
     };
+    note_path(path);
     overlay.next_generation = generation;
     let Some(file) = node_mut(target) else {
         return false;
@@ -1454,6 +1488,7 @@ pub(crate) fn unlink_path(path: &[u8]) -> bool {
                     let Some(node) = node_mut(file) else {
                         return false;
                     };
+                    note_path(&alias_path[..usize::from(alias_length)]);
                     node.path = alias_path;
                     node.path_length = alias_length;
                     drop_alias(alias, file)
@@ -1499,6 +1534,7 @@ pub(crate) fn rename_path(from: &[u8], to: &[u8]) -> bool {
     };
     let mut stored_path = [0_u8; PATH_CAPACITY];
     stored_path[..to.len()].copy_from_slice(to);
+    note_path(to);
     node.path = stored_path;
     node.path_length = to.len() as u16;
     true
@@ -1574,6 +1610,8 @@ pub(crate) fn unlink(handle: Handle) -> bool {
 
 pub(crate) fn teardown() -> bool {
     let overlay = live_mut();
+    *node_hints() = BTreeMap::new();
+    *path_hints() = BTreeMap::new();
     let mut page = core::mem::replace(&mut overlay.first_node_page, FrameLease::EMPTY);
     while page != FrameLease::EMPTY {
         let Some(nodes) = node_page_mut(page) else {
@@ -1621,20 +1659,8 @@ fn valid_path(path: &[u8]) -> Option<()> {
     .then_some(())
 }
 
-fn node_by_path_mut<'a>(overlay: &'a mut Overlay, path: &[u8]) -> Option<&'a mut Node> {
-    let mut page = overlay.first_node_page;
-    while page != FrameLease::EMPTY {
-        let nodes = node_page_mut(page)?;
-        if let Some(index) = nodes
-            .nodes
-            .iter()
-            .position(|node| node.active && node.linked && node.path() == path)
-        {
-            return nodes.nodes.get_mut(index);
-        }
-        page = nodes.next;
-    }
-    None
+fn node_by_path_mut<'a>(_overlay: &'a mut Overlay, path: &[u8]) -> Option<&'a mut Node> {
+    linked_node(path, true)
 }
 
 fn empty_node_slot(overlay: &mut Overlay) -> Option<&mut Node> {
@@ -1951,12 +1977,70 @@ fn release_data_pages(mut page: FrameLease) -> bool {
 }
 
 fn node(handle: Handle) -> Option<&'static Node> {
-    let overlay = live()?;
-    for_each_node(overlay, |node| (node.handle == handle).then_some(node))
+    node_mut(handle).map(|node| &*node)
+}
+
+/// Where each instance's nodes were last found, by inode: a hint checked on
+/// every use (the slot must still hold that handle), so a stale entry only
+/// costs the scan it would have saved. Node pages are freed only in
+/// `teardown`, which clears the instance's hints, so a hint always points
+/// into a live node page. Without it every read, write and page fault of a
+/// file scanned all nodes: rustc mapping its 150 MB driver library from a
+/// domain with tens of thousands of files took minutes.
+struct NodeHints(UnsafeCell<[BTreeMap<u64, usize>; INSTANCE_LIMIT]>);
+
+unsafe impl Sync for NodeHints {}
+
+static NODE_HINTS: NodeHints =
+    NodeHints(UnsafeCell::new([const { BTreeMap::new() }; INSTANCE_LIMIT]));
+
+/// The current instance's node hints. The overlay's own state has the same
+/// owner: whoever runs the instance's file system calls.
+fn node_hints() -> &'static mut BTreeMap<u64, usize> {
+    let index = current_instance();
+    // SAFETY: as for `live_mut`: one instance's overlay is used by one
+    // caller at a time.
+    unsafe { &mut *NODE_HINTS.0.get().cast::<BTreeMap<u64, usize>>().add(index) }
+}
+
+/// Every path an instance's nodes were ever given, by `path_key`, with
+/// where that node was last found (0 when not yet looked up). A path
+/// missing here names no node, which spares path lookups of files that do
+/// not exist (the dynamic loader's, cargo's while it unpacks crates) a scan
+/// of every node; a present one is checked like a node hint. Every place
+/// that gives a node a path notes it (`note_path`); teardown clears them.
+static PATH_HINTS: NodeHints =
+    NodeHints(UnsafeCell::new([const { BTreeMap::new() }; INSTANCE_LIMIT]));
+
+fn path_hints() -> &'static mut BTreeMap<u64, usize> {
+    let index = current_instance();
+    // SAFETY: as for `node_hints`.
+    unsafe { &mut *PATH_HINTS.0.get().cast::<BTreeMap<u64, usize>>().add(index) }
+}
+
+/// FNV-1a of `path`; two paths may share a key, which costs a scan.
+fn path_key(path: &[u8]) -> u64 {
+    path.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// Records that a node now has the name `path`.
+fn note_path(path: &[u8]) {
+    path_hints().entry(path_key(path)).or_insert(0);
 }
 
 fn node_mut(handle: Handle) -> Option<&'static mut Node> {
     let overlay = live_mut();
+    let hints = node_hints();
+    if let Some(address) = hints.get(&handle.inode).copied() {
+        // SAFETY: hints point at node slots in this instance's node pages,
+        // which stay allocated until `teardown` clears the hints.
+        let node = unsafe { &mut *(address as *mut Node) };
+        if node.active && node.handle == handle {
+            return Some(node);
+        }
+    }
     let mut page = overlay.first_node_page;
     while page != FrameLease::EMPTY {
         let nodes = node_page_mut(page)?;
@@ -1965,7 +2049,9 @@ fn node_mut(handle: Handle) -> Option<&'static mut Node> {
             .iter()
             .position(|node| node.active && node.handle == handle)
         {
-            return nodes.nodes.get_mut(index);
+            let node = nodes.nodes.get_mut(index)?;
+            hints.insert(handle.inode, core::ptr::from_mut(node) as usize);
+            return Some(node);
         }
         page = nodes.next;
     }

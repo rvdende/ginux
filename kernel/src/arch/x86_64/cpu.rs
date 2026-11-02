@@ -6395,7 +6395,7 @@ fn execute_deferred_live_fork() -> bool {
     }
     // Fork execution is recursive: a child may fork before returning to its
     // parent. Preserve the outer transaction's vfork/CLONE_VM exec policy.
-    let _exec_flag_guard = LinuxForkExecFlagGuard::capture();
+    let exec_flag_guard = LinuxForkExecFlagGuard::capture();
     let domain_exec = X86_RUNTIME
         .LINUX_DOMAIN_EXEC_INJECT
         .swap(false, Ordering::AcqRel);
@@ -6737,6 +6737,9 @@ fn execute_deferred_live_fork() -> bool {
         let Some(parent) = linux_process::resume_live_parent_after_child_exec(child.pid) else {
             return false;
         };
+        // The child runs on its own now; the parent resumes here, inside
+        // this transaction, and its own exec or exit goes to the outer one.
+        exec_flag_guard.resume_parent();
         X86_RUNTIME
             .LINUX_CURRENT_PROCESS_PID
             .store(parent_pid, Ordering::SeqCst);
@@ -6823,6 +6826,9 @@ fn execute_deferred_live_fork() -> bool {
     let profile_parent_started =
         cfg!(feature = "linux-boot-profile").then(timer::timestamp_counter);
     let parent_synced = sync_live_linux_process_address_space(parent_pid);
+    // The parent resumes inside this transaction: its own exec or exit goes
+    // to the outer one.
+    exec_flag_guard.resume_parent();
     let parent_resumed = parent_synced && run_dispatched_linux_process(&parent);
     let parent_resumed = if parent_resumed
         && !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
@@ -8248,6 +8254,20 @@ fn retire_linux_thread(handle: LinuxThreadHandle) -> bool {
     }
     clear_linux_thread_slot(slot);
     true
+}
+
+/// An exec's point of no return: the process's other threads end (Linux's
+/// de_thread), leaving the calling one. linux_execve_at let the exec start
+/// only when none of them runs on another CPU.
+fn end_other_linux_threads_for_exec() {
+    let Some(current) = current_linux_thread_slot() else {
+        return;
+    };
+    for slot in (0..LINUX_THREAD_LIMIT).filter(|slot| *slot != current) {
+        if X86_RUNTIME.LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) != LINUX_THREAD_FREE {
+            clear_linux_thread_slot(slot);
+        }
+    }
 }
 
 fn retire_current_linux_thread() -> bool {
@@ -13581,12 +13601,16 @@ fn linux_request_process_fork(
                 caller.rflags,
                 caller.fs_base,
             );
+        // posix_spawn's child stack is fresh mmap memory nothing has touched
+        // yet: its top page is brought in first, so the child (on the
+        // parent's pages) and the parent's list agree on it.
         let child_stack_refreshed = child_stack == 0
             || child_stack.checked_sub(1).is_some_and(|address| {
-                linux_process::import_live_process_mapping_from_hardware(
-                    current_linux_process_pid(),
-                    address,
-                )
+                materialize_linux_runtime_user_range(address, 1, true)
+                    && linux_process::import_live_process_mapping_from_hardware(
+                        current_linux_process_pid(),
+                        address,
+                    )
             });
         context_refreshed && child_stack_refreshed
     } else {
@@ -14265,6 +14289,8 @@ pub(super) fn linux_wait_for_interrupt() {
     }
     crate::cpu_time::add_idle(timer::timestamp_counter().saturating_sub(started));
     crate::sync::kernel_entry_return_from_user();
+    // Closed TCP connections finish sending while the domain waits.
+    crate::linux_socket::poll_closing();
 }
 
 fn current_linux_user_namespace() -> Option<linux_user::UserNamespaceHandle> {
@@ -14784,6 +14810,18 @@ fn run_other_linux_processes(
     caller: LinuxUserContext,
     number: u64,
 ) -> Option<LinuxBlockedWait> {
+    run_other_linux_processes_deferring(output, caller, number, true)
+}
+
+/// `run_other_linux_processes`; with `defer_to_siblings` false, the other
+/// processes run even while a sibling thread is ready, which may itself be
+/// only waiting to retry its call.
+fn run_other_linux_processes_deferring(
+    output: *mut LinuxSyscallFrame,
+    caller: LinuxUserContext,
+    number: u64,
+    defer_to_siblings: bool,
+) -> Option<LinuxBlockedWait> {
     // Processes run nested on the boot CPU's kernel stack; a thread on an
     // application processor has no process tree to run.
     if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
@@ -14802,7 +14840,7 @@ fn run_other_linux_processes(
     // Descriptor waits made ready while another process ran complete here,
     // in this process's address space; a woken sibling thread runs instead.
     let _ = wake_linux_descriptor_waits();
-    if ready_linux_thread_handle().is_some() {
+    if defer_to_siblings && ready_linux_thread_handle().is_some() {
         return None;
     }
     let pid = current_linux_process_pid();
@@ -16687,8 +16725,18 @@ struct LinuxForkParentRuntime {
     nice: u8,
 }
 
+/// The outer fork transaction's exec policy and the process whose exec it
+/// waits for. A child that forks starts a nested transaction, which points
+/// the exec pid at the grandchild; when the child resumes inside that
+/// transaction (after the grandchild exits or execs), its own exec (a
+/// subshell that runs a pipeline, then execs its last command) must reach
+/// the outer transaction again.
 struct LinuxForkExecFlagGuard {
     previous: bool,
+    exec_pid: u32,
+    /// Whether `resume_parent` already gave the exec pid back: an exec the
+    /// parent reports after that must not be overwritten.
+    exec_pid_restored: core::cell::Cell<bool>,
 }
 
 /// Marks a domain-exec fork transaction as running. It re-runs only the
@@ -16720,6 +16768,10 @@ impl LinuxForkExecFlagGuard {
             previous: X86_RUNTIME
                 .LINUX_PROCESS_RELEASE_PARENT_ON_EXEC
                 .load(Ordering::SeqCst),
+            exec_pid: X86_RUNTIME
+                .LINUX_PROCESS_CHILD_EXEC_PID
+                .load(Ordering::SeqCst),
+            exec_pid_restored: core::cell::Cell::new(false),
         }
     }
 }
@@ -16729,6 +16781,19 @@ impl Drop for LinuxForkExecFlagGuard {
         X86_RUNTIME
             .LINUX_PROCESS_RELEASE_PARENT_ON_EXEC
             .store(self.previous, Ordering::SeqCst);
+        self.resume_parent();
+    }
+}
+
+impl LinuxForkExecFlagGuard {
+    /// Points the exec pid back at the outer transaction's child before the
+    /// parent resumes inside this transaction; once only.
+    fn resume_parent(&self) {
+        if !self.exec_pid_restored.replace(true) {
+            X86_RUNTIME
+                .LINUX_PROCESS_CHILD_EXEC_PID
+                .store(self.exec_pid, Ordering::SeqCst);
+        }
     }
 }
 
@@ -26420,7 +26485,7 @@ fn linux_proc_pid_file_kind(pid: u32, name: &[u8]) -> Option<u16> {
         (1, b"status") => Some(LINUX_FILE_PROC_STATUS),
         (1, b"stat") => Some(LINUX_FILE_PROC_PID1_STAT),
         (1, b"statm") => Some(LINUX_FILE_PROC_PID1_STATM),
-        (1, b"mountinfo") => Some(LINUX_FILE_PROC_MOUNTINFO),
+        (_, b"mountinfo") => Some(LINUX_FILE_PROC_MOUNTINFO),
         (_, b"uid_map") => Some(LINUX_FILE_PROC_UID_MAP),
         (_, b"gid_map") => Some(LINUX_FILE_PROC_GID_MAP),
         (_, b"setgroups") => Some(LINUX_FILE_PROC_SETGROUPS),
@@ -27068,6 +27133,14 @@ fn linux_rootfs_execve_source(
         }
         _ => path,
     };
+    // A symlink written at runtime (dpkg installs clang-21 -> clang) leads
+    // to the file that runs, in the overlay or the image.
+    let mut followed = [0_u8; crate::linux_overlay::PATH_CAPACITY + 1];
+    let path = match linux_exec_follow_overlay_links(path, &mut followed) {
+        Ok(Some(length)) if domain_exec_slot.is_none() => &followed[..length],
+        Err(error) if domain_exec_slot.is_none() => return error,
+        _ => path,
+    };
     let mut overlay_image = None;
     let mut exec_file = None;
     if domain_exec_slot.is_none() {
@@ -27486,6 +27559,7 @@ fn linux_rootfs_execve_source(
             let _ = linux_descriptor_close(descriptor);
         }
     }
+    end_other_linux_threads_for_exec();
     reset_linux_signal_state_after_exec();
     let _ = set_current_linux_clear_child_tid(0);
     let _ = set_current_linux_robust_list(0);
@@ -27633,6 +27707,30 @@ fn linux_absolute_exec_path(
     output[0] = b'/';
     output[1..=length].copy_from_slice(&canonical[..length]);
     Ok(length + 1)
+}
+
+/// The absolute path the overlay's symlinks at absolute `path` lead to,
+/// written to `output`, or `None` when the overlay has no symlink there.
+fn linux_exec_follow_overlay_links(
+    path: &[u8],
+    output: &mut [u8; crate::linux_overlay::PATH_CAPACITY + 1],
+) -> Result<Option<usize>, u64> {
+    let Some(relative) = path.strip_prefix(b"/") else {
+        return Ok(None);
+    };
+    let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    let Some(start) = canonical.get_mut(..relative.len()) else {
+        return Ok(None);
+    };
+    start.copy_from_slice(relative);
+    let (length, followed, _) =
+        linux_overlay_lookup_following(&mut canonical, relative.len(), true)?;
+    if !followed {
+        return Ok(None);
+    }
+    output[0] = b'/';
+    output[1..=length].copy_from_slice(&canonical[..length]);
+    Ok(Some(length + 1))
 }
 
 /// Reads an executable written at runtime into a kernel extent. Returns the
@@ -27787,9 +27885,18 @@ fn build_linux_exec_stack_image(
     } else {
         linux_exec_vector_length(arguments_address, true)?
     };
-    let argument_count = launch_arguments
-        .count
-        .checked_add(original_argument_count.saturating_sub(1))
+    // A program (not a script) gets the caller's argv[0], as in Linux:
+    // rustup's proxies (cargo -> rustup) and clang++ -> clang tell what to
+    // be from it. The path that runs is only AT_EXECFN then.
+    let keep_argument_zero =
+        launch_arguments.count == 1 && domain_exec_slot.is_none() && original_argument_count >= 1;
+    let (launch_count, first_original) = if keep_argument_zero {
+        (0, 0)
+    } else {
+        (launch_arguments.count, 1)
+    };
+    let argument_count = launch_count
+        .checked_add(original_argument_count.saturating_sub(first_original))
         .filter(|count| *count <= LINUX_EXEC_ARGUMENT_LIMIT)
         .ok_or(LINUX_E2BIG)?;
     let environment_count = if domain_exec_slot.is_some() {
@@ -27824,7 +27931,7 @@ fn build_linux_exec_stack_image(
     let mut execfn_offset = None;
     for index in 0..argument_count {
         let remaining = &mut buffer[cursor..];
-        let length = if index < launch_arguments.count {
+        let length = if index < launch_count {
             let value = launch_arguments.values[index];
             let output = remaining.get_mut(..=value.len()).ok_or(LINUX_E2BIG)?;
             output[..value.len()].copy_from_slice(value);
@@ -27846,15 +27953,25 @@ fn build_linux_exec_stack_image(
             output[length] = 0;
             length
         } else {
-            let original_index = 1 + index - launch_arguments.count;
+            let original_index = first_original + index - launch_count;
             let pointer = linux_exec_vector_entry(arguments_address, original_index)?;
             copy_linux_c_string(pointer, remaining).map_err(string_error)?
         };
-        if index == launch_arguments.execfn {
+        if index == launch_arguments.execfn && !keep_argument_zero {
             execfn_offset = Some(cursor);
         }
         write_word(buffer, 1 + index, cursor as u64);
         cursor += length + 1;
+    }
+    if keep_argument_zero {
+        let value = launch_arguments.values[0];
+        let output = buffer
+            .get_mut(cursor..=cursor + value.len())
+            .ok_or(LINUX_E2BIG)?;
+        output[..value.len()].copy_from_slice(value);
+        output[value.len()] = 0;
+        execfn_offset = Some(cursor);
+        cursor += value.len() + 1;
     }
     let execfn_offset = execfn_offset.ok_or(LINUX_ENOEXEC)?;
     for index in 0..environment_count {
@@ -27936,13 +28053,20 @@ fn linux_execve_at(
     environment_address: u64,
     allow_empty_path: bool,
 ) -> u64 {
+    // The main thread of a process with other threads may exec too (they
+    // end at the point of no return, as Linux's de_thread does: rustup's
+    // proxies exec the toolchain's rustc from a threaded process), unless
+    // one of them is running on another CPU.
+    let other_threads = X86_RUNTIME
+        .LINUX_THREAD_STATES
+        .iter()
+        .filter(|state| state.load(Ordering::SeqCst) != LINUX_THREAD_FREE)
+        .count()
+        != 1;
     if current_linux_tid() != Some(current_linux_process_pid())
-        || X86_RUNTIME
-            .LINUX_THREAD_STATES
-            .iter()
-            .filter(|state| state.load(Ordering::SeqCst) != LINUX_THREAD_FREE)
-            .count()
-            != 1
+        || other_threads
+            && (!X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
+                || linux_remote_thread_running())
     {
         if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) && current_linux_process_pid() != 1
         {
@@ -28600,6 +28724,7 @@ fn linux_execve_at(
             let _ = linux_descriptor_close(descriptor);
         }
     }
+    end_other_linux_threads_for_exec();
     reset_linux_signal_state_after_exec();
     X86_RUNTIME
         .ELF_PROBE_MEMBARRIER_REGISTRATIONS
@@ -29489,6 +29614,17 @@ fn linux_openat_path(
             | LINUX_O_NOFOLLOW
             | LINUX_O_NOATIME
             | LINUX_O_PATH);
+    // /proc/self/exe opens the file the process runs (rustup's installer
+    // reads its ELF header to learn the bitness).
+    if flags & LINUX_O_NOFOLLOW == 0 {
+        if let Some(executable) = linux_proc_self_exe_target(directory, &path[..path_length]) {
+            let Some(target) = path.get_mut(..executable.len()) else {
+                return LINUX_ENAMETOOLONG;
+            };
+            target.copy_from_slice(&executable);
+            path_length = executable.len();
+        }
+    }
     if let Some(descriptor) = linux_descriptor_link_at(directory, &path[..path_length], true) {
         if !linux_descriptor_open(descriptor) {
             return LINUX_ENOENT;
@@ -30634,7 +30770,22 @@ fn linux_newfstatat(directory: u64, path_address: u64, stat_address: u64, flags:
         Err(error) => return error,
     };
     let path = &path[..path_length];
-    if path.is_empty() && flags & LINUX_AT_EMPTY_PATH != 0 {
+    // An empty pathname names nothing without AT_EMPTY_PATH, as in statx:
+    // std::filesystem::exists("") must be false (mold canonicalizes what
+    // exists).
+    if path.is_empty() && flags & LINUX_AT_EMPTY_PATH == 0 {
+        return LINUX_ENOENT;
+    }
+    if let Some(stat) =
+        linux_proc_self_exe_stat(directory, path, flags & LINUX_AT_SYMLINK_NOFOLLOW == 0)
+    {
+        return if copy_to_linux_user(stat_address, &stat) {
+            0
+        } else {
+            LINUX_EFAULT
+        };
+    }
+    if path.is_empty() {
         let Some(stat) = linux_descriptor_stat(directory) else {
             return LINUX_EBADF;
         };
@@ -32657,6 +32808,15 @@ fn linux_statx(directory: u64, path_address: u64, flags: u64, mask: u64, stat_ad
         };
         let statx = linux_statx_from_stat(&stat);
         return if copy_to_linux_user(stat_address, &statx) {
+            0
+        } else {
+            LINUX_EFAULT
+        };
+    }
+    if let Some(stat) =
+        linux_proc_self_exe_stat(directory, path, flags & LINUX_AT_SYMLINK_NOFOLLOW == 0)
+    {
+        return if copy_to_linux_user(stat_address, &linux_statx_from_stat(&stat)) {
             0
         } else {
             LINUX_EFAULT
@@ -35951,6 +36111,10 @@ fn complete_linux_pipe_read_wait(slot: usize) -> bool {
             );
         }
         linux_pipe_readv_ranges(descriptor, &ranges[..vector_count])
+    } else if let Some(slot) = linux_socket_slot(descriptor)
+        .filter(|_| linux_socket_pipe_descriptor(descriptor, LINUX_DESCRIPTOR_INPUT))
+    {
+        linux_socket_pipe_read_wait_result(slot, address, count)
     } else {
         linux_pipe_read(descriptor, address, count).unwrap_or(LINUX_EBADF)
     };
@@ -35968,6 +36132,31 @@ fn complete_linux_pipe_read_wait(slot: usize) -> bool {
         .LINUX_PIPE_READ_WAKE_COUNT
         .fetch_add(1, Ordering::SeqCst);
     true
+}
+
+/// A blocked read of up to `count` bytes (at most a page) from the pipe in
+/// socket table `slot` into `address`: its result once the pipe has data or
+/// no writer, and ENOSYS while the read must still wait.
+fn linux_socket_pipe_read_wait_result(
+    slot: crate::linux_socket::SlotId,
+    address: u64,
+    count: u64,
+) -> u64 {
+    let mut bytes = [0_u8; PAGE_SIZE];
+    let length = usize::try_from(count).unwrap_or(PAGE_SIZE).min(PAGE_SIZE);
+    match crate::linux_socket::recv(slot, &mut bytes[..length]) {
+        Ok((received, _)) => {
+            if copy_to_linux_user(address, &bytes[..received]) {
+                received as u64
+            } else {
+                LINUX_EFAULT
+            }
+        }
+        Err(crate::linux_socket::Error::WouldBlock | crate::linux_socket::Error::InProgress) => {
+            LINUX_ENOSYS
+        }
+        Err(error) => linux_socket_error(error),
+    }
 }
 
 fn wake_linux_pipe_read_waits() -> u32 {
@@ -36106,6 +36295,39 @@ fn linux_descriptor_read_live_return(
     count: u64,
 ) -> u64 {
     if linux_blocking_socket_yields(descriptor) {
+        // A thread of a process with another ready thread blocks on an
+        // empty pipe until a writer fills it, as in Linux: retrying in a
+        // loop, two such threads (git's reader and its sideband thread)
+        // would hand the CPU to each other and starve the writer.
+        if descriptor <= 0xff
+            && linux_socket_pipe_descriptor(descriptor, LINUX_DESCRIPTOR_INPUT)
+            && ready_linux_thread_handle().is_some()
+        {
+            X86_RUNTIME
+                .LINUX_SOCKET_SINGLE_ATTEMPT
+                .store(true, Ordering::SeqCst);
+            let immediate = linux_descriptor_read(descriptor, address, count);
+            X86_RUNTIME
+                .LINUX_SOCKET_SINGLE_ATTEMPT
+                .store(false, Ordering::SeqCst);
+            if immediate != LINUX_EAGAIN || count == 0 {
+                return immediate;
+            }
+            let wait_count = count.min(PAGE_SIZE as u64);
+            if !linux_writable_user_range_contains(address, wait_count as usize) {
+                return LINUX_EFAULT;
+            }
+            return linux_blocking_descriptor_io_live_return(
+                output,
+                caller,
+                LINUX_READ_SYSCALL,
+                LINUX_THREAD_WAIT_PIPE_READ,
+                address,
+                wait_count << 8 | descriptor,
+                0,
+                None,
+            );
+        }
         return linux_local_socket_io_live_return(
             output,
             caller,
@@ -36125,6 +36347,9 @@ fn linux_descriptor_read_live_return(
             X86_RUNTIME.CONTAINER_CONSOLE_ATTACHED[slot].load(Ordering::Acquire)
         })
     {
+        if crate::console_nonblocking() && !crate::serial_input_ready() {
+            return LINUX_EAGAIN;
+        }
         while !crate::serial_input_ready() {
             if ready_linux_thread_handle().is_some() || current_linux_runtime_cpu_index() != 0 {
                 return linux_retry_later_live_return(output, caller, LINUX_READ_SYSCALL);
@@ -36631,6 +36856,11 @@ fn linux_local_socket_io_live_return(
 
 /// Lets the rest of the domain run before system call `number` starts again:
 /// a ready sibling thread first, and otherwise other processes.
+/// Consecutive times a waiting thread handed the CPU to a ready sibling
+/// thread instead of letting other processes run.
+static LINUX_RETRY_SIBLING_HANDOFFS: AtomicU32 = AtomicU32::new(0);
+const LINUX_RETRY_SIBLING_HANDOFF_LIMIT: u32 = 1;
+
 fn linux_retry_later_live_return(
     output: *mut LinuxSyscallFrame,
     caller: LinuxUserContext,
@@ -36642,10 +36872,21 @@ fn linux_retry_later_live_return(
     let mut restart = caller;
     restart.rip = caller.rip.wrapping_sub(LINUX_SYSCALL_INSTRUCTION_SIZE);
     restart.rax = number;
-    if let (Some(current), Some(target)) = (
-        current_linux_thread_handle(),
-        yield_ready_linux_thread_handle(),
-    ) {
+    // Waiting threads of one process that hand the CPU to each other would
+    // never let the process they wait for run (git's two threads reading
+    // pipes that its index-pack child fills): after a few handoffs in a
+    // row, the other processes get their turn.
+    let handoffs = LINUX_RETRY_SIBLING_HANDOFFS.fetch_add(1, Ordering::Relaxed);
+    let others_first = handoffs >= LINUX_RETRY_SIBLING_HANDOFF_LIMIT;
+    let sibling = if others_first {
+        None
+    } else {
+        yield_ready_linux_thread_handle()
+    };
+    if sibling.is_none() {
+        LINUX_RETRY_SIBLING_HANDOFFS.store(0, Ordering::Relaxed);
+    }
+    if let (Some(current), Some(target)) = (current_linux_thread_handle(), sibling) {
         let mut registers = LinuxSyscallFrame::ZERO;
         let (mut rip, mut rsp, mut rflags, mut rax) = (0, 0, 0, 0);
         if save_linux_thread_return_context(current, restart)
@@ -36675,7 +36916,7 @@ fn linux_retry_later_live_return(
             return LINUX_RETURN_FROM_IRET;
         }
     }
-    match run_other_linux_processes(output, caller, number) {
+    match run_other_linux_processes_deferring(output, caller, number, !others_first) {
         Some(LinuxBlockedWait::Return(result)) => result,
         _ => linux_restart_syscall_live_return(output, caller, number),
     }
@@ -43045,10 +43286,26 @@ fn linux_console_fcntl(descriptor: u64, command: u64, argument: u64) -> u64 {
             );
             0
         }
-        LINUX_F_GETFL if u16::from(state) == LINUX_DESCRIPTOR_INPUT => 0,
-        LINUX_F_GETFL if u16::from(state) == LINUX_DESCRIPTOR_OUTPUT => 1,
+        LINUX_F_GETFL if u16::from(state) == LINUX_DESCRIPTOR_INPUT => linux_console_status(0),
+        LINUX_F_GETFL if u16::from(state) == LINUX_DESCRIPTOR_OUTPUT => linux_console_status(1),
+        // apt sets O_NONBLOCK on its terminal to drain typed-ahead input
+        // before dpkg runs, and exits if the terminal refuses.
+        LINUX_F_SETFL => {
+            crate::set_console_nonblocking(argument & LINUX_O_NONBLOCK != 0);
+            0
+        }
         _ => LINUX_EINVAL,
     }
+}
+
+/// F_GETFL of a console descriptor: its access mode and O_NONBLOCK.
+fn linux_console_status(access: u64) -> u64 {
+    access
+        | if crate::console_nonblocking() {
+            LINUX_O_NONBLOCK
+        } else {
+            0
+        }
 }
 
 fn linux_fcntl_descriptor_flags(descriptor: u64, command: u64, argument: u64) -> u64 {
@@ -45838,6 +46095,60 @@ fn linux_descriptor_stat(descriptor: u64) -> Option<[u8; LINUX_STAT_SIZE]> {
             LinuxCharacterDevice::from_kind(device).stat()
         }
     })
+}
+
+/// The path of the program the calling process runs, when `path` (from
+/// `directory`) is its /proc/self/exe or /proc/PID/exe.
+fn linux_proc_self_exe_target(directory: u64, path: &[u8]) -> Option<Vec<u8>> {
+    let pid = current_linux_process_pid();
+    let process = path.strip_prefix(b"/proc/")?.strip_suffix(b"/exe")?;
+    let own = process == b"self"
+        || !process.is_empty()
+            && process.iter().all(u8::is_ascii_digit)
+            && core::str::from_utf8(process)
+                .ok()
+                .and_then(|digits| digits.parse::<u32>().ok())
+                == Some(pid);
+    if directory as u32 != LINUX_AT_FDCWD || !own {
+        return None;
+    }
+    crate::linux_exe::lookup(
+        X86_RUNTIME.LINUX_EXECUTION_INSTANCE.load(Ordering::SeqCst),
+        pid,
+    )
+}
+
+/// stat or lstat (`follow` false) of /proc/self/exe or /proc/PID/exe of the
+/// calling process: the symlink itself, or the file it runs. `None` for
+/// any other path. rustup's installer checks `test -L /proc/self/exe`.
+fn linux_proc_self_exe_stat(
+    directory: u64,
+    path: &[u8],
+    follow: bool,
+) -> Option<[u8; LINUX_STAT_SIZE]> {
+    const SYMLINK_MODE: u32 = 0o120_777;
+    let executable = linux_proc_self_exe_target(directory, path)?;
+    if !follow {
+        let mut stat = linux_stat(SYMLINK_MODE, 0);
+        stat[48..56].copy_from_slice(&(executable.len() as u64).to_ne_bytes());
+        return Some(stat);
+    }
+    let relative = executable.strip_prefix(b"/")?;
+    let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    canonical
+        .get_mut(..relative.len())?
+        .copy_from_slice(relative);
+    match linux_overlay_lookup_following(&mut canonical, relative.len(), true).ok()? {
+        (_, _, Some(metadata)) => Some(linux_overlay_stat(metadata)),
+        (length, _, None) => {
+            let mut absolute = [0_u8; crate::linux_overlay::PATH_CAPACITY + 1];
+            absolute[0] = b'/';
+            absolute[1..=length].copy_from_slice(&canonical[..length]);
+            let (handle, entry) =
+                linux_rootfs_path_at(u64::from(LINUX_AT_FDCWD), &absolute[..=length])?;
+            Some(linux_rootfs_stat(handle, entry))
+        }
+    }
 }
 
 fn linux_stat(mode: u32, inode: u64) -> [u8; LINUX_STAT_SIZE] {

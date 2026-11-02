@@ -2175,7 +2175,9 @@ fn parse_phdr(bytes: &[u8], header: usize, program_header_count: usize) -> Optio
     let table_size = PROGRAM_HEADER_SIZE.checked_mul(program_header_count)? as u64;
     let virtual_address = read_u64(bytes, header + 16)?;
     let physical_address = read_u64(bytes, header + 24)?;
-    (read_u32(bytes, header + 4)? == PF_READ
+    // Linux reads only PT_PHDR's address; rustup-init's is marked R E (the
+    // segment it lies in).
+    (read_u32(bytes, header + 4)? & !(PF_READ | PF_WRITE | PF_EXECUTE) == 0
         && read_u64(bytes, header + 8)? == ELF_HEADER_SIZE as u64
         && (physical_address == 0 || physical_address == virtual_address)
         && read_u64(bytes, header + 32)? == table_size
