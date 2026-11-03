@@ -1103,7 +1103,7 @@ sched_getscheduler02 sched_getscheduler02
 sched_setscheduler01 sched_setscheduler01
 sched_setscheduler02 sched_setscheduler02
 sched_setscheduler03 sched_setscheduler03
-sched_setscheduler04 sched_setscheduler04
+!sched_setscheduler04 sched_setscheduler04  # musl: sched_getscheduler() and sched_getparam() return ENOSYS without a system call
 sched_yield01 sched_yield01
 sched_setaffinity01 sched_setaffinity01
 sched_getaffinity01 sched_getaffinity01

@@ -401,12 +401,6 @@ pub(crate) fn setgroups_file(handle: UserNamespaceHandle) -> &'static [u8] {
     }
 }
 
-pub(crate) fn has_no_linux_capabilities(handle: UserNamespaceHandle) -> bool {
-    live_table_for_handle(handle)
-        .and_then(|table| table.namespace(handle))
-        .is_some_and(|namespace| namespace.linux_capabilities == 0)
-}
-
 pub(crate) fn privileged_operation_denied(
     handle: UserNamespaceHandle,
     operation: PrivilegedOperation,

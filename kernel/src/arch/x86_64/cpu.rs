@@ -13843,7 +13843,10 @@ fn linux_unshare(flags: u64) -> u64 {
     // Making namespaces other than a user namespace needs CAP_SYS_ADMIN,
     // which a new user namespace grants its creator.
     let new_namespaces = flags & (UNIMPLEMENTED | LINUX_CLONE_NEWNS);
-    if new_namespaces != 0 && flags & LINUX_CLONE_NEWUSER == 0 && !credentials.privileged() {
+    if new_namespaces != 0
+        && flags & LINUX_CLONE_NEWUSER == 0
+        && !credentials.has(ginux_credentials::capability::SYS_ADMIN)
+    {
         return LINUX_EPERM;
     }
     if flags & UNIMPLEMENTED != 0 {
@@ -14092,8 +14095,8 @@ fn linux_clone3(
     {
         return LINUX_EINVAL;
     }
-    let privileged =
-        current_linux_credentials().is_some_and(|credentials| credentials.privileged());
+    let privileged = current_linux_credentials()
+        .is_some_and(|credentials| credentials.has(ginux_credentials::capability::SYS_ADMIN));
     // set_tid and the namespaces other than the user one need CAP_SYS_ADMIN
     // (or CAP_CHECKPOINT_RESTORE); root gets the ones this kernel has.
     if (set_tid_size != 0 || flags & NAMESPACE_FLAGS & !LINUX_CLONE_NEWUSER != 0) && !privileged {
@@ -14813,6 +14816,7 @@ fn linux_set_current_identity(number: u64, first: u64, second: u64, third: u64) 
         return LINUX_ESRCH;
     };
     let authority = linux_user::identity_authority(namespace, &credentials);
+    let old_user = credentials.user;
     let [first, second, third] = [first, second, third].map(|id| id as u32);
     let result = match number {
         LINUX_SETUID_SYSCALL => credentials.user.set(first, authority),
@@ -14836,6 +14840,7 @@ fn linux_set_current_identity(number: u64, first: u64, second: u64, third: u64) 
                 &mut credentials.group
             };
             let old = ids.set_filesystem(first, authority);
+            credentials.after_user_change(old_user);
             if !linux_process::set_live_process_credentials(pid, credentials) {
                 return LINUX_ESRCH;
             }
@@ -14843,6 +14848,9 @@ fn linux_set_current_identity(number: u64, first: u64, second: u64, third: u64) 
         }
         _ => return LINUX_ENOSYS,
     };
+    if result.is_ok() {
+        credentials.after_user_change(old_user);
+    }
     match result {
         Ok(()) if linux_process::set_live_process_credentials(pid, credentials) => 0,
         Ok(()) => LINUX_ESRCH,
@@ -29626,6 +29634,7 @@ fn linux_apply_exec_credentials(file: Option<ginux_credentials::FileAccess>) {
     };
     credentials.user.exec(set_id(0o4000, |file| file.owner));
     credentials.group.exec(set_id(0o2010, |file| file.group));
+    credentials.after_exec();
     linux_process::set_live_process_credentials(pid, credentials);
 }
 
@@ -46186,7 +46195,8 @@ fn linux_descriptor_fcntl(descriptor: u64, command: u64, argument: u64) -> u64 {
                     return LINUX_EINVAL;
                 }
                 if requested > linux_pipe_max_size()
-                    && !current_linux_credentials().is_some_and(|value| value.user.effective == 0)
+                    && !current_linux_credentials()
+                        .is_some_and(|value| value.has(ginux_credentials::capability::SYS_RESOURCE))
                 {
                     return LINUX_EPERM;
                 }
@@ -48243,8 +48253,13 @@ fn linux_scheduler_process(pid: u64) -> Result<u32, u64> {
 
 fn linux_sched_getscheduler(pid: u64) -> u64 {
     match linux_scheduler_process(pid) {
-        Ok(pid) => linux_process::live_process_scheduling(pid)
-            .map_or(LINUX_ESRCH, |(policy, _)| u64::from(policy)),
+        Ok(pid) => {
+            linux_process::live_process_scheduling(pid).map_or(LINUX_ESRCH, |(policy, _)| {
+                let reset = policy & linux_process::SCHED_RESET_ON_FORK != 0;
+                u64::from(policy & !linux_process::SCHED_RESET_ON_FORK)
+                    | if reset { 0x4000_0000 } else { 0 }
+            })
+        }
         Err(error) => error,
     }
 }
@@ -50780,73 +50795,137 @@ fn copy_linux_id_triple(first: u64, second: u64, third: u64, ids: (u32, u32, u32
     0
 }
 
+/// capget(2): a process's effective, permitted and inheritable sets, in
+/// the layout of the header's version (one 32-bit word each for version
+/// 1, two for 2 and 3); another version is EINVAL with version 3 written
+/// back, as Linux prefers it.
 fn linux_capget(header_address: u64, data_address: u64) -> u64 {
-    let Some(namespace) = current_linux_user_namespace() else {
-        return LINUX_ESRCH;
-    };
     let mut header = [0_u8; 8];
     if !copy_from_linux_user(header_address, &mut header) {
         return LINUX_EFAULT;
     }
     let version = u32::from_ne_bytes(header[..4].try_into().unwrap());
-    if version != LINUX_CAPABILITY_VERSION_3 {
-        return if copy_to_linux_user(header_address, &LINUX_CAPABILITY_VERSION_3.to_ne_bytes()) {
-            LINUX_EINVAL
-        } else {
-            LINUX_EFAULT
-        };
-    }
+    let words = match version {
+        0x1998_0330 => 1,
+        0x2007_1026 | LINUX_CAPABILITY_VERSION_3 => 2,
+        _ => {
+            return if copy_to_linux_user(header_address, &LINUX_CAPABILITY_VERSION_3.to_ne_bytes())
+            {
+                LINUX_EINVAL
+            } else {
+                LINUX_EFAULT
+            };
+        }
+    };
     let pid = i32::from_ne_bytes(header[4..].try_into().unwrap());
-    if pid != 0 && u32::try_from(pid).ok() != Some(current_linux_process_pid()) {
-        return LINUX_ESRCH;
+    if pid < 0 {
+        return LINUX_EINVAL;
     }
-    if !linux_user::has_no_linux_capabilities(namespace) {
-        return LINUX_EPERM;
-    }
-    if data_address != 0 && !copy_to_linux_user(data_address, &[0_u8; LINUX_CAPABILITY_DATA_SIZE]) {
-        return LINUX_EFAULT;
-    }
-    0
-}
-
-fn linux_capset(header_address: u64, data_address: u64) -> u64 {
-    let Some(namespace) = current_linux_user_namespace() else {
+    let target = if pid == 0 {
+        current_linux_process_pid()
+    } else {
+        pid as u32
+    };
+    let Some(credentials) = linux_process::live_process_credentials(target) else {
         return LINUX_ESRCH;
     };
+    // With no data the call only checks the version (libcap probes so).
+    if data_address == 0 {
+        return 0;
+    }
+    let capabilities = credentials.capabilities;
+    let mut data = [0_u8; LINUX_CAPABILITY_DATA_SIZE];
+    for word in 0..words {
+        let shift = 32 * word;
+        for (index, set) in [
+            capabilities.effective,
+            capabilities.permitted,
+            capabilities.inheritable,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let offset = word * 12 + index * 4;
+            data[offset..offset + 4].copy_from_slice(&((set >> shift) as u32).to_ne_bytes());
+        }
+    }
+    if copy_to_linux_user(data_address, &data[..words * 12]) {
+        0
+    } else {
+        LINUX_EFAULT
+    }
+}
+
+/// capset(2): the caller's own sets (another pid is EPERM), within what
+/// capabilities(7) allows (EPERM).
+fn linux_capset(header_address: u64, data_address: u64) -> u64 {
     let mut header = [0_u8; 8];
     if !copy_from_linux_user(header_address, &mut header) {
         return LINUX_EFAULT;
     }
-    if u32::from_ne_bytes(header[..4].try_into().unwrap()) != LINUX_CAPABILITY_VERSION_3 {
-        return LINUX_EINVAL;
-    }
-    if i32::from_ne_bytes(header[4..].try_into().unwrap()) != 0
-        || !linux_user::has_no_linux_capabilities(namespace)
-    {
+    let version = u32::from_ne_bytes(header[..4].try_into().unwrap());
+    let words = match version {
+        0x1998_0330 => 1,
+        0x2007_1026 | LINUX_CAPABILITY_VERSION_3 => 2,
+        _ => {
+            return if copy_to_linux_user(header_address, &LINUX_CAPABILITY_VERSION_3.to_ne_bytes())
+            {
+                LINUX_EINVAL
+            } else {
+                LINUX_EFAULT
+            };
+        }
+    };
+    let pid = i32::from_ne_bytes(header[4..].try_into().unwrap());
+    let current = current_linux_process_pid();
+    if pid != 0 && u32::try_from(pid).ok() != Some(current) {
         return LINUX_EPERM;
     }
     let mut data = [0_u8; LINUX_CAPABILITY_DATA_SIZE];
-    if !copy_from_linux_user(data_address, &mut data) {
+    if !copy_from_linux_user(data_address, &mut data[..words * 12]) {
         return LINUX_EFAULT;
     }
-    if data.iter().any(|byte| *byte != 0) {
-        LINUX_EPERM
-    } else {
-        0
+    let mut sets = [0_u64; 3];
+    for word in 0..words {
+        for (index, set) in sets.iter_mut().enumerate() {
+            let offset = word * 12 + index * 4;
+            let value = u32::from_ne_bytes(data[offset..offset + 4].try_into().unwrap());
+            *set |= u64::from(value) << (32 * word);
+        }
+    }
+    let Some(mut credentials) = linux_process::live_process_credentials(current) else {
+        return LINUX_ESRCH;
+    };
+    let new = ginux_credentials::Capabilities {
+        effective: sets[0] & ginux_credentials::capability::ALL,
+        permitted: sets[1] & ginux_credentials::capability::ALL,
+        inheritable: sets[2] & ginux_credentials::capability::ALL,
+    };
+    match credentials.set_capabilities(new) {
+        Ok(()) if linux_process::set_live_process_credentials(current, credentials) => 0,
+        Ok(()) => LINUX_ESRCH,
+        Err(_) => LINUX_EPERM,
     }
 }
 
 /// sched_setscheduler(2): SCHED_OTHER, BATCH and IDLE take priority 0 from
 /// anyone; FIFO and RR take 1..=99 from a privileged caller (CAP_SYS_NICE);
 /// SCHED_DEADLINE needs sched_setattr. The policy and priority are kept
-/// per process for sched_getscheduler and sched_getparam.
+/// per process for sched_getscheduler and sched_getparam, with
+/// SCHED_RESET_ON_FORK, which gives the process's children SCHED_OTHER.
 fn linux_set_scheduler(pid: u64, policy: u64, parameter_address: u64) -> u64 {
     const SCHED_RESET_ON_FORK: u64 = 0x4000_0000;
+    let reset = u64::from(policy as u32) & SCHED_RESET_ON_FORK != 0;
     let policy = u64::from(policy as u32) & !SCHED_RESET_ON_FORK;
     if !matches!(policy, 0 | 1 | 2 | 3 | 5 | 6) {
         return LINUX_EINVAL;
     }
-    linux_set_scheduling(pid, policy as u8, parameter_address)
+    let flag = if reset {
+        linux_process::SCHED_RESET_ON_FORK
+    } else {
+        0
+    };
+    linux_set_scheduling(pid, policy as u8 | flag, parameter_address)
 }
 
 /// sched_setparam(2): a priority for the process's current policy.
@@ -50877,8 +50956,9 @@ fn linux_set_scheduling(pid: u64, policy: u8, parameter_address: u64) -> u64 {
         return LINUX_EFAULT;
     }
     let priority = i32::from_ne_bytes(priority);
-    let realtime = matches!(policy, SCHED_FIFO | SCHED_RR);
-    if policy == SCHED_DEADLINE
+    let kind = policy & !linux_process::SCHED_RESET_ON_FORK;
+    let realtime = matches!(kind, SCHED_FIFO | SCHED_RR);
+    if kind == SCHED_DEADLINE
         || realtime && !(1..=99).contains(&priority)
         || !realtime && priority != 0
     {

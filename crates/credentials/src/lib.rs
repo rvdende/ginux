@@ -191,11 +191,71 @@ impl Ids {
     }
 }
 
-/// A process's user and group ids.
+/// Linux capability numbers (capabilities(7)).
+pub mod capability {
+    pub const CHOWN: u32 = 0;
+    pub const DAC_OVERRIDE: u32 = 1;
+    pub const DAC_READ_SEARCH: u32 = 2;
+    pub const FOWNER: u32 = 3;
+    pub const FSETID: u32 = 4;
+    pub const KILL: u32 = 5;
+    pub const SETGID: u32 = 6;
+    pub const SETUID: u32 = 7;
+    pub const SETPCAP: u32 = 8;
+    pub const LINUX_IMMUTABLE: u32 = 9;
+    pub const NET_RAW: u32 = 13;
+    pub const IPC_LOCK: u32 = 14;
+    pub const SYS_CHROOT: u32 = 18;
+    pub const SYS_ADMIN: u32 = 21;
+    pub const SYS_NICE: u32 = 23;
+    pub const SYS_RESOURCE: u32 = 24;
+    pub const SYS_TIME: u32 = 25;
+    pub const MKNOD: u32 = 27;
+    pub const MAC_OVERRIDE: u32 = 33;
+    /// The highest capability Linux defines (CAP_CHECKPOINT_RESTORE).
+    pub const LAST: u32 = 40;
+    /// Every capability.
+    pub const ALL: u64 = (1 << (LAST + 1)) - 1;
+    /// The capabilities a filesystem id change gives or takes with it.
+    pub const FILESYSTEM: u64 = 1 << CHOWN
+        | 1 << DAC_OVERRIDE
+        | 1 << DAC_READ_SEARCH
+        | 1 << FOWNER
+        | 1 << FSETID
+        | 1 << LINUX_IMMUTABLE
+        | 1 << MAC_OVERRIDE
+        | 1 << MKNOD;
+}
+
+/// A process's capability sets.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Capabilities {
+    pub effective: u64,
+    pub permitted: u64,
+    pub inheritable: u64,
+}
+
+impl Capabilities {
+    /// What root starts with: every capability permitted and effective.
+    pub const ROOT: Self = Self {
+        effective: capability::ALL,
+        permitted: capability::ALL,
+        inheritable: 0,
+    };
+    /// None.
+    pub const NONE: Self = Self {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    };
+}
+
+/// A process's user and group ids and its capabilities.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Credentials {
     pub user: Ids,
     pub group: Ids,
+    pub capabilities: Capabilities,
 }
 
 /// What a file allows: its owner, group and mode.
@@ -221,7 +281,85 @@ impl Credentials {
     pub const ROOT: Self = Self {
         user: Ids::all(0),
         group: Ids::all(0),
+        capabilities: Capabilities::ROOT,
     };
+
+    /// Credentials of an ordinary user: its ids, no capabilities.
+    pub const fn user(uid: u32, gid: u32) -> Self {
+        Self {
+            user: Ids::all(uid),
+            group: Ids::all(gid),
+            capabilities: Capabilities::NONE,
+        }
+    }
+
+    /// Whether the process holds capability `capability` (effective).
+    pub fn has(&self, capability: u32) -> bool {
+        capability <= capability::LAST && self.capabilities.effective & 1 << capability != 0
+    }
+
+    /// The capabilities follow a change of the user ids from `old`, as
+    /// capabilities(7) says: losing every id 0 drops the permitted and
+    /// effective sets, an effective id leaving 0 drops the effective set
+    /// and one becoming 0 restores it from the permitted set; the
+    /// filesystem capabilities follow the filesystem id the same way.
+    pub fn after_user_change(&mut self, old: Ids) {
+        let new = self.user;
+        let caps = &mut self.capabilities;
+        let old_root = old.real == 0 || old.effective == 0 || old.saved == 0;
+        let new_root = new.real == 0 || new.effective == 0 || new.saved == 0;
+        if old_root && !new_root {
+            caps.permitted = 0;
+            caps.effective = 0;
+        }
+        if old.effective == 0 && new.effective != 0 {
+            caps.effective = 0;
+        } else if old.effective != 0 && new.effective == 0 {
+            caps.effective = caps.permitted;
+        }
+        if old.filesystem == 0 && new.filesystem != 0 {
+            caps.effective &= !capability::FILESYSTEM;
+        } else if old.filesystem != 0 && new.filesystem == 0 {
+            caps.effective |= caps.permitted & capability::FILESYSTEM;
+        }
+    }
+
+    /// execve(2) without file capabilities: root (real or effective) gets
+    /// every capability permitted, effective when its effective id is 0;
+    /// any other process none.
+    pub fn after_exec(&mut self) {
+        if self.user.real == 0 || self.user.effective == 0 {
+            self.capabilities.permitted = capability::ALL;
+            self.capabilities.effective = if self.user.effective == 0 {
+                capability::ALL
+            } else {
+                0
+            };
+        } else {
+            self.capabilities.permitted = 0;
+            self.capabilities.effective = 0;
+        }
+    }
+
+    /// capset(2): the new permitted set within the old, the effective within
+    /// the new permitted, the inheritable within the old inheritable and
+    /// permitted sets unless CAP_SETPCAP allows any (EPERM otherwise).
+    pub fn set_capabilities(&mut self, new: Capabilities) -> Result<(), Error> {
+        let old = self.capabilities;
+        let inheritable_allowed = if self.has(capability::SETPCAP) {
+            capability::ALL
+        } else {
+            old.inheritable | old.permitted
+        };
+        if new.permitted & !old.permitted != 0
+            || new.effective & !new.permitted != 0
+            || new.inheritable & !inheritable_allowed != 0
+        {
+            return Err(Error::Permission);
+        }
+        self.capabilities = new;
+        Ok(())
+    }
 
     /// The process holds CAP_SETUID, CAP_SETGID and CAP_KILL.
     pub fn privileged(&self) -> bool {
@@ -429,10 +567,7 @@ mod tests {
             mode: 0o640,
             directory: false,
         };
-        let user = |uid, gid| Credentials {
-            user: Ids::all(uid),
-            group: Ids::all(gid),
-        };
+        let user = Credentials::user;
         assert!(user(1000, 1000).may_access(&[], file, access::READ | access::WRITE));
         assert!(user(5, 100).may_access(&[], file, access::READ));
         assert!(!user(5, 100).may_access(&[], file, access::WRITE));
@@ -462,18 +597,12 @@ mod tests {
             mode: 0o644,
             directory: false,
         };
-        let owner = Credentials {
-            user: Ids::all(1000),
-            group: Ids::all(1000),
-        };
+        let owner = Credentials::user(1000, 1000);
         assert!(owner.may_chown(&[50], file, UNCHANGED, 50));
         assert!(!owner.may_chown(&[50], file, UNCHANGED, 60));
         assert!(!owner.may_chown(&[], file, 0, UNCHANGED));
         assert!(Credentials::ROOT.may_chown(&[], file, 0, 0));
-        let stranger = Credentials {
-            user: Ids::all(5),
-            group: Ids::all(5),
-        };
+        let stranger = Credentials::user(5, 5);
         assert!(!stranger.may_signal(&owner));
         assert!(owner.may_signal(&owner));
         assert!(Credentials::ROOT.may_signal(&owner));
@@ -487,5 +616,37 @@ mod tests {
         assert_eq!(list, [10, 20, 30]);
         let mut unmapped = vec![70_000];
         assert_eq!(set_groups(&mut unmapped, ROOT), Err(Error::Invalid));
+    }
+
+    #[test]
+    fn capabilities_follow_user_changes_and_capset() {
+        let mut root = Credentials::ROOT;
+        assert!(root.has(capability::SYS_ADMIN));
+        let old = root.user;
+        root.user.effective = 1000;
+        root.after_user_change(old);
+        assert!(!root.has(capability::SYS_ADMIN));
+        assert_eq!(root.capabilities.permitted, capability::ALL);
+        let old = root.user;
+        root.user.effective = 0;
+        root.after_user_change(old);
+        assert!(root.has(capability::SYS_ADMIN));
+        let old = root.user;
+        root.user = Ids::all(1000);
+        root.after_user_change(old);
+        assert_eq!(root.capabilities, Capabilities::NONE);
+        let mut caps = Credentials::ROOT;
+        let dropped = Capabilities {
+            effective: capability::ALL & !(1 << capability::SYS_RESOURCE),
+            ..Capabilities::ROOT
+        };
+        assert_eq!(caps.set_capabilities(dropped), Ok(()));
+        assert!(!caps.has(capability::SYS_RESOURCE));
+        let raised = Capabilities {
+            permitted: 0,
+            effective: 1,
+            inheritable: 0,
+        };
+        assert_eq!(caps.set_capabilities(raised), Err(Error::Permission));
     }
 }

@@ -1661,7 +1661,11 @@ impl ProcessTable {
                         parent.process_group,
                         parent.session,
                         parent.cpu_affinity,
-                        parent.scheduling,
+                        if parent.scheduling.0 & SCHED_RESET_ON_FORK == 0 {
+                            parent.scheduling
+                        } else {
+                            (0, 0)
+                        },
                         parent.oom_score_adj,
                         parent.credentials,
                     )
@@ -3382,6 +3386,10 @@ pub(crate) fn continue_live_process(pid: u32) -> bool {
     };
     table.continue_process(handle)
 }
+
+/// Set in a process's policy byte by SCHED_RESET_ON_FORK: its children
+/// start with SCHED_OTHER and priority 0.
+pub(crate) const SCHED_RESET_ON_FORK: u8 = 0x80;
 
 /// sched_getscheduler and sched_getparam: `pid`'s policy and priority.
 pub(crate) fn live_process_scheduling(pid: u32) -> Option<(u8, u8)> {

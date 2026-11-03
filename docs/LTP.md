@@ -31,6 +31,7 @@ QEMU, and reports one machine-parseable line per test plus failure clusters.
 | ICMP sockets | ping and raw ICMP sockets, blocking socket calls with SO_RCVTIMEO/SO_SNDTIMEO let other processes run (baseline 412) | 1362 | 728 | 236 | 159 | 222 | 14 | 0 | 3 |
 | `18b5a49f` | POSIX timers per process, stop and continue, lone-thread sigtimedwait and sigsuspend, blocked signals kept when ignored, mlock limits, scheduling policies, pwrite and truncate fixes, a settable wall clock, `/proc/PID/task`, `/proc/sysvipc`, writable sysctls; the harness's full test list (1552) on a 4-CPU domain (`LTP_DOMAIN_CPUS=4`, baseline 363) | 1552 | 789 | 206 | 125 | 216 | 14 | 1 | 11 |
 | `9032103b` | the multithread lost wakeup, clone3 and forks on a child stack, blocking socket calls and owner-path preemption on every CPU, per-thread nice and CPU time, socket files, connect errors, splice from /dev/zero, affinity and rlimit permissions, mlockall limits, semaphore-set limit, memory within the domain budget (4 CPUs, baseline 347) | 1552 | 801 | 200 | 126 | 214 | 15 | 0 | 4 |
+| `cd1cf9c9` | UTS and domain names, flock waits and leases, MAP_32BIT, epoll's nesting, oneshot and fairness, inotify with an event queue, System V IPC ownership, permissions, info and stat commands (4 CPUs, baseline 283) | 1552 | 867 | 154 | 112 | 212 | 12 | 0 | 3 |
 
 \* Counted with the exit status alone, which overstated passes (below).
 The later rows are rescored from each run's saved console logs with LTP's

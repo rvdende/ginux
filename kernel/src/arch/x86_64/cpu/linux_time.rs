@@ -139,8 +139,10 @@ pub(super) fn linux_time(output_address: u64) -> u64 {
 }
 
 /// Whether the caller may set the clock: root, standing in for CAP_SYS_TIME.
+/// Setting the clock needs CAP_SYS_TIME (settimeofday02 drops it as root).
 fn linux_may_set_clock() -> bool {
-    current_linux_credentials().is_some_and(|credentials| credentials.user.effective == 0)
+    current_linux_credentials()
+        .is_some_and(|credentials| credentials.has(ginux_credentials::capability::SYS_TIME))
 }
 
 /// Sets the domain's wall clock to `seconds` and `nanoseconds`: the

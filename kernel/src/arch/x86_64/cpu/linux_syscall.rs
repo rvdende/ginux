@@ -1032,6 +1032,24 @@ fn linux_syscall_dispatch(
                 Some(mask),
             )
         }
+        // A new namespace other than a user one needs CAP_SYS_ADMIN, checked
+        // before anything else of the request (clone11).
+        LINUX_CLONE_SYSCALL
+            if saved_registers.rdi
+                & (0x80
+                    | LINUX_CLONE_NEWNS
+                    | 0x0200_0000
+                    | 0x0400_0000
+                    | 0x0800_0000
+                    | 0x2000_0000
+                    | 0x4000_0000)
+                != 0
+                && !current_linux_credentials().is_some_and(|credentials| {
+                    credentials.has(ginux_credentials::capability::SYS_ADMIN)
+                }) =>
+        {
+            LINUX_EPERM
+        }
         LINUX_CLONE_SYSCALL
             if (saved_registers.rdi & !(LINUX_CLONE_NEWNS | LINUX_CLONE_NEWUSER)
                 == LINUX_SIGCHLD
