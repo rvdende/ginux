@@ -117,6 +117,12 @@ pub(crate) enum Error {
     NotConnected,
     BrokenPipe,
     Reset,
+    /// A connection attempt the peer refused (RST to the SYN).
+    Refused,
+    /// connect on a stream socket already connected.
+    IsConnected,
+    /// connect on a stream socket whose connection is still in progress.
+    Already,
 }
 
 #[derive(Clone, Copy)]
@@ -1330,6 +1336,13 @@ impl Sockets {
     fn connect(&mut self, id: SlotId, remote: IpEndpoint) -> Result<(), Error> {
         self.poll();
         self.start_runtime()?;
+        // Connecting to INADDR_ANY reaches the local host, as in Linux.
+        let remote = match remote.addr {
+            IpAddress::Ipv4(address) if address.is_unspecified() => {
+                IpEndpoint::new(IpAddress::v4(127, 0, 0, 1), remote.port)
+            }
+            _ => remote,
+        };
         let index = usize::from(id);
         let Self { runtime, slots, .. } = self;
         let runtime = runtime.as_mut().ok_or(Error::Unavailable)?;
@@ -1337,6 +1350,22 @@ impl Sockets {
         let handle = state.handle.ok_or(Error::Invalid)?;
         if state.listening {
             return Err(Error::Invalid);
+        }
+        // A TCP socket already connected answers EISCONN, one still
+        // connecting EALREADY, as Linux does outside TCP_CLOSE (connect01);
+        // one whose connection ended or failed may connect again.
+        if state.kind == Kind::Tcp && (state.remote.is_some() || state.peer_closed) {
+            if state.peer.is_some() || state.peer_closed {
+                return Err(Error::IsConnected);
+            }
+            let socket = runtime.sockets.get::<tcp::Socket>(handle);
+            if socket.is_active() {
+                return Err(if socket.may_send() {
+                    Error::IsConnected
+                } else {
+                    Error::Already
+                });
+            }
         }
         let (kind, current_port) = (state.kind, state.local_port);
         let local_port = if current_port == 0 {
@@ -1368,6 +1397,11 @@ impl Sockets {
                 state.peer = Some(listener);
                 return Ok(());
             }
+            // Nothing listens on that local port: a reset, as the host
+            // answers a SYN to a closed port (connect01's ECONNREFUSED).
+            // Local connections never go out as packets, so the handshake
+            // would otherwise wait for an answer that never comes.
+            return Err(Error::Refused);
         }
         match kind {
             Kind::Tcp => {
@@ -2579,7 +2613,8 @@ pub(crate) fn complete_connect(id: SlotId) -> Result<(), Error> {
             return Ok(());
         }
         if error {
-            return Err(Error::Reset);
+            // The peer answered the SYN with a reset: nothing listens there.
+            return Err(Error::Refused);
         }
         core::hint::spin_loop();
     }

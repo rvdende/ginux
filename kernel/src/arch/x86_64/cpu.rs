@@ -580,6 +580,12 @@ struct X86RuntimeOwner {
     /// to run it (its system call is not for the light path).
     LINUX_THREAD_OWNER_ONLY: RuntimeRef<CpuBankedAtomicArray<AtomicU8, LINUX_THREAD_LIMIT>>,
     LINUX_THREAD_TIDS: RuntimeRef<[CpuBankedAtomicU32; LINUX_THREAD_LIMIT]>,
+    /// Per thread, its nice value plus 20 (0..=39), as Linux keeps nice per
+    /// task: a thread's time slice follows it.
+    LINUX_THREAD_NICES: RuntimeRef<[CpuBankedAtomicU8; LINUX_THREAD_LIMIT]>,
+    /// Per thread, the timestamp-counter cycles it has run, charged when it
+    /// leaves a CPU (`linux_charge_thread_cpu`).
+    LINUX_THREAD_CPU_CYCLES: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
     LINUX_THREAD_TLS_EXTENTS: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
     LINUX_THREAD_TLS_SIZES: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
     LINUX_THREAD_WAIT_DEADLINES: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
@@ -1147,6 +1153,8 @@ static X86_RUNTIME: X86RuntimeOwner = X86RuntimeOwner {
     LINUX_THREAD_STATES: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_THREAD_STATES),
     LINUX_THREAD_OWNER_ONLY: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_THREAD_OWNER_ONLY),
     LINUX_THREAD_TIDS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_THREAD_TIDS),
+    LINUX_THREAD_NICES: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_THREAD_NICES),
+    LINUX_THREAD_CPU_CYCLES: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_THREAD_CPU_CYCLES),
     LINUX_THREAD_TLS_EXTENTS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_THREAD_TLS_EXTENTS),
     LINUX_THREAD_TLS_SIZES: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_THREAD_TLS_SIZES),
     LINUX_THREAD_WAIT_DEADLINES: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_THREAD_WAIT_DEADLINES),
@@ -2222,7 +2230,9 @@ fn run_linux_light_thread(cpu: usize, bank: usize, slot: usize) -> bool {
         .store(LINUX_THREAD_SLOT_NONE, Ordering::SeqCst);
     LINUX_PROCESS_SLICE[cpu].store(0, Ordering::SeqCst);
     linux_process::start_live_process_cpu(timer::timestamp_counter());
+    linux_mark_thread_cpu();
     let ran = run_linux_light_thread_here(cpu, bank, pid, slot);
+    linux_charge_thread_cpu(slot);
     if !ran {
         // Not run: left to the owner rather than tried again at once.
         X86_RUNTIME.LINUX_THREAD_OWNER_ONLY[slot].store(1, Ordering::SeqCst);
@@ -2567,7 +2577,7 @@ fn linux_preempt_light_thread_from_timer(cpu: usize, bank: usize, frame: &mut Us
     };
     let ticks = LINUX_PROCESS_SLICE[cpu].fetch_add(1, Ordering::SeqCst) + 1;
     let dying = LINUX_BANK_DYING[bank].load(Ordering::Acquire);
-    if ticks < LINUX_PROCESS_SLICE_TICKS && !dying {
+    if ticks < linux_thread_slice_ticks() && !dying {
         return;
     }
     let Some(entry) = crate::linux_elf::vdso_preempt_entry() else {
@@ -2754,6 +2764,7 @@ pub(crate) fn run_application_processor_runtime(cpu: usize) {
     let mut after = 0;
     let mut thread_cursor = 0;
     let mut idle_ticks = LINUX_SMP_IDLE_SPIN_TICKS;
+    let mut process_first = false;
     loop {
         // Looking for work takes the kernel-entry lock only when it is free:
         // a CPU with nothing to run must not queue for it behind the owner
@@ -2775,20 +2786,18 @@ pub(crate) fn run_application_processor_runtime(cpu: usize) {
             break;
         }
         let _ = expire_linux_light_waits();
-        if let Some((bank, slot)) = pick_linux_light_thread(&mut thread_cursor) {
-            idle_ticks = LINUX_SMP_IDLE_SPIN_TICKS;
-            crate::cpu_time::add_run();
-            if !run_linux_light_thread(cpu, bank, slot) {
-                serial_write("ginux: application processor thread run failed cpu/bank/slot: ");
-                serial_write_u64(cpu as u64);
-                serial_write(" ");
-                serial_write_u64(bank as u64);
-                serial_write(" ");
-                serial_write_u64(slot as u64);
-                serial_write("\r\n");
+        // Light threads and dispatchable processes take turns: a process
+        // pinned with its threads to this CPU alone (nice05 pins its main
+        // thread and two busy threads to one CPU) would otherwise never
+        // see its main thread run while the threads keep this CPU busy.
+        process_first = !process_first;
+        if !process_first {
+            if let Some((bank, slot)) = pick_linux_light_thread(&mut thread_cursor) {
+                idle_ticks = LINUX_SMP_IDLE_SPIN_TICKS;
+                run_linux_light_thread_reporting(cpu, bank, slot);
+                drop(guard);
+                continue;
             }
-            drop(guard);
-            continue;
         }
         let picked = linux_process::ready_live_process_after(after, |pid| {
             pid != 1
@@ -2810,6 +2819,14 @@ pub(crate) fn run_application_processor_runtime(cpu: usize) {
             drop(guard);
             continue;
         }
+        if process_first {
+            if let Some((bank, slot)) = pick_linux_light_thread(&mut thread_cursor) {
+                idle_ticks = LINUX_SMP_IDLE_SPIN_TICKS;
+                run_linux_light_thread_reporting(cpu, bank, slot);
+                drop(guard);
+                continue;
+            }
+        }
         drop(guard);
         // Nothing to run: leave the kernel to the other CPUs for a while,
         // longer each time nothing turns up (up to about a millisecond), so
@@ -2830,6 +2847,20 @@ pub(crate) fn run_application_processor_runtime(cpu: usize) {
         .LINUX_EXECUTION_INSTANCE
         .store(previous_instance, Ordering::Release);
     LINUX_SMP_LOOP_ACTIVE[cpu].store(false, Ordering::Release);
+}
+
+/// `run_linux_light_thread` from the loop, reporting a failure to run.
+fn run_linux_light_thread_reporting(cpu: usize, bank: usize, slot: usize) {
+    crate::cpu_time::add_run();
+    if !run_linux_light_thread(cpu, bank, slot) {
+        serial_write("ginux: application processor thread run failed cpu/bank/slot: ");
+        serial_write_u64(cpu as u64);
+        serial_write(" ");
+        serial_write_u64(bank as u64);
+        serial_write(" ");
+        serial_write_u64(slot as u64);
+        serial_write("\r\n");
+    }
 }
 
 /// Keeps process `pid` on this CPU while it lives: the CPU made the process
@@ -3376,6 +3407,10 @@ static X86_RUNTIME_BACKING_LINUX_THREAD_GENERATIONS: [CpuBankedAtomicU32; LINUX_
     [const { CpuBankedAtomicU32::new(0) }; LINUX_THREAD_LIMIT];
 static X86_RUNTIME_BACKING_LINUX_THREAD_TIDS: [CpuBankedAtomicU32; LINUX_THREAD_LIMIT] =
     [const { CpuBankedAtomicU32::new(0) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_NICES: [CpuBankedAtomicU8; LINUX_THREAD_LIMIT] =
+    [const { CpuBankedAtomicU8::new(LINUX_NICE_DEFAULT) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_CPU_CYCLES: [CpuBankedAtomicU64; LINUX_THREAD_LIMIT] =
+    [const { CpuBankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
 static X86_RUNTIME_BACKING_LINUX_THREAD_POINTERS: [CpuBankedAtomicU64; LINUX_THREAD_LIMIT] =
     [const { CpuBankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
 static X86_RUNTIME_BACKING_LINUX_THREAD_TLS_EXTENTS: [CpuBankedAtomicU64; LINUX_THREAD_LIMIT] =
@@ -8027,6 +8062,8 @@ fn reserve_linux_thread(
     X86_RUNTIME.LINUX_THREAD_STACK_SIZES[slot].store(stack_size as u64, Ordering::SeqCst);
     X86_RUNTIME.LINUX_THREAD_CLEAR_CHILD_TIDS[slot].store(0, Ordering::SeqCst);
     X86_RUNTIME.LINUX_THREAD_ROBUST_LISTS[slot].store(0, Ordering::SeqCst);
+    X86_RUNTIME.LINUX_THREAD_NICES[slot].store(current_linux_thread_nice(), Ordering::SeqCst);
+    X86_RUNTIME.LINUX_THREAD_CPU_CYCLES[slot].store(0, Ordering::SeqCst);
     X86_RUNTIME.LINUX_THREAD_RSEQ_POINTERS[slot].store(0, Ordering::SeqCst);
     X86_RUNTIME.LINUX_THREAD_RSEQ_LENGTHS[slot].store(0, Ordering::SeqCst);
     X86_RUNTIME.LINUX_THREAD_RSEQ_SIGNATURES[slot].store(0, Ordering::SeqCst);
@@ -8393,6 +8430,7 @@ fn switch_linux_thread(handle: LinuxThreadHandle) -> bool {
             Ordering::SeqCst,
         );
         X86_RUNTIME.LINUX_THREAD_STATES[prior].store(LINUX_THREAD_READY, Ordering::SeqCst);
+        linux_charge_thread_cpu(prior);
     } else if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
         // A thread that blocked saved its extended state, and a timer may
         // have preempted it with live vector registers; it resumes on that
@@ -8415,6 +8453,7 @@ fn switch_linux_thread(handle: LinuxThreadHandle) -> bool {
     // Whatever call kept the thread for the owner runs now.
     X86_RUNTIME.LINUX_THREAD_OWNER_ONLY[slot].store(0, Ordering::SeqCst);
     X86_RUNTIME.LINUX_THREAD_STATES[slot].store(LINUX_THREAD_RUNNING, Ordering::SeqCst);
+    linux_mark_thread_cpu();
     X86_RUNTIME
         .LINUX_CURRENT_THREAD_SLOT
         .store(handle.slot, Ordering::SeqCst);
@@ -15602,9 +15641,73 @@ fn write_linux_live_return(output: *mut LinuxSyscallFrame, context: LinuxUserCon
 /// The Ginux-internal system call the vDSO's preemption entry makes; above
 /// every Linux system call number.
 const LINUX_PREEMPT_SYSCALL: u64 = 0x4750;
-/// Timer ticks a process other than init runs before it is preempted so
-/// that others get the CPU.
+/// Timer ticks a thread of nice 0 runs before it is preempted so that
+/// others get the CPU; a thread's own slice scales with its nice as Linux's
+/// load weights do (`linux_thread_slice_ticks`).
 const LINUX_PROCESS_SLICE_TICKS: u32 = 50;
+/// A nice value of 0, as the thread table keeps it (nice plus 20).
+const LINUX_NICE_DEFAULT: u8 = 20;
+/// Linux's load weight per nice value, -20 first: each step is about 10%
+/// of CPU time more or less than the next.
+const LINUX_NICE_WEIGHTS: [u32; 40] = [
+    88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916, 9548, 7620, 6100, 4904,
+    3906, 3121, 2501, 1991, 1586, 1277, 1024, 820, 655, 526, 423, 335, 272, 215, 172, 137, 110, 87,
+    70, 56, 45, 36, 29, 23, 18, 15,
+];
+
+/// Per CPU, the timestamp counter when the thread it runs took the CPU.
+static LINUX_THREAD_CPU_MARK: [AtomicU64; CPU_ENTRY_STATE_LIMIT] =
+    [const { AtomicU64::new(0) }; CPU_ENTRY_STATE_LIMIT];
+
+/// A thread takes this CPU: its CPU time runs from now.
+fn linux_mark_thread_cpu() {
+    LINUX_THREAD_CPU_MARK[linux_cpu_slot()].store(timer::timestamp_counter(), Ordering::Relaxed);
+}
+
+/// Thread `slot` leaves this CPU: the cycles since it took the CPU are
+/// its, as Linux charges a task at the switch.
+fn linux_charge_thread_cpu(slot: usize) {
+    let mark = LINUX_THREAD_CPU_MARK[linux_cpu_slot()].swap(0, Ordering::Relaxed);
+    let now = timer::timestamp_counter();
+    if mark == 0 || now <= mark || slot >= LINUX_THREAD_LIMIT {
+        return;
+    }
+    X86_RUNTIME.LINUX_THREAD_CPU_CYCLES[slot].fetch_add(now - mark, Ordering::SeqCst);
+}
+
+/// The CPU time thread `slot` of the current process has used, in
+/// timestamp-counter cycles, the running interval of the current thread
+/// included.
+fn linux_thread_cpu_cycles(slot: usize) -> u64 {
+    let cycles = X86_RUNTIME.LINUX_THREAD_CPU_CYCLES[slot].load(Ordering::SeqCst);
+    if current_linux_thread_slot() != Some(slot) {
+        return cycles;
+    }
+    let mark = LINUX_THREAD_CPU_MARK[linux_cpu_slot()].load(Ordering::Relaxed);
+    let now = timer::timestamp_counter();
+    if mark == 0 || now <= mark {
+        return cycles;
+    }
+    cycles.saturating_add(now - mark)
+}
+
+/// The current thread's nice value plus 20: its slot's, or the process's
+/// for a process with no thread table yet.
+fn current_linux_thread_nice() -> u8 {
+    current_linux_thread_slot().map_or_else(
+        || X86_RUNTIME.ELF_PROBE_NICE.load(Ordering::SeqCst),
+        |slot| X86_RUNTIME.LINUX_THREAD_NICES[slot].load(Ordering::SeqCst),
+    )
+}
+
+/// The timer ticks the current thread runs before it is preempted: the nice
+/// 0 slice scaled by its nice's weight, between a tick and ten times the
+/// slice (nice05: the lower nice thread of two pinned to one CPU runs more).
+fn linux_thread_slice_ticks() -> u32 {
+    let weight = LINUX_NICE_WEIGHTS[usize::from(current_linux_thread_nice().min(39))];
+    (LINUX_PROCESS_SLICE_TICKS.saturating_mul(weight) / LINUX_NICE_WEIGHTS[20])
+        .clamp(1, LINUX_PROCESS_SLICE_TICKS * 10)
+}
 
 /// A process the timer preempted: its exact registers at the interrupted
 /// instruction (rax..r15 in `process_general` order), kept until it reaches
@@ -15701,9 +15804,12 @@ pub(crate) fn linux_application_processor_tick(frame: &mut UserInterruptFrame) {
 /// preempts at the tick itself; doing it through a system call reuses the
 /// normal return-to-kernel path.
 fn linux_preempt_process_from_timer(frame: &mut UserInterruptFrame) {
-    if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
-        || current_linux_runtime_cpu_index() != 0
-    {
+    // On an application processor too: a process it runs as the owner
+    // (run_linux_process_on_this_cpu) is entered under the scheduler
+    // nesting that takes the yield, and one pinned there with a busy thread
+    // current otherwise keeps the CPU from its other threads for good
+    // (nice05's two busy threads and main thread on one CPU).
+    if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
         return;
     }
     let Some(mut context) = frame.user_context(USER_CODE_SELECTOR, USER_DATA_SELECTOR) else {
@@ -15712,7 +15818,7 @@ fn linux_preempt_process_from_timer(frame: &mut UserInterruptFrame) {
     let ticks = LINUX_PROCESS_SLICE[linux_cpu_slot()].fetch_add(1, Ordering::SeqCst) + 1;
     let signal_due = !X86_RUNTIME.LINUX_SIGNAL_ACTIVE.load(Ordering::SeqCst)
         && linux_signal_due_from_timer(ticks.is_multiple_of(LINUX_SIGNAL_QUEUE_CHECK_TICKS));
-    if ticks < LINUX_PROCESS_SLICE_TICKS && !signal_due {
+    if ticks < linux_thread_slice_ticks() && !signal_due {
         return;
     }
     let pid = current_linux_process_pid();
@@ -15804,6 +15910,15 @@ fn linux_complete_timer_preemption(output: *mut LinuxSyscallFrame, user_rip: u64
     if preempted.signal {
         return Some(linux_deliver_signal_to_interrupted(output, &preempted));
     }
+    // A sibling thread kept for the owner (its call is not for the light
+    // path) takes the CPU from the preempted thread, as a thread switch on
+    // one CPU would: dispatching the process again resumes the thread the
+    // timer interrupted, so with a busy thread current a thread waiting for
+    // the owner never ran (nice05's main thread sleeping while its two busy
+    // threads, pinned with it to one CPU, kept that CPU's owner path).
+    if let Some(result) = linux_preempted_owner_switches_to_kept_thread(output, &preempted) {
+        return Some(result);
+    }
     let recorded = live_runtime_linux_process_address_space_snapshot().is_some_and(|snapshot| {
         linux_process::refresh_validated_runtime_process_registry(
             pid,
@@ -15842,6 +15957,110 @@ fn linux_complete_timer_preemption(output: *mut LinuxSyscallFrame, user_rip: u64
         .LINUX_PROCESS_LAST_BLOCKED_PID
         .store(pid, Ordering::SeqCst);
     Some(LINUX_RETURN_TO_KERNEL)
+}
+
+/// Per CPU, whether the last owner-path preemption there switched to a
+/// sibling thread rather than yielding the process: the next yields.
+static LINUX_PREEMPTION_SWITCHED: [AtomicBool; CPU_ENTRY_STATE_LIMIT] =
+    [const { AtomicBool::new(false) }; CPU_ENTRY_STATE_LIMIT];
+
+/// A ready thread of the current process kept for the owner, after the
+/// current slot in a round robin, with a saved context to resume.
+fn kept_ready_linux_thread_handle() -> Option<LinuxThreadHandle> {
+    let after = current_linux_thread_slot().unwrap_or(0);
+    (1..=LINUX_THREAD_LIMIT).find_map(|offset| {
+        let slot = after.wrapping_add(offset) % LINUX_THREAD_LIMIT;
+        (X86_RUNTIME.LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) == LINUX_THREAD_READY
+            && X86_RUNTIME.LINUX_THREAD_OWNER_ONLY[slot].load(Ordering::SeqCst) != 0)
+            .then(|| linux_thread_handle(slot))
+            .flatten()
+            .filter(|handle| linux_thread_return_context(*handle).is_some())
+    })
+}
+
+/// On the owner's path, a timer preemption of the current thread switches
+/// to a sibling kept for the owner: the preempted thread's exact context
+/// goes to its slot (ready for any CPU) and the kept thread's call returns
+/// through the frame. None when there is no such thread or the switch
+/// cannot be made, and the preemption yields the process as before.
+fn linux_preempted_owner_switches_to_kept_thread(
+    output: *mut LinuxSyscallFrame,
+    preempted: &LinuxPreemptedContext,
+) -> Option<u64> {
+    let current = current_linux_thread_handle()?;
+    // A thread kept for the owner first; else any ready sibling, every
+    // other preemption, so the process's other threads share this CPU with
+    // the other processes (a process pinned to one CPU has no other CPU to
+    // run its ready threads on: its bank is live only while the owner runs).
+    let cpu = linux_cpu_slot();
+    let target = match kept_ready_linux_thread_handle() {
+        Some(target) => target,
+        None => {
+            if LINUX_PREEMPTION_SWITCHED[cpu].swap(false, Ordering::Relaxed) {
+                return None;
+            }
+            ready_linux_thread_handle()?
+        }
+    };
+    LINUX_PREEMPTION_SWITCHED[cpu].store(true, Ordering::Relaxed);
+    let general = preempted.general;
+    let context = LinuxUserContext {
+        registers: LinuxSyscallFrame {
+            r15: general[14],
+            r14: general[13],
+            r13: general[12],
+            r12: general[11],
+            rbp: general[6],
+            rbx: general[1],
+            r10: general[9],
+            r9: general[8],
+            r8: general[7],
+            rdx: general[3],
+            rsi: general[4],
+            rdi: general[5],
+        },
+        rip: preempted.rip,
+        rsp: preempted.rsp,
+        rflags: preempted.rflags,
+        rax: general[0],
+        fs_base: active_fs_base(),
+    };
+    if !save_linux_thread_return_context(current, context) {
+        return None;
+    }
+    let slot = usize::from(current.slot);
+    X86_RUNTIME.LINUX_THREAD_RCXS[slot].store(general[2], Ordering::SeqCst);
+    X86_RUNTIME.LINUX_THREAD_R11S[slot].store(general[10], Ordering::SeqCst);
+    let mut registers = LinuxSyscallFrame::ZERO;
+    let (mut rip, mut rsp, mut rflags, mut rax) = (0, 0, 0, 0);
+    if !install_linux_thread_return(
+        target,
+        &mut registers,
+        &mut rip,
+        &mut rsp,
+        &mut rflags,
+        &mut rax,
+    ) {
+        return None;
+    }
+    X86_RUNTIME
+        .LINUX_LAST_PREEMPTED_THREAD_SLOT
+        .store(current.slot, Ordering::SeqCst);
+    let selected = LinuxUserContext {
+        registers,
+        rip,
+        rsp,
+        rflags,
+        rax,
+        fs_base: active_fs_base(),
+    };
+    if !write_linux_thread_live_return(output, target, selected) {
+        return Some(LINUX_EINVAL);
+    }
+    X86_RUNTIME
+        .LINUX_LIVE_RETURN_VALIDATED
+        .store(true, Ordering::SeqCst);
+    Some(LINUX_RETURN_FROM_IRET)
 }
 
 /// Delivers the pending signal to a process the timer interrupted in user
@@ -16861,11 +17080,15 @@ struct LinuxThreadRuntimeState {
     iov_addresses: [u64; LINUX_IOV_LIMIT],
     iov_lengths: [u64; LINUX_IOV_LIMIT],
     owner_only: u8,
+    nice: u8,
+    cpu_cycles: u64,
 }
 
 impl LinuxThreadRuntimeState {
     const EMPTY: Self = Self {
         owner_only: 0,
+        nice: LINUX_NICE_DEFAULT,
+        cpu_cycles: 0,
         state: LINUX_THREAD_FREE,
         generation: 0,
         tid: 0,
@@ -17324,6 +17547,9 @@ fn save_current_linux_process_runtime_state(pid: u32) {
 fn save_current_linux_process_runtime_state_now(pid: u32) {
     let started = cfg!(feature = "linux-boot-profile").then(timer::timestamp_counter);
     linux_process::charge_live_process_cpu(pid, timer::timestamp_counter());
+    if let Some(slot) = current_linux_thread_slot() {
+        linux_charge_thread_cpu(slot);
+    }
     adopt_linux_process_bank(pid);
     if !linux_bank_holds(linux_cpu_bank(), pid, linux_execution_instance()) {
         // The bank holds another process: its state is not this one's.
@@ -17365,6 +17591,7 @@ fn restore_saved_linux_process_runtime_state_now(pid: u32) -> bool {
         return false;
     };
     linux_process::start_live_process_cpu(timer::timestamp_counter());
+    linux_mark_thread_cpu();
     if attached == BankAttach::Live {
         // Threads of the process run on other CPUs: the bank is its state,
         // newer than what was saved. This CPU takes up the saved thread.
@@ -17483,6 +17710,8 @@ fn capture_linux_thread_runtime_state(slot: usize) -> LinuxThreadRuntimeState {
             X86_RUNTIME.LINUX_THREAD_IOV_LENGTHS[slot][index].load(Ordering::SeqCst)
         }),
         owner_only: X86_RUNTIME.LINUX_THREAD_OWNER_ONLY[slot].load(Ordering::SeqCst),
+        nice: X86_RUNTIME.LINUX_THREAD_NICES[slot].load(Ordering::SeqCst),
+        cpu_cycles: X86_RUNTIME.LINUX_THREAD_CPU_CYCLES[slot].load(Ordering::SeqCst),
     }
 }
 
@@ -17502,6 +17731,8 @@ fn restore_linux_thread_runtime_state(
         X86_RUNTIME.LINUX_THREAD_STATES[slot].store(state.state, Ordering::SeqCst);
         X86_RUNTIME.LINUX_THREAD_GENERATIONS[slot].store(state.generation, Ordering::SeqCst);
         X86_RUNTIME.LINUX_THREAD_TIDS[slot].store(state.tid, Ordering::SeqCst);
+        X86_RUNTIME.LINUX_THREAD_NICES[slot].store(state.nice, Ordering::SeqCst);
+        X86_RUNTIME.LINUX_THREAD_CPU_CYCLES[slot].store(state.cpu_cycles, Ordering::SeqCst);
         X86_RUNTIME.LINUX_THREAD_POINTERS[slot].store(state.pointer, Ordering::SeqCst);
         X86_RUNTIME.LINUX_THREAD_TLS_EXTENTS[slot].store(state.tls_extent, Ordering::SeqCst);
         X86_RUNTIME.LINUX_THREAD_TLS_SIZES[slot].store(state.tls_size, Ordering::SeqCst);
@@ -30533,6 +30764,7 @@ fn linux_overlay_stat(metadata: crate::linux_overlay::Metadata) -> [u8; LINUX_ST
         crate::linux_overlay::NodeKind::Directory => 0o040000,
         crate::linux_overlay::NodeKind::Symlink => 0o120000,
         crate::linux_overlay::NodeKind::Fifo => 0o010000,
+        crate::linux_overlay::NodeKind::Socket => 0o140000,
         crate::linux_overlay::NodeKind::CharacterDevice => 0o020000,
         crate::linux_overlay::NodeKind::BlockDevice => 0o060000,
     };
@@ -30952,6 +31184,11 @@ fn linux_openat_path(
             Some(crate::linux_overlay::NodeKind::Fifo) => {
                 return linux_open_named_fifo(flags, handle);
             }
+            Some(crate::linux_overlay::NodeKind::Socket) if flags & LINUX_O_PATH != 0 => {
+                LINUX_FILE_TMP_SCRATCH
+            }
+            // A socket file is not opened (Linux's ENXIO); connect(2) names it.
+            Some(crate::linux_overlay::NodeKind::Socket) => return LINUX_ENXIO,
             Some(
                 crate::linux_overlay::NodeKind::CharacterDevice
                 | crate::linux_overlay::NodeKind::BlockDevice,
@@ -31740,6 +31977,7 @@ fn linux_open_by_handle_at(mount_descriptor: u64, handle_address: u64, flags: u6
             LINUX_FILE_TMP_SCRATCH
         }
         crate::linux_overlay::NodeKind::Fifo
+        | crate::linux_overlay::NodeKind::Socket
         | crate::linux_overlay::NodeKind::CharacterDevice
         | crate::linux_overlay::NodeKind::BlockDevice => return LINUX_EOPNOTSUPP,
     };
@@ -32454,6 +32692,9 @@ fn linux_linkat(
             }
             crate::linux_overlay::NodeKind::Fifo => {
                 crate::linux_overlay::create_fifo(destination, source.mode)
+            }
+            crate::linux_overlay::NodeKind::Socket => {
+                crate::linux_overlay::create_socket(destination, source.mode)
             }
             kind @ (crate::linux_overlay::NodeKind::CharacterDevice
             | crate::linux_overlay::NodeKind::BlockDevice) => {
@@ -33894,6 +34135,7 @@ fn linux_statx(directory: u64, path_address: u64, flags: u64, mask: u64, stat_ad
                 crate::linux_overlay::NodeKind::Directory => 0o040000,
                 crate::linux_overlay::NodeKind::Symlink => 0o120000,
                 crate::linux_overlay::NodeKind::Fifo => 0o010000,
+                crate::linux_overlay::NodeKind::Socket => 0o140000,
                 crate::linux_overlay::NodeKind::CharacterDevice => 0o020000,
                 crate::linux_overlay::NodeKind::BlockDevice => 0o060000,
             } | metadata.mode;
@@ -34077,6 +34319,9 @@ fn linux_socket_error(error: crate::linux_socket::Error) -> u64 {
         crate::linux_socket::Error::NotConnected => LINUX_ENOTCONN,
         crate::linux_socket::Error::BrokenPipe => LINUX_EPIPE,
         crate::linux_socket::Error::Reset => LINUX_ECONNRESET,
+        crate::linux_socket::Error::Refused => LINUX_ECONNREFUSED,
+        crate::linux_socket::Error::IsConnected => LINUX_EISCONN,
+        crate::linux_socket::Error::Already => LINUX_EALREADY,
     }
 }
 
@@ -34292,7 +34537,9 @@ fn linux_socket_address(address: u64, length: u64) -> Result<smoltcp::wire::IpEn
     }
     let port = u16::from_be_bytes(sockaddr[2..4].try_into().unwrap());
     let ipv4 = u32::from_be_bytes(sockaddr[4..8].try_into().unwrap());
-    if port == 0 || ipv4 == 0 {
+    // INADDR_ANY as a destination reaches the local host (the socket table
+    // maps it to loopback), as in Linux.
+    if port == 0 {
         return Err(LINUX_EINVAL);
     }
     Ok(crate::linux_socket::endpoint(ipv4, port))
@@ -34364,8 +34611,39 @@ fn linux_socket_bind(descriptor: u64, address: u64, length: u64) -> u64 {
             Ok(length) => length,
             Err(error) => return error,
         };
-        return crate::linux_socket::bind_unix(slot, &path[..path_length])
-            .map_or_else(linux_socket_error, |()| 0);
+        // A pathname becomes a socket file where the path leads, as Linux
+        // makes one (bind04 unlinks it after the test): a name already there
+        // is EADDRINUSE, a missing parent ENOENT. An abstract name has none.
+        let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+        let node_length = if path[0] != 0 {
+            let length = match linux_canonical_path_at(
+                u64::from(LINUX_AT_FDCWD),
+                &path[..path_length],
+                &mut canonical,
+            ) {
+                Ok(length) => length,
+                Err(error) => return error,
+            };
+            if crate::linux_overlay::lookup(&canonical[..length]).is_some()
+                || linux_path_access(&canonical[..length]).is_some()
+            {
+                return LINUX_EADDRINUSE;
+            }
+            if !linux_overlay_parent_exists(&canonical[..length]) {
+                return linux_missing_path_error(&canonical[..length]);
+            }
+            Some(length)
+        } else {
+            None
+        };
+        if let Err(error) = crate::linux_socket::bind_unix(slot, &path[..path_length]) {
+            return linux_socket_error(error);
+        }
+        if let Some(length) = node_length {
+            let mode = 0o777 & !(X86_RUNTIME.ELF_PROBE_UMASK.load(Ordering::SeqCst) as u32);
+            let _ = crate::linux_overlay::create_socket(&canonical[..length], mode);
+        }
+        return 0;
     }
     let (address, port) = match linux_socket_bind_address(address, length) {
         Ok(endpoint) => endpoint,
@@ -34422,7 +34700,11 @@ fn linux_socket_accept(descriptor: u64, address: u64, length: u64, flags: u64) -
     if !linux_socket_accept_address_valid(address, length) {
         return LINUX_EFAULT;
     }
-    let accepted = if linux_socket_nonblocking(descriptor) {
+    let accepted = if linux_socket_nonblocking(descriptor)
+        || X86_RUNTIME
+            .LINUX_SOCKET_SINGLE_ATTEMPT
+            .load(Ordering::SeqCst)
+    {
         crate::linux_socket::accept(listener_slot)
     } else {
         crate::linux_socket::accept_blocking(listener_slot)
@@ -34451,6 +34733,33 @@ fn linux_socket_accept(descriptor: u64, address: u64, length: u64, flags: u64) -
     accepted_descriptor
 }
 
+/// accept(2) (system call `number`) on a blocking listener waits as a
+/// blocking read does: one attempt, then a ready sibling thread or the
+/// other processes run and the call starts again, until SO_RCVTIMEO passes.
+/// A listener that spun inside the kernel with the entry lock held kept the
+/// peer that would connect, a thread or a child on another CPU, from ever
+/// entering it (bind04, connect01, setsockopt10).
+#[allow(clippy::too_many_arguments)]
+fn linux_socket_accept_live_return(
+    output: *mut LinuxSyscallFrame,
+    caller: LinuxUserContext,
+    number: u64,
+    descriptor: u64,
+    address: u64,
+    length: u64,
+    flags: u64,
+) -> u64 {
+    if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::Acquire)
+        && linux_socket_slot(descriptor).is_some()
+        && !linux_socket_nonblocking(descriptor)
+    {
+        return linux_local_socket_io_live_return(output, caller, number, descriptor, || {
+            linux_socket_accept(descriptor, address, length, flags)
+        });
+    }
+    linux_socket_accept(descriptor, address, length, flags)
+}
+
 fn linux_socket_connect(descriptor: u64, address: u64, length: u64) -> u64 {
     let Some(slot) = linux_socket_slot(descriptor) else {
         return linux_not_socket_error(descriptor);
@@ -34467,7 +34776,25 @@ fn linux_socket_connect(descriptor: u64, address: u64, length: u64) -> u64 {
         return match crate::linux_socket::connect_unix(slot, &path[..path_length]) {
             Ok(()) => 0,
             Err(crate::linux_socket::Error::NotConnected) if path[0] == 0 => LINUX_ECONNREFUSED,
-            Err(crate::linux_socket::Error::NotConnected) => LINUX_ENOENT,
+            // A socket file nothing is bound to any more refuses; a path
+            // with no file is ENOENT.
+            Err(crate::linux_socket::Error::NotConnected) => {
+                let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+                match linux_canonical_path_at(
+                    u64::from(LINUX_AT_FDCWD),
+                    &path[..path_length],
+                    &mut canonical,
+                ) {
+                    Ok(length)
+                        if crate::linux_overlay::lookup(&canonical[..length]).is_some_and(
+                            |metadata| metadata.kind == crate::linux_overlay::NodeKind::Socket,
+                        ) =>
+                    {
+                        LINUX_ECONNREFUSED
+                    }
+                    _ => LINUX_ENOENT,
+                }
+            }
             Err(error) => linux_socket_error(error),
         };
     }
@@ -35545,6 +35872,9 @@ fn linux_socket_setsockopt(
             Some(crate::linux_socket::BooleanOption::NoDelay)
         }
         (1, 7 | 8) => None,
+        // TCP_ULP: no upper-layer protocol (TLS) is loadable here, which
+        // Linux reports as ENOENT (setsockopt10 then reports TCONF).
+        (6, 31) => return LINUX_ENOENT,
         _ => return LINUX_ENOPROTOOPT,
     };
     if length < 4 {
@@ -36498,6 +36828,20 @@ fn linux_regular_file_read_kernel(
         let handle = linux_tmp_descriptor_handle(descriptor, state).ok_or(LINUX_EBADF)?;
         return linux_tmpfs::read(handle, offset, output).ok_or(LINUX_EBADF);
     }
+    // /dev/zero and /dev/full read as zeros and /dev/urandom as random
+    // bytes from the kernel's side too, so they can be spliced into a pipe
+    // (splice08).
+    if state & LINUX_DEVICE_ZERO != 0 && state & LINUX_DEVICE_DIRECTORY == 0 {
+        if state & !3 == LINUX_DEVICE_RANDOM {
+            for chunk in output.chunks_mut(16) {
+                let random = linux_startup_random().ok_or(LINUX_EIO)?;
+                chunk.copy_from_slice(&random[..chunk.len()]);
+            }
+        } else {
+            output.fill(0);
+        }
+        return Ok(output.len());
+    }
     Err(if linux_descriptor_open(descriptor) {
         LINUX_ESPIPE
     } else {
@@ -37364,6 +37708,15 @@ fn linux_descriptor_read_live_return(
     address: u64,
     count: u64,
 ) -> u64 {
+    // A read of nothing from a pipe or socket is done at once, as Linux's
+    // pipe_read and sock_read_iter return 0 before looking for data
+    // (splice08 reads 0 bytes from an empty pipe).
+    if count == 0
+        && (linux_socket_slot(descriptor).is_some()
+            || linux_socket_pipe_descriptor(descriptor, LINUX_DESCRIPTOR_INPUT))
+    {
+        return 0;
+    }
     if linux_blocking_socket_yields(descriptor) {
         // A thread of a process with another ready thread blocks on an
         // empty pipe until a writer fills it, as in Linux: retrying in a
@@ -37853,9 +38206,14 @@ fn linux_blocking_descriptor_io_live_return(
 /// too: spinning out its timeout held the domain's only CPU from the peer
 /// (cadrs's geometry kernel could not send the hello its app waited 10 s
 /// for). Threads on application processors keep the in-kernel waits.
+/// Whether a blocking call on socket `descriptor` lets the rest of the
+/// domain run instead of polling inside the kernel: on every CPU. A thread
+/// on the light path goes to the owner for it, and a process an
+/// application processor owns starts the call again; the bounded poll with
+/// the entry lock held kept the writer, on another CPU, out of the kernel
+/// until the poll gave up (bind04's peer thread read EAGAIN).
 fn linux_blocking_socket_yields(descriptor: u64) -> bool {
     X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::Acquire)
-        && current_linux_runtime_cpu_index() == 0
         && linux_socket_slot(descriptor).is_some()
         && !linux_socket_nonblocking(descriptor)
 }
@@ -39006,9 +39364,12 @@ impl LinuxSpliceEnd {
         match linux_socket_slot(descriptor) {
             Some(slot) if state & LINUX_DEVICE_PIPE != 0 => Self::Pipe(slot),
             Some(slot) => Self::Socket(slot),
+            // /dev/zero, /dev/full and /dev/urandom read as files do, so
+            // they can be spliced into a pipe (splice08).
             None if linux_overlay_descriptor_handle(descriptor).is_some()
                 || linux_rootfs_descriptor(descriptor) != 0
-                || linux_tmp_descriptor_handle(descriptor, state).is_some() =>
+                || linux_tmp_descriptor_handle(descriptor, state).is_some()
+                || state & LINUX_DEVICE_ZERO != 0 && state & LINUX_DEVICE_DIRECTORY == 0 =>
             {
                 Self::File
             }
@@ -45276,6 +45637,7 @@ fn linux_getdents(descriptor: u64, address: u64, count: u64, legacy: bool) -> u6
                     crate::linux_overlay::NodeKind::Directory => 4,
                     crate::linux_overlay::NodeKind::Symlink => 10,
                     crate::linux_overlay::NodeKind::Fifo => 1,
+                    crate::linux_overlay::NodeKind::Socket => 12,
                     crate::linux_overlay::NodeKind::CharacterDevice => 2,
                     crate::linux_overlay::NodeKind::BlockDevice => 6,
                 };
@@ -46494,9 +46856,17 @@ fn linux_set_process_nice(pid: u32, nice: u8) -> bool {
     }
     if pid == current_linux_process_pid() {
         X86_RUNTIME.ELF_PROBE_NICE.store(nice, Ordering::SeqCst);
+        if let Some(handle) = linux_thread_handle_by_tid(u64::from(pid)) {
+            X86_RUNTIME.LINUX_THREAD_NICES[usize::from(handle.slot)].store(nice, Ordering::SeqCst);
+        }
         true
     } else if let Some(state) = linux_process_runtime_state(pid).filter(|state| state.valid) {
         state.nice = nice;
+        if let Some(threads) = linux_process_thread_runtime_state(pid) {
+            for thread in threads.iter_mut().filter(|thread| thread.tid == pid) {
+                thread.nice = nice;
+            }
+        }
         true
     } else {
         false
@@ -46527,7 +46897,30 @@ fn linux_set_process_ioprio(pid: u32, priority: u16) -> bool {
     }
 }
 
+/// The thread slot `who` names for PRIO_PROCESS in the calling process: the
+/// calling thread for 0 or its own id, another thread by its id; None for a
+/// process id (its main thread's, or another process).
+fn linux_priority_thread_slot(which: u64, who: u64) -> Option<usize> {
+    if which as u32 != LINUX_PRIO_PROCESS {
+        return None;
+    }
+    let who = who as u32;
+    if who == 0 {
+        return current_linux_thread_slot();
+    }
+    if who == current_linux_process_pid() {
+        return None;
+    }
+    linux_thread_handle_by_tid(u64::from(who)).map(|handle| usize::from(handle.slot))
+}
+
 fn linux_getpriority(which: u64, who: u64) -> u64 {
+    // A thread's own nice (nice() and getpriority(PRIO_PROCESS, 0) in a
+    // thread are the thread's), as Linux keeps nice per task.
+    if let Some(slot) = linux_priority_thread_slot(which, who) {
+        let nice = X86_RUNTIME.LINUX_THREAD_NICES[slot].load(Ordering::SeqCst);
+        return u64::from(40 - nice.min(39));
+    }
     let (targets, count) = match linux_priority_targets(which, who) {
         Ok(targets) => targets,
         Err(error) => return error,
@@ -46552,6 +46945,20 @@ fn linux_setpriority(which: u64, who: u64, priority: u64) -> u64 {
     let Some(caller) = current_linux_credentials() else {
         return LINUX_ESRCH;
     };
+    if let Some(slot) = linux_priority_thread_slot(which, who) {
+        let current = X86_RUNTIME.LINUX_THREAD_NICES[slot].load(Ordering::SeqCst);
+        if !caller.privileged() && encoded < current {
+            return LINUX_EACCES;
+        }
+        X86_RUNTIME.LINUX_THREAD_NICES[slot].store(encoded, Ordering::SeqCst);
+        // The main thread's nice is the process's.
+        if X86_RUNTIME.LINUX_THREAD_TIDS[slot].load(Ordering::SeqCst) == current_linux_process_pid()
+            && !linux_set_process_nice(current_linux_process_pid(), encoded)
+        {
+            return LINUX_ESRCH;
+        }
+        return 0;
+    }
     let mut result = LINUX_ESRCH;
     for pid in targets[..count].iter().copied() {
         let Some(target) = linux_process::live_process_credentials(pid) else {

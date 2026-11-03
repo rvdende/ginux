@@ -391,6 +391,8 @@ interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_THREAD_
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_THREAD_STATES	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_THREAD_OWNER_ONLY	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_THREAD_TIDS	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
+interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_THREAD_NICES	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
+interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_THREAD_CPU_CYCLES	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_THREAD_TLS_EXTENTS	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_THREAD_TLS_SIZES	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_THREAD_WAIT_DEADLINES	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
@@ -598,6 +600,8 @@ interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_PARK_REFUSALS	per-cpu-arch	
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_LIGHT_THREAD_BANK	per-cpu-arch	allowlist	none	per-cpu-light-thread-publication
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_LIGHT_THREAD_SLOT	per-cpu-arch	allowlist	none	per-cpu-light-thread-publication
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_LIGHT_THREAD_YIELDED	per-cpu-arch	allowlist	none	per-cpu-light-thread-publication
+interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_PREEMPTION_SWITCHED	per-cpu-arch	allowlist	none	per-cpu-light-thread-publication
+interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_THREAD_CPU_MARK	per-cpu-arch	allowlist	none	per-cpu-light-thread-publication
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_LIGHT_RUNS	per-cpu-arch	allowlist	none	diagnostic-counter
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_LIGHT_MIGRATIONS	per-cpu-arch	allowlist	none	diagnostic-counter
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_LIGHT_LAST_MIGRATION	per-cpu-arch	allowlist	none	diagnostic-counter

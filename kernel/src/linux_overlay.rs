@@ -22,6 +22,8 @@ pub(crate) enum NodeKind {
     Directory,
     Symlink,
     Fifo,
+    /// A UNIX socket's name in the filesystem (bind(2) on a pathname).
+    Socket,
     /// A device file (mknod S_IFCHR or S_IFBLK); `Metadata::device` says
     /// which device.
     CharacterDevice,
@@ -877,6 +879,11 @@ pub(crate) fn create_fifo(path: &[u8], mode: u32) -> Option<Handle> {
     create(path, NodeKind::Fifo, mode, &[])
 }
 
+/// Creates the socket file a UNIX socket is bound to at `path`.
+pub(crate) fn create_socket(path: &[u8], mode: u32) -> Option<Handle> {
+    create(path, NodeKind::Socket, mode, &[])
+}
+
 /// Creates a device file at `path` for `device` (mknod S_IFCHR or S_IFBLK).
 pub(crate) fn create_device(path: &[u8], kind: NodeKind, mode: u32, device: u32) -> Option<Handle> {
     if !matches!(kind, NodeKind::CharacterDevice | NodeKind::BlockDevice) {
@@ -1041,7 +1048,11 @@ pub(crate) fn read(handle: Handle, offset: usize, output: &mut [u8]) -> Option<u
     let node = node_mut(handle)?;
     if matches!(
         node.kind,
-        NodeKind::Directory | NodeKind::Fifo | NodeKind::CharacterDevice | NodeKind::BlockDevice
+        NodeKind::Directory
+            | NodeKind::Fifo
+            | NodeKind::Socket
+            | NodeKind::CharacterDevice
+            | NodeKind::BlockDevice
     ) {
         return None;
     }
@@ -1105,7 +1116,11 @@ pub(crate) fn write(handle: Handle, offset: usize, input: &[u8]) -> Option<usize
     let node = node_mut(handle)?;
     if matches!(
         node.kind,
-        NodeKind::Directory | NodeKind::Fifo | NodeKind::CharacterDevice | NodeKind::BlockDevice
+        NodeKind::Directory
+            | NodeKind::Fifo
+            | NodeKind::Socket
+            | NodeKind::CharacterDevice
+            | NodeKind::BlockDevice
     ) {
         return None;
     }

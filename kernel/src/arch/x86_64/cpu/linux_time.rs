@@ -1,8 +1,67 @@
 use super::*;
 
+/// The CPU time a clock id names, in cycles: CLOCK_PROCESS_CPUTIME_ID and
+/// CLOCK_THREAD_CPUTIME_ID for the caller, and the ids clock_getcpuclockid
+/// and pthread_getcpuclockid make (negative: the pid or tid in the upper
+/// bits, inverted, the kind in the low three, bit 2 for a thread). None for
+/// a clock that is not a CPU clock; an error for a process or thread that
+/// is not there (EINVAL, as Linux answers an invalid clock id).
+fn linux_cpu_clock_cycles(clock: u64) -> Option<Result<u64, u64>> {
+    let id = clock as u32 as i32;
+    let pid = current_linux_process_pid();
+    if id == LINUX_CLOCK_PROCESS_CPUTIME_ID as i32 {
+        return Some(Ok(linux_process_cpu_cycles(pid)));
+    }
+    if id == LINUX_CLOCK_THREAD_CPUTIME_ID as i32 {
+        return Some(Ok(
+            current_linux_thread_slot().map_or(0, linux_thread_cpu_cycles)
+        ));
+    }
+    if id >= 0 {
+        return None;
+    }
+    let target = !(id >> 3) as u32;
+    let per_thread = id & 4 != 0;
+    if id & 3 == 3 {
+        return Some(Err(LINUX_EINVAL));
+    }
+    Some(if per_thread {
+        let own = target == 0 || Some(target) == current_linux_tid();
+        match (own, linux_thread_handle_by_tid(u64::from(target))) {
+            (true, _) => Ok(current_linux_thread_slot().map_or(0, linux_thread_cpu_cycles)),
+            (false, Some(handle)) => Ok(linux_thread_cpu_cycles(usize::from(handle.slot))),
+            (false, None) => Err(LINUX_EINVAL),
+        }
+    } else {
+        let target = if target == 0 { pid } else { target };
+        if linux_process::live_process_status(target).is_none() {
+            Err(LINUX_EINVAL)
+        } else {
+            Ok(linux_process_cpu_cycles(target))
+        }
+    })
+}
+
+/// Timestamp-counter cycles as a (seconds, nanoseconds) pair.
+fn linux_cycles_time(cycles: u64) -> (u64, u64) {
+    let frequency = X86_RUNTIME.ELF_PROBE_CLOCK_FREQUENCY.load(Ordering::SeqCst);
+    if frequency == 0 {
+        return (0, 0);
+    }
+    (
+        cycles / frequency,
+        cycles % frequency * NANOSECONDS_PER_SECOND / frequency,
+    )
+}
+
 pub(super) fn linux_clock_gettime(clock: u64, output_address: u64) -> u64 {
     let clock = u64::from(clock as u32);
-    if !linux_clock_supported(clock) {
+    let cpu_clock = match linux_cpu_clock_cycles(clock) {
+        Some(Ok(cycles)) => Some(linux_cycles_time(cycles)),
+        Some(Err(error)) => return error,
+        None => None,
+    };
+    if cpu_clock.is_none() && !linux_clock_supported(clock) {
         return LINUX_EINVAL;
     }
     let realtime = matches!(
@@ -12,10 +71,12 @@ pub(super) fn linux_clock_gettime(clock: u64, output_address: u64) -> u64 {
             | LINUX_CLOCK_REALTIME_ALARM
             | LINUX_CLOCK_TAI
     );
-    let Some((seconds, mut nanoseconds)) = (if realtime {
-        linux_realtime_time()
-    } else {
-        linux_elapsed_time()
+    let Some((seconds, mut nanoseconds)) = cpu_clock.or_else(|| {
+        if realtime {
+            linux_realtime_time()
+        } else {
+            linux_elapsed_time()
+        }
     }) else {
         return LINUX_ENOSYS;
     };
