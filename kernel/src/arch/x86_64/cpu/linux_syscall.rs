@@ -721,6 +721,7 @@ fn linux_syscall_dispatch(
             } else if linux_rootfs_entry(first_argument).is_some()
                 || linux_regular_file(device).is_some()
                 || linux_tmp_file(device)
+                || device & !3 == LINUX_FILE_PROC_DYNAMIC_PAGEMAP
             {
                 linux_regular_file_seek(first_argument, device, buffer, count)
             } else if device & LINUX_DEVICE_DIRECTORY != 0 {

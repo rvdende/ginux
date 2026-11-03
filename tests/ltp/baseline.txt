@@ -58,7 +58,6 @@ link08 TFAIL
 lsm_list_modules01 TFAIL
 mlock201 TFAIL
 mmap04 TBROK
-mmap12 TFAIL
 mmap13 TFAIL
 mmap18 TBROK
 mmap24 TFAIL

@@ -908,6 +908,11 @@ pub(super) const LINUX_FILE_PROC_DYNAMIC_STATUS: u16 =
 pub(super) const LINUX_PROC_DYNAMIC_STATM_NODE: u16 = 0xe000;
 pub(super) const LINUX_PROC_DYNAMIC_MAPS_NODE: u16 = 0xd100;
 pub(super) const LINUX_FILE_PROC_DYNAMIC_MAPS: u16 = LINUX_FILE_MASK | LINUX_PROC_DYNAMIC_MAPS_NODE;
+/// /proc/PID/pagemap: eight bytes per virtual page, bit 63 set when the
+/// page is present.
+pub(super) const LINUX_PROC_DYNAMIC_PAGEMAP_NODE: u16 = 0xa700;
+pub(super) const LINUX_FILE_PROC_DYNAMIC_PAGEMAP: u16 =
+    LINUX_FILE_MASK | LINUX_PROC_DYNAMIC_PAGEMAP_NODE;
 /// /proc/PID/smaps: maps with each area's sizes (Rss, Locked, ...).
 pub(super) const LINUX_PROC_DYNAMIC_SMAPS_NODE: u16 = 0xaf00;
 pub(super) const LINUX_FILE_PROC_DYNAMIC_SMAPS: u16 =
@@ -1124,7 +1129,7 @@ use super::PAGE_SIZE;
 /// The fixed file nodes and the `/proc/sys` nodes are distinct and clear of
 /// the `/dev/input/eventN` range, so no file is taken for another.
 const _: () = {
-    const NODES: [u16; 47] = [
+    const NODES: [u16; 48] = [
         LINUX_PROC_TASK_DIRECTORY_NODE,
         LINUX_PROC_TASK_COMM_NODE,
         LINUX_PROC_TASK_STAT_NODE,
@@ -1164,6 +1169,7 @@ const _: () = {
         LINUX_PROC_DYNAMIC_STATM_NODE,
         LINUX_PROC_DYNAMIC_MAPS_NODE,
         LINUX_PROC_DYNAMIC_SMAPS_NODE,
+        LINUX_PROC_DYNAMIC_PAGEMAP_NODE,
         LINUX_CGROUP_DIRECTORY_NODE,
         LINUX_MOUNTINFO_FILE_NODE,
         LINUX_UID_MAP_FILE_NODE,

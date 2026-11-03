@@ -29312,6 +29312,7 @@ fn linux_proc_pid_file_kind(pid: u32, name: &[u8]) -> Option<u16> {
         (_, b"statm") => Some(LINUX_FILE_PROC_DYNAMIC_STATM),
         (_, b"maps") => Some(LINUX_FILE_PROC_DYNAMIC_MAPS),
         (_, b"smaps") => Some(LINUX_FILE_PROC_DYNAMIC_SMAPS),
+        (_, b"pagemap") => Some(LINUX_FILE_PROC_DYNAMIC_PAGEMAP),
         (_, b"comm") => Some(LINUX_FILE_PROC_TASK_COMM),
         (_, b"task" | b"task/") => Some(LINUX_PROC_TASK_DIRECTORY),
         (_, name) if name.starts_with(b"task/") => linux_proc_task_file_kind(pid, &name[5..]),
@@ -33001,6 +33002,7 @@ fn linux_openat_path(
                     | b"statm"
                     | b"maps"
                     | b"smaps"
+                    | b"pagemap"
                     | b"oom_score_adj"
                     | b"comm"
                     | b"task"
@@ -38722,6 +38724,7 @@ fn linux_descriptor_read(descriptor: u64, address: u64, count: u64) -> u64 {
             | LINUX_FILE_PROC_DYNAMIC_STATM
             | LINUX_FILE_PROC_DYNAMIC_MAPS
             | LINUX_FILE_PROC_DYNAMIC_SMAPS
+            | LINUX_FILE_PROC_DYNAMIC_PAGEMAP
             | LINUX_FILE_PROC_OOM_SCORE_ADJ
             | LINUX_FILE_PROC_TASK_COMM
             | LINUX_FILE_PROC_TASK_STAT
@@ -38962,6 +38965,45 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
             .min(used);
         return if copy_to_linux_user(address, &file[start..end]) {
             (end - start) as u64
+        } else {
+            LINUX_EFAULT
+        };
+    }
+    // /proc/PID/pagemap: an entry of eight bytes for each virtual page,
+    // made for the range read: bit 63 when the page is present (another
+    // process's pages read as absent), the frame number withheld (0), as
+    // Linux withholds it without CAP_SYS_ADMIN.
+    if state & !3 == LINUX_FILE_PROC_DYNAMIC_PAGEMAP {
+        let Some(pid) = linux_proc_dynamic_descriptor_pid(descriptor) else {
+            return LINUX_EBADF;
+        };
+        let own = pid == current_linux_process_pid();
+        let count = usize::try_from(count).unwrap_or(usize::MAX).min(PAGE_SIZE);
+        let first = offset / 8;
+        let skip = (offset % 8) as usize;
+        let mut entries = [0_u8; PAGE_SIZE + 8];
+        let mut used = 0;
+        let mut page = first;
+        while used < skip + count && used + 8 <= entries.len() {
+            let address = page.saturating_mul(PAGE_SIZE as u64);
+            if address >= 1 << 47 {
+                break;
+            }
+            let present = own
+                && address_space::current_linux_runtime_page(address)
+                    .frame
+                    .is_some();
+            let entry: u64 = if present { 1 << 63 | 1 << 56 } else { 0 };
+            entries[used..used + 8].copy_from_slice(&entry.to_ne_bytes());
+            used += 8;
+            page += 1;
+        }
+        let end = used.min(skip + count);
+        if skip >= end {
+            return 0;
+        }
+        return if copy_to_linux_user(address, &entries[skip..end]) {
+            (end - skip) as u64
         } else {
             LINUX_EFAULT
         };
@@ -46704,6 +46746,7 @@ fn linux_proc_dynamic_descriptor_pid(descriptor: u64) -> Option<u32> {
             | LINUX_FILE_PROC_DYNAMIC_STATM
             | LINUX_FILE_PROC_DYNAMIC_MAPS
             | LINUX_FILE_PROC_DYNAMIC_SMAPS
+            | LINUX_FILE_PROC_DYNAMIC_PAGEMAP
             | LINUX_FILE_PROC_OOM_SCORE_ADJ
             | LINUX_FILE_PROC_TASK_COMM
             | LINUX_FILE_PROC_TASK_STAT
@@ -46756,6 +46799,7 @@ fn linux_proc_file(state: u16) -> bool {
             | LINUX_FILE_PROC_DYNAMIC_STATM
             | LINUX_FILE_PROC_DYNAMIC_MAPS
             | LINUX_FILE_PROC_DYNAMIC_SMAPS
+            | LINUX_FILE_PROC_DYNAMIC_PAGEMAP
             | LINUX_FILE_PROC_TASK_COMM
             | LINUX_FILE_PROC_TASK_STAT
             | LINUX_FILE_PROC_MOUNTS
@@ -46955,6 +46999,7 @@ fn linux_regular_file(state: u16) -> Option<&'static [u8]> {
         | LINUX_FILE_PROC_DYNAMIC_STATM
         | LINUX_FILE_PROC_DYNAMIC_MAPS
         | LINUX_FILE_PROC_DYNAMIC_SMAPS
+        | LINUX_FILE_PROC_DYNAMIC_PAGEMAP
         | LINUX_FILE_PROC_TASK_COMM
         | LINUX_FILE_PROC_TASK_STAT => return None,
         LINUX_FILE_PROC_PID1_STAT => return Some(LINUX_PROC_PID1_STAT),
@@ -47046,7 +47091,8 @@ fn linux_regular_file_inode(state: u16) -> Option<u64> {
         | LINUX_FILE_PROC_DYNAMIC_STATUS
         | LINUX_FILE_PROC_DYNAMIC_STATM
         | LINUX_FILE_PROC_DYNAMIC_MAPS
-        | LINUX_FILE_PROC_DYNAMIC_SMAPS => return Some(48),
+        | LINUX_FILE_PROC_DYNAMIC_SMAPS
+        | LINUX_FILE_PROC_DYNAMIC_PAGEMAP => return Some(48),
         LINUX_FILE_PROC_TASK_COMM => return Some(95),
         LINUX_FILE_PROC_TASK_STAT => return Some(96),
         _ => {}
@@ -49439,6 +49485,7 @@ fn linux_getdents(descriptor: u64, address: u64, count: u64, legacy: bool) -> u6
                 (41, 8, b"environ"),
                 (file(LINUX_FILE_PROC_DYNAMIC_MAPS), 8, b"maps"),
                 (file(LINUX_FILE_PROC_DYNAMIC_SMAPS), 8, b"smaps"),
+                (file(LINUX_FILE_PROC_DYNAMIC_PAGEMAP), 8, b"pagemap"),
                 (file(LINUX_FILE_PROC_MOUNTS), 8, b"mounts"),
                 (file(LINUX_FILE_PROC_OOM_SCORE_ADJ), 8, b"oom_score_adj"),
                 (
