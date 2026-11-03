@@ -164,6 +164,78 @@ pub(crate) fn protection_at(instance: usize, pid: u32, address: u64) -> Option<P
         .map(|area| area.protection)
 }
 
+/// A copy of `pid`'s area covering `address`.
+pub(crate) fn area_at(instance: usize, pid: u32, address: u64) -> Option<Area> {
+    PROCESSES
+        .lock()
+        .iter()
+        .find(|process| process.instance == instance && process.pid == pid)?
+        .areas
+        .find(address)
+        .cloned()
+}
+
+/// Copies of `pid`'s shared mappings of file (`device`, `inode`).
+pub(crate) fn shared_file_areas(instance: usize, pid: u32, device: u64, inode: u64) -> Vec<Area> {
+    let processes = PROCESSES.lock();
+    let Some(process) = processes
+        .iter()
+        .find(|process| process.instance == instance && process.pid == pid)
+    else {
+        return Vec::new();
+    };
+    let mapping_file = |area: &&Area| {
+        area.shared
+            && matches!(
+                area.backing,
+                Backing::File {
+                    device: mapped_device,
+                    inode: mapped_inode,
+                    ..
+                } if mapped_device == device && mapped_inode == inode
+            )
+    };
+    let mut areas = Vec::new();
+    if areas
+        .try_reserve_exact(process.areas.iter().filter(mapping_file).count())
+        .is_ok()
+    {
+        areas.extend(process.areas.iter().filter(mapping_file).cloned());
+    }
+    areas
+}
+
+/// Grows `pid`'s area that grows down (MAP_GROWSDOWN) above `address`,
+/// which no area holds, down to the page of `address`, as Linux grows a
+/// stack on a fault below it: unless that comes within `gap` bytes (the
+/// stack guard gap) of an accessible area below. Returns the grown area's
+/// old start and its protection.
+pub(crate) fn grow_down(
+    instance: usize,
+    pid: u32,
+    address: u64,
+    gap: u64,
+) -> Option<(u64, Protection)> {
+    let page = address & !(PAGE_SIZE - 1);
+    let mut processes = PROCESSES.lock();
+    let process = processes
+        .iter_mut()
+        .find(|process| process.instance == instance && process.pid == pid)?;
+    let (above, below) = process.areas.grows_down_over(page)?;
+    if below.is_some_and(|below| {
+        !below.grows_down && below.protection.bits() != 0 && page - below.end < gap
+    }) {
+        return None;
+    }
+    let grown = Area {
+        start: page,
+        ..above.clone()
+    };
+    let (old_start, protection) = (above.start, above.protection);
+    process.areas.map(grown).ok()?;
+    Some((old_start, protection))
+}
+
 /// Whether some area of `pid` overlaps `length` bytes at `start`.
 pub(crate) fn overlaps(instance: usize, pid: u32, start: u64, length: u64) -> bool {
     let Some(end) = start.checked_add(length) else {
@@ -276,6 +348,7 @@ pub(crate) fn remap(
             shared: area.shared,
             may_write: area.may_write,
             locked: area.locked,
+            grows_down: area.grows_down,
             backing,
         });
     });

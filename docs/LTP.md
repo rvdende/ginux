@@ -122,13 +122,15 @@ feature rather than a fix:
 - **Writable and executable memory** is allowed in a domain set
   `write-execute=true` (the LTP domain is); each page is writable or
   executable at a time and flips on the access that needs the other
-  (mincore02 passes). mmap04 still fails on a shared anonymous mapping
-  placed over a private one.
+  (mincore02 passes).
 - **io_uring** (io_uring01, 03, 04): one minimal ring per process.
 - **fanotify, keyctl, loop devices, perf events**: missing features or
   kernel config the tests parse (`/proc/config.gz`).
 - **Memory details**: mmap, madvise, mremap, msync, mlock and mseal
-  corner cases, `/proc/self/smaps`, `/proc/PID/pagemap`.
+  corner cases, `/proc/self/smaps`, `/proc/PID/pagemap`. MAP_32BIT
+  cannot place anything (mmap24): the kernel's identity map holds the
+  first 4 GiB of every process. Shrinking a file turns its pages past
+  the new end into SIGBUS pages only in the process that truncates it.
 - **musl, not the kernel**: tests that cannot pass with musl are skipped
   in `tests/ltp/syscalls.list` with the reason (fork() is the fork system
   call, readlink with size 0 gets a one-byte buffer, fchmod retries

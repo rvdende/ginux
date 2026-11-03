@@ -900,7 +900,7 @@ fn linux_syscall_dispatch(
         LINUX_MSYNC_SYSCALL => linux_msync(first_argument, buffer, count),
         // A shared mapping that may not be written cannot be made writable
         // (EACCES: Linux's VM_MAYWRITE).
-        LINUX_MPROTECT_SYSCALL
+        LINUX_MPROTECT_SYSCALL | LINUX_PKEY_MPROTECT_SYSCALL
             if runtime_mode
                 && count & LINUX_PROT_WRITE != 0
                 && crate::linux_areas::write_forbidden(
@@ -912,8 +912,12 @@ fn linux_syscall_dispatch(
         {
             LINUX_EACCES
         }
-        LINUX_MPROTECT_SYSCALL => {
-            let result = linux_mprotect(first_argument, buffer, count);
+        LINUX_MPROTECT_SYSCALL | LINUX_PKEY_MPROTECT_SYSCALL => {
+            let result = if number == LINUX_MPROTECT_SYSCALL {
+                linux_mprotect(first_argument, buffer, count)
+            } else {
+                linux_pkey_mprotect(first_argument, buffer, count, register(0))
+            };
             if result == 0 && runtime_mode {
                 crate::linux_areas::protect(
                     linux_execution_instance(),
@@ -926,9 +930,6 @@ fn linux_syscall_dispatch(
             result
         }
         LINUX_MSEAL_SYSCALL => linux_mseal(first_argument, buffer, count),
-        LINUX_PKEY_MPROTECT_SYSCALL => {
-            linux_pkey_mprotect(first_argument, buffer, count, register(0))
-        }
         LINUX_PKEY_ALLOC_SYSCALL => linux_pkey_alloc(first_argument, buffer),
         LINUX_PKEY_FREE_SYSCALL => linux_pkey_free(first_argument),
         LINUX_IOCTL_SYSCALL => {

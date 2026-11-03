@@ -5993,6 +5993,34 @@ impl PageEntry {
             unsafe { self.0.write(value) }
         }
     }
+
+    /// Sets `bits` atomically, so a bit the processor sets meanwhile (the
+    /// accessed or dirty bit) is kept.
+    fn set_bits(self, bits: u64) {
+        if !self.0.is_null() {
+            // SAFETY: as for read; entries are aligned u64s, and the
+            // processor updates them atomically too.
+            unsafe { AtomicU64::from_ptr(self.0) }.fetch_or(bits, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Whether the present page at `address` has been read or written since
+/// it was mapped (its accessed or dirty bit): for anonymous shared memory,
+/// whether the page is resident as Linux counts it (mincore).
+pub(crate) fn current_linux_page_accessed(address: u64) -> bool {
+    current_linux_leaf(address).is_some_and(|entry| {
+        let value = entry.read();
+        value & PRESENT != 0 && value & (ACCESSED | DIRTY) != 0
+    })
+}
+
+/// Marks the present page at `address` accessed, as faulting it in would
+/// (mlock populating anonymous shared memory).
+pub(crate) fn mark_current_linux_page_accessed(address: u64) {
+    if let Some(entry) = current_linux_leaf(address).filter(|entry| entry.read() & PRESENT != 0) {
+        entry.set_bits(ACCESSED);
+    }
 }
 
 fn current_linux_leaf(address: u64) -> Option<PageEntry> {

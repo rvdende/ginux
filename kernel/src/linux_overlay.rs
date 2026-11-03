@@ -674,6 +674,27 @@ pub(crate) fn memfd_frame(handle: Handle, index: usize) -> Option<FrameLease> {
     memfd_page(node, index, true)
 }
 
+/// The frame holding page `index` of a paged file, if the page has one:
+/// what a shared mapping of that page maps. Nothing is allocated.
+pub(crate) fn paged_frame(handle: Handle, index: usize) -> Option<FrameLease> {
+    let node = node_mut(handle)?;
+    node.paged().then_some(())?;
+    memfd_page(node, index, false)
+}
+
+/// The paged file whose inode is `inode` (not a hard link's name for it):
+/// the file a shared mapping recorded by inode maps.
+pub(crate) fn paged_file(inode: u64) -> Option<Handle> {
+    let overlay = live()?;
+    for_each_node(overlay, |node| {
+        (node.handle.inode == inode
+            && node.alias_of.is_none()
+            && node.kind == NodeKind::File
+            && node.paged())
+        .then_some(node.handle)
+    })
+}
+
 /// Makes the unnamed node behind an anonymous shared mapping. Its pages are
 /// allocated zeroed as they are first mapped (`memfd_frame`).
 pub(crate) fn create_shmem() -> Option<Handle> {

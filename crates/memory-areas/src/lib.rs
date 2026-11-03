@@ -135,6 +135,9 @@ pub struct Area {
     pub may_write: bool,
     /// Locked in memory (Linux's VM_LOCKED): mlock, mlockall or MAP_LOCKED.
     pub locked: bool,
+    /// A stack that grows down (MAP_GROWSDOWN, Linux's VM_GROWSDOWN): a
+    /// fault just below it extends it (`Areas::grows_down_over`).
+    pub grows_down: bool,
     pub backing: Backing,
 }
 
@@ -161,6 +164,7 @@ impl Area {
             shared: self.shared,
             may_write: self.may_write,
             locked: self.locked,
+            grows_down: self.grows_down,
             backing: self.backing.advanced(start - self.start),
         }
     }
@@ -172,6 +176,7 @@ impl Area {
             && self.shared == next.shared
             && self.may_write == next.may_write
             && self.locked == next.locked
+            && self.grows_down == next.grows_down
             && self.backing.continues_into(self.len(), &next.backing)
     }
 }
@@ -326,6 +331,19 @@ impl Areas {
             .sum()
     }
 
+    /// For an address no area holds: the area above it, if that grows
+    /// down (so a fault at the address may extend it), and the area below
+    /// the address, whose distance from it Linux's stack guard gap bounds.
+    pub fn grows_down_over(&self, address: u64) -> Option<(&Area, Option<&Area>)> {
+        let index = self.areas.partition_point(|area| area.end <= address);
+        let above = self
+            .areas
+            .get(index)
+            .filter(|area| area.start > address && area.grows_down)?;
+        let below = index.checked_sub(1).and_then(|index| self.areas.get(index));
+        Some((above, below))
+    }
+
     /// Whether some area overlaps `[start, end)`.
     pub fn overlaps(&self, start: u64, end: u64) -> bool {
         self.overlapping(start, end).next().is_some()
@@ -475,6 +493,7 @@ mod tests {
             shared: false,
             may_write: true,
             locked: false,
+            grows_down: false,
             backing: Backing::Anonymous,
         }
     }
@@ -487,6 +506,7 @@ mod tests {
             shared: false,
             may_write: true,
             locked: false,
+            grows_down: false,
             backing: Backing::File {
                 device: 1,
                 inode: 7,
@@ -687,5 +707,29 @@ mod tests {
         areas.set_lock_future(true);
         areas.map(anonymous(10, 12, RW)).unwrap();
         assert_eq!(areas.locked_bytes(), 2 * PAGE_SIZE);
+    }
+
+    #[test]
+    fn a_stack_that_grows_down_is_found_from_below() {
+        let mut areas = Areas::new();
+        areas.map(anonymous(0, 2, RW)).unwrap();
+        areas
+            .map(Area {
+                grows_down: true,
+                ..anonymous(10, 12, RW)
+            })
+            .unwrap();
+        let (above, below) = areas.grows_down_over(5 * PAGE_SIZE).unwrap();
+        assert_eq!(above.start, 10 * PAGE_SIZE);
+        assert_eq!(below.map(|area| area.end), Some(2 * PAGE_SIZE));
+        assert!(areas.grows_down_over(10 * PAGE_SIZE).is_none());
+        assert!(areas.grows_down_over(12 * PAGE_SIZE).is_none());
+        areas
+            .map(Area {
+                grows_down: true,
+                ..anonymous(9, 10, RW)
+            })
+            .unwrap();
+        assert_eq!(ranges(&areas), [(0, 2, 3), (9, 12, 3)]);
     }
 }

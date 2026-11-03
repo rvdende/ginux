@@ -45,14 +45,10 @@ keyctl29 TBROK
 keyctl30 TBROK
 kcmp03 TFAIL
 lsm_list_modules01 TFAIL
-mlock201 TFAIL
-mmap04 TBROK
 mmap18 TBROK
 mmap24 TFAIL
 mount08 TFAIL
 mount_setattr02 TBROK
-mprotect01 TBROK
-mremap01 TFAIL
 msgstress01 TBROK
 openat03 TBROK
 madvise11 TBROK
@@ -60,7 +56,6 @@ pidfd_send_signal01 TFAIL
 pidfd_send_signal02 TFAIL
 pivot_root01 TBROK
 prctl10 TFAIL
-process_vm_readv03 TBROK
 prot_hsymlinks TBROK
 dirtyc0w TBROK
 dirtyc0w_shmem HANG
@@ -68,8 +63,6 @@ ptrace08 TBROK
 ptrace09 TBROK
 ptrace10 TBROK
 ptrace11 TBROK
-remap_file_pages01 TBROK
-sbrk01 TFAIL
 setns02 TWARN
 setxattr03 TBROK
 signal06 TBROK
@@ -79,7 +72,6 @@ unshare03 TFAIL
 unshare05 TBROK
 userfaultfd03 TBROK
 futex_cmp_requeue01 TBROK
-futex_wake05 TFAIL
 io_uring01 TBROK
 io_uring02 TBROK
 io_uring03 TBROK

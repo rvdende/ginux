@@ -23608,20 +23608,101 @@ fn verify_linux_keyring_syscalls() -> bool {
     rejected && cleared && unmapped
 }
 
+/// remap_file_pages(2), as Linux now emulates it: the pages of a shared
+/// file mapping from `start` are mapped again, to the file's pages from
+/// page `page` on, keeping the mapping's protection. The start and length
+/// are rounded down to pages; the range must lie in shared mappings of
+/// one file (EINVAL otherwise).
 fn linux_remap_file_pages(start: u64, length: u64, protection: u64, page: u64, _flags: u64) -> u64 {
-    if start == 0
-        || !start.is_multiple_of(PAGE_SIZE as u64)
-        || length == 0
-        || !length.is_multiple_of(PAGE_SIZE as u64)
-        || protection != 0
-        || page.checked_mul(PAGE_SIZE as u64).is_none()
-    {
+    use crate::linux_areas::{Area, Backing};
+    let start = start & !(PAGE_SIZE as u64 - 1);
+    let length = length & !(PAGE_SIZE as u64 - 1);
+    let pages = length / PAGE_SIZE as u64;
+    let Some(end) = start
+        .checked_add(length)
+        .filter(|end| protection == 0 && *end > start && *end <= 1 << 47)
+    else {
+        return LINUX_EINVAL;
+    };
+    let Some(file_offset) = page
+        .checked_add(pages)
+        .and_then(|_| page.checked_mul(PAGE_SIZE as u64))
+        .and_then(|offset| usize::try_from(offset).ok())
+    else {
+        return LINUX_EINVAL;
+    };
+    if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
         return LINUX_EINVAL;
     }
-    // Linux accepts only MAP_SHARED file VMAs here. Ginux currently exposes
-    // anonymous shared mappings and private file mappings, neither of which is
-    // an eligible nonlinear file VMA.
-    LINUX_EINVAL
+    let (instance, pid) = (linux_execution_instance(), current_linux_process_pid());
+    let Some(first) = crate::linux_areas::area_at(instance, pid, start) else {
+        return LINUX_EINVAL;
+    };
+    let Backing::File {
+        device,
+        inode,
+        ref path,
+        ..
+    } = first.backing
+    else {
+        return LINUX_EINVAL;
+    };
+    let Some((handle, _)) = linux_shared_file_page(start) else {
+        return LINUX_EINVAL;
+    };
+    // The areas the range covers must follow each other without a hole,
+    // all mapping the same file with the same flags.
+    let mut cursor = first.end;
+    while cursor < end {
+        let next = crate::linux_areas::area_at(instance, pid, cursor).filter(|area| {
+            area.start == cursor
+                && area.shared
+                && area.protection == first.protection
+                && area.may_write == first.may_write
+                && area.locked == first.locked
+                && matches!(
+                    area.backing,
+                    Backing::File {
+                        device: next_device,
+                        inode: next_inode,
+                        ..
+                    } if next_device == device && next_inode == inode
+                )
+        });
+        let Some(area) = next else {
+            return LINUX_EINVAL;
+        };
+        cursor = area.end;
+    }
+    if (start..end)
+        .step_by(PAGE_SIZE)
+        .any(|address| address_space::current_linux_runtime_page(address).sealed)
+    {
+        return LINUX_EPERM;
+    }
+    for (index, address) in (start..end).step_by(PAGE_SIZE).enumerate() {
+        let protection = address_space::current_linux_runtime_page(address).protection;
+        if !linux_map_shared_file_page(address, handle, file_offset + index * PAGE_SIZE, protection)
+        {
+            return LINUX_ENOMEM;
+        }
+    }
+    crate::linux_areas::map(
+        instance,
+        pid,
+        Area {
+            start,
+            end,
+            backing: Backing::File {
+                device,
+                inode,
+                offset: file_offset as u64,
+                path: path.clone(),
+            },
+            ..first
+        },
+    );
+    0
 }
 
 fn verify_linux_remap_file_pages_syscall() -> bool {
@@ -25563,6 +25644,12 @@ fn linux_runtime_mmap(
     {
         return LINUX_EBADF;
     }
+    // A mapping of /dev/zero is anonymous memory, private or shared.
+    let flags = if flags & LINUX_MAP_ANONYMOUS == 0 && linux_dev_zero_descriptor(fd) {
+        flags | LINUX_MAP_ANONYMOUS
+    } else {
+        flags
+    };
     let protection = linux_runtime_page_protection(linux_implied_protection(protection));
     if length == 0
         || ![
@@ -25586,7 +25673,9 @@ fn linux_runtime_mmap(
     // MAP_NORESERVE needs a distinct mapping mechanism.
     // MAP_SHARED_VALIDATE is MAP_SHARED that refuses flags it does not
     // know with EOPNOTSUPP instead of ignoring them (mmap20); MAP_32BIT
-    // places the mapping below 2 GiB (mmap23, mmap24).
+    // places the mapping below 2 GiB (mmap23, mmap24). MAP_GROWSDOWN is
+    // kept in the memory areas, which a fault below the mapping grows
+    // (`grow_linux_growsdown_area`, mmap18).
     let shared_validate = flags & LINUX_MAP_SHARED_VALIDATE == LINUX_MAP_SHARED_VALIDATE;
     let flags = if shared_validate {
         flags & !LINUX_MAP_SHARED_VALIDATE | LINUX_MAP_SHARED
@@ -25600,6 +25689,7 @@ fn linux_runtime_mmap(
             | LINUX_MAP_LOCKED
             | LINUX_MAP_NORESERVE
             | LINUX_MAP_STACK
+            | LINUX_MAP_GROWSDOWN
             | LINUX_MAP_32BIT);
     let normalized = flags & !ignored;
     let sharing = normalized & (LINUX_MAP_SHARED | LINUX_MAP_PRIVATE);
@@ -25768,11 +25858,7 @@ fn linux_runtime_mmap(
     };
     let file_backed = !anonymous;
     let replace = fixed;
-    if anonymous
-        && sharing == LINUX_MAP_SHARED
-        && matches!(protection, 1 | 3 | 5)
-        && pages <= LINUX_SHMEM_PAGE_LIMIT
-    {
+    if anonymous && sharing == LINUX_MAP_SHARED && pages <= LINUX_SHMEM_PAGE_LIMIT {
         return linux_map_shared_anonymous(mapping, pages, protection as u8, replace);
     }
     if let Some((handle, start)) = overlay_file.filter(|(handle, _)| {
@@ -25780,7 +25866,7 @@ fn linux_runtime_mmap(
         // a file moved to paged storage on its first shared mapping.
         sharing == LINUX_MAP_SHARED && !secret && crate::linux_overlay::make_paged(*handle)
     }) {
-        return linux_map_shared_memfd(
+        let mapped = linux_map_shared_memfd(
             mapping,
             pages,
             handle,
@@ -25789,6 +25875,10 @@ fn linux_runtime_mmap(
             replace,
             file_size,
         );
+        if replace {
+            crate::linux_overlay::release_unmapped_shmem();
+        }
+        return mapped;
     }
     if replace {
         for page in 0..pages {
@@ -26010,10 +26100,133 @@ fn linux_map_shared_memfd(
             return LINUX_ENOMEM;
         }
     }
-    if replace {
-        crate::linux_overlay::release_unmapped_shmem();
-    }
+    // The caller frees the shared memory the replaced pages held, once
+    // what it maps here is registered (so it is not freed with them).
     mapping
+}
+
+/// The device and inode numbers (st_dev, st_ino) a mapping of overlay
+/// file `handle` is recorded by in the memory areas.
+fn linux_overlay_file_identity(handle: crate::linux_overlay::Handle) -> Option<(u64, u64)> {
+    let stat = linux_overlay_stat(crate::linux_overlay::metadata(handle)?);
+    Some((
+        u64::from_ne_bytes(stat[..8].try_into().ok()?),
+        u64::from_ne_bytes(stat[8..16].try_into().ok()?),
+    ))
+}
+
+/// The paged file, and the offset in it, that the current process's
+/// shared file mapping covering `address` maps there.
+fn linux_shared_file_page(address: u64) -> Option<(crate::linux_overlay::Handle, usize)> {
+    let area = crate::linux_areas::area_at(
+        linux_execution_instance(),
+        current_linux_process_pid(),
+        address,
+    )?;
+    let crate::linux_areas::Backing::File {
+        device,
+        inode,
+        offset,
+        ..
+    } = area.backing
+    else {
+        return None;
+    };
+    if !area.shared {
+        return None;
+    }
+    let handle = crate::linux_overlay::paged_file(inode)?;
+    (linux_overlay_file_identity(handle)? == (device, inode)).then_some(())?;
+    let offset = usize::try_from(offset.checked_add(address - area.start)?).ok()?;
+    Some((handle, offset))
+}
+
+/// Maps page `address` of the current process to the page of paged file
+/// `handle` at `offset` (shared with every other mapping of it and with
+/// read(2) and write(2)), or, past the file's end, reserves it so that
+/// touching it is SIGBUS, in place of what was there.
+fn linux_map_shared_file_page(
+    address: u64,
+    handle: crate::linux_overlay::Handle,
+    offset: usize,
+    protection: u8,
+) -> bool {
+    let Some(metadata) = crate::linux_overlay::metadata(handle) else {
+        return false;
+    };
+    if !release_linux_runtime_page(address_space::remove_current_linux_runtime_page(address)) {
+        return false;
+    }
+    if offset >= metadata.size.next_multiple_of(PAGE_SIZE) {
+        return address_space::reserve_current_linux_past_eof_page(address, protection, false)
+            .is_some();
+    }
+    // A PROT_NONE page is installed readable, then made inaccessible.
+    crate::linux_overlay::memfd_frame(handle, offset / PAGE_SIZE).is_some_and(|frame| {
+        address_space::install_current_linux_shared_page(address, frame, protection.max(1))
+    }) && (protection != 0 || address_space::protect_current_linux_runtime_page(address, 0))
+}
+
+/// Gives a page of a shared file mapping that was past the file's end
+/// its file page, once the file has grown to reach it (Linux maps the
+/// page then, where it raised SIGBUS before).
+fn linux_refill_shared_file_page(address: u64) -> bool {
+    if !address_space::current_linux_page_past_eof(address) {
+        return false;
+    }
+    let Some((handle, offset)) = linux_shared_file_page(address) else {
+        return false;
+    };
+    crate::linux_overlay::metadata(handle)
+        .is_some_and(|metadata| offset < metadata.size.next_multiple_of(PAGE_SIZE))
+        && linux_map_shared_file_page(
+            address,
+            handle,
+            offset,
+            address_space::current_linux_runtime_page(address).protection,
+        )
+}
+
+/// Truncates overlay file `handle` to `size`. The pages of the current
+/// process's shared mappings of it that end up wholly past the new end
+/// become SIGBUS to touch (and EFAULT to the kernel), as Linux unmaps
+/// them. Other processes' mappings keep their pages until they map again.
+fn linux_truncate_overlay_file(handle: crate::linux_overlay::Handle, size: usize) -> bool {
+    let old_size = crate::linux_overlay::metadata(handle).map_or(0, |metadata| metadata.size);
+    if !crate::linux_overlay::truncate(handle, size) {
+        return false;
+    }
+    let end = size.next_multiple_of(PAGE_SIZE) as u64;
+    if old_size as u64 <= end || !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
+        return true;
+    }
+    let Some((device, inode)) = linux_overlay_file_identity(handle) else {
+        return true;
+    };
+    let areas = crate::linux_areas::shared_file_areas(
+        linux_execution_instance(),
+        current_linux_process_pid(),
+        device,
+        inode,
+    );
+    for area in areas {
+        let crate::linux_areas::Backing::File { offset, .. } = area.backing else {
+            continue;
+        };
+        let first = area.start + end.saturating_sub(offset);
+        for address in (first..area.end).step_by(PAGE_SIZE) {
+            let page = address_space::current_linux_runtime_page(address);
+            let file_offset = (offset + (address - area.start)) as usize;
+            if page.shared
+                && !page.sealed
+                && page.frame.is_some()
+                && page.frame == crate::linux_overlay::paged_frame(handle, file_offset / PAGE_SIZE)
+            {
+                let _ = linux_map_shared_file_page(address, handle, file_offset, page.protection);
+            }
+        }
+    }
+    true
 }
 
 /// The largest anonymous shared mapping backed by shared pages (64 MiB).
@@ -26049,6 +26262,9 @@ fn linux_map_shared_anonymous(mapping: u64, pages: usize, protection: u8, replac
             crate::linux_overlay::release_unmapped_shmem();
             return LINUX_ENOMEM;
         }
+    }
+    if replace {
+        crate::linux_overlay::release_unmapped_shmem();
     }
     mapping
 }
@@ -26098,6 +26314,7 @@ fn linux_record_exec_image(
                 shared: false,
                 may_write: true,
                 locked: false,
+                grows_down: false,
                 backing: Backing::File {
                     device: 0,
                     inode: 0,
@@ -26124,6 +26341,7 @@ fn linux_record_exec_image(
                 shared: false,
                 may_write: true,
                 locked: false,
+                grows_down: false,
                 backing: Backing::Stack,
             },
         );
@@ -26151,10 +26369,22 @@ fn linux_record_heap(program_break: u64) {
                 shared: false,
                 may_write: true,
                 locked: false,
+                grows_down: false,
                 backing: Backing::Heap,
             },
         );
     }
+}
+
+/// Whether `descriptor` is open on /dev/zero, whose mappings are
+/// anonymous memory.
+fn linux_dev_zero_descriptor(descriptor: u64) -> bool {
+    let descriptor = u64::from(descriptor as u32);
+    linux_descriptor_open(descriptor)
+        && linux_overlay_descriptor_handle(descriptor).is_none()
+        && linux_rootfs_descriptor(descriptor) == 0
+        && linux_socket_slot(descriptor).is_none()
+        && linux_device_descriptor(descriptor) & !3 == LINUX_DEVICE_ZERO
 }
 
 /// Records a successful mmap of `length` bytes at `address` in the
@@ -26188,7 +26418,7 @@ fn linux_record_mapping(
             && !linux_overlay_descriptor_handle(descriptor)
                 .and_then(crate::linux_overlay::file_seals)
                 .is_some_and(|seals| seals & (LINUX_F_SEAL_WRITE | LINUX_F_SEAL_FUTURE_WRITE) != 0);
-    let backing = if flags & LINUX_MAP_ANONYMOUS != 0 {
+    let backing = if flags & LINUX_MAP_ANONYMOUS != 0 || linux_dev_zero_descriptor(descriptor) {
         Backing::Anonymous
     } else {
         let mut path = [0_u8; crate::linux_overlay::PATH_CAPACITY];
@@ -26215,6 +26445,7 @@ fn linux_record_mapping(
             shared: flags & LINUX_MAP_SHARED != 0,
             may_write,
             locked: flags & LINUX_MAP_LOCKED != 0,
+            grows_down: flags & LINUX_MAP_GROWSDOWN != 0,
             backing,
         },
     );
@@ -26308,6 +26539,11 @@ fn linux_mremap(
         return LINUX_EPERM;
     }
     let template = address_space::current_linux_runtime_page(old_address);
+    // A shared file mapping grows over the file's next pages.
+    let shared_file = template
+        .shared
+        .then(|| linux_shared_file_page(old_address))
+        .flatten();
     if fixed {
         if template.file && new_pages > old_pages {
             return LINUX_ENOMEM;
@@ -26337,6 +26573,7 @@ fn linux_mremap(
             new_pages,
             fixed_address,
             &template,
+            shared_file,
         );
     }
     if old_pages == new_pages {
@@ -26363,13 +26600,23 @@ fn linux_mremap(
     if linux_runtime_range_available(old_end, extension_pages) {
         for page in 0..extension_pages {
             let address = old_end + (page * PAGE_SIZE) as u64;
-            if address_space::reserve_current_linux_runtime_page(
-                address,
-                template.protection,
-                false,
-                false,
-            ) != Some(None)
-            {
+            let extended = match shared_file {
+                Some((handle, offset)) => linux_map_shared_file_page(
+                    address,
+                    handle,
+                    offset + (old_pages + page) * PAGE_SIZE,
+                    template.protection,
+                ),
+                None => {
+                    address_space::reserve_current_linux_runtime_page(
+                        address,
+                        template.protection,
+                        false,
+                        false,
+                    ) == Some(None)
+                }
+            };
+            if !extended {
                 let _ = rollback_linux_runtime_mapping(old_end, page);
                 return LINUX_ENOMEM;
             }
@@ -26397,18 +26644,27 @@ fn linux_mremap(
     if !linux_runtime_range_available(destination, new_pages) {
         return LINUX_ENOMEM;
     }
-    linux_mremap_move(old_address, old_pages, new_pages, destination, &template)
+    linux_mremap_move(
+        old_address,
+        old_pages,
+        new_pages,
+        destination,
+        &template,
+        shared_file,
+    )
 }
 
 /// Moves the first `old_pages` pages at `old_address` to `destination`
-/// and reserves the rest up to `new_pages` like `template`, undoing the
-/// move if a page cannot be placed.
+/// and reserves the rest up to `new_pages` like `template`, or maps them
+/// to the next pages of `shared_file` (its file and the offset of
+/// `old_address` in it), undoing the move if a page cannot be placed.
 fn linux_mremap_move(
     old_address: u64,
     old_pages: usize,
     new_pages: usize,
     destination: u64,
     template: &address_space::LinuxRuntimePage,
+    shared_file: Option<(crate::linux_overlay::Handle, usize)>,
 ) -> u64 {
     for page_index in 0..old_pages {
         let source = old_address + (page_index * PAGE_SIZE) as u64;
@@ -26440,13 +26696,23 @@ fn linux_mremap_move(
     }
     for page in old_pages..new_pages {
         let target = destination + (page * PAGE_SIZE) as u64;
-        if address_space::reserve_current_linux_runtime_page(
-            target,
-            template.protection,
-            false,
-            false,
-        ) != Some(None)
-        {
+        let extended = match shared_file {
+            Some((handle, offset)) => linux_map_shared_file_page(
+                target,
+                handle,
+                offset + page * PAGE_SIZE,
+                template.protection,
+            ),
+            None => {
+                address_space::reserve_current_linux_runtime_page(
+                    target,
+                    template.protection,
+                    false,
+                    false,
+                ) == Some(None)
+            }
+        };
+        if !extended {
             for extension in old_pages..page {
                 let _ =
                     release_linux_runtime_page(address_space::remove_current_linux_runtime_page(
@@ -26617,22 +26883,21 @@ fn linux_process_vm_iov(
             return LINUX_EPERM;
         }
     }
-    let (local, local_count) =
-        match linux_socket_iov_ranges(local_vectors, local_count, !write_remote) {
-            Ok(value) => value,
-            Err(error) => return error,
-        };
-    let (remote, remote_count) = if current {
-        match linux_socket_iov_ranges(remote_vectors, remote_count, write_remote) {
-            Ok(value) => value,
-            Err(error) => return error,
-        }
-    } else {
-        match linux_process_vm_remote_iov_ranges(remote_vectors, remote_count) {
-            Ok(value) => value,
-            Err(error) => return error,
-        }
+    // Linux checks the local vector, then the remote one; only the local
+    // buffers (and a caller's own remote ones) must be accessible here.
+    let local = match linux_process_vm_vectors(local_vectors, local_count, Some(!write_remote)) {
+        Ok(value) => value,
+        Err(error) => return error,
     };
+    let remote = match linux_process_vm_vectors(
+        remote_vectors,
+        remote_count,
+        current.then_some(write_remote),
+    ) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let (local_count, remote_count) = (local.len(), remote.len());
     let mut local_index = 0;
     let mut remote_index = 0;
     let mut local_offset = 0;
@@ -26723,35 +26988,57 @@ fn linux_ptrace_access_permitted(pid: u32) -> bool {
         && (caller.privileged() || linux_ids_match(&caller, &target))
 }
 
-fn linux_process_vm_remote_iov_ranges(
+/// Linux's UIO_MAXIOV: the most vectors process_vm_readv and
+/// process_vm_writev take.
+const LINUX_PROCESS_VM_IOV_LIMIT: usize = 1024;
+
+/// The `count` vectors at `vectors` of process_vm_readv or
+/// process_vm_writev: too many, or lengths whose sum overflows an ssize_t,
+/// are EINVAL. With `accessible` (whether the buffers must be writable),
+/// each buffer must lie in the caller's memory (EFAULT).
+fn linux_process_vm_vectors(
     vectors: u64,
     count: u64,
-) -> Result<([(u64, usize); LINUX_IOV_LIMIT], usize), u64> {
-    let Ok(vector_count) = usize::try_from(count) else {
-        return Err(LINUX_EINVAL);
-    };
-    if vector_count > LINUX_IOV_LIMIT {
-        return Err(LINUX_EINVAL);
-    }
-    let mut table = [0_u8; LINUX_IOV_LIMIT * 16];
-    if vector_count != 0 && !copy_from_linux_user(vectors, &mut table[..vector_count * 16]) {
+    accessible: Option<bool>,
+) -> Result<Vec<(u64, usize)>, u64> {
+    let count = usize::try_from(count)
+        .ok()
+        .filter(|count| *count <= LINUX_PROCESS_VM_IOV_LIMIT)
+        .ok_or(LINUX_EINVAL)?;
+    let mut table = Vec::new();
+    table
+        .try_reserve_exact(count * 16)
+        .map_err(|_| LINUX_ENOMEM)?;
+    table.resize(count * 16, 0_u8);
+    if count != 0 && !copy_from_linux_user(vectors, &mut table) {
         return Err(LINUX_EFAULT);
     }
-    let mut ranges = [(0_u64, 0_usize); LINUX_IOV_LIMIT];
+    let mut ranges = Vec::new();
+    ranges.try_reserve_exact(count).map_err(|_| LINUX_ENOMEM)?;
     let mut total = 0_usize;
-    for (index, vector) in table[..vector_count * 16]
-        .as_chunks::<16>()
-        .0
-        .iter()
-        .enumerate()
-    {
+    for vector in table.as_chunks::<16>().0 {
         let address = u64::from_ne_bytes(vector[..8].try_into().unwrap());
-        let length = usize::try_from(u64::from_ne_bytes(vector[8..].try_into().unwrap()))
-            .map_err(|_| LINUX_EINVAL)?;
-        total = total.checked_add(length).ok_or(LINUX_EINVAL)?;
-        ranges[index] = (address, length);
+        let length = usize::from_ne_bytes(vector[8..].try_into().unwrap());
+        total = total
+            .checked_add(length)
+            .filter(|total| *total <= isize::MAX as usize)
+            .ok_or(LINUX_EINVAL)?;
+        ranges.push((address, length));
     }
-    Ok((ranges, vector_count))
+    if let Some(writable) = accessible {
+        let reachable = |&(address, length): &(u64, usize)| {
+            length == 0
+                || if writable {
+                    linux_writable_user_range_contains(address, length)
+                } else {
+                    linux_readable_user_range_contains(address, length)
+                }
+        };
+        if !ranges.iter().all(reachable) {
+            return Err(LINUX_EFAULT);
+        }
+    }
+    Ok(ranges)
 }
 
 fn linux_node_zero_mask(address: u64, maximum_node: u64) -> Result<bool, u64> {
@@ -27403,13 +27690,32 @@ fn linux_runtime_mincore(address: u64, length: u64, vector: u64) -> u64 {
         }
     }
     for page in 0..pages {
-        let state = address_space::current_linux_runtime_page(address + (page * PAGE_SIZE) as u64);
-        let resident = u8::from(state.frame.is_some());
+        let page_address = address + (page * PAGE_SIZE) as u64;
+        let state = address_space::current_linux_runtime_page(page_address);
+        // Anonymous shared memory has its pages from the start; one counts
+        // as resident once touched, as Linux allocates it then.
+        let resident = u8::from(
+            state.frame.is_some()
+                && (!state.shared
+                    || !linux_anonymous_shared_area(page_address)
+                    || address_space::current_linux_page_accessed(page_address)),
+        );
         if !copy_to_linux_user(vector + page as u64, &[resident]) {
             return LINUX_EFAULT;
         }
     }
     0
+}
+
+/// Whether the current process's area covering `address` is anonymous
+/// shared memory (MAP_SHARED | MAP_ANONYMOUS).
+fn linux_anonymous_shared_area(address: u64) -> bool {
+    crate::linux_areas::area_at(
+        linux_execution_instance(),
+        current_linux_process_pid(),
+        address,
+    )
+    .is_some_and(|area| area.shared && area.backing == crate::linux_areas::Backing::Anonymous)
 }
 
 fn linux_mprotect(address: u64, length: u64, protection: u64) -> u64 {
@@ -33463,9 +33769,7 @@ fn linux_openat_path(
         if flags & LINUX_O_TRUNC != 0 && regular && access == 0 {
             return LINUX_EACCES;
         }
-        if flags & LINUX_O_TRUNC != 0
-            && regular
-            && !crate::linux_overlay::truncate(metadata.handle, 0)
+        if flags & LINUX_O_TRUNC != 0 && regular && !linux_truncate_overlay_file(metadata.handle, 0)
         {
             return LINUX_EIO;
         }
@@ -35367,7 +35671,7 @@ fn linux_ftruncate(descriptor: u64, length: u64) -> u64 {
     if length > metadata.size && linux_file_extension_limit(length).is_err() {
         return LINUX_EFBIG;
     }
-    if crate::linux_overlay::truncate(handle, length) {
+    if linux_truncate_overlay_file(handle, length) {
         0
     } else {
         LINUX_ENOSPC
@@ -47151,23 +47455,29 @@ fn append_linux_maps_line(
     name: &[u8],
 ) -> Option<()> {
     use crate::linux_areas::Backing;
+    // A recorded area keeps the protection and sharing the program asked
+    // for (PROT_WRITE alone, a shared PROT_NONE mapping), which the page
+    // tables cannot always express.
+    let (protection, shared) = recorded.map_or((area.protection, area.shared), |part| {
+        (part.protection.bits(), part.shared)
+    });
     let flags = [
-        if area.protection & LINUX_PROT_READ as u8 != 0 {
+        if protection & LINUX_PROT_READ as u8 != 0 {
             b'r'
         } else {
             b'-'
         },
-        if area.protection & LINUX_PROT_WRITE as u8 != 0 {
+        if protection & LINUX_PROT_WRITE as u8 != 0 {
             b'w'
         } else {
             b'-'
         },
-        if area.protection & LINUX_PROT_EXEC as u8 != 0 {
+        if protection & LINUX_PROT_EXEC as u8 != 0 {
             b'x'
         } else {
             b'-'
         },
-        if area.shared { b's' } else { b'p' },
+        if shared { b's' } else { b'p' },
     ];
     let (offset, device, inode, name) = match recorded.map(|part| (part, &part.backing)) {
         Some((
@@ -51851,6 +52161,11 @@ fn linux_memory_lock(address: u64, length: u64, flags: u64, lock: bool) -> u64 {
     {
         return LINUX_ENOMEM;
     }
+    if lock && flags & MLOCK_ONFAULT == 0 {
+        for page in (start..end).step_by(PAGE_SIZE) {
+            address_space::mark_current_linux_page_accessed(page);
+        }
+    }
     crate::linux_areas::lock(linux_execution_instance(), pid, start, end - start, lock);
     0
 }
@@ -53707,7 +54022,14 @@ fn materialize_linux_runtime_user_range(address: u64, length: usize, writable: b
                 || linux_runtime_primary_stack_contains(page_address))
         {
             if page.file {
-                return false;
+                if !linux_refill_shared_file_page(page_address) {
+                    return false;
+                }
+                if page_address == last {
+                    return true;
+                }
+                page_address += PAGE_SIZE as u64;
+                continue;
             }
             if linux_runtime_primary_stack_contains(page_address) {
                 record_linux_primary_stack_growth(page_address);
@@ -58163,6 +58485,7 @@ fn handle_user_fault(frame: *mut UserFaultFrame) -> u64 {
         && (materialize_linux_runtime_mapping(fault_metadata)
             || materialize_linux_runtime_stack_page(fault_metadata)
             || grow_linux_runtime_stack(fault_metadata)
+            || grow_linux_growsdown_area(fault_metadata)
             || linux_flip_write_execute_page(fault_metadata))
     {
         return 0;
@@ -58523,6 +58846,55 @@ fn grow_linux_runtime_stack(fault: domain::FaultMetadata) -> bool {
     true
 }
 
+/// Linux's stack guard gap: a mapping that grows down stops this far
+/// above the mapping below it (256 pages).
+const LINUX_STACK_GUARD_GAP: u64 = 256 * PAGE_SIZE as u64;
+
+/// A fault just below a mapping made with MAP_GROWSDOWN grows it down to
+/// the faulting page (`linux_areas::grow_down`); the pages it gains are
+/// reserved, and the access, run again, makes the one it touches. A
+/// thread whose stack the mapping is gets the larger stack.
+fn grow_linux_growsdown_area(fault: domain::FaultMetadata) -> bool {
+    if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
+        || fault.vector != 14
+        || fault.error & 1 != 0
+        || fault.address < LINUX_FIXED_LOW_BASE
+        || fault.address >= 1 << 47
+        || !crate::sync::rank_available(crate::sync::LockRank::MEMORY_AREAS)
+    {
+        return false;
+    }
+    let page = fault.address & !(PAGE_SIZE as u64 - 1);
+    if address_space::current_linux_runtime_page(page).occupied {
+        return false;
+    }
+    let Some((old_start, protection)) = crate::linux_areas::grow_down(
+        linux_execution_instance(),
+        current_linux_process_pid(),
+        page,
+        LINUX_STACK_GUARD_GAP,
+    ) else {
+        return false;
+    };
+    let protection = linux_runtime_page_protection(u64::from(protection.bits())) as u8;
+    for address in (page..old_start).step_by(PAGE_SIZE) {
+        if !address_space::current_linux_runtime_page(address).occupied
+            && address_space::reserve_current_linux_runtime_page(address, protection, false, false)
+                .is_none()
+        {
+            return false;
+        }
+    }
+    if let Some(slot) = current_linux_thread_slot() {
+        if X86_RUNTIME.LINUX_THREAD_STACK_BASES[slot].load(Ordering::SeqCst) == old_start {
+            X86_RUNTIME.LINUX_THREAD_STACK_BASES[slot].store(page, Ordering::SeqCst);
+            X86_RUNTIME.LINUX_THREAD_STACK_SIZES[slot]
+                .fetch_add(old_start - page, Ordering::SeqCst);
+        }
+    }
+    true
+}
+
 fn materialize_linux_cow_page(fault: domain::FaultMetadata) -> bool {
     if fault.vector != 14 || fault.error & 3 != 3 || fault.address >= 1 << 47 {
         return false;
@@ -58662,6 +59034,9 @@ fn materialize_linux_runtime_mapping(fault: domain::FaultMetadata) -> bool {
         return false;
     }
     let page_address = fault.address & !(PAGE_SIZE as u64 - 1);
+    if linux_refill_shared_file_page(page_address) {
+        return true;
+    }
     let page = address_space::current_linux_runtime_page(page_address);
     if !page.occupied
         || page.frame.is_some()

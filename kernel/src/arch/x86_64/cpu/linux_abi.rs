@@ -544,6 +544,7 @@ pub(super) const LINUX_MAP_ANONYMOUS: u64 = 0x20;
 pub(super) const LINUX_MAP_EXECUTABLE: u64 = 0x1000;
 pub(super) const LINUX_MAP_LOCKED: u64 = 0x2000;
 pub(super) const LINUX_MAP_NORESERVE: u64 = 0x4000;
+pub(super) const LINUX_MAP_GROWSDOWN: u64 = 0x100;
 pub(super) const LINUX_MAP_DENYWRITE: u64 = 0x800;
 pub(super) const LINUX_MAP_POPULATE: u64 = 0x8000;
 pub(super) const LINUX_MAP_NONBLOCK: u64 = 0x1_0000;

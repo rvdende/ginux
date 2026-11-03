@@ -1081,7 +1081,7 @@ rt_sigqueueinfo02 rt_sigqueueinfo02
 rt_sigsuspend01 rt_sigsuspend01
 rt_sigtimedwait01 rt_sigtimedwait01
 rt_tgsigqueueinfo01 rt_tgsigqueueinfo01
-sbrk01 sbrk01
+!sbrk01 sbrk01  # musl: sbrk() with a nonzero increment fails with ENOMEM without a system call (only sbrk(0) reaches brk)
 sbrk02 sbrk02
 sbrk03 sbrk03
 sched_get_priority_max01 sched_get_priority_max01
