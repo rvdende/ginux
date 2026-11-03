@@ -15,6 +15,7 @@ mod execution;
 mod linux_abi;
 mod linux_futex;
 mod linux_poll;
+mod linux_pty;
 mod linux_signal;
 mod linux_syscall;
 mod linux_time;
@@ -39,6 +40,7 @@ use execution::{
 pub(crate) use linux_abi::*;
 use linux_futex::*;
 use linux_poll::*;
+use linux_pty::*;
 use linux_signal::*;
 pub(crate) use linux_signal::{
     expire_linux_waits_from_timer, linux_nanoseconds_to_next_wait_deadline, sample_linux_profile,
@@ -35915,6 +35917,9 @@ fn linux_openat_path(
                     return linux_open_object(crate::linux_loop::CLASS_CONTROL, 0, flags)
                 }
                 Ok(LinuxDeviceNode::KernelLog) => return linux_open_kernel_log(flags),
+                Ok(LinuxDeviceNode::PtyMaster) => return linux_open_pty_master(flags),
+                Ok(LinuxDeviceNode::PtySlave(index)) => return linux_open_pty_slave(index, flags),
+                Ok(LinuxDeviceNode::Userfaultfd) => return linux_open_userfaultfd_device(flags),
                 Err(error) => return error,
             },
             None => return LINUX_ENOENT,
@@ -37012,6 +37017,23 @@ fn linux_ensure_dev_nodes() {
             linux_device_number(crate::linux_kmsg::MAJOR, crate::linux_kmsg::MINOR),
         ));
     }
+    // /dev/pts lists the pty slaves; /dev/ptmx makes them.
+    if !image_has(b"dev/pts") && crate::linux_overlay::lookup(b"dev/pts").is_none() {
+        root_owned(crate::linux_overlay::create_directory(b"dev/pts", 0o755));
+    }
+    for (name, device, permissions) in [
+        (&b"dev/ptmx"[..], crate::linux_pty::MASTER_DEVICE, 0o666),
+        (b"dev/userfaultfd", LINUX_USERFAULTFD_DEVICE, 0o600),
+    ] {
+        if crate::linux_overlay::lookup(name).is_none() {
+            root_owned(crate::linux_overlay::create_device(
+                name,
+                crate::linux_overlay::NodeKind::CharacterDevice,
+                permissions,
+                device,
+            ));
+        }
+    }
     for (name, target) in LINKS {
         if crate::linux_overlay::lookup(name).is_none() {
             root_owned(crate::linux_overlay::create_symlink(name, target));
@@ -37184,12 +37206,18 @@ enum LinuxDeviceNode {
     LoopControl,
     /// /dev/kmsg (1:11).
     KernelLog,
+    /// /dev/ptmx (5:2): a new pseudo-terminal pair.
+    PtyMaster,
+    /// /dev/pts/N (136:N and up): pair N's slave.
+    PtySlave(u64),
+    /// /dev/userfaultfd (10:126).
+    Userfaultfd,
 }
 
 /// What opening the device file `handle` opens: the kernel's null, zero and
-/// console devices, loop devices and RAM disks for their numbers; no other device
-/// is reachable through a device file (ENXIO), and none on a nodev mount
-/// (EACCES).
+/// console devices, loop devices, RAM disks, /dev/ptmx and pty slaves, and
+/// /dev/userfaultfd for their numbers; no other device is reachable through
+/// a device file (ENXIO), and none on a nodev mount (EACCES).
 fn linux_device_node_kind(
     handle: crate::linux_overlay::Handle,
     kind: crate::linux_overlay::NodeKind,
@@ -37205,6 +37233,16 @@ fn linux_device_node_kind(
     let device = crate::linux_overlay::metadata(handle)
         .ok_or(LINUX_ENOENT)?
         .device;
+    let character = kind == crate::linux_overlay::NodeKind::CharacterDevice;
+    if character && device == crate::linux_pty::MASTER_DEVICE {
+        return Ok(LinuxDeviceNode::PtyMaster);
+    }
+    if character && device == LINUX_USERFAULTFD_DEVICE {
+        return Ok(LinuxDeviceNode::Userfaultfd);
+    }
+    if let Some(index) = crate::linux_pty::slave_index(device).filter(|_| character) {
+        return Ok(LinuxDeviceNode::PtySlave(index));
+    }
     match (kind, linux_device_numbers(device)) {
         (
             crate::linux_overlay::NodeKind::BlockDevice,
@@ -44844,6 +44882,7 @@ pub(crate) fn linux_release_objects() {
         crate::linux_loop::release(class, id);
         crate::linux_ramdisk::release(class, id);
         crate::linux_kmsg::release(class, id);
+        crate::linux_pty::release(class, id);
     }
 }
 
@@ -44856,6 +44895,16 @@ fn linux_object_descriptor(descriptor: u64) -> Option<(u8, u64)> {
 
 /// Makes a descriptor for object `slot`, the lowest free one.
 fn linux_install_object_descriptor(slot: crate::linux_socket::SlotId, flags: u64) -> u64 {
+    linux_install_object_descriptor_with_access(slot, flags, 3)
+}
+
+/// `linux_install_object_descriptor` open for `access` (input, output or
+/// both).
+fn linux_install_object_descriptor_with_access(
+    slot: crate::linux_socket::SlotId,
+    flags: u64,
+    access: u16,
+) -> u64 {
     let Some(descriptor) = (LINUX_AUX_DESCRIPTOR_FIRST..LINUX_AUX_DESCRIPTOR_LIMIT)
         .find(|descriptor| linux_aux_descriptor_free(*descriptor))
     else {
@@ -44868,9 +44917,19 @@ fn linux_install_object_descriptor(slot: crate::linux_socket::SlotId, flags: u64
     X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index]
         .store((flags & LINUX_O_NONBLOCK) as u32, Ordering::SeqCst);
     X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index]
-        .store(LINUX_DEVICE_SOCKET | 3, Ordering::SeqCst);
+        .store(LINUX_DEVICE_SOCKET | access, Ordering::SeqCst);
     set_linux_descriptor_close_on_exec(descriptor, flags & LINUX_O_CLOEXEC != 0);
     descriptor
+}
+
+/// /dev/userfaultfd (10:126), whose USERFAULTFD_IOC_NEW makes userfaultfds:
+/// an object slot of a class that keeps no state to release. Classes 1 to
+/// 9 belong to DRM, loop devices, RAM disks, /dev/kmsg and ptys.
+const LINUX_USERFAULTFD_DEVICE: u32 = (10 << 8) | 126;
+const LINUX_USERFAULTFD_DEVICE_CLASS: u8 = 10;
+
+fn linux_open_userfaultfd_device(flags: u64) -> u64 {
+    linux_open_object(LINUX_USERFAULTFD_DEVICE_CLASS, 0, flags)
 }
 
 /// Opens /dev/dri/renderD128.
@@ -45224,6 +45283,11 @@ fn linux_object_syscall(number: u64, descriptor: u64, buffer: u64, count: u64) -
     match (number, class) {
         (LINUX_IOCTL_SYSCALL, crate::linux_drm::CLASS_FILE) => {
             linux_drm_ioctl(id, buffer as u32, count)
+        }
+        // USERFAULTFD_IOC_NEW: a userfaultfd, as userfaultfd(2) makes one;
+        // opening the device was the permission check.
+        (LINUX_IOCTL_SYSCALL, LINUX_USERFAULTFD_DEVICE_CLASS) if buffer & 0xffff_ffff == 0xaa00 => {
+            linux_userfaultfd_create(count, true)
         }
         // Host memory is coherent: there is nothing to flush.
         (LINUX_IOCTL_SYSCALL, crate::linux_drm::CLASS_DMABUF)
@@ -47818,6 +47882,12 @@ fn linux_userfaultfd_descriptor(descriptor: u64) -> bool {
 }
 
 fn linux_userfaultfd(flags: u64) -> u64 {
+    linux_userfaultfd_create(flags, false)
+}
+
+/// A userfaultfd with `flags`; `device` when /dev/userfaultfd asks, which
+/// needs no UFFD_USER_MODE_ONLY.
+fn linux_userfaultfd_create(flags: u64, device: bool) -> u64 {
     const USER_MODE_ONLY: u64 = 1;
     const VALID_FLAGS: u64 = USER_MODE_ONLY | LINUX_O_NONBLOCK | LINUX_O_CLOEXEC;
     let flags = u64::from(flags as u32);
@@ -47827,7 +47897,7 @@ fn linux_userfaultfd(flags: u64) -> u64 {
     // Domains intentionally lack host ptrace authority. Linux requires either
     // that authority or UFFD_USER_MODE_ONLY when unprivileged userfaultfd is
     // disabled.
-    if flags & USER_MODE_ONLY == 0 {
+    if flags & USER_MODE_ONLY == 0 && !device {
         return LINUX_EPERM;
     }
     let Some(descriptor) = (LINUX_AUX_DESCRIPTOR_FIRST..LINUX_AUX_DESCRIPTOR_LIMIT)
@@ -49192,6 +49262,9 @@ fn linux_descriptor_poll_events(descriptor: i32, requested: u16) -> u16 {
         } else {
             0
         };
+    }
+    if let Some((end, index)) = linux_pty_descriptor(descriptor) {
+        return linux_pty_poll_events(end, index, requested);
     }
     if let Some(slot) = linux_socket_slot(descriptor) {
         if let Some((class, id)) = crate::linux_socket::object(slot) {
@@ -52187,6 +52260,7 @@ fn linux_descriptor_close_with_wake_inner(descriptor: u64, wake_waiters: bool) -
     if let Some(slot) = linux_socket_slot(descriptor) {
         let closed = crate::linux_socket::close(slot);
         linux_release_objects();
+        linux_pty_send_hangups();
         if let Some(index) = usize::try_from(descriptor)
             .ok()
             .filter(|index| *index < X86_RUNTIME.ELF_PROBE_STDIO_SOCKET_SLOTS.len())
@@ -56134,11 +56208,19 @@ fn linux_descriptor_stat(descriptor: u64) -> Option<[u8; LINUX_STAT_SIZE]> {
     if linux_pipe_descriptor(descriptor) {
         return Some(linux_stat(LINUX_STAT_FIFO_MODE, socket_inode()));
     }
+    if let Some((end, index)) = linux_pty_descriptor(descriptor) {
+        return Some(linux_pty_stat(end, index));
+    }
     if let Some((class, id)) = linux_object_descriptor(descriptor) {
         if class == crate::linux_drm::CLASS_FILE {
             // A character device, 226:128.
             let mut stat = linux_stat(0o020_666, 50);
             stat[40..48].copy_from_slice(&u64::from(crate::linux_drm::NODE_DEVICE).to_ne_bytes());
+            return Some(stat);
+        }
+        if class == LINUX_USERFAULTFD_DEVICE_CLASS {
+            let mut stat = linux_stat(0o020_600, 0x2000 + u64::from(LINUX_USERFAULTFD_DEVICE));
+            stat[40..48].copy_from_slice(&u64::from(LINUX_USERFAULTFD_DEVICE).to_ne_bytes());
             return Some(stat);
         }
         if class == crate::linux_kmsg::CLASS_READER {
@@ -57105,6 +57187,9 @@ fn linux_descriptor_link_target(
     if !linux_descriptor_open(descriptor) {
         return None;
     }
+    if let Some((end, index)) = linux_pty_descriptor(descriptor) {
+        return linux_pty_link_target(end, index, output);
+    }
     let state = linux_device_descriptor(descriptor);
     let inode = linux_descriptor_stat(descriptor).map_or(0, |stat| {
         u64::from_ne_bytes(stat[8..16].try_into().unwrap_or([0; 8]))
@@ -57148,6 +57233,10 @@ fn linux_descriptor_link_target(
         .is_some_and(|(class, _)| class == crate::linux_drm::CLASS_FILE)
     {
         (b"/dev/dri/renderD128", false)
+    } else if linux_object_descriptor(descriptor)
+        .is_some_and(|(class, _)| class == LINUX_USERFAULTFD_DEVICE_CLASS)
+    {
+        (b"/dev/userfaultfd", false)
     } else if let Some(device) = linux_graphics_device(state) {
         match device {
             LinuxGraphicsDevice::Framebuffer => (b"/dev/fb0", false),

@@ -10,7 +10,6 @@ clone08 TBROK
 clone09 TBROK
 clone10 TBROK
 clone301 TBROK
-ioctl01 TBROK
 ioctl02 TBROK
 ioctl_loop05 TBROK
 kcmp03 TFAIL

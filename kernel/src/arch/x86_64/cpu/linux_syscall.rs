@@ -483,6 +483,28 @@ fn linux_syscall_dispatch(
         {
             linux_graphics_syscall(number, first_argument, buffer, count)
         }
+        LINUX_READ_SYSCALL | LINUX_WRITE_SYSCALL | LINUX_READV_SYSCALL | LINUX_WRITEV_SYSCALL
+        | LINUX_IOCTL_SYSCALL
+            if runtime_mode && linux_pty_descriptor(first_argument).is_some() =>
+        {
+            linux_pty_syscall_live_return(
+                registers,
+                syscall_return,
+                number,
+                first_argument,
+                buffer,
+                count,
+            )
+        }
+        // A terminal has no file position.
+        LINUX_PREAD64_SYSCALL
+        | LINUX_PWRITE64_SYSCALL
+        | LINUX_PREADV_SYSCALL
+        | LINUX_PWRITEV_SYSCALL
+            if runtime_mode && linux_pty_descriptor(first_argument).is_some() =>
+        {
+            LINUX_ESPIPE
+        }
         LINUX_READ_SYSCALL
         | LINUX_WRITE_SYSCALL
         | LINUX_IOCTL_SYSCALL

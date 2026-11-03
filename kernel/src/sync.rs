@@ -47,6 +47,10 @@ impl LockRank {
     /// Open /dev/kmsg readers; ranks below the heap so the table may grow
     /// while held.
     pub(crate) const KMSG: Self = Self(155);
+    /// Pseudo-terminal pairs; ranks below the heap so their queues may grow
+    /// while held, and below inotify, which removing a slave's node under it
+    /// may reach.
+    pub(crate) const PTYS: Self = Self(158);
     /// The record (fcntl) lock table; ranks below the heap so the table may
     /// grow while held.
     pub(crate) const RECORD_LOCKS: Self = Self(160);

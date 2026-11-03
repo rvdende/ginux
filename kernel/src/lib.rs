@@ -41,6 +41,7 @@ mod linux_namespace;
 mod linux_overlay;
 mod linux_process;
 mod linux_profile;
+mod linux_pty;
 mod linux_ramdisk;
 mod linux_record_lock;
 mod linux_signal;
