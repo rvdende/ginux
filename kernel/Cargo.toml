@@ -18,6 +18,7 @@ ginux-credentials = { path = "../crates/credentials" }
 ginux-keyrings = { path = "../crates/keyrings" }
 ginux-image-store = { path = "../crates/image-store" }
 ginux-memory-areas = { path = "../crates/memory-areas" }
+ginux-seccomp = { path = "../crates/seccomp" }
 ginux-oci = { path = "../crates/oci" }
 ginux-oci-cache = { path = "../crates/oci-cache" }
 ed25519-dalek = { version = "=3.0.0", default-features = false }

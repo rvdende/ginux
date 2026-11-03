@@ -968,6 +968,7 @@ pub(super) const LINUX_SS_DISABLE: u32 = 2;
 pub(super) const LINUX_SS_AUTODISARM: u32 = 1 << 31;
 pub(super) const LINUX_UNBLOCKABLE_SIGNALS: u64 = (1 << (9 - 1)) | (1 << (19 - 1));
 pub(super) const LINUX_SIGSEGV: u64 = 11;
+pub(super) const LINUX_SIGSYS: u64 = 31;
 pub(super) const LINUX_SIGPIPE: u64 = 13;
 pub(super) const LINUX_SIGALRM: u64 = 14;
 pub(super) const LINUX_SIGTERM: u64 = 15;

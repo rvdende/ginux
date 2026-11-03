@@ -333,6 +333,7 @@ struct X86RuntimeOwner {
     ELF_PROBE_ROOTFS_CWD: RuntimeRef<CpuBankedAtomicU16>,
     ELF_PROBE_ROOTFS_DESCRIPTORS:
         RuntimeRef<CpuBankedAtomicArray<AtomicU16, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
+    ELF_PROBE_SECCOMP_FILTERED: RuntimeRef<CpuBankedAtomicBool>,
     ELF_PROBE_SECCOMP_STRICT: RuntimeRef<CpuBankedAtomicBool>,
     ELF_PROBE_SECUREBITS: RuntimeRef<CpuBankedAtomicU32>,
     ELF_PROBE_SIBLING_FS_BASE: RuntimeRef<BankedAtomicU64>,
@@ -828,6 +829,7 @@ static X86_RUNTIME: X86RuntimeOwner = X86RuntimeOwner {
     ELF_PROBE_RLIMITS: RuntimeRef(&X86_RUNTIME_BACKING_ELF_PROBE_RLIMITS),
     ELF_PROBE_ROOTFS_CWD: RuntimeRef(&X86_RUNTIME_BACKING_ELF_PROBE_ROOTFS_CWD),
     ELF_PROBE_ROOTFS_DESCRIPTORS: RuntimeRef(&X86_RUNTIME_BACKING_ELF_PROBE_ROOTFS_DESCRIPTORS),
+    ELF_PROBE_SECCOMP_FILTERED: RuntimeRef(&X86_RUNTIME_BACKING_ELF_PROBE_SECCOMP_FILTERED),
     ELF_PROBE_SECCOMP_STRICT: RuntimeRef(&X86_RUNTIME_BACKING_ELF_PROBE_SECCOMP_STRICT),
     ELF_PROBE_SECUREBITS: RuntimeRef(&X86_RUNTIME_BACKING_ELF_PROBE_SECUREBITS),
     ELF_PROBE_SIBLING_FS_BASE: RuntimeRef(&X86_RUNTIME_BACKING_ELF_PROBE_SIBLING_FS_BASE),
@@ -3810,6 +3812,9 @@ static X86_RUNTIME_BACKING_LINUX_RUNTIME_EINVAL_SYSCALLS: [BankedAtomicU64;
 static X86_RUNTIME_BACKING_ELF_PROBE_NO_NEW_PRIVS: CpuBankedAtomicBool =
     CpuBankedAtomicBool::new(false);
 static X86_RUNTIME_BACKING_ELF_PROBE_SECCOMP_STRICT: CpuBankedAtomicBool =
+    CpuBankedAtomicBool::new(false);
+/// The process has seccomp filters (the process table holds them).
+static X86_RUNTIME_BACKING_ELF_PROBE_SECCOMP_FILTERED: CpuBankedAtomicBool =
     CpuBankedAtomicBool::new(false);
 static X86_RUNTIME_BACKING_ELF_PROBE_MEMBARRIER_REGISTRATIONS: CpuBankedAtomicU32 =
     CpuBankedAtomicU32::new(0);
@@ -10809,6 +10814,9 @@ pub(crate) fn verify_linux_elf_entry(execution: &LinuxElfExecution<'_>) -> Linux
         .ELF_PROBE_SECCOMP_STRICT
         .store(false, Ordering::SeqCst);
     X86_RUNTIME
+        .ELF_PROBE_SECCOMP_FILTERED
+        .store(false, Ordering::SeqCst);
+    X86_RUNTIME
         .ELF_PROBE_MEMBARRIER_REGISTRATIONS
         .store(0, Ordering::SeqCst);
     store_current_linux_signal_mask(0);
@@ -17194,6 +17202,7 @@ struct LinuxProcessRuntimeState {
     ioprio: u16,
     no_new_privileges: bool,
     seccomp_strict: bool,
+    seccomp_filtered: bool,
     membarrier_registrations: u32,
     real_timer_interval: u64,
     real_timer_deadline: u64,
@@ -17243,6 +17252,7 @@ impl LinuxProcessRuntimeState {
         ioprio: 0,
         no_new_privileges: false,
         seccomp_strict: false,
+        seccomp_filtered: false,
         membarrier_registrations: 0,
         real_timer_interval: 0,
         real_timer_deadline: 0,
@@ -17953,6 +17963,9 @@ fn capture_linux_process_runtime_state_for(thread_slot: u8) -> Option<LinuxProce
         ioprio: X86_RUNTIME.ELF_PROBE_IOPRIO.load(Ordering::SeqCst),
         no_new_privileges: X86_RUNTIME.ELF_PROBE_NO_NEW_PRIVS.load(Ordering::SeqCst),
         seccomp_strict: X86_RUNTIME.ELF_PROBE_SECCOMP_STRICT.load(Ordering::SeqCst),
+        seccomp_filtered: X86_RUNTIME
+            .ELF_PROBE_SECCOMP_FILTERED
+            .load(Ordering::SeqCst),
         membarrier_registrations: X86_RUNTIME
             .ELF_PROBE_MEMBARRIER_REGISTRATIONS
             .load(Ordering::SeqCst),
@@ -18088,6 +18101,9 @@ fn restore_linux_process_runtime_state(state: &LinuxProcessRuntimeState) {
     X86_RUNTIME
         .ELF_PROBE_SECCOMP_STRICT
         .store(state.seccomp_strict, Ordering::SeqCst);
+    X86_RUNTIME
+        .ELF_PROBE_SECCOMP_FILTERED
+        .store(state.seccomp_filtered, Ordering::SeqCst);
     X86_RUNTIME
         .ELF_PROBE_MEMBARRIER_REGISTRATIONS
         .store(state.membarrier_registrations, Ordering::SeqCst);
@@ -22761,15 +22777,74 @@ fn linux_seccomp_strict_syscall_allowed(number: u64) -> bool {
     )
 }
 
+/// Runs the process's seccomp filters on system call `number`: None lets
+/// it run; otherwise its result: an errno, ENOSYS for an action that needs
+/// a listener or tracer (there is none), SIGSYS delivered to a handler
+/// (SECCOMP_RET_TRAP), or the process killed by SIGSYS.
+fn linux_seccomp_filter_syscall(
+    number: u64,
+    arguments: [u64; 6],
+    output: *mut LinuxSyscallFrame,
+    interrupted: LinuxUserContext,
+    return_registers: (u64, u64),
+) -> Option<u64> {
+    let user_rip = return_registers.0;
+    let data = ginux_seccomp::Data {
+        number: number as u32 as i32,
+        arch: ginux_seccomp::AUDIT_ARCH_X86_64,
+        instruction_pointer: user_rip,
+        arguments,
+    };
+    let value = linux_process::live_process_seccomp_return(current_linux_process_pid(), &data)?;
+    match ginux_seccomp::Verdict::from_return(value) {
+        ginux_seccomp::Verdict::Allow | ginux_seccomp::Verdict::Log => None,
+        ginux_seccomp::Verdict::Errno(errno) => Some(u64::from(errno).wrapping_neg()),
+        ginux_seccomp::Verdict::NoHandler => Some(LINUX_ENOSYS),
+        ginux_seccomp::Verdict::KillThread | ginux_seccomp::Verdict::KillProcess => {
+            Some(linux_terminate_by_default_signal(LINUX_SIGSYS))
+        }
+        ginux_seccomp::Verdict::Trap(_) => {
+            const SYS_SECCOMP: i32 = 1;
+            let index = LINUX_SIGSYS as usize - 1;
+            let handler = X86_RUNTIME.ELF_PROBE_SIGNAL_HANDLERS[index].load(Ordering::SeqCst);
+            let blocked = X86_RUNTIME.ELF_PROBE_SIGNAL_MASK.load(Ordering::SeqCst)
+                & (1 << (LINUX_SIGSYS - 1))
+                != 0;
+            // Linux forces the signal: ignored or blocked, it kills.
+            if handler <= 1 || blocked {
+                return Some(linux_terminate_by_default_signal(LINUX_SIGSYS));
+            }
+            // siginfo's _sigsys fields are the call address, then the
+            // system call's number and architecture: where a queued
+            // signal's information keeps the sender's pid and uid, then
+            // its value (si_errno is left 0).
+            let value = (number & 0xffff_ffff) | u64::from(ginux_seccomp::AUDIT_ARCH_X86_64) << 32;
+            Some(linux_kill_current(
+                (LINUX_SIGSYS, SYS_SECCOMP, Some(value)),
+                Some((user_rip as u32, (user_rip >> 32) as u32)),
+                output,
+                interrupted,
+                return_registers,
+            ))
+        }
+    }
+}
+
 fn linux_seccomp(operation: u64, flags: u64, arguments: u64) -> u64 {
     const SET_MODE_STRICT: u64 = 0;
     const SET_MODE_FILTER: u64 = 1;
     const GET_ACTION_AVAIL: u64 = 2;
-    const RET_KILL_THREAD: u32 = 0;
 
     match operation {
         SET_MODE_STRICT => {
             if flags != 0 || arguments != 0 {
+                return LINUX_EINVAL;
+            }
+            // A filtered process cannot change to strict mode.
+            if X86_RUNTIME
+                .ELF_PROBE_SECCOMP_FILTERED
+                .load(Ordering::SeqCst)
+            {
                 return LINUX_EINVAL;
             }
             if X86_RUNTIME
@@ -22805,7 +22880,46 @@ fn linux_seccomp(operation: u64, flags: u64, arguments: u64) -> u64 {
             {
                 return LINUX_EACCES;
             }
-            LINUX_EOPNOTSUPP
+            // There is no user-space listener (SECCOMP_FILTER_FLAG_NEW_LISTENER
+            // and the flags that need one); TSYNC holds, as the filters are
+            // the process's.
+            const NEW_LISTENER: u64 = 8;
+            const TSYNC_ESRCH: u64 = 16;
+            const WAIT_KILLABLE_RECV: u64 = 32;
+            if flags & (NEW_LISTENER | TSYNC_ESRCH | WAIT_KILLABLE_RECV) != 0 {
+                return LINUX_EINVAL;
+            }
+            let filter = u64::from_ne_bytes(program[8..16].try_into().unwrap());
+            let mut instructions = Vec::new();
+            if instructions.try_reserve_exact(usize::from(length)).is_err() {
+                return LINUX_ENOMEM;
+            }
+            let mut bytes = [0_u8; 8];
+            for index in 0..u64::from(length) {
+                let Some(address) = filter.checked_add(index * 8) else {
+                    return LINUX_EFAULT;
+                };
+                if !copy_from_linux_user(address, &mut bytes) {
+                    return LINUX_EFAULT;
+                }
+                instructions.push(ginux_seccomp::Instruction::from_bytes(bytes));
+            }
+            let Ok(program) = ginux_seccomp::Program::new(instructions) else {
+                return LINUX_EINVAL;
+            };
+            match linux_process::install_live_process_seccomp_filter(
+                current_linux_process_pid(),
+                program,
+            ) {
+                Ok(()) => {
+                    X86_RUNTIME
+                        .ELF_PROBE_SECCOMP_FILTERED
+                        .store(true, Ordering::SeqCst);
+                    0
+                }
+                Err(linux_process::SeccompError::NoMemory) => LINUX_ENOMEM,
+                Err(linux_process::SeccompError::NoProcess) => LINUX_ESRCH,
+            }
         }
         GET_ACTION_AVAIL => {
             if flags != 0 {
@@ -22815,7 +22929,7 @@ fn linux_seccomp(operation: u64, flags: u64, arguments: u64) -> u64 {
             if !copy_from_linux_user(arguments, &mut action) {
                 return LINUX_EFAULT;
             }
-            if u32::from_ne_bytes(action) == RET_KILL_THREAD {
+            if ginux_seccomp::action_available(u32::from_ne_bytes(action)) {
                 0
             } else {
                 LINUX_EOPNOTSUPP
@@ -22827,7 +22941,7 @@ fn linux_seccomp(operation: u64, flags: u64, arguments: u64) -> u64 {
 
 fn verify_linux_seccomp_syscall() -> bool {
     const GET_ACTION_AVAIL: u64 = 2;
-    const RET_ALLOW: u32 = 0x7fff_0000;
+    const UNKNOWN_ACTION: u32 = 0x1234_0000;
     let mapping = linux_runtime_mmap(
         0,
         PAGE_SIZE as u64,
@@ -22850,13 +22964,15 @@ fn verify_linux_seccomp_syscall() -> bool {
     let kill_available = strict_contract
         && copy_to_linux_user(mapping, &0_u32.to_ne_bytes())
         && linux_seccomp(GET_ACTION_AVAIL, 0, mapping) == 0;
-    let filter_action_rejected = kill_available
-        && copy_to_linux_user(mapping, &RET_ALLOW.to_ne_bytes())
+    let unknown_action_rejected = kill_available
+        && copy_to_linux_user(mapping, &ginux_seccomp::action::ALLOW.to_ne_bytes())
+        && linux_seccomp(GET_ACTION_AVAIL, 0, mapping) == 0
+        && copy_to_linux_user(mapping, &UNKNOWN_ACTION.to_ne_bytes())
         && linux_seccomp(GET_ACTION_AVAIL, 0, mapping) == LINUX_EOPNOTSUPP
         && linux_seccomp(GET_ACTION_AVAIL, 1, mapping) == LINUX_EINVAL
         && linux_seccomp(GET_ACTION_AVAIL, 0, 0) == LINUX_EFAULT;
     let unmapped = linux_runtime_munmap(mapping, PAGE_SIZE as u64) == 0;
-    filter_action_rejected && unmapped
+    unknown_action_rejected && unmapped
 }
 
 fn linux_map_shadow_stack(_address: u64, _length: u64, _flags: u64) -> u64 {
@@ -51211,7 +51327,14 @@ fn linux_prctl(option: u64, argument2: u64, argument3: u64, argument4: u64, argu
         LINUX_PR_SET_NAME => linux_set_process_name(argument2),
         LINUX_PR_GET_NAME => linux_get_process_name(argument2),
         LINUX_PR_GET_SECCOMP => {
-            u64::from(X86_RUNTIME.ELF_PROBE_SECCOMP_STRICT.load(Ordering::SeqCst))
+            if X86_RUNTIME
+                .ELF_PROBE_SECCOMP_FILTERED
+                .load(Ordering::SeqCst)
+            {
+                2
+            } else {
+                u64::from(X86_RUNTIME.ELF_PROBE_SECCOMP_STRICT.load(Ordering::SeqCst))
+            }
         }
         LINUX_PR_SET_SECCOMP if argument2 == 1 => linux_seccomp(0, argument3, 0),
         LINUX_PR_SET_SECCOMP if argument2 == 2 => linux_seccomp(1, 0, argument3),

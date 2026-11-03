@@ -535,6 +535,9 @@ struct Process {
     oom_score_adj: i16,
     /// The signal whose default action terminated the process, or 0.
     killed_by_signal: u8,
+    /// Its newest seccomp filter (index + 1 in the table's filters), or 0:
+    /// inherited across fork, kept across exec.
+    seccomp_filter: u32,
     state: ProcessState,
     wait_event: Option<ProcessWaitEvent>,
     /// A child forked onto its parent's pages (CLONE_VM, or a vfork child
@@ -630,9 +633,25 @@ struct ProcessTable {
     /// Each slot's supplementary groups, sorted, parallel to `processes`:
     /// inherited across fork, emptied when the slot is freed.
     groups: Vec<Vec<u32>>,
+    /// seccomp filters, each with the one installed before it; a process
+    /// names its newest. One no process reaches is reused (`install`).
+    seccomp_filters: Vec<Option<SeccompFilter>>,
     next_pid: u32,
     init: Option<ProcessHandle>,
 }
+
+/// One installed seccomp program and the filter before it in its chain.
+struct SeccompFilter {
+    program: ginux_seccomp::Program,
+    /// Index + 1 of the previous filter, or 0.
+    previous: u32,
+    /// The chain's instructions up to here, each filter counting 4 more,
+    /// as Linux limits them (MAX_INSNS_PER_PATH).
+    path_instructions: usize,
+}
+
+/// The most instructions a chain may hold (Linux's MAX_INSNS_PER_PATH).
+const SECCOMP_PATH_LIMIT: usize = 32_768;
 
 impl ProcessTable {
     const fn new() -> Self {
@@ -641,6 +660,7 @@ impl ProcessTable {
             processes: Vec::new(),
             generations: Vec::new(),
             groups: Vec::new(),
+            seccomp_filters: Vec::new(),
             next_pid: 1,
             init: None,
         }
@@ -1676,6 +1696,9 @@ impl ProcessTable {
             .map_or((DEFAULT_TIMER_SLACK, DEFAULT_TIMER_SLACK), |parent| {
                 (parent.timer_slack.0, parent.timer_slack.0)
             });
+        let seccomp_filter = parent
+            .and_then(|parent| self.process(parent))
+            .map_or(0, |parent| parent.seccomp_filter);
         // A new process's groups are its parent's; the first is in group 0.
         let inherited: &[u32] = match parent {
             Some(parent) => self.groups.get(usize::from(parent.slot))?,
@@ -1705,6 +1728,7 @@ impl ProcessTable {
             stopped_in_call: false,
             oom_score_adj,
             killed_by_signal: 0,
+            seccomp_filter,
             state,
             wait_event: None,
             shares_parent_vm: false,
@@ -2488,6 +2512,7 @@ pub(crate) fn install_live_process_registry(
         (*table).processes.clear();
         (*table).generations.clear();
         (*table).groups.clear();
+        (*table).seccomp_filters.clear();
         core::ptr::addr_of_mut!((*table).next_pid).write(1);
         core::ptr::addr_of_mut!((*table).init).write(None);
     }
@@ -3437,6 +3462,125 @@ pub(crate) fn set_live_process_scheduling(pid: u32, policy: u8, priority: u8) ->
 pub(crate) const DEFAULT_TIMER_SLACK: u64 = 50_000;
 
 /// prctl(PR_GET_TIMERSLACK): `pid`'s current timer slack.
+/// Why a seccomp filter was not installed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SeccompError {
+    /// No such live process.
+    NoProcess,
+    /// The chain would pass MAX_INSNS_PER_PATH, or no memory (ENOMEM).
+    NoMemory,
+}
+
+impl ProcessTable {
+    /// Adds `program` in front of `pid`'s filters. Filters no process
+    /// reaches any more (their processes exited) are freed first.
+    fn install_seccomp_filter(
+        &mut self,
+        pid: u32,
+        program: ginux_seccomp::Program,
+    ) -> Result<(), SeccompError> {
+        let handle = self.handle_by_pid(pid).ok_or(SeccompError::NoProcess)?;
+        let previous = self
+            .process(handle)
+            .ok_or(SeccompError::NoProcess)?
+            .seccomp_filter;
+        let path_instructions = self
+            .seccomp_filter(previous)
+            .map_or(0, |filter| filter.path_instructions)
+            .saturating_add(program.len() + 4);
+        if path_instructions > SECCOMP_PATH_LIMIT {
+            return Err(SeccompError::NoMemory);
+        }
+        self.free_unreached_seccomp_filters();
+        let filter = SeccompFilter {
+            program,
+            previous,
+            path_instructions,
+        };
+        let index = match self.seccomp_filters.iter().position(Option::is_none) {
+            Some(index) => {
+                self.seccomp_filters[index] = Some(filter);
+                index
+            }
+            None => {
+                self.seccomp_filters
+                    .try_reserve(1)
+                    .map_err(|_| SeccompError::NoMemory)?;
+                self.seccomp_filters.push(Some(filter));
+                self.seccomp_filters.len() - 1
+            }
+        };
+        let id = u32::try_from(index + 1).map_err(|_| SeccompError::NoMemory)?;
+        self.process_mut(handle)
+            .ok_or(SeccompError::NoProcess)?
+            .seccomp_filter = id;
+        Ok(())
+    }
+
+    fn seccomp_filter(&self, id: u32) -> Option<&SeccompFilter> {
+        self.seccomp_filters
+            .get(usize::try_from(id).ok()?.checked_sub(1)?)?
+            .as_ref()
+    }
+
+    /// Frees the filters no process's chain reaches.
+    fn free_unreached_seccomp_filters(&mut self) {
+        let mut reached = Vec::new();
+        if reached
+            .try_reserve_exact(self.seccomp_filters.len())
+            .is_err()
+        {
+            return;
+        }
+        reached.resize(self.seccomp_filters.len(), false);
+        for process in self.processes.iter().flatten() {
+            let mut id = process.seccomp_filter;
+            while let Some(filter) = self.seccomp_filter(id) {
+                let index = id as usize - 1;
+                if reached[index] {
+                    break;
+                }
+                reached[index] = true;
+                id = filter.previous;
+            }
+        }
+        for (slot, reached) in self.seccomp_filters.iter_mut().zip(reached) {
+            if !reached {
+                *slot = None;
+            }
+        }
+    }
+
+    /// The strictest return value of `pid`'s filters for `data`, or None
+    /// when it has none.
+    fn seccomp_return(&self, pid: u32, data: &ginux_seccomp::Data) -> Option<u32> {
+        let mut id = self.process(self.handle_by_pid(pid)?)?.seccomp_filter;
+        let mut result = None;
+        while let Some(filter) = self.seccomp_filter(id) {
+            let value = filter.program.run(data);
+            result = Some(result.map_or(value, |old| ginux_seccomp::strictest(old, value)));
+            id = filter.previous;
+        }
+        result
+    }
+}
+
+/// seccomp(SECCOMP_SET_MODE_FILTER) for `pid`.
+pub(crate) fn install_live_process_seccomp_filter(
+    pid: u32,
+    program: ginux_seccomp::Program,
+) -> Result<(), SeccompError> {
+    live_process_table_mut()
+        .ok_or(SeccompError::NoProcess)?
+        .install_seccomp_filter(pid, program)
+}
+
+/// What `pid`'s seccomp filters return for a system call, or None without
+/// filters.
+pub(crate) fn live_process_seccomp_return(pid: u32, data: &ginux_seccomp::Data) -> Option<u32> {
+    live_process_table_mut()?.seccomp_return(pid, data)
+}
+
 pub(crate) fn live_process_timer_slack(pid: u32) -> Option<u64> {
     let table = live_process_table_mut()?;
     let process = table.process(table.handle_by_pid(pid)?)?;

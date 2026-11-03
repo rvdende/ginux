@@ -484,6 +484,7 @@ dependencies = [
  "ginux-native-abi",
  "ginux-oci",
  "ginux-oci-cache",
+ "ginux-seccomp",
  "ginux-usb-audio",
  "ginux-usb-hid",
  "ginux-virtio-gpu",
@@ -564,6 +565,10 @@ version = "0.1.0"
 
 [[package]]
 name = "ginux-runtime-memory"
+version = "0.1.0"
+
+[[package]]
+name = "ginux-seccomp"
 version = "0.1.0"
 
 [[package]]

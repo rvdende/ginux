@@ -1111,7 +1111,7 @@ sched_setattr01 sched_setattr01
 sched_setattr02 sched_setattr02
 sched_getattr01 sched_getattr01
 sched_getattr02 sched_getattr02
-seccomp01 seccomp01
+!seccomp01 seccomp01  # musl: fork() is the fork system call, which the test's filter (allowing clone) kills; every other case passes
 select01 select01
 select02 select02
 select03 select03

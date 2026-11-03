@@ -196,6 +196,9 @@ fn linux_syscall_dispatch(
     let fast_runtime_syscall = X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::Acquire)
         && X86_RUNTIME.ELF_PROBE_ACTIVE.load(Ordering::Acquire)
         && !X86_RUNTIME.ELF_PROBE_SECCOMP_STRICT.load(Ordering::Acquire)
+        && !X86_RUNTIME
+            .ELF_PROBE_SECCOMP_FILTERED
+            .load(Ordering::Acquire)
         && !X86_RUNTIME.LINUX_SIGNAL_ACTIVE.load(Ordering::Acquire)
         && X86_RUNTIME
             .ELF_PROBE_PENDING_SIGNALS
@@ -240,7 +243,12 @@ fn linux_syscall_dispatch(
                 .store(LINUX_THREAD_SLOT_NONE, Ordering::SeqCst);
             return LINUX_RETURN_TO_KERNEL;
         }
+        // seccomp is checked on the owner path.
         if !linux_light_syscall_allowed(number, saved_registers)
+            || X86_RUNTIME.ELF_PROBE_SECCOMP_STRICT.load(Ordering::SeqCst)
+            || X86_RUNTIME
+                .ELF_PROBE_SECCOMP_FILTERED
+                .load(Ordering::SeqCst)
             || X86_RUNTIME.LINUX_SIGNAL_ACTIVE.load(Ordering::SeqCst)
             || X86_RUNTIME.ELF_PROBE_PENDING_SIGNALS.load(Ordering::SeqCst) != 0
             || current_container_slot().is_some_and(crate::linux_signal::any_pending)
@@ -364,6 +372,32 @@ fn linux_syscall_dispatch(
             X86_RUNTIME.LINUX_RUNTIME_SYSCALL_RESULT_TRACE[index].store(result, Ordering::SeqCst);
         }
         return result;
+    }
+    if X86_RUNTIME
+        .ELF_PROBE_SECCOMP_FILTERED
+        .load(Ordering::SeqCst)
+    {
+        let arguments = [
+            saved_registers.rdi,
+            saved_registers.rsi,
+            saved_registers.rdx,
+            saved_registers.r10,
+            saved_registers.r8,
+            saved_registers.r9,
+        ];
+        if let Some(result) = linux_seccomp_filter_syscall(
+            number,
+            arguments,
+            registers,
+            syscall_return,
+            (user_rip, user_rflags),
+        ) {
+            if let Some(index) = trace_index {
+                X86_RUNTIME.LINUX_RUNTIME_SYSCALL_RESULT_TRACE[index]
+                    .store(result, Ordering::SeqCst);
+            }
+            return result;
+        }
     }
     X86_RUNTIME
         .LINUX_FSIZE_LIMIT_HIT

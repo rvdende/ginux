@@ -219,7 +219,6 @@ sbrk01 TFAIL
 sched_setattr01 TFAIL
 sched_setattr02 TFAIL
 sched_getattr01 TBROK
-seccomp01 TBROK
 select01 TFAIL
 send01 TFAIL
 send02 TBROK
