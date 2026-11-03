@@ -23,7 +23,6 @@ execve04 TFAIL
 fsetxattr02 TBROK
 fgetxattr02 TBROK
 getcpu01 TFAIL
-get_robust_list01 TFAIL
 ioctl01 TBROK
 ioctl02 TBROK
 ioctl10 TFAIL

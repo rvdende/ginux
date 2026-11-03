@@ -28413,8 +28413,24 @@ fn linux_thread_robust_list(tid: u64) -> Result<u64, u64> {
         linux_thread_handle_by_tid(tid as u64)
     } else {
         None
-    }
-    .ok_or(LINUX_ESRCH)?;
+    };
+    // Another process's thread: Linux finds it, then needs ptrace access to
+    // it (the same user, or CAP_SYS_PTRACE), else EPERM.
+    let Some(handle) = handle else {
+        let pid = u32::try_from(tid).map_err(|_| LINUX_ESRCH)?;
+        linux_process::live_process_status(pid).ok_or(LINUX_ESRCH)?;
+        let permitted = current_linux_credentials().is_some_and(|credentials| {
+            credentials.has(ginux_credentials::capability::SYS_PTRACE)
+                || linux_process::live_process_credentials(pid)
+                    .is_some_and(|target| target.user.real == credentials.user.effective)
+        });
+        if !permitted {
+            return Err(LINUX_EPERM);
+        }
+        return Ok(linux_process_thread_runtime_state(pid)
+            .and_then(|threads| threads.iter().find(|thread| thread.tid == pid))
+            .map_or(0, |thread| thread.robust_list));
+    };
     (linux_thread_handle(usize::from(handle.slot)) == Some(handle))
         .then(|| {
             X86_RUNTIME.LINUX_THREAD_ROBUST_LISTS[usize::from(handle.slot)].load(Ordering::SeqCst)
