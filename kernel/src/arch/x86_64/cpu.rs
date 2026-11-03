@@ -37314,8 +37314,18 @@ fn linux_socket_sendto(
         return LINUX_EMSGSIZE;
     }
     let netlink = kind == Some(crate::linux_socket::Kind::Netlink);
+    let unix = kind == Some(crate::linux_socket::Kind::Unix);
+    // A Unix datagram sent to a name goes to the socket bound to it.
+    let _target = if unix && destination != 0 {
+        match linux_unix_send_target(slot, destination, destination_length) {
+            Ok(target) => target,
+            Err(error) => return error,
+        }
+    } else {
+        None
+    };
     // A TCP socket sends to its peer, whatever address it is given.
-    let remote = if destination == 0 || netlink || tcp {
+    let remote = if destination == 0 || netlink || tcp || unix {
         None
     } else {
         match linux_socket_address(destination, destination_length) {
@@ -37469,6 +37479,23 @@ fn linux_socket_recvfrom(
         {
             return LINUX_EFAULT;
         }
+    } else if source != 0 && endpoint.is_none() && crate::linux_socket::unix_type(slot) == Some(2) {
+        // A Unix datagram names its sender (bind05 answers it), an unbound
+        // one with length 0.
+        let mut supplied = [0_u8; 4];
+        if !copy_from_linux_user(source_length, &mut supplied) {
+            return LINUX_EFAULT;
+        }
+        if i32::from_ne_bytes(supplied) < 0 {
+            return LINUX_EINVAL;
+        }
+        if !linux_write_unix_address(
+            source,
+            source_length,
+            &crate::linux_socket::unix_last_sender(slot),
+        ) {
+            return LINUX_EFAULT;
+        }
     } else if source != 0 && endpoint.is_none() {
         // A connected stream names no sender: the length reads back 0 and
         // the address is left alone (recvfrom01's bad address); a negative
@@ -37510,11 +37537,18 @@ fn linux_socket_recvfrom(
 }
 
 fn linux_socket_sendmsg(descriptor: u64, message: u64, flags: u64) -> u64 {
+    const MSG_OOB: u64 = 1;
     const SUPPORTED_FLAGS: u64 = 0x40 | 0x4000;
     let flags = u64::from(flags as u32);
     let Some(slot) = linux_socket_slot(descriptor) else {
         return linux_not_socket_error(descriptor);
     };
+    // Only TCP has urgent data, as sendto answers (sendmsg01).
+    if flags & MSG_OOB != 0
+        && crate::linux_socket::kind(slot) != Some(crate::linux_socket::Kind::Tcp)
+    {
+        return LINUX_EOPNOTSUPP;
+    }
     if flags & !SUPPORTED_FLAGS != 0 {
         return LINUX_EINVAL;
     }
@@ -37536,9 +37570,20 @@ fn linux_socket_sendmsg(descriptor: u64, message: u64, flags: u64) -> u64 {
     }
     let kind = crate::linux_socket::kind(slot);
     let tcp = kind == Some(crate::linux_socket::Kind::Tcp);
+    let unix = kind == Some(crate::linux_socket::Kind::Unix);
+    // A Unix datagram sent to a name goes to the socket bound to it, its
+    // rights and credentials too.
+    let _target = if unix && name != 0 {
+        match linux_unix_send_target(slot, name, name_length) {
+            Ok(target) => target,
+            Err(error) => return error,
+        }
+    } else {
+        None
+    };
     // A TCP socket sends to its peer, whatever address it is given, as
     // sendto does (sendmsg01).
-    let remote = if name == 0 || tcp || kind == Some(crate::linux_socket::Kind::Netlink) {
+    let remote = if name == 0 || tcp || unix || kind == Some(crate::linux_socket::Kind::Netlink) {
         None
     } else {
         match linux_socket_address(name, name_length) {
@@ -37973,6 +38018,21 @@ fn linux_socket_recvmsg(
                 return LINUX_EFAULT;
             }
             header[8..12].copy_from_slice(&16_u32.to_ne_bytes());
+        } else if crate::linux_socket::unix_type(slot) == Some(2) {
+            // A Unix datagram's sender, as recvfrom gives it.
+            let name_length_address = message + 8;
+            if !linux_write_unix_address(
+                name,
+                name_length_address,
+                &crate::linux_socket::unix_last_sender(slot),
+            ) {
+                return LINUX_EFAULT;
+            }
+            let mut written = [0_u8; 4];
+            if !copy_from_linux_user(name_length_address, &mut written) {
+                return LINUX_EFAULT;
+            }
+            header[8..12].copy_from_slice(&written);
         }
     }
     let mut output_flags = if message_length > received {
@@ -38273,6 +38333,84 @@ fn linux_write_unnamed_unix_address(address: u64, length_address: u64) -> bool {
     let length = u32::from_ne_bytes(supplied).min(2) as usize;
     copy_to_linux_user(address, &1_u16.to_ne_bytes()[..length])
         && copy_to_linux_user(length_address, &2_u32.to_ne_bytes())
+}
+
+/// A Unix datagram socket's send to a name in progress: its sends go to the
+/// socket bound to the name until this is dropped.
+struct LinuxUnixSendTarget(crate::linux_socket::SlotId);
+
+impl Drop for LinuxUnixSendTarget {
+    fn drop(&mut self) {
+        let _ = crate::linux_socket::set_unix_send_target(self.0, None);
+    }
+}
+
+/// Points Unix socket `slot`'s sends at the datagram socket bound to the
+/// sockaddr_un at `address`, as sendto and sendmsg with a name do. A
+/// stream socket given a name is EISCONN when connected, else EOPNOTSUPP;
+/// no socket at the name is ECONNREFUSED (an abstract name, or a socket
+/// file nothing is bound to) or ENOENT.
+fn linux_unix_send_target(
+    slot: crate::linux_socket::SlotId,
+    address: u64,
+    length: u64,
+) -> Result<Option<LinuxUnixSendTarget>, u64> {
+    let mut path = [0_u8; 108];
+    let path_length = linux_unix_socket_path(address, length, &mut path)?;
+    if crate::linux_socket::unix_type(slot) != Some(2) {
+        return Err(if crate::linux_socket::unix_peer_name(slot).is_some() {
+            LINUX_EISCONN
+        } else {
+            LINUX_EOPNOTSUPP
+        });
+    }
+    let target = match crate::linux_socket::unix_datagram_target(slot, &path[..path_length]) {
+        Ok(target) => target,
+        Err(crate::linux_socket::Error::WrongType) => return Err(LINUX_EPROTOTYPE),
+        Err(_) if path[0] == 0 => return Err(LINUX_ECONNREFUSED),
+        Err(_) => {
+            let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+            let socket_file = linux_canonical_path_at(
+                u64::from(LINUX_AT_FDCWD),
+                &path[..path_length],
+                &mut canonical,
+            )
+            .is_ok_and(|length| {
+                crate::linux_overlay::lookup(&canonical[..length])
+                    .is_some_and(|metadata| metadata.kind == crate::linux_overlay::NodeKind::Socket)
+            });
+            return Err(if socket_file {
+                LINUX_ECONNREFUSED
+            } else {
+                LINUX_ENOENT
+            });
+        }
+    };
+    crate::linux_socket::set_unix_send_target(slot, Some(target)).map_err(linux_socket_error)?;
+    Ok(Some(LinuxUnixSendTarget(slot)))
+}
+
+/// Writes Unix socket name `name` as a sockaddr_un at `address`, cut to the
+/// length at `length_address`, which then holds the whole length: an
+/// unbound socket's name is empty and its length 0.
+fn linux_write_unix_address(address: u64, length_address: u64, name: &[u8]) -> bool {
+    let mut supplied = [0_u8; 4];
+    if !copy_from_linux_user(length_address, &mut supplied) {
+        return false;
+    }
+    if name.is_empty() {
+        return copy_to_linux_user(length_address, &0_u32.to_ne_bytes());
+    }
+    let mut sockaddr = [0_u8; 110];
+    let name = &name[..name.len().min(108)];
+    sockaddr[..2].copy_from_slice(&1_u16.to_ne_bytes());
+    sockaddr[2..2 + name.len()].copy_from_slice(name);
+    // A pathname's length takes in its terminating NUL; an abstract one's
+    // does not.
+    let actual = (2 + name.len() + usize::from(name[0] != 0)).min(sockaddr.len());
+    let output_length = (u32::from_ne_bytes(supplied) as usize).min(actual);
+    copy_to_linux_user(address, &sockaddr[..output_length])
+        && copy_to_linux_user(length_address, &(actual as u32).to_ne_bytes())
 }
 
 fn linux_write_socket_address(

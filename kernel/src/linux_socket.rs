@@ -174,6 +174,10 @@ struct LocalQueue {
     /// Where reading resumes in the first chunk.
     head: usize,
     length: usize,
+    /// A Unix datagram socket's messages, in order: each one's length in
+    /// the bytes and its sender's name (empty for an unbound sender). A
+    /// read takes one message and drops what does not fit.
+    messages: VecDeque<(usize, Vec<u8>)>,
 }
 
 impl LocalQueue {
@@ -224,6 +228,47 @@ impl LocalQueue {
             head = 0;
         }
         copied
+    }
+
+    /// Appends `input` as one datagram from `sender`, whole or not at all.
+    fn push_message(&mut self, input: &[u8], sender: &[u8]) -> usize {
+        let mut name = Vec::new();
+        if self.messages.try_reserve(1).is_err() || name.try_reserve_exact(sender.len()).is_err() {
+            return 0;
+        }
+        name.extend_from_slice(sender);
+        let queued = self.push(input);
+        if queued != 0 {
+            self.messages.push_back((queued, name));
+        }
+        queued
+    }
+
+    /// Copies the first datagram into `output` without removing it: the
+    /// bytes copied, its length and its sender's name.
+    fn peek_message(&self, output: &mut [u8]) -> Option<(usize, usize, &[u8])> {
+        let (length, sender) = self.messages.front()?;
+        let wanted = output.len().min(*length);
+        let copied = self.peek(&mut output[..wanted]);
+        Some((copied, *length, sender))
+    }
+
+    /// Moves the first datagram into `output`, dropping what does not fit:
+    /// the bytes copied, its length and its sender's name.
+    fn pop_message(&mut self, output: &mut [u8]) -> Option<(usize, usize, Vec<u8>)> {
+        let (length, sender) = self.messages.pop_front()?;
+        let wanted = output.len().min(length);
+        let copied = self.pop(&mut output[..wanted]);
+        let mut rest = length - copied;
+        let mut scratch = [0_u8; 256];
+        while rest != 0 {
+            let dropped = self.pop(&mut scratch[..rest.min(256)]);
+            if dropped == 0 {
+                break;
+            }
+            rest -= dropped;
+        }
+        Some((copied, length, sender))
     }
 
     /// Moves the first bytes into `output`.
@@ -293,6 +338,12 @@ struct Slot {
     icmp_filter: u32,
     /// The TTL of the datagram an ICMP socket received last.
     received_ttl: u8,
+    /// A Unix datagram socket's destination for the send in progress, a
+    /// socket bound to the name sendto or sendmsg gave (else its peer).
+    send_target: Option<SlotId>,
+    /// The name of the sender of the datagram read last (recvfrom's
+    /// address), empty for an unbound one.
+    last_sender: Vec<u8>,
     /// The IPv4 multicast groups the socket joined (MCAST_JOIN_GROUP,
     /// IP_ADD_MEMBERSHIP); an accepted socket starts with none.
     groups: Vec<u32>,
@@ -332,6 +383,8 @@ impl Slot {
             icmp_filter: 0,
             received_ttl: 0,
             groups: Vec::new(),
+            send_target: None,
+            last_sender: Vec::new(),
             netlink_protocol: 0,
             netlink_port: 0,
             netlink_messages: VecDeque::new(),
@@ -1562,7 +1615,27 @@ impl Sockets {
                 return Err(Error::Invalid);
             }
             let kind = state.kind;
-            let peer = state.peer.ok_or(Error::NotConnected)?;
+            let peer = state
+                .send_target
+                .or(state.peer)
+                .ok_or(Error::NotConnected)?;
+            // A Unix datagram keeps its bounds and names its sender.
+            let datagram_sender =
+                (kind == Kind::Unix && state.unix_type == 2).then(|| state.unix_path.clone());
+            if let Some(sender) = datagram_sender {
+                let peer_state = self
+                    .slot_mut(peer)
+                    .filter(|slot| slot.kind == Kind::Unix && slot.unix_type == 2)
+                    .ok_or(Error::NotConnected)?;
+                let capacity = local_capacity.unwrap_or(usize::MAX);
+                if input.len() > capacity.saturating_sub(peer_state.local.len()) {
+                    return Err(Error::WouldBlock);
+                }
+                return match peer_state.local.push_message(input, &sender) {
+                    0 if !input.is_empty() => Err(Error::Exhausted),
+                    queued => Ok(queued),
+                };
+            }
             let Some(peer_state) = self
                 .slot_mut(peer)
                 .filter(|slot| slot.kind == kind && !slot.listening)
@@ -1598,12 +1671,19 @@ impl Sockets {
             }
             Kind::Udp => {
                 let endpoint = remote.or(connected).ok_or(Error::NotConnected)?;
-                runtime
+                let sent = runtime
                     .sockets
                     .get_mut::<udp::Socket>(handle)
                     .send_slice(input, endpoint)
                     .map(|_| input.len())
-                    .map_err(|_| Error::WouldBlock)
+                    .map_err(|_| Error::WouldBlock);
+                // The datagram leaves at once: one still in the socket's
+                // buffer would be lost if the socket closed first (bind05's
+                // peer writes its answer and closes).
+                if sent.is_ok() {
+                    self.poll();
+                }
+                sent
             }
             Kind::Icmp | Kind::Unix | Kind::Object | Kind::Netlink => Err(Error::Invalid),
         }
@@ -1754,6 +1834,10 @@ impl Sockets {
             return Ok((0, None));
         }
         if state.is_local() {
+            if let Some((received, _, sender)) = state.local.pop_message(output) {
+                state.last_sender = sender;
+                return Ok((received, None));
+            }
             let received = state.local.pop(output);
             if received != 0 {
                 return Ok((received, None));
@@ -1793,6 +1877,9 @@ impl Sockets {
             .slot(id)
             .filter(|state| state.is_local())
             .ok_or(Error::Invalid)?;
+        if let Some((copied, ..)) = state.local.peek_message(output) {
+            return Ok(copied);
+        }
         match state.local.peek(output) {
             0 => self.local_empty_result(state),
             returned => Ok(returned),
@@ -1937,6 +2024,26 @@ impl Sockets {
             let copied = output.len().min(message.len());
             output[..copied].copy_from_slice(&message[..copied]);
             return Ok((copied, message.len(), None));
+        }
+        // A Unix datagram is read whole: its length says whether it was
+        // cut short (MSG_TRUNC), and its sender is kept for recvfrom.
+        if kind == Some(Kind::Unix) {
+            let state = slot_in_mut(&mut self.slots, id).ok_or(Error::Invalid)?;
+            if !state.read_shutdown {
+                if peek_only {
+                    if let Some((copied, length, sender)) = state.local.peek_message(output) {
+                        let mut name = Vec::new();
+                        if name.try_reserve_exact(sender.len()).is_ok() {
+                            name.extend_from_slice(sender);
+                        }
+                        state.last_sender = name;
+                        return Ok((copied, length, None));
+                    }
+                } else if let Some((copied, length, sender)) = state.local.pop_message(output) {
+                    state.last_sender = sender;
+                    return Ok((copied, length, None));
+                }
+            }
         }
         if !matches!(kind, Some(Kind::Udp | Kind::Icmp)) {
             let (copied, endpoint) = if peek_only {
@@ -2133,10 +2240,40 @@ impl Sockets {
 
     /// The connected peer of a Unix socket `sender`.
     fn unix_peer(&self, sender: SlotId) -> Result<SlotId, Error> {
-        self.unix(sender)
+        let state = self.unix(sender).ok_or(Error::Invalid)?;
+        state.send_target.or(state.peer).ok_or(Error::NotConnected)
+    }
+
+    /// The datagram socket bound to `path` that Unix datagram socket `id`
+    /// may send to.
+    fn unix_datagram_target(&self, id: SlotId, path: &[u8]) -> Result<SlotId, Error> {
+        let state = self.unix(id).ok_or(Error::Invalid)?;
+        let owner = state.owner;
+        let mut other_type = false;
+        for (candidate, slot) in self.slots.iter().enumerate() {
+            let Some(slot) = slot else {
+                continue;
+            };
+            if slot.owner != owner || slot.kind != Kind::Unix || slot.unix_path != path {
+                continue;
+            }
+            if slot.unix_type == 2 {
+                return Ok(candidate as SlotId);
+            }
+            other_type = true;
+        }
+        Err(if other_type {
+            Error::WrongType
+        } else {
+            Error::NotConnected
+        })
+    }
+
+    fn set_unix_send_target(&mut self, id: SlotId, target: Option<SlotId>) -> Result<(), Error> {
+        unix_in_mut(&mut self.slots, id)
             .ok_or(Error::Invalid)?
-            .peer
-            .ok_or(Error::NotConnected)
+            .send_target = target;
+        Ok(())
     }
 
     fn queue_unix_rights(&mut self, sender: SlotId, rights: &[(SlotId, u32)]) -> Result<(), Error> {
@@ -2582,6 +2719,35 @@ pub(crate) fn connect_unix(
 }
 
 /// The path a Unix socket is bound to, empty when it has none.
+/// The datagram socket bound to `path` that `id` may send to.
+pub(crate) fn unix_datagram_target(id: SlotId, path: &[u8]) -> Result<SlotId, Error> {
+    SOCKETS.lock().unix_datagram_target(id, path)
+}
+
+/// Sends of Unix datagram socket `id` go to `target` until it is set back
+/// to None (sendto and sendmsg to a name; one send at a time per socket).
+pub(crate) fn set_unix_send_target(id: SlotId, target: Option<SlotId>) -> Result<(), Error> {
+    SOCKETS.lock().set_unix_send_target(id, target)
+}
+
+/// The name of the sender of the datagram `id` read last (empty: unbound).
+pub(crate) fn unix_last_sender(id: SlotId) -> Vec<u8> {
+    let sockets = SOCKETS.lock();
+    let Some(state) = sockets.unix(id) else {
+        return Vec::new();
+    };
+    let mut name = Vec::new();
+    if name.try_reserve_exact(state.last_sender.len()).is_ok() {
+        name.extend_from_slice(&state.last_sender);
+    }
+    name
+}
+
+/// The socket type of Unix socket `id` (1 stream, 2 datagram, 5 packets).
+pub(crate) fn unix_type(id: SlotId) -> Option<u8> {
+    SOCKETS.lock().unix(id).map(|state| state.unix_type)
+}
+
 pub(crate) fn unix_name(id: SlotId) -> Option<Vec<u8>> {
     SOCKETS.lock().unix_name(id)
 }

@@ -1151,7 +1151,7 @@ sendfile08 sendfile08
 sendfile08_64 sendfile08_64
 sendfile09 sendfile09  # auto: budget=180
 sendfile09_64 sendfile09_64  # auto: budget=180
-sendmsg01 sendmsg01
+!sendmsg01 sendmsg01  # musl: sendmsg copies msg_control in user space, so the invalid cmsg pointer case faults before the call (cases 1-14 pass)
 sendmsg02 sendmsg02
 sendmsg03 sendmsg03
 sendmmsg01 sendmmsg01
