@@ -651,7 +651,8 @@ pub(super) fn linux_futex_waitv_live_return(
     timeout: u64,
     clock: u64,
 ) -> u64 {
-    if flags != 0 || count == 0 || count > 128 {
+    // No waiter array is EINVAL before anything is read, as in Linux.
+    if flags != 0 || count == 0 || count > 128 || waiters == 0 {
         return LINUX_EINVAL;
     }
     if count != 1 {

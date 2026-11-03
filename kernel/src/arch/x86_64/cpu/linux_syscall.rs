@@ -423,6 +423,24 @@ fn linux_syscall_dispatch(
             linux_current_resident_kib(),
         );
     }
+    // An O_PATH descriptor names a file without opening it: calls that
+    // need an open file are EBADF on it, as in Linux (open13).
+    if matches!(
+        number,
+        LINUX_FCHMOD_SYSCALL
+            | LINUX_FCHOWN_SYSCALL
+            | LINUX_IOCTL_SYSCALL
+            | LINUX_FGETXATTR_SYSCALL
+            | LINUX_FSETXATTR_SYSCALL
+            | LINUX_FLISTXATTR_SYSCALL
+            | LINUX_FREMOVEXATTR_SYSCALL
+            | LINUX_FSYNC_SYSCALL
+            | LINUX_FDATASYNC_SYSCALL
+            | LINUX_FLOCK_SYSCALL
+    ) && linux_path_descriptor(u64::from(first_argument as u32))
+    {
+        return LINUX_EBADF;
+    }
     // A parent ignoring SIGCHLD has no zombies to see or wait for.
     if runtime_mode
         && matches!(

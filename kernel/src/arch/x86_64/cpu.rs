@@ -25818,9 +25818,15 @@ fn linux_sync_file_range(descriptor: u64, offset: u64, length: u64, flags: u64) 
     {
         return LINUX_EINVAL;
     }
-    let state = linux_device_descriptor(descriptor);
-    if linux_overlay_descriptor_handle(descriptor).is_none() || state & 3 == 1 {
+    // A closed descriptor is EBADF; one that is no regular file (a device,
+    // pipe or socket) has no range to sync (ESPIPE), as in Linux.
+    if !linux_descriptor_open(descriptor) {
         return LINUX_EBADF;
+    }
+    if linux_overlay_descriptor_handle(descriptor).is_none()
+        && linux_rootfs_descriptor(descriptor) == 0
+    {
+        return LINUX_ESPIPE;
     }
     0
 }
@@ -27895,7 +27901,10 @@ fn linux_readlink_at(
         {
             return LINUX_EINVAL;
         }
-        return LINUX_ENOENT;
+        // A path through a regular file is ENOTDIR (readlinkat02).
+        return canonical_length.map_or(LINUX_ENOENT, |length| {
+            linux_missing_path_error(&canonical[..length])
+        });
     }
     let exec_node = X86_RUNTIME.ELF_PROBE_EXEC_NODE.load(Ordering::SeqCst);
     let mut measured_path = [0_u8; 64];
@@ -31454,6 +31463,13 @@ fn linux_walk_start(
 /// target, relative to the link's directory unless absolute. `followed`
 /// counts links across the whole walk; more than 40 is ELOOP. The image's
 /// own links are followed by its lookups.
+/// Whether a component of `path` is longer than NAME_MAX (ENAMETOOLONG),
+/// which Linux finds before it looks anything up.
+fn linux_path_component_too_long(path: &[u8]) -> bool {
+    path.split(|byte| *byte == b'/')
+        .any(|component| component.len() > 255)
+}
+
 fn linux_walk_path_components(
     output: &mut [u8; crate::linux_overlay::PATH_CAPACITY],
     mut length: usize,
@@ -32198,7 +32214,9 @@ fn linux_openat_path(
         // O_TRUNC truncates regular files only; Linux ignores it for
         // devices and FIFOs (`2>/dev/null` opens O_CREAT|O_TRUNC).
         let regular = metadata.kind == crate::linux_overlay::NodeKind::File;
-        if flags & LINUX_O_TRUNC != 0 && metadata.kind == crate::linux_overlay::NodeKind::Directory
+        // A directory is not truncated, nor created over (O_CREAT: EISDIR).
+        if flags & (LINUX_O_TRUNC | LINUX_O_CREAT) != 0
+            && metadata.kind == crate::linux_overlay::NodeKind::Directory
         {
             return LINUX_EISDIR;
         }
@@ -32387,7 +32405,8 @@ fn linux_openat_path(
             },
         }
     };
-    if kind & LINUX_DEVICE_DIRECTORY != 0 && access != 0 {
+    // A directory opens only for reading, and never with O_CREAT (open11).
+    if kind & LINUX_DEVICE_DIRECTORY != 0 && (access != 0 || flags & LINUX_O_CREAT != 0) {
         return LINUX_EISDIR;
     }
     if kind & LINUX_DEVICE_DIRECTORY == 0 && flags & LINUX_O_DIRECTORY != 0 {
@@ -33132,6 +33151,9 @@ fn linux_newfstatat(directory: u64, path_address: u64, stat_address: u64, flags:
         Err(error) => return error,
     };
     let path = &path[..path_length];
+    if linux_path_component_too_long(path) {
+        return LINUX_ENAMETOOLONG;
+    }
     // An empty pathname names nothing without AT_EMPTY_PATH, as in statx:
     // std::filesystem::exists("") must be false (mold canonicalizes what
     // exists).
@@ -33875,6 +33897,18 @@ fn linux_unlinkat(directory: u64, path_address: u64, flags: u64) -> u64 {
         Err(error) => return error,
     };
     let path = &path[..path_length];
+    // rmdir of a path ending in "." is EINVAL, in ".." ENOTEMPTY, as
+    // Linux answers before looking the directory up (rmdir02).
+    if flags & LINUX_AT_REMOVEDIR != 0 {
+        let last = path
+            .rsplit(|byte| *byte == b'/')
+            .find(|component| !component.is_empty());
+        match last {
+            Some(b".") => return LINUX_EINVAL,
+            Some(b"..") => return LINUX_ENOTEMPTY,
+            _ => {}
+        }
+    }
     if directory as u32 == LINUX_AT_FDCWD && path == b"/tmp/ginux-ready" {
         if flags != 0 {
             return LINUX_ENOTDIR;
@@ -34785,6 +34819,11 @@ fn linux_set_times(handle: crate::linux_overlay::Handle, times: [(i64, i64); 2])
 fn linux_utimensat(directory: u64, path_address: u64, times_address: u64, flags: u64) -> u64 {
     let directory = u64::from(directory as u32);
     let flags = u64::from(flags as u32);
+    // No path means the descriptor itself, but AT_FDCWD names none: the
+    // missing path is then EFAULT, as in Linux (musl's utimes comes here).
+    if path_address == 0 && directory == u64::from(LINUX_AT_FDCWD) {
+        return LINUX_EFAULT;
+    }
     let handle = match linux_timestamp_handle(directory, path_address, flags) {
         Ok(handle) => handle,
         Err(error) => return error,
@@ -35206,6 +35245,9 @@ fn linux_statx(directory: u64, path_address: u64, flags: u64, mask: u64, stat_ad
         Err(error) => return error,
     };
     let path = &path[..path_length];
+    if linux_path_component_too_long(path) {
+        return LINUX_ENAMETOOLONG;
+    }
     if path.is_empty() {
         if flags & LINUX_AT_EMPTY_PATH == 0 {
             return LINUX_ENOENT;
@@ -40211,8 +40253,13 @@ fn linux_timerfd_settime(descriptor: u64, flags: u64, new_address: u64, old_addr
     const TFD_TIMER_CANCEL_ON_SET: u64 = 2;
     let descriptor = u64::from(descriptor as u32);
     let flags = u64::from(flags as u32);
+    // An open descriptor that is no timerfd is EINVAL, as in Linux.
     let Some(state) = linux_timerfd_state(descriptor) else {
-        return LINUX_EBADF;
+        return if linux_descriptor_open(descriptor) {
+            LINUX_EINVAL
+        } else {
+            LINUX_EBADF
+        };
     };
     let clock = u64::from(state.clock.load(Ordering::SeqCst));
     if flags & !(LINUX_TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET) != 0
@@ -40277,8 +40324,13 @@ fn linux_timerfd_settime(descriptor: u64, flags: u64, new_address: u64, old_addr
 
 fn linux_timerfd_gettime(descriptor: u64, address: u64) -> u64 {
     let descriptor = u64::from(descriptor as u32);
+    // An open descriptor that is no timerfd is EINVAL, as in Linux.
     let Some(state) = linux_timerfd_state(descriptor) else {
-        return LINUX_EBADF;
+        return if linux_descriptor_open(descriptor) {
+            LINUX_EINVAL
+        } else {
+            LINUX_EBADF
+        };
     };
     let Some(now) = linux_elapsed_nanoseconds() else {
         return LINUX_ENOSYS;
@@ -40722,6 +40774,15 @@ fn linux_open_named_fifo(flags: u64, handle: crate::linux_overlay::Handle) -> u6
     else {
         return LINUX_EMFILE;
     };
+    // A nonblocking open for writing finds no reader on a FIFO nobody has
+    // open (ENXIO), as Linux answers (open06).
+    if access == 1
+        && flags & LINUX_O_NONBLOCK != 0
+        && crate::linux_overlay::fifo_socket(handle)
+            .is_none_or(|slot| crate::linux_socket::kind(slot).is_none())
+    {
+        return LINUX_ENXIO;
+    }
     let slot = match crate::linux_overlay::fifo_socket(handle) {
         Some(slot) if crate::linux_socket::duplicate(slot) => slot,
         _ => match crate::linux_socket::open_loopback(1) {
@@ -42857,9 +42918,17 @@ fn linux_signalfd(descriptor: u64, mask_address: u64, mask_size: u64, flags: u64
         };
         descriptor
     } else if linux_signalfd_descriptor(descriptor) {
-        descriptor
+        // An existing signalfd takes the new mask only; its flags stay.
+        let index = (descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
+        X86_RUNTIME.ELF_PROBE_DESCRIPTOR_OFFSETS[index].store(mask, Ordering::SeqCst);
+        return descriptor;
     } else {
-        return LINUX_EBADF;
+        // An open descriptor that is no signalfd is EINVAL, as in Linux.
+        return if linux_descriptor_open(descriptor) {
+            LINUX_EINVAL
+        } else {
+            LINUX_EBADF
+        };
     };
     let index = (descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
     X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index].store(LINUX_DEVICE_SIGNALFD, Ordering::SeqCst);
@@ -47094,7 +47163,14 @@ fn linux_descriptor_fcntl(descriptor: u64, command: u64, argument: u64) -> u64 {
         )),
         LINUX_F_NOTIFY => linux_fcntl_notify(descriptor, argument),
         LINUX_F_GETFL => {
-            u64::from((state & 3) - 1)
+            // A descriptor without access bits (a signalfd, other anonymous
+            // files) is O_RDWR; `(0 - 1)` wrapped to every flag, O_NONBLOCK
+            // among them (signalfd4_02).
+            let access = match state & 3 {
+                0 => 2,
+                bits => bits - 1,
+            };
+            u64::from(access)
                 | u64::from(
                     linux_socket_flags(descriptor).unwrap_or(0)
                         & !(LINUX_PRIVATE_SECRET_DESCRIPTOR | LINUX_PRIVATE_IO_URING_DESCRIPTOR),
@@ -49339,6 +49415,10 @@ fn linux_readahead(descriptor: u64, offset: u64, _count: u64) -> u64 {
     let state = linux_device_descriptor(descriptor);
     if !matches!(state & 3, LINUX_DESCRIPTOR_INPUT | 3) || linux_path_descriptor(descriptor) {
         return LINUX_EBADF;
+    }
+    // A directory or another kind of file has no pages to read ahead.
+    if state & LINUX_DEVICE_DIRECTORY != 0 || linux_inotify_descriptor(descriptor) {
+        return LINUX_EINVAL;
     }
     if linux_overlay_descriptor_handle(descriptor).is_some()
         || linux_rootfs_entry(descriptor).is_some()

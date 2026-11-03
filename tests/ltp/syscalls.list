@@ -861,7 +861,7 @@ open09 open09
 open10 open10
 open11 open11
 !open12 open12  # auto: needs a loop block device (mkfs and mount)
-open13 open13
+!open13 open13  # musl: fchmod() and fchown() retry an EBADF through /proc/self/fd/N, which an O_PATH descriptor allows
 !open14 open14  # auto: needs a loop block device (mkfs and mount)
 open15 open15
 openat01 openat01
@@ -1027,9 +1027,9 @@ readahead01 readahead01
 !readdir01 readdir01  # auto: needs a loop block device (mkfs and mount)
 !readdir21 readdir21  # auto: needs a loop block device (mkfs and mount)
 readlink01 readlink01
-readlink03 readlink03
+!readlink03 readlink03  # musl: readlink() with a zero size passes a one-byte buffer instead, so the EINVAL case cannot fail
 readlinkat01 readlinkat01
-readlinkat02 readlinkat02
+!readlinkat02 readlinkat02  # musl: readlinkat() with a zero size passes a one-byte buffer instead, so the EINVAL case cannot fail
 readv01 readv01
 readv02 readv02
 realpath01 realpath01
@@ -1197,7 +1197,7 @@ setgroups01 setgroups01
 setgroups01_16 setgroups01_16
 setgroups02 setgroups02
 setgroups02_16 setgroups02_16
-setgroups03 setgroups03
+!setgroups03 setgroups03  # musl: NGROUPS is 32, so the test's NGROUPS+1 groups are within Linux's limit
 setgroups03_16 setgroups03_16
 sethostname01 sethostname01
 sethostname02 sethostname02

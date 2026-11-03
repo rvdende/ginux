@@ -123,10 +123,6 @@ munmap04 TBROK
 name_to_handle_at01 TFAIL
 nftw01 TFAIL
 nftw6401 TFAIL
-open04 TWARN
-open06 TFAIL
-open11 TFAIL
-open13 TFAIL
 openat03 TBROK
 openat202 TFAIL
 open_by_handle_at01 TFAIL
@@ -155,10 +151,7 @@ ptrace08 TBROK
 ptrace09 TBROK
 ptrace10 TBROK
 ptrace11 TBROK
-readahead01 TFAIL
-readlink03 TFAIL
 readlinkat01 TBROK
-readlinkat02 TFAIL
 realpath01 TBROK
 reboot01 TFAIL
 reboot02 TFAIL
@@ -166,7 +159,6 @@ recvfrom01 TFAIL
 recvmsg01 TFAIL
 recvmmsg01 TBROK
 remap_file_pages01 TBROK
-rmdir02 TFAIL
 rt_sigaction01 TBROK
 rt_sigqueueinfo01 TFAIL
 sbrk01 TFAIL
@@ -178,7 +170,6 @@ send01 TFAIL
 send02 TBROK
 sendmsg01 TBROK
 sendto01 TFAIL
-setgroups03 TFAIL
 setns02 TWARN
 setrlimit06 TFAIL
 setsockopt01 TFAIL
@@ -187,8 +178,6 @@ setxattr03 TBROK
 shmget02 TBROK
 sigaction01 TBROK
 signal06 TBROK
-signalfd02 TFAIL
-signalfd4_02 TFAIL
 sigtimedwait01 HANG
 sigwaitinfo01 HANG
 socketpair01 TFAIL
@@ -197,19 +186,15 @@ splice06 TBROK
 splice09 TFAIL
 statmount03 TBROK
 statmount08 TBROK
-sync_file_range01 TFAIL
 syslog11 TBROK
 syslog12 TFAIL
 tgkill02 TFAIL
 times03 TFAIL
-timerfd_gettime01 TFAIL
-timerfd_settime01 TFAIL
 unshare03 TFAIL
 unshare05 TBROK
 userfaultfd03 TBROK
 ustat01 TFAIL
 ustat02 TFAIL
-utimes01 TFAIL
 vhangup02 TFAIL
 waitpid01 TFAIL
 waitid10 TBROK
@@ -219,7 +204,6 @@ futex_cmp_requeue01 TBROK
 futex_waitv01 TFAIL
 futex_wake05 TFAIL
 copy_file_range03 TFAIL
-statx03 TFAIL
 io_uring01 TBROK
 io_uring02 TBROK
 io_uring03 TBROK
