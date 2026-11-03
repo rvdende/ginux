@@ -449,11 +449,6 @@ struct X86RuntimeOwner {
     LINUX_FUTEX_WAIT_BLOCK_COUNT: RuntimeRef<BankedAtomicU32>,
     LINUX_FUTEX_WAIT_TIMEOUT_COUNT: RuntimeRef<BankedAtomicU32>,
     LINUX_INIT_EXIT_KILL_ROUNDS: RuntimeRef<BankedAtomicU32>,
-    LINUX_INOTIFY_PENDING_MASKS: RuntimeRef<[AtomicU32; LINUX_INOTIFY_WATCH_SLOT_COUNT]>,
-    LINUX_INOTIFY_WATCH_DESCRIPTORS: RuntimeRef<[AtomicU32; LINUX_INOTIFY_WATCH_SLOT_COUNT]>,
-    LINUX_INOTIFY_WATCH_MASKS: RuntimeRef<[AtomicU32; LINUX_INOTIFY_WATCH_SLOT_COUNT]>,
-    LINUX_INOTIFY_WATCH_OWNERS: RuntimeRef<[AtomicU16; LINUX_INOTIFY_WATCH_SLOT_COUNT]>,
-    LINUX_INOTIFY_WATCH_PATHS: RuntimeRef<[AtomicU64; LINUX_INOTIFY_WATCH_SLOT_COUNT]>,
     LINUX_IO_URING_CQ_ENTRIES: RuntimeRef<BankedAtomicU32>,
     LINUX_IO_URING_CQ_RING: RuntimeRef<BankedAtomicU64>,
     LINUX_IO_URING_ENTRIES: RuntimeRef<BankedAtomicU32>,
@@ -980,13 +975,6 @@ static X86_RUNTIME: X86RuntimeOwner = X86RuntimeOwner {
     LINUX_FUTEX_WAIT_BLOCK_COUNT: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_FUTEX_WAIT_BLOCK_COUNT),
     LINUX_FUTEX_WAIT_TIMEOUT_COUNT: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_FUTEX_WAIT_TIMEOUT_COUNT),
     LINUX_INIT_EXIT_KILL_ROUNDS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_INIT_EXIT_KILL_ROUNDS),
-    LINUX_INOTIFY_PENDING_MASKS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_INOTIFY_PENDING_MASKS),
-    LINUX_INOTIFY_WATCH_DESCRIPTORS: RuntimeRef(
-        &X86_RUNTIME_BACKING_LINUX_INOTIFY_WATCH_DESCRIPTORS,
-    ),
-    LINUX_INOTIFY_WATCH_MASKS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_INOTIFY_WATCH_MASKS),
-    LINUX_INOTIFY_WATCH_OWNERS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_INOTIFY_WATCH_OWNERS),
-    LINUX_INOTIFY_WATCH_PATHS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_INOTIFY_WATCH_PATHS),
     LINUX_IO_URING_CQ_ENTRIES: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_IO_URING_CQ_ENTRIES),
     LINUX_IO_URING_CQ_RING: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_IO_URING_CQ_RING),
     LINUX_IO_URING_ENTRIES: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_IO_URING_ENTRIES),
@@ -3644,16 +3632,6 @@ static X86_RUNTIME_BACKING_ELF_PROBE_TMP_FILE_GENERATIONS: CpuBankedAtomicArray<
     AtomicU32,
     LINUX_DEVICE_DESCRIPTOR_COUNT,
 > = CpuBankedAtomicArray::<AtomicU32, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
-static X86_RUNTIME_BACKING_LINUX_INOTIFY_WATCH_OWNERS: [AtomicU16; LINUX_INOTIFY_WATCH_SLOT_COUNT] =
-    [const { AtomicU16::new(0) }; LINUX_INOTIFY_WATCH_SLOT_COUNT];
-static X86_RUNTIME_BACKING_LINUX_INOTIFY_WATCH_PATHS: [AtomicU64; LINUX_INOTIFY_WATCH_SLOT_COUNT] =
-    [const { AtomicU64::new(0) }; LINUX_INOTIFY_WATCH_SLOT_COUNT];
-static X86_RUNTIME_BACKING_LINUX_INOTIFY_WATCH_MASKS: [AtomicU32; LINUX_INOTIFY_WATCH_SLOT_COUNT] =
-    [const { AtomicU32::new(0) }; LINUX_INOTIFY_WATCH_SLOT_COUNT];
-static X86_RUNTIME_BACKING_LINUX_INOTIFY_WATCH_DESCRIPTORS: [AtomicU32;
-    LINUX_INOTIFY_WATCH_SLOT_COUNT] = [const { AtomicU32::new(0) }; LINUX_INOTIFY_WATCH_SLOT_COUNT];
-static X86_RUNTIME_BACKING_LINUX_INOTIFY_PENDING_MASKS: [AtomicU32;
-    LINUX_INOTIFY_WATCH_SLOT_COUNT] = [const { AtomicU32::new(0) }; LINUX_INOTIFY_WATCH_SLOT_COUNT];
 static X86_RUNTIME_BACKING_LINUX_FANOTIFY_REFS: BankedAtomicU16 = BankedAtomicU16::new(0);
 static X86_RUNTIME_BACKING_LINUX_FANOTIFY_MARK_PATHS: [BankedAtomicU64; LINUX_FANOTIFY_MARK_LIMIT] =
     [const { BankedAtomicU64::new(0) }; LINUX_FANOTIFY_MARK_LIMIT];
@@ -10592,27 +10570,8 @@ pub(crate) fn verify_linux_elf_entry(execution: &LinuxElfExecution<'_>) -> Linux
     for generation in &X86_RUNTIME.ELF_PROBE_TMP_FILE_GENERATIONS {
         generation.store(0, Ordering::SeqCst);
     }
-    let inotify_instance = linux_execution_instance();
-    let inotify_watch_start = inotify_instance * LINUX_INOTIFY_WATCH_LIMIT;
-    let inotify_watch_end = inotify_watch_start + LINUX_INOTIFY_WATCH_LIMIT;
-    for owner in &X86_RUNTIME.LINUX_INOTIFY_WATCH_OWNERS[inotify_watch_start..inotify_watch_end] {
-        owner.store(0, Ordering::SeqCst);
-    }
-    for path in &X86_RUNTIME.LINUX_INOTIFY_WATCH_PATHS[inotify_watch_start..inotify_watch_end] {
-        path.store(0, Ordering::SeqCst);
-    }
-    for mask in &X86_RUNTIME.LINUX_INOTIFY_WATCH_MASKS[inotify_watch_start..inotify_watch_end] {
-        mask.store(0, Ordering::SeqCst);
-    }
-    for descriptor in
-        &X86_RUNTIME.LINUX_INOTIFY_WATCH_DESCRIPTORS[inotify_watch_start..inotify_watch_end]
-    {
-        descriptor.store(0, Ordering::SeqCst);
-    }
-    for pending in &X86_RUNTIME.LINUX_INOTIFY_PENDING_MASKS[inotify_watch_start..inotify_watch_end]
-    {
-        pending.store(0, Ordering::SeqCst);
-    }
+    // A runtime starts with no inotify instances of its domain.
+    crate::linux_inotify::release(linux_execution_instance(), None, 0);
     X86_RUNTIME.LINUX_FANOTIFY_REFS.store(0, Ordering::SeqCst);
     for path in &X86_RUNTIME.LINUX_FANOTIFY_MARK_PATHS {
         path.store(0, Ordering::SeqCst);
@@ -27138,10 +27097,11 @@ fn linux_runtime_file_kind(path: &[u8]) -> Option<u16> {
             return Some(kind);
         }
     }
+    // The caller's fdinfo by /proc/self or by its own pid (inotify12).
+    if linux_proc_fdinfo_target(path).is_some() {
+        return Some(LINUX_FILE_PROC_FDINFO);
+    }
     if let Some(name) = path.strip_prefix(b"/proc/self/") {
-        if linux_proc_fdinfo_target(path).is_some() {
-            return Some(LINUX_FILE_PROC_FDINFO);
-        }
         return linux_proc_pid_file_kind(current_linux_process_pid(), name);
     }
     if let Some((pid, name)) = linux_proc_numeric_file(path, true) {
@@ -27648,13 +27608,26 @@ fn linux_proc_process_file(path: &[u8]) -> Option<(u32, &[u8])> {
 }
 
 fn linux_proc_fdinfo_target(path: &[u8]) -> Option<u64> {
-    let descriptor = path.strip_prefix(b"/proc/self/fdinfo/")?;
+    // /proc/self/fdinfo/N, or the calling process's own /proc/PID/fdinfo/N.
+    let descriptor = path.strip_prefix(b"/proc/self/fdinfo/").or_else(|| {
+        let rest = path.strip_prefix(b"/proc/")?;
+        let slash = rest.iter().position(|byte| *byte == b'/')?;
+        let pid = core::str::from_utf8(&rest[..slash])
+            .ok()?
+            .parse::<u32>()
+            .ok()?;
+        (pid == current_linux_process_pid())
+            .then(|| rest[slash..].strip_prefix(b"/fdinfo/"))
+            .flatten()
+    })?;
     let descriptor = descriptor.iter().try_fold(0_u64, |value, byte| {
         byte.is_ascii_digit()
             .then(|| value.checked_mul(10)?.checked_add(u64::from(byte - b'0')))
             .flatten()
     })?;
-    linux_pidfd_descriptor(descriptor).then_some(descriptor)
+    // A pidfd's (its process) and an inotify descriptor's (its watches).
+    (linux_pidfd_descriptor(descriptor) || linux_inotify_descriptor(descriptor))
+        .then_some(descriptor)
 }
 
 /// The command name (comm) of process `pid`, in `name`: the running
@@ -32588,9 +32561,7 @@ fn linux_update_cgroup_files(generation: u32, populated: bool, pid: u32) -> bool
     {
         return false;
     }
-    if let Some(path_hash) = crate::linux_overlay::path_hash(events) {
-        linux_inotify_notify_path_hash(path_hash, 0x0000_0002);
-    }
+    linux_inotify_overlay_event(events, crate::linux_inotify::IN_MODIFY);
     wake_linux_descriptor_waits();
     true
 }
@@ -36601,6 +36572,41 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
         let Some(target) = linux_proc_fdinfo_descriptor_target(descriptor) else {
             return LINUX_EBADF;
         };
+        // An inotify descriptor lists its watches, one line each, with the
+        // mask and flags they were added with (inotify12).
+        if let Some((domain, instance)) = linux_inotify_key(target) {
+            let mut file = [0_u8; 1024];
+            let prefix = b"pos:\t0\nflags:\t02000000\nmnt_id:\t1\nino:\t1\n";
+            file[..prefix.len()].copy_from_slice(prefix);
+            let mut used = prefix.len();
+            crate::linux_inotify::watches(domain, instance, |wd, mask| {
+                let mut line = [0_u8; 96];
+                let mut length = 0;
+                let written = append_linux_bytes(&mut line, &mut length, b"inotify wd:")
+                    && append_linux_hex(&mut line, &mut length, wd as u32 as u64)
+                    && append_linux_bytes(&mut line, &mut length, b" ino:1 sdev:0 mask:")
+                    && append_linux_hex(&mut line, &mut length, u64::from(mask))
+                    && append_linux_bytes(&mut line, &mut length, b" ignored_mask:0\n");
+                if written && used + length <= file.len() {
+                    file[used..used + length].copy_from_slice(&line[..length]);
+                    used += length;
+                }
+            });
+            let Ok(start) = usize::try_from(offset) else {
+                return 0;
+            };
+            if start >= used || count == 0 {
+                return 0;
+            }
+            let end = start
+                .saturating_add(usize::try_from(count).unwrap_or(usize::MAX))
+                .min(used);
+            return if copy_to_linux_user(address, &file[start..end]) {
+                (end - start) as u64
+            } else {
+                LINUX_EFAULT
+            };
+        }
         let Some(pid) = linux_pidfd_process(target) else {
             return LINUX_ENOENT;
         };
@@ -38078,6 +38084,15 @@ fn linux_descriptor_read_live_return(
             return LINUX_EINVAL;
         }
         return LINUX_RETURN_TO_KERNEL;
+    }
+    // An inotify descriptor opened without IN_NONBLOCK waits for an event
+    // as other blocking reads wait: the rest of the domain runs and the read
+    // starts again (inotify11).
+    if immediate == LINUX_EAGAIN
+        && linux_inotify_descriptor(descriptor)
+        && !linux_socket_flags(descriptor).is_some_and(|flags| flags & LINUX_O_NONBLOCK as u32 != 0)
+    {
+        return linux_retry_later_live_return(output, caller, LINUX_READ_SYSCALL);
     }
     if immediate != LINUX_ENOSYS
         || !linux_eventfd_descriptor(descriptor)
@@ -42061,11 +42076,6 @@ fn linux_fanotify_release() {
     }
 }
 
-fn linux_inotify_watch_range() -> core::ops::Range<usize> {
-    let start = linux_execution_instance() * LINUX_INOTIFY_WATCH_LIMIT;
-    start..start + LINUX_INOTIFY_WATCH_LIMIT
-}
-
 fn linux_inotify_instance(descriptor: u64) -> Option<usize> {
     if !linux_inotify_descriptor(descriptor) {
         return None;
@@ -42075,6 +42085,11 @@ fn linux_inotify_instance(descriptor: u64) -> Option<usize> {
         .checked_sub(1)
         .and_then(|index| usize::try_from(index).ok())
         .filter(|index| *index < usize::from(u16::MAX))
+}
+
+/// The inotify instance a descriptor stands for: its domain and id.
+fn linux_inotify_key(descriptor: u64) -> Option<(usize, u64)> {
+    linux_inotify_instance(descriptor).map(|instance| (linux_execution_instance(), instance as u64))
 }
 
 fn linux_inotify_init(flags: u64) -> u64 {
@@ -42101,6 +42116,21 @@ fn linux_inotify_init(flags: u64) -> u64 {
         return LINUX_EMFILE;
     };
     X86_RUNTIME.ELF_PROBE_DESCRIPTOR_OFFSETS[index].store(instance + 1, Ordering::SeqCst);
+    // The queue holds max_queued_events as /proc/sys/fs/inotify sets it.
+    let limit = linux_proc_sysctl_value(b"sys/fs/inotify/max_queued_events")
+        .and_then(|limit| usize::try_from(limit).ok())
+        .unwrap_or(crate::linux_inotify::DEFAULT_QUEUE_LIMIT);
+    if !crate::linux_inotify::create(
+        linux_execution_instance(),
+        instance,
+        current_linux_process_pid(),
+        limit,
+    ) {
+        X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index].store(0, Ordering::SeqCst);
+        X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index].store(0, Ordering::SeqCst);
+        X86_RUNTIME.ELF_PROBE_DESCRIPTOR_OFFSETS[index].store(0, Ordering::SeqCst);
+        return LINUX_ENOMEM;
+    }
     set_linux_descriptor_close_on_exec(descriptor, flags & IN_CLOEXEC != 0);
     descriptor
 }
@@ -42115,17 +42145,17 @@ fn linux_inotify_path_hash(path: &[u8]) -> u64 {
 }
 
 fn linux_inotify_add_watch(descriptor: u64, path_address: u64, mask: u64) -> u64 {
-    const IN_ONLYDIR: u32 = 0x0100_0000;
-    const IN_MASK_CREATE: u32 = 0x1000_0000;
-    const IN_MASK_ADD: u32 = 0x2000_0000;
-    const IN_ALL_EVENTS: u32 = 0x0000_0fff;
-    const IN_ALLOWED: u32 = IN_ALL_EVENTS | 0xb700_0000;
+    use crate::linux_inotify::{IN_ALL_EVENTS, IN_ONLYDIR};
     let descriptor = u64::from(descriptor as u32);
     let mask = mask as u32;
-    let Some(instance) = linux_inotify_instance(descriptor) else {
-        return LINUX_EBADF;
+    let Some((domain, instance)) = linux_inotify_key(descriptor) else {
+        return if linux_descriptor_open(descriptor) {
+            LINUX_EINVAL
+        } else {
+            LINUX_EBADF
+        };
     };
-    if mask & IN_ALL_EVENTS == 0 || mask & !IN_ALLOWED != 0 {
+    if mask & IN_ALL_EVENTS == 0 {
         return LINUX_EINVAL;
     }
     let mut path = [0_u8; LINUX_PATH_MAX];
@@ -42164,144 +42194,327 @@ fn linux_inotify_add_watch(descriptor: u64, path_address: u64, mask: u64) -> u64
     if mask & IN_ONLYDIR != 0 && !directory {
         return LINUX_ENOTDIR;
     }
-    let owner = instance as u16 + 1;
-    let path_hash = linux_inotify_path_hash(&canonical[..length]);
-    if let Some(index) = linux_inotify_watch_range().find(|index| {
-        X86_RUNTIME.LINUX_INOTIFY_WATCH_OWNERS[*index].load(Ordering::SeqCst) == owner
-            && X86_RUNTIME.LINUX_INOTIFY_WATCH_PATHS[*index].load(Ordering::SeqCst) == path_hash
-            && X86_RUNTIME.LINUX_INOTIFY_WATCH_MASKS[*index].load(Ordering::SeqCst) != 0
-    }) {
-        if mask & IN_MASK_CREATE != 0 {
-            return LINUX_EEXIST;
-        }
-        let previous = X86_RUNTIME.LINUX_INOTIFY_WATCH_MASKS[index].load(Ordering::SeqCst);
-        let events = mask & IN_ALL_EVENTS;
-        X86_RUNTIME.LINUX_INOTIFY_WATCH_MASKS[index].store(
-            if mask & IN_MASK_ADD != 0 {
-                previous | events
-            } else {
-                events
-            },
-            Ordering::SeqCst,
-        );
-        return u64::from(
-            X86_RUNTIME.LINUX_INOTIFY_WATCH_DESCRIPTORS[index].load(Ordering::SeqCst),
-        );
+    if mask & IN_ONLYDIR != 0 && !directory {
+        return LINUX_ENOTDIR;
     }
-    let watches = linux_inotify_watch_range();
-    let Some(index) = X86_RUNTIME.LINUX_INOTIFY_WATCH_OWNERS[watches.clone()]
-        .iter()
-        .position(|owner| owner.load(Ordering::SeqCst) == 0)
-        .map(|index| watches.start + index)
-    else {
-        return LINUX_ENOSPC;
-    };
-    let wd = linux_inotify_watch_range()
-        .filter(|index| {
-            X86_RUNTIME.LINUX_INOTIFY_WATCH_OWNERS[*index].load(Ordering::SeqCst) == owner
-        })
-        .map(|index| X86_RUNTIME.LINUX_INOTIFY_WATCH_DESCRIPTORS[index].load(Ordering::SeqCst))
-        .max()
-        .unwrap_or(0)
-        .saturating_add(1)
-        .max(1);
-    X86_RUNTIME.LINUX_INOTIFY_WATCH_PATHS[index].store(path_hash, Ordering::SeqCst);
-    X86_RUNTIME.LINUX_INOTIFY_WATCH_MASKS[index].store(mask & IN_ALL_EVENTS, Ordering::SeqCst);
-    X86_RUNTIME.LINUX_INOTIFY_WATCH_DESCRIPTORS[index].store(wd, Ordering::SeqCst);
-    X86_RUNTIME.LINUX_INOTIFY_PENDING_MASKS[index].store(0, Ordering::SeqCst);
-    X86_RUNTIME.LINUX_INOTIFY_WATCH_OWNERS[index].store(owner, Ordering::SeqCst);
-    u64::from(wd)
+    match crate::linux_inotify::add_watch(domain, instance, &canonical[..length], mask) {
+        Ok(wd) => wd as u64,
+        Err(crate::linux_inotify::Error::Exists) => LINUX_EEXIST,
+        Err(crate::linux_inotify::Error::NoMemory) => LINUX_ENOSPC,
+        Err(crate::linux_inotify::Error::Invalid) => LINUX_EINVAL,
+    }
 }
 
 fn linux_inotify_rm_watch(descriptor: u64, watch_descriptor: u64) -> u64 {
-    const IN_IGNORED: u32 = 0x0000_8000;
     let descriptor = u64::from(descriptor as u32);
-    let watch_descriptor = watch_descriptor as i32;
-    let Some(instance) = linux_inotify_instance(descriptor) else {
-        return LINUX_EBADF;
+    let Some((domain, instance)) = linux_inotify_key(descriptor) else {
+        return if linux_descriptor_open(descriptor) {
+            LINUX_EINVAL
+        } else {
+            LINUX_EBADF
+        };
     };
-    if watch_descriptor < 0 {
-        return LINUX_EINVAL;
-    }
-    let wd = watch_descriptor as u32;
-    let owner = instance as u16 + 1;
-    let Some(index) = linux_inotify_watch_range().find(|index| {
-        X86_RUNTIME.LINUX_INOTIFY_WATCH_OWNERS[*index].load(Ordering::SeqCst) == owner
-            && X86_RUNTIME.LINUX_INOTIFY_WATCH_DESCRIPTORS[*index].load(Ordering::SeqCst) == wd
-            && X86_RUNTIME.LINUX_INOTIFY_WATCH_MASKS[*index].load(Ordering::SeqCst) != 0
-    }) else {
-        return LINUX_EINVAL;
-    };
-    X86_RUNTIME.LINUX_INOTIFY_WATCH_MASKS[index].store(0, Ordering::SeqCst);
-    X86_RUNTIME.LINUX_INOTIFY_PENDING_MASKS[index].fetch_or(IN_IGNORED, Ordering::SeqCst);
-    wake_linux_descriptor_waits();
-    0
-}
-
-fn linux_inotify_notify_path_hash(path_hash: u64, event: u32) {
-    let mut queued = false;
-    for index in linux_inotify_watch_range() {
-        if X86_RUNTIME.LINUX_INOTIFY_WATCH_PATHS[index].load(Ordering::SeqCst) == path_hash
-            && X86_RUNTIME.LINUX_INOTIFY_WATCH_MASKS[index].load(Ordering::SeqCst) & event != 0
-        {
-            X86_RUNTIME.LINUX_INOTIFY_PENDING_MASKS[index].fetch_or(event, Ordering::SeqCst);
-            queued = true;
+    match crate::linux_inotify::rm_watch(domain, instance, watch_descriptor as i32) {
+        Ok(()) => {
+            wake_linux_descriptor_waits();
+            0
         }
-    }
-    if queued {
-        wake_linux_descriptor_waits();
+        Err(_) => LINUX_EINVAL,
     }
 }
 
 fn linux_inotify_read(descriptor: u64, address: u64, count: u64) -> Option<u64> {
-    const EVENT_SIZE: u64 = 16;
-    const IN_IGNORED: u32 = 0x0000_8000;
-    let instance = linux_inotify_instance(descriptor)?;
-    if count < EVENT_SIZE {
-        return Some(LINUX_EINVAL);
+    let (domain, instance) = linux_inotify_key(descriptor)?;
+    let capacity = usize::try_from(count).unwrap_or(usize::MAX);
+    let result = crate::linux_inotify::read(domain, instance, capacity, |offset, bytes| {
+        copy_to_linux_user(address + offset as u64, bytes)
+    });
+    Some(match result {
+        Ok(0) => LINUX_EAGAIN,
+        Ok(written) => written as u64,
+        Err(crate::linux_inotify::Error::NoMemory) => LINUX_EFAULT,
+        Err(_) => LINUX_EINVAL,
+    })
+}
+
+/// A canonical path, as watches name paths.
+type LinuxInotifyPath = ([u8; crate::linux_overlay::PATH_CAPACITY], usize);
+
+/// The canonical path a path argument names, from `directory`.
+fn linux_inotify_path_at(directory: u64, address: u64) -> Option<LinuxInotifyPath> {
+    let mut path = [0_u8; LINUX_PATH_MAX];
+    let length = copy_linux_c_string(address, &mut path).ok()?;
+    let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    let canonical_length = if &path[..length] == b"/" {
+        0
+    } else {
+        linux_canonical_path_at(u64::from(directory as u32), &path[..length], &mut canonical)
+            .ok()?
+    };
+    Some((canonical, canonical_length))
+}
+
+/// The canonical path of an open descriptor's file, if it has one.
+fn linux_inotify_descriptor_path(descriptor: u64) -> Option<LinuxInotifyPath> {
+    let descriptor = u64::from(descriptor as u32);
+    if linux_overlay_descriptor_handle(descriptor).is_none()
+        && linux_rootfs_descriptor(descriptor) == 0
+    {
+        return None;
     }
-    let owner = instance as u16 + 1;
-    let mut written = 0_u64;
-    for index in linux_inotify_watch_range() {
-        if written + EVENT_SIZE > count
-            || X86_RUNTIME.LINUX_INOTIFY_WATCH_OWNERS[index].load(Ordering::SeqCst) != owner
-        {
-            continue;
-        }
-        let pending = X86_RUNTIME.LINUX_INOTIFY_PENDING_MASKS[index].swap(0, Ordering::SeqCst);
-        if pending == 0 {
-            continue;
-        }
-        let mut event = [0_u8; EVENT_SIZE as usize];
-        event[..4].copy_from_slice(
-            &X86_RUNTIME.LINUX_INOTIFY_WATCH_DESCRIPTORS[index]
-                .load(Ordering::SeqCst)
-                .to_ne_bytes(),
+    let mut absolute = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    let length = linux_descriptor_path(descriptor, &mut absolute)?;
+    let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    let relative = absolute[..length]
+        .strip_prefix(b"/")
+        .unwrap_or(&absolute[..length]);
+    canonical[..relative.len()].copy_from_slice(relative);
+    Some((canonical, relative.len()))
+}
+
+/// Whether canonical `path` still names a file (an open one may have been
+/// unlinked).
+fn linux_inotify_exists(path: &[u8]) -> bool {
+    path.is_empty()
+        || crate::linux_overlay::lookup(path).is_some()
+        || crate::published_rootfs::lookup_metadata_at(crate::published_rootfs::ROOT_HANDLE, path)
+            .is_some_and(|(_, entry)| entry.is_some())
+            && !crate::linux_overlay::hidden(path)
+}
+
+/// Whether canonical `path` names a directory.
+fn linux_inotify_is_directory(path: &[u8]) -> bool {
+    if path.is_empty() {
+        return true;
+    }
+    if let Some(metadata) = crate::linux_overlay::lookup(path) {
+        return metadata.kind == crate::linux_overlay::NodeKind::Directory;
+    }
+    crate::published_rootfs::lookup_metadata_at(crate::published_rootfs::ROOT_HANDLE, path)
+        .is_some_and(|(_, entry)| {
+            entry.is_none_or(|entry| entry.kind == crate::published_rootfs::EntryKind::Directory)
+        })
+}
+
+/// An event on an overlay node, by its path (the cgroup events files).
+fn linux_inotify_overlay_event(handle: crate::linux_overlay::Handle, mask: u32) {
+    if !crate::linux_inotify::active() {
+        return;
+    }
+    let mut absolute = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    if let Some(length) = crate::linux_overlay::copy_path(handle, &mut absolute) {
+        crate::linux_inotify::notify(
+            linux_execution_instance(),
+            &absolute[..length],
+            mask,
+            false,
+            false,
         );
-        event[4..8].copy_from_slice(&pending.to_ne_bytes());
-        if !copy_to_linux_user(address + written, &event) {
-            X86_RUNTIME.LINUX_INOTIFY_PENDING_MASKS[index].fetch_or(pending, Ordering::SeqCst);
-            return Some(if written == 0 { LINUX_EFAULT } else { written });
-        }
-        written += EVENT_SIZE;
-        if pending & IN_IGNORED != 0 {
-            X86_RUNTIME.LINUX_INOTIFY_WATCH_OWNERS[index].store(0, Ordering::SeqCst);
-            X86_RUNTIME.LINUX_INOTIFY_WATCH_PATHS[index].store(0, Ordering::SeqCst);
-            X86_RUNTIME.LINUX_INOTIFY_WATCH_DESCRIPTORS[index].store(0, Ordering::SeqCst);
-        }
     }
-    Some(if written == 0 { LINUX_EAGAIN } else { written })
+}
+
+/// What a system call inotify reports needs from before it runs: the
+/// path it removes or renames (from and to), or the descriptor it closes.
+pub(super) struct LinuxInotifyCall {
+    number: u64,
+    arguments: [u64; 6],
+    first: Option<LinuxInotifyPath>,
+    second: Option<LinuxInotifyPath>,
+    directory: bool,
+    writer: bool,
+}
+
+/// Before system call `number` with `arguments`, when inotify has watches.
+pub(super) fn linux_inotify_before(number: u64, arguments: [u64; 6]) -> Option<LinuxInotifyCall> {
+    if !crate::linux_inotify::active() || !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::Relaxed) {
+        return None;
+    }
+    const AT_REMOVEDIR: u64 = 0x200;
+    let at = u64::from(LINUX_AT_FDCWD);
+    let (first, second, directory) = match number {
+        LINUX_UNLINK_SYSCALL => (linux_inotify_path_at(at, arguments[0]), None, false),
+        LINUX_RMDIR_SYSCALL => (linux_inotify_path_at(at, arguments[0]), None, true),
+        LINUX_UNLINKAT_SYSCALL => (
+            linux_inotify_path_at(arguments[0], arguments[1]),
+            None,
+            arguments[2] & AT_REMOVEDIR != 0,
+        ),
+        LINUX_RENAME_SYSCALL => {
+            let from = linux_inotify_path_at(at, arguments[0]);
+            let directory =
+                from.is_some_and(|(path, length)| linux_inotify_is_directory(&path[..length]));
+            (from, linux_inotify_path_at(at, arguments[1]), directory)
+        }
+        LINUX_RENAMEAT_SYSCALL | LINUX_RENAMEAT2_SYSCALL => {
+            let from = linux_inotify_path_at(arguments[0], arguments[1]);
+            let directory =
+                from.is_some_and(|(path, length)| linux_inotify_is_directory(&path[..length]));
+            (
+                from,
+                linux_inotify_path_at(arguments[2], arguments[3]),
+                directory,
+            )
+        }
+        LINUX_CLOSE_SYSCALL => {
+            let path = linux_inotify_descriptor_path(arguments[0]);
+            let directory =
+                path.is_some_and(|(path, length)| linux_inotify_is_directory(&path[..length]));
+            let writer = linux_device_descriptor(u64::from(arguments[0] as u32))
+                & LINUX_DESCRIPTOR_OUTPUT
+                != 0;
+            return Some(LinuxInotifyCall {
+                number,
+                arguments,
+                first: path,
+                second: None,
+                directory,
+                writer,
+            });
+        }
+        _ => (None, None, false),
+    };
+    Some(LinuxInotifyCall {
+        number,
+        arguments,
+        first,
+        second,
+        directory,
+        writer: false,
+    })
+}
+
+/// After the call: the events its result stands for.
+pub(super) fn linux_inotify_after(call: LinuxInotifyCall, result: u64) {
+    use crate::linux_inotify::{
+        IN_ACCESS, IN_ATTRIB, IN_CLOSE_NOWRITE, IN_CLOSE_WRITE, IN_MODIFY, IN_OPEN,
+    };
+    if result >= LINUX_RETURN_TO_KERNEL {
+        return;
+    }
+    let domain = linux_execution_instance();
+    let arguments = call.arguments;
+    let at = u64::from(LINUX_AT_FDCWD);
+    let object = |path: Option<LinuxInotifyPath>, mask: u32| {
+        if let Some((path, length)) = path {
+            let path = &path[..length];
+            let directory = linux_inotify_is_directory(path);
+            crate::linux_inotify::notify(
+                domain,
+                path,
+                mask,
+                directory,
+                !linux_inotify_exists(path),
+            );
+        }
+    };
+    let created = |path: Option<LinuxInotifyPath>, directory: bool| {
+        if let Some((path, length)) = path {
+            crate::linux_inotify::created(domain, &path[..length], directory);
+        }
+    };
+    match call.number {
+        LINUX_OPEN_SYSCALL | LINUX_OPENAT_SYSCALL | LINUX_CREAT_SYSCALL | LINUX_OPENAT2_SYSCALL => {
+            let path = linux_inotify_descriptor_path(result);
+            if linux_descriptor_flag(&X86_RUNTIME.ELF_PROBE_DESCRIPTOR_CREATED, result) {
+                created(path, false);
+            }
+            object(path, IN_OPEN);
+        }
+        LINUX_READ_SYSCALL
+        | LINUX_PREAD64_SYSCALL
+        | LINUX_READV_SYSCALL
+        | LINUX_PREADV_SYSCALL
+        | LINUX_PREADV2_SYSCALL
+            if result != 0 =>
+        {
+            object(linux_inotify_descriptor_path(arguments[0]), IN_ACCESS);
+        }
+        LINUX_WRITE_SYSCALL
+        | LINUX_PWRITE64_SYSCALL
+        | LINUX_WRITEV_SYSCALL
+        | LINUX_PWRITEV_SYSCALL
+        | LINUX_PWRITEV2_SYSCALL
+            if result != 0 =>
+        {
+            object(linux_inotify_descriptor_path(arguments[0]), IN_MODIFY);
+        }
+        LINUX_FTRUNCATE_SYSCALL | LINUX_FALLOCATE_SYSCALL => {
+            object(linux_inotify_descriptor_path(arguments[0]), IN_MODIFY);
+        }
+        LINUX_TRUNCATE_SYSCALL => object(linux_inotify_path_at(at, arguments[0]), IN_MODIFY),
+        LINUX_CHMOD_SYSCALL
+        | LINUX_CHOWN_SYSCALL
+        | LINUX_LCHOWN_SYSCALL
+        | LINUX_UTIME_SYSCALL
+        | LINUX_UTIMES_SYSCALL
+        | LINUX_SETXATTR_SYSCALL
+        | LINUX_LSETXATTR_SYSCALL
+        | LINUX_REMOVEXATTR_SYSCALL => {
+            object(linux_inotify_path_at(at, arguments[0]), IN_ATTRIB);
+        }
+        LINUX_FCHMODAT_SYSCALL
+        | LINUX_FCHMODAT2_SYSCALL
+        | LINUX_FCHOWNAT_SYSCALL
+        | LINUX_FUTIMESAT_SYSCALL => {
+            object(linux_inotify_path_at(arguments[0], arguments[1]), IN_ATTRIB);
+        }
+        LINUX_UTIMENSAT_SYSCALL => {
+            let path = if arguments[1] == 0 {
+                linux_inotify_descriptor_path(arguments[0])
+            } else {
+                linux_inotify_path_at(arguments[0], arguments[1])
+            };
+            object(path, IN_ATTRIB);
+        }
+        LINUX_FCHMOD_SYSCALL | LINUX_FCHOWN_SYSCALL | LINUX_FSETXATTR_SYSCALL => {
+            object(linux_inotify_descriptor_path(arguments[0]), IN_ATTRIB);
+        }
+        LINUX_MKDIR_SYSCALL => created(linux_inotify_path_at(at, arguments[0]), true),
+        LINUX_MKDIRAT_SYSCALL => created(linux_inotify_path_at(arguments[0], arguments[1]), true),
+        LINUX_MKNOD_SYSCALL => created(linux_inotify_path_at(at, arguments[0]), false),
+        LINUX_MKNODAT_SYSCALL => created(linux_inotify_path_at(arguments[0], arguments[1]), false),
+        LINUX_SYMLINK_SYSCALL | LINUX_LINK_SYSCALL => {
+            created(linux_inotify_path_at(at, arguments[1]), false);
+        }
+        LINUX_SYMLINKAT_SYSCALL => {
+            created(linux_inotify_path_at(arguments[1], arguments[2]), false);
+        }
+        LINUX_LINKAT_SYSCALL => created(linux_inotify_path_at(arguments[2], arguments[3]), false),
+        LINUX_UNLINK_SYSCALL | LINUX_UNLINKAT_SYSCALL | LINUX_RMDIR_SYSCALL => {
+            if let Some((path, length)) = call.first {
+                crate::linux_inotify::deleted(domain, &path[..length], call.directory);
+            }
+        }
+        LINUX_RENAME_SYSCALL | LINUX_RENAMEAT_SYSCALL | LINUX_RENAMEAT2_SYSCALL => {
+            if let (Some((from, from_length)), Some((to, to_length))) = (call.first, call.second) {
+                crate::linux_inotify::renamed(
+                    domain,
+                    &from[..from_length],
+                    &to[..to_length],
+                    call.directory,
+                );
+            }
+        }
+        LINUX_CLOSE_SYSCALL => {
+            if let Some((path, length)) = call.first {
+                let mask = if call.writer {
+                    IN_CLOSE_WRITE
+                } else {
+                    IN_CLOSE_NOWRITE
+                };
+                let path = &path[..length];
+                let unlinked = !linux_inotify_exists(path);
+                crate::linux_inotify::notify(domain, path, mask, call.directory, unlinked);
+            }
+        }
+        _ => return,
+    }
+    wake_linux_descriptor_waits();
 }
 
 fn linux_inotify_ready(descriptor: u64) -> bool {
-    let Some(instance) = linux_inotify_instance(descriptor) else {
-        return false;
-    };
-    let owner = instance as u16 + 1;
-    linux_inotify_watch_range().any(|index| {
-        X86_RUNTIME.LINUX_INOTIFY_WATCH_OWNERS[index].load(Ordering::SeqCst) == owner
-            && X86_RUNTIME.LINUX_INOTIFY_PENDING_MASKS[index].load(Ordering::SeqCst) != 0
-    })
+    linux_inotify_key(descriptor)
+        .is_some_and(|(domain, instance)| crate::linux_inotify::ready(domain, instance))
 }
 
 fn linux_inotify_release(descriptor: u64) {
@@ -42316,16 +42529,11 @@ fn linux_inotify_release(descriptor: u64) {
     }) {
         return;
     }
-    let owner = instance as u16 + 1;
-    for index in linux_inotify_watch_range() {
-        if X86_RUNTIME.LINUX_INOTIFY_WATCH_OWNERS[index].load(Ordering::SeqCst) == owner {
-            X86_RUNTIME.LINUX_INOTIFY_WATCH_OWNERS[index].store(0, Ordering::SeqCst);
-            X86_RUNTIME.LINUX_INOTIFY_WATCH_PATHS[index].store(0, Ordering::SeqCst);
-            X86_RUNTIME.LINUX_INOTIFY_WATCH_MASKS[index].store(0, Ordering::SeqCst);
-            X86_RUNTIME.LINUX_INOTIFY_WATCH_DESCRIPTORS[index].store(0, Ordering::SeqCst);
-            X86_RUNTIME.LINUX_INOTIFY_PENDING_MASKS[index].store(0, Ordering::SeqCst);
-        }
-    }
+    crate::linux_inotify::release(
+        linux_execution_instance(),
+        Some(instance as u64),
+        current_linux_process_pid(),
+    );
 }
 
 fn linux_pidfd_open(process: u64, flags: u64) -> u64 {
@@ -44425,7 +44633,6 @@ fn linux_overlay_write(descriptor: u64, state: u16, address: u64, count: u64) ->
         );
         if result != 0 {
             if let Some(path_hash) = crate::linux_overlay::path_hash(handle) {
-                linux_inotify_notify_path_hash(path_hash, 0x0000_0002);
                 linux_fanotify_notify_path_hash(path_hash, descriptor, 0x0000_0002);
             }
         }

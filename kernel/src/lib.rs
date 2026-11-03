@@ -24,6 +24,7 @@ mod linux_elf;
 mod linux_event_files;
 mod linux_exe;
 mod linux_file_cache;
+mod linux_inotify;
 mod linux_input;
 mod linux_keyring;
 mod linux_mount;

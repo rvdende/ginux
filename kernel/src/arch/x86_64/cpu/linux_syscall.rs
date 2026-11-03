@@ -60,7 +60,31 @@ pub(super) extern "sysv64" fn linux_syscall_handler(
     crate::linux_socket::poll_closing();
     let traced = linux_strace_call(number, registers);
     let started = timer::timestamp_counter();
+    // File events for inotify watches: what a call removes or closes is
+    // looked at before it runs.
+    let inotify = if registers.is_null() {
+        None
+    } else {
+        // SAFETY: as in linux_syscall_dispatch, the entry stub passes the
+        // aligned base of the saved register frame.
+        let saved = unsafe { registers.read() };
+        let argument = |index: usize| saved.argument(index).unwrap_or(0);
+        linux_inotify_before(
+            number,
+            [
+                argument(5),
+                argument(4),
+                argument(3),
+                argument(0),
+                argument(2),
+                argument(1),
+            ],
+        )
+    };
     let result = linux_syscall_dispatch(number, registers, user_stack, user_rip, user_rflags);
+    if let Some(call) = inotify {
+        linux_inotify_after(call, result);
+    }
     crate::linux_profile::time_syscall(number, timer::timestamp_counter().wrapping_sub(started));
     if let Some(call) = traced.filter(|call| !crate::linux_strace::logged_before(call.number)) {
         call.log(Some(result));

@@ -40,6 +40,9 @@ impl LockRank {
     /// The record (fcntl) lock table; ranks below the heap so the table may
     /// grow while held.
     pub(crate) const RECORD_LOCKS: Self = Self(160);
+    /// inotify instances, watches and queues; ranks below the heap so the
+    /// queues may grow while held.
+    pub(crate) const INOTIFY: Self = Self(165);
     /// The pool of Linux activation stacks; ranks below the heap so the
     /// pool may grow while held.
     pub(crate) const KERNEL_STACKS: Self = Self(170);

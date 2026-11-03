@@ -589,10 +589,7 @@ pub(super) const LINUX_SELECT_WORD_LIMIT: usize =
 pub(super) const LINUX_DESCRIPTOR_TABLE_LIMIT: u64 = 1024;
 pub(super) const LINUX_DEVICE_DESCRIPTOR_COUNT: usize =
     LINUX_DESCRIPTOR_TABLE_LIMIT as usize - LINUX_AUX_DESCRIPTOR_FIRST as usize;
-pub(super) const LINUX_INOTIFY_WATCH_LIMIT: usize = 16;
 pub(super) const LINUX_FANOTIFY_MARK_LIMIT: usize = 16;
-pub(super) const LINUX_INOTIFY_WATCH_SLOT_COUNT: usize =
-    LINUX_RUNTIME_INSTANCE_LIMIT * LINUX_INOTIFY_WATCH_LIMIT;
 pub(super) const LINUX_DESCRIPTOR_FLAG_WORD_COUNT: usize =
     LINUX_DESCRIPTOR_TABLE_LIMIT.div_ceil(u64::BITS as u64) as usize;
 pub(super) const LINUX_POLLIN: u16 = 1;
@@ -1019,7 +1016,7 @@ pub(super) const LINUX_CLOCK_TICKS_PER_SECOND: u64 = 100;
 // The verification workload issues additional yield hints while no peer is
 // runnable. Only the fifteen calls that transfer execution are switches.
 pub(super) const LINUX_VERIFICATION_YIELD_SWITCHES: u32 = 15;
-use super::{LINUX_RUNTIME_INSTANCE_LIMIT, PAGE_SIZE};
+use super::PAGE_SIZE;
 
 /// The fixed file nodes and the `/proc/sys` nodes are distinct and clear of
 /// the `/dev/input/eventN` range, so no file is taken for another.
