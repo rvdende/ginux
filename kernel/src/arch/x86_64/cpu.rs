@@ -14568,6 +14568,32 @@ fn retire_linux_process_record(pid: u32) {
     discard_linux_process_extended_state(pid);
 }
 
+/// `caller` with a stack pointer on a mapped, writable page: its own, or a
+/// sibling thread's saved one when its stack is already gone.
+fn linux_exit_context_with_mapped_stack(caller: LinuxUserContext) -> LinuxUserContext {
+    let writable = |rsp: u64| {
+        rsp.checked_sub(1)
+            .and_then(address_space::current_linux_active_mapping)
+            .is_some_and(|page| page.writable)
+    };
+    if writable(caller.rsp) {
+        return caller;
+    }
+    let current = current_linux_thread_slot();
+    let replacement = (0..LINUX_THREAD_LIMIT)
+        .filter(|slot| {
+            Some(*slot) != current
+                && X86_RUNTIME.LINUX_THREAD_STATES[*slot].load(Ordering::SeqCst)
+                    != LINUX_THREAD_FREE
+        })
+        .map(|slot| X86_RUNTIME.LINUX_THREAD_RSPS[slot].load(Ordering::SeqCst))
+        .find(|rsp| writable(*rsp));
+    LinuxUserContext {
+        rsp: replacement.unwrap_or(caller.rsp),
+        ..caller
+    }
+}
+
 fn linux_exit_child_to_parent(output: *mut LinuxSyscallFrame, caller: LinuxUserContext) -> u64 {
     let clear_child_tid = current_linux_clear_child_tid().unwrap_or(0);
     let robust_list = current_linux_robust_list().unwrap_or(0);
@@ -14596,6 +14622,11 @@ fn linux_exit_child_to_parent(output: *mut LinuxSyscallFrame, caller: LinuxUserC
     // current and other processes run. A yield restarts this exit, which has
     // nothing left to undo. A thread on an application processor just ends,
     // and so does one whose siblings run on other CPUs.
+    // musl unmaps a detached thread's stack before this call, which then
+    // uses no stack; the yields record a context the registry checks, so a
+    // sibling's mapped stack pointer stands in for the unmapped one (the
+    // refresh was refused every time and CPU 0 spun here: fcntl36_64).
+    let caller = linux_exit_context_with_mapped_stack(caller);
     while current_linux_runtime_cpu_index() == 0 && ready_linux_thread_handle().is_none() {
         let _ = expire_linux_waits();
         // Its siblings all ended on other CPUs meanwhile: the process ends
@@ -39640,8 +39671,20 @@ enum LinuxSpliceEnd {
 impl LinuxSpliceEnd {
     fn of(descriptor: u64) -> Self {
         let state = linux_device_descriptor(descriptor);
+        // An io_uring is kept as a scratch file but is none to splice.
+        if linux_io_uring_descriptor(descriptor) {
+            return Self::Other;
+        }
         match linux_socket_slot(descriptor) {
             Some(slot) if state & LINUX_DEVICE_PIPE != 0 => Self::Pipe(slot),
+            // A kernel object shared like a socket (an io_uring, a DRM
+            // file) is no socket: splice refuses it at once rather than
+            // waiting on the pipe (splice07 hung on pipe -> io_uring).
+            Some(slot)
+                if crate::linux_socket::kind(slot) == Some(crate::linux_socket::Kind::Object) =>
+            {
+                Self::Other
+            }
             Some(slot) => Self::Socket(slot),
             // /dev/zero, /dev/full and /dev/urandom read as files do, so
             // they can be spliced into a pipe (splice08).
