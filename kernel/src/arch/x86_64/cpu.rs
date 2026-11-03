@@ -52090,25 +52090,45 @@ fn linux_set_scheduling(pid: u64, policy: u8, parameter_address: u64) -> u64 {
     0
 }
 
+/// sched_setattr(2), in Linux's order: no attributes, a negative pid or
+/// flags are EINVAL; the size is read next (0 meaning version 0; smaller,
+/// past a page, or with nonzero bytes past what Ginux knows is E2BIG, with
+/// the size it takes written back); then a negative policy (EINVAL), the
+/// process (ESRCH), the flags, policy and priority (EINVAL), SCHED_DEADLINE's
+/// runtime <= deadline <= period, 100 us to 4 s (EINVAL), and permission
+/// for a real-time or deadline policy (EPERM). The policy, priority,
+/// SCHED_RESET_ON_FORK and deadline parameters are kept for
+/// sched_getattr; a normal policy's nice goes through setpriority.
 fn linux_sched_setattr(pid: u64, attribute_address: u64, flags: u64) -> u64 {
-    const SCHED_ATTR_MIN_SIZE: usize = 48;
+    const SCHED_ATTR_VER0: usize = 48;
     const SCHED_ATTR_SIZE: usize = 56;
-    if let Err(error) = linux_scheduler_process(pid) {
-        return error;
-    }
-    if flags as u32 != 0 {
+    const SCHED_FLAG_RESET_ON_FORK: u64 = 0x01;
+    const SCHED_FLAG_KEEP_POLICY: u64 = 0x08;
+    const SCHED_FLAG_KEEP_PARAMS: u64 = 0x10;
+    const SCHED_FLAG_ALL: u64 = 0x7f;
+    const SCHED_FIFO: u32 = 1;
+    const SCHED_RR: u32 = 2;
+    const SCHED_DEADLINE: u32 = 6;
+    const DL_RUNTIME_MIN: u64 = 1 << 10;
+    const DL_PERIOD_MIN: u64 = 100 * 1_000;
+    const DL_PERIOD_MAX: u64 = (1 << 22) * 1_000;
+    if attribute_address == 0 || (pid as i32) < 0 || flags as u32 != 0 {
         return LINUX_EINVAL;
     }
     let mut header = [0_u8; 4];
     if !copy_from_linux_user(attribute_address, &mut header) {
         return LINUX_EFAULT;
     }
-    let size = u32::from_ne_bytes(header) as usize;
-    if size < SCHED_ATTR_MIN_SIZE {
-        return LINUX_E2BIG;
-    }
-    if size > PAGE_SIZE {
-        return LINUX_E2BIG;
+    let size = match u32::from_ne_bytes(header) as usize {
+        0 => SCHED_ATTR_VER0,
+        size => size,
+    };
+    let too_big = || {
+        let _ = copy_to_linux_user(attribute_address, &(SCHED_ATTR_SIZE as u32).to_ne_bytes());
+        LINUX_E2BIG
+    };
+    if !(SCHED_ATTR_VER0..=PAGE_SIZE).contains(&size) {
+        return too_big();
     }
     let mut attribute = [0_u8; SCHED_ATTR_SIZE];
     let copied = size.min(attribute.len());
@@ -52126,48 +52146,148 @@ fn linux_sched_setattr(pid: u64, attribute_address: u64, flags: u64) -> u64 {
             return LINUX_EFAULT;
         }
         if extension[..length].iter().any(|byte| *byte != 0) {
-            return LINUX_E2BIG;
+            return too_big();
         }
         extension_offset += length;
     }
-    let policy = u32::from_ne_bytes(attribute[4..8].try_into().unwrap());
+    let mut policy = u32::from_ne_bytes(attribute[4..8].try_into().unwrap());
     let scheduler_flags = u64::from_ne_bytes(attribute[8..16].try_into().unwrap());
-    let nice = i32::from_ne_bytes(attribute[16..20].try_into().unwrap());
-    let priority = u32::from_ne_bytes(attribute[20..24].try_into().unwrap());
-    let runtime = u64::from_ne_bytes(attribute[24..32].try_into().unwrap());
-    let deadline = u64::from_ne_bytes(attribute[32..40].try_into().unwrap());
-    let period = u64::from_ne_bytes(attribute[40..48].try_into().unwrap());
-    if !matches!(policy, 0 | 1 | 2 | 3 | 5 | 6) {
+    let nice = i32::from_ne_bytes(attribute[16..20].try_into().unwrap()).clamp(-20, 19);
+    let mut priority = u32::from_ne_bytes(attribute[20..24].try_into().unwrap());
+    let mut deadline = [
+        u64::from_ne_bytes(attribute[24..32].try_into().unwrap()),
+        u64::from_ne_bytes(attribute[32..40].try_into().unwrap()),
+        u64::from_ne_bytes(attribute[40..48].try_into().unwrap()),
+    ];
+    if (policy as i32) < 0 {
         return LINUX_EINVAL;
     }
-    if policy != 0 || scheduler_flags != 0 {
+    let target = match linux_scheduler_process(pid) {
+        Ok(target) => target,
+        Err(error) => return error,
+    };
+    if scheduler_flags & !SCHED_FLAG_ALL != 0 {
+        return LINUX_EINVAL;
+    }
+    let Some((current_policy, current_priority)) = linux_process::live_process_scheduling(target)
+    else {
+        return LINUX_ESRCH;
+    };
+    let current_kind = u32::from(current_policy & !linux_process::SCHED_RESET_ON_FORK);
+    if scheduler_flags & SCHED_FLAG_KEEP_POLICY != 0 {
+        policy = current_kind;
+    }
+    if scheduler_flags & SCHED_FLAG_KEEP_PARAMS != 0 {
+        priority = u32::from(current_priority);
+        deadline = linux_process::live_process_deadline_parameters(target).unwrap_or([0; 3]);
+    }
+    if !matches!(policy, 0 | 1 | 2 | 3 | 5 | SCHED_DEADLINE) {
+        return LINUX_EINVAL;
+    }
+    let realtime = matches!(policy, SCHED_FIFO | SCHED_RR);
+    if realtime && !(1..=99).contains(&priority) || !realtime && priority != 0 {
+        return LINUX_EINVAL;
+    }
+    if policy == SCHED_DEADLINE {
+        let [runtime, relative_deadline, period] = deadline;
+        let period = if period == 0 {
+            relative_deadline
+        } else {
+            period
+        };
+        if relative_deadline == 0
+            || runtime < DL_RUNTIME_MIN
+            || relative_deadline & 1 << 63 != 0
+            || deadline[2] & 1 << 63 != 0
+            || period < relative_deadline
+            || relative_deadline < runtime
+            || !(DL_PERIOD_MIN..=DL_PERIOD_MAX).contains(&period)
+        {
+            return LINUX_EINVAL;
+        }
+    }
+    let Some(caller) = current_linux_credentials() else {
+        return LINUX_EPERM;
+    };
+    if (realtime || policy == SCHED_DEADLINE)
+        && !caller.has(ginux_credentials::capability::SYS_NICE)
+    {
         return LINUX_EPERM;
     }
-    if nice != 0 || priority != 0 || runtime != 0 || deadline != 0 || period != 0 {
-        return LINUX_EINVAL;
+    if !realtime && policy != SCHED_DEADLINE {
+        let result = linux_setpriority(0, u64::from(target), nice as i64 as u64);
+        if result != 0 {
+            return result;
+        }
+    }
+    let reset = if scheduler_flags & SCHED_FLAG_RESET_ON_FORK != 0 {
+        linux_process::SCHED_RESET_ON_FORK
+    } else {
+        0
+    };
+    if !linux_process::set_live_process_scheduling(target, policy as u8 | reset, priority as u8)
+        || !linux_process::set_live_process_deadline_parameters(
+            target,
+            if policy == SCHED_DEADLINE {
+                deadline
+            } else {
+                [0; 3]
+            },
+        )
+    {
+        return LINUX_ESRCH;
     }
     0
 }
 
+/// sched_getattr(2): no attributes, a negative pid, a size below version 0
+/// or past a page, or flags are EINVAL; then the process (ESRCH). Its
+/// policy, SCHED_RESET_ON_FORK, nice, priority and deadline parameters
+/// are written, in as much of the caller's struct as Ginux's fills, and
+/// any larger rest zeroed.
 fn linux_sched_getattr(pid: u64, attribute_address: u64, size: u64, flags: u64) -> u64 {
+    const SCHED_ATTR_VER0: u64 = 48;
     const SCHED_ATTR_SIZE: usize = 56;
-    if let Err(error) = linux_scheduler_process(pid) {
-        return error;
-    }
+    const SCHED_FLAG_RESET_ON_FORK: u64 = 0x01;
     let size = u64::from(size as u32);
-    if flags as u32 != 0 || size < SCHED_ATTR_SIZE as u64 {
+    if attribute_address == 0
+        || (pid as i32) < 0
+        || size > PAGE_SIZE as u64
+        || size < SCHED_ATTR_VER0
+        || flags as u32 != 0
+    {
         return LINUX_EINVAL;
     }
-    if size > PAGE_SIZE as u64 {
-        return LINUX_E2BIG;
-    }
+    let target = match linux_scheduler_process(pid) {
+        Ok(target) => target,
+        Err(error) => return error,
+    };
+    let Some((policy, priority)) = linux_process::live_process_scheduling(target) else {
+        return LINUX_ESRCH;
+    };
+    let reset = policy & linux_process::SCHED_RESET_ON_FORK != 0;
+    let policy = policy & !linux_process::SCHED_RESET_ON_FORK;
+    let deadline = linux_process::live_process_deadline_parameters(target).unwrap_or([0; 3]);
+    let nice = 20 - linux_getpriority(0, u64::from(target)).min(40) as i32;
+    let written = (size as usize).min(SCHED_ATTR_SIZE);
     let mut attribute = [0_u8; SCHED_ATTR_SIZE];
-    attribute[..4].copy_from_slice(&(SCHED_ATTR_SIZE as u32).to_ne_bytes());
+    attribute[..4].copy_from_slice(&(written as u32).to_ne_bytes());
+    attribute[4..8].copy_from_slice(&u32::from(policy).to_ne_bytes());
+    let flags = if reset { SCHED_FLAG_RESET_ON_FORK } else { 0 };
+    attribute[8..16].copy_from_slice(&flags.to_ne_bytes());
+    if matches!(policy, 0 | 3 | 5) {
+        attribute[16..20].copy_from_slice(&nice.to_ne_bytes());
+    }
+    attribute[20..24].copy_from_slice(&u32::from(priority).to_ne_bytes());
+    attribute[24..32].copy_from_slice(&deadline[0].to_ne_bytes());
+    attribute[32..40].copy_from_slice(&deadline[1].to_ne_bytes());
+    attribute[40..48].copy_from_slice(&deadline[2].to_ne_bytes());
+    // sched_util_max: no clamping, the whole range.
     attribute[52..56].copy_from_slice(&1024_u32.to_ne_bytes());
-    if !copy_to_linux_user(attribute_address, &attribute) {
+    if !copy_to_linux_user(attribute_address, &attribute[..written]) {
         return LINUX_EFAULT;
     }
-    let mut extension_offset = attribute.len();
+    let mut extension_offset = written;
     let zeros = [0_u8; 64];
     while extension_offset < size as usize {
         let length = (size as usize - extension_offset).min(zeros.len());

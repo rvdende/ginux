@@ -541,6 +541,9 @@ struct Process {
     /// starts with neither.
     maxrss_kib: u64,
     children_maxrss_kib: u64,
+    /// SCHED_DEADLINE's runtime, deadline and period in nanoseconds, as
+    /// sched_setattr set them (zero for other policies).
+    deadline_parameters: [u64; 3],
     /// `/proc/PID/oom_score_adj`: inherited across fork, kept across exec.
     oom_score_adj: i16,
     /// The signal whose default action terminated the process, or 0.
@@ -1748,6 +1751,7 @@ impl ProcessTable {
             itimers: [None; 2],
             maxrss_kib: 0,
             children_maxrss_kib: 0,
+            deadline_parameters: [0; 3],
         });
         Some(handle)
     }
@@ -5152,6 +5156,25 @@ pub(crate) fn switch_live_process(from_pid: u32, to_pid: u32) -> Option<LiveProc
         return None;
     }
     table.dispatch(to_handle)
+}
+
+/// `pid`'s SCHED_DEADLINE runtime, deadline and period.
+pub(crate) fn live_process_deadline_parameters(pid: u32) -> Option<[u64; 3]> {
+    let table = live_process_table_mut()?;
+    let process = table.process(table.handle_by_pid(pid)?)?;
+    Some(process.deadline_parameters)
+}
+
+/// Sets `pid`'s SCHED_DEADLINE runtime, deadline and period.
+pub(crate) fn set_live_process_deadline_parameters(pid: u32, parameters: [u64; 3]) -> bool {
+    let Some(process) = live_process_table_mut().and_then(|table| {
+        let handle = table.handle_by_pid(pid)?;
+        table.process_mut(handle)
+    }) else {
+        return false;
+    };
+    process.deadline_parameters = parameters;
+    true
 }
 
 /// Notes that `pid` holds `kib` KiB resident now (its ru_maxrss peak).

@@ -161,9 +161,6 @@ remap_file_pages01 TBROK
 rt_sigaction01 TBROK
 rt_sigqueueinfo01 TFAIL
 sbrk01 TFAIL
-sched_setattr01 TFAIL
-sched_setattr02 TFAIL
-sched_getattr01 TBROK
 select01 TFAIL
 send02 TBROK
 sendmsg01 TBROK
