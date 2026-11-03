@@ -420,7 +420,13 @@ struct X86RuntimeOwner {
     LINUX_FORK_CHILD_STACK: RuntimeRef<CpuBankedAtomicU64>,
     LINUX_FORK_SHARE_VM: RuntimeRef<CpuBankedAtomicBool>,
     LINUX_FORK_CHILD_TID_ADDRESS: RuntimeRef<CpuBankedAtomicU64>,
+    /// clone3's CLONE_PARENT_SETTID: where the parent gets the child's pid.
+    LINUX_FORK_PARENT_TID_ADDRESS: RuntimeRef<CpuBankedAtomicU64>,
     LINUX_FORK_CLEAR_SIGHAND: RuntimeRef<CpuBankedAtomicBool>,
+    /// A fork on a child stack whose pages are the child's own copy
+    /// (clone(SIGCHLD, stack), clone3 with a stack), not shared as
+    /// posix_spawn's CLONE_VM form shares them.
+    LINUX_FORK_OWN_PAGES: RuntimeRef<CpuBankedAtomicBool>,
     LINUX_FORK_NEW_MOUNT_NAMESPACE: RuntimeRef<CpuBankedAtomicBool>,
     LINUX_FORK_NEW_USER_NAMESPACE: RuntimeRef<CpuBankedAtomicBool>,
     LINUX_FORK_PIDFD_ADDRESS: RuntimeRef<CpuBankedAtomicU64>,
@@ -934,7 +940,9 @@ static X86_RUNTIME: X86RuntimeOwner = X86RuntimeOwner {
     LINUX_FORK_CHILD_STACK: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_FORK_CHILD_STACK),
     LINUX_FORK_SHARE_VM: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_FORK_SHARE_VM),
     LINUX_FORK_CHILD_TID_ADDRESS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_FORK_CHILD_TID_ADDRESS),
+    LINUX_FORK_PARENT_TID_ADDRESS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_FORK_PARENT_TID_ADDRESS),
     LINUX_FORK_CLEAR_SIGHAND: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_FORK_CLEAR_SIGHAND),
+    LINUX_FORK_OWN_PAGES: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_FORK_OWN_PAGES),
     LINUX_FORK_NEW_MOUNT_NAMESPACE: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_FORK_NEW_MOUNT_NAMESPACE),
     LINUX_FORK_NEW_USER_NAMESPACE: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_FORK_NEW_USER_NAMESPACE),
     LINUX_FORK_PIDFD_ADDRESS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_FORK_PIDFD_ADDRESS),
@@ -1335,8 +1343,10 @@ fn copy_linux_bank_transients(from: usize, to: usize) {
         LINUX_FORK_NEW_USER_NAMESPACE,
         LINUX_FORK_CGROUP_GENERATION,
         LINUX_FORK_CHILD_TID_ADDRESS,
+        LINUX_FORK_PARENT_TID_ADDRESS,
         LINUX_FORK_PIDFD_ADDRESS,
         LINUX_FORK_CLEAR_SIGHAND,
+        LINUX_FORK_OWN_PAGES,
     );
 }
 
@@ -3108,6 +3118,8 @@ static X86_RUNTIME_BACKING_LINUX_FORK_NEW_USER_NAMESPACE: CpuBankedAtomicBool =
     CpuBankedAtomicBool::new(false);
 static X86_RUNTIME_BACKING_LINUX_FORK_CHILD_TID_ADDRESS: CpuBankedAtomicU64 =
     CpuBankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_LINUX_FORK_PARENT_TID_ADDRESS: CpuBankedAtomicU64 =
+    CpuBankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_LINUX_FORK_CHILD_STACK: CpuBankedAtomicU64 = CpuBankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_LINUX_FORK_SHARE_VM: CpuBankedAtomicBool =
     CpuBankedAtomicBool::new(false);
@@ -3116,6 +3128,8 @@ static X86_RUNTIME_BACKING_LINUX_FORK_PIDFD_ADDRESS: CpuBankedAtomicU64 =
 static X86_RUNTIME_BACKING_LINUX_FORK_CGROUP_GENERATION: CpuBankedAtomicU32 =
     CpuBankedAtomicU32::new(0);
 static X86_RUNTIME_BACKING_LINUX_FORK_CLEAR_SIGHAND: CpuBankedAtomicBool =
+    CpuBankedAtomicBool::new(false);
+static X86_RUNTIME_BACKING_LINUX_FORK_OWN_PAGES: CpuBankedAtomicBool =
     CpuBankedAtomicBool::new(false);
 static X86_RUNTIME_BACKING_LINUX_PROCESS_CHILD_EXITED: CpuBankedAtomicBool =
     CpuBankedAtomicBool::new(false);
@@ -6577,10 +6591,17 @@ fn execute_deferred_live_fork() -> bool {
         && child_stack == 0
         && !new_mount_namespace
         && X86_RUNTIME.LINUX_DOMAIN_EXEC_DEPTH.load(Ordering::SeqCst) == 0;
+    // vfork shares the parent's memory, and so does posix_spawn's
+    // clone(CLONE_VM | CLONE_VFORK, stack) child, which exec's from it; a
+    // stack with pages of the child's own (clone(SIGCHLD, stack), clone3
+    // with a stack) is a fork whose child starts on that stack (clone01).
+    let own_pages = X86_RUNTIME
+        .LINUX_FORK_OWN_PAGES
+        .swap(false, Ordering::SeqCst);
     let Some(child) = linux_process::begin_live_fork(
         parent_pid,
         false,
-        share_vm || child_stack != 0,
+        share_vm || child_stack != 0 && !own_pages,
         (child_stack != 0).then_some(child_stack),
         !parent_first,
     ) else {
@@ -6589,10 +6610,16 @@ fn execute_deferred_live_fork() -> bool {
             .LINUX_FORK_CHILD_TID_ADDRESS
             .store(0, Ordering::SeqCst);
         X86_RUNTIME
+            .LINUX_FORK_PARENT_TID_ADDRESS
+            .store(0, Ordering::SeqCst);
+        X86_RUNTIME
             .LINUX_FORK_PIDFD_ADDRESS
             .store(0, Ordering::SeqCst);
         X86_RUNTIME
             .LINUX_FORK_CLEAR_SIGHAND
+            .store(false, Ordering::SeqCst);
+        X86_RUNTIME
+            .LINUX_FORK_OWN_PAGES
             .store(false, Ordering::SeqCst);
         if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
             serial_write("ginux: runtime fork preparation failed at stage ");
@@ -6737,17 +6764,32 @@ fn execute_deferred_live_fork() -> bool {
             .for_each(|mask| mask.store(0, Ordering::SeqCst));
     }
     if child_stack != 0 {
-        let stack_page = (child_stack - 1) & !(PAGE_SIZE as u64 - 1);
+        // A child with pages of its own may use its whole stack buffer; one
+        // sharing the parent's memory (posix_spawn) exec's from the top
+        // page, which is all that is registered for it, as before.
+        let (base, size) = if own_pages {
+            linux_clone_stack_extent(parent_pid, child_stack)
+        } else {
+            (
+                (child_stack - 1) & !(PAGE_SIZE as u64 - 1),
+                PAGE_SIZE as u64,
+            )
+        };
         if let Some(slot) = current_linux_thread_slot() {
-            X86_RUNTIME.LINUX_THREAD_STACK_BASES[slot].store(stack_page, Ordering::SeqCst);
-            X86_RUNTIME.LINUX_THREAD_STACK_SIZES[slot].store(PAGE_SIZE as u64, Ordering::SeqCst);
+            X86_RUNTIME.LINUX_THREAD_STACK_BASES[slot].store(base, Ordering::SeqCst);
+            X86_RUNTIME.LINUX_THREAD_STACK_SIZES[slot].store(size, Ordering::SeqCst);
         }
     }
     let child_tid_address = X86_RUNTIME
         .LINUX_FORK_CHILD_TID_ADDRESS
         .swap(0, Ordering::SeqCst);
-    let child_tid_ready = child_tid_address == 0
-        || linux_process::write_live_process_u32(child.pid, child_tid_address, child.pid);
+    let parent_tid_address = X86_RUNTIME
+        .LINUX_FORK_PARENT_TID_ADDRESS
+        .swap(0, Ordering::SeqCst);
+    let child_tid_ready = (child_tid_address == 0
+        || linux_process::write_live_process_u32(child.pid, child_tid_address, child.pid))
+        && (parent_tid_address == 0
+            || linux_process::write_live_process_u32(parent_pid, parent_tid_address, child.pid));
     if parent_first {
         return child_tid_ready
             && resume_linux_fork_parent_first(parent_pid, child.pid, parent_runtime.stack);
@@ -10020,10 +10062,16 @@ pub(crate) fn verify_linux_elf_entry(execution: &LinuxElfExecution<'_>) -> Linux
         .LINUX_FORK_PIDFD_ADDRESS
         .store(0, Ordering::SeqCst);
     X86_RUNTIME
+        .LINUX_FORK_PARENT_TID_ADDRESS
+        .store(0, Ordering::SeqCst);
+    X86_RUNTIME
         .LINUX_FORK_CGROUP_GENERATION
         .store(0, Ordering::SeqCst);
     X86_RUNTIME
         .LINUX_FORK_CLEAR_SIGHAND
+        .store(false, Ordering::SeqCst);
+    X86_RUNTIME
+        .LINUX_FORK_OWN_PAGES
         .store(false, Ordering::SeqCst);
     for generation in &X86_RUNTIME.LINUX_PROCESS_CGROUP_GENERATIONS {
         generation.store(0, Ordering::SeqCst);
@@ -13826,6 +13874,7 @@ fn linux_request_process_fork(
     pidfd_address: u64,
     cgroup_generation: u32,
     clear_sighand: bool,
+    own_pages: bool,
 ) -> u64 {
     // vfork/CLONE_VM inherits the already-owned address space. Updating only
     // the execution context avoids manufacturing a page-per-leaf snapshot for
@@ -13929,6 +13978,9 @@ fn linux_request_process_fork(
         X86_RUNTIME
             .LINUX_FORK_CLEAR_SIGHAND
             .store(clear_sighand, Ordering::SeqCst);
+        X86_RUNTIME
+            .LINUX_FORK_OWN_PAGES
+            .store(own_pages, Ordering::SeqCst);
         LINUX_RETURN_TO_KERNEL
     }
 }
@@ -13943,15 +13995,37 @@ fn linux_clone3(
 ) -> u64 {
     const CLONE_ARGS_MIN_SIZE: usize = 64;
     const CLONE_ARGS_SIZE: usize = 88;
+    // The arguments as Linux takes them: up to a page, at least the first
+    // version's 64 bytes, anything past the known struct zero (E2BIG) and
+    // readable (EFAULT) (clone302).
     let Ok(size) = usize::try_from(size) else {
-        return LINUX_EINVAL;
+        return LINUX_E2BIG;
     };
-    if !(CLONE_ARGS_MIN_SIZE..=CLONE_ARGS_SIZE).contains(&size) {
+    if size > PAGE_SIZE {
+        return LINUX_E2BIG;
+    }
+    if size < CLONE_ARGS_MIN_SIZE {
         return LINUX_EINVAL;
     }
     let mut bytes = [0_u8; CLONE_ARGS_SIZE];
-    if !copy_from_linux_user(arguments, &mut bytes[..size]) {
+    let known = size.min(CLONE_ARGS_SIZE);
+    if !copy_from_linux_user(arguments, &mut bytes[..known]) {
         return LINUX_EFAULT;
+    }
+    let mut extra_offset = known;
+    while extra_offset < size {
+        let mut extra = [0_u8; 64];
+        let length = (size - extra_offset).min(extra.len());
+        let Some(address) = arguments.checked_add(extra_offset as u64) else {
+            return LINUX_EFAULT;
+        };
+        if !copy_from_linux_user(address, &mut extra[..length]) {
+            return LINUX_EFAULT;
+        }
+        if extra[..length].iter().any(|byte| *byte != 0) {
+            return LINUX_E2BIG;
+        }
+        extra_offset += length;
     }
     let word = |offset: usize| u64::from_ne_bytes(bytes[offset..offset + 8].try_into().unwrap());
     let flags = word(0);
@@ -13968,26 +14042,76 @@ fn linux_clone3(
     let Some(child_stack) = stack.checked_add(stack_size) else {
         return LINUX_EINVAL;
     };
+    // Linux's checks of the flags and signal (clone302), before the
+    // namespace and set_tid ones that need privilege (clone304).
+    const CLONE_NEWTIME: u64 = 0x80;
+    const CLONE_NEWCGROUP: u64 = 0x0200_0000;
+    const CLONE_NEWUTS: u64 = 0x0400_0000;
+    const CLONE_NEWIPC: u64 = 0x0800_0000;
+    const CLONE_NEWPID: u64 = 0x2000_0000;
+    const CLONE_NEWNET: u64 = 0x4000_0000;
+    const NAMESPACE_FLAGS: u64 = CLONE_NEWTIME
+        | LINUX_CLONE_NEWNS
+        | CLONE_NEWCGROUP
+        | CLONE_NEWUTS
+        | CLONE_NEWIPC
+        | LINUX_CLONE_NEWUSER
+        | CLONE_NEWPID
+        | CLONE_NEWNET;
+    if flags & LINUX_CLONE_SIGHAND != 0 && flags & LINUX_CLONE_VM == 0
+        || flags & LINUX_CLONE_THREAD != 0 && flags & LINUX_CLONE_SIGHAND == 0
+        || flags & LINUX_CLONE_FS != 0 && flags & (LINUX_CLONE_NEWNS | LINUX_CLONE_NEWUSER) != 0
+        || exit_signal & !0xff != 0
+        || (stack == 0) != (stack_size == 0)
+    {
+        return LINUX_EINVAL;
+    }
+    let privileged =
+        current_linux_credentials().is_some_and(|credentials| credentials.privileged());
+    // set_tid and the namespaces other than the user one need CAP_SYS_ADMIN
+    // (or CAP_CHECKPOINT_RESTORE); root gets the ones this kernel has.
+    if (set_tid_size != 0 || flags & NAMESPACE_FLAGS & !LINUX_CLONE_NEWUSER != 0) && !privileged {
+        return LINUX_EPERM;
+    }
+    if set_tid_size != 0
+        || flags & NAMESPACE_FLAGS & !(LINUX_CLONE_NEWNS | LINUX_CLONE_NEWUSER) != 0
+    {
+        return LINUX_EINVAL;
+    }
+    // A process (not a thread) ending with SIGCHLD: a fork, on `stack` if
+    // given. CLONE_FS, CLONE_SYSVSEM and CLONE_IO are taken as fork's
+    // copies: nothing here shares those between processes.
+    const CLONE_IO: u64 = 0x8000_0000;
     const PROCESS_CLONE_FLAGS: u64 = LINUX_CLONE_VM
         | LINUX_CLONE_PIDFD
         | LINUX_CLONE_VFORK
+        | LINUX_CLONE_NEWNS
         | LINUX_CLONE_NEWUSER
         | LINUX_CLONE_CLEAR_SIGHAND
-        | LINUX_CLONE_INTO_CGROUP;
+        | LINUX_CLONE_INTO_CGROUP
+        | LINUX_CLONE_FS
+        | LINUX_CLONE_SYSVSEM
+        | CLONE_IO
+        | LINUX_CLONE_PARENT_SETTID
+        | LINUX_CLONE_CHILD_SETTID
+        | LINUX_CLONE_CHILD_CLEARTID;
     if flags & LINUX_CLONE_THREAD == 0 && exit_signal == LINUX_SIGCHLD {
         if flags & !PROCESS_CLONE_FLAGS != 0
-            || flags & LINUX_CLONE_VFORK == 0
-            || set_tid_size != 0
-            || stack == 0
-            || stack_size == 0
-            || flags & LINUX_CLONE_PIDFD != 0
-                && (_pidfd == 0 || !linux_writable_user_range_contains(_pidfd, 4))
+            || flags & LINUX_CLONE_VM != 0 && flags & LINUX_CLONE_VFORK == 0
         {
             return LINUX_EINVAL;
         }
-        let stack_page = (child_stack - 1) & !(PAGE_SIZE as u64 - 1);
-        if !materialize_linux_runtime_user_range(stack_page, PAGE_SIZE, true) {
+        if flags & LINUX_CLONE_PIDFD != 0 && !linux_writable_user_range_contains(_pidfd, 4)
+            || flags & LINUX_CLONE_PARENT_SETTID != 0
+                && !linux_writable_user_range_contains(parent_tid, 4)
+        {
             return LINUX_EFAULT;
+        }
+        if stack != 0 {
+            let stack_page = (child_stack - 1) & !(PAGE_SIZE as u64 - 1);
+            if !materialize_linux_runtime_user_range(stack_page, PAGE_SIZE, true) {
+                return LINUX_EFAULT;
+            }
         }
         let cgroup_generation = if flags & LINUX_CLONE_INTO_CGROUP != 0 {
             let Some(handle) = linux_overlay_descriptor_handle(cgroup) else {
@@ -14009,10 +14133,10 @@ fn linux_clone3(
         } else {
             0
         };
-        return linux_request_process_fork(
+        let result = linux_request_process_fork(
             true,
             caller,
-            false,
+            flags & LINUX_CLONE_NEWNS != 0,
             flags & LINUX_CLONE_NEWUSER != 0,
             child_stack,
             flags & LINUX_CLONE_VM != 0,
@@ -14023,7 +14147,29 @@ fn linux_clone3(
             },
             cgroup_generation,
             flags & LINUX_CLONE_CLEAR_SIGHAND != 0,
+            flags & LINUX_CLONE_VM == 0,
         );
+        if result == LINUX_RETURN_TO_KERNEL {
+            // The tid words are written once the child exists: the
+            // child's in it (CHILD_SETTID), the parent's in the parent.
+            X86_RUNTIME.LINUX_FORK_CHILD_TID_ADDRESS.store(
+                if flags & LINUX_CLONE_CHILD_SETTID != 0 {
+                    child_tid
+                } else {
+                    0
+                },
+                Ordering::SeqCst,
+            );
+            X86_RUNTIME.LINUX_FORK_PARENT_TID_ADDRESS.store(
+                if flags & LINUX_CLONE_PARENT_SETTID != 0 {
+                    parent_tid
+                } else {
+                    0
+                },
+                Ordering::SeqCst,
+            );
+        }
+        return result;
     }
     // Linux permits unused clone3 output fields to alias the thread-id word.
     // Their values only carry meaning when the corresponding flag is set.
@@ -18211,6 +18357,37 @@ fn linux_runtime_brk(requested: u64) -> u64 {
     }
     X86_RUNTIME.ELF_PROBE_BRK.store(requested, Ordering::SeqCst);
     requested
+}
+
+/// The extent (base, size) of a clone child's stack whose top is `top`,
+/// for the stack-pointer check of its system calls: the memory area or
+/// heap of `pid` holding the top, else the mapped pages below the top
+/// page (up to 8 MiB). clone02 gives a top 56 bytes into a page with the
+/// buffer below it untouched, so the top page alone is not enough.
+fn linux_clone_stack_extent(pid: u32, top: u64) -> (u64, u64) {
+    const SCAN_LIMIT: u64 = 8 << 20;
+    let page_mask = !(PAGE_SIZE as u64 - 1);
+    let top_page = (top - 1) & page_mask;
+    let end = top_page + PAGE_SIZE as u64;
+    if let Some(start) = crate::linux_areas::snapshot(linux_execution_instance(), pid)
+        .and_then(|areas| areas.find(top - 1).map(|area| area.start))
+    {
+        return (start, end - start);
+    }
+    let heap_limit = X86_RUNTIME.ELF_PROBE_BRK_LIMIT.load(Ordering::SeqCst);
+    let heap_base = heap_limit.saturating_sub((LINUX_RUNTIME_HEAP_PAGES * PAGE_SIZE) as u64);
+    if linux_runtime_heap_contains(top - 1) && heap_base < end {
+        return (heap_base, end - heap_base);
+    }
+    let mut base = top_page;
+    while top_page - base < SCAN_LIMIT
+        && base
+            .checked_sub(PAGE_SIZE as u64)
+            .is_some_and(|below| address_space::current_linux_range_mapped(below, PAGE_SIZE, false))
+    {
+        base -= PAGE_SIZE as u64;
+    }
+    (base, end - base)
 }
 
 fn linux_runtime_heap_contains(address: u64) -> bool {

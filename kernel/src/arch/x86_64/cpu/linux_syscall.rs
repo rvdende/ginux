@@ -1040,6 +1040,7 @@ fn linux_syscall_dispatch(
                     0,
                     0,
                     false,
+                    false,
                 );
                 if result == LINUX_RETURN_TO_KERNEL {
                     X86_RUNTIME
@@ -1089,6 +1090,7 @@ fn linux_syscall_dispatch(
                     0,
                     0,
                     false,
+                    flags & LINUX_CLONE_VM == 0,
                 )
             }
         }
@@ -1146,6 +1148,7 @@ fn linux_syscall_dispatch(
             0,
             0,
             false,
+            false,
         ),
         LINUX_VFORK_SYSCALL => linux_request_process_fork(
             runtime_mode,
@@ -1156,6 +1159,7 @@ fn linux_syscall_dispatch(
             true,
             0,
             0,
+            false,
             false,
         ),
         LINUX_EXECVE_SYSCALL => {
