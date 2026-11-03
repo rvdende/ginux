@@ -722,7 +722,7 @@ pub(super) const LINUX_FILE_PROC_TASK_STAT: u16 = LINUX_FILE_MASK | LINUX_PROC_T
 /// file exists but cannot be written, and runs it when the file is absent.
 /// `/proc/sys/fs/aio-max-nr`: the most events one io_setup context may hold.
 pub(super) const LINUX_AIO_MAX_NR: u64 = 65_536;
-pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 30] = [
+pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 31] = [
     // System V IPC limits, Linux's defaults; tests read them to size runs.
     (0xb000, b"sys/kernel/shmmni", b"4096\n"),
     (0xb100, b"sys/kernel/shmmax", b"18446744073692774399\n"),
@@ -750,6 +750,8 @@ pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 30] = [
     (0xd400, b"sys/fs/pipe-max-size", b"1048576\n"),
     (0xd200, b"sys/fs/aio-max-nr", b"65536\n"),
     (0xd000, b"sys/fs/pipe-user-pages-soft", b"16384\n"),
+    // Seconds a lease holder has to give up its lease (fcntl33 saves it).
+    (0xa500, b"sys/fs/lease-break-time", b"45\n"),
     // POSIX message queue limits (mq_open): the queues a domain may hold,
     // the largest attributes an unprivileged process may ask for, and what
     // a queue gets without attributes.
@@ -906,6 +908,9 @@ pub(super) const LINUX_F_OFD_SETLKW: u64 = 38;
 pub(super) const LINUX_F_DUPFD_CLOEXEC: u64 = 1030;
 pub(super) const LINUX_F_SETLEASE: u64 = 1024;
 pub(super) const LINUX_F_GETLEASE: u64 = 1025;
+pub(super) const LINUX_F_NOTIFY: u64 = 1026;
+pub(super) const LINUX_F_SETSIG: u64 = 10;
+pub(super) const LINUX_F_GETSIG: u64 = 11;
 pub(super) const LINUX_F_CREATED_QUERY: u64 = 1028;
 pub(super) const LINUX_F_ADD_SEALS: u64 = 1033;
 pub(super) const LINUX_F_GET_SEALS: u64 = 1034;

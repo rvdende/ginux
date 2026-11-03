@@ -1571,6 +1571,25 @@ pub(super) fn linux_queue_process_signal(
     signal_code: i32,
     signal_value: Option<u64>,
 ) -> u64 {
+    linux_queue_process_signal_from(
+        target,
+        signal,
+        signal_code,
+        signal_value,
+        linux_signal_sender(),
+    )
+}
+
+/// `linux_queue_process_signal` with the information's sender fields
+/// given: the pid and uid of a kill, or the first two words of another
+/// layout (a SIGIO's si_band).
+pub(super) fn linux_queue_process_signal_from(
+    target: u32,
+    signal: u64,
+    signal_code: i32,
+    signal_value: Option<u64>,
+    (sender_pid, sender_uid): (u32, u32),
+) -> u64 {
     // SIGCONT continues a stopped process as it is sent, whatever its
     // disposition (ignored by default); the parent's wait (WCONTINUED) is told.
     if signal == LINUX_SIGCONT && linux_process::continue_live_process(target) {
@@ -1592,7 +1611,6 @@ pub(super) fn linux_queue_process_signal(
     let Some(process) = linux_process::live_process_slot(target) else {
         return LINUX_ESRCH;
     };
-    let (sender_pid, sender_uid) = linux_signal_sender();
     match crate::linux_signal::enqueue(
         linux_signal_instance(),
         crate::linux_signal::Scope::Process,

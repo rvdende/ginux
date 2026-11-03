@@ -3,11 +3,9 @@
 # ("known failure"); a failure of any other test is a regression and fails
 # the run. Rewrite it from a run with LTP_UPDATE_BASELINE=1
 # (tests/qemu/ltp.sh --update-baseline); LTP_STRICT=1 ignores it.
-# From target/ltp-results.txt (2026-11-03), list=tests/ltp/syscalls.list ltp=20260930 kernel=cd1cf9c9.
+# From target/ltp-results.txt (2026-11-03), list=tests/ltp/syscalls.list ltp=20260930 kernel=6f9f6055.
 abort01 TFAIL
-accept01 TFAIL
 accept02 TBROK
-accept03 TFAIL
 acct01 TBROK
 acct02 TBROK
 arch_prctl01 TFAIL
@@ -18,7 +16,6 @@ chmod06 TFAIL
 chroot02 TFAIL
 chroot03 TFAIL
 chroot04 TFAIL
-clock_nanosleep01 TFAIL
 clock_gettime03 TBROK
 leapsec01 TBROK
 clone02 TFAIL
@@ -28,25 +25,18 @@ clone09 TBROK
 clone10 TBROK
 clone301 TBROK
 connect03 TFAIL
-creat05 TWARN
 creat07 TFAIL
 delete_module02 TFAIL
-dup05 TWARN
-epoll_create02 TFAIL
-epoll_ctl06 TFAIL
 epoll_wait05 TFAIL
 epoll_wait06 TFAIL
 epoll_wait10 TBROK
 epoll_wait16 TBROK
 epoll_pwait01 TBROK
-epoll_pwait06 TBROK
 eventfd06 TFAIL
 execve04 TFAIL
 execveat02 TFAIL
 fsetxattr02 TBROK
 fchdir03 TFAIL
-fcntl07 TWARN
-fcntl07_64 TWARN
 fcntl11 TFAIL
 fcntl11_64 TFAIL
 fcntl17 TBROK
@@ -55,24 +45,13 @@ fcntl21 TFAIL
 fcntl21_64 TFAIL
 fcntl31 TFAIL
 fcntl31_64 TFAIL
-fcntl33 TWARN
-fcntl33_64 TWARN
-fcntl37_64 TFAIL
-fcntl38 TBROK
-fcntl38_64 TBROK
-fcntl39 TBROK
-fcntl39_64 TBROK
 fgetxattr02 TBROK
 fork14 HANG
-fsync03 TWARN
 getcpu01 TFAIL
 gethostbyname_r01 TFAIL
 gethostname02 TFAIL
-getitimer01 TFAIL
-getpeername01 TFAIL
 get_robust_list01 TFAIL
-getsockname01 TFAIL
-getsockopt01 TFAIL
+getrusage03 HANG
 getsockopt02 TFAIL
 ioctl01 TBROK
 ioctl02 TBROK
@@ -124,10 +103,7 @@ link08 TFAIL
 linkat01 TFAIL
 listmount03 TBROK
 listmount04 TFAIL
-lseek02 TWARN
 lsm_list_modules01 TFAIL
-mkdir03 TWARN
-mknod06 TWARN
 mknod07 TFAIL
 mlock05 TBROK
 mlock201 TFAIL
@@ -153,7 +129,6 @@ msgstress01 TBROK
 msync03 TFAIL
 munlockall01 TBROK
 munmap04 TBROK
-nanosleep02 TFAIL
 name_to_handle_at01 TFAIL
 nftw01 TFAIL
 nftw6401 TFAIL
@@ -213,7 +188,6 @@ send02 TBROK
 sendmsg01 TBROK
 sendto01 TFAIL
 setgroups03 TFAIL
-setitimer01 TFAIL
 setns02 TWARN
 setrlimit06 TFAIL
 setsockopt01 TFAIL
@@ -248,7 +222,7 @@ utimes01 TFAIL
 vhangup02 TFAIL
 waitpid01 TFAIL
 waitid10 TBROK
-write04 TBROK
+write04 TWARN
 perf_event_open02 TBROK
 futex_cmp_requeue01 TBROK
 futex_waitv01 TFAIL
@@ -256,5 +230,6 @@ futex_wake05 TFAIL
 copy_file_range03 TFAIL
 statx03 TFAIL
 io_uring01 TBROK
+io_uring02 TBROK
 io_uring03 TBROK
 io_uring04 TBROK

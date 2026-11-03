@@ -531,6 +531,10 @@ struct Process {
     stopped_in_call: bool,
     /// POSIX timers (timer_create) by id - 1: none across fork and exec.
     posix_timers: [Option<PosixTimer>; POSIX_TIMER_LIMIT],
+    /// setitimer's ITIMER_VIRTUAL and ITIMER_PROF, as timers on the
+    /// process's CPU clock (SIGVTALRM, SIGPROF): none in a new child, kept
+    /// across exec.
+    itimers: [Option<PosixTimer>; 2],
     /// `/proc/PID/oom_score_adj`: inherited across fork, kept across exec.
     oom_score_adj: i16,
     /// The signal whose default action terminated the process, or 0.
@@ -1735,6 +1739,7 @@ impl ProcessTable {
             waiting: false,
             cpu_cycles: 0,
             posix_timers: [None; POSIX_TIMER_LIMIT],
+            itimers: [None; 2],
         });
         Some(handle)
     }
@@ -3209,7 +3214,14 @@ pub(crate) struct PosixTimerExpiry {
     pub(crate) signal: u8,
     pub(crate) tid: u32,
     pub(crate) value: u64,
+    /// An interval timer's (setitimer): its signal comes from the kernel
+    /// (SI_KERNEL), not a POSIX timer (SI_TIMER).
+    pub(crate) interval_timer: bool,
 }
+
+/// The most expiries one check reports: every POSIX timer and both CPU
+/// interval timers.
+pub(crate) const TIMER_EXPIRY_LIMIT: usize = POSIX_TIMER_LIMIT + 2;
 
 impl PosixTimerExpiry {
     pub(crate) const NONE: Self = Self {
@@ -3217,6 +3229,7 @@ impl PosixTimerExpiry {
         signal: 0,
         tid: 0,
         value: 0,
+        interval_timer: false,
     };
 }
 
@@ -3294,6 +3307,7 @@ pub(crate) fn earliest_posix_timer_deadline(pid: u32) -> u64 {
     process
         .posix_timers
         .iter()
+        .chain(process.itimers.iter())
         .flatten()
         .map(|timer| timer.deadline)
         .filter(|deadline| *deadline != 0)
@@ -3320,6 +3334,53 @@ pub(crate) fn posix_clock_is_thread_cpu(clock: u32) -> bool {
     clock == 3 || (clock as i32) < 0 && clock & 4 != 0
 }
 
+/// setitimer's ITIMER_VIRTUAL (`which` 1) or ITIMER_PROF (2) of `pid`:
+/// its interval and its deadline on the process CPU clock (0: disarmed).
+pub(crate) fn live_process_interval_timer(pid: u32, which: usize) -> Option<(u64, u64)> {
+    let table = live_process_table_mut()?;
+    let process = table.process(table.handle_by_pid(pid)?)?;
+    let timer = process.itimers.get(which.checked_sub(1)?)?;
+    Some(timer.map_or((0, 0), |timer| (timer.interval, timer.deadline)))
+}
+
+/// Arms (`deadline` nonzero, on the process CPU clock) or disarms
+/// `pid`'s ITIMER_VIRTUAL or ITIMER_PROF, which sends `signal`.
+pub(crate) fn set_live_process_interval_timer(
+    pid: u32,
+    which: usize,
+    signal: u8,
+    (interval, deadline): (u64, u64),
+) -> bool {
+    let Some(table) = live_process_table_mut() else {
+        return false;
+    };
+    let Some(process) = table
+        .handle_by_pid(pid)
+        .and_then(|handle| table.process_mut(handle))
+    else {
+        return false;
+    };
+    let Some(timer) = which
+        .checked_sub(1)
+        .and_then(|index| process.itimers.get_mut(index))
+    else {
+        return false;
+    };
+    // CLOCK_PROCESS_CPUTIME_ID, signalled as SIGEV_SIGNAL.
+    *timer = (deadline != 0).then_some(PosixTimer {
+        clock: 2,
+        notify: 0,
+        signal,
+        tid: 0,
+        value: 0,
+        deadline,
+        interval,
+        overrun: 0,
+        delivered_overrun: 0,
+    });
+    true
+}
+
 /// Fires process `pid`'s timers whose deadline passed: `now` on the
 /// monotonic clock, `cpu_now` the process's CPU time, for timers on a CPU
 /// clock (timer_settime01).
@@ -3327,7 +3388,7 @@ pub(crate) fn expire_posix_timers(
     pid: u32,
     (monotonic_now, cpu_now, thread_now): (u64, u64, u64),
     pending: u64,
-    expiries: &mut [PosixTimerExpiry; POSIX_TIMER_LIMIT],
+    expiries: &mut [PosixTimerExpiry; TIMER_EXPIRY_LIMIT],
 ) -> usize {
     let Some(table) = live_process_table_mut() else {
         return 0;
@@ -3339,7 +3400,14 @@ pub(crate) fn expire_posix_timers(
         return 0;
     };
     let mut count = 0;
-    for timer in process.posix_timers.iter_mut().flatten() {
+    let posix_count = process.posix_timers.len();
+    for (index, timer) in process
+        .posix_timers
+        .iter_mut()
+        .chain(process.itimers.iter_mut())
+        .enumerate()
+        .filter_map(|(index, timer)| Some((index, timer.as_mut()?)))
+    {
         let now = if posix_clock_is_thread_cpu(timer.clock) {
             thread_now
         } else if posix_clock_is_cpu(timer.clock) {
@@ -3374,6 +3442,7 @@ pub(crate) fn expire_posix_timers(
             signal: timer.signal,
             tid: timer.tid,
             value: timer.value,
+            interval_timer: index >= posix_count,
         };
         count += 1;
     }

@@ -81,10 +81,12 @@ pub(super) extern "sysv64" fn linux_syscall_handler(
             ],
         )
     };
-    let result = linux_syscall_dispatch(number, registers, user_stack, user_rip, user_rflags);
-    if let Some(call) = inotify {
-        linux_inotify_after(call, result);
-    }
+    let result = linux_syscall_dispatch(
+        number,
+        registers,
+        (user_stack, user_rip, user_rflags),
+        inotify,
+    );
     crate::linux_profile::time_syscall(number, timer::timestamp_counter().wrapping_sub(started));
     if let Some(call) = traced.filter(|call| !crate::linux_strace::logged_before(call.number)) {
         call.log(Some(result));
@@ -177,12 +179,15 @@ fn linux_environment_requests_strace(address: u64) -> bool {
         })
 }
 
+/// Runs system call `number`. `inotify` is what the call's file events
+/// need from before it ran; they are reported, and dnotify's signals
+/// queued, before the call's own signal delivery, so a dnotify signal
+/// reaches the caller as the call returns (fcntl38).
 fn linux_syscall_dispatch(
     number: u64,
     registers: *mut LinuxSyscallFrame,
-    user_stack: u64,
-    user_rip: u64,
-    user_rflags: u64,
+    (user_stack, user_rip, user_rflags): (u64, u64, u64),
+    inotify: Option<LinuxInotifyCall>,
 ) -> u64 {
     if registers.is_null() {
         let _kernel_entry = crate::sync::kernel_entry_lock();
@@ -1762,7 +1767,7 @@ fn linux_syscall_dispatch(
         LINUX_GETDENTS64_SYSCALL => linux_getdents64(first_argument, buffer, count),
         LINUX_READAHEAD_SYSCALL => linux_readahead(first_argument, buffer, count),
         LINUX_EPOLL_CREATE_SYSCALL => {
-            if first_argument as i32 == 0 {
+            if first_argument as i32 <= 0 {
                 LINUX_EINVAL
             } else {
                 linux_epoll_create1(0)
@@ -2024,6 +2029,10 @@ fn linux_syscall_dispatch(
     } else {
         result
     };
+    if let Some(call) = inotify {
+        linux_inotify_after(call, result);
+        linux_send_dnotify_notices();
+    }
     let same_thread = current_linux_thread_handle() == calling_thread;
     // A call that went back to the kernel to wait has no result yet to
     // interrupt; its wait sees the signal pending and is interrupted there.

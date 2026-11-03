@@ -32209,6 +32209,22 @@ fn linux_openat_path(
         overlay_handle = Some(handle);
         created = true;
     }
+    // O_DIRECTORY opens only a directory: a FIFO, socket or device file is
+    // ENOTDIR before anything opens it (LTP's cleanup tells files from
+    // directories this way).
+    if flags & LINUX_O_DIRECTORY != 0
+        && overlay_handle
+            .and_then(crate::linux_overlay::metadata)
+            .is_some_and(|metadata| {
+                !matches!(
+                    metadata.kind,
+                    crate::linux_overlay::NodeKind::Directory
+                        | crate::linux_overlay::NodeKind::Symlink
+                )
+            })
+    {
+        return LINUX_ENOTDIR;
+    }
     let kind = if let Some(handle) = overlay_handle {
         match crate::linux_overlay::metadata(handle).map(|metadata| metadata.kind) {
             Some(crate::linux_overlay::NodeKind::File) => LINUX_FILE_TMP_SCRATCH,
@@ -35713,8 +35729,12 @@ fn linux_unix_socket_path(address: u64, length: u64, output: &mut [u8; 108]) -> 
 
 /// The error for a socket call on `descriptor` that is not a socket: ENOTSOCK
 /// when it is an open descriptor of another kind, EBADF when it is not open.
+/// A socket call's error for a descriptor that is no socket: EBADF when
+/// it is closed or an O_PATH descriptor (which socket calls cannot use, as
+/// in Linux), ENOTSOCK otherwise.
 fn linux_not_socket_error(descriptor: u64) -> u64 {
-    if linux_descriptor_open(u64::from(descriptor as u32)) {
+    let descriptor = u64::from(descriptor as u32);
+    if linux_descriptor_open(descriptor) && !linux_path_descriptor(descriptor) {
         LINUX_ENOTSOCK
     } else {
         LINUX_EBADF
@@ -35827,9 +35847,25 @@ fn linux_socket_accept(descriptor: u64, address: u64, length: u64, flags: u64) -
     if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
         return LINUX_EINVAL;
     }
-    let Some(listener_slot) = linux_socket_slot(descriptor) else {
+    // A pipe end is no socket here, though pipes are socket pairs inside.
+    let Some(listener_slot) = linux_socket_slot(descriptor)
+        .filter(|_| !linux_pipe_descriptor(u64::from(descriptor as u32)))
+    else {
         return linux_not_socket_error(descriptor);
     };
+    // As Linux's order: a datagram socket cannot accept (EOPNOTSUPP), one
+    // not listening has nothing to accept (EINVAL), before the address is
+    // looked at (accept01).
+    if matches!(
+        crate::linux_socket::kind(listener_slot),
+        Some(crate::linux_socket::Kind::Udp | crate::linux_socket::Kind::Icmp)
+    ) || crate::linux_socket::socket_type(listener_slot) == Some(2)
+    {
+        return LINUX_EOPNOTSUPP;
+    }
+    if !crate::linux_socket::is_listening(listener_slot) {
+        return LINUX_EINVAL;
+    }
     let Some(accepted_descriptor) = (LINUX_AUX_DESCRIPTOR_FIRST..LINUX_AUX_DESCRIPTOR_LIMIT)
         .find(|descriptor| linux_aux_descriptor_free(*descriptor))
     else {
@@ -36907,14 +36943,20 @@ fn linux_socket_shutdown(descriptor: u64, how: u64) -> u64 {
 }
 
 fn linux_socket_name(descriptor: u64, address: u64, length: u64, peer: bool) -> u64 {
-    let Some(slot) = linux_socket_slot(descriptor) else {
-        let descriptor = u64::from(descriptor as u32);
-        return if linux_descriptor_open(descriptor) {
-            LINUX_ENOTSOCK
-        } else {
-            LINUX_EBADF
-        };
+    let Some(slot) = linux_socket_slot(descriptor)
+        .filter(|_| !linux_pipe_descriptor(u64::from(descriptor as u32)))
+    else {
+        return linux_not_socket_error(descriptor);
     };
+    // The length is read first: unreadable is EFAULT, negative EINVAL
+    // (getsockname01).
+    let mut supplied = [0_u8; 4];
+    if !copy_from_linux_user(length, &mut supplied) {
+        return LINUX_EFAULT;
+    }
+    if i32::from_ne_bytes(supplied) < 0 {
+        return LINUX_EINVAL;
+    }
     if let Some((_, port)) = crate::linux_socket::netlink_address(slot) {
         // Its own port id; the peer is the kernel (port 0).
         let mut sockaddr = [0_u8; 12];
@@ -37146,8 +37188,33 @@ fn linux_socket_getsockopt(
         };
     }
     let mut supplied = [0_u8; 4];
-    if !copy_from_linux_user(length, &mut supplied) || u32::from_ne_bytes(supplied) < 4 {
+    if !copy_from_linux_user(length, &mut supplied) {
         return LINUX_EFAULT;
+    }
+    let Ok(supplied) = usize::try_from(i32::from_ne_bytes(supplied)) else {
+        return LINUX_EINVAL;
+    };
+    // A level the socket's family does not have is EOPNOTSUPP, as Linux's
+    // protocol handlers answer (getsockopt01): SOL_SOCKET everywhere, IP
+    // on inet sockets, TCP or UDP on their own, ICMP's on a raw ICMP one.
+    let kind = crate::linux_socket::kind(slot);
+    let level_known = match level {
+        1 => true,
+        0 => matches!(
+            kind,
+            Some(
+                crate::linux_socket::Kind::Tcp
+                    | crate::linux_socket::Kind::Udp
+                    | crate::linux_socket::Kind::Icmp
+            )
+        ),
+        6 => kind == Some(crate::linux_socket::Kind::Tcp),
+        17 => kind == Some(crate::linux_socket::Kind::Udp),
+        255 => kind == Some(crate::linux_socket::Kind::Icmp),
+        _ => false,
+    };
+    if !level_known {
+        return LINUX_EOPNOTSUPP;
     }
     let read_boolean = |option| match crate::linux_socket::boolean_option(slot, option) {
         Ok(value) => Ok(i32::from(value)),
@@ -37183,6 +37250,8 @@ fn linux_socket_getsockopt(
             crate::linux_socket::readiness(slot).is_some_and(|(_, _, error)| error) as i32 * 111
         }
         (1, 7 | 8) => 64 * 1024,
+        // SO_OOBINLINE: urgent data is not kept apart here.
+        (1, 10) => 0,
         (1, 9) => match read_boolean(crate::linux_socket::BooleanOption::KeepAlive) {
             Ok(value) => value,
             Err(error) => return error,
@@ -37230,8 +37299,10 @@ fn linux_socket_getsockopt(
         }
         _ => return LINUX_ENOPROTOOPT,
     };
-    if !copy_to_linux_user(value, &result.to_ne_bytes())
-        || !copy_to_linux_user(length, &4_u32.to_ne_bytes())
+    // A shorter buffer gets the first bytes of the int, as in Linux.
+    let copied = supplied.min(4);
+    if copied != 0 && !copy_to_linux_user(value, &result.to_ne_bytes()[..copied])
+        || !copy_to_linux_user(length, &(copied as u32).to_ne_bytes())
     {
         return LINUX_EFAULT;
     }
@@ -40038,7 +40109,7 @@ pub(super) fn refresh_linux_posix_timers() -> bool {
     // Called in a system call, where the signal queues may be consulted.
     let pending = X86_RUNTIME.ELF_PROBE_PENDING_SIGNALS.load(Ordering::SeqCst)
         | linux_dynamic_pending_masks().map_or(0, |(process, thread)| process | thread);
-    let mut expiries = [linux_process::PosixTimerExpiry::NONE; linux_process::POSIX_TIMER_LIMIT];
+    let mut expiries = [linux_process::PosixTimerExpiry::NONE; linux_process::TIMER_EXPIRY_LIMIT];
     let cpu_now = linux_current_process_cpu_nanoseconds();
     let thread_now = linux_current_thread_cpu_nanoseconds();
     let count =
@@ -40052,11 +40123,17 @@ pub(super) fn refresh_linux_posix_timers() -> bool {
         // queues of their own a timer can reach; the thread is recorded.
         let _thread = (expiry.notify == SIGEV_THREAD_ID).then_some(expiry.tid);
         // Queued as kill queues a signal; its delivery freezes the overrun.
+        // An interval timer's signal comes from the kernel (SI_KERNEL).
+        let code = if expiry.interval_timer {
+            0x80
+        } else {
+            LINUX_SI_TIMER
+        };
         if linux_queue_process_signal(
             pid,
             u64::from(expiry.signal),
-            LINUX_SI_TIMER,
-            Some(expiry.value),
+            code,
+            (!expiry.interval_timer).then_some(expiry.value),
         ) == 0
         {
             queued = true;
@@ -41513,7 +41590,8 @@ fn linux_epoll_ctl(epoll: u64, operation: u64, descriptor: u64, event_address: u
         return LINUX_EINVAL;
     }
     let epoll = linux_epoll_instance(epoll);
-    if !linux_descriptor_open(descriptor) {
+    // An O_PATH descriptor is no file to watch (EBADF, as in Linux).
+    if !linux_descriptor_open(descriptor) || linux_path_descriptor(descriptor) {
         return LINUX_EBADF;
     }
     if !linux_descriptor_epollable(descriptor) {
@@ -41636,6 +41714,11 @@ fn linux_descriptor_epollable(descriptor: u64) -> bool {
         || linux_eventfd_descriptor(descriptor)
         || linux_timerfd_descriptor(descriptor)
         || linux_pipe_descriptor(descriptor)
+        // io_uring (its completions), userfaultfd (its events) and
+        // /proc/mounts (a mount table change) can be polled in Linux too.
+        || linux_io_uring_descriptor(descriptor)
+        || linux_userfaultfd_descriptor(descriptor)
+        || device & !3 == LINUX_FILE_PROC_MOUNTS
 }
 
 /// Bits of a watch's stored events word that hold the readiness last reported
@@ -45929,6 +46012,55 @@ fn linux_fcntl_set_lease(descriptor: u64, kind: u64) -> u64 {
     0
 }
 
+/// F_NOTIFY (dnotify) on a directory descriptor: the process is signalled
+/// (F_SETSIG's signal, else SIGIO) when the directory or its entries
+/// change as `events` (DN_*) asks; `linux_inotify` matches the events.
+fn linux_fcntl_notify(descriptor: u64, events: u64) -> u64 {
+    let mut path = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    let length = match linux_walk_start(descriptor, &mut path) {
+        Ok(length) => length,
+        Err(_) => return LINUX_ENOTDIR,
+    };
+    if !linux_inotify_is_directory(&path[..length]) {
+        return LINUX_ENOTDIR;
+    }
+    match crate::linux_inotify::dnotify_register(
+        linux_execution_instance(),
+        current_linux_process_pid(),
+        descriptor as u32,
+        &path[..length],
+        events as u32,
+    ) {
+        Ok(()) => 0,
+        Err(_) => LINUX_ENOMEM,
+    }
+}
+
+/// Sends the dnotify notices the last system call caused: F_SETSIG's
+/// signal with si_code POLL_MSG, si_band and si_fd (kept where a queued
+/// signal's information keeps the sender and the value), or SIGIO.
+pub(super) fn linux_send_dnotify_notices() {
+    const POLL_MSG: i32 = 3;
+    // POLLIN | POLLRDNORM | POLLMSG, Linux's band for POLL_MSG.
+    const BAND: u32 = 0x441;
+    const SIGIO: u64 = 29;
+    let mut notices = Vec::new();
+    crate::linux_inotify::take_dnotify_notices(linux_execution_instance(), &mut notices);
+    for (pid, descriptor, signal) in notices {
+        if signal == 0 {
+            let _ = linux_queue_process_signal(pid, SIGIO, LINUX_SI_KERNEL, None);
+        } else {
+            let _ = linux_queue_process_signal_from(
+                pid,
+                u64::from(signal),
+                POLL_MSG,
+                Some(u64::from(descriptor)),
+                (BAND, 0),
+            );
+        }
+    }
+}
+
 /// F_GETLEASE: F_RDLCK, F_WRLCK or F_UNLCK.
 fn linux_fcntl_get_lease(descriptor: u64) -> u64 {
     if linux_descriptor_flag(&X86_RUNTIME.ELF_PROBE_DESCRIPTOR_READ_LEASES, descriptor) {
@@ -46056,6 +46188,12 @@ fn linux_close_range(first: u64, last: u64, flags: u64) -> u64 {
 }
 
 fn linux_descriptor_close_with_wake(descriptor: u64, wake_waiters: bool) -> u64 {
+    // A dnotify registration and F_SETSIG choice end with the descriptor.
+    crate::linux_inotify::dnotify_closed(
+        linux_execution_instance(),
+        current_linux_process_pid(),
+        descriptor as u32,
+    );
     // Closing any descriptor of a file drops the process's record locks on
     // it, and closing a description's descriptor drops its OFD locks.
     let owners = [
@@ -46871,6 +47009,26 @@ fn linux_descriptor_fcntl(descriptor: u64, command: u64, argument: u64) -> u64 {
         )),
         LINUX_F_SETLEASE => linux_fcntl_set_lease(descriptor, argument),
         LINUX_F_GETLEASE => linux_fcntl_get_lease(descriptor),
+        LINUX_F_SETSIG => {
+            if argument > LINUX_SIGNAL_COUNT as u64 {
+                LINUX_EINVAL
+            } else if crate::linux_inotify::set_notice_signal(
+                linux_execution_instance(),
+                current_linux_process_pid(),
+                descriptor as u32,
+                argument as u8,
+            ) {
+                0
+            } else {
+                LINUX_ENOMEM
+            }
+        }
+        LINUX_F_GETSIG => u64::from(crate::linux_inotify::notice_signal(
+            linux_execution_instance(),
+            current_linux_process_pid(),
+            descriptor as u32,
+        )),
+        LINUX_F_NOTIFY => linux_fcntl_notify(descriptor, argument),
         LINUX_F_GETFL => {
             u64::from((state & 3) - 1)
                 | u64::from(

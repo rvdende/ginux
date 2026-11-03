@@ -834,33 +834,48 @@ pub(crate) fn next_child_at(directory: &[u8], cursor: usize) -> Option<Option<Ch
         parent[prefix_length] = b'/';
         prefix_length += 1;
     }
-    let mut observed = 0;
+    // The cursor is a node slot's place among all slots, which stays put
+    // while nodes come and go (pages are only appended): unlinking the
+    // entries already read, as `rm -r` does between reads, moves none of
+    // the rest past the cursor.
     let overlay = live()?;
-    Some(for_each_node(overlay, |node| {
-        if !node.linked || node.whiteout {
-            return None;
+    let mut page = overlay.first_node_page;
+    let mut ordinal = 0_usize;
+    while page != FrameLease::EMPTY {
+        let nodes = node_page(page)?;
+        if ordinal + nodes.nodes.len() <= cursor {
+            ordinal += nodes.nodes.len();
+            page = nodes.next;
+            continue;
         }
-        let remainder = node.path().strip_prefix(&parent[..prefix_length])?;
-        if remainder.is_empty() || remainder.contains(&b'/') {
-            return None;
+        for (index, node) in nodes.nodes.iter().enumerate() {
+            let place = ordinal + index;
+            if place < cursor || !node.active || !node.linked || node.whiteout {
+                continue;
+            }
+            let Some(remainder) = node.path().strip_prefix(&parent[..prefix_length]) else {
+                continue;
+            };
+            if remainder.is_empty() || remainder.contains(&b'/') {
+                continue;
+            }
+            let mut name = [0_u8; PATH_CAPACITY];
+            name[..remainder.len()].copy_from_slice(remainder);
+            let metadata = match node.alias_of {
+                Some(file) => metadata(file)?,
+                None => node.metadata(),
+            };
+            return Some(Some(Child {
+                next_cursor: place + 1,
+                metadata,
+                name_length: remainder.len(),
+                name,
+            }));
         }
-        if observed != cursor {
-            observed += 1;
-            return None;
-        }
-        let mut name = [0_u8; PATH_CAPACITY];
-        name[..remainder.len()].copy_from_slice(remainder);
-        let metadata = match node.alias_of {
-            Some(file) => metadata(file)?,
-            None => node.metadata(),
-        };
-        Some(Child {
-            next_cursor: cursor + 1,
-            metadata,
-            name_length: remainder.len(),
-            name,
-        })
-    }))
+        ordinal += nodes.nodes.len();
+        page = nodes.next;
+    }
+    Some(None)
 }
 
 pub(crate) fn create_file(path: &[u8], mode: u32, initial: &[u8]) -> Option<Handle> {

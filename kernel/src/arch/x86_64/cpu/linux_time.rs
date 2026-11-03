@@ -600,10 +600,62 @@ pub(super) fn linux_getrusage(who: u64, output_address: u64) -> u64 {
     0
 }
 
+/// ITIMER_VIRTUAL (1, SIGVTALRM) and ITIMER_PROF (2, SIGPROF): timers on
+/// the process's CPU time (user and system alike here, so both count the
+/// same time), kept in the process table and fired with its POSIX timers.
+fn linux_set_cpu_interval_timer(
+    which: u64,
+    (interval, value): (u64, u64),
+    old_output_address: u64,
+) -> u64 {
+    const SIGVTALRM: u8 = 26;
+    const SIGPROF: u8 = 27;
+    let pid = current_linux_process_pid();
+    let which = which as usize;
+    let cpu_now = linux_current_process_cpu_nanoseconds();
+    let Some((old_interval, old_deadline)) = linux_process::live_process_interval_timer(pid, which)
+    else {
+        return LINUX_ESRCH;
+    };
+    let old = linux_interval_timer_specification(old_interval, old_deadline, cpu_now);
+    if old_output_address != 0 && !copy_to_linux_user(old_output_address, &old) {
+        return LINUX_EFAULT;
+    }
+    let deadline = if value == 0 {
+        0
+    } else {
+        cpu_now.saturating_add(value).max(1)
+    };
+    let signal = if which == 1 { SIGVTALRM } else { SIGPROF };
+    if !linux_process::set_live_process_interval_timer(pid, which, signal, (interval, deadline)) {
+        return LINUX_ESRCH;
+    }
+    linux_refresh_posix_timer_cache(pid);
+    0
+}
+
 pub(super) fn linux_getitimer(which: u64, output_address: u64) -> u64 {
     let which = u64::from(which as u32);
     if which > 2 {
         return LINUX_EINVAL;
+    }
+    if which != 0 {
+        let cpu_now = linux_current_process_cpu_nanoseconds();
+        let Some((interval, deadline)) =
+            linux_process::live_process_interval_timer(current_linux_process_pid(), which as usize)
+        else {
+            return LINUX_ESRCH;
+        };
+        let specification = if deadline == 0 {
+            linux_interval_timer_specification(interval, 0, 0)
+        } else {
+            linux_interval_timer_specification(interval, deadline, cpu_now)
+        };
+        return if copy_to_linux_user(output_address, &specification) {
+            0
+        } else {
+            LINUX_EFAULT
+        };
     }
     let specification = if which == 0 {
         let Some(now) = linux_elapsed_nanoseconds() else {
@@ -836,8 +888,20 @@ fn linux_sleep_live_return(
     request: u64,
     remaining: u64,
 ) -> u64 {
+    const CLOCK_THREAD_CPUTIME_ID: u64 = 3;
+    const CLOCK_BOOTTIME: u64 = 7;
     let clock = u64::from(clock as u32);
     let flags = u64::from(flags as u32);
+    // A thread's CPU clock cannot be slept on (Linux has no nsleep for it:
+    // EOPNOTSUPP); CLOCK_BOOTTIME runs as CLOCK_MONOTONIC, with no suspend.
+    if clock == CLOCK_THREAD_CPUTIME_ID && flags & !LINUX_TIMER_ABSTIME == 0 {
+        return LINUX_EOPNOTSUPP;
+    }
+    let clock = if clock == CLOCK_BOOTTIME {
+        LINUX_CLOCK_MONOTONIC
+    } else {
+        clock
+    };
     if !matches!(clock, LINUX_CLOCK_REALTIME | LINUX_CLOCK_MONOTONIC)
         || flags & !LINUX_TIMER_ABSTIME != 0
     {
@@ -900,7 +964,19 @@ fn linux_sleep_live_return(
         // the deadline. Device/timer interrupts still wake the CPU and are
         // handled normally between checks. Once a sibling thread is ready,
         // this thread sleeps as a thread wait while it runs.
-        while linux_elapsed_nanoseconds().is_some_and(|now| now < deadline) {
+        while let Some(now) = linux_elapsed_nanoseconds().filter(|now| *now < deadline) {
+            // The time left is written before each turn: a signal the turn
+            // delivers ends the sleep with EINTR straight into its handler,
+            // and a relative sleep reports what was left then.
+            if remaining != 0 {
+                let left = deadline - now;
+                let mut timespec = [0_u8; 16];
+                timespec[..8].copy_from_slice(&(left / 1_000_000_000).to_ne_bytes());
+                timespec[8..].copy_from_slice(&(left % 1_000_000_000).to_ne_bytes());
+                if !copy_to_linux_user(remaining, &timespec) {
+                    return LINUX_EFAULT;
+                }
+            }
             let turn = linux_timed_wait_run_others(output, caller, number, Some(deadline));
             if let LinuxWaitTurn::Done(result) = turn {
                 return result;
@@ -990,8 +1066,8 @@ pub(super) fn linux_setitimer(which: u64, input_address: u64, old_output_address
     let Some(value) = linux_timeval_nanoseconds(&requested[16..]) else {
         return LINUX_EINVAL;
     };
-    if which != 0 && (interval != 0 || value != 0) {
-        return LINUX_ENOSYS;
+    if which != 0 {
+        return linux_set_cpu_interval_timer(which, (interval, value), old_output_address);
     }
     let Some(now) = linux_elapsed_nanoseconds() else {
         return LINUX_ENOSYS;

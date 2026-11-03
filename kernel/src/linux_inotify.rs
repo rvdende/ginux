@@ -170,6 +170,215 @@ impl Instance {
 }
 
 static INSTANCES: SpinLock<Vec<Instance>> = SpinLock::new(LockRank::INOTIFY, Vec::new());
+
+/// dnotify (fcntl F_NOTIFY): a process asks to be signalled, through a
+/// directory's descriptor, when the directory or its entries change.
+struct Dnotify {
+    domain: usize,
+    pid: u32,
+    descriptor: u32,
+    path: Vec<u8>,
+    /// DN_* events.
+    events: u32,
+    multishot: bool,
+}
+
+/// dnotify's registrations, the signals F_SETSIG chose (domain, pid,
+/// descriptor, signal), and the notices due (domain, pid, descriptor) for
+/// the kernel to send once the system call that caused them is done.
+struct DnotifyState {
+    registrations: Vec<Dnotify>,
+    signals: Vec<(usize, u32, u32, u8)>,
+    fired: Vec<(usize, u32, u32)>,
+}
+
+static DNOTIFY: SpinLock<DnotifyState> = SpinLock::new(
+    LockRank::INOTIFY,
+    DnotifyState {
+        registrations: Vec::new(),
+        signals: Vec::new(),
+        fired: Vec::new(),
+    },
+);
+
+pub(crate) const DN_ACCESS: u32 = 0x1;
+pub(crate) const DN_MODIFY: u32 = 0x2;
+pub(crate) const DN_CREATE: u32 = 0x4;
+pub(crate) const DN_DELETE: u32 = 0x8;
+pub(crate) const DN_RENAME: u32 = 0x10;
+pub(crate) const DN_ATTRIB: u32 = 0x20;
+pub(crate) const DN_MULTISHOT: u32 = 0x8000_0000;
+
+/// F_NOTIFY on the descriptor `descriptor` of `pid`, for directory
+/// `path`: `events` (DN_*, with DN_MULTISHOT to stay after the first
+/// notice) replace the descriptor's registration; none removes it.
+pub(crate) fn dnotify_register(
+    domain: usize,
+    pid: u32,
+    descriptor: u32,
+    path: &[u8],
+    events: u32,
+) -> Result<(), Error> {
+    let mut state = DNOTIFY.lock();
+    let before = state.registrations.len();
+    state.registrations.retain(|registration| {
+        !(registration.domain == domain
+            && registration.pid == pid
+            && registration.descriptor == descriptor)
+    });
+    let removed = before - state.registrations.len();
+    let multishot = events & DN_MULTISHOT != 0;
+    let events = events & !DN_MULTISHOT;
+    let added = if events != 0 {
+        let mut copy = Vec::new();
+        copy.try_reserve_exact(path.len())
+            .map_err(|_| Error::NoMemory)?;
+        copy.extend_from_slice(path);
+        state
+            .registrations
+            .try_reserve(1)
+            .map_err(|_| Error::NoMemory)?;
+        state.registrations.push(Dnotify {
+            domain,
+            pid,
+            descriptor,
+            path: copy,
+            events,
+            multishot,
+        });
+        1
+    } else {
+        0
+    };
+    // The watch count turns the system call hooks on and off.
+    WATCHES.fetch_add(added, Ordering::Relaxed);
+    WATCHES.fetch_sub(removed, Ordering::Relaxed);
+    Ok(())
+}
+
+/// F_SETSIG: the signal (0 for SIGIO) `pid`'s descriptor's notices use.
+pub(crate) fn set_notice_signal(domain: usize, pid: u32, descriptor: u32, signal: u8) -> bool {
+    let mut state = DNOTIFY.lock();
+    state
+        .signals
+        .retain(|entry| !(entry.0 == domain && entry.1 == pid && entry.2 == descriptor));
+    if signal == 0 {
+        return true;
+    }
+    if state.signals.try_reserve(1).is_err() {
+        return false;
+    }
+    state.signals.push((domain, pid, descriptor, signal));
+    true
+}
+
+/// F_GETSIG: the signal F_SETSIG set, else 0.
+pub(crate) fn notice_signal(domain: usize, pid: u32, descriptor: u32) -> u8 {
+    DNOTIFY
+        .lock()
+        .signals
+        .iter()
+        .find(|entry| entry.0 == domain && entry.1 == pid && entry.2 == descriptor)
+        .map_or(0, |entry| entry.3)
+}
+
+/// `pid` closed `descriptor`: its registration and signal choice go.
+pub(crate) fn dnotify_closed(domain: usize, pid: u32, descriptor: u32) {
+    let mut state = DNOTIFY.lock();
+    let before = state.registrations.len();
+    state.registrations.retain(|registration| {
+        !(registration.domain == domain
+            && registration.pid == pid
+            && registration.descriptor == descriptor)
+    });
+    WATCHES.fetch_sub(before - state.registrations.len(), Ordering::Relaxed);
+    state
+        .signals
+        .retain(|entry| !(entry.0 == domain && entry.1 == pid && entry.2 == descriptor));
+}
+
+/// The notices due since the last call: (pid, descriptor, signal), the
+/// signal 0 meaning SIGIO.
+pub(crate) fn take_dnotify_notices(domain: usize, output: &mut Vec<(u32, u32, u8)>) {
+    let mut state = DNOTIFY.lock();
+    let mut index = 0;
+    while index < state.fired.len() {
+        let (fired_domain, pid, descriptor) = state.fired[index];
+        if fired_domain != domain {
+            index += 1;
+            continue;
+        }
+        state.fired.swap_remove(index);
+        let signal = state
+            .signals
+            .iter()
+            .find(|entry| entry.0 == domain && entry.1 == pid && entry.2 == descriptor)
+            .map_or(0, |entry| entry.3);
+        if output.try_reserve(1).is_ok() {
+            output.push((pid, descriptor, signal));
+        }
+    }
+}
+
+/// Dnotify's DN_* events that inotify event `mask` stands for.
+fn dnotify_events(mask: u32) -> u32 {
+    let mut events = 0;
+    if mask & IN_ACCESS != 0 {
+        events |= DN_ACCESS;
+    }
+    if mask & IN_MODIFY != 0 {
+        events |= DN_MODIFY;
+    }
+    if mask & (IN_CREATE | IN_MOVED_TO) != 0 {
+        events |= DN_CREATE;
+    }
+    if mask & (IN_DELETE | IN_MOVED_FROM) != 0 {
+        events |= DN_DELETE;
+    }
+    if mask & IN_ATTRIB != 0 {
+        events |= DN_ATTRIB;
+    }
+    events
+}
+
+/// Notes the dnotify registrations `events` (DN_*) on `path` reach: the
+/// directory's own (`own`) and, with `to_parent`, its parent's. A
+/// registration without DN_MULTISHOT ends with its first notice.
+fn dnotify_hear(domain: usize, path: &[u8], events: u32, own: bool, to_parent: bool) {
+    if events == 0 {
+        return;
+    }
+    let (parent, _) = split(path);
+    let mut state = DNOTIFY.lock();
+    let DnotifyState {
+        registrations,
+        fired,
+        ..
+    } = &mut *state;
+    let mut index = 0;
+    let mut ended = 0;
+    while index < registrations.len() {
+        let registration = &registrations[index];
+        let reached = registration.domain == domain
+            && registration.events & events != 0
+            && (own && registration.path == path
+                || to_parent && !path.is_empty() && registration.path == parent);
+        if !reached {
+            index += 1;
+            continue;
+        }
+        if fired.try_reserve(1).is_ok() {
+            fired.push((domain, registration.pid, registration.descriptor));
+        }
+        if registration.multishot {
+            index += 1;
+        } else {
+            registrations.swap_remove(index);
+            ended += 1;
+        }
+    }
+    WATCHES.fetch_sub(ended, Ordering::Relaxed);
+}
 /// Watches in all domains, so file operations skip the table when none.
 static WATCHES: AtomicUsize = AtomicUsize::new(0);
 /// Cookies pairing IN_MOVED_FROM with IN_MOVED_TO.
@@ -338,6 +547,11 @@ fn deliver_to(
             }
         }
     }
+    drop(instances);
+    // Dnotify hears its own and its entries' events, but not a move of
+    // the watched directory itself.
+    let events = dnotify_events(mask & !(IN_MOVE_SELF | IN_DELETE_SELF));
+    dnotify_hear(domain, path, events, mask & OWN_EVENTS != 0, to_parent);
 }
 
 /// An event on the object at canonical `path`: IN_ACCESS, IN_MODIFY,
@@ -418,6 +632,12 @@ pub(crate) fn renamed(domain: usize, from: &[u8], to: &[u8], directory: bool) {
         return;
     }
     let cookie = NEXT_COOKIE.fetch_add(1, Ordering::Relaxed).max(1);
+    // A rename within one directory is dnotify's DN_RENAME there; one out
+    // of or into it is not (fcntl39).
+    let same_directory = split(from).0 == split(to).0;
+    if same_directory {
+        dnotify_hear(domain, from, DN_RENAME, false, true);
+    }
     deliver(domain, from, IN_MOVED_FROM, directory, cookie);
     deliver(domain, to, IN_MOVED_TO, directory, cookie);
     deliver(domain, from, IN_MOVE_SELF, directory, 0);

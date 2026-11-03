@@ -557,6 +557,7 @@ interior-mutable	kernel/src/arch/x86_64/cpu/activation.rs	SWITCHING_VERIFIED	pro
 interior-mutable	kernel/src/linux_record_lock.rs	LOCKS	process-runtime	allowlist	none	ranked-record-lock-table
 interior-mutable	kernel/src/linux_record_lock.rs	FLOCKS	process-runtime	allowlist	none	ranked-record-lock-table
 interior-mutable	kernel/src/linux_inotify.rs	INSTANCES	process-runtime	allowlist	none	ranked-inotify-table
+interior-mutable	kernel/src/linux_inotify.rs	DNOTIFY	process-runtime	allowlist	none	ranked-inotify-table
 interior-mutable	kernel/src/linux_inotify.rs	NEXT_COOKIE	process-runtime	allowlist	none	diagnostic-counter
 interior-mutable	kernel/src/linux_inotify.rs	WATCHES	process-runtime	allowlist	none	diagnostic-counter
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_DOMAIN_EXEC_DEPTH	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
