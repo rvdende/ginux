@@ -1571,12 +1571,32 @@ fn release_messages(mut message: Option<memory::FrameLease>) -> bool {
     false
 }
 
+fn count_message_queues(instance: usize) -> usize {
+    let mut current = root(
+        &SYSV_IPC_RUNTIME.message_root_addresses,
+        &SYSV_IPC_RUNTIME.message_root_generations,
+        instance,
+    );
+    let mut count = 0;
+    for _ in 0..WALK_LIMIT {
+        let Some(queue) = current.and_then(message_queue) else {
+            break;
+        };
+        count += 1;
+        current = (queue.next_queue != memory::FrameLease::EMPTY).then_some(queue.next_queue);
+    }
+    count
+}
+
+/// msgget: the queue `key` names, or a new one; no more queues in all
+/// than `limit` (/proc/sys/kernel/msgmni, ENOSPC: msgget03).
 pub(crate) fn message_get_or_create(
     key: i32,
     mode: u16,
     create: bool,
     exclusive: bool,
     requested: Option<u32>,
+    limit: usize,
 ) -> Result<u32, Error> {
     const DEFAULT_BYTE_LIMIT: u64 = 16_384;
     let guard = Guard::acquire().ok_or(Error::Invalid)?;
@@ -1591,6 +1611,9 @@ pub(crate) fn message_get_or_create(
         if !create {
             return Err(Error::NoEntry);
         }
+    }
+    if count_message_queues(guard.instance) >= limit {
+        return Err(Error::NoSpace);
     }
     let frame = allocate_zeroed().ok_or(Error::NoMemory)?;
     // A requested id (/proc/sys/kernel/msg_next_id) that is free is used, and
@@ -2043,7 +2066,7 @@ pub(crate) fn verify_message_queue_lifecycle() -> bool {
     let Some(before) = memory::owner_live_frame_count(memory::FrameOwner::KERNEL) else {
         return false;
     };
-    let Ok(id) = message_get_or_create(0x4d53_4751, 0o620, true, true, None) else {
+    let Ok(id) = message_get_or_create(0x4d53_4751, 0o620, true, true, None, usize::MAX) else {
         return false;
     };
     let large_size = MESSAGE_CAPACITY + 37;

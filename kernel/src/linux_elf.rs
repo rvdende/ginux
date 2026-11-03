@@ -942,6 +942,19 @@ pub(crate) fn vdso_preempt_entry() -> Option<u64> {
     VDSO_ADDRESS.checked_add(u64::try_from(offset).ok()?)
 }
 
+/// The bytes of the vDSO's signal return (`__ginux_sigreturn` in
+/// linux-vdso.S): `mov eax, 15; syscall; ud2`.
+const VDSO_SIGRETURN_ENTRY: [u8; 9] = [0xb8, 0x0f, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x0f, 0x0b];
+
+/// The user address of the vDSO's rt_sigreturn trampoline, the restorer of
+/// a handler installed without a usable one.
+pub(crate) fn vdso_sigreturn_entry() -> Option<u64> {
+    let offset = LINUX_VDSO
+        .windows(VDSO_SIGRETURN_ENTRY.len())
+        .position(|window| window == VDSO_SIGRETURN_ENTRY)?;
+    VDSO_ADDRESS.checked_add(u64::try_from(offset).ok()?)
+}
+
 pub(crate) fn parse(bytes: &[u8]) -> Option<Image<'_>> {
     if bytes.len() < ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE * MIN_LOAD_SEGMENT_COUNT
         || bytes.get(0..4)? != b"\x7fELF"

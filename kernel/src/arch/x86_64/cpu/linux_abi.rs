@@ -532,6 +532,8 @@ pub(super) const LINUX_PROT_EXEC: u64 = 4;
 pub(super) const LINUX_MAP_SHARED: u64 = 1;
 pub(super) const LINUX_MAP_PRIVATE: u64 = 2;
 pub(super) const LINUX_MAP_FIXED: u64 = 0x10;
+pub(super) const LINUX_MAP_SHARED_VALIDATE: u64 = 0x3;
+pub(super) const LINUX_MAP_32BIT: u64 = 0x40;
 pub(super) const LINUX_MAP_ANONYMOUS: u64 = 0x20;
 pub(super) const LINUX_MAP_EXECUTABLE: u64 = 0x1000;
 pub(super) const LINUX_MAP_LOCKED: u64 = 0x2000;
@@ -615,6 +617,7 @@ pub(super) const LINUX_EPOLL_SUPPORTED_EVENTS: u32 =
         | 0x4000_0000
         | 0x8000_0000;
 pub(super) const LINUX_EPOLLET: u32 = 0x8000_0000;
+pub(super) const LINUX_EPOLLONESHOT: u32 = 0x4000_0000;
 pub(super) const LINUX_EFD_SEMAPHORE: u64 = 1;
 pub(super) const LINUX_EFD_NONBLOCK: u64 = 0x800;
 pub(super) const LINUX_TFD_TIMER_ABSTIME: u64 = 1;
@@ -895,6 +898,9 @@ pub(super) const LINUX_F_OFD_GETLK: u64 = 36;
 pub(super) const LINUX_F_OFD_SETLK: u64 = 37;
 pub(super) const LINUX_F_OFD_SETLKW: u64 = 38;
 pub(super) const LINUX_F_DUPFD_CLOEXEC: u64 = 1030;
+pub(super) const LINUX_F_SETLEASE: u64 = 1024;
+pub(super) const LINUX_F_GETLEASE: u64 = 1025;
+pub(super) const LINUX_F_CREATED_QUERY: u64 = 1028;
 pub(super) const LINUX_F_ADD_SEALS: u64 = 1033;
 pub(super) const LINUX_F_GET_SEALS: u64 = 1034;
 pub(super) const LINUX_F_SEAL_SEAL: u32 = 0x0001;

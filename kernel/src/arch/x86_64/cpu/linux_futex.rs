@@ -189,6 +189,12 @@ pub(super) fn linux_futex_live_return(
     }
     let mut bytes = [0_u8; size_of::<u32>()];
     if !copy_from_linux_user(address, &mut bytes) {
+        // A word on a page not mapped in yet (a SysV segment just attached)
+        // is mapped by the owner's path; the light path cannot change page
+        // tables (futex_waitv03's waker thread).
+        if linux_light_thread_here().is_some() {
+            return migrate_current_linux_thread_to_owner(caller, LINUX_FUTEX_SYSCALL);
+        }
         return LINUX_EFAULT;
     }
     if matches!(command, FUTEX_REQUEUE | FUTEX_CMP_REQUEUE) {

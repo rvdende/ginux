@@ -3268,9 +3268,25 @@ pub(crate) fn earliest_posix_timer_deadline(pid: u32) -> u64 {
 /// of signals the process has pending: a timer whose signal is still
 /// queued counts these expirations on its overrun instead of queueing
 /// again, as Linux does until the signal is delivered.
+/// Whether a POSIX timer's clock counts CPU time: CLOCK_PROCESS_CPUTIME_ID,
+/// CLOCK_THREAD_CPUTIME_ID, or a clock id clock_getcpuclockid or
+/// pthread_getcpuclockid made (negative). Its deadlines are CPU nanoseconds.
+pub(crate) fn posix_clock_is_cpu(clock: u32) -> bool {
+    matches!(clock, 2 | 3) || (clock as i32) < 0
+}
+
+/// Whether a CPU clock counts one thread's time (CLOCK_THREAD_CPUTIME_ID,
+/// or a pthread_getcpuclockid id: bit 2 set).
+pub(crate) fn posix_clock_is_thread_cpu(clock: u32) -> bool {
+    clock == 3 || (clock as i32) < 0 && clock & 4 != 0
+}
+
+/// Fires process `pid`'s timers whose deadline passed: `now` on the
+/// monotonic clock, `cpu_now` the process's CPU time, for timers on a CPU
+/// clock (timer_settime01).
 pub(crate) fn expire_posix_timers(
     pid: u32,
-    now: u64,
+    (monotonic_now, cpu_now, thread_now): (u64, u64, u64),
     pending: u64,
     expiries: &mut [PosixTimerExpiry; POSIX_TIMER_LIMIT],
 ) -> usize {
@@ -3285,6 +3301,13 @@ pub(crate) fn expire_posix_timers(
     };
     let mut count = 0;
     for timer in process.posix_timers.iter_mut().flatten() {
+        let now = if posix_clock_is_thread_cpu(timer.clock) {
+            thread_now
+        } else if posix_clock_is_cpu(timer.clock) {
+            cpu_now
+        } else {
+            monotonic_now
+        };
         if timer.deadline == 0 || now < timer.deadline {
             continue;
         }

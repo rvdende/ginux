@@ -10,7 +10,7 @@ fn linux_cpu_clock_cycles(clock: u64) -> Option<Result<u64, u64>> {
     let id = clock as u32 as i32;
     let pid = current_linux_process_pid();
     if id == LINUX_CLOCK_PROCESS_CPUTIME_ID as i32 {
-        return Some(Ok(linux_process_cpu_cycles(pid)));
+        return Some(Ok(linux_current_process_cpu_cycles()));
     }
     if id == LINUX_CLOCK_THREAD_CPUTIME_ID as i32 {
         return Some(Ok(
@@ -36,6 +36,8 @@ fn linux_cpu_clock_cycles(clock: u64) -> Option<Result<u64, u64>> {
         let target = if target == 0 { pid } else { target };
         if linux_process::live_process_status(target).is_none() {
             Err(LINUX_EINVAL)
+        } else if target == pid {
+            Ok(linux_current_process_cpu_cycles())
         } else {
             Ok(linux_process_cpu_cycles(target))
         }
@@ -291,7 +293,9 @@ pub(super) fn linux_uname_with_copy(address: u64, copy: impl FnOnce(u64, &[u8]) 
     // autoconf's config.guess and Node check before anything runs; the
     // release ("...-ginux...") and node name still say Ginux.
     name[..6].copy_from_slice(b"Linux\0");
-    name[65..71].copy_from_slice(b"ginux\0");
+    let mut host = [0_u8; LINUX_UTS_NAME_CAPACITY];
+    let host_length = linux_uts_name(LINUX_UTS_HOST, &mut host);
+    name[65..65 + host_length].copy_from_slice(&host[..host_length]);
     let release = if X86_RUNTIME.ELF_PROBE_PERSONALITY.load(Ordering::SeqCst)
         & LINUX_PERSONALITY_UNAME26
         != 0
@@ -303,7 +307,9 @@ pub(super) fn linux_uname_with_copy(address: u64, copy: impl FnOnce(u64, &[u8]) 
     name[130..130 + release.len()].copy_from_slice(release);
     name[195..198].copy_from_slice(b"#1\0");
     name[260..267].copy_from_slice(b"x86_64\0");
-    name[325..337].copy_from_slice(b"localdomain\0");
+    let mut domain = [0_u8; LINUX_UTS_NAME_CAPACITY];
+    let domain_length = linux_uts_name(LINUX_UTS_DOMAIN, &mut domain);
+    name[325..325 + domain_length].copy_from_slice(&domain[..domain_length]);
     if copy(address, &name) {
         0
     } else {
@@ -543,9 +549,12 @@ pub(super) fn linux_sysinfo_information(
     processes: u16,
     (uptime, _): (u64, u64),
 ) -> Result<[u8; 112], u64> {
-    let Some((total_frames, free_frames)) = memory::frame_counts() else {
+    // The domain's memory, as /proc/meminfo reports it (sysinfo01 compares
+    // the two): the machine's, bounded by the domain's budget.
+    if memory::frame_counts().is_none() {
         return Err(LINUX_ENOSYS);
-    };
+    }
+    let (total_frames, free_frames) = linux_domain_frame_counts();
     let Some(total_memory) = total_frames.checked_mul(PAGE_SIZE as u64) else {
         return Err(LINUX_EOVERFLOW);
     };

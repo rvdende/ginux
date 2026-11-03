@@ -908,7 +908,9 @@ fn linux_syscall_dispatch(
             )
         }
         LINUX_FCNTL_SYSCALL => linux_descriptor_fcntl(first_argument, buffer, count),
-        LINUX_FLOCK_SYSCALL => linux_flock(first_argument, buffer),
+        LINUX_FLOCK_SYSCALL => {
+            linux_flock_live_return(registers, syscall_return, first_argument, buffer)
+        }
         LINUX_FSYNC_SYSCALL | LINUX_FDATASYNC_SYSCALL => linux_fsync(first_argument),
         LINUX_FADVISE64_SYSCALL => linux_fadvise64(first_argument, buffer, count, register(0)),
         LINUX_TRUNCATE_SYSCALL => linux_truncate(first_argument, buffer),
@@ -1340,6 +1342,8 @@ fn linux_syscall_dispatch(
         LINUX_ARCH_PRCTL_SYSCALL => linux_arch_prctl(first_argument, buffer),
         LINUX_MODIFY_LDT_SYSCALL => linux_modify_ldt(first_argument, buffer, count),
         LINUX_UNAME_SYSCALL => linux_uname_with_copy(first_argument, copy_to_linux_user),
+        LINUX_SETHOSTNAME_SYSCALL => linux_set_uts_name(LINUX_UTS_HOST, first_argument, buffer),
+        LINUX_SETDOMAINNAME_SYSCALL => linux_set_uts_name(LINUX_UTS_DOMAIN, first_argument, buffer),
         LINUX_STATFS_SYSCALL => linux_statfs(first_argument, buffer),
         LINUX_FSTATFS_SYSCALL => linux_fstatfs(first_argument, buffer),
         LINUX_MOUNT_SYSCALL => {

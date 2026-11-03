@@ -150,4 +150,16 @@ __ginux_preempt:
     ud2
 .size __ginux_preempt, .-__ginux_preempt
 
+# Where a signal handler installed without a usable restorer returns:
+# rt_sigreturn. LTP's raw rt_sigaction under musl passes a restorer it read
+# back from libc's sigaction, which musl does not fill in. The kernel finds
+# this sequence by its bytes (linux_elf::vdso_sigreturn_entry).
+.p2align 4
+.type __ginux_sigreturn,@function
+__ginux_sigreturn:
+    movl $15, %eax
+    syscall
+    ud2
+.size __ginux_sigreturn, .-__ginux_sigreturn
+
 .section .note.GNU-stack,"",@progbits

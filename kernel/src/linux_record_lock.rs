@@ -153,3 +153,59 @@ pub(crate) fn release(owner: Owner, file: File) {
 pub(crate) fn holds_any(owner: Owner) -> bool {
     LOCKS.lock().iter().any(|lock| lock.owner == owner)
 }
+
+/// A flock(2) lock: on the whole file, held by an open file description
+/// (`holder`, its open-file id), so a descriptor a dup or a fork shares
+/// unlocks it too (flock03). `pid` set it, and the lock goes with that
+/// process. flock locks and record locks never see each other, as in Linux.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Flock {
+    pub(crate) file: File,
+    pub(crate) pid: u32,
+    pub(crate) holder: u64,
+    pub(crate) exclusive: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FlockError {
+    /// Another holder's lock is in the way.
+    Conflict,
+    NoMemory,
+}
+
+static FLOCKS: SpinLock<Vec<Flock>> = SpinLock::new(LockRank::RECORD_LOCKS, Vec::new());
+
+/// Gives `holder` (a process and its descriptor) a shared or exclusive
+/// flock lock on `file`, replacing the one it holds there (an upgrade or
+/// a downgrade), unless another holder's lock is in the way: a shared lock
+/// shares with shared locks, an exclusive one with none.
+pub(crate) fn flock_set(
+    file: File,
+    (pid, holder): (u32, u64),
+    exclusive: bool,
+    alive: impl Fn(u32) -> bool,
+) -> Result<(), FlockError> {
+    let mut locks = FLOCKS.lock();
+    locks.retain(|lock| alive(lock.pid));
+    if locks
+        .iter()
+        .any(|lock| lock.file == file && lock.holder != holder && (exclusive || lock.exclusive))
+    {
+        return Err(FlockError::Conflict);
+    }
+    locks.try_reserve(1).map_err(|_| FlockError::NoMemory)?;
+    locks.retain(|lock| lock.file != file || lock.holder != holder);
+    locks.push(Flock {
+        file,
+        pid,
+        holder,
+        exclusive,
+    });
+    Ok(())
+}
+
+/// Drops the flock lock open file description `holder` holds (LOCK_UN, or
+/// a descriptor of it closing).
+pub(crate) fn flock_release(holder: u64) {
+    FLOCKS.lock().retain(|lock| lock.holder != holder);
+}

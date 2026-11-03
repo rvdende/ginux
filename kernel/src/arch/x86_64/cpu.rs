@@ -73,6 +73,10 @@ const PAGE_SIZE: usize = 4096;
 pub(crate) const LINUX_MMAP_SLOT_COUNT: usize = 4;
 const LINUX_RUNTIME_MMAP_SLOT_COUNT: usize = 32;
 const LINUX_RUNTIME_DYNAMIC_MMAP_BASE: u64 = 1 << 39;
+/// Where MAP_32BIT mappings go: the second gigabyte, as on x86-64 Linux,
+/// above the program image and heap and below 2 GiB.
+const LINUX_LOW_MMAP_BASE: u64 = 0x4000_0000;
+const LINUX_LOW_MMAP_LIMIT: u64 = 0x8000_0000;
 pub(crate) const LINUX_RUNTIME_STACK_PAGES: usize = 1;
 pub(crate) const LINUX_RUNTIME_HEAP_PAGES: usize = 16;
 const EXCEPTION_STACK_SIZE: usize = 4 * 1024 * 1024;
@@ -211,6 +215,14 @@ struct X86RuntimeOwner {
     ELF_PROBE_CODE_SIZE: RuntimeRef<CpuBankedAtomicU64>,
     ELF_PROBE_COMPLETED: RuntimeRef<CpuBankedAtomicBool>,
     ELF_PROBE_CONSOLE_CLOEXEC: RuntimeRef<[CpuBankedAtomicU64; LINUX_DESCRIPTOR_FLAG_WORD_COUNT]>,
+    /// Per descriptor: its open created the file (F_CREATED_QUERY), and
+    /// the lease it holds (F_SETLEASE), one bit per descriptor.
+    ELF_PROBE_DESCRIPTOR_CREATED:
+        RuntimeRef<[CpuBankedAtomicU64; LINUX_DESCRIPTOR_FLAG_WORD_COUNT]>,
+    ELF_PROBE_DESCRIPTOR_READ_LEASES:
+        RuntimeRef<[CpuBankedAtomicU64; LINUX_DESCRIPTOR_FLAG_WORD_COUNT]>,
+    ELF_PROBE_DESCRIPTOR_WRITE_LEASES:
+        RuntimeRef<[CpuBankedAtomicU64; LINUX_DESCRIPTOR_FLAG_WORD_COUNT]>,
     ELF_PROBE_CONSOLE_DESCRIPTORS: RuntimeRef<CpuBankedAtomicU8>,
     ELF_PROBE_CWD: RuntimeRef<CpuBankedAtomicU16>,
     ELF_PROBE_DATA: RuntimeRef<CpuBankedAtomicU64>,
@@ -677,6 +689,13 @@ static X86_RUNTIME: X86RuntimeOwner = X86RuntimeOwner {
     ELF_PROBE_CODE_SIZE: RuntimeRef(&X86_RUNTIME_BACKING_ELF_PROBE_CODE_SIZE),
     ELF_PROBE_COMPLETED: RuntimeRef(&X86_RUNTIME_BACKING_ELF_PROBE_COMPLETED),
     ELF_PROBE_CONSOLE_CLOEXEC: RuntimeRef(&X86_RUNTIME_BACKING_ELF_PROBE_CONSOLE_CLOEXEC),
+    ELF_PROBE_DESCRIPTOR_CREATED: RuntimeRef(&X86_RUNTIME_BACKING_ELF_PROBE_DESCRIPTOR_CREATED),
+    ELF_PROBE_DESCRIPTOR_READ_LEASES: RuntimeRef(
+        &X86_RUNTIME_BACKING_ELF_PROBE_DESCRIPTOR_READ_LEASES,
+    ),
+    ELF_PROBE_DESCRIPTOR_WRITE_LEASES: RuntimeRef(
+        &X86_RUNTIME_BACKING_ELF_PROBE_DESCRIPTOR_WRITE_LEASES,
+    ),
     ELF_PROBE_CONSOLE_DESCRIPTORS: RuntimeRef(&X86_RUNTIME_BACKING_ELF_PROBE_CONSOLE_DESCRIPTORS),
     ELF_PROBE_CWD: RuntimeRef(&X86_RUNTIME_BACKING_ELF_PROBE_CWD),
     ELF_PROBE_DATA: RuntimeRef(&X86_RUNTIME_BACKING_ELF_PROBE_DATA),
@@ -1618,7 +1637,7 @@ fn linux_report_process_banks() {
         serial_write("\r\n");
     }
     serial_write(
-        "ginux: sysrq: light threads cpu/bank/slot/runs/migrations/last-migrated-call/syscalls:\r\n",
+        "ginux: sysrq: light-path runs cpu/bank/slot/runs/migrations/last-migrated-call/syscalls:\r\n",
     );
     for cpu in 0..CPU_ENTRY_STATE_LIMIT {
         serial_write("ginux: cpu ");
@@ -3590,6 +3609,15 @@ static X86_RUNTIME_BACKING_ELF_PROBE_CONSOLE_DESCRIPTORS: CpuBankedAtomicU8 =
 static X86_RUNTIME_BACKING_ELF_PROBE_STDERR_OPEN: CpuBankedAtomicBool =
     CpuBankedAtomicBool::new(false);
 static X86_RUNTIME_BACKING_ELF_PROBE_CONSOLE_CLOEXEC: [CpuBankedAtomicU64;
+    LINUX_DESCRIPTOR_FLAG_WORD_COUNT] =
+    [const { CpuBankedAtomicU64::new(0) }; LINUX_DESCRIPTOR_FLAG_WORD_COUNT];
+static X86_RUNTIME_BACKING_ELF_PROBE_DESCRIPTOR_CREATED: [CpuBankedAtomicU64;
+    LINUX_DESCRIPTOR_FLAG_WORD_COUNT] =
+    [const { CpuBankedAtomicU64::new(0) }; LINUX_DESCRIPTOR_FLAG_WORD_COUNT];
+static X86_RUNTIME_BACKING_ELF_PROBE_DESCRIPTOR_READ_LEASES: [CpuBankedAtomicU64;
+    LINUX_DESCRIPTOR_FLAG_WORD_COUNT] =
+    [const { CpuBankedAtomicU64::new(0) }; LINUX_DESCRIPTOR_FLAG_WORD_COUNT];
+static X86_RUNTIME_BACKING_ELF_PROBE_DESCRIPTOR_WRITE_LEASES: [CpuBankedAtomicU64;
     LINUX_DESCRIPTOR_FLAG_WORD_COUNT] =
     [const { CpuBankedAtomicU64::new(0) }; LINUX_DESCRIPTOR_FLAG_WORD_COUNT];
 static X86_RUNTIME_BACKING_ELF_PROBE_DEVICE_DESCRIPTORS: CpuBankedAtomicArray<
@@ -6364,10 +6392,6 @@ fn refresh_live_linux_process_registry(context: LinuxUserContext) -> bool {
             context.rflags,
             context.fs_base,
         );
-        if !refreshed && LINUX_REFRESH_FAILURES.fetch_add(1, Ordering::Relaxed) == 7 {
-            serial_write("ginux: registry refresh failures diagnostic\r\n");
-            linux_write_stall_diagnostic();
-        }
         return refreshed;
     }
     refresh_nonruntime_linux_process_registry(context)
@@ -8885,9 +8909,6 @@ fn linux_write_stall_diagnostic() {
     linux_show_task_states();
 }
 
-/// Registry refreshes that failed; the eighth writes the stall diagnostic.
-static LINUX_REFRESH_FAILURES: AtomicU32 = AtomicU32::new(0);
-
 /// Wakes up to `limit` waiters on the futex word at `address` from the
 /// kernel's own side (a thread's exit clearing its tid word, a robust mutex
 /// whose owner died): threads of this process blocked on it, then waits
@@ -10540,6 +10561,15 @@ pub(crate) fn verify_linux_elf_entry(execution: &LinuxElfExecution<'_>) -> Linux
         .store(execution.runtime, Ordering::SeqCst);
     for word in &X86_RUNTIME.ELF_PROBE_CONSOLE_CLOEXEC {
         word.store(0, Ordering::SeqCst);
+    }
+    for table in [
+        &X86_RUNTIME.ELF_PROBE_DESCRIPTOR_CREATED,
+        &X86_RUNTIME.ELF_PROBE_DESCRIPTOR_READ_LEASES,
+        &X86_RUNTIME.ELF_PROBE_DESCRIPTOR_WRITE_LEASES,
+    ] {
+        for word in table.iter() {
+            word.store(0, Ordering::SeqCst);
+        }
     }
     for descriptor in &X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS {
         descriptor.store(0, Ordering::SeqCst);
@@ -13787,8 +13817,6 @@ fn linux_privileged_operation(number: u64) -> Option<linux_user::PrivilegedOpera
         | LINUX_FSPICK_SYSCALL
         | LINUX_MOUNT_SETATTR_SYSCALL => Some(PrivilegedOperation::ManageMounts),
         LINUX_REBOOT_SYSCALL
-        | LINUX_SETHOSTNAME_SYSCALL
-        | LINUX_SETDOMAINNAME_SYSCALL
         | LINUX_INIT_MODULE_SYSCALL
         | LINUX_DELETE_MODULE_SYSCALL
         | LINUX_KEXEC_LOAD_SYSCALL
@@ -14118,8 +14146,9 @@ fn linux_clone3(
         return LINUX_EINVAL;
     }
     // A process (not a thread) ending with SIGCHLD: a fork, on `stack` if
-    // given. CLONE_FS, CLONE_SYSVSEM and CLONE_IO are taken as fork's
-    // copies: nothing here shares those between processes.
+    // given. CLONE_FS, CLONE_FILES, CLONE_SYSVSEM and CLONE_IO are taken
+    // as fork's copies: nothing here shares those between processes yet
+    // (unshare03 forks with CLONE_FILES and unshares the table again).
     const CLONE_IO: u64 = 0x8000_0000;
     const PROCESS_CLONE_FLAGS: u64 = LINUX_CLONE_VM
         | LINUX_CLONE_PIDFD
@@ -14129,6 +14158,7 @@ fn linux_clone3(
         | LINUX_CLONE_CLEAR_SIGHAND
         | LINUX_CLONE_INTO_CGROUP
         | LINUX_CLONE_FS
+        | LINUX_CLONE_FILES
         | LINUX_CLONE_SYSVSEM
         | CLONE_IO
         | LINUX_CLONE_PARENT_SETTID
@@ -16971,6 +17001,9 @@ struct LinuxDescriptorRuntimeState {
     console: u8,
     stderr_open: bool,
     close_on_exec: [u64; LINUX_DESCRIPTOR_FLAG_WORD_COUNT],
+    created: [u64; LINUX_DESCRIPTOR_FLAG_WORD_COUNT],
+    read_leases: [u64; LINUX_DESCRIPTOR_FLAG_WORD_COUNT],
+    write_leases: [u64; LINUX_DESCRIPTOR_FLAG_WORD_COUNT],
     devices: [u16; LINUX_DEVICE_DESCRIPTOR_COUNT],
     rootfs: [u16; LINUX_DEVICE_DESCRIPTOR_COUNT],
     sockets: [crate::linux_socket::SlotId; LINUX_DEVICE_DESCRIPTOR_COUNT],
@@ -17014,6 +17047,9 @@ impl LinuxDescriptorRuntimeState {
         console: 0,
         stderr_open: false,
         close_on_exec: [0; LINUX_DESCRIPTOR_FLAG_WORD_COUNT],
+        created: [0; LINUX_DESCRIPTOR_FLAG_WORD_COUNT],
+        read_leases: [0; LINUX_DESCRIPTOR_FLAG_WORD_COUNT],
+        write_leases: [0; LINUX_DESCRIPTOR_FLAG_WORD_COUNT],
         devices: [0; LINUX_DEVICE_DESCRIPTOR_COUNT],
         rootfs: [0; LINUX_DEVICE_DESCRIPTOR_COUNT],
         sockets: [0; LINUX_DEVICE_DESCRIPTOR_COUNT],
@@ -18127,6 +18163,15 @@ fn capture_linux_descriptor_runtime_state() -> LinuxDescriptorRuntimeState {
         close_on_exec: core::array::from_fn(|index| {
             X86_RUNTIME.ELF_PROBE_CONSOLE_CLOEXEC[index].load(Ordering::Relaxed)
         }),
+        created: core::array::from_fn(|index| {
+            X86_RUNTIME.ELF_PROBE_DESCRIPTOR_CREATED[index].load(Ordering::Relaxed)
+        }),
+        read_leases: core::array::from_fn(|index| {
+            X86_RUNTIME.ELF_PROBE_DESCRIPTOR_READ_LEASES[index].load(Ordering::Relaxed)
+        }),
+        write_leases: core::array::from_fn(|index| {
+            X86_RUNTIME.ELF_PROBE_DESCRIPTOR_WRITE_LEASES[index].load(Ordering::Relaxed)
+        }),
         devices: X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS.snapshot(),
         rootfs: X86_RUNTIME.ELF_PROBE_ROOTFS_DESCRIPTORS.snapshot(),
         sockets: X86_RUNTIME.ELF_PROBE_SOCKET_SLOTS.snapshot(),
@@ -18327,6 +18372,21 @@ fn install_linux_descriptor_runtime_state(state: &LinuxDescriptorRuntimeState) {
     {
         word.store(value, Ordering::Relaxed);
     }
+    for (table, values) in [
+        (&X86_RUNTIME.ELF_PROBE_DESCRIPTOR_CREATED, &state.created),
+        (
+            &X86_RUNTIME.ELF_PROBE_DESCRIPTOR_READ_LEASES,
+            &state.read_leases,
+        ),
+        (
+            &X86_RUNTIME.ELF_PROBE_DESCRIPTOR_WRITE_LEASES,
+            &state.write_leases,
+        ),
+    ] {
+        for (word, value) in table.iter().zip(values.iter().copied()) {
+            word.store(value, Ordering::Relaxed);
+        }
+    }
     for index in 0..state.stdio_sockets.len() {
         X86_RUNTIME.ELF_PROBE_STDIO_SOCKET_SLOTS[index]
             .store(state.stdio_sockets[index], Ordering::Relaxed);
@@ -18513,18 +18573,22 @@ fn linux_runtime_mmap_end() -> Option<u64> {
 
 fn linux_runtime_mapping_range(address: u64, length: u64) -> Option<(u64, usize)> {
     let end = linux_runtime_mmap_end()?;
+    let in_low_window = (LINUX_LOW_MMAP_BASE..LINUX_LOW_MMAP_LIMIT).contains(&address);
     if length == 0
         || !address.is_multiple_of(PAGE_SIZE as u64)
-        || address < LINUX_RUNTIME_DYNAMIC_MMAP_BASE
+        || address < LINUX_RUNTIME_DYNAMIC_MMAP_BASE && !in_low_window
     {
         return None;
     }
     let pages = usize::try_from(length.div_ceil(PAGE_SIZE as u64)).ok()?;
     let mapped_end = address.checked_add((pages as u64).checked_mul(PAGE_SIZE as u64)?)?;
     // Programs too large for the low window load in their own region above
-    // the mmap area; their pages are managed the same way.
+    // the mmap area; their pages are managed the same way. MAP_32BIT
+    // mappings lie in the second gigabyte.
     let in_high_image = address >= LINUX_EXEC_HIGH_LOAD_BASE && mapped_end <= LINUX_EXEC_HIGH_LIMIT;
-    (pages != 0 && (mapped_end <= end || in_high_image)).then_some((mapped_end, pages))
+    let in_low_window = in_low_window && mapped_end <= LINUX_LOW_MMAP_LIMIT;
+    (pages != 0 && (mapped_end <= end || in_high_image || in_low_window))
+        .then_some((mapped_end, pages))
 }
 
 fn linux_page_ceil(address: u64) -> Option<u64> {
@@ -18632,10 +18696,25 @@ fn linux_runtime_range_available(address: u64, pages: usize) -> bool {
     address_space::current_linux_range_unoccupied(address, pages)
 }
 
-fn linux_runtime_select_mapping(address: u64, pages: usize, fixed: bool) -> Option<u64> {
+/// `low` for MAP_32BIT: the first free range in the second gigabyte, or
+/// none (ENOMEM) when nothing that size fits there (mmap23's 2 GiB).
+fn linux_runtime_select_mapping(address: u64, pages: usize, fixed: bool, low: bool) -> Option<u64> {
     let base = LINUX_RUNTIME_DYNAMIC_MMAP_BASE;
     let end = linux_runtime_mmap_end()?;
     let size = (pages as u64).checked_mul(PAGE_SIZE as u64)?;
+    if low && !fixed {
+        let mut candidate = LINUX_LOW_MMAP_BASE;
+        while candidate
+            .checked_add(size)
+            .is_some_and(|mapped_end| mapped_end <= LINUX_LOW_MMAP_LIMIT)
+        {
+            if linux_runtime_range_available(candidate, pages) {
+                return Some(candidate);
+            }
+            candidate = candidate.checked_add(PAGE_SIZE as u64)?;
+        }
+        return None;
+    }
     if fixed {
         return (address >= base
             && address.is_multiple_of(PAGE_SIZE as u64)
@@ -18769,7 +18848,8 @@ fn linux_shmat(id: u64, requested: u64, flags: u64) -> u64 {
     if requested != 0 && !requested.is_multiple_of(SHMLBA) {
         return LINUX_EINVAL;
     }
-    let Some(address) = linux_runtime_select_mapping(requested, pages, requested != 0) else {
+    let Some(address) = linux_runtime_select_mapping(requested, pages, requested != 0, false)
+    else {
         return LINUX_ENOMEM;
     };
     if !linux_runtime_range_available(address, pages) {
@@ -19128,12 +19208,16 @@ fn linux_msgget(key: u64, flags: u64) -> u64 {
     let key = key as u32 as i32;
     let requested =
         linux_proc_sysctl_value(b"sys/kernel/msg_next_id").and_then(|id| u32::try_from(id).ok());
+    let limit = linux_proc_sysctl_value(b"sys/kernel/msgmni")
+        .and_then(|limit| usize::try_from(limit).ok())
+        .unwrap_or(32_000);
     let result = crate::linux_sysv_ipc::message_get_or_create(
         key,
         flags as u16,
         key == 0 || flags & IPC_CREAT != 0,
         flags & IPC_EXCL != 0,
         requested,
+        limit,
     );
     // msg_next_id is used up by the queue it named.
     if requested.is_some_and(|id| result == Ok(id)) {
@@ -24044,12 +24128,23 @@ fn linux_runtime_mmap(
     // MAP_STACK is currently a Linux compatibility hint.  Runtime mappings
     // already have page-granular backing and teardown, so neither it nor
     // MAP_NORESERVE needs a distinct mapping mechanism.
+    // MAP_SHARED_VALIDATE is MAP_SHARED that refuses flags it does not
+    // know with EOPNOTSUPP instead of ignoring them (mmap20); MAP_32BIT
+    // places the mapping below 2 GiB (mmap23, mmap24).
+    let shared_validate = flags & LINUX_MAP_SHARED_VALIDATE == LINUX_MAP_SHARED_VALIDATE;
+    let flags = if shared_validate {
+        flags & !LINUX_MAP_SHARED_VALIDATE | LINUX_MAP_SHARED
+    } else {
+        flags
+    };
+    let low = flags & LINUX_MAP_32BIT != 0;
     let ignored = flags
         & (LINUX_MAP_DENYWRITE
             | LINUX_MAP_EXECUTABLE
             | LINUX_MAP_LOCKED
             | LINUX_MAP_NORESERVE
-            | LINUX_MAP_STACK);
+            | LINUX_MAP_STACK
+            | LINUX_MAP_32BIT);
     let normalized = flags & !ignored;
     let sharing = normalized & (LINUX_MAP_SHARED | LINUX_MAP_PRIVATE);
     if !matches!(sharing, LINUX_MAP_SHARED | LINUX_MAP_PRIVATE) {
@@ -24077,13 +24172,18 @@ fn linux_runtime_mmap(
     };
     // Linux ignores the descriptor of an anonymous mapping (LTP passes 0)
     // and only wants its offset page-aligned.
-    if normalized != valid_flags
-        || fixed && no_replace
-        || anonymous && !offset.is_multiple_of(PAGE_SIZE as u64)
-    {
+    if normalized != valid_flags {
+        return if shared_validate {
+            LINUX_EOPNOTSUPP
+        } else {
+            LINUX_EINVAL
+        };
+    }
+    if fixed && no_replace || anonymous && !offset.is_multiple_of(PAGE_SIZE as u64) {
         return LINUX_EINVAL;
     }
-    let Some(mapping) = linux_runtime_select_mapping(address, pages, fixed || no_replace) else {
+    let Some(mapping) = linux_runtime_select_mapping(address, pages, fixed || no_replace, low)
+    else {
         return LINUX_ENOMEM;
     };
     if no_replace && !linux_runtime_range_available(mapping, pages) {
@@ -24725,7 +24825,8 @@ fn linux_mremap(
         return LINUX_ENOMEM;
     }
     let fixed = flags & MREMAP_FIXED != 0;
-    let Some(destination) = linux_runtime_select_mapping(fixed_address, new_pages, fixed) else {
+    let Some(destination) = linux_runtime_select_mapping(fixed_address, new_pages, fixed, false)
+    else {
         return LINUX_ENOMEM;
     };
     let Some(destination_end) = destination.checked_add((new_pages * PAGE_SIZE) as u64) else {
@@ -27124,6 +27225,83 @@ static LINUX_SYSCTL_OVERRIDES: [[core::sync::atomic::AtomicI64; LINUX_PROC_SYSCT
     [const { core::sync::atomic::AtomicI64::new(LINUX_SYSCTL_UNSET) }; LINUX_PROC_SYSCTLS.len()]
 }; control_abi::DOMAIN_LIMIT];
 
+/// Each domain's host and domain name (Linux's UTS namespace: a domain
+/// has its own), as sethostname, setdomainname and
+/// /proc/sys/kernel/domainname set them; unset, the built-in ones. Bytes and
+/// a length (0: unset) per name; names are short and rarely written, so a
+/// torn read shows at worst a name being changed.
+const LINUX_UTS_NAME_CAPACITY: usize = 64;
+const LINUX_UTS_HOST: usize = 0;
+const LINUX_UTS_DOMAIN: usize = 1;
+static LINUX_UTS_NAMES: [[[AtomicU8; LINUX_UTS_NAME_CAPACITY]; 2]; control_abi::DOMAIN_LIMIT] =
+    [const { [const { [const { AtomicU8::new(0) }; LINUX_UTS_NAME_CAPACITY] }; 2] };
+        control_abi::DOMAIN_LIMIT];
+static LINUX_UTS_LENGTHS: [[AtomicU8; 2]; control_abi::DOMAIN_LIMIT] =
+    [const { [const { AtomicU8::new(0) }; 2] }; control_abi::DOMAIN_LIMIT];
+
+/// The current domain's host (`LINUX_UTS_HOST`) or domain name into
+/// `output`, its length returned.
+fn linux_uts_name(kind: usize, output: &mut [u8; LINUX_UTS_NAME_CAPACITY]) -> usize {
+    let set = current_container_slot().and_then(|slot| {
+        let length = usize::from(LINUX_UTS_LENGTHS[slot][kind].load(Ordering::Acquire));
+        (length != 0).then(|| {
+            let length = length - 1;
+            for (byte, stored) in output
+                .iter_mut()
+                .zip(&LINUX_UTS_NAMES[slot][kind][..length])
+            {
+                *byte = stored.load(Ordering::Relaxed);
+            }
+            length
+        })
+    });
+    set.unwrap_or_else(|| {
+        let default: &[u8] = if kind == LINUX_UTS_HOST {
+            b"ginux"
+        } else {
+            b"localdomain"
+        };
+        output[..default.len()].copy_from_slice(default);
+        default.len()
+    })
+}
+
+fn linux_uts_set(kind: usize, name: &[u8]) -> bool {
+    let Some(slot) = current_container_slot() else {
+        return false;
+    };
+    if name.len() > LINUX_UTS_NAME_CAPACITY {
+        return false;
+    }
+    for (stored, byte) in LINUX_UTS_NAMES[slot][kind].iter().zip(name) {
+        stored.store(*byte, Ordering::Relaxed);
+    }
+    LINUX_UTS_LENGTHS[slot][kind].store(name.len() as u8 + 1, Ordering::Release);
+    true
+}
+
+/// sethostname(2) and setdomainname(2): at most 64 bytes (EINVAL, as is a
+/// negative length), readable (EFAULT), by root of the domain (EPERM).
+fn linux_set_uts_name(kind: usize, address: u64, length: u64) -> u64 {
+    let length = length as i64;
+    if !(0..=LINUX_UTS_NAME_CAPACITY as i64).contains(&length) {
+        return LINUX_EINVAL;
+    }
+    if !current_linux_credentials().is_some_and(|credentials| credentials.privileged()) {
+        return LINUX_EPERM;
+    }
+    let mut name = [0_u8; LINUX_UTS_NAME_CAPACITY];
+    let length = length as usize;
+    if !copy_from_linux_user(address, &mut name[..length]) {
+        return LINUX_EFAULT;
+    }
+    if linux_uts_set(kind, &name[..length]) {
+        0
+    } else {
+        LINUX_EIO
+    }
+}
+
 /// The number the current domain wrote to `/proc/sys` value `index`, if any.
 fn linux_proc_sysctl_override(index: usize) -> Option<i64> {
     let slot = current_container_slot()?;
@@ -27166,6 +27344,30 @@ fn linux_pipe_max_size() -> u64 {
 
 /// Writes a `/proc/sys` value: a number in Linux's integer syntax, from a
 /// process with root's effective user id, as Linux wants CAP_SYS_ADMIN.
+/// A write of /proc/sys/kernel/domainname: the name up to a newline, as
+/// setdomainname sets it, by root.
+fn linux_proc_domainname_write(device: u16, address: u64, count: u64) -> u64 {
+    if device & 3 & LINUX_DESCRIPTOR_OUTPUT == 0 {
+        return LINUX_EBADF;
+    }
+    if current_linux_credentials().is_none_or(|credentials| credentials.user.effective != 0) {
+        return LINUX_EACCES;
+    }
+    let mut text = [0_u8; LINUX_UTS_NAME_CAPACITY + 1];
+    let length = usize::try_from(count).map_or(text.len(), |count| count.min(text.len()));
+    if !copy_from_linux_user(address, &mut text[..length]) {
+        return LINUX_EFAULT;
+    }
+    let name = text[..length]
+        .split(|byte| *byte == b'\n' || *byte == 0)
+        .next()
+        .unwrap_or_default();
+    if name.len() > LINUX_UTS_NAME_CAPACITY || !linux_uts_set(LINUX_UTS_DOMAIN, name) {
+        return LINUX_EINVAL;
+    }
+    count
+}
+
 fn linux_proc_sysctl_write(device: u16, index: usize, address: u64, count: u64) -> u64 {
     if device & 3 & LINUX_DESCRIPTOR_OUTPUT == 0 {
         return LINUX_EBADF;
@@ -30949,6 +31151,9 @@ fn linux_openat_path(
     let mut tmp_handle = None;
     let mut tmp_created = false;
     let mut overlay_handle = None;
+    // Whether this open makes the file (F_CREATED_QUERY): a copy-up of an
+    // image file is not a creation.
+    let mut created = false;
     let mut rootfs_handle = 0;
     let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
     let mut canonical_length = if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
@@ -31154,6 +31359,7 @@ fn linux_openat_path(
             return LINUX_ENOSPC;
         };
         overlay_handle = Some(handle);
+        created = rootfs_at_path.is_none();
     } else if canonical_length.is_some()
         && flags & LINUX_O_CREAT != 0
         && !tmp_path
@@ -31172,6 +31378,7 @@ fn linux_openat_path(
             return LINUX_ENOSPC;
         };
         overlay_handle = Some(handle);
+        created = true;
     }
     let kind = if let Some(handle) = overlay_handle {
         match crate::linux_overlay::metadata(handle).map(|metadata| metadata.kind) {
@@ -31322,6 +31529,7 @@ fn linux_openat_path(
         X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index].store(descriptor_flags, Ordering::SeqCst);
     }
     set_linux_descriptor_close_on_exec(descriptor, flags & LINUX_O_CLOEXEC != 0);
+    reset_linux_descriptor_flags(descriptor, created);
     let initial_offset = if flags & LINUX_O_APPEND != 0 {
         overlay_handle
             .and_then(crate::linux_overlay::metadata)
@@ -36296,6 +36504,31 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
     if linux_secret_descriptor(descriptor) {
         return LINUX_EINVAL;
     }
+    // /proc/sys/kernel/domainname reads the domain's name (splice06).
+    if linux_proc_sysctl_index(state)
+        .is_some_and(|index| LINUX_PROC_SYSCTLS[index].1 == b"sys/kernel/domainname")
+    {
+        let mut name = [0_u8; LINUX_UTS_NAME_CAPACITY];
+        let length = linux_uts_name(LINUX_UTS_DOMAIN, &mut name);
+        let mut file = [0_u8; LINUX_UTS_NAME_CAPACITY + 1];
+        file[..length].copy_from_slice(&name[..length]);
+        file[length] = b'\n';
+        let file = &file[..=length];
+        let Ok(start) = usize::try_from(offset) else {
+            return 0;
+        };
+        if start >= file.len() || count == 0 {
+            return 0;
+        }
+        let end = start
+            .saturating_add(usize::try_from(count).unwrap_or(usize::MAX))
+            .min(file.len());
+        return if copy_to_linux_user(address, &file[start..end]) {
+            (end - start) as u64
+        } else {
+            LINUX_EFAULT
+        };
+    }
     // A /proc/sys value the domain wrote reads back as that number.
     if let Some(value) = linux_proc_sysctl_index(state).and_then(linux_proc_sysctl_override) {
         let mut file = [0_u8; 24];
@@ -38496,6 +38729,49 @@ fn linux_posix_timer_clock_supported(clock: u64) -> bool {
 
 /// Whether a timer's clock counts wall time, whose absolute values need
 /// converting to the monotonic clock.
+/// Timestamp-counter cycles in nanoseconds.
+fn linux_cycles_nanoseconds(cycles: u64) -> u64 {
+    let frequency = X86_RUNTIME.ELF_PROBE_CLOCK_FREQUENCY.load(Ordering::SeqCst);
+    if frequency == 0 {
+        return 0;
+    }
+    cycles / frequency * NANOSECONDS_PER_SECOND
+        + cycles % frequency * NANOSECONDS_PER_SECOND / frequency
+}
+
+/// The CPU time the current process's threads have used, the running one's
+/// current interval included: each thread's charged time only grows, where
+/// the process's running interval is marked once per runtime and moves
+/// with every CPU that takes one of its threads up.
+fn linux_current_process_cpu_cycles() -> u64 {
+    (0..LINUX_THREAD_LIMIT)
+        .filter(|slot| {
+            X86_RUNTIME.LINUX_THREAD_STATES[*slot].load(Ordering::Relaxed) != LINUX_THREAD_FREE
+        })
+        .map(linux_thread_cpu_cycles)
+        .fold(0_u64, u64::saturating_add)
+}
+
+fn linux_current_process_cpu_nanoseconds() -> u64 {
+    linux_cycles_nanoseconds(linux_current_process_cpu_cycles())
+}
+
+fn linux_current_thread_cpu_nanoseconds() -> u64 {
+    linux_cycles_nanoseconds(current_linux_thread_slot().map_or(0, linux_thread_cpu_cycles))
+}
+
+/// "Now" on a POSIX timer's clock: CPU nanoseconds for a CPU clock (the
+/// thread's for a thread clock), else the monotonic clock.
+fn linux_posix_timer_now(clock: u32) -> Option<u64> {
+    if linux_process::posix_clock_is_thread_cpu(clock) {
+        Some(linux_current_thread_cpu_nanoseconds())
+    } else if linux_process::posix_clock_is_cpu(clock) {
+        Some(linux_current_process_cpu_nanoseconds())
+    } else {
+        linux_elapsed_nanoseconds()
+    }
+}
+
 fn linux_posix_timer_clock_is_wall(clock: u32) -> bool {
     matches!(
         u64::from(clock),
@@ -38628,7 +38904,7 @@ fn linux_timer_settime(timer: u64, flags: u64, new_address: u64, old_address: u6
     let Some(value) = linux_timespec_nanoseconds(&specification[16..]) else {
         return LINUX_EINVAL;
     };
-    let Some(now) = linux_elapsed_nanoseconds() else {
+    let Some(now) = linux_posix_timer_now(current.clock) else {
         return LINUX_ENOSYS;
     };
     let old = linux_timer_specification(current.interval, current.deadline, now);
@@ -38681,7 +38957,7 @@ fn linux_timer_gettime(timer: u64, address: u64) -> u64 {
     let Some(current) = linux_process::posix_timer(pid, timer as u32) else {
         return LINUX_EINVAL;
     };
-    let Some(now) = linux_elapsed_nanoseconds() else {
+    let Some(now) = linux_posix_timer_now(current.clock) else {
         return LINUX_ENOSYS;
     };
     let specification = linux_timer_specification(current.interval, current.deadline, now);
@@ -38736,7 +39012,10 @@ pub(super) fn refresh_linux_posix_timers() -> bool {
     let pending = X86_RUNTIME.ELF_PROBE_PENDING_SIGNALS.load(Ordering::SeqCst)
         | linux_dynamic_pending_masks().map_or(0, |(process, thread)| process | thread);
     let mut expiries = [linux_process::PosixTimerExpiry::NONE; linux_process::POSIX_TIMER_LIMIT];
-    let count = linux_process::expire_posix_timers(pid, now, pending, &mut expiries);
+    let cpu_now = linux_current_process_cpu_nanoseconds();
+    let thread_now = linux_current_thread_cpu_nanoseconds();
+    let count =
+        linux_process::expire_posix_timers(pid, (now, cpu_now, thread_now), pending, &mut expiries);
     let mut queued = false;
     for expiry in &expiries[..count] {
         if expiry.notify == SIGEV_NONE || expiry.signal == 0 {
@@ -39240,7 +39519,7 @@ fn linux_object_mmap(
     };
     let pages = length.div_ceil(PAGE_SIZE as u64) as usize;
     let fixed = flags & LINUX_MAP_FIXED != 0;
-    let Some(mapping) = linux_runtime_select_mapping(address, pages, fixed) else {
+    let Some(mapping) = linux_runtime_select_mapping(address, pages, fixed, false) else {
         return LINUX_ENOMEM;
     };
     if !linux_runtime_range_available(mapping, pages)
@@ -40231,6 +40510,18 @@ fn linux_epoll_ctl(epoll: u64, operation: u64, descriptor: u64, event_address: u
     if operation == LINUX_EPOLL_CTL_ADD && existing.is_some() {
         return LINUX_EEXIST;
     }
+    // An epoll instance watching another: a cycle back to this one is
+    // ELOOP, and a chain deeper than Linux's EP_MAX_NESTS (4 below the
+    // top) is EINVAL (epoll_ctl04, 05, 07).
+    if runtime && operation == LINUX_EPOLL_CTL_ADD && linux_epoll_descriptor(descriptor) {
+        let target = linux_epoll_instance(descriptor);
+        if linux_epoll_reaches(target, epoll, 0) {
+            return LINUX_ELOOP;
+        }
+        if linux_epoll_depth_below(target, 0) + linux_epoll_depth_above(epoll, 0) >= 4 {
+            return LINUX_EINVAL;
+        }
+    }
     if operation == LINUX_EPOLL_CTL_MOD && existing.is_none() {
         return LINUX_ENOENT;
     }
@@ -40368,12 +40659,70 @@ pub(super) fn linux_epoll_rearm_for_syscall(number: u64, first: u64, second: u64
 /// yet honoured (the watch stays armed): some paths that take an event can
 /// still drop it, which would leave a one-shot watch disarmed for good.
 fn linux_epoll_event(epoll: u64, consume: bool) -> Result<Option<[u8; 12]>, u64> {
+    linux_epoll_event_from(epoll, consume, 0).map(|event| event.map(|(_, event)| event))
+}
+
+/// Per epoll descriptor, the watch slot the next epoll_wait starts its scan
+/// at: ready descriptors are reported in turn when more are ready than
+/// `maxevents` (epoll_wait14).
+static LINUX_EPOLL_CURSORS: [AtomicU16; LINUX_DESCRIPTOR_TABLE_LIMIT as usize] =
+    [const { AtomicU16::new(0) }; LINUX_DESCRIPTOR_TABLE_LIMIT as usize];
+
+/// Collects up to `maximum` ready events of epoll descriptor `epoll` into
+/// the user array at `address`, as epoll_wait does: each watch at most
+/// once, starting where the last call stopped. The count, EFAULT when
+/// nothing could be written, or the instance's error.
+fn linux_epoll_collect(epoll: u64, address: u64, maximum: u64) -> Result<u64, u64> {
+    let limit = LINUX_DESCRIPTOR_TABLE_LIMIT as usize;
+    let cursor = &LINUX_EPOLL_CURSORS[(epoll as usize) % limit];
+    let start = usize::from(cursor.load(Ordering::Relaxed)) % limit;
+    let mut next = start;
+    let mut travelled = 0;
+    let mut count = 0_u64;
+    while count < maximum && travelled < limit {
+        let Some((slot, event)) = linux_epoll_event_from(epoll, true, next)? else {
+            break;
+        };
+        let distance = (slot + limit - next) % limit;
+        travelled += distance + 1;
+        if travelled > limit {
+            break;
+        }
+        if !copy_to_linux_user(address + count * 12, &event) {
+            return if count == 0 {
+                Err(LINUX_EFAULT)
+            } else {
+                Ok(count)
+            };
+        }
+        count += 1;
+        next = (slot + 1) % limit;
+    }
+    cursor.store(next as u16, Ordering::Relaxed);
+    Ok(count)
+}
+
+/// The first ready event of epoll descriptor `epoll` at or after watch slot
+/// `start`, round the table, with its slot. An EPOLLONESHOT watch reports
+/// once, then waits for EPOLL_CTL_MOD.
+fn linux_epoll_event_from(
+    epoll: u64,
+    consume: bool,
+    start: usize,
+) -> Result<Option<(usize, [u8; 12])>, u64> {
+    // A descriptor that is open but no epoll instance is EINVAL (epoll_wait03).
     if !linux_epoll_descriptor(epoll) {
-        return Err(LINUX_EBADF);
+        return Err(if linux_descriptor_open(epoll) {
+            LINUX_EINVAL
+        } else {
+            LINUX_EBADF
+        });
     }
     let epoll = linux_epoll_instance(epoll);
     let runtime = X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst);
-    for slot in 0..LINUX_DESCRIPTOR_TABLE_LIMIT as usize {
+    let limit = LINUX_DESCRIPTOR_TABLE_LIMIT as usize;
+    for step in 0..limit {
+        let slot = (start + step) % limit;
         let target = if runtime {
             if X86_RUNTIME.LINUX_RUNTIME_EPOLL_WATCH_EPOLL[slot].load(Ordering::SeqCst)
                 != epoll as u16 + 1
@@ -40423,10 +40772,67 @@ fn linux_epoll_event(epoll: u64, consume: bool) -> Result<Option<[u8; 12]>, u64>
                     .load(Ordering::SeqCst)
                     .to_ne_bytes(),
             );
-            return Ok(Some(event));
+            if consume && stored & LINUX_EPOLLONESHOT != 0 {
+                // Disarmed: the flags stay, the events are gone.
+                X86_RUNTIME.ELF_PROBE_EPOLL_EVENTS[slot].store(stored & !0xffff, Ordering::SeqCst);
+            }
+            return Ok(Some((slot, event)));
         }
     }
     Ok(None)
+}
+
+/// The epoll instances epoll instance `epoll` watches directly.
+fn linux_epoll_watched_instances(epoll: u64) -> impl Iterator<Item = u64> {
+    (0..LINUX_DESCRIPTOR_TABLE_LIMIT as usize).filter_map(move |slot| {
+        if X86_RUNTIME.LINUX_RUNTIME_EPOLL_WATCH_EPOLL[slot].load(Ordering::SeqCst)
+            != epoll as u16 + 1
+        {
+            return None;
+        }
+        let target = X86_RUNTIME.LINUX_RUNTIME_EPOLL_WATCH_TARGET[slot].load(Ordering::SeqCst);
+        let target = u64::from(target.checked_sub(1)?);
+        linux_epoll_descriptor(target).then(|| linux_epoll_instance(target))
+    })
+}
+
+/// Whether epoll instance `from` reaches `to` through the instances it
+/// watches (bounded, as Linux bounds its walk).
+fn linux_epoll_reaches(from: u64, to: u64, depth: usize) -> bool {
+    from == to
+        || depth < 8
+            && linux_epoll_watched_instances(from)
+                .any(|next| linux_epoll_reaches(next, to, depth + 1))
+}
+
+/// How many epoll levels lie below instance `epoll` (0: it watches none).
+fn linux_epoll_depth_below(epoll: u64, depth: usize) -> usize {
+    if depth >= 8 {
+        return depth;
+    }
+    linux_epoll_watched_instances(epoll)
+        .map(|next| 1 + linux_epoll_depth_below(next, depth + 1))
+        .max()
+        .unwrap_or(0)
+}
+
+/// How many epoll instances watch instance `epoll`, level over level.
+fn linux_epoll_depth_above(epoll: u64, depth: usize) -> usize {
+    if depth >= 8 {
+        return depth;
+    }
+    (0..LINUX_DESCRIPTOR_TABLE_LIMIT as usize)
+        .filter_map(|slot| {
+            let target = X86_RUNTIME.LINUX_RUNTIME_EPOLL_WATCH_TARGET[slot].load(Ordering::SeqCst);
+            let owner = X86_RUNTIME.LINUX_RUNTIME_EPOLL_WATCH_EPOLL[slot].load(Ordering::SeqCst);
+            let target = u64::from(target.checked_sub(1)?);
+            let owner = u64::from(owner.checked_sub(1)?);
+            (linux_epoll_descriptor(target) && linux_epoll_instance(target) == epoll)
+                .then_some(owner)
+        })
+        .map(|owner| 1 + linux_epoll_depth_above(owner, depth + 1))
+        .max()
+        .unwrap_or(0)
 }
 
 /// The descriptor that owns an epoll instance's watches: the descriptor
@@ -40531,18 +40937,13 @@ fn complete_linux_epoll_wait(slot: usize, timed_out: bool) -> bool {
     {
         return false;
     }
-    let epoll = X86_RUNTIME.LINUX_THREAD_WAIT_OUTPUTS[slot].load(Ordering::SeqCst);
-    let event = linux_epoll_event(epoll, true);
-    if matches!(event, Ok(None)) && !timed_out {
+    let output = X86_RUNTIME.LINUX_THREAD_WAIT_OUTPUTS[slot].load(Ordering::SeqCst);
+    let (epoll, maximum) = (output & u64::from(u32::MAX), (output >> 32).max(1));
+    if matches!(linux_epoll_event(epoll, false), Ok(None)) && !timed_out {
         return false;
     }
     let address = X86_RUNTIME.LINUX_THREAD_WAIT_KEYS[slot].load(Ordering::SeqCst);
-    let result = match event {
-        Ok(Some(event)) if copy_to_linux_user(address, &event) => 1,
-        Ok(Some(_)) => LINUX_EFAULT,
-        Ok(None) => 0,
-        Err(error) => error,
-    };
+    let result = linux_epoll_collect(epoll, address, maximum).unwrap_or_else(|error| error);
     X86_RUNTIME.LINUX_THREAD_RAXS[slot].store(result, Ordering::SeqCst);
     X86_RUNTIME.LINUX_THREAD_WAIT_KINDS[slot].store(LINUX_THREAD_WAIT_NONE, Ordering::SeqCst);
     X86_RUNTIME.LINUX_THREAD_WAIT_KEYS[slot].store(0, Ordering::SeqCst);
@@ -40795,16 +41196,10 @@ fn linux_epoll_wait_duration_live_return(
         maximum: maximum as u64,
         ..input
     };
-    match linux_epoll_event(input.epoll, true) {
-        Ok(Some(event)) => {
-            return if copy_to_linux_user(input.address, &event) {
-                1
-            } else {
-                LINUX_EFAULT
-            };
-        }
-        Ok(None) if duration == Some(0) => return 0,
-        Ok(None) => {}
+    match linux_epoll_collect(input.epoll, input.address, input.maximum) {
+        Ok(0) if duration == Some(0) => return 0,
+        Ok(0) => {}
+        Ok(count) => return count,
         Err(error) => return error,
     }
     if !linux_writable_user_range_contains(input.address, 12) {
@@ -40861,15 +41256,9 @@ fn linux_epoll_wait_duration_live_return(
                             continued_deadline = Some(deadline.unwrap_or(0));
                             break 'target target;
                         }
-                        match linux_epoll_event(input.epoll, true) {
-                            Ok(Some(event)) => {
-                                return if copy_to_linux_user(input.address, &event) {
-                                    1
-                                } else {
-                                    LINUX_EFAULT
-                                };
-                            }
-                            Ok(None) => {}
+                        match linux_epoll_collect(input.epoll, input.address, input.maximum) {
+                            Ok(0) => {}
+                            Ok(count) => return count,
                             Err(error) => return error,
                         }
                     }
@@ -40887,17 +41276,8 @@ fn linux_epoll_wait_duration_live_return(
                 if X86_RUNTIME.LINUX_RUNTIME_SUSPENDED.load(Ordering::Acquire) {
                     return LINUX_RETURN_TO_KERNEL;
                 }
-                let result = match linux_epoll_event(input.epoll, true) {
-                    Ok(Some(event)) => {
-                        if copy_to_linux_user(input.address, &event) {
-                            1
-                        } else {
-                            LINUX_EFAULT
-                        }
-                    }
-                    Ok(None) => 0,
-                    Err(error) => error,
-                };
+                let result = linux_epoll_collect(input.epoll, input.address, input.maximum)
+                    .unwrap_or_else(|error| error);
                 if !restore_linux_process_live_return(output, parent_pid) {
                     return LINUX_EINVAL;
                 }
@@ -40943,7 +41323,12 @@ fn linux_epoll_wait_duration_live_return(
     };
     let slot = usize::from(current.slot);
     if !save_linux_thread_return_context(current, caller)
-        || !block_current_linux_thread(wait_kind, input.address, input.epoll, deadline)
+        || !block_current_linux_thread(
+            wait_kind,
+            input.address,
+            input.epoll | input.maximum.min(u64::from(u32::MAX)) << 32,
+            deadline,
+        )
     {
         return LINUX_EINVAL;
     }
@@ -42314,6 +42699,9 @@ fn linux_descriptor_write(descriptor: u64, address: u64, count: u64) -> u64 {
         return linux_proc_oom_score_adj_write(descriptor, device, address, count);
     }
     if let Some(index) = linux_proc_sysctl_index(device) {
+        if LINUX_PROC_SYSCTLS[index].1 == b"sys/kernel/domainname" {
+            return linux_proc_domainname_write(device, address, count);
+        }
         return linux_proc_sysctl_write(device, index, address, count);
     }
     if device & !3 == LINUX_FILE_PROC_SYSRQ_TRIGGER {
@@ -44228,6 +44616,98 @@ fn linux_descriptor_close_on_exec(descriptor: u64) -> bool {
     X86_RUNTIME.ELF_PROBE_CONSOLE_CLOEXEC[word].load(Ordering::SeqCst) & mask != 0
 }
 
+/// One bit per descriptor in `table`, as the close-on-exec bits are kept.
+fn linux_descriptor_flag(
+    table: &[CpuBankedAtomicU64; LINUX_DESCRIPTOR_FLAG_WORD_COUNT],
+    descriptor: u64,
+) -> bool {
+    if descriptor >= LINUX_DESCRIPTOR_TABLE_LIMIT {
+        return false;
+    }
+    let word = descriptor as usize / u64::BITS as usize;
+    let mask = 1_u64 << (descriptor % u64::BITS as u64);
+    table[word].load(Ordering::SeqCst) & mask != 0
+}
+
+fn set_linux_descriptor_flag(
+    table: &[CpuBankedAtomicU64; LINUX_DESCRIPTOR_FLAG_WORD_COUNT],
+    descriptor: u64,
+    enabled: bool,
+) {
+    if descriptor >= LINUX_DESCRIPTOR_TABLE_LIMIT {
+        return;
+    }
+    let word = descriptor as usize / u64::BITS as usize;
+    let mask = 1_u64 << (descriptor % u64::BITS as u64);
+    if enabled {
+        table[word].fetch_or(mask, Ordering::SeqCst);
+    } else {
+        table[word].fetch_and(!mask, Ordering::SeqCst);
+    }
+}
+
+/// A descriptor number taken for a new open file: nothing of an earlier
+/// use is kept for it.
+fn reset_linux_descriptor_flags(descriptor: u64, created: bool) {
+    set_linux_descriptor_flag(
+        &X86_RUNTIME.ELF_PROBE_DESCRIPTOR_CREATED,
+        descriptor,
+        created,
+    );
+    set_linux_descriptor_flag(
+        &X86_RUNTIME.ELF_PROBE_DESCRIPTOR_READ_LEASES,
+        descriptor,
+        false,
+    );
+    set_linux_descriptor_flag(
+        &X86_RUNTIME.ELF_PROBE_DESCRIPTOR_WRITE_LEASES,
+        descriptor,
+        false,
+    );
+}
+
+/// F_SETLEASE on a regular file: a read lease needs the file open for
+/// reading only (EAGAIN), as a writer anywhere forbids one in Linux. Leases
+/// are kept per descriptor and never broken: no other opener is told.
+fn linux_fcntl_set_lease(descriptor: u64, kind: u64) -> u64 {
+    const F_RDLCK: u64 = 0;
+    const F_WRLCK: u64 = 1;
+    const F_UNLCK: u64 = 2;
+    let (read, write) = match u64::from(kind as u32) {
+        F_RDLCK => {
+            if linux_device_descriptor(descriptor) & LINUX_DESCRIPTOR_OUTPUT != 0 {
+                return LINUX_EAGAIN;
+            }
+            (true, false)
+        }
+        F_WRLCK => (false, true),
+        F_UNLCK => (false, false),
+        _ => return LINUX_EINVAL,
+    };
+    set_linux_descriptor_flag(
+        &X86_RUNTIME.ELF_PROBE_DESCRIPTOR_READ_LEASES,
+        descriptor,
+        read,
+    );
+    set_linux_descriptor_flag(
+        &X86_RUNTIME.ELF_PROBE_DESCRIPTOR_WRITE_LEASES,
+        descriptor,
+        write,
+    );
+    0
+}
+
+/// F_GETLEASE: F_RDLCK, F_WRLCK or F_UNLCK.
+fn linux_fcntl_get_lease(descriptor: u64) -> u64 {
+    if linux_descriptor_flag(&X86_RUNTIME.ELF_PROBE_DESCRIPTOR_READ_LEASES, descriptor) {
+        0
+    } else if linux_descriptor_flag(&X86_RUNTIME.ELF_PROBE_DESCRIPTOR_WRITE_LEASES, descriptor) {
+        1
+    } else {
+        2
+    }
+}
+
 fn set_linux_descriptor_close_on_exec(descriptor: u64, enabled: bool) {
     if descriptor >= LINUX_DESCRIPTOR_TABLE_LIMIT {
         return;
@@ -44357,6 +44837,15 @@ fn linux_descriptor_close_with_wake(descriptor: u64, wake_waiters: bool) -> u64 
             if let Some(file) = linux_record_lock_file(descriptor) {
                 crate::linux_record_lock::release(owner, file);
             }
+        }
+    }
+    // The last descriptor of the description to close drops its flock lock.
+    if let Some(description) = linux_descriptor_open_file_id(descriptor) {
+        let shared = (0..LINUX_DESCRIPTOR_TABLE_LIMIT).any(|other| {
+            other != descriptor && linux_descriptor_open_file_id(other) == Some(description)
+        });
+        if !shared {
+            crate::linux_record_lock::flock_release(description);
         }
     }
     let result = linux_descriptor_close_with_wake_inner(descriptor, wake_waiters);
@@ -45016,6 +45505,10 @@ fn linux_descriptor_fcntl(descriptor: u64, command: u64, argument: u64) -> u64 {
                 }),
             LINUX_F_SETPIPE_SZ if state & LINUX_DEVICE_PIPE != 0 => {
                 let requested = u64::from(argument as u32);
+                // A size past 1 << 31 is not a size (fcntl37).
+                if requested > 1 << 31 {
+                    return LINUX_EINVAL;
+                }
                 if requested > linux_pipe_max_size()
                     && !current_linux_credentials().is_some_and(|value| value.user.effective == 0)
                 {
@@ -45115,6 +45608,13 @@ fn linux_descriptor_fcntl(descriptor: u64, command: u64, argument: u64) -> u64 {
         LINUX_F_GETLK | LINUX_F_OFD_GETLK | LINUX_F_SETLK | LINUX_F_SETLKW | LINUX_F_OFD_SETLK
         | LINUX_F_OFD_SETLKW => linux_fcntl_lock(descriptor, command, argument),
         LINUX_F_ADD_SEALS | LINUX_F_GET_SEALS => linux_memfd_fcntl(descriptor, command, argument),
+        // Whether this descriptor's open created the file (fcntl40).
+        LINUX_F_CREATED_QUERY => u64::from(linux_descriptor_flag(
+            &X86_RUNTIME.ELF_PROBE_DESCRIPTOR_CREATED,
+            descriptor,
+        )),
+        LINUX_F_SETLEASE => linux_fcntl_set_lease(descriptor, argument),
+        LINUX_F_GETLEASE => linux_fcntl_get_lease(descriptor),
         LINUX_F_GETFL => {
             u64::from((state & 3) - 1)
                 | u64::from(
@@ -45141,17 +45641,82 @@ fn linux_flock(descriptor: u64, operation: u64) -> u64 {
     const LOCK_UNLOCK: u64 = 8;
     let descriptor = u64::from(descriptor as u32);
     let operation = u64::from(operation as u32);
-    // Processes in a domain run one at a time, so the lock itself is not
-    // tracked yet; the operation still has to be valid.
     if !linux_descriptor_open(descriptor) {
-        LINUX_EBADF
-    } else if matches!(
-        operation & !LOCK_NONBLOCKING,
-        LOCK_SHARED | LOCK_EXCLUSIVE | LOCK_UNLOCK
-    ) {
-        0
-    } else {
-        LINUX_EINVAL
+        return LINUX_EBADF;
+    }
+    let kind = operation & !LOCK_NONBLOCKING;
+    if !matches!(kind, LOCK_SHARED | LOCK_EXCLUSIVE | LOCK_UNLOCK) {
+        return LINUX_EINVAL;
+    }
+    // The open file description holds the lock; a descriptor without an
+    // open-file id stands for its own.
+    let description = linux_descriptor_open_file_id(descriptor).unwrap_or(1 << 63 | descriptor);
+    let holder = (current_linux_process_pid(), description);
+    if kind == LOCK_UNLOCK {
+        crate::linux_record_lock::flock_release(description);
+        return 0;
+    }
+    // A pipe or socket has no device and inode: the descriptor stands in.
+    let file = linux_record_lock_file(descriptor).unwrap_or((u64::MAX, descriptor));
+    match crate::linux_record_lock::flock_set(file, holder, kind == LOCK_EXCLUSIVE, |pid| {
+        linux_process::live_process_status(pid).is_some()
+    }) {
+        Ok(()) => 0,
+        // EWOULDBLOCK, for the caller to wait on unless LOCK_NB.
+        Err(crate::linux_record_lock::FlockError::Conflict) => LINUX_EAGAIN,
+        Err(crate::linux_record_lock::FlockError::NoMemory) => LINUX_ENOMEM,
+    }
+}
+
+/// flock(2): one attempt, and without LOCK_NB a wait for the holder to let
+/// go, as F_SETLKW waits: a signal interrupts it (EINTR, flock07).
+fn linux_flock_live_return(
+    output: *mut LinuxSyscallFrame,
+    caller: LinuxUserContext,
+    descriptor: u64,
+    operation: u64,
+) -> u64 {
+    const LOCK_NONBLOCKING: u64 = 4;
+    loop {
+        let result = linux_flock(descriptor, operation);
+        if result != LINUX_EAGAIN || u64::from(operation as u32) & LOCK_NONBLOCKING != 0 {
+            return result;
+        }
+        if linux_light_thread_here().is_some() {
+            if let (Some(current), Some(deadline)) = (
+                current_linux_thread_handle(),
+                linux_elapsed_nanoseconds().map(|now| now.saturating_add(1_000_000)),
+            ) {
+                let mut restart = caller;
+                restart.rip = caller.rip.wrapping_sub(LINUX_SYSCALL_INSTRUCTION_SIZE);
+                restart.rax = LINUX_FLOCK_SYSCALL;
+                if save_linux_thread_return_context(current, restart)
+                    && block_current_linux_thread(
+                        LINUX_THREAD_WAIT_RETRY,
+                        LINUX_FLOCK_SYSCALL,
+                        0,
+                        deadline,
+                    )
+                {
+                    return LINUX_RETURN_TO_KERNEL;
+                }
+            }
+        }
+        match run_other_linux_processes(output, caller, LINUX_FLOCK_SYSCALL) {
+            Some(LinuxBlockedWait::Recheck) => {}
+            Some(LinuxBlockedWait::Return(result)) => return result,
+            None => match ready_linux_thread_handle() {
+                Some(target) => {
+                    return linux_retry_after_thread_live_return(
+                        output,
+                        caller,
+                        LINUX_FLOCK_SYSCALL,
+                        target,
+                    )
+                }
+                None => linux_wait_for_interrupt(),
+            },
+        }
     }
 }
 
@@ -47768,7 +48333,7 @@ fn linux_framebuffer_mmap(
     }
     let pages = length.div_ceil(PAGE_SIZE as u64) as usize;
     let fixed = flags & LINUX_MAP_FIXED != 0;
-    let Some(mapping) = linux_runtime_select_mapping(address, pages, fixed) else {
+    let Some(mapping) = linux_runtime_select_mapping(address, pages, fixed, false) else {
         return LINUX_ENOMEM;
     };
     if !linux_runtime_range_available(mapping, pages)

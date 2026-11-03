@@ -1136,6 +1136,19 @@ pub(super) fn linux_executable_user_address(address: u64) -> bool {
     address_space::current_linux_address_executable(address)
 }
 
+/// The restorer a handler returns through: its own when that is code the
+/// process can run, else the vDSO's rt_sigreturn trampoline. Linux would
+/// fail the frame without SA_RESTORER; LTP's raw rt_sigaction under musl
+/// passes a restorer read back from libc's sigaction, which musl leaves
+/// unset (rt_sigaction01, rt_sigprocmask01, rt_sigsuspend01).
+pub(super) fn linux_effective_signal_restorer(restorer: u64) -> u64 {
+    if linux_executable_user_address(restorer) {
+        restorer
+    } else {
+        crate::linux_elf::vdso_sigreturn_entry().unwrap_or(restorer)
+    }
+}
+
 pub(super) fn linux_signal_action_deliverable(handler: u64, flags: u64, restorer: u64) -> bool {
     // A blocking call interrupted for an SA_RESTART handler restarts after
     // it (linux_deliver_pending_signal_restarting). SA_NOCLDSTOP and
@@ -1150,7 +1163,6 @@ pub(super) fn linux_signal_action_deliverable(handler: u64, flags: u64, restorer
         | LINUX_SA_NOCLDSTOP
         | LINUX_SA_NOCLDWAIT;
     handler > 1
-        && flags & LINUX_SA_RESTORER != 0
         && flags & !supported == 0
         && linux_executable_user_address(handler)
         && linux_executable_user_address(restorer)
@@ -1785,7 +1797,9 @@ pub(super) fn linux_kill_current(
         return LINUX_ENOSYS;
     }
     let flags = X86_RUNTIME.ELF_PROBE_SIGNAL_FLAGS[index].load(Ordering::SeqCst);
-    let restorer = X86_RUNTIME.ELF_PROBE_SIGNAL_RESTORERS[index].load(Ordering::SeqCst);
+    let restorer = linux_effective_signal_restorer(
+        X86_RUNTIME.ELF_PROBE_SIGNAL_RESTORERS[index].load(Ordering::SeqCst),
+    );
     if !linux_signal_action_deliverable(handler, flags, restorer) {
         // A handler whose frame cannot be made (no executable restorer: LTP
         // under musl reads one back from a libc sigaction, which musl does
@@ -1966,7 +1980,9 @@ pub(super) fn linux_deliver_signal_to_blocked_wait(
         return 0;
     }
     let flags = X86_RUNTIME.ELF_PROBE_SIGNAL_FLAGS[index].load(Ordering::SeqCst);
-    let restorer = X86_RUNTIME.ELF_PROBE_SIGNAL_RESTORERS[index].load(Ordering::SeqCst);
+    let restorer = linux_effective_signal_restorer(
+        X86_RUNTIME.ELF_PROBE_SIGNAL_RESTORERS[index].load(Ordering::SeqCst),
+    );
     if handler == 0 || !linux_signal_action_deliverable(handler, flags, restorer) {
         return LINUX_ENOSYS;
     }
@@ -2692,7 +2708,9 @@ pub(super) fn deliver_linux_sigsegv(
     let index = LINUX_SIGSEGV as usize - 1;
     let handler = X86_RUNTIME.ELF_PROBE_SIGNAL_HANDLERS[index].load(Ordering::SeqCst);
     let flags = X86_RUNTIME.ELF_PROBE_SIGNAL_FLAGS[index].load(Ordering::SeqCst);
-    let restorer = X86_RUNTIME.ELF_PROBE_SIGNAL_RESTORERS[index].load(Ordering::SeqCst);
+    let restorer = linux_effective_signal_restorer(
+        X86_RUNTIME.ELF_PROBE_SIGNAL_RESTORERS[index].load(Ordering::SeqCst),
+    );
     if !linux_signal_action_deliverable(handler, flags, restorer) {
         return false;
     }
