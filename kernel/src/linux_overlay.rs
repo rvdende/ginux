@@ -3,11 +3,15 @@ use crate::{
     control_abi,
     memory::{self, FrameLease, FrameOwner},
 };
-use alloc::collections::BTreeMap;
+use alloc::{collections::BTreeMap, vec::Vec};
 use core::cell::UnsafeCell;
 
 const PAGE_SIZE: usize = 4096;
-pub(crate) const PATH_CAPACITY: usize = 256;
+/// Room for a canonical path: Linux's PATH_MAX, so every path a single
+/// argument can name fits (shorter by the terminating NUL), however deep.
+pub(crate) const PATH_CAPACITY: usize = 4096;
+/// NAME_MAX: the longest name a directory entry can have.
+pub(crate) const NAME_MAX: usize = 255;
 const NODE_COUNT: usize = 9;
 const MAPPING_COUNT: usize = 100;
 const DATA_CAPACITY: usize = PAGE_SIZE - core::mem::size_of::<FrameLease>();
@@ -65,7 +69,7 @@ pub(crate) struct Child {
     pub(crate) next_cursor: usize,
     pub(crate) metadata: Metadata,
     name_length: usize,
-    name: [u8; PATH_CAPACITY],
+    name: [u8; NAME_MAX],
 }
 
 impl Child {
@@ -160,7 +164,6 @@ enum Origin {
     Temporary { linkable: bool },
 }
 
-#[derive(Clone, Copy)]
 struct Node {
     active: bool,
     linked: bool,
@@ -168,7 +171,6 @@ struct Node {
     origin: Origin,
     data: Data,
     kind: NodeKind,
-    path_length: u16,
     mode: u32,
     owner: u32,
     group: u32,
@@ -197,7 +199,9 @@ struct Node {
     atime: (i64, i64),
     mtime: (i64, i64),
     ctime: (i64, i64),
-    path: [u8; PATH_CAPACITY],
+    /// The node's canonical path, on the kernel heap at its own length
+    /// (most are short; a deep one may be up to `PATH_CAPACITY - 1`).
+    path: Vec<u8>,
 }
 
 impl Node {
@@ -212,7 +216,6 @@ impl Node {
         origin: Origin::Named,
         data: Data::Chain,
         kind: NodeKind::File,
-        path_length: 0,
         mode: 0,
         owner: 0,
         group: 0,
@@ -236,11 +239,11 @@ impl Node {
         atime: (0, 0),
         mtime: (0, 0),
         ctime: (0, 0),
-        path: [0; PATH_CAPACITY],
+        path: Vec::new(),
     };
 
     fn path(&self) -> &[u8] {
-        &self.path[..usize::from(self.path_length)]
+        &self.path
     }
 
     fn metadata(&self) -> Metadata {
@@ -647,6 +650,7 @@ pub(crate) fn link_unnamed(path: &[u8], handle: Handle) -> Result<(), LinkError>
         Origin::Temporary { linkable: true } if !node.linked => {}
         _ => return Err(LinkError::Gone),
     }
+    let stored = stored_path(path).ok_or(LinkError::Failed)?;
     // A whiteout of the same name hides the image's entry; the file takes
     // its place by taking over the name.
     if hidden(path) {
@@ -656,9 +660,7 @@ pub(crate) fn link_unnamed(path: &[u8], handle: Handle) -> Result<(), LinkError>
     }
     let node = node_mut(handle).ok_or(LinkError::Gone)?;
     note_path(path);
-    node.path = [0; PATH_CAPACITY];
-    node.path[..path.len()].copy_from_slice(path);
-    node.path_length = path.len() as u16;
+    node.path = stored;
     node.linked = true;
     node.links = 1;
     // Named once, it is an ordinary file (Linux clears I_LINKABLE).
@@ -776,7 +778,7 @@ fn make_node_paged(node: &mut Node) -> bool {
     let mut paged = Node {
         first_page: FrameLease::EMPTY,
         data: Data::Paged,
-        ..*node
+        ..Node::EMPTY
     };
     let mut buffer = [0_u8; PAGE_SIZE];
     for index in 0..node.size.div_ceil(PAGE_SIZE) {
@@ -843,15 +845,16 @@ pub(crate) fn copy_path(handle: Handle, output: &mut [u8]) -> Option<usize> {
 /// has a node for the directory itself: files created in a directory of the
 /// image are overlay nodes below the image's directory.
 pub(crate) fn next_child_at(directory: &[u8], cursor: usize) -> Option<Option<Child>> {
-    let mut parent = [0_u8; PATH_CAPACITY + 1];
-    parent
-        .get_mut(..directory.len())?
-        .copy_from_slice(directory);
-    let mut prefix_length = directory.len();
-    if prefix_length != 0 {
-        parent[prefix_length] = b'/';
-        prefix_length += 1;
-    }
+    // A child's path is the directory's, a slash (none below the root),
+    // then its name.
+    let name_below = |path: &'static [u8]| {
+        let rest = path.strip_prefix(directory)?;
+        if directory.is_empty() {
+            Some(rest)
+        } else {
+            rest.strip_prefix(b"/")
+        }
+    };
     // The cursor is a node slot's place among all slots, which stays put
     // while nodes come and go (pages are only appended): unlinking the
     // entries already read, as `rm -r` does between reads, moves none of
@@ -871,14 +874,14 @@ pub(crate) fn next_child_at(directory: &[u8], cursor: usize) -> Option<Option<Ch
             if place < cursor || !node.active || !node.linked || node.whiteout {
                 continue;
             }
-            let Some(remainder) = node.path().strip_prefix(&parent[..prefix_length]) else {
+            let Some(remainder) = name_below(node.path()) else {
                 continue;
             };
             if remainder.is_empty() || remainder.contains(&b'/') {
                 continue;
             }
-            let mut name = [0_u8; PATH_CAPACITY];
-            name[..remainder.len()].copy_from_slice(remainder);
+            let mut name = [0_u8; NAME_MAX];
+            name.get_mut(..remainder.len())?.copy_from_slice(remainder);
             let metadata = match node.alias_of {
                 Some(file) => metadata(file)?,
                 None => node.metadata(),
@@ -951,6 +954,7 @@ fn create(path: &[u8], kind: NodeKind, mode: u32, initial: &[u8]) -> Option<Hand
         return None;
     }
     let replace_whiteout = hidden(path);
+    let stored_path = stored_path(path)?;
     let overlay = live_mut();
     let generation = overlay.next_generation.checked_add(1)?;
     let inode = overlay.next_inode.checked_add(1)?;
@@ -959,8 +963,6 @@ fn create(path: &[u8], kind: NodeKind, mode: u32, initial: &[u8]) -> Option<Hand
     } else {
         empty_node_slot(overlay)?
     };
-    let mut stored_path = [0_u8; PATH_CAPACITY];
-    stored_path[..path.len()].copy_from_slice(path);
     let handle = Handle { generation, inode };
     // A new file belongs to its creator, or to a set-group-ID directory's
     // group.
@@ -973,7 +975,6 @@ fn create(path: &[u8], kind: NodeKind, mode: u32, initial: &[u8]) -> Option<Hand
         origin: Origin::Named,
         data: Data::Chain,
         kind,
-        path_length: path.len() as u16,
         mode: mode & 0o7777,
         owner,
         group,
@@ -1040,11 +1041,12 @@ pub(crate) fn whiteout(path: &[u8]) -> bool {
         Some(inode) => inode,
         None => return false,
     };
+    let Some(stored_path) = stored_path(path) else {
+        return false;
+    };
     let Some(node) = empty_node_slot(overlay) else {
         return false;
     };
-    let mut stored_path = [0_u8; PATH_CAPACITY];
-    stored_path[..path.len()].copy_from_slice(path);
     *node = Node {
         active: true,
         linked: true,
@@ -1052,7 +1054,6 @@ pub(crate) fn whiteout(path: &[u8]) -> bool {
         origin: Origin::Named,
         data: Data::Chain,
         kind: NodeKind::File,
-        path_length: path.len() as u16,
         mode: 0,
         owner: 0,
         group: 0,
@@ -1441,46 +1442,37 @@ pub(crate) fn rename(handle: Handle, path: &[u8]) -> bool {
     if valid_path(path).is_none() || lookup(path).is_some() {
         return false;
     }
-    let Some(source) = node(handle) else {
+    let Some(source) = node(handle).filter(|source| source.linked) else {
         return false;
     };
-    if !source.linked {
-        return false;
-    }
-    let mut old_path = [0_u8; PATH_CAPACITY];
-    let old_length = source.path().len();
-    old_path[..old_length].copy_from_slice(source.path());
     let directory = source.kind == NodeKind::Directory;
+    let Some(old_path) = stored_path(source.path()) else {
+        return false;
+    };
     let Some(overlay) = live() else {
         return false;
     };
-    let valid = for_each_node(overlay, |candidate| {
-        if !candidate.linked
-            || candidate.handle == handle
-            || !directory
-            || !candidate.path().starts_with(&old_path[..old_length])
-            || candidate.path().get(old_length) != Some(&b'/')
-        {
-            return None;
+    // Every new path is made, and checked free, before any node moves, so
+    // a taken name or a short heap leaves everything as it was.
+    let mut new_paths = Vec::new();
+    let failed = for_each_node(overlay, |candidate| {
+        let suffix = renamed_suffix(candidate, handle, &old_path, directory)?;
+        let new_path = stored_joined(&[path, suffix])
+            .filter(|new_path| new_path.len() < PATH_CAPACITY)
+            .filter(|new_path| suffix.is_empty() || lookup(new_path).is_none());
+        match new_path {
+            Some(new_path) if new_paths.try_reserve(1).is_ok() => {
+                new_paths.push(new_path);
+                None
+            }
+            _ => Some(()),
         }
-        let suffix = &candidate.path()[old_length..];
-        let Some(new_length) = path.len().checked_add(suffix.len()) else {
-            return Some(false);
-        };
-        if new_length >= PATH_CAPACITY {
-            return Some(false);
-        }
-        let mut destination = [0_u8; PATH_CAPACITY];
-        destination[..path.len()].copy_from_slice(path);
-        destination[path.len()..new_length].copy_from_slice(suffix);
-        if lookup(&destination[..new_length]).is_some() {
-            return Some(false);
-        }
-        None
     });
-    if valid == Some(false) {
+    if failed.is_some() {
         return false;
     }
+    // The same walk in the same order, now moving each node.
+    let mut new_paths = new_paths.into_iter();
     let overlay = live_mut();
     let mut page = overlay.first_node_page;
     while page != FrameLease::EMPTY {
@@ -1488,30 +1480,37 @@ pub(crate) fn rename(handle: Handle, path: &[u8]) -> bool {
             return false;
         };
         for candidate in &mut nodes.nodes {
-            if !candidate.active || !candidate.linked {
+            if renamed_suffix(candidate, handle, &old_path, directory).is_none() {
                 continue;
             }
-            let suffix = if candidate.handle == handle {
-                &[][..]
-            } else if directory
-                && candidate.path().starts_with(&old_path[..old_length])
-                && candidate.path().get(old_length) == Some(&b'/')
-            {
-                &candidate.path()[old_length..]
-            } else {
-                continue;
+            let Some(new_path) = new_paths.next() else {
+                return false;
             };
-            let new_length = path.len() + suffix.len();
-            let mut destination = [0_u8; PATH_CAPACITY];
-            destination[..path.len()].copy_from_slice(path);
-            destination[path.len()..new_length].copy_from_slice(suffix);
-            note_path(&destination[..new_length]);
-            candidate.path = destination;
-            candidate.path_length = new_length as u16;
+            note_path(&new_path);
+            candidate.path = new_path;
         }
         page = nodes.next;
     }
     true
+}
+
+/// What follows `old_path` in the path of `candidate` when renaming the
+/// node `handle` (at `old_path`) moves it: empty for that node itself, the
+/// rest of the path for everything below it when it is a directory.
+fn renamed_suffix<'a>(
+    candidate: &'a Node,
+    handle: Handle,
+    old_path: &[u8],
+    directory: bool,
+) -> Option<&'a [u8]> {
+    if !candidate.active || !candidate.linked {
+        return None;
+    }
+    if candidate.handle == handle {
+        return Some(&[]);
+    }
+    let suffix = candidate.path().strip_prefix(old_path)?;
+    (directory && suffix.starts_with(b"/")).then_some(suffix)
 }
 
 /// Gives the file `target` (not a directory) another name, `path`: a hard
@@ -1528,6 +1527,9 @@ pub(crate) fn create_link(path: &[u8], target: Handle) -> bool {
     }
     let kind = file.kind;
     let replace_whiteout = hidden(path);
+    let Some(stored_path) = stored_path(path) else {
+        return false;
+    };
     let overlay = live_mut();
     let Some(generation) = overlay.next_generation.checked_add(1) else {
         return false;
@@ -1539,13 +1541,10 @@ pub(crate) fn create_link(path: &[u8], target: Handle) -> bool {
     }) else {
         return false;
     };
-    let mut stored_path = [0_u8; PATH_CAPACITY];
-    stored_path[..path.len()].copy_from_slice(path);
     *slot = Node {
         active: true,
         linked: true,
         kind,
-        path_length: path.len() as u16,
         alias_of: Some(target),
         handle: Handle {
             generation,
@@ -1581,20 +1580,22 @@ pub(crate) fn unlink_path(path: &[u8]) -> bool {
         (alias, Some(file)) => drop_alias(alias, file),
         (file, None) => {
             let alias = for_each_node(overlay, |node| {
-                (node.linked && node.alias_of == Some(file)).then_some((
-                    node.handle,
-                    node.path,
-                    node.path_length,
-                ))
+                (node.linked && node.alias_of == Some(file)).then_some(node.handle)
             });
             match alias {
-                Some((alias, alias_path, alias_length)) => {
+                Some(alias) => {
+                    // The file's node takes the alias's name (its path moves
+                    // over) and the alias goes.
+                    let Some(alias_path) =
+                        node_mut(alias).map(|node| core::mem::take(&mut node.path))
+                    else {
+                        return false;
+                    };
                     let Some(node) = node_mut(file) else {
                         return false;
                     };
-                    note_path(&alias_path[..usize::from(alias_length)]);
+                    note_path(&alias_path);
                     node.path = alias_path;
-                    node.path_length = alias_length;
                     drop_alias(alias, file)
                 }
                 None => unlink(file),
@@ -1633,14 +1634,11 @@ pub(crate) fn rename_path(from: &[u8], to: &[u8]) -> bool {
     if alias_of.is_none() {
         return rename(handle, to);
     }
-    let Some(node) = node_mut(handle) else {
+    let (Some(node), Some(stored_path)) = (node_mut(handle), stored_path(to)) else {
         return false;
     };
-    let mut stored_path = [0_u8; PATH_CAPACITY];
-    stored_path[..to.len()].copy_from_slice(to);
     note_path(to);
     node.path = stored_path;
-    node.path_length = to.len() as u16;
     true
 }
 
@@ -1760,11 +1758,30 @@ fn valid_path(path: &[u8]) -> Option<()> {
         && !path.ends_with(b"/")
         && path.split(|byte| *byte == b'/').all(|component| {
             !component.is_empty()
+                && component.len() <= NAME_MAX
                 && component != b"."
                 && component != b".."
                 && !component.contains(&0)
         }))
     .then_some(())
+}
+
+/// `path` copied to the kernel heap for a node to keep; None when the heap
+/// is out of memory.
+fn stored_path(path: &[u8]) -> Option<Vec<u8>> {
+    stored_joined(&[path])
+}
+
+/// `parts` joined into one path on the kernel heap, as `stored_path`.
+fn stored_joined(parts: &[&[u8]]) -> Option<Vec<u8>> {
+    let mut stored = Vec::new();
+    stored
+        .try_reserve_exact(parts.iter().map(|part| part.len()).sum())
+        .ok()?;
+    for part in parts {
+        stored.extend_from_slice(part);
+    }
+    Some(stored)
 }
 
 fn node_by_path_mut<'a>(_overlay: &'a mut Overlay, path: &[u8]) -> Option<&'a mut Node> {

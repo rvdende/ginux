@@ -24,7 +24,6 @@ kcmp03 TFAIL
 mmap24 TFAIL
 mount_setattr02 TBROK
 msgstress01 TBROK
-openat03 TBROK
 madvise11 TBROK
 pivot_root01 TBROK
 prot_hsymlinks TBROK

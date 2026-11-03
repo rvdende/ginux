@@ -30700,6 +30700,11 @@ fn linux_getcwd(address: u64, capacity: u64) -> u64 {
     };
     shown[length] = 0;
     let required = length + 1;
+    // Linux builds the path in a PATH_MAX buffer: one that does not fit is
+    // ENAMETOOLONG, whatever the caller's buffer.
+    if required > LINUX_PATH_MAX {
+        return LINUX_ENAMETOOLONG;
+    }
     if capacity < required as u64 {
         return LINUX_ERANGE;
     }
@@ -33528,7 +33533,13 @@ fn linux_walk_path_components(
         if *followed > LINK_LIMIT {
             return Err(LINUX_ELOOP);
         }
-        let mut target = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+        // The target is kept on the heap, at its own length: the walk
+        // recurses into it, as deep as links lead to links.
+        let mut target = Vec::new();
+        target
+            .try_reserve_exact(link.size)
+            .map_err(|_| LINUX_ENOMEM)?;
+        target.resize(link.size, 0);
         let target_length =
             crate::linux_overlay::read(link.handle, 0, &mut target).ok_or(LINUX_EIO)?;
         let base = if target[..target_length].starts_with(b"/") {
@@ -46422,21 +46433,22 @@ fn linux_fanotify_permission_check(
                 LINUX_CREAT_SYSCALL => (at, arguments[0], 0),
                 _ => (arguments[0], arguments[1], arguments[2]),
             };
-            let (mut path, length) = linux_inotify_path_at(directory, address)?;
-            let length = if flags & LINUX_O_NOFOLLOW == 0 {
-                linux_overlay_lookup_following(&mut path, length, true)
-                    .ok()?
-                    .0
+            let path = linux_inotify_path_at(directory, address)?;
+            if flags & LINUX_O_NOFOLLOW != 0 {
+                (path, FAN_OPEN_PERM)
             } else {
-                length
-            };
-            ((path, length), FAN_OPEN_PERM)
+                let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+                canonical.get_mut(..path.len())?.copy_from_slice(&path);
+                let length = linux_overlay_lookup_following(&mut canonical, path.len(), true)
+                    .ok()?
+                    .0;
+                (linux_heap_path(&canonical[..length])?, FAN_OPEN_PERM)
+            }
         }
         _ => return None,
     };
-    let (path, length) = path;
-    let object = linux_fanotify_object(&path[..length])
-        .filter(|object| mask == FAN_OPEN_PERM || !object.directory)?;
+    let object =
+        linux_fanotify_object(&path).filter(|object| mask == FAN_OPEN_PERM || !object.directory)?;
     match crate::linux_fanotify::permission(
         linux_execution_instance(),
         object,
@@ -46545,12 +46557,12 @@ fn linux_fanotify_mark(
     let length = if path_address == 0 {
         // No path: the mark goes on what `directory` refers to.
         let directory = u64::from(directory as u32);
-        if let Some((path, length)) = (directory != u64::from(LINUX_AT_FDCWD))
+        if let Some(path) = (directory != u64::from(LINUX_AT_FDCWD))
             .then(|| linux_descriptor_canonical_path(directory))
             .flatten()
         {
-            canonical[..length].copy_from_slice(&path[..length]);
-            length
+            canonical[..path.len()].copy_from_slice(&path);
+            path.len()
         } else {
             match linux_walk_start(directory, &mut canonical) {
                 Ok(length) => length,
@@ -46932,8 +46944,17 @@ fn linux_inotify_read(descriptor: u64, address: u64, count: u64) -> Option<u64> 
     })
 }
 
-/// A canonical path, as watches name paths.
-type LinuxInotifyPath = ([u8; crate::linux_overlay::PATH_CAPACITY], usize);
+/// A canonical path, as watches name paths. It is kept on the heap at its
+/// own length: a call carries two from before it runs to after.
+type LinuxInotifyPath = Vec<u8>;
+
+/// `path` copied to the kernel heap; None when the heap is out of memory.
+fn linux_heap_path(path: &[u8]) -> Option<LinuxInotifyPath> {
+    let mut stored = Vec::new();
+    stored.try_reserve_exact(path.len()).ok()?;
+    stored.extend_from_slice(path);
+    Some(stored)
+}
 
 /// The canonical path a path argument names, from `directory`.
 fn linux_inotify_path_at(directory: u64, address: u64) -> Option<LinuxInotifyPath> {
@@ -46946,7 +46967,7 @@ fn linux_inotify_path_at(directory: u64, address: u64) -> Option<LinuxInotifyPat
         linux_canonical_path_at(u64::from(directory as u32), &path[..length], &mut canonical)
             .ok()?
     };
-    Some((canonical, canonical_length))
+    linux_heap_path(&canonical[..canonical_length])
 }
 
 /// The canonical path of an open descriptor's file, for the events done
@@ -46971,12 +46992,10 @@ fn linux_descriptor_canonical_path(descriptor: u64) -> Option<LinuxInotifyPath> 
     }
     let mut absolute = [0_u8; crate::linux_overlay::PATH_CAPACITY];
     let length = linux_descriptor_path(descriptor, &mut absolute)?;
-    let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
     let relative = absolute[..length]
         .strip_prefix(b"/")
         .unwrap_or(&absolute[..length]);
-    canonical[..relative.len()].copy_from_slice(relative);
-    Some((canonical, relative.len()))
+    linux_heap_path(relative)
 }
 
 /// Whether canonical `path` still names a file (an open one may have been
@@ -47050,14 +47069,12 @@ pub(super) fn linux_inotify_before(number: u64, arguments: [u64; 6]) -> Option<L
         ),
         LINUX_RENAME_SYSCALL => {
             let from = linux_inotify_path_at(at, arguments[0]);
-            let directory =
-                from.is_some_and(|(path, length)| linux_inotify_is_directory(&path[..length]));
+            let directory = from.as_deref().is_some_and(linux_inotify_is_directory);
             (from, linux_inotify_path_at(at, arguments[1]), directory)
         }
         LINUX_RENAMEAT_SYSCALL | LINUX_RENAMEAT2_SYSCALL => {
             let from = linux_inotify_path_at(arguments[0], arguments[1]);
-            let directory =
-                from.is_some_and(|(path, length)| linux_inotify_is_directory(&path[..length]));
+            let directory = from.as_deref().is_some_and(linux_inotify_is_directory);
             (
                 from,
                 linux_inotify_path_at(arguments[2], arguments[3]),
@@ -47066,8 +47083,7 @@ pub(super) fn linux_inotify_before(number: u64, arguments: [u64; 6]) -> Option<L
         }
         LINUX_CLOSE_SYSCALL => {
             let path = linux_inotify_descriptor_path(arguments[0]);
-            let directory =
-                path.is_some_and(|(path, length)| linux_inotify_is_directory(&path[..length]));
+            let directory = path.as_deref().is_some_and(linux_inotify_is_directory);
             let writer = linux_device_descriptor(u64::from(arguments[0] as u32))
                 & LINUX_DESCRIPTOR_OUTPUT
                 != 0;
@@ -47107,8 +47123,8 @@ pub(super) fn linux_inotify_after(call: LinuxInotifyCall, result: u64) {
     let arguments = call.arguments;
     let at = u64::from(LINUX_AT_FDCWD);
     let object = |path: Option<LinuxInotifyPath>, mask: u32| {
-        if let Some((path, length)) = path {
-            let path = &path[..length];
+        if let Some(path) = path {
+            let path = &path[..];
             let directory = linux_inotify_is_directory(path);
             crate::linux_inotify::notify(
                 domain,
@@ -47119,21 +47135,21 @@ pub(super) fn linux_inotify_after(call: LinuxInotifyCall, result: u64) {
             );
         }
     };
-    let created = |path: Option<LinuxInotifyPath>, directory: bool| {
-        if let Some((path, length)) = path {
-            crate::linux_inotify::created(domain, &path[..length], directory);
+    let created = |path: &Option<LinuxInotifyPath>, directory: bool| {
+        if let Some(path) = path {
+            crate::linux_inotify::created(domain, path, directory);
         }
     };
     let fanotify = |path: &Option<LinuxInotifyPath>, mask: u32| {
-        if let Some((path, length)) = path {
-            linux_fanotify_event(&path[..*length], mask);
+        if let Some(path) = path {
+            linux_fanotify_event(path, mask);
         }
     };
     match call.number {
         LINUX_OPEN_SYSCALL | LINUX_OPENAT_SYSCALL | LINUX_CREAT_SYSCALL | LINUX_OPENAT2_SYSCALL => {
             let path = linux_inotify_descriptor_path(result);
             if linux_descriptor_flag(&X86_RUNTIME.ELF_PROBE_DESCRIPTOR_CREATED, result) {
-                created(path, false);
+                created(&path, false);
             }
             fanotify(&path, FAN_OPEN);
             object(path, IN_OPEN);
@@ -47197,30 +47213,25 @@ pub(super) fn linux_inotify_after(call: LinuxInotifyCall, result: u64) {
         LINUX_FCHMOD_SYSCALL | LINUX_FCHOWN_SYSCALL | LINUX_FSETXATTR_SYSCALL => {
             object(linux_inotify_descriptor_path(arguments[0]), IN_ATTRIB);
         }
-        LINUX_MKDIR_SYSCALL => created(linux_inotify_path_at(at, arguments[0]), true),
-        LINUX_MKDIRAT_SYSCALL => created(linux_inotify_path_at(arguments[0], arguments[1]), true),
-        LINUX_MKNOD_SYSCALL => created(linux_inotify_path_at(at, arguments[0]), false),
-        LINUX_MKNODAT_SYSCALL => created(linux_inotify_path_at(arguments[0], arguments[1]), false),
+        LINUX_MKDIR_SYSCALL => created(&linux_inotify_path_at(at, arguments[0]), true),
+        LINUX_MKDIRAT_SYSCALL => created(&linux_inotify_path_at(arguments[0], arguments[1]), true),
+        LINUX_MKNOD_SYSCALL => created(&linux_inotify_path_at(at, arguments[0]), false),
+        LINUX_MKNODAT_SYSCALL => created(&linux_inotify_path_at(arguments[0], arguments[1]), false),
         LINUX_SYMLINK_SYSCALL | LINUX_LINK_SYSCALL => {
-            created(linux_inotify_path_at(at, arguments[1]), false);
+            created(&linux_inotify_path_at(at, arguments[1]), false);
         }
         LINUX_SYMLINKAT_SYSCALL => {
-            created(linux_inotify_path_at(arguments[1], arguments[2]), false);
+            created(&linux_inotify_path_at(arguments[1], arguments[2]), false);
         }
-        LINUX_LINKAT_SYSCALL => created(linux_inotify_path_at(arguments[2], arguments[3]), false),
+        LINUX_LINKAT_SYSCALL => created(&linux_inotify_path_at(arguments[2], arguments[3]), false),
         LINUX_UNLINK_SYSCALL | LINUX_UNLINKAT_SYSCALL | LINUX_RMDIR_SYSCALL => {
-            if let Some((path, length)) = call.first {
-                crate::linux_inotify::deleted(domain, &path[..length], call.directory);
+            if let Some(path) = call.first {
+                crate::linux_inotify::deleted(domain, &path, call.directory);
             }
         }
         LINUX_RENAME_SYSCALL | LINUX_RENAMEAT_SYSCALL | LINUX_RENAMEAT2_SYSCALL => {
-            if let (Some((from, from_length)), Some((to, to_length))) = (call.first, call.second) {
-                crate::linux_inotify::renamed(
-                    domain,
-                    &from[..from_length],
-                    &to[..to_length],
-                    call.directory,
-                );
+            if let (Some(from), Some(to)) = (call.first, call.second) {
+                crate::linux_inotify::renamed(domain, &from, &to, call.directory);
             }
         }
         LINUX_CLOSE_SYSCALL => {
@@ -47230,13 +47241,13 @@ pub(super) fn linux_inotify_after(call: LinuxInotifyCall, result: u64) {
                 FAN_CLOSE_NOWRITE
             };
             fanotify(&call.first, closed);
-            if let Some((path, length)) = call.first {
+            if let Some(path) = call.first {
                 let mask = if call.writer {
                     IN_CLOSE_WRITE
                 } else {
                     IN_CLOSE_NOWRITE
                 };
-                let path = &path[..length];
+                let path = &path[..];
                 let unlinked = !linux_inotify_exists(path);
                 crate::linux_inotify::notify(domain, path, mask, call.directory, unlinked);
             }
@@ -54393,7 +54404,7 @@ fn linux_statfs_data(kind: LinuxFilesystemKind) -> [u8; 120] {
         stat[32..40].copy_from_slice(&free_frames.to_ne_bytes());
     }
     stat[56..64].copy_from_slice(&filesystem_id.to_ne_bytes());
-    stat[64..72].copy_from_slice(&(crate::linux_overlay::PATH_CAPACITY as u64 - 1).to_ne_bytes());
+    stat[64..72].copy_from_slice(&(crate::linux_overlay::NAME_MAX as u64).to_ne_bytes());
     stat[72..80].copy_from_slice(&(PAGE_SIZE as u64).to_ne_bytes());
     stat[80..88].copy_from_slice(&flags.to_ne_bytes());
     stat
