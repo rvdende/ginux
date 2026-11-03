@@ -49527,6 +49527,33 @@ fn linux_set_process_resource_limit(pid: u32, resource: u64, requested: [u64; 2]
     {
         return LINUX_EPERM;
     }
+    // RLIMIT_CPU (seconds of CPU time): SIGXCPU at the soft limit and
+    // every second after, SIGKILL at the hard one, as timers on the
+    // process's CPU clock (interval-timer slots 3 and 4).
+    if resource == 0 {
+        const SECOND: u64 = 1_000_000_000;
+        const SIGXCPU: u8 = 24;
+        let deadline = |limit: u64| {
+            if limit == u64::MAX {
+                0
+            } else {
+                limit.max(1).saturating_mul(SECOND)
+            }
+        };
+        let _ = linux_process::set_live_process_interval_timer(
+            pid,
+            3,
+            SIGXCPU,
+            (SECOND, deadline(requested[0])),
+        );
+        let _ = linux_process::set_live_process_interval_timer(
+            pid,
+            4,
+            LINUX_SIGKILL as u8,
+            (0, deadline(requested[1])),
+        );
+        linux_refresh_posix_timer_cache(pid);
+    }
     let index = resource as usize * 2;
     if pid == current_linux_process_pid() {
         X86_RUNTIME.ELF_PROBE_RLIMITS[index].store(requested[0], Ordering::SeqCst);

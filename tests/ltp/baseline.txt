@@ -108,7 +108,6 @@ send02 TBROK
 sendmsg01 TBROK
 sendto01 TFAIL
 setns02 TWARN
-setrlimit06 TFAIL
 setxattr03 TBROK
 sigaction01 TBROK
 signal06 TBROK

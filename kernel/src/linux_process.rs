@@ -534,7 +534,9 @@ struct Process {
     /// setitimer's ITIMER_VIRTUAL and ITIMER_PROF, as timers on the
     /// process's CPU clock (SIGVTALRM, SIGPROF): none in a new child, kept
     /// across exec.
-    itimers: [Option<PosixTimer>; 2],
+    /// and RLIMIT_CPU's soft (SIGXCPU, then every second) and hard
+    /// (SIGKILL) limits as two more.
+    itimers: [Option<PosixTimer>; 4],
     /// getrusage's ru_maxrss in KiB: the most the process was seen to hold
     /// resident (at getrusage and as it exits), and the most any child it
     /// waited for (or that child's own waited children) held. A new child
@@ -1809,7 +1811,7 @@ impl ProcessTable {
             cpu_cycles: 0,
             started_nanoseconds: crate::arch::x86_64::cpu::linux_uptime_nanoseconds(),
             posix_timers: [None; POSIX_TIMER_LIMIT],
-            itimers: [None; 2],
+            itimers: [None; 4],
             maxrss_kib: 0,
             children_maxrss_kib: 0,
             deadline_parameters: [0; 3],
@@ -3331,9 +3333,9 @@ pub(crate) struct PosixTimerExpiry {
     pub(crate) interval_timer: bool,
 }
 
-/// The most expiries one check reports: every POSIX timer and both CPU
-/// interval timers.
-pub(crate) const TIMER_EXPIRY_LIMIT: usize = POSIX_TIMER_LIMIT + 2;
+/// The most expiries one check reports: every POSIX timer, both CPU
+/// interval timers and the two RLIMIT_CPU limits.
+pub(crate) const TIMER_EXPIRY_LIMIT: usize = POSIX_TIMER_LIMIT + 4;
 
 impl PosixTimerExpiry {
     pub(crate) const NONE: Self = Self {
