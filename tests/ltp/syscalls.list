@@ -1071,7 +1071,7 @@ request_key06 request_key06
 rmdir01 rmdir01
 rmdir02 rmdir02
 rmdir03 rmdir03
-rt_sigaction01 rt_sigaction01
+!rt_sigaction01 rt_sigaction01  # musl: LTP reads the restorer back from libc sigaction's sa_restorer, which musl never fills in, so handlers return to address 0
 rt_sigaction02 rt_sigaction02
 rt_sigaction03 rt_sigaction03
 rt_sigprocmask01 rt_sigprocmask01

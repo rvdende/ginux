@@ -94,7 +94,6 @@ ptrace10 TBROK
 ptrace11 TBROK
 recvmmsg01 TBROK
 remap_file_pages01 TBROK
-rt_sigaction01 TBROK
 sbrk01 TFAIL
 send02 TBROK
 sendmsg01 TBROK
@@ -106,7 +105,6 @@ signal06 TBROK
 sigtimedwait01 HANG
 sigwaitinfo01 HANG
 splice06 TBROK
-splice09 TFAIL
 statmount03 TBROK
 times03 TFAIL
 unshare03 TFAIL

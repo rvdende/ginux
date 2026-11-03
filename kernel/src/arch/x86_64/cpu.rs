@@ -42291,12 +42291,59 @@ fn linux_splice_between_pipes(
 }
 
 /// Moves bytes from pipe `from` into a socket or regular file `sink`.
+/// Whether `descriptor` is /dev/null or /dev/zero (`Some(false)`), which
+/// take and drop what is written, or /dev/full (`Some(true)`), which takes
+/// nothing (ENOSPC).
+fn linux_discard_sink(descriptor: u64) -> Option<bool> {
+    let state = linux_device_descriptor(descriptor);
+    if !linux_descriptor_open(descriptor)
+        || linux_console_descriptor(descriptor) != 0
+        || linux_socket_slot(descriptor).is_some()
+        || linux_overlay_descriptor_handle(descriptor).is_some()
+        || linux_rootfs_descriptor(descriptor) != 0
+        || linux_tmp_descriptor_handle(descriptor, state).is_some()
+        || linux_io_uring_descriptor(descriptor)
+        || linux_graphics_device(state).is_some()
+        || state & (LINUX_FILE_MASK | LINUX_DEVICE_DIRECTORY | LINUX_DEVICE_CONSOLE) != 0
+    {
+        return None;
+    }
+    match state & !3 {
+        0 | LINUX_DEVICE_ZERO => Some(false),
+        LINUX_DEVICE_FULL => Some(true),
+        _ => None,
+    }
+}
+
 fn linux_splice_from_pipe(
     from: crate::linux_socket::SlotId,
     (sink, sink_offset): (u64, u64),
     to: LinuxSpliceEnd,
     length: u64,
 ) -> LinuxSpliceStep {
+    // Into /dev/null or /dev/zero the bytes are taken from the pipe and
+    // dropped, as writing them would; /dev/full takes none (splice09).
+    if let Some(full) = linux_discard_sink(sink) {
+        if full {
+            return LinuxSpliceStep::Done(LINUX_ENOSPC);
+        }
+        let requested = usize::try_from(length).unwrap_or(usize::MAX);
+        let mut buffer = [0_u8; PAGE_SIZE];
+        let mut moved = 0_usize;
+        while moved < requested {
+            let chunk = (requested - moved).min(buffer.len());
+            match crate::linux_socket::recv(from, &mut buffer[..chunk]) {
+                Ok((0, _)) => break,
+                Ok((received, _)) => moved += received,
+                Err(crate::linux_socket::Error::WouldBlock) if moved == 0 => {
+                    return LinuxSpliceStep::Blocked;
+                }
+                Err(crate::linux_socket::Error::WouldBlock) => break,
+                Err(error) => return linux_splice_moved(moved, Some(linux_socket_error(error))),
+            }
+        }
+        return linux_splice_moved(moved, None);
+    }
     let (mut offset, explicit) = match to {
         LinuxSpliceEnd::File => {
             if linux_socket_flags(sink).is_some_and(|flags| flags & LINUX_O_APPEND as u32 != 0) {
