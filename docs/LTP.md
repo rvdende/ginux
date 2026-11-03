@@ -108,9 +108,13 @@ feature rather than a fix:
   (inherited, kept across exec): absolute paths, `..` and absolute
   symlink targets resolve inside it, `/proc` is not visible there unless
   mounted, and getcwd shows paths from it or "(unreachable)" (chroot02-04
-  and realpath01 pass). Still to implement behind the flag: process
-  accounting (acct01-02), ptrace, pivot_root, and listmount/statmount
-  refusing mounts outside the root. iopl and ioperm check their
+  and realpath01 pass). Process accounting writes Linux's version 2
+  records (acct01-02 pass). ptrace has its core: PTRACE_TRACEME, ATTACH,
+  SEIZE, CONT, KILL and DETACH, signal-delivery stops its tracer's wait
+  sees, and tracees detached when their tracer exits (ptrace01, 03, 05,
+  06, 07 pass); reading and writing a tracee's memory and registers,
+  single-stepping and breakpoints are not implemented (ptrace08-10), and
+  init cannot be traced (ptrace11). Still to implement: pivot_root. iopl and ioperm check their
   arguments but stay refused even there (ioperm02, iopl02 pass; ioperm01
   and iopl01 are skipped): raw I/O ports would reach around the drivers'
   isolation.

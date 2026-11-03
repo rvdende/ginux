@@ -116,11 +116,6 @@ process_vm_readv03 TBROK
 prot_hsymlinks TBROK
 dirtyc0w TBROK
 dirtyc0w_shmem TBROK
-ptrace01 TBROK
-ptrace03 TBROK
-ptrace05 TBROK
-ptrace06 TBROK
-ptrace07 TBROK
 ptrace08 TBROK
 ptrace09 TBROK
 ptrace10 TBROK

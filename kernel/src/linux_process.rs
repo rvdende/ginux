@@ -551,6 +551,13 @@ struct Process {
     /// Its newest seccomp filter (index + 1 in the table's filters), or 0:
     /// inherited across fork, kept across exec.
     seccomp_filter: u32,
+    /// The pid of the process tracing this one (ptrace), or 0: not
+    /// inherited across fork, kept across exec.
+    tracer: u32,
+    /// The signal PTRACE_CONT asked to deliver as the tracee resumes from
+    /// its trace stop (0: none), and whether that delivery is past the stop.
+    ptrace_resume_signal: u8,
+    ptrace_bypass: bool,
     state: ProcessState,
     wait_event: Option<ProcessWaitEvent>,
     /// A child forked onto its parent's pages (CLONE_VM, or a vfork child
@@ -1303,7 +1310,31 @@ impl ProcessTable {
         process.retiring_address_space = Some(expected_space);
         process.context = None;
         process.state = ProcessState::Exiting;
+        // However it ends, a tracer leaves its tracees running.
+        self.detach_tracees(handle.pid);
         Some(expected_space)
+    }
+
+    /// Detaches every process `tracer` traces and continues the stopped
+    /// ones, as Linux's exit_ptrace does.
+    fn detach_tracees(&mut self, tracer: u32) {
+        if tracer == 0 {
+            return;
+        }
+        for slot in 0..self.processes.len() {
+            let Some(handle) = self.processes[slot]
+                .as_ref()
+                .filter(|process| process.tracer == tracer)
+                .map(|process| process.handle)
+            else {
+                continue;
+            };
+            if let Some(process) = self.process_mut(handle) {
+                process.tracer = 0;
+                process.ptrace_resume_signal = 0;
+            }
+            let _ = self.continue_process(handle);
+        }
     }
 
     fn exit(&mut self, handle: ProcessHandle, status: u8) -> bool {
@@ -1482,19 +1513,23 @@ impl ProcessTable {
             .iter()
             .flatten()
             .filter(|process| process.parent == Some(parent) && matches(process));
+        // A tracer is told of its tracee's stops without WUNTRACED.
+        let parent_pid = parent.pid;
+        let stops_reported =
+            |process: &Process| report_stopped || process.tracer == parent_pid && parent_pid != 0;
         let child = children
             .clone()
             .find(|process| report_exited && matches!(process.state, ProcessState::Zombie { .. }))
             .or_else(|| {
                 children.clone().find(|process| {
-                    report_stopped
+                    stops_reported(process)
                         && matches!(process.wait_event, Some(ProcessWaitEvent::Stopped { .. }))
                         || report_continued
                             && process.wait_event == Some(ProcessWaitEvent::Continued)
                 })
             })
             .or_else(|| children.next())?;
-        if report_stopped {
+        if stops_reported(child) {
             if let Some(ProcessWaitEvent::Stopped { signal }) = child.wait_event {
                 return Some(ChildWaitState::Stopped {
                     pid: child.handle.pid,
@@ -1764,6 +1799,9 @@ impl ProcessTable {
             oom_score_adj,
             killed_by_signal: 0,
             seccomp_filter,
+            tracer: 0,
+            ptrace_resume_signal: 0,
+            ptrace_bypass: false,
             state,
             wait_event: None,
             shares_parent_vm: false,
@@ -3875,6 +3913,76 @@ pub(crate) fn set_live_process_scheduler_nice(pid: u32, nice: u8) -> bool {
         return false;
     };
     run_queue.set_priority(thread, 39_i8 - nice as i8)
+}
+
+/// The pid of the process tracing `pid` (ptrace), if one is.
+pub(crate) fn live_process_tracer(pid: u32) -> Option<u32> {
+    let table = live_process_table_mut()?;
+    let tracer = table.process(table.handle_by_pid(pid)?)?.tracer;
+    (tracer != 0).then_some(tracer)
+}
+
+/// Makes `tracer` (0: none) trace `pid`, clearing any resume signal.
+pub(crate) fn set_live_process_tracer(pid: u32, tracer: u32) -> bool {
+    let Some(table) = live_process_table_mut() else {
+        return false;
+    };
+    let Some(handle) = table.handle_by_pid(pid) else {
+        return false;
+    };
+    let Some(process) = table.process_mut(handle) else {
+        return false;
+    };
+    process.tracer = tracer;
+    process.ptrace_resume_signal = 0;
+    true
+}
+
+/// Records the signal a tracee delivers as it resumes (PTRACE_CONT).
+pub(crate) fn set_live_process_ptrace_resume_signal(pid: u32, signal: u8) -> bool {
+    let Some(table) = live_process_table_mut() else {
+        return false;
+    };
+    let Some(process) = table
+        .handle_by_pid(pid)
+        .and_then(|handle| table.process_mut(handle))
+    else {
+        return false;
+    };
+    process.ptrace_resume_signal = signal;
+    true
+}
+
+/// Takes the signal a tracee resuming from its trace stop delivers.
+pub(crate) fn take_live_process_ptrace_resume_signal(pid: u32) -> u8 {
+    live_process_table_mut()
+        .and_then(|table| {
+            let handle = table.handle_by_pid(pid)?;
+            let process = table.process_mut(handle)?;
+            Some(core::mem::take(&mut process.ptrace_resume_signal))
+        })
+        .unwrap_or(0)
+}
+
+/// Marks (or, taking it, reads and clears) that the tracee's next signal
+/// delivery is the one its tracer let through, which does not stop again.
+pub(crate) fn set_live_process_ptrace_bypass(pid: u32, bypass: bool) {
+    if let Some(process) = live_process_table_mut().and_then(|table| {
+        let handle = table.handle_by_pid(pid)?;
+        table.process_mut(handle)
+    }) {
+        process.ptrace_bypass = bypass;
+    }
+}
+
+pub(crate) fn take_live_process_ptrace_bypass(pid: u32) -> bool {
+    live_process_table_mut()
+        .and_then(|table| {
+            let handle = table.handle_by_pid(pid)?;
+            let process = table.process_mut(handle)?;
+            Some(core::mem::take(&mut process.ptrace_bypass))
+        })
+        .unwrap_or(false)
 }
 
 pub(crate) fn live_process_parent_pid(pid: u32) -> Option<u32> {

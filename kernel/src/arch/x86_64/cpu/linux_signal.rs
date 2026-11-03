@@ -1587,6 +1587,10 @@ pub(super) fn linux_reap_ignored_children() {
 }
 
 pub(super) fn linux_target_signal_ignored(target: u32, signal: u64) -> bool {
+    // A traced process gets every signal: its tracer sees it at the stop.
+    if linux_process::live_process_tracer(target).is_some() {
+        return false;
+    }
     let index = signal as usize - 1;
     let (handler, mask) = if target == current_linux_process_pid() {
         (
@@ -1746,8 +1750,9 @@ pub(super) fn linux_kill(
     if linux_default_signal_stops(signal)
         && X86_RUNTIME.ELF_PROBE_SIGNAL_HANDLERS[signal as usize - 1].load(Ordering::SeqCst) == 0
         && current_linux_signal_mask() & (1 << (signal - 1)) == 0
+        && linux_process::live_process_tracer(current_linux_process_pid()).is_none()
     {
-        return linux_stop_in_call(signal, output, interrupted);
+        return linux_stop_in_call(signal, output, interrupted, false);
     }
     linux_kill_current(
         (signal, signal_code, signal_value),
@@ -1768,7 +1773,10 @@ fn linux_stop_in_call(
     signal: u64,
     output: *mut LinuxSyscallFrame,
     caller: LinuxUserContext,
+    traced: bool,
 ) -> u64 {
+    /// si_code of a tracee's stop, as its tracer's SIGCHLD reports it.
+    const LINUX_CLD_TRAPPED: i32 = 4;
     let pid = current_linux_process_pid();
     if pid == 1
         || output.is_null()
@@ -1778,9 +1786,18 @@ fn linux_stop_in_call(
         return LINUX_ENOSYS;
     }
     if linux_process::stop_live_process(pid, signal as u8, true) {
-        if let Some(parent) = linux_process::live_process_parent_pid(pid) {
-            let _ =
-                linux_queue_process_signal(parent, LINUX_SIGCHLD, LINUX_CLD_STOPPED, Some(signal));
+        // A tracee's stop is its tracer's to see; a stop signal's, its
+        // parent's.
+        let (told, code) = if traced {
+            (linux_process::live_process_tracer(pid), LINUX_CLD_TRAPPED)
+        } else {
+            (
+                linux_process::live_process_parent_pid(pid),
+                LINUX_CLD_STOPPED,
+            )
+        };
+        if let Some(told) = told {
+            let _ = linux_queue_process_signal(told, LINUX_SIGCHLD, code, Some(signal));
         }
     } else if !linux_process::live_process_stopped(pid) {
         return 0;
@@ -1809,6 +1826,96 @@ fn linux_stop_in_call(
     result
 }
 
+/// ptrace(2), in a domain set `privileged=true`: PTRACE_TRACEME and
+/// PTRACE_ATTACH make a tracer, which then sees each signal its tracee
+/// gets as a stop (`linux_kill_current`) and resumes it with PTRACE_CONT
+/// (delivering the signal it names, or none), PTRACE_DETACH or
+/// PTRACE_KILL. Reading and writing the tracee's memory and registers is
+/// not implemented yet (EIO).
+pub(super) fn linux_ptrace(request: u64, pid: u64, _address: u64, data: u64) -> u64 {
+    const TRACEME: u64 = 0;
+    const CONT: u64 = 7;
+    const KILL: u64 = 8;
+    const ATTACH: u64 = 16;
+    const DETACH: u64 = 17;
+    const SEIZE: u64 = 0x4206;
+    let caller = current_linux_process_pid();
+    let request = u64::from(request as u32);
+    if request == TRACEME {
+        if linux_process::live_process_tracer(caller).is_some() {
+            return LINUX_EPERM;
+        }
+        let Some(parent) = linux_process::live_process_parent_pid(caller).filter(|p| *p != 0)
+        else {
+            return LINUX_EPERM;
+        };
+        return if linux_process::set_live_process_tracer(caller, parent) {
+            0
+        } else {
+            LINUX_ESRCH
+        };
+    }
+    let pid = pid as u32;
+    let Some(status) = linux_process::live_process_status(pid) else {
+        return LINUX_ESRCH;
+    };
+    if matches!(request, ATTACH | SEIZE) {
+        // Only another process, not traced yet, that the caller may signal
+        // (the same user, or CAP_SYS_PTRACE); init only with the
+        // capability.
+        // Init is not traced: stopping it would stop the domain, and a
+        // tracer may only wait for its own children here.
+        if pid == caller || pid == 1 || linux_process::live_process_tracer(pid).is_some() {
+            return LINUX_EPERM;
+        }
+        let may_trace = super::current_linux_credentials().is_some_and(|credentials| {
+            credentials.has(ginux_credentials::capability::SYS_PTRACE)
+                || pid != 1
+                    && linux_process::live_process_credentials(pid)
+                        .is_some_and(|target| target.user.real == credentials.user.real)
+        });
+        if !may_trace || status.state == linux_process::LiveProcessState::Zombie {
+            return LINUX_EPERM;
+        }
+        if !linux_process::set_live_process_tracer(pid, caller) {
+            return LINUX_ESRCH;
+        }
+        if request == ATTACH {
+            const SIGSTOP: u64 = 19;
+            let _ = linux_queue_process_signal(pid, SIGSTOP, LINUX_SI_USER, None);
+        }
+        return 0;
+    }
+    // The rest need a tracee of the caller's that is stopped.
+    if linux_process::live_process_tracer(pid) != Some(caller)
+        || request != KILL && status.state != linux_process::LiveProcessState::Stopped
+    {
+        return LINUX_ESRCH;
+    }
+    match request {
+        CONT | DETACH => {
+            if data > LINUX_SIGNAL_COUNT as u64 {
+                return LINUX_EIO;
+            }
+            if request == DETACH {
+                let _ = linux_process::set_live_process_tracer(pid, 0);
+            } else {
+                let _ = linux_process::set_live_process_ptrace_resume_signal(pid, data as u8);
+            }
+            let _ = linux_process::continue_live_process(pid);
+            linux_process::set_live_process_waiting(pid, false);
+            0
+        }
+        KILL => {
+            let _ = linux_queue_process_signal(pid, LINUX_SIGKILL, LINUX_SI_USER, None);
+            let _ = linux_process::continue_live_process(pid);
+            linux_process::set_live_process_waiting(pid, false);
+            0
+        }
+        _ => LINUX_EIO,
+    }
+}
+
 pub(super) fn linux_kill_current(
     generated: (u64, i32, Option<u64>),
     sender: Option<(u32, u32)>,
@@ -1821,6 +1928,29 @@ pub(super) fn linux_kill_current(
     let signal_bit = 1 << (signal - 1);
     if wake_linux_signal_wait_target(None, signal, signal_code, signal_value, sender) {
         return 0;
+    }
+    // A traced process stops for each signal it does not block but
+    // SIGKILL, for its tracer to see, instead of acting on it.
+    let pid = current_linux_process_pid();
+    if signal != LINUX_SIGKILL
+        && X86_RUNTIME.ELF_PROBE_SIGNAL_MASK.load(Ordering::SeqCst) & signal_bit == 0
+        && linux_process::live_process_tracer(pid).is_some()
+        && !linux_process::take_live_process_ptrace_bypass(pid)
+    {
+        let result = linux_stop_in_call(signal, output, interrupted, true);
+        let resume = linux_process::take_live_process_ptrace_resume_signal(pid);
+        if result != 0 || resume == 0 {
+            return result;
+        }
+        // The signal the tracer let through is delivered now, past the stop.
+        linux_process::set_live_process_ptrace_bypass(pid, true);
+        return linux_kill_current(
+            (u64::from(resume), LINUX_SI_USER, None),
+            sender,
+            output,
+            interrupted,
+            return_registers,
+        );
     }
     let handler = X86_RUNTIME.ELF_PROBE_SIGNAL_HANDLERS[index].load(Ordering::SeqCst);
     let old_mask = X86_RUNTIME.ELF_PROBE_SIGNAL_MASK.load(Ordering::SeqCst);

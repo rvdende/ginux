@@ -2077,6 +2077,13 @@ fn linux_syscall_dispatch(
         LINUX_REBOOT_SYSCALL => linux_reboot(first_argument, buffer, count, register(0)),
         LINUX_CHROOT_SYSCALL => linux_chroot(first_argument),
         LINUX_ACCT_SYSCALL => linux_acct(first_argument),
+        LINUX_PTRACE_SYSCALL
+            if linux_privileged_operation_allowed(
+                linux_user::PrivilegedOperation::TraceProcesses,
+            ) =>
+        {
+            linux_ptrace(first_argument, buffer, count, register(0))
+        }
         LINUX_VHANGUP_SYSCALL => linux_vhangup(),
         LINUX_IOPERM_SYSCALL => linux_ioperm(first_argument, buffer, count),
         LINUX_IOPL_SYSCALL => linux_iopl(first_argument),
