@@ -3,7 +3,7 @@
 # ("known failure"); a failure of any other test is a regression and fails
 # the run. Rewrite it from a run with LTP_UPDATE_BASELINE=1
 # (tests/qemu/ltp.sh --update-baseline); LTP_STRICT=1 ignores it.
-# From target/ltp-results.txt (2026-11-03), list=tests/ltp/syscalls.list ltp=20260930 kernel=97c546ab.
+# From target/ltp-results.txt (2026-11-03), list=tests/ltp/syscalls.list ltp=20260930 kernel=468a6a67.
 abort01 TFAIL
 accept02 TBROK
 arch_prctl01 TFAIL
@@ -115,7 +115,7 @@ prctl10 TFAIL
 process_vm_readv03 TBROK
 prot_hsymlinks TBROK
 dirtyc0w TBROK
-dirtyc0w_shmem TBROK
+dirtyc0w_shmem HANG
 ptrace08 TBROK
 ptrace09 TBROK
 ptrace10 TBROK
@@ -133,7 +133,7 @@ setns02 TWARN
 setrlimit06 TFAIL
 setxattr02 TBROK
 setxattr03 TBROK
-shmget02 TBROK
+shmget02 TFAIL
 sigaction01 TBROK
 signal06 TBROK
 sigtimedwait01 HANG

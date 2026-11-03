@@ -34,6 +34,7 @@ QEMU, and reports one machine-parseable line per test plus failure clusters.
 | `cd1cf9c9` | UTS and domain names, flock waits and leases, MAP_32BIT, epoll's nesting, oneshot and fairness, inotify with an event queue, System V IPC ownership, permissions, info and stat commands (4 CPUs, baseline 283) | 1552 | 867 | 154 | 112 | 212 | 12 | 0 | 3 |
 | `6f9f6055` | capability sets and the bounding set, seccomp filters, POSIX message queues that block and notify (netlink for SIGEV_THREAD), memfd seals, fallocate's tmpfs modes, an exiting thread's unmapped stack (futex_wait03, bind04) (4 CPUs, baseline 255) | 1552 | 896 | 136 | 102 | 209 | 13 | 0 | 2 |
 | `97c546ab` | ru_maxrss and SIGCHLD auto-reaping, Linux AIO per process, dnotify, CPU interval timers, interface ioctls, sched_setattr and SCHED_DEADLINE, stable directory cursors, many errno orders (4 CPUs, baseline 194; the one hang is fork14) | 1552 | 951 | 96 | 94 | 211 | 1 | 0 | 1 |
+| `468a6a67` | lazy large anonymous mappings (fork14 no longer hangs), memory locks and VmLck, real MREMAP_FIXED moves, wipe-on-fork in copy-on-write forks, domain flags write-execute and privileged (machine reboot, kernel log and syslog, chroot, process accounting, ptrace's core), /proc/config.gz (4 CPUs, baseline 154; the one hang is dirtyc0w_shmem) | 1552 | 987 | 72 | 78 | 213 | 1 | 0 | 1 |
 
 \* Counted with the exit status alone, which overstated passes (below).
 The later rows are rescored from each run's saved console logs with LTP's
@@ -82,9 +83,9 @@ waiting for a signal), poll02, ppoll01, pause01, tgkill01 and
 rt_tgsigqueueinfo01. Results of a
 full run are kept in `target/ltp-baseline/` (not committed).
 
-## What remains (full run 13, 97c546ab)
+## What remains (full run 14, 468a6a67)
 
-192 known failures and one hang (fork14, since fixed). The larger groups, each needing a
+154 known failures and one hang (dirtyc0w_shmem). The larger groups, each needing a
 feature rather than a fix:
 
 - **fork14 (fixed after run 13): lazy reservations.** An anonymous
