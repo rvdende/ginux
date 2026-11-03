@@ -2969,6 +2969,10 @@ fn settle_linux_process_exit(pid: u32, status: u8) -> bool {
     // run anywhere once its memory goes.
     wait_for_linux_process_threads_to_leave(pid);
     linux_end_pid_namespace(pid);
+    // The process leaves its mount namespace before its record may go
+    // with its runtime slot.
+    let mount_namespace =
+        linux_process_runtime_state(pid).and_then(|state| state.mount_namespace.take());
     let process_slot = linux_process::live_process_slot(pid);
     let parent = linux_process::live_process_parent_pid(pid);
     let signals_cleared = process_slot
@@ -2990,6 +2994,9 @@ fn settle_linux_process_exit(pid: u32, status: u8) -> bool {
     if let Some(state) = linux_process_runtime_state(pid) {
         release_linux_descriptor_runtime_state(&state.descriptors);
         *state = LinuxProcessRuntimeState::EMPTY;
+    }
+    if let Some(namespace) = mount_namespace {
+        linux_release_mount_namespace(namespace);
     }
     if let Some(threads) = linux_process_thread_runtime_state(pid) {
         threads.fill(LinuxThreadRuntimeState::EMPTY);
@@ -7012,8 +7019,9 @@ fn execute_deferred_live_fork() -> bool {
     if !restore_linux_process_extended_state(parent_pid) {
         return false;
     }
-    if new_mount_namespace && !child_executed && !linux_mount::retire(child_mount_namespace) {
-        return false;
+    // A child that left its new mount namespace (exited) took it along.
+    if new_mount_namespace && !child_executed {
+        linux_release_mount_namespace(child_mount_namespace);
     }
     if let Some((slot, base, size)) = parent_runtime.stack {
         X86_RUNTIME.LINUX_THREAD_STACK_BASES[slot].store(base, Ordering::SeqCst);
@@ -7091,9 +7099,14 @@ fn execute_deferred_live_fork() -> bool {
     }
     linux_release_process_cgroup(child.pid);
     release_linux_process_shared_mappings(child.pid);
+    let mut left_namespace = None;
     if let Some(child_state_slot) = linux_process_runtime_state(child.pid) {
         release_linux_descriptor_runtime_state(&child_state_slot.descriptors);
+        left_namespace = child_state_slot.mount_namespace;
         *child_state_slot = LinuxProcessRuntimeState::EMPTY;
+    }
+    if let Some(namespace) = left_namespace {
+        linux_release_mount_namespace(namespace);
     }
     if let Some(threads) = linux_process_thread_runtime_state(child.pid) {
         threads.fill(LinuxThreadRuntimeState::EMPTY);
@@ -14352,10 +14365,17 @@ fn linux_setns_join(reference: linux_namespace::Reference) -> u64 {
             let Some(state) = linux_process_runtime_state(pid).filter(|state| state.valid) else {
                 return LINUX_ESRCH;
             };
+            // The process record says which namespace is current: it
+            // changes first, then the installed one, and the namespace left
+            // goes if nothing else uses it.
+            let previous = state.mount_namespace.replace(target);
             if !linux_mount::switch_to(target) {
+                state.mount_namespace = previous;
                 return LINUX_ENOMEM;
             }
-            state.mount_namespace = Some(target);
+            if let Some(previous) = previous.filter(|previous| *previous != target) {
+                linux_release_mount_namespace(previous);
+            }
             return 0;
         }
         // One network and one cgroup namespace per domain: joining it
@@ -14645,16 +14665,61 @@ fn linux_unshare(flags: u64) -> u64 {
         let Some(state) = linux_process_runtime_state(pid).filter(|state| state.valid) else {
             return LINUX_ESRCH;
         };
-        let Some(mount_namespace) = linux_mount::clone_current() else {
+        let previous = linux_mount::current_handle();
+        let Some(mount_namespace) = linux_clone_mount_namespace() else {
             return LINUX_ENOMEM;
         };
+        // The process's record names its namespace from here on.
+        state.mount_namespace = Some(mount_namespace);
         if !linux_mount::switch_to(mount_namespace) {
-            let _ = linux_mount::retire(mount_namespace);
+            state.mount_namespace = previous;
+            linux_release_mount_namespace(mount_namespace);
             return LINUX_ENOMEM;
         }
-        state.mount_namespace = Some(mount_namespace);
+        if let Some(previous) = previous {
+            linux_release_mount_namespace(previous);
+        }
     }
     0
+}
+
+/// A new mount namespace (unshare or clone with CLONE_NEWNS): a copy of
+/// the current one, with copies of its mounts.
+fn linux_clone_mount_namespace() -> Option<linux_mount::MountNamespaceHandle> {
+    let from = linux_mount_space();
+    let namespace = linux_mount::clone_current()?;
+    let to = crate::linux_mounts::Space {
+        instance: from.instance,
+        namespace: namespace.id(),
+    };
+    if crate::linux_mounts::copy_space(from, to).is_err() {
+        crate::linux_mounts::drop_space(to, |_, _| {});
+        let _ = linux_mount::retire(namespace);
+        return None;
+    }
+    Some(namespace)
+}
+
+/// Retires mount namespace `namespace` with its mounts once no process
+/// of the domain uses it any more (Linux frees a namespace with its last
+/// reference); a tmpfs no other namespace has mounted takes its files.
+fn linux_release_mount_namespace(namespace: linux_mount::MountNamespaceHandle) {
+    if linux_mount::is_domain_root(namespace)
+        || allocated_linux_process_records()
+            .any(|record| record.runtime.mount_namespace == Some(namespace))
+    {
+        return;
+    }
+    // An exiting process's namespace may still be the one installed.
+    if linux_mount::vacate(namespace) && linux_mount::retire(namespace) {
+        crate::linux_mounts::drop_space(
+            crate::linux_mounts::Space {
+                instance: linux_execution_instance(),
+                namespace: namespace.id(),
+            },
+            linux_filesystem_gone,
+        );
+    }
 }
 
 /// Whether the current process's domain lets root use `operation` (a
@@ -15791,6 +15856,19 @@ fn current_linux_process_pid() -> u32 {
 /// The process this CPU runs (0: none).
 pub(crate) fn current_linux_process_id() -> u32 {
     current_linux_process_pid()
+}
+
+/// The mount namespace the process this CPU runs is in, as its runtime
+/// record holds it (unshare and fork set it); None outside a process.
+pub(crate) fn current_process_mount_namespace() -> Option<linux_mount::MountNamespaceHandle> {
+    if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::Relaxed) {
+        return None;
+    }
+    let pid = current_linux_process_pid();
+    if pid == 0 {
+        return None;
+    }
+    linux_process_runtime_state(pid)?.mount_namespace
 }
 
 fn linux_child_exited(pid: u32) -> bool {
@@ -18746,7 +18824,7 @@ fn stage_linux_fork_child_runtime_state(
     let child_threads: *mut [LinuxThreadRuntimeState; LINUX_THREAD_LIMIT] =
         linux_process_thread_runtime_state(child_pid)?;
     let mount_namespace = if new_mount_namespace {
-        linux_mount::clone_current()?
+        linux_clone_mount_namespace()?
     } else {
         unsafe { (*parent).mount_namespace? }
     };
@@ -22099,6 +22177,74 @@ fn linux_mount_id_request(address: u64) -> Result<(u64, u64), u64> {
     ))
 }
 
+/// The domain mount of the current namespace with unique id `unique`.
+fn linux_domain_mount_by_unique_id(unique: u64) -> Option<u32> {
+    let local = u32::try_from(unique & u64::from(u32::MAX)).ok()?;
+    if local <= 3 || linux_mount::current_unique_mount_id(u64::from(local)) != Some(unique) {
+        return None;
+    }
+    crate::linux_mounts::with_mount(linux_mount_space(), local, |_| local)
+}
+
+/// The superblock magic statfs and statmount report for `filesystem`.
+fn linux_filesystem_magic(filesystem: &[u8]) -> u64 {
+    match filesystem {
+        b"tmpfs" | b"devtmpfs" => 0x0102_1994,
+        b"ramfs" => 0x8584_58f6,
+        b"proc" => 0x9fa0,
+        b"sysfs" => 0x6265_6572,
+        b"cgroup2" => 0x6367_7270,
+        b"devpts" => 0x1cd1,
+        b"mqueue" => 0x1980_0202,
+        b"debugfs" => 0x6462_6720,
+        b"tracefs" => 0x7472_6163,
+        b"securityfs" => 0x7363_6673,
+        b"pstore" => 0x6165_676c,
+        b"bpf" => 0xcafe_4a11,
+        b"hugetlbfs" => 0x9584_58f6,
+        _ => 0x8584_58f6,
+    }
+}
+
+/// A domain mount's options as mountinfo's sixth field shows them.
+fn linux_mount_options(flags: u32, output: &mut [u8], used: &mut usize) -> bool {
+    use crate::linux_mounts::{NO_ATIME, NO_DEVICES, NO_EXEC, NO_SUID, READ_ONLY};
+    append_linux_bytes(
+        output,
+        used,
+        if flags & READ_ONLY != 0 { b"ro" } else { b"rw" },
+    ) && (flags & NO_SUID == 0 || append_linux_bytes(output, used, b",nosuid"))
+        && (flags & NO_DEVICES == 0 || append_linux_bytes(output, used, b",nodev"))
+        && (flags & NO_EXEC == 0 || append_linux_bytes(output, used, b",noexec"))
+        && append_linux_bytes(
+            output,
+            used,
+            if flags & NO_ATIME != 0 {
+                b",noatime"
+            } else {
+                b",relatime"
+            },
+        )
+}
+
+/// Canonical mount point `path` as the current process sees it from its
+/// root ("/" + the rest), into `output`; None when it lies outside the
+/// root.
+fn linux_shown_mount_point(path: &[u8], output: &mut [u8], used: &mut usize) -> Option<()> {
+    let mut root = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    let root_length = linux_root_prefix(&mut root);
+    let rest = if root_length == 0 {
+        path
+    } else {
+        let rest = path.strip_prefix(&root[..root_length])?;
+        if !rest.is_empty() && !rest.starts_with(b"/") {
+            return None;
+        }
+        rest.strip_prefix(b"/").unwrap_or(rest)
+    };
+    (append_linux_bytes(output, used, b"/") && append_linux_bytes(output, used, rest)).then_some(())
+}
+
 fn linux_statmount(request_address: u64, output_address: u64, capacity: u64, flags: u64) -> u64 {
     const FIXED_SIZE: usize = 512;
     const SB_BASIC: u64 = 1;
@@ -22133,7 +22279,8 @@ fn linux_statmount(request_address: u64, output_address: u64, capacity: u64, fla
     let Some(proc_id) = linux_mount::current_unique_mount_id(2) else {
         return LINUX_EINVAL;
     };
-    let proc_mount = if mount_id == root_id {
+    let domain_mount = linux_domain_mount_by_unique_id(mount_id);
+    let proc_mount = if mount_id == root_id || domain_mount.is_some() {
         false
     } else if mount_id == proc_id {
         true
@@ -22143,8 +22290,28 @@ fn linux_statmount(request_address: u64, output_address: u64, capacity: u64, fla
     if !linux_mounts_visible() {
         return LINUX_EPERM;
     }
-    let mut output = [0_u8; FIXED_SIZE + 96];
+    let mut output = [0_u8; FIXED_SIZE + 2 * crate::linux_overlay::PATH_CAPACITY + 128];
     output[8..16].copy_from_slice(&requested.to_ne_bytes());
+    if let Some(local) = domain_mount {
+        let space = linux_mount_space();
+        let filled = crate::linux_mounts::with_mount(space, local, |mount| {
+            linux_statmount_domain(mount, requested, &mut output)
+        });
+        let used = match filled {
+            Some(Ok(used)) => used,
+            Some(Err(error)) => return error,
+            None => return LINUX_ENOENT,
+        };
+        output[..4].copy_from_slice(&(used as u32).to_ne_bytes());
+        if capacity < used as u64 {
+            return LINUX_EOVERFLOW;
+        }
+        return if copy_to_linux_user(output_address, &output[..used]) {
+            0
+        } else {
+            LINUX_EFAULT
+        };
+    }
     if requested & SB_BASIC != 0 {
         output[16..20].copy_from_slice(&0_u32.to_ne_bytes());
         output[20..24].copy_from_slice(&(if proc_mount { 2_u32 } else { 1 }).to_ne_bytes());
@@ -22212,9 +22379,135 @@ fn linux_statmount(request_address: u64, output_address: u64, capacity: u64, fla
     }
 }
 
+/// Fills statmount's `output` with what `requested` asks of domain mount
+/// `mount`; returns the size used.
+fn linux_statmount_domain(
+    mount: &crate::linux_mounts::Mount,
+    requested: u64,
+    output: &mut [u8],
+) -> Result<usize, u64> {
+    const FIXED_SIZE: usize = 512;
+    const SB_BASIC: u64 = 1;
+    const MNT_BASIC: u64 = 2;
+    const PROPAGATE_FROM: u64 = 4;
+    const MNT_ROOT: u64 = 8;
+    const MNT_POINT: u64 = 0x10;
+    const FS_TYPE: u64 = 0x20;
+    const MNT_NS_ID: u64 = 0x40;
+    const MNT_OPTS: u64 = 0x80;
+    const MS_UNBINDABLE: u64 = 1 << 17;
+    const MS_PRIVATE: u64 = 1 << 18;
+    const MS_SLAVE: u64 = 1 << 19;
+    const MS_SHARED: u64 = 1 << 20;
+    use crate::linux_mounts::{NO_ATIME, NO_DEVICES, NO_EXEC, NO_SUID, READ_ONLY};
+    let unique = |local: u32| linux_mount::current_unique_mount_id(u64::from(local)).unwrap_or(0);
+    if requested & SB_BASIC != 0 {
+        output[16..20].copy_from_slice(&0_u32.to_ne_bytes());
+        output[20..24].copy_from_slice(&mount.device.to_ne_bytes());
+        output[24..32].copy_from_slice(&linux_filesystem_magic(&mount.filesystem).to_ne_bytes());
+        output[32..36].copy_from_slice(&0_u32.to_ne_bytes());
+    }
+    let sharing = mount.sharing;
+    if requested & MNT_BASIC != 0 {
+        output[40..48].copy_from_slice(&unique(mount.id).to_ne_bytes());
+        output[48..56].copy_from_slice(&unique(mount.parent).to_ne_bytes());
+        output[56..60].copy_from_slice(&mount.id.to_ne_bytes());
+        output[60..64].copy_from_slice(&mount.parent.to_ne_bytes());
+        let attributes = [
+            (READ_ONLY, 1_u64),
+            (NO_SUID, 2),
+            (NO_DEVICES, 4),
+            (NO_EXEC, 8),
+            (NO_ATIME, 0x10),
+        ]
+        .into_iter()
+        .filter(|(flag, _)| mount.flags & flag != 0)
+        .fold(0, |attributes, (_, attribute)| attributes | attribute);
+        output[64..72].copy_from_slice(&attributes.to_ne_bytes());
+        let mut propagation = 0;
+        if sharing.peer_group != 0 {
+            propagation |= MS_SHARED;
+        }
+        if sharing.master != 0 {
+            propagation |= MS_SLAVE;
+        }
+        if sharing.unbindable {
+            propagation |= MS_UNBINDABLE;
+        }
+        if propagation == 0 {
+            propagation = MS_PRIVATE;
+        }
+        output[72..80].copy_from_slice(&propagation.to_ne_bytes());
+        output[80..88].copy_from_slice(&u64::from(sharing.peer_group).to_ne_bytes());
+        output[88..96].copy_from_slice(&u64::from(sharing.master).to_ne_bytes());
+    }
+    if requested & PROPAGATE_FROM != 0 {
+        output[96..104].copy_from_slice(&u64::from(sharing.master).to_ne_bytes());
+    }
+    if requested & MNT_NS_ID != 0 {
+        output[112..120].copy_from_slice(
+            &linux_mount::current_namespace_id()
+                .unwrap_or(0)
+                .to_ne_bytes(),
+        );
+    }
+    let mut used = FIXED_SIZE;
+    let mut append = |output: &mut [u8], field: usize, value: &[u8]| -> bool {
+        let offset = used - FIXED_SIZE;
+        let Some(end) = used.checked_add(value.len() + 1) else {
+            return false;
+        };
+        let Some(destination) = output.get_mut(used..end) else {
+            return false;
+        };
+        destination[..value.len()].copy_from_slice(value);
+        destination[value.len()] = 0;
+        output[field..field + 4].copy_from_slice(&(offset as u32).to_ne_bytes());
+        used = end;
+        true
+    };
+    let mut text = [0_u8; crate::linux_overlay::PATH_CAPACITY + 1];
+    if requested & MNT_OPTS != 0 {
+        let mut length = 0;
+        if !linux_mount_options(mount.flags, &mut text, &mut length)
+            || !append(output, 4, &text[..length])
+        {
+            return Err(LINUX_EOVERFLOW);
+        }
+    }
+    if requested & FS_TYPE != 0 && !append(output, 36, &mount.filesystem) {
+        return Err(LINUX_EOVERFLOW);
+    }
+    if requested & MNT_ROOT != 0 {
+        let mut length = 0;
+        if !append_linux_bytes(&mut text, &mut length, b"/")
+            || !append_linux_bytes(&mut text, &mut length, &mount.root)
+            || !append(output, 104, &text[..length])
+        {
+            return Err(LINUX_EOVERFLOW);
+        }
+    }
+    if requested & MNT_POINT != 0 {
+        let mut length = 0;
+        if linux_shown_mount_point(&mount.path, &mut text, &mut length).is_none() {
+            length = 0;
+            if !append_linux_bytes(&mut text, &mut length, b"/")
+                || !append_linux_bytes(&mut text, &mut length, &mount.path)
+            {
+                return Err(LINUX_EOVERFLOW);
+            }
+        }
+        if !append(output, 108, &text[..length]) {
+            return Err(LINUX_EOVERFLOW);
+        }
+    }
+    Ok(used)
+}
+
 fn linux_listmount(request_address: u64, output_address: u64, count: u64, flags: u64) -> u64 {
     const LSMT_ROOT: u64 = u64::MAX;
     const LISTMOUNT_REVERSE: u64 = 1;
+    const LIMIT: usize = 64;
     if flags & !LISTMOUNT_REVERSE != 0 || count == 0 {
         return LINUX_EINVAL;
     }
@@ -22232,27 +22525,81 @@ fn linux_listmount(request_address: u64, output_address: u64, count: u64, flags:
     let Some(proc_mount) = linux_mount::current_unique_mount_id(2) else {
         return LINUX_EINVAL;
     };
-    if !matches!(parent, LSMT_ROOT) && parent != root && parent != proc_mount {
+    let space = linux_mount_space();
+    let parent_mount = linux_domain_mount_by_unique_id(parent);
+    if !matches!(parent, LSMT_ROOT)
+        && parent != root
+        && parent != proc_mount
+        && parent_mount.is_none()
+    {
         return LINUX_ENOENT;
     }
     if !matches!(parent, LSMT_ROOT) && !linux_mounts_visible() {
         return LINUX_EPERM;
     }
-    let candidates = if flags & LISTMOUNT_REVERSE != 0 {
-        [proc_mount, root]
-    } else {
-        [root, proc_mount]
+    // Where the mounts listed lie: under the parent mount (or the
+    // caller's root), not the parent itself, by unique id.
+    let mut root_path = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    let root_length = linux_root_prefix(&mut root_path);
+    let below = |point: &[u8], path: &[u8]| {
+        point.is_empty()
+            || path
+                .strip_prefix(point)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(b"/"))
     };
-    let mut output = [0_u8; 16];
+    let parent_path = parent_mount
+        .and_then(|local| {
+            crate::linux_mounts::with_mount(space, local, |mount| {
+                let mut path = Vec::new();
+                path.try_reserve_exact(mount.path.len()).ok()?;
+                path.extend_from_slice(&mount.path);
+                Some((local, path))
+            })
+        })
+        .flatten();
+    let mut candidates = [0_u64; LIMIT];
+    let mut found = 0;
+    let mut add = |id: u64| {
+        if found < LIMIT {
+            candidates[found] = id;
+            found += 1;
+        }
+    };
+    if parent == LSMT_ROOT {
+        add(root);
+    }
+    if parent == LSMT_ROOT || parent == root {
+        add(proc_mount);
+    }
+    crate::linux_mounts::for_each(space, |mount| {
+        let listed = match &parent_path {
+            Some((local, path)) => {
+                mount.id != *local
+                    && below(path, &mount.path)
+                    && (mount.path != *path || mount.id > *local)
+            }
+            None if parent == proc_mount => below(b"proc", &mount.path),
+            None if parent == LSMT_ROOT => below(&root_path[..root_length], &mount.path),
+            None => true,
+        };
+        if listed {
+            add(linux_mount::current_unique_mount_id(u64::from(mount.id)).unwrap_or(0));
+        }
+    });
+    let candidates = &mut candidates[..found];
+    candidates.sort_unstable();
+    if flags & LISTMOUNT_REVERSE != 0 {
+        candidates.reverse();
+    }
+    let mut output = [0_u8; LIMIT * 8];
     let mut returned = 0_usize;
-    for mount in candidates {
-        let under_parent = parent == LSMT_ROOT || parent == root && mount == proc_mount;
+    for &mount in candidates.iter() {
         let after_cursor = if flags & LISTMOUNT_REVERSE != 0 {
             last == 0 || mount < last
         } else {
             mount > last
         };
-        if under_parent && after_cursor && returned < count.min(2) as usize {
+        if mount != 0 && after_cursor && (returned as u64) < count.min(LIMIT as u64) {
             output[returned * 8..returned * 8 + 8].copy_from_slice(&mount.to_ne_bytes());
             returned += 1;
         }
@@ -31760,6 +32107,141 @@ fn linux_chroot(path_address: u64) -> u64 {
     linux_finish_chroot(root)
 }
 
+/// The canonical directory at the path at `address`, as pivot_root looks
+/// its arguments up: following a final symlink, a directory (ENOTDIR).
+fn linux_lookup_directory(address: u64) -> Result<Vec<u8>, u64> {
+    let mut path = [0_u8; LINUX_PATH_MAX];
+    let length = copy_linux_c_string(address, &mut path)?;
+    let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    let length =
+        match linux_canonical_path_at(u64::from(LINUX_AT_FDCWD), &path[..length], &mut canonical) {
+            Ok(length) => length,
+            // The domain's root itself.
+            Err(LINUX_EISDIR) => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+    let (length, _, found) = linux_overlay_lookup_following(&mut canonical, length, true)?;
+    let directory = match found {
+        Some(metadata) => metadata.kind == crate::linux_overlay::NodeKind::Directory,
+        None => {
+            let Some((_, entry)) = linux_rootfs_path_at(u64::from(LINUX_AT_FDCWD), &path[..])
+            else {
+                return Err(linux_missing_path_error(&canonical[..length]));
+            };
+            entry.is_none_or(|entry| entry.kind == crate::published_rootfs::EntryKind::Directory)
+        }
+    };
+    if !directory {
+        return Err(LINUX_ENOTDIR);
+    }
+    let mut directory = Vec::new();
+    directory
+        .try_reserve_exact(length)
+        .map_err(|_| LINUX_ENOMEM)?;
+    directory.extend_from_slice(&canonical[..length]);
+    Ok(directory)
+}
+
+/// pivot_root(2): makes the mount at `new_root` the root of the processes
+/// of the mount namespace whose root was the caller's (their working
+/// directory too when it was that root), as Linux's checks allow: no
+/// shared mount involved, neither directory on the current root's mount
+/// (EBUSY), the root and `new_root` mount roots with a parent, and
+/// `put_old` at or under `new_root`, which lies under the root (EINVAL).
+/// The old root's mount is not shown at `put_old`: paths are not
+/// redirected between mounts here.
+fn linux_pivot_root(new_root_address: u64, put_old_address: u64) -> u64 {
+    if !linux_privileged_operation_allowed(linux_user::PrivilegedOperation::ChangeRoot)
+        || !linux_has_capability(ginux_credentials::capability::SYS_ADMIN)
+    {
+        return LINUX_EPERM;
+    }
+    let new_root = match linux_lookup_directory(new_root_address) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let put_old = match linux_lookup_directory(put_old_address) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let mut root = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    let root_length = linux_root_prefix(&mut root);
+    let root = &root[..root_length];
+    let space = linux_mount_space();
+    let mount_at = |path: &[u8]| crate::linux_mounts::mount_id_at(space, path);
+    let shared = |id: u32| {
+        crate::linux_mounts::with_mount(space, id, |mount| mount.sharing.peer_group != 0)
+            .unwrap_or(false)
+    };
+    let parent = |id: u32| {
+        crate::linux_mounts::with_mount(space, id, |mount| mount.parent)
+            .unwrap_or(crate::linux_mounts::ROOT_ID)
+    };
+    let (root_mount, new_mount, old_mount) =
+        (mount_at(root), mount_at(&new_root), mount_at(&put_old));
+    let below = |point: &[u8], path: &[u8]| {
+        point.is_empty()
+            || path
+                .strip_prefix(point)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(b"/"))
+    };
+    if shared(old_mount) || shared(parent(new_mount)) || shared(parent(root_mount)) {
+        return LINUX_EINVAL;
+    }
+    if new_mount == root_mount || old_mount == root_mount {
+        return LINUX_EBUSY;
+    }
+    if root_mount == crate::linux_mounts::ROOT_ID
+        || !crate::linux_mounts::is_mount_point(space, root)
+        || !crate::linux_mounts::is_mount_point(space, &new_root)
+        || !below(&new_root, &put_old)
+        || !below(root, &new_root)
+    {
+        return LINUX_EINVAL;
+    }
+    // Every process of this mount namespace rooted where the caller is
+    // moves to the new root.
+    let namespace = linux_mount::current_handle();
+    let caller = current_linux_process_pid();
+    for slot in 0..linux_process::PROCESS_LIMIT {
+        let Some(pid) = linux_process::live_process_pid_at(slot) else {
+            continue;
+        };
+        let in_namespace = pid == caller
+            || linux_process_runtime_state(pid)
+                .is_some_and(|state| state.mount_namespace == namespace);
+        let rooted_here =
+            linux_process::with_live_process_root(pid, |own| own == root).unwrap_or(false);
+        if !in_namespace || !rooted_here {
+            continue;
+        }
+        let mut moved = Vec::new();
+        if moved.try_reserve_exact(new_root.len()).is_err() {
+            return LINUX_ENOMEM;
+        }
+        moved.extend_from_slice(&new_root);
+        if !linux_process::set_live_process_root(pid, moved) {
+            return LINUX_ESRCH;
+        }
+    }
+    let mut cwd = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    let at_root = linux_walk_start(u64::from(LINUX_AT_FDCWD), &mut cwd)
+        .is_ok_and(|length| &cwd[..length] == root);
+    if at_root {
+        if let Some(metadata) = crate::linux_overlay::lookup(&new_root) {
+            X86_RUNTIME.ELF_PROBE_OVERLAY_CWD.store(
+                crate::linux_overlay::generation(metadata.handle),
+                Ordering::SeqCst,
+            );
+            X86_RUNTIME.ELF_PROBE_ROOTFS_CWD.store(0, Ordering::SeqCst);
+            X86_RUNTIME
+                .ELF_PROBE_CWD
+                .store(LINUX_ROOT_MEASURED_DIRECTORY, Ordering::SeqCst);
+        }
+    }
+    0
+}
+
 fn linux_finish_chroot(root: Vec<u8>) -> u64 {
     if !linux_has_capability(ginux_credentials::capability::SYS_CHROOT) {
         return LINUX_EPERM;
@@ -35760,7 +36242,7 @@ fn linux_resolve_restricted(
     };
     let confined = restrictions & (LINUX_RESOLVE_BENEATH | LINUX_RESOLVE_IN_ROOT) != 0;
     let top = if confined { base_length } else { 0 };
-    let instance = linux_execution_instance();
+    let mount_space = linux_mount_space();
     let mut rest: Vec<u8> = Vec::new();
     rest.try_reserve_exact(path.len())
         .map_err(|_| LINUX_ENOMEM)?;
@@ -35796,7 +36278,7 @@ fn linux_resolve_restricted(
                 continue;
             }
             if restrictions & LINUX_RESOLVE_NO_XDEV != 0
-                && (crate::linux_mounts::is_mount_point(instance, &output[..length])
+                && (crate::linux_mounts::is_mount_point(mount_space, &output[..length])
                     || linux_kernel_mount_point(&output[..length]))
             {
                 return Err(LINUX_EXDEV);
@@ -35821,7 +36303,7 @@ fn linux_resolve_restricted(
         // The kernel's own mounts (/proc, cgroup) are crossed too
         // (openat202 opens /proc/version).
         if restrictions & LINUX_RESOLVE_NO_XDEV != 0
-            && (crate::linux_mounts::is_mount_point(instance, &output[..length])
+            && (crate::linux_mounts::is_mount_point(mount_space, &output[..length])
                 || linux_kernel_mount_point(&output[..length]))
         {
             return Err(LINUX_EXDEV);
@@ -36714,7 +37196,7 @@ fn linux_device_node_kind(
 ) -> Result<LinuxDeviceNode, u64> {
     let mut path = [0_u8; crate::linux_overlay::PATH_CAPACITY];
     let length = crate::linux_overlay::copy_path(handle, &mut path).ok_or(LINUX_ENOENT)?;
-    if crate::linux_mounts::flags_at(linux_execution_instance(), &path[..length])
+    if crate::linux_mounts::flags_at(linux_mount_space(), &path[..length])
         & crate::linux_mounts::NO_DEVICES
         != 0
     {
@@ -36977,8 +37459,8 @@ fn linux_linkat(
     if ["proc", "sys", "dev"].iter().any(|mount| {
         old == mount.as_bytes()
             || old.starts_with(mount.as_bytes()) && old.get(mount.len()) == Some(&b'/')
-    }) || crate::linux_mounts::mount_id_at(linux_execution_instance(), old)
-        != crate::linux_mounts::mount_id_at(linux_execution_instance(), destination)
+    }) || crate::linux_mounts::mount_id_at(linux_mount_space(), old)
+        != crate::linux_mounts::mount_id_at(linux_mount_space(), destination)
     {
         return LINUX_EXDEV;
     }
@@ -37127,7 +37609,7 @@ fn linux_unlinkat(directory: u64, path_address: u64, flags: u64) -> u64 {
                 (Some(true), false) => return LINUX_EISDIR,
                 (Some(true), true)
                     if crate::linux_mounts::is_mount_point(
-                        linux_execution_instance(),
+                        linux_mount_space(),
                         &canonical[..length],
                     ) =>
                 {
@@ -37163,7 +37645,7 @@ fn linux_unlinkat(directory: u64, path_address: u64, flags: u64) -> u64 {
         return LINUX_ENOTDIR;
     }
     if flags == LINUX_AT_REMOVEDIR
-        && crate::linux_mounts::is_mount_point(linux_execution_instance(), &canonical[..length])
+        && crate::linux_mounts::is_mount_point(linux_mount_space(), &canonical[..length])
     {
         return LINUX_EBUSY;
     }
@@ -38761,8 +39243,9 @@ fn linux_statx_from_stat(stat: &[u8; LINUX_STAT_SIZE]) -> [u8; 256] {
     statx
 }
 
-/// statx(2), reporting the mount's unique id (listmount's and
-/// statmount's) instead of the old one when STATX_MNT_ID_UNIQUE is asked.
+/// statx(2) with the id of the domain mount a file of the root's lies on,
+/// reporting the mount's unique id (listmount's and statmount's) instead
+/// of the old one when STATX_MNT_ID_UNIQUE is asked.
 fn linux_statx_unique_mount(
     directory: u64,
     path_address: u64,
@@ -38772,7 +39255,7 @@ fn linux_statx_unique_mount(
 ) -> u64 {
     const STATX_MNT_ID_UNIQUE: u32 = 0x4000;
     let result = linux_statx(directory, path_address, flags, mask, stat_address);
-    if result != 0 || mask as u32 & STATX_MNT_ID_UNIQUE == 0 {
+    if result != 0 {
         return result;
     }
     let mut stat = [0_u8; 256];
@@ -38780,21 +39263,54 @@ fn linux_statx_unique_mount(
         return result;
     }
     let reported = u32::from_ne_bytes(stat[..4].try_into().unwrap_or([0; 4]));
-    let mount = u64::from_ne_bytes(stat[144..152].try_into().unwrap_or([0; 8]));
-    let Some(unique) = (reported & LINUX_STATX_MNT_ID != 0)
-        .then(|| linux_mount::current_unique_mount_id(mount))
-        .flatten()
-    else {
+    let mut mount = u64::from_ne_bytes(stat[144..152].try_into().unwrap_or([0; 8]));
+    let domain_mount = (reported & LINUX_STATX_MNT_ID != 0
+        && mount == u64::from(crate::linux_mounts::ROOT_ID))
+    .then(|| linux_statx_domain_mount(directory, path_address, flags))
+    .flatten();
+    if domain_mount.is_none() && mask as u32 & STATX_MNT_ID_UNIQUE == 0 {
         return result;
-    };
-    stat[..4]
-        .copy_from_slice(&(reported & !LINUX_STATX_MNT_ID | STATX_MNT_ID_UNIQUE).to_ne_bytes());
-    stat[144..152].copy_from_slice(&unique.to_ne_bytes());
+    }
+    if let Some(id) = domain_mount {
+        mount = u64::from(id);
+    }
+    stat[144..152].copy_from_slice(&mount.to_ne_bytes());
+    if mask as u32 & STATX_MNT_ID_UNIQUE != 0 && reported & LINUX_STATX_MNT_ID != 0 {
+        if let Some(unique) = linux_mount::current_unique_mount_id(mount) {
+            stat[..4].copy_from_slice(
+                &(reported & !LINUX_STATX_MNT_ID | STATX_MNT_ID_UNIQUE).to_ne_bytes(),
+            );
+            stat[144..152].copy_from_slice(&unique.to_ne_bytes());
+        }
+    }
     if copy_to_linux_user(stat_address, &stat) {
         0
     } else {
         LINUX_EFAULT
     }
+}
+
+/// The domain mount the file statx found lies on, if any: the deepest one
+/// at or above its path.
+fn linux_statx_domain_mount(directory: u64, path_address: u64, flags: u64) -> Option<u32> {
+    let mut path = [0_u8; LINUX_PATH_MAX];
+    let length = copy_linux_c_string(path_address, &mut path).ok()?;
+    let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    let length = if length == 0 {
+        if flags & LINUX_AT_EMPTY_PATH == 0 {
+            return None;
+        }
+        linux_descriptor_path(u64::from(directory as u32), &mut canonical)?
+    } else {
+        match linux_canonical_path_at(u64::from(directory as u32), &path[..length], &mut canonical)
+        {
+            Ok(length) => length,
+            Err(LINUX_EISDIR) => 0,
+            Err(_) => return None,
+        }
+    };
+    let id = crate::linux_mounts::mount_id_at(linux_mount_space(), &canonical[..length]);
+    (id != crate::linux_mounts::ROOT_ID).then_some(id)
 }
 
 /// Whether the caller may see the domain's mounts (its root and /proc):
@@ -41257,6 +41773,8 @@ fn linux_descriptor_read(descriptor: u64, address: u64, count: u64) -> u64 {
             | LINUX_FILE_PROC_TIMENS_OFFSETS
             | LINUX_FILE_PROC_TASK_COMM
             | LINUX_FILE_PROC_TASK_STAT
+            | LINUX_FILE_PROC_MOUNTS
+            | LINUX_FILE_PROC_MOUNTINFO
     ) || linux_proc_sysctl_index(device).is_some()
     {
         let offset = linux_descriptor_offset(descriptor).load(Ordering::SeqCst);
@@ -41426,6 +41944,28 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
     }
     if state & !3 == LINUX_FILE_PROC_CPUINFO {
         return linux_proc_cpuinfo_read(address, count, offset);
+    }
+    if matches!(
+        state & !3,
+        LINUX_FILE_PROC_MOUNTS | LINUX_FILE_PROC_MOUNTINFO
+    ) {
+        let Some(file) = linux_proc_mount_table(state & !3 == LINUX_FILE_PROC_MOUNTINFO) else {
+            return LINUX_EIO;
+        };
+        let Ok(start) = usize::try_from(offset) else {
+            return 0;
+        };
+        if start >= file.len() || count == 0 {
+            return 0;
+        }
+        let end = start
+            .saturating_add(usize::try_from(count).unwrap_or(usize::MAX))
+            .min(file.len());
+        return if copy_to_linux_user(address, &file[start..end]) {
+            (end - start) as u64
+        } else {
+            LINUX_EFAULT
+        };
     }
     if linux_proc_sysvipc_file(state) {
         return linux_proc_sysvipc_read(state, address, count, offset);
@@ -47475,7 +48015,7 @@ fn linux_fanotify_object_kind(path: &[u8]) -> Option<bool> {
 fn linux_fanotify_object(path: &[u8]) -> Option<crate::linux_fanotify::Object<'_>> {
     let directory = linux_fanotify_object_kind(path)?;
     let mount = if crate::linux_fanotify::mount_marks() {
-        crate::linux_mounts::mount_id_at(linux_execution_instance(), path)
+        crate::linux_mounts::mount_id_at(linux_mount_space(), path)
     } else {
         0
     };
@@ -47737,8 +48277,12 @@ fn linux_fanotify_mark(
         mask &= !FAN_EVENT_ON_CHILD;
     }
     let kind = match mark_type {
-        FAN_MARK_MOUNT => MarkKind::Mount(crate::linux_mounts::mount_id_at(domain, path)),
-        FAN_MARK_FILESYSTEM => MarkKind::Filesystem(crate::linux_mounts::mount_id_at(domain, path)),
+        FAN_MARK_MOUNT => {
+            MarkKind::Mount(crate::linux_mounts::mount_id_at(linux_mount_space(), path))
+        }
+        FAN_MARK_FILESYSTEM => {
+            MarkKind::Filesystem(crate::linux_mounts::mount_id_at(linux_mount_space(), path))
+        }
         _ => MarkKind::Inode,
     };
     let change = Change {
@@ -50559,6 +51103,100 @@ fn linux_proc_file(state: u16) -> bool {
             | LINUX_FILE_PROC_TASK_STAT
             | LINUX_FILE_PROC_MOUNTS
     ) || linux_proc_sysctl(state).is_some()
+}
+
+/// `/proc/PID/mountinfo` (`mountinfo`) or `/proc/mounts`: the kernel's
+/// own mounts, then the domain mounts of the current mount namespace that
+/// lie under the process's root, as Linux formats them (mountinfo's
+/// optional fields show peer groups and masters).
+fn linux_proc_mount_table(mountinfo: bool) -> Option<Vec<u8>> {
+    let kernel = if mountinfo {
+        linux_mount::current_mountinfo()?
+    } else {
+        linux_mount::current_mounts()?
+    };
+    let mut file = Vec::new();
+    file.try_reserve(kernel.len() + 256).ok()?;
+    file.extend_from_slice(kernel);
+    // Spaces, tabs, newlines and backslashes in names are octal escapes.
+    let escaped = |text: &[u8], line: &mut [u8], used: &mut usize| {
+        text.iter().all(|byte| match byte {
+            b' ' | b'\t' | b'\n' | b'\\' => append_linux_bytes(
+                line,
+                used,
+                &[
+                    b'\\',
+                    b'0' + (byte >> 6),
+                    b'0' + ((byte >> 3) & 7),
+                    b'0' + (byte & 7),
+                ],
+            ),
+            _ => append_linux_bytes(line, used, &[*byte]),
+        })
+    };
+    let mut complete = true;
+    crate::linux_mounts::for_each(linux_mount_space(), |mount| {
+        let mut point = [0_u8; crate::linux_overlay::PATH_CAPACITY + 1];
+        let mut point_length = 0;
+        if linux_shown_mount_point(&mount.path, &mut point, &mut point_length).is_none() {
+            return;
+        }
+        let mut line = [0_u8; 4 * crate::linux_overlay::PATH_CAPACITY + 256];
+        let mut used = 0;
+        let sharing = mount.sharing;
+        let written = if mountinfo {
+            append_linux_decimal(&mut line, &mut used, u64::from(mount.id))
+                && append_linux_bytes(&mut line, &mut used, b" ")
+                && append_linux_decimal(&mut line, &mut used, u64::from(mount.parent))
+                && append_linux_bytes(&mut line, &mut used, b" 0:")
+                && append_linux_decimal(&mut line, &mut used, u64::from(mount.device))
+                && append_linux_bytes(&mut line, &mut used, b" /")
+                && escaped(&mount.root, &mut line, &mut used)
+                && append_linux_bytes(&mut line, &mut used, b" ")
+                && escaped(&point[..point_length], &mut line, &mut used)
+                && append_linux_bytes(&mut line, &mut used, b" ")
+                && linux_mount_options(mount.flags, &mut line, &mut used)
+                && (sharing.peer_group == 0
+                    || append_linux_bytes(&mut line, &mut used, b" shared:")
+                        && append_linux_decimal(
+                            &mut line,
+                            &mut used,
+                            u64::from(sharing.peer_group),
+                        ))
+                && (sharing.master == 0
+                    || append_linux_bytes(&mut line, &mut used, b" master:")
+                        && append_linux_decimal(&mut line, &mut used, u64::from(sharing.master)))
+                && (!sharing.unbindable || append_linux_bytes(&mut line, &mut used, b" unbindable"))
+                && append_linux_bytes(&mut line, &mut used, b" - ")
+                && escaped(&mount.filesystem, &mut line, &mut used)
+                && append_linux_bytes(&mut line, &mut used, b" ")
+                && escaped(&mount.source, &mut line, &mut used)
+                && append_linux_bytes(
+                    &mut line,
+                    &mut used,
+                    if mount.flags & crate::linux_mounts::READ_ONLY != 0 {
+                        b" ro\n"
+                    } else {
+                        b" rw\n"
+                    },
+                )
+        } else {
+            escaped(&mount.source, &mut line, &mut used)
+                && append_linux_bytes(&mut line, &mut used, b" ")
+                && escaped(&point[..point_length], &mut line, &mut used)
+                && append_linux_bytes(&mut line, &mut used, b" ")
+                && escaped(&mount.filesystem, &mut line, &mut used)
+                && append_linux_bytes(&mut line, &mut used, b" ")
+                && linux_mount_options(mount.flags, &mut line, &mut used)
+                && append_linux_bytes(&mut line, &mut used, b" 0 0\n")
+        };
+        if written && file.try_reserve(used).is_ok() {
+            file.extend_from_slice(&line[..used]);
+        } else {
+            complete = false;
+        }
+    });
+    complete.then_some(file)
 }
 
 fn linux_mountinfo_file(state: u16) -> bool {
@@ -55940,6 +56578,7 @@ fn linux_mount_filesystem(
         (MS_NOSUID, crate::linux_mounts::NO_SUID),
         (MS_NODEV, crate::linux_mounts::NO_DEVICES),
         (MS_NOEXEC, crate::linux_mounts::NO_EXEC),
+        (MS_NOATIME, crate::linux_mounts::NO_ATIME),
     ]
     .into_iter()
     .filter(|(flag, _)| flags & flag != 0)
@@ -55949,18 +56588,49 @@ fn linux_mount_filesystem(
         linux_canonical_path_at(u64::from(LINUX_AT_FDCWD), target, &mut canonical_target)
             .unwrap_or(0);
     let canonical_target = &canonical_target[..canonical_length];
-    let propagation = flags & (MS_SHARED | MS_PRIVATE | MS_SLAVE | MS_UNBINDABLE) != 0;
-    if flags & MS_REMOUNT != 0 && !propagation {
+    let space = linux_mount_space();
+    let propagation = flags & (MS_SHARED | MS_PRIVATE | MS_SLAVE | MS_UNBINDABLE);
+    if flags & MS_REMOUNT != 0 && propagation == 0 {
         // Remounting changes a domain mount's options; the root and the
         // kernel's own mounts keep theirs.
-        let instance = linux_execution_instance();
-        return match crate::linux_mounts::remount(instance, canonical_target, mount_flags) {
+        return match crate::linux_mounts::remount(space, canonical_target, mount_flags) {
             Ok(()) => 0,
             Err(_) if flags & MS_BIND != 0 || linux_kernel_mount_point(canonical_target) => 0,
             Err(_) => LINUX_EINVAL,
         };
     }
-    if propagation || flags & (MS_BIND | MS_MOVE) != 0 {
+    // Linux's order: a bind mount, a change of propagation, a move, then
+    // a new mount.
+    if flags & MS_BIND != 0 {
+        return linux_bind_mount(source_address, canonical_target, flags & MS_REC != 0);
+    }
+    if propagation != 0 {
+        let kernel_point = linux_kernel_mount_point(canonical_target);
+        if !kernel_point && !crate::linux_mounts::is_mount_point(space, canonical_target) {
+            return LINUX_EINVAL;
+        }
+        // Exactly one propagation type, with nothing but MS_REC and
+        // MS_SILENT beside it.
+        use crate::linux_mounts::Propagation;
+        let kind = match flags & !(MS_REC | MS_SILENT) {
+            MS_SHARED => Propagation::Shared,
+            MS_PRIVATE => Propagation::Private,
+            MS_SLAVE => Propagation::Slave,
+            MS_UNBINDABLE => Propagation::Unbindable,
+            _ => return LINUX_EINVAL,
+        };
+        return match crate::linux_mounts::set_propagation(
+            space,
+            canonical_target,
+            kind,
+            flags & MS_REC != 0,
+            kernel_point,
+        ) {
+            Ok(()) => 0,
+            Err(_) => LINUX_EINVAL,
+        };
+    }
+    if flags & MS_MOVE != 0 {
         return 0;
     }
     if !target_is_directory {
@@ -55996,12 +56666,15 @@ fn linux_mount_filesystem(
     if filesystem == b"cgroup2" && !linux_ensure_cgroup_root() {
         return LINUX_ENOSPC;
     }
-    if source_address != 0 {
-        let mut source = [0_u8; LINUX_PATH_MAX];
-        if let Err(error) = copy_linux_c_string(source_address, &mut source) {
-            return error;
+    let mut source = [0_u8; LINUX_PATH_MAX];
+    let source = if source_address != 0 {
+        match copy_linux_c_string(source_address, &mut source) {
+            Ok(length) => &source[..length],
+            Err(error) => return error,
         }
-    }
+    } else {
+        b"none"
+    };
     // The kernel's own /proc and cgroup mounts are always there.
     if linux_kernel_mount_point(canonical_target) {
         return 0;
@@ -56018,8 +56691,9 @@ fn linux_mount_filesystem(
         group: metadata.group,
     });
     match crate::linux_mounts::mount(
-        linux_execution_instance(),
+        space,
         canonical_target,
+        source,
         filesystem,
         mount_flags,
         covered,
@@ -56041,6 +56715,74 @@ fn linux_mount_filesystem(
 /// The root and the mounts the kernel makes itself (/proc, cgroup2).
 fn linux_kernel_mount_point(canonical: &[u8]) -> bool {
     matches!(canonical, b"" | b"proc" | b"sys/fs/cgroup")
+}
+
+/// The current process's mount table: its domain's, in its mount
+/// namespace.
+fn linux_mount_space() -> crate::linux_mounts::Space {
+    crate::linux_mounts::Space {
+        instance: linux_execution_instance(),
+        namespace: linux_mount::current_handle().map_or(0, linux_mount::MountNamespaceHandle::id),
+    }
+}
+
+/// The kernel filesystem canonical `path` is on when no domain mount
+/// covers it: /proc, cgroup2 or the root.
+fn linux_kernel_filesystem(path: &[u8]) -> crate::linux_mounts::KernelFilesystem<'static> {
+    let below = |point: &[u8]| {
+        path.strip_prefix(point)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(b"/"))
+    };
+    let (filesystem, source, device): (&'static [u8], &'static [u8], u32) = if below(b"proc") {
+        (b"proc", b"proc", 2)
+    } else if below(b"sys/fs/cgroup") {
+        (b"cgroup2", b"cgroup2", 3)
+    } else {
+        (b"ginux-root", b"rootfs", 1)
+    };
+    crate::linux_mounts::KernelFilesystem {
+        filesystem,
+        source,
+        device,
+    }
+}
+
+/// mount(2) with MS_BIND: shows the filesystem under the path at
+/// `source_address` at canonical `target` too, with the mounts below it
+/// when `recursive` (MS_REC). An unbindable source is EINVAL.
+fn linux_bind_mount(source_address: u64, target: &[u8], recursive: bool) -> u64 {
+    if source_address == 0 {
+        return LINUX_EFAULT;
+    }
+    let mut source = [0_u8; LINUX_PATH_MAX];
+    let length = match copy_linux_c_string(source_address, &mut source) {
+        Ok(length) => length,
+        Err(error) => return error,
+    };
+    let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    let length =
+        match linux_canonical_path_at(u64::from(LINUX_AT_FDCWD), &source[..length], &mut canonical)
+        {
+            Ok(length) => length,
+            // The domain's root itself.
+            Err(LINUX_EISDIR) => 0,
+            Err(error) => return error,
+        };
+    let canonical = &canonical[..length];
+    if linux_path_access(canonical).is_none() && !linux_kernel_mount_point(canonical) {
+        return linux_missing_path_error(canonical);
+    }
+    match crate::linux_mounts::bind(
+        linux_mount_space(),
+        canonical,
+        target,
+        recursive,
+        &linux_kernel_filesystem(canonical),
+    ) {
+        Ok(_) => 0,
+        Err(crate::linux_mounts::Error::NotMounted) => LINUX_EINVAL,
+        Err(crate::linux_mounts::Error::NoMemory) => LINUX_ENOMEM,
+    }
 }
 
 /// umount2(2): removes a domain mount; a tmpfs takes what was created on
@@ -56083,19 +56825,10 @@ fn linux_umount(target_address: u64, flags: u64) -> u64 {
     {
         return linux_missing_path_error(canonical);
     }
-    match crate::linux_mounts::unmount(linux_execution_instance(), canonical) {
-        Ok((filesystem, covered)) => {
-            if matches!(filesystem.as_slice(), b"tmpfs" | b"ramfs" | b"devtmpfs") {
-                crate::linux_overlay::unlink_below(canonical);
-            }
-            if let Some((covered, metadata)) = covered.zip(crate::linux_overlay::lookup(canonical))
-            {
-                let _ = crate::linux_overlay::set_mode(metadata.handle, covered.mode)
-                    && crate::linux_overlay::set_owner(
-                        metadata.handle,
-                        covered.owner,
-                        covered.group,
-                    );
+    match crate::linux_mounts::unmount(linux_mount_space(), canonical) {
+        Ok(gone) => {
+            if let Some(gone) = gone {
+                linux_filesystem_gone(canonical, gone);
             }
             0
         }
@@ -56104,10 +56837,19 @@ fn linux_umount(target_address: u64, flags: u64) -> u64 {
     }
 }
 
+/// A tmpfs mounted at canonical `path` went with its last mount: its files
+/// go, and the directory it covered gets its own attributes back.
+fn linux_filesystem_gone(path: &[u8], gone: crate::linux_mounts::Gone) {
+    crate::linux_overlay::unlink_below(path);
+    if let Some((covered, metadata)) = gone.covered.zip(crate::linux_overlay::lookup(path)) {
+        let _ = crate::linux_overlay::set_mode(metadata.handle, covered.mode)
+            && crate::linux_overlay::set_owner(metadata.handle, covered.owner, covered.group);
+    }
+}
+
 /// Canonical `path` lies on a read-only mount: changing it is EROFS.
 fn linux_read_only_path(path: &[u8]) -> bool {
-    crate::linux_mounts::flags_at(linux_execution_instance(), path) & crate::linux_mounts::READ_ONLY
-        != 0
+    crate::linux_mounts::flags_at(linux_mount_space(), path) & crate::linux_mounts::READ_ONLY != 0
 }
 
 /// EROFS for a change to the overlay file `handle` on a read-only mount.
@@ -56119,6 +56861,11 @@ fn linux_check_writable_handle(handle: crate::linux_overlay::Handle) -> Result<(
     }
 }
 
+/// mount_setattr(2): changes the options (MOUNT_ATTR_*) and propagation of
+/// the mount at a path and, with AT_RECURSIVE, of the mounts below it, in
+/// Linux's order of checks: the flags, the size, privilege, the
+/// attributes (nothing to change succeeds at once), then the path, which
+/// must be a mount's root.
 fn linux_mount_setattr(
     directory: u64,
     path_address: u64,
@@ -56130,52 +56877,152 @@ fn linux_mount_setattr(
     const AT_EMPTY_PATH: u64 = 0x1000;
     const AT_RECURSIVE: u64 = 0x8000;
     const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
-    const VALID_FLAGS: u64 = AT_EMPTY_PATH | AT_RECURSIVE | AT_SYMLINK_NOFOLLOW;
+    const AT_NO_AUTOMOUNT: u64 = 0x800;
+    const VALID_FLAGS: u64 = AT_EMPTY_PATH | AT_RECURSIVE | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT;
+    const MOUNT_ATTR_RDONLY: u64 = 1;
+    const MOUNT_ATTR_NOSUID: u64 = 2;
+    const MOUNT_ATTR_NODEV: u64 = 4;
+    const MOUNT_ATTR_NOEXEC: u64 = 8;
+    const MOUNT_ATTR_ATIME: u64 = 0x70;
+    const MOUNT_ATTR_NOATIME: u64 = 0x10;
     const MOUNT_ATTR_IDMAP: u64 = 0x10_0000;
-    const VALID_ATTRIBUTES: u64 = 1 | 2 | 4 | 8 | 0x10 | 0x20 | 0x80 | MOUNT_ATTR_IDMAP | 0x20_0000;
-    if size < MOUNT_ATTR_SIZE as u64 {
-        return LINUX_E2BIG;
-    }
+    const VALID_ATTRIBUTES: u64 = MOUNT_ATTR_RDONLY
+        | MOUNT_ATTR_NOSUID
+        | MOUNT_ATTR_NODEV
+        | MOUNT_ATTR_NOEXEC
+        | MOUNT_ATTR_ATIME
+        | 0x80
+        | MOUNT_ATTR_IDMAP
+        | 0x20_0000;
+    const MS_UNBINDABLE: u64 = 1 << 17;
+    const MS_PRIVATE: u64 = 1 << 18;
+    const MS_SLAVE: u64 = 1 << 19;
+    const MS_SHARED: u64 = 1 << 20;
+    let flags = u64::from(flags as u32);
     if flags & !VALID_FLAGS != 0 {
         return LINUX_EINVAL;
+    }
+    if size > PAGE_SIZE as u64 {
+        return LINUX_E2BIG;
+    }
+    if size < MOUNT_ATTR_SIZE as u64 {
+        return LINUX_EINVAL;
+    }
+    if !linux_privileged_operation_allowed(linux_user::PrivilegedOperation::ManageMounts)
+        || !linux_has_capability(ginux_credentials::capability::SYS_ADMIN)
+    {
+        return LINUX_EPERM;
     }
     let mut attributes = [0_u8; MOUNT_ATTR_SIZE];
     if !copy_from_linux_user(attributes_address, &mut attributes) {
         return LINUX_EFAULT;
     }
-    let set = u64::from_ne_bytes(attributes[..8].try_into().unwrap());
-    let clear = u64::from_ne_bytes(attributes[8..16].try_into().unwrap());
-    let propagation = u64::from_ne_bytes(attributes[16..24].try_into().unwrap());
-    let user_namespace = u64::from_ne_bytes(attributes[24..32].try_into().unwrap());
+    // A larger structure's tail must be zero (copy_struct_from_user).
+    let mut tail = [0_u8; 64];
+    let mut offset = MOUNT_ATTR_SIZE as u64;
+    while offset < size {
+        let length = (size - offset).min(tail.len() as u64) as usize;
+        if !copy_from_linux_user(attributes_address + offset, &mut tail[..length]) {
+            return LINUX_EFAULT;
+        }
+        if tail[..length].iter().any(|byte| *byte != 0) {
+            return LINUX_E2BIG;
+        }
+        offset += length as u64;
+    }
+    let word = |at: usize| u64::from_ne_bytes(attributes[at..at + 8].try_into().unwrap());
+    let (set, clear, propagation, user_namespace) = (word(0), word(8), word(16), word(24));
+    if set == 0 && clear == 0 && propagation == 0 {
+        return 0;
+    }
+    use crate::linux_mounts::Propagation;
+    let propagation = match propagation {
+        0 => None,
+        MS_SHARED => Some(Propagation::Shared),
+        MS_PRIVATE => Some(Propagation::Private),
+        MS_SLAVE => Some(Propagation::Slave),
+        MS_UNBINDABLE => Some(Propagation::Unbindable),
+        _ => return LINUX_EINVAL,
+    };
     if (set | clear) & !VALID_ATTRIBUTES != 0
-        || set & clear != 0
-        || propagation != 0
+        || clear & MOUNT_ATTR_ATIME != 0 && clear & MOUNT_ATTR_ATIME != MOUNT_ATTR_ATIME
+        || clear & MOUNT_ATTR_ATIME == 0 && set & MOUNT_ATTR_ATIME != 0
         || user_namespace != 0 && set & MOUNT_ATTR_IDMAP == 0
     {
         return LINUX_EINVAL;
+    }
+    let options = |attributes: u64| {
+        [
+            (MOUNT_ATTR_RDONLY, crate::linux_mounts::READ_ONLY),
+            (MOUNT_ATTR_NOSUID, crate::linux_mounts::NO_SUID),
+            (MOUNT_ATTR_NODEV, crate::linux_mounts::NO_DEVICES),
+            (MOUNT_ATTR_NOEXEC, crate::linux_mounts::NO_EXEC),
+        ]
+        .into_iter()
+        .filter(|(attribute, _)| attributes & attribute != 0)
+        .fold(0, |options, (_, option)| options | option)
+    };
+    let mut set_options = options(set);
+    let mut clear_options = options(clear);
+    if clear & MOUNT_ATTR_ATIME != 0 {
+        clear_options |= crate::linux_mounts::NO_ATIME;
+        if set & MOUNT_ATTR_ATIME == MOUNT_ATTR_NOATIME {
+            set_options |= crate::linux_mounts::NO_ATIME;
+        }
     }
     let mut path = [0_u8; LINUX_PATH_MAX];
     let length = match copy_linux_c_string(path_address, &mut path) {
         Ok(length) => length,
         Err(error) => return error,
     };
-    if length == 0 {
-        if flags & AT_EMPTY_PATH == 0 || !linux_descriptor_open(directory) {
+    let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    let length = if length == 0 {
+        if flags & AT_EMPTY_PATH == 0 {
             return LINUX_ENOENT;
+        }
+        if !linux_descriptor_open(directory) {
+            return LINUX_EBADF;
+        }
+        // A descriptor of a detached mount (fsmount, open_tree) has no
+        // place in the table to change.
+        match linux_descriptor_path(directory, &mut canonical) {
+            Some(length) => length,
+            None => return 0,
         }
     } else {
-        let path = &path[..length];
-        if linux_canonical_path_at(
-            directory,
-            path,
-            &mut [0; crate::linux_overlay::PATH_CAPACITY],
-        )
-        .is_err()
-        {
-            return LINUX_ENOENT;
+        match linux_canonical_path_at(directory, &path[..length], &mut canonical) {
+            Ok(length) => length,
+            Err(LINUX_EISDIR) => 0,
+            Err(error) => return error,
         }
+    };
+    let canonical = &canonical[..length];
+    if linux_path_access(canonical).is_none() && !linux_kernel_mount_point(canonical) {
+        return linux_missing_path_error(canonical);
     }
-    0
+    let space = linux_mount_space();
+    let kernel_point = linux_kernel_mount_point(canonical);
+    if !kernel_point && !crate::linux_mounts::is_mount_point(space, canonical) {
+        return LINUX_EINVAL;
+    }
+    let recursive = flags & AT_RECURSIVE != 0;
+    let changed = crate::linux_mounts::change_options(
+        space,
+        canonical,
+        (set_options, clear_options),
+        recursive,
+        kernel_point,
+    )
+    .and_then(|()| {
+        propagation.map_or(Ok(()), |kind| {
+            crate::linux_mounts::set_propagation(space, canonical, kind, recursive, kernel_point)
+        })
+    });
+    match changed {
+        Ok(()) => 0,
+        Err(crate::linux_mounts::Error::NotMounted) => LINUX_EINVAL,
+        Err(crate::linux_mounts::Error::NoMemory) => LINUX_ENOMEM,
+    }
 }
 
 /// The descriptor a `/proc/self/fd/N` magic link in `path` names, with

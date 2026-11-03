@@ -2158,6 +2158,7 @@ fn linux_syscall_dispatch(
         LINUX_SETNS_SYSCALL => linux_setns(first_argument, buffer),
         LINUX_REBOOT_SYSCALL => linux_reboot(first_argument, buffer, count, register(0)),
         LINUX_CHROOT_SYSCALL => linux_chroot(first_argument),
+        LINUX_PIVOT_ROOT_SYSCALL => linux_pivot_root(first_argument, buffer),
         LINUX_ACCT_SYSCALL => linux_acct(first_argument),
         LINUX_PTRACE_SYSCALL
             if linux_privileged_operation_allowed(

@@ -14,10 +14,7 @@ ioctl01 TBROK
 ioctl02 TBROK
 ioctl_loop05 TBROK
 kcmp03 TFAIL
-mount_setattr02 TBROK
 msgstress01 TBROK
-pivot_root01 TBROK
 prot_hsymlinks TBROK
-statmount03 TBROK
 userfaultfd03 TBROK
 futex_cmp_requeue01 TBROK

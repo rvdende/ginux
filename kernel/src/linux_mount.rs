@@ -46,6 +46,14 @@ pub(crate) struct MountNamespaceHandle {
     id: u32,
 }
 
+impl MountNamespaceHandle {
+    /// The namespace's id: what statmount's mnt_ns_id reports, what keys
+    /// its mount table (`linux_mounts::Space`) and its nsfs inode is made of.
+    pub(crate) fn id(self) -> u32 {
+        self.id
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MountNamespace {
     handle: MountNamespaceHandle,
@@ -268,11 +276,11 @@ fn activate_domain_root(owner_domain: u64, root: NamespaceRoot) -> bool {
         .current_generation
         .store(handle.generation, Ordering::Release);
     MOUNT_RUNTIME.current_id.store(handle.id, Ordering::Release);
-    current().is_some()
+    installed().is_some()
 }
 
 pub(crate) fn deactivate_initial() -> bool {
-    let Some(active) = current() else {
+    let Some(active) = installed() else {
         return false;
     };
     if live_namespace(active).is_none_or(|namespace| !namespace.domain_root) {
@@ -283,7 +291,7 @@ pub(crate) fn deactivate_initial() -> bool {
     MOUNT_RUNTIME
         .current_slot
         .store(EMPTY_SLOT, Ordering::Release);
-    current().is_none()
+    installed().is_none()
 }
 
 pub(crate) fn current_root_is_read_only() -> bool {
@@ -326,11 +334,40 @@ pub(crate) fn switch_to(handle: MountNamespaceHandle) -> bool {
         .current_generation
         .store(handle.generation, Ordering::Release);
     MOUNT_RUNTIME.current_id.store(handle.id, Ordering::Release);
-    current() == Some(handle)
+    installed() == Some(handle)
+}
+
+/// Whether `handle` is a domain's own (first) mount namespace, which lives
+/// as long as the domain.
+pub(crate) fn is_domain_root(handle: MountNamespaceHandle) -> bool {
+    live_namespace(handle).is_some_and(|namespace| namespace.domain_root)
+}
+
+/// Makes sure `handle` is not the namespace `switch_to` last installed, so
+/// it can be retired: the current process's own, or else its domain's
+/// first one, takes its place.
+pub(crate) fn vacate(handle: MountNamespaceHandle) -> bool {
+    if installed() != Some(handle) {
+        return true;
+    }
+    let Some(owner_domain) = live_namespace(handle).map(|namespace| namespace.owner_domain) else {
+        return false;
+    };
+    let replacement = cpu::current_process_mount_namespace()
+        .filter(|own| *own != handle && live_namespace(*own).is_some())
+        .or_else(|| {
+            live_table()?
+                .namespaces
+                .iter()
+                .flatten()
+                .find(|namespace| namespace.owner_domain == owner_domain && namespace.domain_root)
+                .map(|namespace| namespace.handle)
+        });
+    replacement.is_some_and(switch_to)
 }
 
 pub(crate) fn retire(handle: MountNamespaceHandle) -> bool {
-    if current() == Some(handle) {
+    if current() == Some(handle) || installed() == Some(handle) {
         return false;
     }
     live_table_mut().is_some_and(|table| table.retire(handle))
@@ -350,8 +387,11 @@ pub(crate) fn current_namespace_id() -> Option<u64> {
         .map(|handle| u64::from(handle.id))
 }
 
+/// The unique (64-bit) id of the current namespace's mount `local_id`:
+/// the namespace's id above the mount's own. The caller has checked that
+/// the mount exists.
 pub(crate) fn current_unique_mount_id(local_id: u64) -> Option<u64> {
-    if !matches!(local_id, 1 | 2) {
+    if local_id == 0 || local_id > u64::from(u32::MAX) {
         return None;
     }
     current_namespace_id()?
@@ -359,7 +399,17 @@ pub(crate) fn current_unique_mount_id(local_id: u64) -> Option<u64> {
         .and_then(|namespace| namespace.checked_add(local_id))
 }
 
+/// The current process's mount namespace: the one its runtime record
+/// names, which no other CPU's process switches change; before there is
+/// one (boot, a domain starting), the one last installed.
 fn current() -> Option<MountNamespaceHandle> {
+    cpu::current_process_mount_namespace()
+        .filter(|handle| live_namespace(*handle).is_some())
+        .or_else(installed)
+}
+
+/// The namespace `switch_to` last installed, on whichever CPU.
+fn installed() -> Option<MountNamespaceHandle> {
     let slot = MOUNT_RUNTIME.current_slot.load(Ordering::Acquire);
     let generation = MOUNT_RUNTIME.current_generation.load(Ordering::Acquire);
     let id = MOUNT_RUNTIME.current_id.load(Ordering::Acquire);
@@ -393,11 +443,6 @@ fn live_table_mut() -> Option<&'static mut MountNamespaceTable> {
 }
 
 impl MountNamespaceHandle {
-    /// The namespace's number, which its nsfs inode is made of.
-    pub(crate) fn id(self) -> u32 {
-        self.id
-    }
-
     /// The handle as a word a /proc/PID/ns descriptor keeps (`from_word`).
     pub(crate) fn to_word(self) -> u64 {
         u64::from(self.slot) << 24 | u64::from(self.generation & 0xff_ffff)
