@@ -139,10 +139,14 @@ feature rather than a fix:
   a RAM filesystem, device 0), and the device tests below need a
   filesystem made on a loop device and mounted.
 - **Memory details**: mmap, madvise, mremap, msync, mlock and mseal
-  corner cases, `/proc/self/smaps`, `/proc/PID/pagemap`. MAP_32BIT
-  cannot place anything (mmap24): the kernel's identity map holds the
-  first 4 GiB of every process. Shrinking a file turns its pages past
-  the new end into SIGBUS pages only in the process that truncates it.
+  corner cases, `/proc/self/smaps`, `/proc/PID/pagemap`. A Linux
+  process's first 4 GiB hold only the kernel's own 2 MiB regions (its
+  image and the firmware's runtime services, `paging::linux_low_template`;
+  under QEMU about 90 MiB near 2 GiB), so MAP_32BIT places around them
+  (mmap24). MAP_FIXED still starts at 256 MiB, not mmap_min_addr: below
+  it munmap, mprotect and madvise take the program-image paths. Shrinking
+  a file turns its pages past the new end into SIGBUS pages only in the
+  process that truncates it.
 - **musl, not the kernel**: tests that cannot pass with musl are skipped
   in `tests/ltp/syscalls.list` with the reason (fork() is the fork system
   call, readlink with size 0 gets a one-byte buffer, fchmod retries

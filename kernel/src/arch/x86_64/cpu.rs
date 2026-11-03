@@ -74,16 +74,18 @@ pub(crate) const LINUX_MMAP_SLOT_COUNT: usize = 4;
 const LINUX_RUNTIME_MMAP_SLOT_COUNT: usize = 32;
 const LINUX_RUNTIME_DYNAMIC_MMAP_BASE: u64 = 1 << 39;
 /// Where MAP_32BIT mappings go: the second gigabyte, as on x86-64 Linux,
-/// above the program image and heap and below 2 GiB.
+/// above the program image and heap and below 2 GiB. The 2 MiB regions
+/// the kernel keeps in every address space (its image, wherever the
+/// firmware put it, `paging::linux_low_template`) are taken there.
 const LINUX_LOW_MMAP_BASE: u64 = 0x4000_0000;
 const LINUX_LOW_MMAP_LIMIT: u64 = 0x8000_0000;
 /// The lowest address a program may map at with MAP_FIXED (or unmap and
 /// protect) below the mmap area, up to it: above the kernel's own
 /// placements (heap, stack, vDSO and the program image near 4 MiB), so only
 /// the program's own mappings are there (munmap04 maps from 256 MiB up).
-/// Ranges the kernel's own mappings hold (the low identity map) cannot get
-/// page tables of the process's and are EEXIST. munmap, mprotect and
-/// madvise from here up take the runtime's paths.
+/// The kernel's own regions there (the low template's) are EEXIST, or
+/// ENOMEM for MAP_FIXED. munmap, mprotect and madvise from here up take
+/// the runtime's paths, and exec drops what is mapped from here up.
 const LINUX_FIXED_LOW_BASE: u64 = 0x1000_0000;
 
 /// Whether `[address, end)` lies in the fixed-mapping window below the mmap
@@ -26183,14 +26185,15 @@ fn linux_runtime_mmap(
     {
         return LINUX_EPERM;
     }
-    // A large private anonymous mapping the kernel places, neither
-    // populated nor locked, is reserved lazily (LINUX_LAZY_MAPPING_PAGES):
-    // the dispatcher records its memory area, and its pages are made as
-    // they are touched.
+    // A large private anonymous mapping the kernel places in the mmap
+    // area, neither populated nor locked, is reserved lazily
+    // (LINUX_LAZY_MAPPING_PAGES): the dispatcher records its memory area,
+    // and its pages are made as they are touched.
     let lazy = anonymous
         && sharing == LINUX_MAP_PRIVATE
         && !fixed
         && !no_replace
+        && !low
         && flags & (LINUX_MAP_POPULATE | LINUX_MAP_LOCKED) == 0
         && matches!(protection, 0 | 1 | 3)
         && pages >= LINUX_LAZY_MAPPING_PAGES
@@ -32036,13 +32039,18 @@ fn linux_rootfs_execve_source(
     reset_linux_signal_state_after_exec();
     let _ = set_current_linux_clear_child_tid(0);
     let _ = set_current_linux_robust_list(0);
-    // Drop the old program's mmap area; the new image's own pages are kept.
+    // Drop the old program's mmap area and its mappings below it (MAP_FIXED
+    // and MAP_32BIT memory); the new image's own pages are kept.
     // The high image window is left alone: releasing it from a vfork child
     // of a high-loaded program unmapped that program's own code. Each
     // private page loses this mapping; a vfork child's pages, all its
     // parent's, stay with the parent.
     if !address_space::release_current_linux_runtime_mappings_preserving(
         LINUX_RUNTIME_DYNAMIC_MMAP_BASE,
+        |frame| !address_space::linux_private_page_counted(frame),
+        |frame| replacements[..replacement_count].contains(&frame),
+    ) || !address_space::release_current_linux_low_mappings_preserving(
+        LINUX_FIXED_LOW_BASE,
         |frame| !address_space::linux_private_page_counted(frame),
         |frame| replacements[..replacement_count].contains(&frame),
     ) {

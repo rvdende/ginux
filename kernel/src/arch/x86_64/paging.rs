@@ -1,7 +1,10 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::{arch::asm, cell::UnsafeCell};
 
-use crate::{pe::ImageSummary, BootInfo, UefiMemoryDescriptor, EFI_RUNTIME_SERVICES_CODE};
+use crate::{
+    pe::ImageSummary, BootInfo, UefiMemoryDescriptor, EFI_RUNTIME_SERVICES_CODE,
+    EFI_RUNTIME_SERVICES_DATA,
+};
 
 const ENTRY_COUNT: usize = 512;
 const DIRECTORY_COUNT: usize = 4;
@@ -473,6 +476,17 @@ struct PagingOwner {
     /// stays writable after boot: page tables for stacks are added to it
     /// while the kernel runs.
     kernel_stack_directory: UnsafeCell<PageTable>,
+    /// What a Linux process's first PML4 entry starts from: the kernel's
+    /// identity entries for only the 2 MiB regions it still reaches by
+    /// physical address while a process's tables are loaded (its own
+    /// image, which holds the boot inputs, and the firmware's runtime
+    /// services), so the rest of the first 4 GiB is the process's to map.
+    /// Entries point at the same leaves and fine tables as the kernel's
+    /// directories; the tables are sealed read-only with the others, and
+    /// a process makes a directory its own only to add user tables beside
+    /// these entries (`address_space::ensure_current_linux_leaf`).
+    linux_low_pdpt: UnsafeCell<PageTable>,
+    linux_low_directories: UnsafeCell<[PageTable; DIRECTORY_COUNT]>,
     /// End of the physical range reachable through the direct map once RAM
     /// above the initial identity map joins it; zero until then. (A zero
     /// initializer keeps this owner, and its page tables, out of the image's
@@ -494,11 +508,36 @@ static PAGING: PagingOwner = PagingOwner {
     device_directory: UnsafeCell::new(PageTable([0; ENTRY_COUNT])),
     device_table: UnsafeCell::new(PageTable([0; ENTRY_COUNT])),
     kernel_stack_directory: UnsafeCell::new(PageTable([0; ENTRY_COUNT])),
+    linux_low_pdpt: UnsafeCell::new(PageTable([0; ENTRY_COUNT])),
+    linux_low_directories: UnsafeCell::new([PageTable([0; ENTRY_COUNT]); DIRECTORY_COUNT]),
     direct_map_limit: AtomicUsize::new(0),
 };
 
 pub(crate) fn kernel_root_address() -> u64 {
     PAGING.pml4.get().cast_const() as u64
+}
+
+/// The physical address of the directory-pointer table a Linux process's
+/// first PML4 entry is copied from (`PagingOwner::linux_low_pdpt`).
+pub(crate) fn linux_low_template() -> u64 {
+    PAGING.linux_low_pdpt.get().cast_const() as u64
+}
+
+/// The shared template directory for gigabyte `index` of the first 4 GiB,
+/// if the kernel keeps any region there.
+pub(crate) fn linux_low_template_directory(index: usize) -> Option<u64> {
+    if index >= DIRECTORY_COUNT {
+        return None;
+    }
+    // SAFETY: the template is written once during boot, before any Linux
+    // process exists, and is read-only afterwards.
+    let entry = unsafe {
+        core::ptr::addr_of!((*PAGING.linux_low_pdpt.get()).0)
+            .cast::<u64>()
+            .add(index)
+            .read()
+    };
+    (entry & PRESENT != 0).then_some(entry & ADDRESS_MASK as u64)
 }
 
 /// Returns the end of the physical range the direct map covers.
@@ -1351,22 +1390,7 @@ pub(crate) unsafe fn install_initial_identity_map(
         }
     }
 
-    const TABLE_PAGE_COUNT: usize = 8 + DIRECTORY_COUNT + MAX_FINE_TABLES;
-    let mut table_pages = [0_usize; TABLE_PAGE_COUNT];
-    table_pages[TABLE_PAGE_COUNT - 1] = PAGING.framebuffer_directory.get().cast_const() as usize;
-    table_pages[TABLE_PAGE_COUNT - 2] = PAGING.device_directory.get().cast_const() as usize;
-    table_pages[TABLE_PAGE_COUNT - 3] = PAGING.device_table.get().cast_const() as usize;
-    table_pages[0] = pml4_address;
-    table_pages[1] = pdpt_address;
-    table_pages[2] = direct_pdpt_address;
-    table_pages[3] = mmio_directory_address;
-    table_pages[4] = mmio_table_address;
-    for index in 0..DIRECTORY_COUNT {
-        table_pages[5 + index] = directories_address + index * PAGE_SIZE;
-    }
-    for index in 0..MAX_FINE_TABLES {
-        table_pages[5 + DIRECTORY_COUNT + index] = fine_tables_address + index * PAGE_SIZE;
-    }
+    let table_pages = static_table_pages();
     for address in table_pages {
         ensure_fine_region(
             address / LARGE_PAGE_SIZE as usize,
@@ -1376,6 +1400,9 @@ pub(crate) unsafe fn install_initial_identity_map(
             directories,
         )?;
     }
+    // The identity directories are final now: sealing the table pages
+    // changes only fine tables, which the template shares.
+    install_linux_low_template(boot_info, image, required_addresses);
     for address in table_pages {
         let region = address / LARGE_PAGE_SIZE as usize;
         let Some(fine_index) = fine_regions[..fine_count]
@@ -1977,26 +2004,171 @@ pub(crate) fn mmio_translation_is_bounded(
         && mapping.address(u64::MAX, 1).is_none()
 }
 
+/// How many pages `static_table_pages` lists.
+const STATIC_TABLE_PAGE_COUNT: usize = 9 + 2 * DIRECTORY_COUNT + MAX_FINE_TABLES;
+
+/// The pages of the kernel's static page tables, which are sealed
+/// read-only once built. The kernel stack directory is not among them: it
+/// gains tables while the kernel runs.
+fn static_table_pages() -> [usize; STATIC_TABLE_PAGE_COUNT] {
+    let single = [
+        PAGING.pml4.get().cast_const() as usize,
+        PAGING.pdpt.get().cast_const() as usize,
+        PAGING.direct_pdpt.get().cast_const() as usize,
+        PAGING.mmio_directory.get().cast_const() as usize,
+        PAGING.mmio_table.get().cast_const() as usize,
+        PAGING.framebuffer_directory.get().cast_const() as usize,
+        PAGING.device_directory.get().cast_const() as usize,
+        PAGING.device_table.get().cast_const() as usize,
+        PAGING.linux_low_pdpt.get().cast_const() as usize,
+    ];
+    let arrays = [
+        (
+            PAGING.page_directories.get().cast_const() as usize,
+            DIRECTORY_COUNT,
+        ),
+        (
+            PAGING.linux_low_directories.get().cast_const() as usize,
+            DIRECTORY_COUNT,
+        ),
+        (
+            PAGING.fine_page_tables.get().cast_const() as usize,
+            MAX_FINE_TABLES,
+        ),
+    ];
+    let mut pages = [0; STATIC_TABLE_PAGE_COUNT];
+    pages[..single.len()].copy_from_slice(&single);
+    let mut next = single.len();
+    for (base, count) in arrays {
+        for index in 0..count {
+            pages[next] = base + index * PAGE_SIZE;
+            next += 1;
+        }
+    }
+    pages
+}
+
+/// Fills the Linux low template (`PagingOwner::linux_low_pdpt`) from the
+/// finished identity directories. It keeps the 2 MiB regions holding the
+/// kernel image (which carries the boot inputs, the boot handoff and the
+/// kernel's own stacks and tables), the other addresses the handoff names
+/// (the ACPI root pointer, the firmware's reset entry) and the firmware's
+/// runtime services. The rest of the first 4 GiB is free RAM, which the
+/// kernel reaches through the direct map, and device ranges, which it
+/// reaches through its windows; it is left to Linux processes.
+///
+/// # Safety
+///
+/// Runs once, from `install_initial_identity_map` with interrupts off,
+/// after the last change to an identity directory entry.
+unsafe fn install_linux_low_template(
+    boot_info: &BootInfo,
+    image: &ImageSummary,
+    required_addresses: &[usize],
+) {
+    const REGIONS: usize = DIRECTORY_COUNT * ENTRY_COUNT;
+    let mut resident = [false; REGIONS];
+    let mut keep = |start: usize, end: usize| {
+        let first = start / LARGE_PAGE_SIZE as usize;
+        let last = end.div_ceil(LARGE_PAGE_SIZE as usize).min(REGIONS);
+        for region in resident.iter_mut().take(last).skip(first) {
+            *region = true;
+        }
+    };
+    let (image_start, image_end) = image.image_range();
+    keep(image_start, image_end);
+    for address in required_addresses {
+        keep(*address, address.saturating_add(1));
+    }
+    let descriptor_count = boot_info.memory_map_size / boot_info.memory_descriptor_size;
+    for index in 0..descriptor_count {
+        let descriptor = read_descriptor(boot_info, index);
+        if !matches!(
+            descriptor.memory_type,
+            EFI_RUNTIME_SERVICES_CODE | EFI_RUNTIME_SERVICES_DATA
+        ) {
+            continue;
+        }
+        let start = usize::try_from(descriptor.physical_start).unwrap_or(usize::MAX);
+        let size = usize::try_from(descriptor.page_count)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(PAGE_SIZE);
+        if start < INITIAL_IDENTITY_LIMIT {
+            keep(
+                start,
+                start.saturating_add(size).min(INITIAL_IDENTITY_LIMIT),
+            );
+        }
+    }
+    let directories = PAGING
+        .page_directories
+        .get()
+        .cast_const()
+        .cast::<PageTable>();
+    let low_pdpt = core::ptr::addr_of_mut!((*PAGING.linux_low_pdpt.get()).0).cast::<u64>();
+    let low_directories = PAGING.linux_low_directories.get().cast::<PageTable>();
+    zero_entries(low_pdpt);
+    for directory_index in 0..DIRECTORY_COUNT {
+        let kernel = core::ptr::addr_of!((*directories.add(directory_index)).0).cast::<u64>();
+        let low = low_directories.add(directory_index);
+        let entries = core::ptr::addr_of_mut!((*low).0).cast::<u64>();
+        zero_entries(entries);
+        let mut kept = false;
+        for entry_index in 0..ENTRY_COUNT {
+            if resident[directory_index * ENTRY_COUNT + entry_index] {
+                entries
+                    .add(entry_index)
+                    .write(kernel.add(entry_index).read());
+                kept = true;
+            }
+        }
+        if kept {
+            low_pdpt
+                .add(directory_index)
+                .write((low as u64) | PRESENT | WRITABLE);
+        }
+    }
+}
+
+/// Writes the ranges of the first 4 GiB that Linux processes cannot map,
+/// the kernel's own (`install_linux_low_template`), to the kernel log.
+pub(crate) fn report_linux_low_template() {
+    let directories = PAGING
+        .linux_low_directories
+        .get()
+        .cast_const()
+        .cast::<PageTable>();
+    let kept = |region: usize| {
+        region < DIRECTORY_COUNT * ENTRY_COUNT
+            // SAFETY: the template is read-only after boot.
+            && unsafe {
+                core::ptr::addr_of!((*directories.add(region / ENTRY_COUNT)).0)
+                    .cast::<u64>()
+                    .add(region % ENTRY_COUNT)
+                    .read()
+            } & PRESENT
+                != 0
+    };
+    crate::serial_write("ginux: kernel ranges in Linux address spaces:");
+    let mut run_start = None;
+    for region in 0..=DIRECTORY_COUNT * ENTRY_COUNT {
+        match (kept(region), run_start) {
+            (true, None) => run_start = Some(region),
+            (false, Some(start)) => {
+                crate::serial_write(" ");
+                crate::serial_write_u64(start as u64 * LARGE_PAGE_SIZE);
+                crate::serial_write("-");
+                crate::serial_write_u64(region as u64 * LARGE_PAGE_SIZE);
+                run_start = None;
+            }
+            _ => {}
+        }
+    }
+    crate::serial_write("\r\n");
+}
+
 pub(crate) fn static_page_tables_are_read_only() -> bool {
-    const TABLE_PAGE_COUNT: usize = 8 + DIRECTORY_COUNT + MAX_FINE_TABLES;
-    let mut table_pages = [0_usize; TABLE_PAGE_COUNT];
-    table_pages[TABLE_PAGE_COUNT - 1] = PAGING.framebuffer_directory.get().cast_const() as usize;
-    table_pages[TABLE_PAGE_COUNT - 2] = PAGING.device_directory.get().cast_const() as usize;
-    table_pages[TABLE_PAGE_COUNT - 3] = PAGING.device_table.get().cast_const() as usize;
-    table_pages[0] = PAGING.pml4.get().cast_const() as usize;
-    table_pages[1] = PAGING.pdpt.get().cast_const() as usize;
-    table_pages[2] = PAGING.direct_pdpt.get().cast_const() as usize;
-    table_pages[3] = PAGING.mmio_directory.get().cast_const() as usize;
-    table_pages[4] = PAGING.mmio_table.get().cast_const() as usize;
-    let directories_address = PAGING.page_directories.get().cast_const() as usize;
-    let fine_tables_address = PAGING.fine_page_tables.get().cast_const() as usize;
-    for index in 0..DIRECTORY_COUNT {
-        table_pages[5 + index] = directories_address + index * PAGE_SIZE;
-    }
-    for index in 0..MAX_FINE_TABLES {
-        table_pages[5 + DIRECTORY_COUNT + index] = fine_tables_address + index * PAGE_SIZE;
-    }
-    table_pages.into_iter().all(|address| unsafe {
+    static_table_pages().into_iter().all(|address| unsafe {
         let region = address / LARGE_PAGE_SIZE as usize;
         let directory = PAGING
             .page_directories
@@ -2199,7 +2371,12 @@ fn is_static_table_page(address: usize) -> bool {
         || address == PAGING.framebuffer_directory.get().cast_const() as usize
         || address == PAGING.device_directory.get().cast_const() as usize
         || address == PAGING.device_table.get().cast_const() as usize
+        || address == PAGING.linux_low_pdpt.get().cast_const() as usize
     {
+        return true;
+    }
+    let low_directories = PAGING.linux_low_directories.get().cast_const() as usize;
+    if (low_directories..low_directories + DIRECTORY_COUNT * PAGE_SIZE).contains(&address) {
         return true;
     }
     let directories = PAGING.page_directories.get().cast_const() as usize;

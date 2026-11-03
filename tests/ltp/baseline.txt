@@ -20,7 +20,6 @@ ioctl_ns03 TBROK
 ioctl_ns05 TBROK
 ioctl_ns06 TBROK
 kcmp03 TFAIL
-mmap24 TFAIL
 mount_setattr02 TBROK
 msgstress01 TBROK
 pivot_root01 TBROK

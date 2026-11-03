@@ -108,6 +108,7 @@ const EFI_LOADER_DATA: u32 = 2;
 const EFI_BOOT_SERVICES_CODE: u32 = 3;
 const EFI_BOOT_SERVICES_DATA: u32 = 4;
 pub(crate) const EFI_RUNTIME_SERVICES_CODE: u32 = 5;
+pub(crate) const EFI_RUNTIME_SERVICES_DATA: u32 = 6;
 const EFI_CONVENTIONAL_MEMORY: u32 = 7;
 const UEFI_PAGES_PER_MIB: u64 = 256;
 const PAGE_SIZE: usize = 4096;
@@ -666,6 +667,7 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
         kernel_fail("ginux: static kernel page tables remain writable\r\n");
     }
     serial_write("ginux: static kernel page tables sealed read-only\r\n");
+    arch::x86_64::paging::report_linux_low_template();
     if !arch::x86_64::cpu::enable_supervisor_execution_prevention() {
         kernel_fail("ginux: SMEP unavailable or inactive\r\n");
     }
@@ -4479,7 +4481,10 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     serial_write("\r\nginux: controller requested clean shutdown");
     serial_write("\r\nGINUX_KERNEL_OK\r\n");
 
-    // A privileged domain's reboot(2) may have asked for a cold reset.
+    // A privileged domain's reboot(2) may have asked for a cold reset. The
+    // firmware runs on the kernel's own tables, which map all its memory
+    // (a Linux process's map only its runtime services).
+    address_space::activate_root(arch::x86_64::paging::kernel_root_address());
     (boot_info.reset_system)(
         machine_control::reset_kind(),
         EFI_SUCCESS,

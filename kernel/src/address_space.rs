@@ -390,12 +390,21 @@ pub(crate) fn run_linux_init(init: &[u8]) -> LinuxProcessOutcome {
             let kernel_entries = mapped_frame::<u64>(kernel_root)?;
             root_entries.add(256).write(kernel_entries.add(256).read());
             root_entries.write(pdpt.address() | PRESENT | WRITABLE | USER);
+            // The first 4 GiB hold only the kernel's own regions (the
+            // template's); the process's mappings go everywhere else.
             let pdpt_entries = mapped_frame::<u64>(pdpt.address())?;
-            let kernel_pdpt = mapped_frame::<u64>(kernel_entries.read() & ADDRESS_MASK)?;
-            core::ptr::copy_nonoverlapping(kernel_pdpt, pdpt_entries, ENTRY_COUNT);
-            let kernel_directory = mapped_frame::<u64>(kernel_pdpt.read() & ADDRESS_MASK)?;
+            let template = mapped_frame::<u64>(paging::linux_low_template())?;
+            core::ptr::copy_nonoverlapping(template, pdpt_entries, ENTRY_COUNT);
             let directory_entries = mapped_frame::<u64>(directory.address())?;
-            core::ptr::copy_nonoverlapping(kernel_directory, directory_entries, ENTRY_COUNT);
+            if let Some(template_directory) = paging::linux_low_template_directory(0) {
+                let template_directory = mapped_frame::<u64>(template_directory)?;
+                core::ptr::copy_nonoverlapping(template_directory, directory_entries, ENTRY_COUNT);
+            }
+            // The program's tables below replace these entries: a kernel
+            // region there would vanish from the process's view.
+            if (2..=4).any(|index| directory_entries.add(index).read() != 0) {
+                return None;
+            }
             pdpt_entries.write(directory.address() | PRESENT | WRITABLE | USER);
             directory_entries
                 .add(2)
@@ -6158,11 +6167,17 @@ pub(crate) fn current_linux_range_unoccupied(address: u64, pages: usize) -> bool
             // SAFETY: the index is below 512 and the table is one of the
             // current address space's own, reached through its entries.
             let entry = unsafe { entries.add(((cursor >> shift) & 0x1ff) as usize).read() };
-            if entry & (PRESENT | USER) != PRESENT | USER || level > 0 && entry & LARGE_PAGE != 0 {
+            if entry & PRESENT == 0 {
                 // Nothing below this entry is a mapped or reserved page.
                 let span = 1_u64 << shift;
                 cursor = (cursor & !(span - 1)) + span;
                 continue 'pages;
+            }
+            // The kernel's own regions in the first 4 GiB (supervisor
+            // entries of the low template, `paging::linux_low_template`)
+            // are taken; a template directory is read for them.
+            if level > 0 && entry & LARGE_PAGE != 0 || level == 2 && entry & USER == 0 {
+                return false;
             }
             table = entry & ADDRESS_MASK;
         }
@@ -6259,12 +6274,36 @@ fn ensure_current_linux_leaf(address: u64) -> Option<PageEntry> {
             return Some(entry);
         }
         let value = entry.read();
-        if value == 0 {
+        // A gigabyte of the first 4 GiB where the kernel keeps a region
+        // still points at the shared template directory; the process gets
+        // a copy of its own to add tables beside the kernel's entries.
+        let template = (level == 1 && indexes[0] == 0)
+            .then(|| paging::linux_low_template_directory(index))
+            .flatten()
+            .filter(|template| {
+                value & (PRESENT | USER | LARGE_PAGE | ADDRESS_MASK) == PRESENT | template
+            });
+        if value == 0 || template.is_some() {
             let Some([frame]) = memory::allocate_frames::<1>(memory::FrameOwner::KERNEL) else {
                 break;
             };
+            if let Some(template) = template {
+                let (Some(source), Some(copy)) = (
+                    mapped_frame::<u64>(template),
+                    mapped_frame::<u64>(frame.address()),
+                ) else {
+                    let _ = memory::scrub_and_release_frames(
+                        memory::FrameOwner::KERNEL,
+                        core::slice::from_ref(&frame),
+                    );
+                    break;
+                };
+                // SAFETY: both are whole page tables; the template is
+                // read-only after boot and the frame was just allocated.
+                unsafe { core::ptr::copy_nonoverlapping(source, copy, ENTRY_COUNT) };
+            }
             entry.write(frame.address() | PRESENT | WRITABLE | USER);
-            created_entries[created] = Some(entry);
+            created_entries[created] = Some((entry, value));
             created_frames[created] = frame;
             created += 1;
             table = frame.address();
@@ -6275,8 +6314,8 @@ fn ensure_current_linux_leaf(address: u64) -> Option<PageEntry> {
         }
     }
     for index in (0..created).rev() {
-        if let Some(entry) = created_entries[index] {
-            entry.write(0);
+        if let Some((entry, previous)) = created_entries[index] {
+            entry.write(previous);
         }
         let _ = memory::scrub_and_release_frames(
             memory::FrameOwner::KERNEL,
@@ -7126,67 +7165,15 @@ pub(crate) fn release_current_linux_runtime_mappings_preserving(
             return false;
         }
         let directory_address = pdpt_value & ADDRESS_MASK;
-        let Some(directory) = mapped_frame::<u64>(directory_address) else {
+        let Some(directory_retained) = release_linux_runtime_tables(
+            directory_address,
+            0,
+            false,
+            &preserve_frame,
+            &preserve_mapping,
+        ) else {
             return false;
         };
-        let mut directory_retained = false;
-        for directory_index in 0..ENTRY_COUNT {
-            let directory_entry = unsafe { directory.add(directory_index) };
-            let directory_value = unsafe { directory_entry.read() };
-            if directory_value == 0 {
-                continue;
-            }
-            if directory_value & (PRESENT | USER | LARGE_PAGE) != PRESENT | USER {
-                return false;
-            }
-            let table_address = directory_value & ADDRESS_MASK;
-            let Some(table) = mapped_frame::<u64>(table_address) else {
-                return false;
-            };
-            let mut table_retained = false;
-            for leaf_index in 0..ENTRY_COUNT {
-                let leaf = unsafe { table.add(leaf_index) };
-                let value = unsafe { leaf.read() };
-                let page = linux_runtime_page_from_value(value);
-                if page.occupied {
-                    if page.frame.is_some_and(&preserve_mapping) {
-                        table_retained = true;
-                        continue;
-                    }
-                    unsafe { leaf.write(0) };
-                    if let Some(frame) = page.frame.filter(|frame| {
-                        !page.shared
-                            && !memory::frame_lease_is_runtime(*frame)
-                            && !preserve_frame(*frame)
-                    }) {
-                        if !memory::scrub_and_release_frames(
-                            memory::FrameOwner::KERNEL,
-                            core::slice::from_ref(&frame),
-                        ) {
-                            return false;
-                        }
-                    }
-                } else if value != 0 {
-                    return false;
-                }
-            }
-            let Some(table_lease) =
-                memory::live_frame_lease(memory::FrameOwner::KERNEL, table_address)
-            else {
-                return false;
-            };
-            if table_retained {
-                directory_retained = true;
-                continue;
-            }
-            unsafe { directory_entry.write(0) };
-            if !memory::scrub_and_release_frames(
-                memory::FrameOwner::KERNEL,
-                core::slice::from_ref(&table_lease),
-            ) {
-                return false;
-            }
-        }
         let Some(directory_lease) =
             memory::live_frame_lease(memory::FrameOwner::KERNEL, directory_address)
         else {
@@ -7216,6 +7203,170 @@ pub(crate) fn release_current_linux_runtime_mappings_preserving(
         memory::FrameOwner::KERNEL,
         core::slice::from_ref(&pdpt_lease),
     )
+}
+
+/// Drops the process's own mappings in the first 512 GiB from `start` (a
+/// multiple of 2 MiB), the MAP_FIXED and MAP_32BIT memory below the mmap
+/// area, as exec drops the old program's mmap area; frames and mappings
+/// are preserved as `release_current_linux_runtime_mappings_preserving`
+/// does. A gigabyte's directory that only these mappings needed goes
+/// back to the shared template directory, or to nothing.
+pub(crate) fn release_current_linux_low_mappings_preserving(
+    start: u64,
+    preserve_frame: impl Fn(memory::FrameLease) -> bool,
+    preserve_mapping: impl Fn(memory::FrameLease) -> bool,
+) -> bool {
+    if !start.is_multiple_of(1 << 21) || start >= 1 << 39 {
+        return false;
+    }
+    let root = current_root();
+    let Some(root_entries) = mapped_frame::<u64>(root) else {
+        return false;
+    };
+    let root_value = unsafe { root_entries.read() };
+    if root_value & (PRESENT | USER | LARGE_PAGE) != PRESENT | USER {
+        return false;
+    }
+    let Some(pdpt) = mapped_frame::<u64>(root_value & ADDRESS_MASK) else {
+        return false;
+    };
+    let first_directory = (start >> 30) as usize;
+    let mut released = false;
+    for pdpt_index in first_directory..ENTRY_COUNT {
+        let pdpt_entry = unsafe { pdpt.add(pdpt_index) };
+        let pdpt_value = unsafe { pdpt_entry.read() };
+        // Absent, or still the template's: nothing of the process's.
+        if pdpt_value & (PRESENT | USER) != PRESENT | USER {
+            continue;
+        }
+        if pdpt_value & LARGE_PAGE != 0 {
+            return false;
+        }
+        let directory_address = pdpt_value & ADDRESS_MASK;
+        let first_entry = if pdpt_index == first_directory {
+            ((start >> 21) & 0x1ff) as usize
+        } else {
+            0
+        };
+        let Some(retained) = release_linux_runtime_tables(
+            directory_address,
+            first_entry,
+            true,
+            &preserve_frame,
+            &preserve_mapping,
+        ) else {
+            return false;
+        };
+        released = true;
+        // A directory holding entries below `start` (the program's own,
+        // in the first gigabyte) stays.
+        if retained || first_entry != 0 {
+            continue;
+        }
+        let template = paging::linux_low_template_directory(pdpt_index);
+        let (Some(directory), Some(lease)) = (
+            mapped_frame::<u64>(directory_address),
+            memory::live_frame_lease(memory::FrameOwner::KERNEL, directory_address),
+        ) else {
+            return false;
+        };
+        // Only the kernel's entries, as the template has them, are left;
+        // a directory holding anything else stays.
+        let template_entries = template.and_then(mapped_frame::<u64>);
+        let matches_template = (0..ENTRY_COUNT).all(|index| {
+            let value = unsafe { directory.add(index).read() };
+            let expected =
+                template_entries.map_or(0, |entries| unsafe { entries.add(index).read() });
+            value & !(ACCESSED | DIRTY) == expected & !(ACCESSED | DIRTY)
+        });
+        if !matches_template {
+            continue;
+        }
+        unsafe {
+            pdpt_entry.write(template.map_or(0, |template| template | PRESENT | WRITABLE));
+        }
+        if !memory::scrub_and_release_frames(
+            memory::FrameOwner::KERNEL,
+            core::slice::from_ref(&lease),
+        ) {
+            return false;
+        }
+    }
+    if released {
+        // Drop paging-structure caches that may still hold freed tables.
+        unsafe { activate(root) };
+    }
+    true
+}
+
+/// Releases the page tables of `directory_address` from entry `first`
+/// on, and the pages they map but those `preserve_mapping` keeps (which
+/// keep their table); `preserve_frame` keeps a frame out of the release
+/// while its mapping goes. With `kernel_entries`, the kernel's
+/// supervisor entries (the low template's) are passed over; otherwise any
+/// entry but a user table is an error (None). Returns whether a table was
+/// retained.
+fn release_linux_runtime_tables(
+    directory_address: u64,
+    first: usize,
+    kernel_entries: bool,
+    preserve_frame: &impl Fn(memory::FrameLease) -> bool,
+    preserve_mapping: &impl Fn(memory::FrameLease) -> bool,
+) -> Option<bool> {
+    let directory = mapped_frame::<u64>(directory_address)?;
+    let mut directory_retained = false;
+    for directory_index in first..ENTRY_COUNT {
+        let directory_entry = unsafe { directory.add(directory_index) };
+        let directory_value = unsafe { directory_entry.read() };
+        if directory_value == 0 || kernel_entries && directory_value & USER == 0 {
+            continue;
+        }
+        if directory_value & (PRESENT | USER | LARGE_PAGE) != PRESENT | USER {
+            return None;
+        }
+        let table_address = directory_value & ADDRESS_MASK;
+        let table = mapped_frame::<u64>(table_address)?;
+        let mut table_retained = false;
+        for leaf_index in 0..ENTRY_COUNT {
+            let leaf = unsafe { table.add(leaf_index) };
+            let value = unsafe { leaf.read() };
+            let page = linux_runtime_page_from_value(value);
+            if page.occupied {
+                if page.frame.is_some_and(preserve_mapping) {
+                    table_retained = true;
+                    continue;
+                }
+                unsafe { leaf.write(0) };
+                if let Some(frame) = page.frame.filter(|frame| {
+                    !page.shared
+                        && !memory::frame_lease_is_runtime(*frame)
+                        && !preserve_frame(*frame)
+                }) {
+                    if !memory::scrub_and_release_frames(
+                        memory::FrameOwner::KERNEL,
+                        core::slice::from_ref(&frame),
+                    ) {
+                        return None;
+                    }
+                }
+            } else if value != 0 {
+                return None;
+            }
+        }
+        let table_lease = memory::live_frame_lease(memory::FrameOwner::KERNEL, table_address)?;
+        if table_retained {
+            directory_retained = true;
+            continue;
+        }
+        unsafe { directory_entry.write(0) };
+        if !memory::scrub_and_release_frames(
+            memory::FrameOwner::KERNEL,
+            core::slice::from_ref(&table_lease),
+        ) {
+            return None;
+        }
+    }
+    Some(directory_retained)
 }
 
 pub(crate) fn retire_linux_child_address_space(root: memory::FrameLease) -> bool {
