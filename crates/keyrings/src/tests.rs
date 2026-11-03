@@ -1090,10 +1090,11 @@ fn restricting_keyrings() {
         restrict(&mut keys, fresh, Some(b"user"), trusted),
         Err(Error::NotFound)
     );
-    // keyctl_common.h's is_asym_supported(): ENOKEY means no asymmetric keys.
+    // keyctl_common.h's is_asym_supported(): ENOKEY would mean no
+    // asymmetric keys; an unknown scheme is EINVAL.
     assert_eq!(
         restrict(&mut keys, fresh, Some(b"asymmetric"), Some(b"bogus")),
-        Err(Error::NoKey)
+        Err(Error::Invalid)
     );
     assert_eq!(
         restrict(&mut keys, no_setattr, None, None),
@@ -1349,8 +1350,8 @@ fn clearing_empties_a_keyring() {
 #[test]
 fn capabilities_report_what_is_supported() {
     let capabilities = Keyrings::capabilities().unwrap();
-    assert_eq!(capabilities.as_bytes(), [0xe1, 0]);
-    assert_eq!(capabilities.for_buffer(1), [0xe1]);
+    assert_eq!(capabilities.as_bytes(), [0xed, 0]);
+    assert_eq!(capabilities.for_buffer(1), [0xed]);
     assert_eq!(capabilities.len(), 2);
 }
 

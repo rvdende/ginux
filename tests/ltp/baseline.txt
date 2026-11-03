@@ -26,15 +26,6 @@ fanotify07 TBROK
 fanotify11 TBROK
 fanotify12 TBROK
 fanotify25 TBROK
-keyctl05 TBROK
-keyctl09 TFAIL
-keyctl23 TBROK
-keyctl25 TFAIL
-keyctl26 TFAIL
-keyctl27 TFAIL
-keyctl28 TFAIL
-keyctl29 TBROK
-keyctl30 TBROK
 kcmp03 TFAIL
 lsm_list_modules01 TFAIL
 mmap18 TBROK

@@ -54782,6 +54782,8 @@ fn linux_keyctl(command: u64, second: u64, third: u64, fourth: u64, fifth: u64) 
     const REJECT: u64 = 19;
     const INSTANTIATE_IOV: u64 = 20;
     const INVALIDATE: u64 = 21;
+    const DH_COMPUTE: u64 = 23;
+    const PKEY_QUERY: u64 = 24;
     const RESTRICT_KEYRING: u64 = 29;
     const MOVE: u64 = 30;
     const CAPABILITIES: u64 = 31;
@@ -54842,7 +54844,16 @@ fn linux_keyctl(command: u64, second: u64, third: u64, fourth: u64, fifth: u64) 
                 keys.search(caller, id, &key_type, &description, fifth as i32, now)
             })
         })()),
-        READ => output(linux_with_keys(|keys, caller| keys.read(caller, id, now))),
+        READ => {
+            let capacity = if third == 0 {
+                0
+            } else {
+                usize::try_from(fourth).unwrap_or(usize::MAX)
+            };
+            output(linux_with_keys(|keys, caller| {
+                keys.read_into(caller, id, capacity, now)
+            }))
+        }
         INSTANTIATE | NEGATE | REJECT | INSTANTIATE_IOV => LINUX_EPERM,
         SET_REQKEY_KEYRING => serial(linux_with_keys(|keys, caller| {
             keys.set_request_default(caller, id)
@@ -54863,6 +54874,19 @@ fn linux_keyctl(command: u64, second: u64, third: u64, fourth: u64, fifth: u64) 
         INVALIDATE => unit(linux_with_keys(|keys, caller| {
             keys.invalidate(caller, id, now)
         })),
+        DH_COMPUTE => {
+            linux_keyctl_dh_compute(second, third, fourth, fifth, now).unwrap_or_else(|error| error)
+        }
+        // The argument after the key id is reserved and must be 0.
+        PKEY_QUERY if third != 0 => LINUX_EINVAL,
+        PKEY_QUERY => unit((|| {
+            let info = linux_key_string(fourth, 4096)?;
+            let query = linux_with_keys(|keys, caller| keys.pkey_query(caller, id, &info, now))?;
+            if !copy_to_linux_user(fifth, &query.to_bytes()) {
+                return Err(LINUX_EFAULT);
+            }
+            Ok(())
+        })()),
         RESTRICT_KEYRING => unit((|| {
             let key_type = if third == 0 {
                 None
@@ -54889,6 +54913,89 @@ fn linux_keyctl(command: u64, second: u64, third: u64, fourth: u64, fifth: u64) 
             ),
         _ => LINUX_EOPNOTSUPP,
     }
+}
+
+/// KEYCTL_DH_COMPUTE in Linux's order of checks: the KDF parameters
+/// (`struct keyctl_kdf_params`) are copied first; then the parameters must
+/// be given and a nonzero length needs a buffer (EINVAL); a KDF must have
+/// zeroed spare words (EINVAL), ask for at most 1024 bytes with at most 64
+/// of other information (EMSGSIZE) and name a known hash (ENOENT), all
+/// before the keys are read. Without a KDF a zero length only asks for the
+/// size and a buffer too small for the value is EOVERFLOW. Returns the
+/// length written.
+fn linux_keyctl_dh_compute(
+    parameters: u64,
+    buffer: u64,
+    length: u64,
+    kdf: u64,
+    now: u64,
+) -> Result<u64, u64> {
+    use ginux_keyrings::dh;
+    const KDF_BYTES: usize = 56;
+    let kdf = if kdf == 0 {
+        None
+    } else {
+        let mut raw = [0_u8; KDF_BYTES];
+        if !copy_from_linux_user(kdf, &mut raw) {
+            return Err(LINUX_EFAULT);
+        }
+        Some(raw)
+    };
+    if parameters == 0 || (buffer == 0 && length != 0) {
+        return Err(LINUX_EINVAL);
+    }
+    let mut ids = [0_u8; 12];
+    if !copy_from_linux_user(parameters, &mut ids) {
+        return Err(LINUX_EFAULT);
+    }
+    let id = |index: usize| {
+        let bytes = ids.as_chunks::<4>().0[index];
+        i32::from_ne_bytes(bytes)
+    };
+    let length = usize::try_from(length).unwrap_or(usize::MAX);
+    let derivation = match kdf {
+        None => None,
+        Some(raw) => {
+            let address = |offset: usize| {
+                u64::from_ne_bytes(raw[offset..offset + 8].try_into().unwrap_or_default())
+            };
+            let other_length =
+                u32::from_ne_bytes(raw[16..20].try_into().unwrap_or_default()) as usize;
+            if raw[20..52].iter().any(|byte| *byte != 0) {
+                return Err(LINUX_EINVAL);
+            }
+            if length > dh::KDF_OUTPUT_LIMIT || other_length > dh::KDF_OTHER_INFO_LIMIT {
+                return Err(LINUX_EMSGSIZE);
+            }
+            let hash = linux_key_string(address(0), dh::HASH_NAME_LIMIT)?;
+            dh::check_hash(&hash).map_err(linux_key_error)?;
+            Some((hash, address(8), other_length))
+        }
+    };
+    let mut secret =
+        linux_with_keys(|keys, caller| keys.dh_compute(caller, id(0), id(1), id(2), now))?;
+    let Some((hash, other_address, other_length)) = derivation else {
+        if length == 0 {
+            return Ok(secret.len() as u64);
+        }
+        if secret.len() > length {
+            return Err(LINUX_EOVERFLOW);
+        }
+        if !copy_to_linux_user(buffer, &secret) {
+            return Err(LINUX_EFAULT);
+        }
+        return Ok(secret.len() as u64);
+    };
+    let other = linux_key_payload(other_address, other_length)?;
+    secret
+        .try_reserve_exact(other.len())
+        .map_err(|_| LINUX_ENOMEM)?;
+    secret.extend_from_slice(&other);
+    let derived = dh::derive(&hash, &secret, length).map_err(linux_key_error)?;
+    if !derived.is_empty() && !copy_to_linux_user(buffer, &derived) {
+        return Err(LINUX_EFAULT);
+    }
+    Ok(derived.len() as u64)
 }
 
 /// KEYCTL_SESSION_TO_PARENT: the parent takes the caller's session keyring.

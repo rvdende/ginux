@@ -124,8 +124,13 @@ feature rather than a fix:
   executable at a time and flips on the access that needs the other
   (mincore02 passes).
 - **io_uring** (io_uring01, 03, 04): one minimal ring per process.
-- **fanotify, keyctl, perf events**: missing features or kernel config
-  the tests parse (`/proc/config.gz`).
+- **fanotify, perf events**: missing features or kernel config the tests
+  parse (`/proc/config.gz`).
+- **Keys** (`crates/keyrings`): user, logon, keyring, asymmetric (RSA
+  X.509 and PKCS#8), dns_resolver and encrypted keys, KEYCTL_DH_COMPUTE
+  and KEYCTL_PKEY_QUERY. Tests that `modprobe` a key parser find it in
+  the `/lib/modules/RELEASE/modules.builtin` that `tests/ltp/setup.sh`
+  writes, as a Linux kernel package would install it.
 - **Loop devices** (`kernel/src/linux_loop.rs`: /dev/loop-control,
   /dev/loopN backed by overlay files, /sys/block/loopN) and RAM disks
   (`linux_ramdisk.rs`, /dev/ramN) pass ioctl_loop01-04, 06 and 07.

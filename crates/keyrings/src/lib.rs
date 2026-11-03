@@ -18,16 +18,19 @@
 //! nothing refers to it, with the links it held. Revoked and expired keys
 //! therefore stay until they are unlinked; there is no delayed collector.
 //!
-//! Only the "user", "logon" and "keyring" types exist. There are no
+//! The types are "user", "logon", "keyring", "asymmetric" (RSA keys
+//! from X.509 certificates and PKCS#8 private keys), "dns_resolver" and
+//! "encrypted"; "big_key" and "trusted" do not exist. There are no
 //! upcalls: when request_key(2) is given callout data and finds nothing, it
 //! leaves a negatively instantiated key behind and fails with ENOKEY, as
 //! Linux does when /sbin/request-key cannot instantiate the key. Without
 //! upcalls there are no authorization keys, so KEYCTL_INSTANTIATE,
 //! KEYCTL_INSTANTIATE_IOV, KEYCTL_NEGATE and KEYCTL_REJECT are EPERM for
 //! the kernel to return, and KEYCTL_ASSUME_AUTHORITY has nothing to assume.
-//! Persistent keyrings, security labels (KEYCTL_GET_SECURITY reports an
-//! empty one), Diffie-Hellman and public-key operations and notifications
-//! are not modelled; their keyctl operations are EOPNOTSUPP.
+//! KEYCTL_DH_COMPUTE and KEYCTL_PKEY_QUERY are here; persistent keyrings,
+//! security labels (KEYCTL_GET_SECURITY reports an empty one), the other
+//! public-key operations and notifications are not modelled, and their
+//! keyctl operations are EOPNOTSUPP.
 //!
 //! This is pure bookkeeping, so it can be tested on the host.
 
@@ -38,19 +41,32 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod asymmetric;
+mod crypto;
+pub mod dh;
+mod encrypted;
 mod keys;
 mod proc;
+mod restrict;
+#[cfg(test)]
+mod test_vectors;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod type_tests;
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
+pub use asymmetric::{operation as public_key_operation, Query as PublicKeyQuery};
+use encrypted::Encrypted;
 use keys::{
-    copy, Anchor, Key, Lookup, Match, Need, NewKey, Process, Quota, Search, Searched, State,
-    Thread, User, LINK_BYTES,
+    copy, Anchor, Key, Lookup, Match, Need, NewKey, Payload, Process, Quota, Search, Searched,
+    State, Thread, User, LINK_BYTES,
 };
 use permission::{LINK, READ, SEARCH, SET_ATTRIBUTE, VIEW, WRITE};
 use proc::Text;
+use restrict::Restriction;
 
 /// The caller's thread keyring (`KEY_SPEC_THREAD_KEYRING`).
 pub const THREAD_KEYRING: i32 = -1;
@@ -224,6 +240,17 @@ pub enum Error {
     Deadlock,
     /// ELOOP: the linked keyring nests too deep to check for a cycle.
     TooDeep,
+    /// EBADMSG: no parser recognises an asymmetric key's data.
+    BadMessage,
+    /// ENOPKG: an asymmetric key or signature of an algorithm Ginux lacks.
+    NoPackage,
+    /// EKEYREJECTED: a certificate's signature does not verify.
+    KeyRejected,
+    /// EIO: no random numbers for a new encrypted key.
+    Io,
+    /// Another errno, which a key reports as it is: the DNS error a
+    /// "dns_resolver" key records.
+    Errno(u16),
 }
 
 impl Error {
@@ -245,6 +272,11 @@ impl Error {
             Self::NotFound => 2,
             Self::Deadlock => 35,
             Self::TooDeep => 40,
+            Self::BadMessage => 74,
+            Self::NoPackage => 65,
+            Self::KeyRejected => 129,
+            Self::Io => 5,
+            Self::Errno(errno) => errno as i32,
         }
     }
 }
@@ -340,6 +372,13 @@ pub enum KeyType {
     Logon,
     /// A set of links to other keys.
     Keyring,
+    /// A public or private key; see the asymmetric module.
+    Asymmetric,
+    /// A DNS lookup's result, as the kernel's DNS resolver caches it.
+    DnsResolver,
+    /// Secret data user space reads only encrypted; see the encrypted
+    /// module.
+    Encrypted,
 }
 
 impl KeyType {
@@ -348,6 +387,9 @@ impl KeyType {
             b"user" => Some(Self::User),
             b"logon" => Some(Self::Logon),
             b"keyring" => Some(Self::Keyring),
+            b"asymmetric" => Some(Self::Asymmetric),
+            b"dns_resolver" => Some(Self::DnsResolver),
+            b"encrypted" => Some(Self::Encrypted),
             _ => None,
         }
     }
@@ -357,25 +399,61 @@ impl KeyType {
             Self::User => "user",
             Self::Logon => "logon",
             Self::Keyring => "keyring",
+            Self::Asymmetric => "asymmetric",
+            Self::DnsResolver => "dns_resolver",
+            Self::Encrypted => "encrypted",
         }
     }
 
+    /// Whether the type has a read operation.
     const fn readable(self) -> bool {
-        !matches!(self, Self::Logon)
+        !matches!(self, Self::Logon | Self::Asymmetric)
     }
 
-    /// A keyring has no update: add_key(2) replaces a keyring of the same
-    /// name with a new one instead.
+    /// Whether the type has an update operation. Without one, add_key(2)
+    /// replaces a key of the same description with a new one.
     const fn updatable(self) -> bool {
-        !matches!(self, Self::Keyring)
+        matches!(self, Self::User | Self::Logon | Self::Encrypted)
     }
 
-    fn check_payload(self, payload: &[u8]) -> Result<(), Error> {
-        let valid = match self {
-            Self::User | Self::Logon => (1..=USER_PAYLOAD_LIMIT).contains(&payload.len()),
-            Self::Keyring => payload.is_empty(),
+    /// The type checks its payload before anything else happens to it;
+    /// an encrypted key is only made from its payload once the keyring
+    /// takes it (and needs a description before that).
+    const fn preparses(self) -> bool {
+        !matches!(self, Self::Encrypted)
+    }
+
+    /// The type's preparse: the payload it keeps, a description it
+    /// proposes for a key added without one and when it makes the key
+    /// expire.
+    fn preparse(self, data: &[u8], now: u64) -> Result<Prepared, Error> {
+        let mut prepared = Prepared {
+            payload: Payload::empty(),
+            description: None,
+            expiry: None,
         };
-        valid.then_some(()).ok_or(Error::Invalid)
+        match self {
+            Self::User | Self::Logon => {
+                if !(1..=USER_PAYLOAD_LIMIT).contains(&data.len()) {
+                    return Err(Error::Invalid);
+                }
+                prepared.payload = Payload::Data(copy(data)?);
+            }
+            Self::Keyring if data.is_empty() => {}
+            Self::Keyring | Self::Encrypted => return Err(Error::Invalid),
+            Self::Asymmetric => {
+                let parsed = asymmetric::parse(data)?;
+                prepared.payload = Payload::Asymmetric(parsed.payload);
+                prepared.description = parsed.description;
+            }
+            Self::DnsResolver => {
+                let (payload, lookup_failed) = dns_preparse(data)?;
+                prepared.payload = payload;
+                // A failed lookup is cached for a second.
+                prepared.expiry = lookup_failed.then(|| now.saturating_add(NANOSECONDS_PER_SECOND));
+            }
+        }
+        Ok(prepared)
     }
 
     /// A "logon" description needs a ':' with something before it.
@@ -393,12 +471,72 @@ impl KeyType {
     /// What a key gets when add_key(2) or request_key(2) creates it:
     /// everything the type supports for the possessor, view for the owner.
     const fn default_permissions(self) -> u32 {
-        let rights = match self {
-            Self::User | Self::Keyring => ALL,
-            Self::Logon => ALL & !READ,
-        };
+        let mut rights = VIEW | SEARCH | LINK | SET_ATTRIBUTE;
+        if self.readable() {
+            rights |= READ;
+        }
+        if matches!(self, Self::Keyring) || self.updatable() {
+            rights |= WRITE;
+        }
         possessor(rights) | user(VIEW)
     }
+}
+
+/// What a type's preparse made of a payload.
+struct Prepared {
+    payload: Payload,
+    description: Option<Vec<u8>>,
+    expiry: Option<u64>,
+}
+
+/// dns_resolver_preparse: a binary server list (a zero byte, content type
+/// 0 and version 1; a failed lookup's status asks for a short life), or
+/// NUL-terminated text: the result, then "#name=value" options, of which
+/// "dnserror=N" (1 to 511) records an error instead of a result. Also
+/// returns whether the lookup failed.
+fn dns_preparse(data: &[u8]) -> Result<(Payload, bool), Error> {
+    const SERVER_LIST_HEADER: usize = 6;
+    const STATUS_GOOD: u8 = 1;
+    const STATUS_GOOD_WITH_BAD: u8 = 2;
+    if data.len() <= 1 {
+        return Err(Error::Invalid);
+    }
+    if data[0] == 0 {
+        if data.len() < SERVER_LIST_HEADER || data[1] != 0 || data[2] != 1 {
+            return Err(Error::Invalid);
+        }
+        let failed = !matches!(data[4], STATUS_GOOD | STATUS_GOOD_WITH_BAD);
+        return Ok((Payload::Data(copy(data)?), failed));
+    }
+    let Some((0, text)) = data.split_last() else {
+        return Err(Error::Invalid);
+    };
+    let mut parts = text.split(|&byte| byte == b'#');
+    let result = parts.next().unwrap_or_default();
+    let mut error = None;
+    if text.contains(&b'#') {
+        for option in parts {
+            if option.is_empty() || option.len() > 128 {
+                return Err(Error::Invalid);
+            }
+            let (name, value) = match option.iter().position(|&byte| byte == b'=') {
+                Some(index) => (&option[..index], &option[index + 1..]),
+                None => (option, &[][..]),
+            };
+            let number = core::str::from_utf8(value)
+                .ok()
+                .and_then(|text| text.parse::<u16>().ok())
+                .filter(|number| (1..=511).contains(number));
+            match (name, number) {
+                (b"dnserror", Some(number)) => error = Some(number),
+                _ => return Err(Error::Invalid),
+            }
+        }
+    }
+    Ok(match error {
+        Some(errno) => (Payload::DnsError(errno), false),
+        None => (Payload::Data(copy(result)?), false),
+    })
 }
 
 /// Checks a key type name as Linux does while copying it in: empty or too
@@ -430,6 +568,9 @@ fn check_length(string: &[u8], limit: usize) -> Result<(), Error> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Output {
     bytes: Vec<u8>,
+    /// The full length, which the bytes have unless the operation only
+    /// measured an output too big for the buffer (an encrypted key).
+    length: usize,
     /// A buffer too small for the whole output receives the start of it
     /// (KEYCTL_GET_SECURITY, KEYCTL_CAPABILITIES) instead of nothing
     /// (KEYCTL_DESCRIBE, KEYCTL_READ).
@@ -439,6 +580,7 @@ pub struct Output {
 impl Output {
     fn whole(bytes: Vec<u8>) -> Self {
         Self {
+            length: bytes.len(),
             bytes,
             truncates: false,
         }
@@ -447,17 +589,27 @@ impl Output {
     fn truncating(bytes: &[u8]) -> Result<Self, Error> {
         Ok(Self {
             bytes: copy(bytes)?,
+            length: bytes.len(),
             truncates: true,
         })
     }
 
+    /// Only the length of an output no buffer receives.
+    fn measured(length: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            length,
+            truncates: false,
+        }
+    }
+
     /// The full length, which the system call returns.
     pub fn len(&self) -> usize {
-        self.bytes.len()
+        self.length
     }
 
     pub fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
+        self.length == 0
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -468,7 +620,7 @@ impl Output {
     /// fits, else a prefix or nothing as the operation does. The kernel
     /// copies nothing when the buffer pointer is null.
     pub fn for_buffer(&self, capacity: usize) -> &[u8] {
-        if self.bytes.len() <= capacity {
+        if self.length <= capacity {
             &self.bytes
         } else if self.truncates {
             self.bytes.get(..capacity).unwrap_or_default()
@@ -494,6 +646,8 @@ pub struct Keyrings {
     processes: Vec<Process>,
     next_serial: i32,
     limits: Limits,
+    /// Fills a buffer with random bytes, or fails.
+    random: fn(&mut [u8]) -> bool,
 }
 
 impl Default for Keyrings {
@@ -503,7 +657,15 @@ impl Default for Keyrings {
 }
 
 impl Keyrings {
+    /// Keys without a source of random numbers: making an encrypted key
+    /// of random data fails with EIO.
     pub const fn new() -> Self {
+        Self::with_random(|_| false)
+    }
+
+    /// Keys that take random numbers from `random`, which fills a buffer
+    /// or fails.
+    pub const fn with_random(random: fn(&mut [u8]) -> bool) -> Self {
         Self {
             keys: Vec::new(),
             users: Vec::new(),
@@ -511,6 +673,7 @@ impl Keyrings {
             processes: Vec::new(),
             next_serial: 1,
             limits: Limits::LINUX,
+            random,
         }
     }
 
@@ -553,44 +716,114 @@ impl Keyrings {
         }
         let target = self.lookup(caller, keyring, Lookup::CREATE, Need::Rights(WRITE), now)?;
         let kind = KeyType::from_name(key_type).ok_or(Error::NoDevice)?;
-        let ring = self.get(target.serial)?;
-        if !ring.is_keyring() {
-            return Err(Error::NotDirectory);
-        }
-        kind.check_payload(payload)?;
-        if description.is_empty() {
+        if !kind.preparses() && description.is_empty() {
             return Err(Error::Invalid);
         }
+        if !self.get(target.serial)?.is_keyring() {
+            return Err(Error::NotDirectory);
+        }
+        let prepared = if kind.preparses() {
+            kind.preparse(payload, now)?
+        } else {
+            Prepared {
+                payload: Payload::empty(),
+                description: None,
+                expiry: None,
+            }
+        };
+        let description = match &prepared.description {
+            Some(proposed) if description.is_empty() => &proposed[..],
+            _ if description.is_empty() => return Err(Error::Invalid),
+            _ => description,
+        };
+        let ring = self.get(target.serial)?;
         let existing = self.find_link(ring, kind, description);
         if existing.is_none() && !self.fits(ring.uid, 0, LINK_BYTES) {
             return Err(Error::QuotaExceeded);
         }
-        if ring.restricted {
-            return Err(Error::NotPermitted);
-        }
+        self.check_restriction(caller, target.serial, kind, &prepared.payload, now)?;
         if let Some(serial) = existing.filter(|_| kind.updatable()) {
             let key = self.get(serial)?;
             if !matches!(key.state, State::Revoked | State::Invalidated) {
                 if !key.permits(caller, target.possessed, WRITE) {
                     return Err(Error::AccessDenied);
                 }
+                let payload = self.updated_payload(serial, kind, prepared, payload)?;
                 self.replace_payload(serial, payload)?;
                 return Ok(serial);
             }
         }
         kind.check_description(description)?;
+        let new_payload = match kind {
+            KeyType::Encrypted => Payload::Encrypted(Box::new(self.instantiate_encrypted(
+                caller,
+                description,
+                payload,
+                now,
+            )?)),
+            _ => prepared.payload,
+        };
         let key = Key::new(NewKey {
             kind,
             description,
-            payload,
+            payload: new_payload,
             uid: caller.uid,
             gid: Some(caller.gid),
             permissions: kind.default_permissions(),
             state: State::Positive,
-            expiry: None,
+            expiry: prepared.expiry,
             per_user: false,
         })?;
         self.add_new(target.serial, existing, key)
+    }
+
+    /// What an update gives key `serial` of `kind`: the preparsed payload,
+    /// or for an encrypted key the result of its update command.
+    fn updated_payload(
+        &self,
+        serial: i32,
+        kind: KeyType,
+        prepared: Prepared,
+        command: &[u8],
+    ) -> Result<Payload, Error> {
+        match (kind, &self.get(serial)?.payload) {
+            (KeyType::Encrypted, Payload::Encrypted(key)) => {
+                Ok(Payload::Encrypted(Box::new(key.update(command)?)))
+            }
+            (KeyType::Encrypted, _) => Err(Error::NoKey),
+            _ => Ok(prepared.payload),
+        }
+    }
+
+    /// Makes an encrypted key's payload from its "new" or "load" command.
+    fn instantiate_encrypted(
+        &self,
+        caller: &Caller,
+        description: &[u8],
+        command: &[u8],
+        now: u64,
+    ) -> Result<Encrypted, Error> {
+        let random = self.random;
+        Encrypted::instantiate(
+            description,
+            command,
+            |buffer| random(buffer).then_some(()).ok_or(Error::Io),
+            |master| self.master_key(caller, master, now),
+        )
+    }
+
+    /// The data of an encrypted key's master key: a "user" key that
+    /// request_key(2) would find in the caller's keyrings. There are no
+    /// trusted keys (EOPNOTSUPP).
+    fn master_key(&self, caller: &Caller, master: &[u8], now: u64) -> Result<Vec<u8>, Error> {
+        let Some(name) = master.strip_prefix(b"user:") else {
+            return Err(Error::NotSupported);
+        };
+        match self.search_caller(caller, Match::Index(KeyType::User, name), now) {
+            Searched::Found(serial) => copy(self.get(serial)?.payload.data()),
+            Searched::Skipped(error) => Err(error),
+            Searched::Nothing => Err(Error::NoKey),
+        }
     }
 
     /// request_key(2): searches the caller's thread, process and session
@@ -628,7 +861,7 @@ impl Keyrings {
                     if !self.get(serial)?.permits(caller, true, LINK) {
                         return Err(Error::AccessDenied);
                     }
-                    self.link_checked(destination.serial, serial)?;
+                    self.link_checked(caller, destination.serial, serial, now)?;
                 }
                 Ok(serial)
             }
@@ -729,7 +962,16 @@ impl Keyrings {
         if !kind.updatable() {
             return Err(Error::NotSupported);
         }
-        kind.check_payload(payload)?;
+        let prepared = if kind.preparses() {
+            kind.preparse(payload, now)?
+        } else {
+            Prepared {
+                payload: Payload::empty(),
+                description: None,
+                expiry: None,
+            }
+        };
+        let payload = self.updated_payload(handle.serial, kind, prepared, payload)?;
         self.replace_payload(handle.serial, payload)
     }
 
@@ -856,7 +1098,7 @@ impl Keyrings {
     pub fn link(&mut self, caller: &Caller, key: i32, keyring: i32, now: u64) -> Result<(), Error> {
         let ring = self.lookup(caller, keyring, Lookup::CREATE, Need::Rights(WRITE), now)?;
         let key = self.lookup(caller, key, Lookup::CREATE, Need::Rights(LINK), now)?;
-        self.link_checked(ring.serial, key.serial)
+        self.link_checked(caller, ring.serial, key.serial, now)
     }
 
     /// KEYCTL_UNLINK: removes the link to `key` from `keyring`. The key
@@ -921,7 +1163,7 @@ impl Keyrings {
             if !self.get(found)?.permits(caller, start.possessed, LINK) {
                 return Err(Error::AccessDenied);
             }
-            self.link_checked(destination.serial, found)?;
+            self.link_checked(caller, destination.serial, found, now)?;
         }
         Ok(found)
     }
@@ -931,6 +1173,19 @@ impl Keyrings {
     /// be read without read permission. A buffer too small for all of it
     /// receives nothing.
     pub fn read(&mut self, caller: &Caller, id: i32, now: u64) -> Result<Output, Error> {
+        self.read_into(caller, id, usize::MAX, now)
+    }
+
+    /// KEYCTL_READ into a buffer of `capacity` bytes (0 for none): an
+    /// encrypted key is only encrypted, with its master key, for a buffer
+    /// that holds the result; otherwise only its length is returned.
+    pub fn read_into(
+        &mut self,
+        caller: &Caller,
+        id: i32,
+        capacity: usize,
+        now: u64,
+    ) -> Result<Output, Error> {
         let handle = self.lookup(caller, id, Lookup::PLAIN, Need::Deferred, now)?;
         let key = self.get(handle.serial)?;
         key.instantiated()?;
@@ -941,6 +1196,17 @@ impl Keyrings {
             return Err(Error::NotSupported);
         }
         key.validate(now)?;
+        match &key.payload {
+            Payload::DnsError(errno) => return Err(Error::Errno(*errno)),
+            Payload::Encrypted(encrypted) if encrypted.read_length() > capacity => {
+                return Ok(Output::measured(encrypted.read_length()));
+            }
+            Payload::Encrypted(encrypted) => {
+                let master_key = self.master_key(caller, encrypted.master(), now)?;
+                return Ok(Output::whole(encrypted.read(&master_key)?));
+            }
+            _ => {}
+        }
         let bytes = if key.is_keyring() {
             let mut bytes = Vec::new();
             bytes
@@ -951,7 +1217,7 @@ impl Keyrings {
             }
             bytes
         } else {
-            copy(&key.payload)?
+            copy(key.payload.data())?
         };
         Ok(Output::whole(bytes))
     }
@@ -1054,9 +1320,12 @@ impl Keyrings {
     }
 
     /// KEYCTL_RESTRICT_KEYRING: with neither a type nor a restriction,
-    /// refuses every later link into the keyring (EPERM). No key type here
-    /// has restriction schemes: a known type is ENOENT, an unknown one
-    /// ENOKEY. A keyring can be restricted once (EEXIST).
+    /// refuses every later link into the keyring (EPERM). Only the
+    /// "asymmetric" type has restriction schemes ("builtin_trusted",
+    /// "builtin_and_secondary_trusted", "key_or_keyring:SERIAL[:chain]";
+    /// another is EINVAL); another known type is ENOENT, an unknown one
+    /// ENOKEY. A keyring can be restricted once (EEXIST), and not so that
+    /// restrictions lead back to it (EDEADLK).
     pub fn restrict_keyring(
         &mut self,
         caller: &Caller,
@@ -1071,24 +1340,31 @@ impl Keyrings {
             (Some(key_type), Some(restriction)) => {
                 check_type_name(key_type)?;
                 check_length(restriction, DESCRIPTION_LIMIT)?;
-                Some(key_type)
+                Some((key_type, restriction))
             }
             _ => return Err(Error::Invalid),
         };
-        let key = self.get_mut(handle.serial)?;
-        if !key.is_keyring() {
+        if !self.get(handle.serial)?.is_keyring() {
             return Err(Error::NotDirectory);
         }
-        if let Some(key_type) = restricting {
-            return Err(match KeyType::from_name(key_type) {
-                Some(_) => Error::NotFound,
-                None => Error::NoKey,
-            });
-        }
-        if key.restricted {
+        let restriction = match restricting {
+            None => Restriction::Everything,
+            Some((key_type, scheme)) => match KeyType::from_name(key_type) {
+                Some(KeyType::Asymmetric) => self.asymmetric_restriction(scheme)?,
+                Some(_) => return Err(Error::NotFound),
+                None => return Err(Error::NoKey),
+            },
+        };
+        if self.get(handle.serial)?.restriction.is_some() {
             return Err(Error::Exists);
         }
-        key.restricted = true;
+        if self.restriction_cycles(handle.serial, restriction) {
+            return Err(Error::Deadlock);
+        }
+        if let Some(trusted) = restriction.trusted() {
+            self.retain(trusted);
+        }
+        self.get_mut(handle.serial)?.restriction = Some(restriction);
         Ok(())
     }
 
@@ -1134,9 +1410,7 @@ impl Keyrings {
         if flags & MOVE_EXCLUSIVE != 0 && existing.is_some() {
             return Err(Error::Exists);
         }
-        if destination.restricted {
-            return Err(Error::NotPermitted);
-        }
+        self.check_restriction(caller, to, moved.kind, &moved.payload, now)?;
         if moved.is_keyring() {
             self.check_cycle(to, moved, 0)?;
         }
@@ -1146,11 +1420,35 @@ impl Keyrings {
         Ok(())
     }
 
+    /// KEYCTL_PKEY_QUERY: what an asymmetric key can do with the
+    /// parameters `info` gives ("enc=raw" or "enc=pkcs1", "hash=NAME").
+    /// The caller needs search permission; another type is EOPNOTSUPP.
+    pub fn pkey_query(
+        &mut self,
+        caller: &Caller,
+        id: i32,
+        info: &[u8],
+        now: u64,
+    ) -> Result<PublicKeyQuery, Error> {
+        let parameters = asymmetric::Parameters::parse(info)?;
+        let handle = self.lookup(caller, id, Lookup::PLAIN, Need::Rights(SEARCH), now)?;
+        match &self.get(handle.serial)?.payload {
+            Payload::Asymmetric(key) => key.query(&parameters),
+            _ if self.get(handle.serial)?.kind == KeyType::Asymmetric => Err(Error::Invalid),
+            _ => Err(Error::NotSupported),
+        }
+    }
+
     /// KEYCTL_CAPABILITIES: what this service supports, as two bytes of
     /// [`capability`] bits. A buffer too small receives what fits.
     pub fn capabilities() -> Result<Output, Error> {
-        use capability::{CAPABILITIES, INVALIDATE, MOVE, RESTRICT_KEYRING};
-        Output::truncating(&[CAPABILITIES | INVALIDATE | RESTRICT_KEYRING | MOVE, 0])
+        use capability::{
+            CAPABILITIES, DIFFIE_HELLMAN, INVALIDATE, MOVE, PUBLIC_KEY, RESTRICT_KEYRING,
+        };
+        Output::truncating(&[
+            CAPABILITIES | DIFFIE_HELLMAN | PUBLIC_KEY | INVALIDATE | RESTRICT_KEYRING | MOVE,
+            0,
+        ])
     }
 
     /// A new process `child_tid` forked from `parent`: it shares the
@@ -1266,14 +1564,12 @@ impl Keyrings {
         if existing.is_none() && !self.fits(keyring.uid, 0, LINK_BYTES) {
             return Err(Error::QuotaExceeded);
         }
-        if keyring.restricted {
-            return Err(Error::NotPermitted);
-        }
+        self.check_restriction(caller, ring, kind, &Payload::empty(), now)?;
         kind.check_description(description)?;
         let key = Key::new(NewKey {
             kind,
             description,
-            payload: &[],
+            payload: Payload::empty(),
             uid: caller.uid,
             gid: Some(caller.gid),
             permissions: kind.default_permissions(),

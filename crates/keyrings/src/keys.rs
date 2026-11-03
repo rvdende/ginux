@@ -3,8 +3,13 @@
 //! keyring trees, links and the references that keep keys alive, and quota
 //! accounting.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::{fmt, mem};
+
+use crate::asymmetric::{self, Asymmetric};
+use crate::encrypted::Encrypted;
+use crate::restrict::Restriction;
 
 use crate::permission::SEARCH;
 use crate::proc::Text;
@@ -39,8 +44,8 @@ pub(crate) struct Key {
     pub(crate) serial: i32,
     pub(crate) kind: KeyType,
     pub(crate) description: Vec<u8>,
-    /// A "user" or "logon" key's data.
-    pub(crate) payload: Vec<u8>,
+    /// What the key's type keeps.
+    pub(crate) payload: Payload,
     /// A keyring's links, in the order they were made.
     pub(crate) links: Vec<i32>,
     pub(crate) uid: u32,
@@ -54,8 +59,8 @@ pub(crate) struct Key {
     pub(crate) references: u32,
     /// The bytes charged to the owner's quota.
     pub(crate) charged: usize,
-    /// The keyring refuses new links.
-    pub(crate) restricted: bool,
+    /// What the keyring accepts new links to, once restricted.
+    pub(crate) restriction: Option<Restriction>,
     /// A user or user-session keyring: asking for a new session keyring
     /// replaces it as a thread's session keyring.
     pub(crate) per_user: bool,
@@ -70,7 +75,7 @@ impl fmt::Debug for Key {
             .field("serial", &self.serial)
             .field("kind", &self.kind)
             .field("description", &self.description)
-            .field("payload_length", &self.payload.len())
+            .field("payload_length", &self.payload.quota_bytes())
             .field("links", &self.links)
             .field("uid", &self.uid)
             .field("gid", &self.gid)
@@ -82,11 +87,47 @@ impl fmt::Debug for Key {
     }
 }
 
+/// What a key's type keeps for it.
+pub(crate) enum Payload {
+    /// A "user", "logon" or "dns_resolver" key's data; nothing for a
+    /// keyring, a negative key or one whose contents were discarded.
+    Data(Vec<u8>),
+    /// A "dns_resolver" key recording a failed lookup: reading it fails
+    /// with this errno.
+    DnsError(u16),
+    Asymmetric(Box<Asymmetric>),
+    Encrypted(Box<Encrypted>),
+}
+
+impl Payload {
+    pub(crate) const fn empty() -> Self {
+        Self::Data(Vec::new())
+    }
+
+    /// The data of a "user"-like key; empty for the other kinds.
+    pub(crate) fn data(&self) -> &[u8] {
+        match self {
+            Self::Data(data) => data,
+            _ => &[],
+        }
+    }
+
+    /// The bytes it takes from the owner's quota.
+    pub(crate) fn quota_bytes(&self) -> usize {
+        match self {
+            Self::Data(data) => data.len(),
+            Self::DnsError(_) => 0,
+            Self::Asymmetric(_) => asymmetric::QUOTA_BYTES,
+            Self::Encrypted(key) => key.quota_bytes(),
+        }
+    }
+}
+
 /// What a new key starts as.
 pub(crate) struct NewKey<'a> {
     pub(crate) kind: KeyType,
     pub(crate) description: &'a [u8],
-    pub(crate) payload: &'a [u8],
+    pub(crate) payload: Payload,
     pub(crate) uid: u32,
     pub(crate) gid: Option<u32>,
     pub(crate) permissions: u32,
@@ -110,7 +151,7 @@ impl Key {
             serial: 0,
             kind: new.kind,
             description: copy(new.description)?,
-            payload: copy(new.payload)?,
+            payload: new.payload,
             links: Vec::new(),
             uid: new.uid,
             gid: new.gid,
@@ -119,17 +160,17 @@ impl Key {
             expiry: new.expiry,
             references: 0,
             charged: 0,
-            restricted: false,
+            restriction: None,
             per_user: new.per_user,
         })
     }
 
     /// What the key takes from its owner's quota: the description with its
-    /// NUL, and the payload or four bytes per link.
+    /// NUL, and what the payload takes or four bytes per link.
     pub(crate) fn quota_bytes(&self) -> usize {
         let data = match self.kind {
             KeyType::Keyring => self.links.len() * LINK_BYTES,
-            KeyType::User | KeyType::Logon => self.payload.len(),
+            _ => self.payload.quota_bytes(),
         };
         self.description.len() + 1 + data
     }
@@ -281,6 +322,9 @@ pub(crate) enum Match<'a> {
     Serial(i32),
     /// Keys of a type and exact description.
     Index(KeyType, &'a [u8]),
+    /// Asymmetric keys with this id: the issuer name id if the flag is
+    /// set, else the issuer-and-serial or subject key id.
+    AsymmetricId(&'a [u8], bool),
 }
 
 impl Match<'_> {
@@ -288,6 +332,17 @@ impl Match<'_> {
         match self {
             Self::Serial(serial) => key.serial == serial,
             Self::Index(kind, description) => key.has_index(kind, description),
+            Self::AsymmetricId(id, name) => {
+                let Payload::Asymmetric(asymmetric) = &key.payload else {
+                    return false;
+                };
+                let same = |slot: &Option<Vec<u8>>| slot.as_deref() == Some(id);
+                if name {
+                    same(&asymmetric.ids[2])
+                } else {
+                    same(&asymmetric.ids[0]) || same(&asymmetric.ids[1])
+                }
+            }
         }
     }
 }
@@ -532,7 +587,8 @@ impl Keyrings {
         while let Some(index) = self.keys.iter().position(|key| key.references == 0) {
             let key = self.keys.remove(index);
             self.uncharge(key.uid, key.charged);
-            for serial in key.links {
+            let trusted = key.restriction.and_then(Restriction::trusted);
+            for serial in key.links.into_iter().chain(trusted) {
                 if let Some(linked) = self.key_mut(serial) {
                     linked.references = linked.references.saturating_sub(1);
                 }
@@ -584,7 +640,7 @@ impl Keyrings {
         let key = Key::new(NewKey {
             kind: KeyType::Keyring,
             description: name,
-            payload: &[],
+            payload: Payload::empty(),
             uid,
             gid: Some(owner.real_gid),
             permissions,
@@ -630,7 +686,7 @@ impl Keyrings {
         let new = |description| NewKey {
             kind: KeyType::Keyring,
             description,
-            payload: &[],
+            payload: Payload::empty(),
             uid,
             gid: None,
             permissions: USER_KEYRING_PERMISSIONS,
@@ -908,7 +964,13 @@ impl Keyrings {
     /// key_link: checks and makes a link, displacing a key of the same type
     /// and description. Linking a key that is already there changes
     /// nothing.
-    pub(crate) fn link_checked(&mut self, ring: i32, serial: i32) -> Result<(), Error> {
+    pub(crate) fn link_checked(
+        &mut self,
+        caller: &Caller,
+        ring: i32,
+        serial: i32,
+        now: u64,
+    ) -> Result<(), Error> {
         let keyring = self.get(ring)?;
         if !keyring.is_keyring() {
             return Err(Error::NotDirectory);
@@ -918,9 +980,7 @@ impl Keyrings {
         if existing.is_none() && !self.fits(keyring.uid, 0, LINK_BYTES) {
             return Err(Error::QuotaExceeded);
         }
-        if keyring.restricted {
-            return Err(Error::NotPermitted);
-        }
+        self.check_restriction(caller, ring, key.kind, &key.payload, now)?;
         if key.is_keyring() {
             self.check_cycle(ring, key, 0)?;
         }
@@ -1021,7 +1081,7 @@ impl Keyrings {
         let Some(key) = self.key_mut(serial) else {
             return;
         };
-        key.payload = Vec::new();
+        key.payload = Payload::empty();
         let links = mem::take(&mut key.links);
         self.recharge(serial);
         for linked in links {
@@ -1031,14 +1091,13 @@ impl Keyrings {
 
     /// Gives a key a new payload, which positively instantiates a negative
     /// key and clears any timeout.
-    pub(crate) fn replace_payload(&mut self, serial: i32, payload: &[u8]) -> Result<(), Error> {
+    pub(crate) fn replace_payload(&mut self, serial: i32, payload: Payload) -> Result<(), Error> {
         let key = self.get(serial)?;
-        let bytes = key.description.len() + 1 + payload.len();
+        let bytes = key.description.len() + 1 + payload.quota_bytes();
         let growth = bytes.saturating_sub(key.charged);
         if growth != 0 && !self.fits(key.uid, 0, growth) {
             return Err(Error::QuotaExceeded);
         }
-        let payload = copy(payload)?;
         let key = self.get_mut(serial)?;
         key.payload = payload;
         key.state = State::Positive;

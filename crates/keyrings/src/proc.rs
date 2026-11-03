@@ -4,7 +4,8 @@
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::keys::State;
+use crate::crypto::push_hex;
+use crate::keys::{Payload, State};
 use crate::permission::{possessor, VIEW};
 use crate::{no_memory, Caller, Error, KeyType, Keyrings, NANOSECONDS_PER_SECOND, OVERFLOW_ID};
 
@@ -82,9 +83,7 @@ impl Keyrings {
                 match key.kind {
                     KeyType::Keyring if key.links.is_empty() => text.push(b": empty")?,
                     KeyType::Keyring => text.format(format_args!(": {}", key.links.len()))?,
-                    KeyType::User | KeyType::Logon => {
-                        text.format(format_args!(": {}", key.payload.len()))?;
-                    }
+                    _ => describe_payload(&mut text, &key.payload)?,
                 }
             }
             text.push(b"\n")?;
@@ -134,4 +133,24 @@ fn write_timeout(text: &mut Text, expiry: Option<u64>, now: u64) -> Result<(), E
         _ => (seconds / 604_800, 'w'),
     };
     text.format(format_args!("{amount:>3}{unit}"))
+}
+
+/// What /proc/keys shows after a key's description: the payload size, a
+/// DNS error, or an asymmetric key's source, algorithm and the end of its
+/// subject key identifier.
+fn describe_payload(text: &mut Text, payload: &Payload) -> Result<(), Error> {
+    match payload {
+        Payload::DnsError(errno) => text.format(format_args!(": -{errno}")),
+        Payload::Asymmetric(key) => {
+            text.format(format_args!(": {}.rsa", key.source))?;
+            if let Some(id) = key.subject_key_id() {
+                let mut hex = Vec::new();
+                push_hex(&mut hex, &id[id.len().saturating_sub(4)..])?;
+                text.push(b" ")?;
+                text.push(&hex)?;
+            }
+            text.push(b" []")
+        }
+        _ => text.format(format_args!(": {}", payload.quota_bytes())),
+    }
 }
