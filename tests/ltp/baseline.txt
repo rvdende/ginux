@@ -12,7 +12,6 @@ acct01 TBROK
 acct02 TBROK
 arch_prctl01 TFAIL
 bind02 TFAIL
-bind04 HANG
 bind05 TBROK
 brk02 TFAIL
 chmod06 TFAIL
@@ -145,8 +144,6 @@ mount08 TFAIL
 mount_setattr02 TBROK
 mprotect01 TBROK
 mprotect05 TBROK
-mq_notify01 TBROK
-mq_notify03 TBROK
 mremap01 TFAIL
 mremap03 TFAIL
 mremap05 TFAIL

@@ -186,12 +186,16 @@ struct MessageQueue {
     _notify_padding: u16,
     notify_pid: u32,
     notify_value: u64,
+    /// SIGEV_THREAD's netlink socket and the cookie it gets back.
+    notify_socket: u16,
+    notify_cookie: [u8; 32],
     name: [u8; 256],
 }
 
 const NOTIFY_NONE: u8 = 0;
 const NOTIFY_QUIET: u8 = 1;
 const NOTIFY_SIGNAL: u8 = 2;
+const NOTIFY_THREAD: u8 = 3;
 
 /// What mq_notify asks for when a message reaches an empty queue.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -200,6 +204,9 @@ pub(crate) enum Notification {
     Quiet,
     /// SIGEV_SIGNAL: this signal, with this value.
     Signal { signal: u8, value: u64 },
+    /// SIGEV_THREAD as the C library asks for it: this cookie, sent back
+    /// on this netlink socket (whose reference the registration holds).
+    Thread { socket: u16, cookie: [u8; 32] },
 }
 
 /// A registration taken for delivery: who registered, and for what.
@@ -1970,17 +1977,19 @@ pub(crate) fn posix_queue_duplicate(id: u32) -> Result<(), Error> {
 }
 
 /// Closes a descriptor of queue `id`: the closing process's registration
-/// goes with it, as in Linux; the last close of an unlinked queue frees it.
-pub(crate) fn posix_queue_close_by(id: u32, pid: u32) -> Result<Option<PosixQueueInfo>, Error> {
-    {
+/// goes with it, as in Linux, and is returned for the caller to release;
+/// the last close of an unlinked queue frees the queue.
+pub(crate) fn posix_queue_close_by(
+    id: u32,
+    pid: u32,
+) -> Result<(Option<PosixQueueInfo>, Option<Registration>), Error> {
+    let removed = {
         let guard = Guard::acquire().ok_or(Error::Invalid)?;
         let (frame, _) = find_message_queue(guard.instance, id).ok_or(Error::Invalid)?;
         let queue = message_queue_mut(frame).ok_or(Error::Invalid)?;
-        if queue.notify_kind != NOTIFY_NONE && queue.notify_pid == pid {
-            queue.notify_kind = NOTIFY_NONE;
-        }
-    }
-    posix_queue_close(id)
+        take_registration(queue, Some(pid))
+    };
+    posix_queue_close(id).map(|destroyed| (destroyed, removed))
 }
 
 pub(crate) fn posix_queue_close(id: u32) -> Result<Option<PosixQueueInfo>, Error> {
@@ -2019,12 +2028,12 @@ fn count_posix_queues(instance: usize) -> usize {
 
 /// mq_notify for queue `id` by `pid`: registers `notification` (EBUSY
 /// while another process holds the registration), or with None removes
-/// `pid`'s own registration.
+/// `pid`'s own registration and returns it, for the caller to release.
 pub(crate) fn posix_queue_set_notification(
     id: u32,
     pid: u32,
     notification: Option<Notification>,
-) -> Result<(), Error> {
+) -> Result<Option<Registration>, Error> {
     let guard = Guard::acquire().ok_or(Error::Invalid)?;
     let (frame, _) = find_message_queue(guard.instance, id).ok_or(Error::Invalid)?;
     let queue = message_queue_mut(frame).ok_or(Error::Invalid)?;
@@ -2032,23 +2041,49 @@ pub(crate) fn posix_queue_set_notification(
         return Err(Error::Invalid);
     }
     let Some(notification) = notification else {
-        if queue.notify_kind != NOTIFY_NONE && queue.notify_pid == pid {
-            queue.notify_kind = NOTIFY_NONE;
-        }
-        return Ok(());
+        return Ok(take_registration(queue, Some(pid)));
     };
     if queue.notify_kind != NOTIFY_NONE {
         return Err(Error::Busy);
     }
-    let (kind, signal, value) = match notification {
-        Notification::Quiet => (NOTIFY_QUIET, 0, 0),
-        Notification::Signal { signal, value } => (NOTIFY_SIGNAL, signal, value),
+    queue.notify_kind = match notification {
+        Notification::Quiet => NOTIFY_QUIET,
+        Notification::Signal { signal, value } => {
+            queue.notify_signal = signal;
+            queue.notify_value = value;
+            NOTIFY_SIGNAL
+        }
+        Notification::Thread { socket, cookie } => {
+            queue.notify_socket = socket;
+            queue.notify_cookie = cookie;
+            NOTIFY_THREAD
+        }
     };
-    queue.notify_kind = kind;
-    queue.notify_signal = signal;
     queue.notify_pid = pid;
-    queue.notify_value = value;
-    Ok(())
+    Ok(None)
+}
+
+/// Removes `queue`'s registration (only `pid`'s, if given) and returns it.
+fn take_registration(queue: &mut MessageQueue, pid: Option<u32>) -> Option<Registration> {
+    if queue.notify_kind == NOTIFY_NONE || pid.is_some_and(|pid| pid != queue.notify_pid) {
+        return None;
+    }
+    let notification = match queue.notify_kind {
+        NOTIFY_SIGNAL => Notification::Signal {
+            signal: queue.notify_signal,
+            value: queue.notify_value,
+        },
+        NOTIFY_THREAD => Notification::Thread {
+            socket: queue.notify_socket,
+            cookie: queue.notify_cookie,
+        },
+        _ => Notification::Quiet,
+    };
+    queue.notify_kind = NOTIFY_NONE;
+    Some(Registration {
+        pid: queue.notify_pid,
+        notification,
+    })
 }
 
 /// After a send to queue `id`: when the message reached an empty queue
@@ -2061,25 +2096,10 @@ pub(crate) fn posix_queue_take_notification(
     let guard = Guard::acquire()?;
     let (frame, _) = find_message_queue(guard.instance, id)?;
     let queue = message_queue_mut(frame)?;
-    if queue.posix == 0
-        || queue.notify_kind == NOTIFY_NONE
-        || queue.messages != 1
-        || receiver_waiting
-    {
+    if queue.posix == 0 || queue.messages != 1 || receiver_waiting {
         return None;
     }
-    let notification = match queue.notify_kind {
-        NOTIFY_SIGNAL => Notification::Signal {
-            signal: queue.notify_signal,
-            value: queue.notify_value,
-        },
-        _ => Notification::Quiet,
-    };
-    queue.notify_kind = NOTIFY_NONE;
-    Some(Registration {
-        pid: queue.notify_pid,
-        notification,
-    })
+    take_registration(queue, None)
 }
 
 /// Whether some process waits to receive from queue `id` (its wait is

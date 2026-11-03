@@ -489,6 +489,7 @@ pub(super) const LINUX_EISCONN: u64 = u64::MAX - 105;
 pub(super) const LINUX_EALREADY: u64 = u64::MAX - 113;
 pub(super) const LINUX_EINPROGRESS: u64 = u64::MAX - 114;
 pub(super) const LINUX_EAFNOSUPPORT: u64 = u64::MAX - 96;
+pub(super) const LINUX_ESOCKTNOSUPPORT: u64 = u64::MAX - 93;
 pub(super) const LINUX_EPROTONOSUPPORT: u64 = u64::MAX - 92;
 pub(super) const LINUX_ENOPROTOOPT: u64 = u64::MAX - 91;
 pub(super) const LINUX_ENETUNREACH: u64 = u64::MAX - 100;

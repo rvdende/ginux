@@ -103,6 +103,11 @@ pub(crate) enum Kind {
     /// GPU fence, a dma-buf) that descriptors share as they share sockets,
     /// by reference; [`object`] says which.
     Object,
+    /// An AF_NETLINK socket: it receives what the kernel sends it as
+    /// datagrams (an mq_notify cookie), and every request sent to it is
+    /// answered with an NLMSG_ERROR of EOPNOTSUPP, since no netlink family
+    /// is served yet.
+    Netlink,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -285,6 +290,11 @@ struct Slot {
     icmp_filter: u32,
     /// The TTL of the datagram an ICMP socket received last.
     received_ttl: u8,
+    /// A netlink socket's protocol, its port id (0 until bound), and the
+    /// messages queued for its reader, one datagram each.
+    netlink_protocol: u8,
+    netlink_port: u32,
+    netlink_messages: VecDeque<Vec<u8>>,
 }
 
 impl Slot {
@@ -315,6 +325,9 @@ impl Slot {
             icmp_raw: false,
             icmp_filter: 0,
             received_ttl: 0,
+            netlink_protocol: 0,
+            netlink_port: 0,
+            netlink_messages: VecDeque::new(),
         }
     }
 
@@ -770,7 +783,7 @@ impl Sockets {
     fn open(&mut self, kind: Kind) -> Result<SlotId, Error> {
         let handle = match kind {
             Kind::Unix => return self.open_unix(1),
-            Kind::Object => return Err(Error::Invalid),
+            Kind::Object | Kind::Netlink => return Err(Error::Invalid),
             Kind::Tcp => add_tcp_socket(self.runtime()?)?,
             Kind::Udp => add_udp_socket(self.runtime()?)?,
             Kind::Icmp => add_icmp_socket(self.runtime()?)?,
@@ -810,6 +823,7 @@ impl Sockets {
             Kind::Udp => Some(2),
             Kind::Icmp => Some(if state.icmp_raw { 3 } else { 2 }),
             Kind::Unix => Some(state.unix_type),
+            Kind::Netlink => Some(3),
             Kind::Object => None,
         }
     }
@@ -1439,7 +1453,7 @@ impl Sockets {
                 state.remote = Some(remote);
                 Ok(())
             }
-            Kind::Unix | Kind::Object => Err(Error::Invalid),
+            Kind::Unix | Kind::Object | Kind::Netlink => Err(Error::Invalid),
         }
     }
 
@@ -1450,6 +1464,14 @@ impl Sockets {
         remote: Option<IpEndpoint>,
         local_capacity: Option<usize>,
     ) -> Result<usize, Error> {
+        if self
+            .slot(id)
+            .is_some_and(|state| state.kind == Kind::Netlink)
+        {
+            let state = slot_in_mut(&mut self.slots, id).ok_or(Error::Invalid)?;
+            answer_netlink_requests(state, input)?;
+            return Ok(input.len());
+        }
         self.poll();
         let state = self.slot(id).ok_or(Error::Invalid)?;
         if state.peer == Some(id) {
@@ -1517,7 +1539,7 @@ impl Sockets {
                     .map(|_| input.len())
                     .map_err(|_| Error::WouldBlock)
             }
-            Kind::Icmp | Kind::Unix | Kind::Object => Err(Error::Invalid),
+            Kind::Icmp | Kind::Unix | Kind::Object | Kind::Netlink => Err(Error::Invalid),
         }
     }
 
@@ -1654,7 +1676,7 @@ impl Sockets {
     ) -> Result<(usize, Option<IpEndpoint>), Error> {
         if self
             .slot(id)
-            .is_some_and(|state| matches!(state.kind, Kind::Udp | Kind::Icmp))
+            .is_some_and(|state| matches!(state.kind, Kind::Udp | Kind::Icmp | Kind::Netlink))
         {
             return self
                 .recv_message(id, output, false)
@@ -1696,7 +1718,7 @@ impl Sockets {
                 .recv_slice(output)
                 .map(|(size, metadata)| (size, Some(metadata.endpoint)))
                 .map_err(|_| Error::WouldBlock),
-            Kind::Icmp | Kind::Unix | Kind::Object => Err(Error::Invalid),
+            Kind::Icmp | Kind::Unix | Kind::Object | Kind::Netlink => Err(Error::Invalid),
         }
     }
 
@@ -1779,7 +1801,7 @@ impl Sockets {
     ) -> Result<(usize, Option<IpEndpoint>), Error> {
         if self
             .slot(id)
-            .is_some_and(|state| matches!(state.kind, Kind::Udp | Kind::Icmp))
+            .is_some_and(|state| matches!(state.kind, Kind::Udp | Kind::Icmp | Kind::Netlink))
         {
             return self
                 .recv_message(id, output, true)
@@ -1816,7 +1838,7 @@ impl Sockets {
                 .peek_slice(output)
                 .map(|(size, metadata)| (size, Some(metadata.endpoint)))
                 .map_err(|_| Error::WouldBlock),
-            Kind::Icmp | Kind::Unix | Kind::Object => Err(Error::Invalid),
+            Kind::Icmp | Kind::Unix | Kind::Object | Kind::Netlink => Err(Error::Invalid),
         }
     }
 
@@ -1827,6 +1849,29 @@ impl Sockets {
         peek_only: bool,
     ) -> Result<(usize, usize, Option<IpEndpoint>), Error> {
         let kind = self.slot(id).map(|state| state.kind);
+        if kind == Some(Kind::Netlink) {
+            let state = slot_in_mut(&mut self.slots, id).ok_or(Error::Invalid)?;
+            let message = if peek_only {
+                state.netlink_messages.front()
+            } else {
+                None
+            };
+            let taken;
+            let message = match message {
+                Some(message) => message,
+                None if peek_only => return Err(Error::WouldBlock),
+                None => {
+                    taken = state
+                        .netlink_messages
+                        .pop_front()
+                        .ok_or(Error::WouldBlock)?;
+                    &taken
+                }
+            };
+            let copied = output.len().min(message.len());
+            output[..copied].copy_from_slice(&message[..copied]);
+            return Ok((copied, message.len(), None));
+        }
         if !matches!(kind, Some(Kind::Udp | Kind::Icmp)) {
             let (copied, endpoint) = if peek_only {
                 self.peek(id, output)?
@@ -1859,6 +1904,9 @@ impl Sockets {
     }
 
     fn readiness(&mut self, id: SlotId) -> Option<(bool, bool, bool)> {
+        if let Some(state) = self.slot(id).filter(|state| state.kind == Kind::Netlink) {
+            return Some((!state.netlink_messages.is_empty(), true, false));
+        }
         self.poll();
         if self.slot(id)?.kind == Kind::Icmp {
             let readable = self.icmp_ready(id);
@@ -1910,7 +1958,7 @@ impl Sockets {
                 let socket = runtime.sockets.get::<udp::Socket>(handle);
                 (socket.can_recv(), socket.can_send(), false)
             }
-            Kind::Icmp | Kind::Unix | Kind::Object => return None,
+            Kind::Icmp | Kind::Unix | Kind::Object | Kind::Netlink => return None,
         })
     }
 
@@ -2158,6 +2206,138 @@ pub(crate) fn open_unix(socket_type: u8) -> Result<SlotId, Error> {
     SOCKETS.lock().open_unix(socket_type)
 }
 
+/// The most messages a netlink socket queues for its reader; past it the
+/// kernel's message is dropped, as Linux drops it (ENOBUFS for the reader).
+const NETLINK_QUEUE_LIMIT: usize = 64;
+
+/// The netlink message types and flags the answers use.
+const NLMSG_ERROR: u16 = 2;
+const NLM_F_REQUEST: u16 = 1;
+/// EOPNOTSUPP, negated as an NLMSG_ERROR carries it.
+const NETLINK_EOPNOTSUPP: i32 = -95;
+
+/// Opens an AF_NETLINK socket of `protocol` (NETLINK_ROUTE is 0).
+pub(crate) fn open_netlink(protocol: u8) -> Result<SlotId, Error> {
+    let mut slot = Slot::new(Kind::Netlink, current_owner());
+    slot.netlink_protocol = protocol;
+    SOCKETS.lock().insert(slot)
+}
+
+/// A netlink socket's protocol and port id (0 until bound).
+pub(crate) fn netlink_address(id: SlotId) -> Option<(u8, u32)> {
+    SOCKETS
+        .lock()
+        .slot(id)
+        .filter(|state| state.kind == Kind::Netlink)
+        .map(|state| (state.netlink_protocol, state.netlink_port))
+}
+
+/// Binds a netlink socket to port id `port` (or `fallback` for 0, as
+/// Linux picks the process id); EADDRINUSE (AddressInUse) when another
+/// socket of the protocol in the domain has it.
+pub(crate) fn bind_netlink(id: SlotId, port: u32, fallback: u32) -> Result<u32, Error> {
+    let mut sockets = SOCKETS.lock();
+    let (owner, protocol) = sockets
+        .slot(id)
+        .filter(|state| state.kind == Kind::Netlink)
+        .map(|state| (state.owner, state.netlink_protocol))
+        .ok_or(Error::Invalid)?;
+    let taken = |sockets: &Sockets, candidate: u32| {
+        sockets.slots.iter().enumerate().any(|(other, slot)| {
+            other != usize::from(id)
+                && slot.as_ref().is_some_and(|slot| {
+                    slot.kind == Kind::Netlink
+                        && slot.owner == owner
+                        && slot.netlink_protocol == protocol
+                        && slot.netlink_port == candidate
+                })
+        })
+    };
+    let port = if port != 0 {
+        if taken(&sockets, port) {
+            return Err(Error::AddressInUse);
+        }
+        port
+    } else {
+        // Linux tries the process id, then numbers counting down from -4096.
+        let mut candidate = fallback;
+        let mut next = 0xffff_f000_u32;
+        while candidate == 0 || taken(&sockets, candidate) {
+            candidate = next;
+            next = next.wrapping_sub(1);
+        }
+        candidate
+    };
+    sockets.slot_mut(id).ok_or(Error::Invalid)?.netlink_port = port;
+    Ok(port)
+}
+
+/// Queues `message` for the reader of netlink socket `id`: false when the
+/// socket is gone or its queue is full.
+pub(crate) fn deliver_netlink(id: SlotId, message: &[u8]) -> bool {
+    let mut sockets = SOCKETS.lock();
+    let Some(state) = sockets
+        .slot_mut(id)
+        .filter(|state| state.kind == Kind::Netlink)
+    else {
+        return false;
+    };
+    if state.netlink_messages.len() >= NETLINK_QUEUE_LIMIT {
+        return false;
+    }
+    let mut copy = Vec::new();
+    if copy.try_reserve_exact(message.len()).is_err()
+        || state.netlink_messages.try_reserve(1).is_err()
+    {
+        return false;
+    }
+    copy.extend_from_slice(message);
+    state.netlink_messages.push_back(copy);
+    true
+}
+
+/// Answers each request message in `input` with an NLMSG_ERROR of
+/// EOPNOTSUPP carrying the request's header, as Linux answers a request no
+/// family handles; other messages are dropped. A malformed header ends the
+/// batch, as Linux stops at it.
+fn answer_netlink_requests(state: &mut Slot, input: &[u8]) -> Result<(), Error> {
+    const HEADER: usize = 16;
+    let mut offset = 0;
+    while input.len() - offset >= HEADER {
+        let header = &input[offset..offset + HEADER];
+        let length = u32::from_ne_bytes(header[..4].try_into().unwrap()) as usize;
+        if length < HEADER || length > input.len() - offset {
+            break;
+        }
+        let flags = u16::from_ne_bytes(header[6..8].try_into().unwrap());
+        if flags & NLM_F_REQUEST != 0 && state.netlink_messages.len() < NETLINK_QUEUE_LIMIT {
+            // nlmsghdr, then nlmsgerr: the error and the request's header.
+            let mut answer = Vec::new();
+            answer
+                .try_reserve_exact(HEADER + 4 + HEADER)
+                .map_err(|_| Error::Exhausted)?;
+            answer.extend_from_slice(&((HEADER + 4 + HEADER) as u32).to_ne_bytes());
+            answer.extend_from_slice(&NLMSG_ERROR.to_ne_bytes());
+            answer.extend_from_slice(&0_u16.to_ne_bytes());
+            answer.extend_from_slice(&header[8..12]);
+            answer.extend_from_slice(&state.netlink_port.to_ne_bytes());
+            answer.extend_from_slice(&NETLINK_EOPNOTSUPP.to_ne_bytes());
+            answer.extend_from_slice(header);
+            state
+                .netlink_messages
+                .try_reserve(1)
+                .map_err(|_| Error::Exhausted)?;
+            state.netlink_messages.push_back(answer);
+        }
+        // Messages are 4-byte aligned (NLMSG_ALIGN).
+        offset += (length + 3) & !3;
+        if offset >= input.len() {
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// Opens an ICMP socket: a raw one (SOCK_RAW) or a ping socket.
 pub(crate) fn open_icmp(raw: bool) -> Result<SlotId, Error> {
     SOCKETS.lock().open_icmp(raw)
@@ -2178,7 +2358,7 @@ pub(crate) fn set_ttl(id: SlotId, ttl: u8) -> Result<(), Error> {
     let mut sockets = SOCKETS.lock();
     let Sockets { runtime, slots, .. } = &mut *sockets;
     let state = slot_in_mut(slots, id)
-        .filter(|state| !matches!(state.kind, Kind::Unix | Kind::Object))
+        .filter(|state| !matches!(state.kind, Kind::Unix | Kind::Object | Kind::Netlink))
         .ok_or(Error::Invalid)?;
     state.options.ttl = ttl;
     let (Some(runtime), Some(handle)) = (runtime.as_mut(), state.handle) else {
@@ -2194,7 +2374,7 @@ pub(crate) fn set_ttl(id: SlotId, ttl: u8) -> Result<(), Error> {
             .sockets
             .get_mut::<udp::Socket>(handle)
             .set_hop_limit(hop_limit),
-        Kind::Icmp | Kind::Unix | Kind::Object => {}
+        Kind::Icmp | Kind::Unix | Kind::Object | Kind::Netlink => {}
     }
     Ok(())
 }
@@ -2204,7 +2384,7 @@ pub(crate) fn ttl(id: SlotId) -> Result<u8, Error> {
     SOCKETS
         .lock()
         .slot(id)
-        .filter(|state| !matches!(state.kind, Kind::Unix | Kind::Object))
+        .filter(|state| !matches!(state.kind, Kind::Unix | Kind::Object | Kind::Netlink))
         .map(|state| match state.options.ttl {
             0 => DEFAULT_TTL,
             ttl => ttl,
@@ -2527,7 +2707,7 @@ pub(crate) fn recv_message_blocking(
     if output.is_empty() {
         return Ok((0, 0, None));
     }
-    if !wait_all || matches!(kind(id), Some(Kind::Udp | Kind::Icmp)) {
+    if !wait_all || matches!(kind(id), Some(Kind::Udp | Kind::Icmp | Kind::Netlink)) {
         for () in attempts(id, TimeoutOption::Receive) {
             match recv_message(id, output, peek_only) {
                 Err(Error::WouldBlock | Error::InProgress) => core::hint::spin_loop(),

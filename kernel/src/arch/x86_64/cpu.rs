@@ -20200,10 +20200,22 @@ fn linux_mq_timedsend(
     // process registered with mq_notify, once (SI_MESGQ, from the sender).
     let waiting = crate::linux_sysv_ipc::posix_queue_receiver_waiting(id);
     if let Some(registration) = crate::linux_sysv_ipc::posix_queue_take_notification(id, waiting) {
-        if let crate::linux_sysv_ipc::Notification::Signal { signal, value } =
-            registration.notification
-        {
-            const SI_MESGQ: i32 = -3;
+        linux_mq_finish_registration(registration, true);
+    }
+    0
+}
+
+/// Ends an mq_notify registration: notified (a message came) or removed.
+/// SIGEV_SIGNAL sends its signal when notified (SI_MESGQ, from the
+/// sender); SIGEV_THREAD sends its cookie on its netlink socket with the
+/// last byte NOTIFY_WOKENUP or NOTIFY_REMOVED, as Linux does, and lets go
+/// of the socket.
+fn linux_mq_finish_registration(registration: crate::linux_sysv_ipc::Registration, notified: bool) {
+    const SI_MESGQ: i32 = -3;
+    const NOTIFY_WOKENUP: u8 = 1;
+    const NOTIFY_REMOVED: u8 = 2;
+    match registration.notification {
+        crate::linux_sysv_ipc::Notification::Signal { signal, value } if notified => {
             let _ = linux_queue_process_signal(
                 registration.pid,
                 u64::from(signal),
@@ -20211,8 +20223,17 @@ fn linux_mq_timedsend(
                 Some(value),
             );
         }
+        crate::linux_sysv_ipc::Notification::Thread { socket, mut cookie } => {
+            cookie[31] = if notified {
+                NOTIFY_WOKENUP
+            } else {
+                NOTIFY_REMOVED
+            };
+            let _ = crate::linux_socket::deliver_netlink(socket, &cookie);
+            let _ = crate::linux_socket::close(socket);
+        }
+        _ => {}
     }
-    0
 }
 
 fn linux_mq_timedreceive(
@@ -20261,14 +20282,16 @@ fn linux_mq_timedreceive(
     .map_or_else(linux_sysv_ipc_error, |size| size as u64)
 }
 
-/// mq_notify: SIGEV_NONE or SIGEV_SIGNAL registers the caller for the
-/// queue's next message to an empty queue (EBUSY while another process
-/// holds it), a null event removes its registration. The event is checked
-/// before the descriptor, as Linux does. SIGEV_THREAD's netlink socket is
-/// not supported (EINVAL).
+/// mq_notify: SIGEV_NONE, SIGEV_SIGNAL or SIGEV_THREAD registers the
+/// caller for the queue's next message to an empty queue (EBUSY while
+/// another process holds it), a null event removes its registration. The
+/// event is checked before the descriptor, as Linux does. SIGEV_THREAD
+/// names a netlink socket (sigev_signo) and a 32-byte cookie (sigev_value
+/// points at it), which the C library's helper thread reads back.
 fn linux_mq_notify(descriptor: u64, event: u64) -> u64 {
     const SIGEV_SIGNAL: i32 = 0;
     const SIGEV_NONE: i32 = 1;
+    const SIGEV_THREAD: i32 = 2;
     let descriptor = u64::from(descriptor as u32);
     let notification = if event == 0 {
         None
@@ -20286,18 +20309,51 @@ fn linux_mq_notify(descriptor: u64, event: u64) -> u64 {
                     value: u64::from_ne_bytes(value[..8].try_into().unwrap()),
                 })
             }
+            SIGEV_THREAD => {
+                let mut cookie = [0_u8; 32];
+                let cookie_address = u64::from_ne_bytes(value[..8].try_into().unwrap());
+                if !copy_from_linux_user(cookie_address, &mut cookie) {
+                    return LINUX_EFAULT;
+                }
+                let socket_descriptor = u64::from(signal as u32);
+                let Some(socket) = linux_socket_slot(socket_descriptor) else {
+                    return linux_not_socket_error(socket_descriptor);
+                };
+                if crate::linux_socket::kind(socket) != Some(crate::linux_socket::Kind::Netlink) {
+                    return LINUX_ECONNREFUSED;
+                }
+                Some(crate::linux_sysv_ipc::Notification::Thread { socket, cookie })
+            }
             _ => return LINUX_EINVAL,
         }
     };
     let Some(id) = linux_mq_descriptor_id(descriptor) else {
         return LINUX_EBADF;
     };
-    crate::linux_sysv_ipc::posix_queue_set_notification(
+    // The registration holds a reference to its socket until it ends.
+    if let Some(crate::linux_sysv_ipc::Notification::Thread { socket, .. }) = notification {
+        if !crate::linux_socket::duplicate(socket) {
+            return LINUX_ENOMEM;
+        }
+    }
+    match crate::linux_sysv_ipc::posix_queue_set_notification(
         id,
         current_linux_process_pid(),
         notification,
-    )
-    .map_or_else(linux_sysv_ipc_error, |()| 0)
+    ) {
+        Ok(removed) => {
+            if let Some(removed) = removed {
+                linux_mq_finish_registration(removed, false);
+            }
+            0
+        }
+        Err(error) => {
+            if let Some(crate::linux_sysv_ipc::Notification::Thread { socket, .. }) = notification {
+                let _ = crate::linux_socket::close(socket);
+            }
+            linux_sysv_ipc_error(error)
+        }
+    }
 }
 
 fn linux_mq_getsetattr(descriptor: u64, new: u64, old: u64) -> u64 {
@@ -35387,6 +35443,42 @@ fn linux_socket_flags(descriptor: u64) -> Option<u32> {
         .map(|index| X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index].load(Ordering::SeqCst))
 }
 
+/// socket(AF_NETLINK, SOCK_RAW or SOCK_DGRAM, protocol): a netlink socket
+/// that receives the kernel's messages to it (`linux_socket::Kind::Netlink`).
+fn linux_netlink_socket_create(socket_type: u64, protocol: u64) -> u64 {
+    const SOCK_DGRAM: u64 = 2;
+    const SOCK_RAW: u64 = 3;
+    const SOCK_NONBLOCK: u64 = 0x800;
+    const SOCK_CLOEXEC: u64 = 0x8_0000;
+    const NETLINK_PROTOCOLS: u64 = 32;
+    if socket_type & !(0xf | SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
+        return LINUX_EINVAL;
+    }
+    if !matches!(socket_type & 0xf, SOCK_DGRAM | SOCK_RAW) {
+        return LINUX_ESOCKTNOSUPPORT;
+    }
+    if protocol >= NETLINK_PROTOCOLS {
+        return LINUX_EPROTONOSUPPORT;
+    }
+    let Some(descriptor) = (LINUX_AUX_DESCRIPTOR_FIRST..linux_nofile_soft_limit())
+        .find(|descriptor| linux_aux_descriptor_free(*descriptor))
+    else {
+        return LINUX_EMFILE;
+    };
+    let slot = match crate::linux_socket::open_netlink(protocol as u8) {
+        Ok(slot) => slot,
+        Err(error) => return linux_socket_error(error),
+    };
+    let index = (descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
+    X86_RUNTIME.ELF_PROBE_SOCKET_SLOTS[index].store(slot + 1, Ordering::SeqCst);
+    X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index]
+        .store((socket_type & SOCK_NONBLOCK) as u32, Ordering::SeqCst);
+    X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index]
+        .store(LINUX_DEVICE_SOCKET | 3, Ordering::SeqCst);
+    set_linux_descriptor_close_on_exec(descriptor, socket_type & SOCK_CLOEXEC != 0);
+    descriptor
+}
+
 fn linux_socket_create(family: u64, socket_type: u64, protocol: u64) -> u64 {
     const AF_UNIX: u64 = 1;
     const AF_INET: u64 = 2;
@@ -35397,9 +35489,13 @@ fn linux_socket_create(family: u64, socket_type: u64, protocol: u64) -> u64 {
     const SOCK_NONBLOCK: u64 = 0x800;
     const SOCK_CLOEXEC: u64 = 0x8_0000;
     const IPPROTO_ICMP: u64 = 1;
+    const AF_NETLINK: u64 = 16;
     let family = u64::from(family as u32);
     let socket_type = u64::from(socket_type as u32);
     let protocol = u64::from(protocol as u32);
+    if family == AF_NETLINK {
+        return linux_netlink_socket_create(socket_type, protocol);
+    }
     if !matches!(family, AF_UNIX | AF_INET) {
         return LINUX_EAFNOSUPPORT;
     }
@@ -35629,6 +35725,24 @@ fn linux_socket_bind(descriptor: u64, address: u64, length: u64) -> u64 {
     let Some(slot) = linux_socket_slot(descriptor) else {
         return linux_not_socket_error(descriptor);
     };
+    if crate::linux_socket::kind(slot) == Some(crate::linux_socket::Kind::Netlink) {
+        // struct sockaddr_nl: family, padding, port id, multicast groups.
+        let mut sockaddr = [0_u8; 12];
+        if length < sockaddr.len() as u64 {
+            return LINUX_EINVAL;
+        }
+        if !copy_from_linux_user(address, &mut sockaddr) {
+            return LINUX_EFAULT;
+        }
+        if u16::from_ne_bytes([sockaddr[0], sockaddr[1]]) != 16 {
+            return LINUX_EINVAL;
+        }
+        let port = u32::from_ne_bytes(sockaddr[4..8].try_into().unwrap());
+        return match crate::linux_socket::bind_netlink(slot, port, current_linux_process_pid()) {
+            Ok(_) => 0,
+            Err(error) => linux_socket_error(error),
+        };
+    }
     if crate::linux_socket::kind(slot) == Some(crate::linux_socket::Kind::Unix) {
         let mut path = [0_u8; 108];
         let path_length = match linux_unix_socket_path(address, length, &mut path) {
@@ -35851,7 +35965,8 @@ fn linux_socket_sendto(
     if flags & !SUPPORTED_FLAGS != 0 {
         return LINUX_EINVAL;
     }
-    let remote = if destination == 0 {
+    let netlink = crate::linux_socket::kind(slot) == Some(crate::linux_socket::Kind::Netlink);
+    let remote = if destination == 0 || netlink {
         None
     } else {
         match linux_socket_address(destination, destination_length) {
@@ -35930,7 +36045,9 @@ fn linux_socket_recvfrom(
     const MSG_TRUNC: u64 = 0x20;
     const MSG_DONTWAIT: u64 = 0x40;
     const MSG_WAITALL: u64 = 0x100;
-    const SUPPORTED_FLAGS: u64 = MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT | MSG_WAITALL;
+    // MSG_NOSIGNAL means nothing to a receive; Linux accepts it.
+    const MSG_NOSIGNAL: u64 = 0x4000;
+    const SUPPORTED_FLAGS: u64 = MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT | MSG_WAITALL | MSG_NOSIGNAL;
     let flags = u64::from(flags as u32);
     let Some(slot) = linux_socket_slot(descriptor) else {
         return linux_not_socket_error(descriptor);
@@ -35949,8 +36066,10 @@ fn linux_socket_recvfrom(
     let wait_all = flags & MSG_WAITALL != 0;
     let result = if nonblocking {
         crate::linux_socket::recv_message(slot, &mut bytes[..length], peek_only)
-    } else if crate::linux_socket::kind(slot) == Some(crate::linux_socket::Kind::Unix)
-        && X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
+    } else if matches!(
+        crate::linux_socket::kind(slot),
+        Some(crate::linux_socket::Kind::Unix | crate::linux_socket::Kind::Netlink)
+    ) && X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
         && live.is_some()
     {
         let (output, caller, syscall) = live.unwrap();
@@ -35962,7 +36081,10 @@ fn linux_socket_recvfrom(
                     match run_other_linux_processes(output, caller, syscall) {
                         Some(LinuxBlockedWait::Recheck) => continue,
                         Some(LinuxBlockedWait::Return(result)) => return result,
-                        None => break Err(crate::linux_socket::Error::WouldBlock),
+                        // Nothing else can run now: the call waits parked
+                        // and starts again, as a blocking receive never
+                        // answers EAGAIN (mq_notify03's helper thread).
+                        None => return linux_retry_later_live_return(output, caller, syscall),
                     }
                 }
                 result => break result,
@@ -35978,7 +36100,21 @@ fn linux_socket_recvfrom(
     if received != 0 && !copy_to_linux_user(address, &bytes[..received]) {
         return LINUX_EFAULT;
     }
-    if source != 0 {
+    // A netlink message comes from the kernel: sockaddr_nl with port 0.
+    if source != 0 && crate::linux_socket::kind(slot) == Some(crate::linux_socket::Kind::Netlink) {
+        let mut sockaddr = [0_u8; 12];
+        sockaddr[..2].copy_from_slice(&16_u16.to_ne_bytes());
+        let mut supplied = [0_u8; 4];
+        if !copy_from_linux_user(source_length, &mut supplied) {
+            return LINUX_EFAULT;
+        }
+        let output_length = (u32::from_ne_bytes(supplied) as usize).min(sockaddr.len());
+        if !copy_to_linux_user(source, &sockaddr[..output_length])
+            || !copy_to_linux_user(source_length, &(sockaddr.len() as u32).to_ne_bytes())
+        {
+            return LINUX_EFAULT;
+        }
+    } else if source != 0 {
         let Some(endpoint) = endpoint else {
             return LINUX_EINVAL;
         };
@@ -36029,7 +36165,9 @@ fn linux_socket_sendmsg(descriptor: u64, message: u64, flags: u64) -> u64 {
     if iov_count > LINUX_IOV_LIMIT {
         return LINUX_EINVAL;
     }
-    let remote = if name == 0 {
+    let remote = if name == 0
+        || crate::linux_socket::kind(slot) == Some(crate::linux_socket::Kind::Netlink)
+    {
         None
     } else {
         match linux_socket_address(name, name_length) {
@@ -36305,8 +36443,9 @@ fn linux_socket_recvmsg(
     const MSG_WAITALL: u64 = 0x100;
     const MSG_CTRUNC: u32 = 0x8;
     const MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
+    const MSG_NOSIGNAL: u64 = 0x4000;
     const SUPPORTED_FLAGS: u64 =
-        MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT | MSG_WAITALL | MSG_CMSG_CLOEXEC;
+        MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT | MSG_WAITALL | MSG_CMSG_CLOEXEC | MSG_NOSIGNAL;
     let flags = u64::from(flags as u32);
     let Some(slot) = linux_socket_slot(descriptor) else {
         return linux_not_socket_error(descriptor);
@@ -36376,8 +36515,10 @@ fn linux_socket_recvmsg(
     let wait_all = flags & MSG_WAITALL != 0;
     let result = if nonblocking {
         crate::linux_socket::recv_message(slot, &mut bytes[..capacity], peek_only)
-    } else if crate::linux_socket::kind(slot) == Some(crate::linux_socket::Kind::Unix)
-        && X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
+    } else if matches!(
+        crate::linux_socket::kind(slot),
+        Some(crate::linux_socket::Kind::Unix | crate::linux_socket::Kind::Netlink)
+    ) && X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
         && live.is_some()
     {
         let (output, caller, syscall) = live.unwrap();
@@ -36389,7 +36530,10 @@ fn linux_socket_recvmsg(
                     match run_other_linux_processes(output, caller, syscall) {
                         Some(LinuxBlockedWait::Recheck) => continue,
                         Some(LinuxBlockedWait::Return(result)) => return result,
-                        None => break Err(crate::linux_socket::Error::WouldBlock),
+                        // Nothing else can run now: the call waits parked
+                        // and starts again, as a blocking receive never
+                        // answers EAGAIN (mq_notify03's helper thread).
+                        None => return linux_retry_later_live_return(output, caller, syscall),
                     }
                 }
                 result => break result,
@@ -36771,6 +36915,26 @@ fn linux_socket_name(descriptor: u64, address: u64, length: u64, peer: bool) -> 
             LINUX_EBADF
         };
     };
+    if let Some((_, port)) = crate::linux_socket::netlink_address(slot) {
+        // Its own port id; the peer is the kernel (port 0).
+        let mut sockaddr = [0_u8; 12];
+        sockaddr[..2].copy_from_slice(&16_u16.to_ne_bytes());
+        if !peer {
+            sockaddr[4..8].copy_from_slice(&port.to_ne_bytes());
+        }
+        let mut supplied = [0_u8; 4];
+        if !copy_from_linux_user(length, &mut supplied) {
+            return LINUX_EFAULT;
+        }
+        let output_length = (u32::from_ne_bytes(supplied) as usize).min(sockaddr.len());
+        return if copy_to_linux_user(address, &sockaddr[..output_length])
+            && copy_to_linux_user(length, &(sockaddr.len() as u32).to_ne_bytes())
+        {
+            0
+        } else {
+            LINUX_EFAULT
+        };
+    }
     if crate::linux_socket::kind(slot) == Some(crate::linux_socket::Kind::Unix) {
         let name = if peer {
             let Some(name) = crate::linux_socket::unix_peer_name(slot) else {
@@ -37039,6 +37203,8 @@ fn linux_socket_getsockopt(
             Some(crate::linux_socket::Kind::Udp) => 17,
             Some(crate::linux_socket::Kind::Icmp) => 1,
             Some(crate::linux_socket::Kind::Unix) => 0,
+            Some(crate::linux_socket::Kind::Netlink) => crate::linux_socket::netlink_address(slot)
+                .map_or(0, |(protocol, _)| i32::from(protocol)),
             Some(crate::linux_socket::Kind::Object) => return LINUX_ENOTSOCK,
             None => return LINUX_EBADF,
         },
@@ -37049,6 +37215,7 @@ fn linux_socket_getsockopt(
                 | crate::linux_socket::Kind::Icmp,
             ) => 2,
             Some(crate::linux_socket::Kind::Unix) => 1,
+            Some(crate::linux_socket::Kind::Netlink) => 16,
             Some(crate::linux_socket::Kind::Object) => return LINUX_ENOTSOCK,
             None => return LINUX_EBADF,
         },
@@ -45977,8 +46144,14 @@ fn linux_descriptor_close_with_wake_inner(descriptor: u64, wake_waiters: bool) -
     }
     if let Some(id) = linux_mq_descriptor_id(descriptor) {
         match crate::linux_sysv_ipc::posix_queue_close_by(id, current_linux_process_pid()) {
-            Ok(destroyed) if linux_release_posix_queue_charge(destroyed) => {}
-            Ok(_) => return LINUX_EIO,
+            Ok((destroyed, removed)) => {
+                if let Some(removed) = removed {
+                    linux_mq_finish_registration(removed, false);
+                }
+                if !linux_release_posix_queue_charge(destroyed) {
+                    return LINUX_EIO;
+                }
+            }
             Err(_) => return LINUX_EBADF,
         }
     }
