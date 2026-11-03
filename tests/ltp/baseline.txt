@@ -78,14 +78,6 @@ ioperm01 TFAIL
 ioperm02 TFAIL
 iopl01 TFAIL
 iopl02 TFAIL
-io_cancel01 TFAIL
-io_cancel02 TFAIL
-io_pgetevents01 TFAIL
-io_pgetevents02 TFAIL
-io_submit01 TFAIL
-io_submit02 TFAIL
-io_submit03 TFAIL
-io_submit04 TFAIL
 keyctl02 TBROK
 keyctl05 TBROK
 keyctl09 TFAIL

@@ -20446,7 +20446,9 @@ fn linux_io_setup(events: u64, output: u64) -> u64 {
     if mapping >= LINUX_RETURN_TO_KERNEL {
         return mapping;
     }
-    if let Err(error) = crate::linux_aio::create(mapping, events, pages) {
+    if let Err(error) =
+        crate::linux_aio::create(current_linux_process_pid(), mapping, events, pages)
+    {
         let _ = linux_runtime_munmap(mapping, pages * PAGE_SIZE as u64);
         return linux_aio_error(error);
     }
@@ -20457,7 +20459,7 @@ fn linux_io_setup(events: u64, output: u64) -> u64 {
     header[28..32].copy_from_slice(&32_u32.to_ne_bytes());
     if !copy_to_linux_user(mapping, &header) || !copy_to_linux_user(output, &mapping.to_ne_bytes())
     {
-        let _ = crate::linux_aio::destroy(mapping);
+        let _ = crate::linux_aio::destroy(current_linux_process_pid(), mapping);
         let _ = linux_runtime_munmap(mapping, pages * PAGE_SIZE as u64);
         return LINUX_EFAULT;
     }
@@ -20465,7 +20467,7 @@ fn linux_io_setup(events: u64, output: u64) -> u64 {
 }
 
 fn linux_io_destroy(context: u64) -> u64 {
-    let pages = match crate::linux_aio::destroy(context) {
+    let pages = match crate::linux_aio::destroy(current_linux_process_pid(), context) {
         Ok(pages) => pages,
         Err(error) => return linux_aio_error(error),
     };
@@ -20473,15 +20475,18 @@ fn linux_io_destroy(context: u64) -> u64 {
 }
 
 fn linux_io_submit(context: u64, count: u64, pointers: u64) -> u64 {
-    if count > 1024 {
+    // As Linux: an unknown context, then a negative count, are EINVAL; a
+    // count past the context's size submits what fits.
+    if crate::linux_aio::info(current_linux_process_pid(), context).is_err() {
         return LINUX_EINVAL;
     }
-    if crate::linux_aio::info(context).is_err() {
+    if (count as i64) < 0 {
         return LINUX_EINVAL;
     }
+    let count = count.min(1024);
     let mut submitted = 0_u64;
     for index in 0..count {
-        match crate::linux_aio::can_submit(context) {
+        match crate::linux_aio::can_submit(current_linux_process_pid(), context) {
             Ok(true) => {}
             Ok(false) => {
                 return if submitted == 0 {
@@ -20528,14 +20533,29 @@ fn linux_io_submit(context: u64, count: u64, pointers: u64) -> u64 {
         let buffer = u64::from_ne_bytes(control[24..32].try_into().unwrap());
         let length = u64::from_ne_bytes(control[32..40].try_into().unwrap());
         let offset = i64::from_ne_bytes(control[40..48].try_into().unwrap());
-        if offset < 0 {
-            return if submitted == 0 {
-                LINUX_EINVAL
-            } else {
-                submitted
-            };
+        let reserved = u64::from_ne_bytes(control[48..56].try_into().unwrap());
+        // A request is checked as it is submitted, as Linux's io_submit_one:
+        // its reserved field, its descriptor (EBADF), and that the
+        // descriptor was opened for the transfer's direction (EBADF).
+        let state = linux_device_descriptor(descriptor);
+        let refusal = if reserved != 0 || offset < 0 {
+            Some(LINUX_EINVAL)
+        } else if !linux_descriptor_open(descriptor)
+            || opcode == 0 && state & LINUX_DESCRIPTOR_INPUT == 0 && state & 3 != 0
+            || opcode == 1 && state & LINUX_DESCRIPTOR_OUTPUT == 0 && state & 3 != 0
+        {
+            Some(LINUX_EBADF)
+        } else {
+            None
+        };
+        if let Some(error) = refusal {
+            return if submitted == 0 { error } else { submitted };
         }
+        let stream = linux_pipe_descriptor(descriptor) || linux_socket_slot(descriptor).is_some();
         let result = match opcode {
+            // A pipe or socket has no offset to read at: the read takes what
+            // is there now, EAGAIN when nothing is (io_submit04).
+            0 if stream => linux_aio_stream_read(descriptor, buffer, length),
             0 => linux_regular_file_read_at(descriptor, buffer, length, offset as u64),
             1 => linux_regular_file_write_at(descriptor, buffer, length, offset as u64),
             2 | 3 => {
@@ -20559,7 +20579,7 @@ fn linux_io_submit(context: u64, count: u64, pointers: u64) -> u64 {
             result: result as i64,
             result2: 0,
         };
-        if let Err(error) = crate::linux_aio::push(context, event) {
+        if let Err(error) = crate::linux_aio::push(current_linux_process_pid(), context, event) {
             return if submitted == 0 {
                 linux_aio_error(error)
             } else {
@@ -20579,7 +20599,10 @@ fn linux_io_getevents(
     timeout: u64,
     signal: u64,
 ) -> u64 {
-    if minimum > maximum || maximum > 1024 || crate::linux_aio::info(context).is_err() {
+    if minimum > maximum
+        || maximum > 1024
+        || crate::linux_aio::info(current_linux_process_pid(), context).is_err()
+    {
         return LINUX_EINVAL;
     }
     let mut zero_timeout = false;
@@ -20600,8 +20623,9 @@ fn linux_io_getevents(
         }
         let set = u64::from_ne_bytes(descriptor[..8].try_into().unwrap());
         let size = u64::from_ne_bytes(descriptor[8..].try_into().unwrap());
+        // struct __aio_sigset: a null set means no mask, whatever the size.
         let mut mask = [0_u8; 8];
-        if size != 8 || set == 0 || !copy_from_linux_user(set, &mut mask) {
+        if set != 0 && (size != 8 || !copy_from_linux_user(set, &mut mask)) {
             return if size != 8 {
                 LINUX_EINVAL
             } else {
@@ -20611,7 +20635,7 @@ fn linux_io_getevents(
     }
     let mut received = 0_u64;
     while received < maximum {
-        let event = match crate::linux_aio::pop(context) {
+        let event = match crate::linux_aio::pop(current_linux_process_pid(), context) {
             Ok(Some(event)) => event,
             Ok(None) => break,
             Err(error) => {
@@ -20652,8 +20676,39 @@ fn linux_io_getevents(
     received
 }
 
-fn linux_io_cancel(_context: u64, _control: u64, _result: u64) -> u64 {
+/// io_cancel: the request's key is read first (EFAULT), must be 0
+/// (KIOCB_KEY, else EINVAL), and the context must exist (EINVAL). Requests
+/// complete as they are submitted here, so none is left to cancel
+/// (EINVAL, as Linux answers for a completed one).
+fn linux_io_cancel(context: u64, control: u64, _result: u64) -> u64 {
+    let mut key = [0_u8; 4];
+    if control
+        .checked_add(8)
+        .is_none_or(|address| !copy_from_linux_user(address, &mut key))
+    {
+        return LINUX_EFAULT;
+    }
+    let _ = crate::linux_aio::info(current_linux_process_pid(), context);
     LINUX_EINVAL
+}
+
+/// An AIO read from a pipe or socket: what is queued now, without waiting.
+fn linux_aio_stream_read(descriptor: u64, buffer: u64, length: u64) -> u64 {
+    let Some(slot) = linux_socket_slot(descriptor) else {
+        return LINUX_EBADF;
+    };
+    let mut bytes = [0_u8; PAGE_SIZE];
+    let length = usize::try_from(length).unwrap_or(PAGE_SIZE).min(PAGE_SIZE);
+    match crate::linux_socket::recv(slot, &mut bytes[..length]) {
+        Ok((received, _)) => {
+            if received != 0 && !copy_to_linux_user(buffer, &bytes[..received]) {
+                LINUX_EFAULT
+            } else {
+                received as u64
+            }
+        }
+        Err(error) => linux_socket_error(error),
+    }
 }
 
 fn linux_lsm_attribute_valid(attribute: u64) -> bool {

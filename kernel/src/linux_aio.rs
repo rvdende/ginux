@@ -35,6 +35,10 @@ pub(crate) struct Event {
 #[repr(C)]
 struct Context {
     next: memory::FrameLease,
+    /// The process whose io_setup made it: contexts are a process's (its
+    /// ring is in that process's memory), so another process with a ring
+    /// at the same address has a context of its own.
+    owner: u32,
     id: u64,
     maximum: u64,
     pending: u64,
@@ -104,13 +108,24 @@ fn event_mut(frame: memory::FrameLease) -> Option<&'static mut EventPage> {
     Some(unsafe { &mut *(frame.direct_map_address()? as *mut EventPage) })
 }
 
-fn find(instance: usize, id: u64) -> Option<(memory::FrameLease, Option<memory::FrameLease>)> {
+fn find(
+    instance: usize,
+    owner: u32,
+    id: u64,
+) -> Option<(memory::FrameLease, Option<memory::FrameLease>)> {
+    find_where(instance, |item| item.owner == owner && item.id == id)
+}
+
+fn find_where(
+    instance: usize,
+    matches: impl Fn(&Context) -> bool,
+) -> Option<(memory::FrameLease, Option<memory::FrameLease>)> {
     let mut current = root(instance);
     let mut previous = None;
     for _ in 0..WALK_LIMIT {
         let frame = current?;
         let item = context(frame)?;
-        if item.id == id {
+        if matches(item) {
             return Some((frame, previous));
         }
         previous = Some(frame);
@@ -119,12 +134,18 @@ fn find(instance: usize, id: u64) -> Option<(memory::FrameLease, Option<memory::
     None
 }
 
-pub(crate) fn create(id: u64, maximum: u64, ring_pages: u64) -> Result<(), Error> {
+pub(crate) fn create(owner: u32, id: u64, maximum: u64, ring_pages: u64) -> Result<(), Error> {
     if id == 0 || maximum == 0 || ring_pages == 0 {
         return Err(Error::Invalid);
     }
     let guard = Guard::acquire().ok_or(Error::Invalid)?;
-    if find(guard.instance, id).is_some() {
+    // The contexts of processes gone (their memory with them) go now.
+    while let Some((frame, previous)) = find_where(guard.instance, |item| {
+        linux_process::live_process_status(item.owner).is_none()
+    }) {
+        remove_locked(guard.instance, frame, previous)?;
+    }
+    if find(guard.instance, owner, id).is_some() {
         return Err(Error::Invalid);
     }
     let frame = lease().ok_or(Error::NoMemory)?;
@@ -135,16 +156,18 @@ pub(crate) fn create(id: u64, maximum: u64, ring_pages: u64) -> Result<(), Error
     let old = root(guard.instance);
     let item = context_mut(frame).ok_or(Error::NoMemory)?;
     item.next = old.unwrap_or(memory::FrameLease::EMPTY);
+    item.owner = owner;
     item.id = id;
-    item.maximum = maximum;
+    // Linux sizes a context for at least four requests per CPU, doubled.
+    item.maximum = maximum.max(16) * 2;
     item.ring_pages = ring_pages;
     publish(guard.instance, Some(frame));
     Ok(())
 }
 
-pub(crate) fn push(id: u64, value: Event) -> Result<(), Error> {
+pub(crate) fn push(owner: u32, id: u64, value: Event) -> Result<(), Error> {
     let guard = Guard::acquire().ok_or(Error::Invalid)?;
-    let (frame, _) = find(guard.instance, id).ok_or(Error::Invalid)?;
+    let (frame, _) = find(guard.instance, owner, id).ok_or(Error::Invalid)?;
     let item = context(frame).ok_or(Error::Invalid)?;
     if item.pending >= item.maximum {
         return Err(Error::Full);
@@ -166,9 +189,9 @@ pub(crate) fn push(id: u64, value: Event) -> Result<(), Error> {
     Ok(())
 }
 
-pub(crate) fn pop(id: u64) -> Result<Option<Event>, Error> {
+pub(crate) fn pop(owner: u32, id: u64) -> Result<Option<Event>, Error> {
     let guard = Guard::acquire().ok_or(Error::Invalid)?;
-    let (frame, _) = find(guard.instance, id).ok_or(Error::Invalid)?;
+    let (frame, _) = find(guard.instance, owner, id).ok_or(Error::Invalid)?;
     let item = context_mut(frame).ok_or(Error::Invalid)?;
     if item.head == memory::FrameLease::EMPTY {
         return Ok(None);
@@ -186,23 +209,33 @@ pub(crate) fn pop(id: u64) -> Result<Option<Event>, Error> {
         .ok_or(Error::Invalid)
 }
 
-pub(crate) fn info(id: u64) -> Result<(u64, u64), Error> {
+pub(crate) fn info(owner: u32, id: u64) -> Result<(u64, u64), Error> {
     let guard = Guard::acquire().ok_or(Error::Invalid)?;
-    let (frame, _) = find(guard.instance, id).ok_or(Error::Invalid)?;
+    let (frame, _) = find(guard.instance, owner, id).ok_or(Error::Invalid)?;
     let item = context(frame).ok_or(Error::Invalid)?;
     Ok((item.pending, item.ring_pages))
 }
 
-pub(crate) fn can_submit(id: u64) -> Result<bool, Error> {
+pub(crate) fn can_submit(owner: u32, id: u64) -> Result<bool, Error> {
     let guard = Guard::acquire().ok_or(Error::Invalid)?;
-    let (frame, _) = find(guard.instance, id).ok_or(Error::Invalid)?;
+    let (frame, _) = find(guard.instance, owner, id).ok_or(Error::Invalid)?;
     let item = context(frame).ok_or(Error::Invalid)?;
     Ok(item.pending < item.maximum)
 }
 
-pub(crate) fn destroy(id: u64) -> Result<u64, Error> {
+pub(crate) fn destroy(owner: u32, id: u64) -> Result<u64, Error> {
     let guard = Guard::acquire().ok_or(Error::Invalid)?;
-    let (frame, previous) = find(guard.instance, id).ok_or(Error::Invalid)?;
+    let (frame, previous) = find(guard.instance, owner, id).ok_or(Error::Invalid)?;
+    remove_locked(guard.instance, frame, previous)
+}
+
+/// Frees context `frame` (after `previous` in the list) and its queued
+/// events; its ring's page count, for the caller to unmap.
+fn remove_locked(
+    instance: usize,
+    frame: memory::FrameLease,
+    previous: Option<memory::FrameLease>,
+) -> Result<u64, Error> {
     let item = context(frame).ok_or(Error::Invalid)?;
     let next = item.next;
     let pages = item.ring_pages;
@@ -224,7 +257,7 @@ pub(crate) fn destroy(id: u64) -> Result<u64, Error> {
         context_mut(previous).ok_or(Error::Invalid)?.next = next;
     } else {
         publish(
-            guard.instance,
+            instance,
             (next != memory::FrameLease::EMPTY).then_some(next),
         );
     }
