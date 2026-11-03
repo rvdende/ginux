@@ -407,6 +407,31 @@ fn linux_syscall_dispatch(
     X86_RUNTIME
         .LINUX_FSIZE_LIMIT_HIT
         .store(false, Ordering::SeqCst);
+    // The memory a process held as it exits or replaces its image counts
+    // toward its ru_maxrss, read while the address space is still whole.
+    if runtime_mode
+        && matches!(
+            number,
+            LINUX_EXIT_SYSCALL
+                | LINUX_EXIT_GROUP_SYSCALL
+                | LINUX_EXECVE_SYSCALL
+                | LINUX_EXECVEAT_SYSCALL
+        )
+    {
+        linux_process::note_live_process_rss(
+            current_linux_process_pid(),
+            linux_current_resident_kib(),
+        );
+    }
+    // A parent ignoring SIGCHLD has no zombies to see or wait for.
+    if runtime_mode
+        && matches!(
+            number,
+            LINUX_KILL_SYSCALL | LINUX_WAIT4_SYSCALL | LINUX_WAITID_SYSCALL
+        )
+    {
+        linux_reap_ignored_children();
+    }
     let result = match number {
         LINUX_READ_SYSCALL | LINUX_WRITE_SYSCALL | LINUX_IOCTL_SYSCALL
             if linux_graphics_descriptor(first_argument).is_some() =>

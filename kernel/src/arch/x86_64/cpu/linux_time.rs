@@ -572,6 +572,14 @@ pub(super) fn linux_sysinfo_information(
     Ok(information)
 }
 
+/// The calling process's resident memory in KiB, as its page tables map it.
+pub(super) fn linux_current_resident_kib() -> u64 {
+    address_space::current_linux_user_page_count()
+        .and_then(|pages| pages.checked_mul(PAGE_SIZE / 1024))
+        .and_then(|kib| u64::try_from(kib).ok())
+        .unwrap_or(0)
+}
+
 pub(super) fn linux_getrusage(who: u64, output_address: u64) -> u64 {
     let who = who as i32;
     let children = who == -1;
@@ -588,11 +596,15 @@ pub(super) fn linux_getrusage(who: u64, output_address: u64) -> u64 {
         let microseconds = cycles % frequency * 1_000_000 / frequency;
         usage[..8].copy_from_slice(&(cycles / frequency).to_ne_bytes());
         usage[8..16].copy_from_slice(&microseconds.to_ne_bytes());
-        let resident_kib = address_space::current_linux_user_page_count()
-            .and_then(|pages| pages.checked_mul(PAGE_SIZE / 1024))
-            .and_then(|kib| u64::try_from(kib).ok())
-            .unwrap_or(0);
-        usage[32..40].copy_from_slice(&resident_kib.to_ne_bytes());
+        let pid = current_linux_process_pid();
+        linux_process::note_live_process_rss(pid, linux_current_resident_kib());
+        let peak = linux_process::live_process_maxrss(pid).map_or(0, |(own, _)| own);
+        usage[32..40].copy_from_slice(&peak.to_ne_bytes());
+    } else {
+        // The most any waited-for child (or its own waited children) held.
+        let peak = linux_process::live_process_maxrss(current_linux_process_pid())
+            .map_or(0, |(_, children)| children);
+        usage[32..40].copy_from_slice(&peak.to_ne_bytes());
     }
     if !copy_to_linux_user(output_address, &usage) {
         return LINUX_EFAULT;

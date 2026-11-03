@@ -1542,6 +1542,50 @@ pub(super) fn linux_signal_permitted(target: u32, signal: u64) -> bool {
     caller.may_signal(&target)
 }
 
+/// Whether `parent` has its exiting children reaped at once, leaving no
+/// zombie: SIGCHLD set to SIG_IGN, or SA_NOCLDWAIT, as in Linux (a wait
+/// then blocks until no child is left and fails with ECHILD).
+pub(super) fn linux_parent_reaps_automatically(parent: u32) -> bool {
+    let index = LINUX_SIGCHLD as usize - 1;
+    let (handler, flags) = if parent == current_linux_process_pid() {
+        (
+            X86_RUNTIME.ELF_PROBE_SIGNAL_HANDLERS[index].load(Ordering::SeqCst),
+            X86_RUNTIME.ELF_PROBE_SIGNAL_FLAGS[index].load(Ordering::SeqCst),
+        )
+    } else {
+        linux_process_runtime_state(parent)
+            .filter(|state| state.valid)
+            .map_or((0, 0), |state| {
+                (state.signal_handlers[index], state.signal_flags[index])
+            })
+    };
+    handler == 1 || flags & LINUX_SA_NOCLDWAIT != 0
+}
+
+/// Reaps the calling process's exited children when it ignores SIGCHLD
+/// (`linux_parent_reaps_automatically`): Linux keeps no zombie for such a
+/// parent, so a kill(pid, 0) of the child finds nothing (ESRCH) and a wait
+/// sees no child. Done as the parent calls kill or wait, when the child has
+/// long been settled, not while it is still being torn down.
+pub(super) fn linux_reap_ignored_children() {
+    let parent = current_linux_process_pid();
+    if !linux_parent_reaps_automatically(parent) {
+        return;
+    }
+    let exited = linux_process::ChildWaitEvents {
+        exited: true,
+        stopped: false,
+        continued: false,
+    };
+    while let Some(linux_process::ChildWaitState::Exited { pid, .. }) =
+        linux_process::live_child_wait_state(parent, None, exited)
+    {
+        if linux_process::wait_live_child(parent, pid).is_none() {
+            break;
+        }
+    }
+}
+
 pub(super) fn linux_target_signal_ignored(target: u32, signal: u64) -> bool {
     let index = signal as usize - 1;
     let (handler, mask) = if target == current_linux_process_pid() {

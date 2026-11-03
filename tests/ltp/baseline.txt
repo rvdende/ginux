@@ -51,7 +51,6 @@ getcpu01 TFAIL
 gethostbyname_r01 TFAIL
 gethostname02 TFAIL
 get_robust_list01 TFAIL
-getrusage03 HANG
 getsockopt02 TFAIL
 ioctl01 TBROK
 ioctl02 TBROK

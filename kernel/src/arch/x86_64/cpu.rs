@@ -2969,6 +2969,7 @@ fn settle_linux_process_exit(pid: u32, status: u8) -> bool {
     let exited = signals_cleared
         && child_signal_queued
         && linux_process::complete_live_process_exit_detached(pid, status);
+
     linux_release_process_cgroup(pid);
     release_linux_process_shared_mappings(pid);
     if let Some(state) = linux_process_runtime_state(pid) {
@@ -15042,8 +15043,12 @@ fn linux_wait4(pid: u64, status_address: u64, options: u64, rusage: u64) -> u64 
         return LINUX_EFAULT;
     }
     if reaped {
+        let child_maxrss = linux_process::live_process_maxrss(waited);
         if linux_process::wait_live_child(parent_pid, waited) != Some((waited, exit_status)) {
             return LINUX_ECHILD;
+        }
+        if let Some(child_maxrss) = child_maxrss {
+            linux_process::add_waited_child_maxrss(parent_pid, child_maxrss);
         }
     } else if !linux_process::consume_live_child_wait_event(parent_pid, waited) {
         return LINUX_ECHILD;
@@ -15179,8 +15184,12 @@ fn linux_waitid(id_type: u64, id: u64, information: u64, options: u64, rusage: u
     }
     if options & LINUX_WNOWAIT == 0 {
         if reaped {
+            let child_maxrss = linux_process::live_process_maxrss(pid);
             if linux_process::wait_live_child(parent, pid) != Some((pid, exit_status)) {
                 return LINUX_ECHILD;
+            }
+            if let Some(child_maxrss) = child_maxrss {
+                linux_process::add_waited_child_maxrss(parent, child_maxrss);
             }
         } else if !linux_process::consume_live_child_wait_event(parent, pid) {
             return LINUX_ECHILD;

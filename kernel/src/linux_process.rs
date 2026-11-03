@@ -535,6 +535,12 @@ struct Process {
     /// process's CPU clock (SIGVTALRM, SIGPROF): none in a new child, kept
     /// across exec.
     itimers: [Option<PosixTimer>; 2],
+    /// getrusage's ru_maxrss in KiB: the most the process was seen to hold
+    /// resident (at getrusage and as it exits), and the most any child it
+    /// waited for (or that child's own waited children) held. A new child
+    /// starts with neither.
+    maxrss_kib: u64,
+    children_maxrss_kib: u64,
     /// `/proc/PID/oom_score_adj`: inherited across fork, kept across exec.
     oom_score_adj: i16,
     /// The signal whose default action terminated the process, or 0.
@@ -1740,6 +1746,8 @@ impl ProcessTable {
             cpu_cycles: 0,
             posix_timers: [None; POSIX_TIMER_LIMIT],
             itimers: [None; 2],
+            maxrss_kib: 0,
+            children_maxrss_kib: 0,
         });
         Some(handle)
     }
@@ -5144,6 +5152,34 @@ pub(crate) fn switch_live_process(from_pid: u32, to_pid: u32) -> Option<LiveProc
         return None;
     }
     table.dispatch(to_handle)
+}
+
+/// Notes that `pid` holds `kib` KiB resident now (its ru_maxrss peak).
+pub(crate) fn note_live_process_rss(pid: u32, kib: u64) {
+    if let Some(process) = live_process_table_mut().and_then(|table| {
+        let handle = table.handle_by_pid(pid)?;
+        table.process_mut(handle)
+    }) {
+        process.maxrss_kib = process.maxrss_kib.max(kib);
+    }
+}
+
+/// `pid`'s ru_maxrss peaks: its own and its waited children's, in KiB.
+pub(crate) fn live_process_maxrss(pid: u32) -> Option<(u64, u64)> {
+    let table = live_process_table_mut()?;
+    let process = table.process(table.handle_by_pid(pid)?)?;
+    Some((process.maxrss_kib, process.children_maxrss_kib))
+}
+
+/// A wait reaped `child` of `parent`: the child's peaks join the
+/// parent's children's (RUSAGE_CHILDREN's ru_maxrss).
+pub(crate) fn add_waited_child_maxrss(parent: u32, (own, children): (u64, u64)) {
+    if let Some(process) = live_process_table_mut().and_then(|table| {
+        let handle = table.handle_by_pid(parent)?;
+        table.process_mut(handle)
+    }) {
+        process.children_maxrss_kib = process.children_maxrss_kib.max(own).max(children);
+    }
 }
 
 pub(crate) fn wait_live_child(parent_pid: u32, child_pid: u32) -> Option<(u32, u8)> {
