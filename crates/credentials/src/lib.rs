@@ -233,6 +233,9 @@ pub struct Capabilities {
     pub effective: u64,
     pub permitted: u64,
     pub inheritable: u64,
+    /// The bounding set: what exec may grant and capset may make
+    /// inheritable. Only PR_CAPBSET_DROP shrinks it.
+    pub bounding: u64,
 }
 
 impl Capabilities {
@@ -241,12 +244,14 @@ impl Capabilities {
         effective: capability::ALL,
         permitted: capability::ALL,
         inheritable: 0,
+        bounding: capability::ALL,
     };
-    /// None.
+    /// None held (the bounding set is still full).
     pub const NONE: Self = Self {
         effective: 0,
         permitted: 0,
         inheritable: 0,
+        bounding: capability::ALL,
     };
 }
 
@@ -325,16 +330,13 @@ impl Credentials {
     }
 
     /// execve(2) without file capabilities: root (real or effective) gets
-    /// every capability permitted, effective when its effective id is 0;
-    /// any other process none.
+    /// every capability of the bounding set permitted, effective when its
+    /// effective id is 0; any other process none.
     pub fn after_exec(&mut self) {
         if self.user.real == 0 || self.user.effective == 0 {
-            self.capabilities.permitted = capability::ALL;
-            self.capabilities.effective = if self.user.effective == 0 {
-                capability::ALL
-            } else {
-                0
-            };
+            let granted = capability::ALL & self.capabilities.bounding;
+            self.capabilities.permitted = granted;
+            self.capabilities.effective = if self.user.effective == 0 { granted } else { 0 };
         } else {
             self.capabilities.permitted = 0;
             self.capabilities.effective = 0;
@@ -343,14 +345,20 @@ impl Credentials {
 
     /// capset(2): the new permitted set within the old, the effective within
     /// the new permitted, the inheritable within the old inheritable and
-    /// permitted sets unless CAP_SETPCAP allows any (EPERM otherwise).
+    /// permitted sets unless CAP_SETPCAP allows any, and always within the
+    /// old inheritable and bounding sets (EPERM otherwise). The bounding
+    /// set is kept; `new.bounding` is ignored.
     pub fn set_capabilities(&mut self, new: Capabilities) -> Result<(), Error> {
         let old = self.capabilities;
+        let new = Capabilities {
+            bounding: old.bounding,
+            ..new
+        };
         let inheritable_allowed = if self.has(capability::SETPCAP) {
             capability::ALL
         } else {
             old.inheritable | old.permitted
-        };
+        } & (old.inheritable | old.bounding);
         if new.permitted & !old.permitted != 0
             || new.effective & !new.permitted != 0
             || new.inheritable & !inheritable_allowed != 0
@@ -358,6 +366,28 @@ impl Credentials {
             return Err(Error::Permission);
         }
         self.capabilities = new;
+        Ok(())
+    }
+
+    /// PR_CAPBSET_READ: whether `capability` is in the bounding set
+    /// (Invalid for a capability that does not exist).
+    pub fn bounding_has(&self, capability: u32) -> Result<bool, Error> {
+        if capability > capability::LAST {
+            return Err(Error::Invalid);
+        }
+        Ok(self.capabilities.bounding & 1 << capability != 0)
+    }
+
+    /// PR_CAPBSET_DROP: removes `capability` from the bounding set, which
+    /// takes CAP_SETPCAP.
+    pub fn drop_bounding(&mut self, capability: u32) -> Result<(), Error> {
+        if capability > capability::LAST {
+            return Err(Error::Invalid);
+        }
+        if !self.has(capability::SETPCAP) {
+            return Err(Error::Permission);
+        }
+        self.capabilities.bounding &= !(1 << capability);
         Ok(())
     }
 
@@ -646,7 +676,25 @@ mod tests {
             permitted: 0,
             effective: 1,
             inheritable: 0,
+            bounding: capability::ALL,
         };
         assert_eq!(caps.set_capabilities(raised), Err(Error::Permission));
+        let mut bounded = Credentials::ROOT;
+        assert_eq!(bounded.drop_bounding(capability::KILL), Ok(()));
+        assert_eq!(bounded.bounding_has(capability::KILL), Ok(false));
+        assert_eq!(
+            bounded.bounding_has(capability::LAST + 1),
+            Err(Error::Invalid)
+        );
+        let inherit_kill = Capabilities {
+            inheritable: 1 << capability::KILL,
+            ..bounded.capabilities
+        };
+        assert_eq!(
+            bounded.set_capabilities(inherit_kill),
+            Err(Error::Permission)
+        );
+        bounded.after_exec();
+        assert_eq!(bounded.capabilities.permitted & 1 << capability::KILL, 0);
     }
 }

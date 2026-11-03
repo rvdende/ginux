@@ -8,7 +8,6 @@ abort01 TFAIL
 accept01 TFAIL
 accept02 TBROK
 accept03 TFAIL
-access04 TFAIL
 acct01 TBROK
 acct02 TBROK
 arch_prctl01 TFAIL
@@ -16,7 +15,6 @@ bind02 TFAIL
 bind04 HANG
 bind05 TBROK
 brk02 TFAIL
-capset02 TBROK
 chmod06 TFAIL
 chroot02 TFAIL
 chroot03 TFAIL
@@ -45,7 +43,6 @@ epoll_pwait01 TBROK
 epoll_pwait06 TBROK
 eventfd06 TFAIL
 execve04 TFAIL
-execve06 TFAIL
 execveat02 TFAIL
 fallocate02 TFAIL
 fallocate03 TFAIL
@@ -188,10 +185,8 @@ madvise11 TBROK
 pathconf02 TFAIL
 pidfd_send_signal01 TFAIL
 pidfd_send_signal02 TFAIL
-pipe2_01 TBROK
 pivot_root01 TBROK
 ppoll01 TFAIL
-prctl02 TFAIL
 prctl10 TFAIL
 process_vm_readv03 TBROK
 prot_hsymlinks TBROK
@@ -269,7 +264,6 @@ waitid10 TBROK
 write04 TBROK
 perf_event_open02 TBROK
 futex_cmp_requeue01 TBROK
-futex_wait03 HANG
 futex_waitv01 TFAIL
 futex_wake05 TFAIL
 memfd_create01 TFAIL

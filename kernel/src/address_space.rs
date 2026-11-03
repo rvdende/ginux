@@ -5519,6 +5519,18 @@ pub(crate) fn current_linux_mapping_frame_address(address: u64) -> Option<u64> {
     (value & (PRESENT | USER) == PRESENT | USER).then_some(value & ADDRESS_MASK)
 }
 
+/// For a refresh rejection report: the current root (CR3) and the raw
+/// leaf entry for `address` in it (`u64::MAX` when the walk stops early).
+pub(crate) fn current_linux_leaf_report(address: u64) -> (u64, u64) {
+    let page = address & !(PAGE_SIZE as u64 - 1);
+    let leaf = if address >= 1 << 47 {
+        None
+    } else {
+        current_linux_leaf(page).map(|entry| entry.read())
+    };
+    (current_root(), leaf.unwrap_or(u64::MAX))
+}
+
 pub(crate) fn current_linux_active_mapping(address: u64) -> Option<cpu::LinuxActiveImageMapping> {
     let page = address & !(PAGE_SIZE as u64 - 1);
     if address >= 1 << 47 {

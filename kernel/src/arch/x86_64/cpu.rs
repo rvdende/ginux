@@ -14588,8 +14588,12 @@ fn linux_exit_child_to_parent(output: *mut LinuxSyscallFrame, caller: LinuxUserC
     // uses no stack; the yields record a context the registry checks, so a
     // sibling's mapped stack pointer stands in for the unmapped one (the
     // refresh was refused every time and CPU 0 spun here: fcntl36_64).
-    let caller = linux_exit_context_with_mapped_stack(caller);
+    // A joinable thread's stack goes while this loop runs: the tid word's
+    // wake above lets the joiner unmap it (futex_wait03), so the check is
+    // made again on every pass.
+    let mut caller = caller;
     while current_linux_runtime_cpu_index() == 0 && ready_linux_thread_handle().is_none() {
+        caller = linux_exit_context_with_mapped_stack(caller);
         let _ = expire_linux_waits();
         // Its siblings all ended on other CPUs meanwhile: the process ends
         // with this thread, as exit_group would end it.
@@ -21142,7 +21146,7 @@ fn verify_linux_prctl_syscall() -> bool {
         && linux_prctl(LINUX_PR_SET_SECCOMP, 1, 0, 9, 8) == 0
         && linux_prctl(LINUX_PR_GET_SECCOMP, 0, 0, 0, 0) == 1
         && linux_prctl(LINUX_PR_SET_SECCOMP, 1, 0, 0, 0) == LINUX_EINVAL
-        && linux_prctl(LINUX_PR_SET_SECCOMP, 2, 0, 0, 0) == LINUX_EOPNOTSUPP
+        && linux_prctl(LINUX_PR_SET_SECCOMP, 2, 0, 0, 0) == LINUX_EFAULT
         && linux_prctl(0xffff_ffff, 0, 0, 0, 0) == LINUX_EINVAL;
     X86_RUNTIME
         .ELF_PROBE_PROCESS_NAME_LOW
@@ -22777,7 +22781,32 @@ fn linux_seccomp(operation: u64, flags: u64, arguments: u64) -> u64 {
             }
             0
         }
-        SET_MODE_FILTER => LINUX_EOPNOTSUPP,
+        SET_MODE_FILTER => {
+            // The program header (struct sock_fprog: a u16 length, then
+            // the instructions' address) must be readable, its length
+            // 1..=4096, and a process without no_new_privs needs
+            // CAP_SYS_ADMIN, as Linux checks before installing it.
+            const KNOWN_FLAGS: u64 = 0x3f;
+            if flags & !KNOWN_FLAGS != 0 {
+                return LINUX_EINVAL;
+            }
+            let mut program = [0_u8; 16];
+            if !copy_from_linux_user(arguments, &mut program) {
+                return LINUX_EFAULT;
+            }
+            let length = u16::from_ne_bytes([program[0], program[1]]);
+            if length == 0 || length > 4096 {
+                return LINUX_EINVAL;
+            }
+            if !X86_RUNTIME.ELF_PROBE_NO_NEW_PRIVS.load(Ordering::SeqCst)
+                && !current_linux_credentials().is_some_and(|credentials| {
+                    credentials.has(ginux_credentials::capability::SYS_ADMIN)
+                })
+            {
+                return LINUX_EACCES;
+            }
+            LINUX_EOPNOTSUPP
+        }
         GET_ACTION_AVAIL => {
             if flags != 0 {
                 return LINUX_EINVAL;
@@ -29740,10 +29769,19 @@ fn build_linux_exec_stack_image(
     startup: crate::linux_elf::ProcessStartup,
     stack_top: u64,
 ) -> Result<(LinuxExecStackImage, u64), u64> {
+    // An empty argv gets one empty argument, as Linux has done since 5.18,
+    // so the new program's argv[0] is never NULL (execve06).
+    let mut empty_arguments = false;
     let original_argument_count = if let Some(slot) = domain_exec_slot {
         usize::from(X86_RUNTIME.CONTAINER_EXEC_ARGUMENT_COUNTS[slot].load(Ordering::Acquire))
     } else {
-        linux_exec_vector_length(arguments_address, true)?
+        match linux_exec_vector_length(arguments_address)? {
+            0 => {
+                empty_arguments = true;
+                1
+            }
+            count => count,
+        }
     };
     // A program (not a script) gets the caller's argv[0], as in Linux:
     // rustup's proxies (cargo -> rustup) and clang++ -> clang tell what to
@@ -29762,7 +29800,7 @@ fn build_linux_exec_stack_image(
     let environment_count = if domain_exec_slot.is_some() {
         0
     } else {
-        linux_exec_vector_length(environment_address, false)?
+        linux_exec_vector_length(environment_address)?
     };
     let mut image = LinuxExecStackImage {
         scratch: LinuxExecScratch::allocate(LINUX_EXEC_ARGUMENT_PAGES * PAGE_SIZE)
@@ -29814,8 +29852,13 @@ fn build_linux_exec_stack_image(
             length
         } else {
             let original_index = first_original + index - launch_count;
-            let pointer = linux_exec_vector_entry(arguments_address, original_index)?;
-            copy_linux_c_string(pointer, remaining).map_err(string_error)?
+            if empty_arguments {
+                *remaining.first_mut().ok_or(LINUX_E2BIG)? = 0;
+                0
+            } else {
+                let pointer = linux_exec_vector_entry(arguments_address, original_index)?;
+                copy_linux_c_string(pointer, remaining).map_err(string_error)?
+            }
         };
         if index == launch_arguments.execfn && !keep_argument_zero {
             execfn_offset = Some(cursor);
@@ -29883,12 +29926,13 @@ fn build_linux_exec_stack_image(
 }
 
 /// Counts the entries of a NULL-terminated user pointer vector.
-fn linux_exec_vector_length(address: u64, require_nonempty: bool) -> Result<usize, u64> {
+fn linux_exec_vector_length(address: u64) -> Result<usize, u64> {
+    // A NULL argv or envp is an empty one, as in Linux.
+    if address == 0 {
+        return Ok(0);
+    }
     for index in 0..=LINUX_EXEC_ARGUMENT_LIMIT {
         if linux_exec_vector_entry(address, index)? == 0 {
-            if require_nonempty && index == 0 {
-                return Err(LINUX_E2BIG);
-            }
             return Ok(index);
         }
     }
@@ -34588,14 +34632,21 @@ fn linux_faccessat(directory: u64, path_address: u64, mode: u64, flags: u64) -> 
     let real_ids = flags & LINUX_AT_EACCESS == 0;
     let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
     let canonical_result = linux_canonical_path_at(directory, path, &mut canonical);
-    if let Err(error) = canonical_result {
-        if error == LINUX_EACCES || error == LINUX_ENOTDIR {
-            return error;
-        }
+    if let Err(error @ (LINUX_EACCES | LINUX_ENOTDIR | LINUX_ELOOP)) = canonical_result {
+        return error;
     }
     if let Ok(length) = canonical_result {
-        if let Some(metadata) = crate::linux_overlay::lookup(&canonical[..length]) {
-            if mode & 2 != 0 && linux_read_only_path(&canonical[..length]) {
+        // access(2) follows a symlink at the end of the path (a loop is
+        // ELOOP: access04) unless AT_SYMLINK_NOFOLLOW.
+        let follow = flags & LINUX_AT_SYMLINK_NOFOLLOW == 0;
+        let mut target = canonical;
+        let (target_length, metadata) =
+            match linux_overlay_lookup_following(&mut target, length, follow) {
+                Ok((length, _, metadata)) => (length, metadata),
+                Err(error) => return error,
+            };
+        if let Some(metadata) = metadata {
+            if mode & 2 != 0 && linux_read_only_path(&target[..target_length]) {
                 return LINUX_EROFS;
             }
             let file = linux_overlay_file_access(metadata);
@@ -39689,11 +39740,12 @@ fn linux_store_timespec(timespec: &mut [u8], nanoseconds: u64) {
 
 fn linux_pipe(address: u64, flags: u64) -> u64 {
     let flags = u64::from(flags as u32);
-    if flags & !(LINUX_O_NONBLOCK | LINUX_O_CLOEXEC) != 0 {
-        return LINUX_EINVAL;
-    }
+    // Packet-mode (O_DIRECT) pipes are the runtime's (linux_socket_pipe).
     if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
         return linux_runtime_pipe(address, flags);
+    }
+    if flags & !(LINUX_O_NONBLOCK | LINUX_O_CLOEXEC) != 0 {
+        return LINUX_EINVAL;
     }
     if X86_RUNTIME
         .ELF_PROBE_PIPE_READ_DESCRIPTOR
@@ -50900,6 +50952,7 @@ fn linux_capset(header_address: u64, data_address: u64) -> u64 {
         effective: sets[0] & ginux_credentials::capability::ALL,
         permitted: sets[1] & ginux_credentials::capability::ALL,
         inheritable: sets[2] & ginux_credentials::capability::ALL,
+        bounding: credentials.capabilities.bounding,
     };
     match credentials.set_capabilities(new) {
         Ok(()) if linux_process::set_live_process_credentials(current, credentials) => 0,
@@ -51108,6 +51161,23 @@ fn linux_arch_prctl(option: u64, argument: u64) -> u64 {
     }
 }
 
+/// Runs `change` on the calling process's credentials and keeps what it
+/// leaves: its result, or EINVAL or EPERM for its error.
+fn linux_current_credentials_result(
+    change: impl FnOnce(&mut ginux_credentials::Credentials) -> Result<u64, ginux_credentials::Error>,
+) -> u64 {
+    let current = current_linux_process_pid();
+    let Some(mut credentials) = linux_process::live_process_credentials(current) else {
+        return LINUX_ESRCH;
+    };
+    match change(&mut credentials) {
+        Ok(result) if linux_process::set_live_process_credentials(current, credentials) => result,
+        Ok(_) => LINUX_ESRCH,
+        Err(ginux_credentials::Error::Invalid) => LINUX_EINVAL,
+        Err(ginux_credentials::Error::Permission) => LINUX_EPERM,
+    }
+}
+
 fn linux_prctl(option: u64, argument2: u64, argument3: u64, argument4: u64, argument5: u64) -> u64 {
     match u64::from(option as u32) {
         LINUX_PR_SET_PDEATHSIG if argument2 <= LINUX_SIGNAL_COUNT as u64 => {
@@ -51144,13 +51214,20 @@ fn linux_prctl(option: u64, argument2: u64, argument3: u64, argument4: u64, argu
             u64::from(X86_RUNTIME.ELF_PROBE_SECCOMP_STRICT.load(Ordering::SeqCst))
         }
         LINUX_PR_SET_SECCOMP if argument2 == 1 => linux_seccomp(0, argument3, 0),
-        LINUX_PR_SET_SECCOMP if argument2 == 2 => LINUX_EOPNOTSUPP,
+        LINUX_PR_SET_SECCOMP if argument2 == 2 => linux_seccomp(1, 0, argument3),
         LINUX_PR_SET_SECCOMP => LINUX_EINVAL,
         LINUX_PR_GET_SECUREBITS => {
             u64::from(X86_RUNTIME.ELF_PROBE_SECUREBITS.load(Ordering::SeqCst))
         }
         LINUX_PR_SET_SECUREBITS if argument2 & !u64::from(LINUX_SECUREBITS_VALID_MASK) != 0 => {
             LINUX_EINVAL
+        }
+        LINUX_PR_SET_SECUREBITS
+            if !current_linux_credentials().is_some_and(|credentials| {
+                credentials.has(ginux_credentials::capability::SETPCAP)
+            }) =>
+        {
+            LINUX_EPERM
         }
         LINUX_PR_SET_SECUREBITS => {
             let requested = argument2 as u32;
@@ -51181,6 +51258,16 @@ fn linux_prctl(option: u64, argument2: u64, argument3: u64, argument4: u64, argu
             u64::from(X86_RUNTIME.ELF_PROBE_NO_NEW_PRIVS.load(Ordering::SeqCst))
         }
         LINUX_PR_GET_NO_NEW_PRIVS => LINUX_EINVAL,
+        LINUX_PR_CAPBSET_READ => linux_current_credentials_result(|credentials| {
+            credentials
+                .bounding_has(argument2.min(u64::from(u32::MAX)) as u32)
+                .map(u64::from)
+        }),
+        LINUX_PR_CAPBSET_DROP => linux_current_credentials_result(|credentials| {
+            credentials
+                .drop_bounding(argument2.min(u64::from(u32::MAX)) as u32)
+                .map(|()| 0)
+        }),
         // The timer slack is kept per process for prctl to read back; the
         // timers themselves fire on the tick (prctl08).
         LINUX_PR_SET_TIMERSLACK => {

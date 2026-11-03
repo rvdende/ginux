@@ -2787,6 +2787,16 @@ fn refresh_live_process_registry_inner(
             crate::serial_write_u64(value);
             crate::serial_write(" ");
         }
+        let (root, leaf) = address_space::current_linux_leaf_report(rsp.wrapping_sub(1));
+        let snapshot_root = snapshot
+            .hierarchy()
+            .first()
+            .map_or(0, |frame| frame.address());
+        crate::serial_write("cr3/snapshot-root/stack-leaf: ");
+        for value in [root, snapshot_root, leaf] {
+            crate::serial_write_u64(value);
+            crate::serial_write(" ");
+        }
         crate::serial_write("\r\n");
     }
     refreshed
