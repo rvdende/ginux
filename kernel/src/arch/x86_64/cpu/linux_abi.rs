@@ -509,6 +509,7 @@ pub(super) const LINUX_RLIMIT_MEMLOCK: u64 = 8;
 /// /proc/sys/fs/nr_open: the most RLIMIT_NOFILE may be raised to.
 pub(super) const LINUX_NR_OPEN: u64 = 1_048_576;
 pub(super) const LINUX_RLIMIT_AS: u64 = 9;
+pub(super) const LINUX_RLIMIT_SIGPENDING: u64 = 11;
 pub(super) const LINUX_RLIMIT_MSGQUEUE: u64 = 12;
 pub(super) const LINUX_RLIMIT_NLIMITS: u64 = 16;
 pub(super) const LINUX_RLIMIT_WORDS: usize = LINUX_RLIMIT_NLIMITS as usize * 2;

@@ -3,7 +3,7 @@
 # ("known failure"); a failure of any other test is a regression and fails
 # the run. Rewrite it from a run with LTP_UPDATE_BASELINE=1
 # (tests/qemu/ltp.sh --update-baseline); LTP_STRICT=1 ignores it.
-# From target/ltp-results.txt (2026-11-03), list=tests/ltp/syscalls.list ltp=20260930 kernel=6f9f6055.
+# From target/ltp-results.txt (2026-11-03), list=tests/ltp/syscalls.list ltp=20260930 kernel=97c546ab.
 abort01 TFAIL
 accept02 TBROK
 acct01 TBROK
@@ -29,7 +29,7 @@ creat07 TFAIL
 delete_module02 TFAIL
 epoll_wait05 TFAIL
 epoll_wait06 TFAIL
-epoll_wait10 TBROK
+epoll_wait10 TFAIL
 epoll_wait16 TBROK
 epoll_pwait01 TBROK
 eventfd06 TFAIL
@@ -155,13 +155,11 @@ readlinkat01 TBROK
 realpath01 TBROK
 reboot01 TFAIL
 reboot02 TFAIL
-recvfrom01 TFAIL
 recvmmsg01 TBROK
 remap_file_pages01 TBROK
 rt_sigaction01 TBROK
 rt_sigqueueinfo01 TFAIL
 sbrk01 TFAIL
-select01 TFAIL
 send02 TBROK
 sendmsg01 TBROK
 sendto01 TFAIL
@@ -180,7 +178,6 @@ statmount03 TBROK
 statmount08 TBROK
 syslog11 TBROK
 syslog12 TFAIL
-tgkill02 TFAIL
 times03 TFAIL
 unshare03 TFAIL
 unshare05 TBROK
@@ -190,7 +187,6 @@ ustat02 TFAIL
 vhangup02 TFAIL
 waitpid01 TFAIL
 waitid10 TBROK
-write04 TWARN
 perf_event_open02 TBROK
 futex_cmp_requeue01 TBROK
 futex_waitv01 TFAIL

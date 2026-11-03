@@ -159,20 +159,18 @@ pub(super) fn linux_select_ready(
         {
             return Err(LINUX_EBADF);
         }
-        let mut descriptor_ready = false;
+        // select returns the bits set in all its sets: a descriptor both
+        // readable and writable counts twice, as in Linux (select01).
         if snapshot.requested_read[word] & bit != 0
             && linux_descriptor_poll_events(descriptor as i32, LINUX_POLLIN) & LINUX_POLLIN != 0
         {
             ready_read[word] |= bit;
-            descriptor_ready = true;
+            ready_count += 1;
         }
         if snapshot.requested_write[word] & bit != 0
             && linux_descriptor_poll_events(descriptor as i32, LINUX_POLLOUT) & LINUX_POLLOUT != 0
         {
             ready_write[word] |= bit;
-            descriptor_ready = true;
-        }
-        if descriptor_ready {
             ready_count += 1;
         }
     }
@@ -206,13 +204,12 @@ pub(super) fn linux_select_copy_result(
             }
         }
     }
-    (0..snapshot.input.descriptor_count)
-        .filter(|descriptor| {
-            let word = *descriptor as usize / u64::BITS as usize;
-            let bit = 1_u64 << (*descriptor % u64::BITS as u64);
-            (ready_read[word] | ready_write[word]) & bit != 0
-        })
-        .count() as u64
+    // The bits set in all the sets, as Linux counts (select01).
+    ready_read[..word_count]
+        .iter()
+        .chain(&ready_write[..word_count])
+        .map(|word| u64::from(word.count_ones()))
+        .sum()
 }
 
 pub(super) fn linux_select_with_copy(

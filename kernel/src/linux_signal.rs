@@ -293,6 +293,14 @@ pub(crate) fn enqueue(
     Ok(true)
 }
 
+/// The signals queued in `instance`, for RLIMIT_SIGPENDING.
+pub(crate) fn pending_count(instance: usize) -> u64 {
+    SIGNAL_RUNTIME
+        .pending_counts
+        .get(instance)
+        .map_or(0, |count| count.load(Ordering::Acquire))
+}
+
 pub(crate) fn any_pending(instance: usize) -> bool {
     SIGNAL_RUNTIME
         .pending_counts

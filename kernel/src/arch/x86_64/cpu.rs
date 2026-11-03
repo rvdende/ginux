@@ -48438,7 +48438,9 @@ fn linux_default_resource_limit(resource: u64, runtime: bool) -> Option<[u64; 2]
         // Linux counts every task; the process table and thread slots bound
         // the real capacity.
         LINUX_RLIMIT_NPROC => (linux_process::PROCESS_LIMIT + LINUX_THREAD_LIMIT) as u64,
-        11 => LINUX_SIGNAL_COUNT as u64,
+        // RLIMIT_SIGPENDING: queued signals now count against it, so it is
+        // Linux's order of magnitude (max_threads / 2), not one per signal.
+        LINUX_RLIMIT_SIGPENDING => 16_384,
         13 | 14 => 0,
         resource if resource < LINUX_RLIMIT_NLIMITS => u64::MAX,
         _ => return None,

@@ -305,7 +305,7 @@ pub(super) fn linux_rt_sigqueueinfo(
             return_registers,
         );
     }
-    match crate::linux_signal::enqueue(
+    match linux_enqueue_signal(
         instance,
         scope,
         slot,
@@ -1655,7 +1655,7 @@ pub(super) fn linux_queue_process_signal_from(
     let Some(process) = linux_process::live_process_slot(target) else {
         return LINUX_ESRCH;
     };
-    match crate::linux_signal::enqueue(
+    match linux_enqueue_signal(
         linux_signal_instance(),
         crate::linux_signal::Scope::Process,
         process,
@@ -1838,7 +1838,7 @@ pub(super) fn linux_kill_current(
                 return LINUX_ESRCH;
             };
             let (sender_pid, sender_uid) = linux_signal_sender();
-            return match crate::linux_signal::enqueue(
+            return match linux_enqueue_signal(
                 linux_signal_instance(),
                 crate::linux_signal::Scope::Process,
                 process,
@@ -2440,7 +2440,7 @@ pub(super) fn linux_queue_saved_thread_signal(
         return 0;
     }
     let (sender_pid, sender_uid) = linux_signal_sender();
-    match crate::linux_signal::enqueue(
+    match linux_enqueue_signal(
         linux_signal_instance(),
         crate::linux_signal::Scope::Thread,
         linux_thread_signal_queue_slot(process_slot, thread_slot),
@@ -2599,7 +2599,7 @@ pub(super) fn linux_send_thread_signal(
         return LINUX_ESRCH;
     };
     let (sender_pid, sender_uid) = linux_signal_sender();
-    match crate::linux_signal::enqueue(
+    match linux_enqueue_signal(
         linux_signal_instance(),
         crate::linux_signal::Scope::Thread,
         linux_thread_signal_queue_slot(process, slot),
@@ -2968,4 +2968,30 @@ pub(super) fn abort_linux_signal() {
             .store(context.alt_stack_flags, Ordering::SeqCst);
         unsafe { linux_signal_context().get().write(LinuxSignalContext::ZERO) };
     }
+}
+
+/// Queues `pending` as `crate::linux_signal::enqueue` does, but a real-time
+/// signal sent by sigqueue, tkill or tgkill (SI_QUEUE, SI_TKILL) past the
+/// sender's RLIMIT_SIGPENDING is refused (NoMemory, EAGAIN to the caller),
+/// as Linux refuses to allocate its queue entry (tgkill02).
+fn linux_enqueue_signal(
+    instance: usize,
+    scope: crate::linux_signal::Scope,
+    slot: usize,
+    pending: crate::linux_signal::Pending,
+    realtime: bool,
+) -> Result<bool, crate::linux_signal::Error> {
+    const SI_QUEUE: i32 = -1;
+    const SI_TKILL: i32 = -6;
+    if realtime && matches!(pending.code, SI_QUEUE | SI_TKILL) {
+        let limit = linux_resource_limit_values(
+            LINUX_RLIMIT_SIGPENDING,
+            X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst),
+        )
+        .map_or(u64::MAX, |limit| limit[0]);
+        if crate::linux_signal::pending_count(instance) >= limit {
+            return Err(crate::linux_signal::Error::NoMemory);
+        }
+    }
+    crate::linux_signal::enqueue(instance, scope, slot, pending, realtime)
 }
