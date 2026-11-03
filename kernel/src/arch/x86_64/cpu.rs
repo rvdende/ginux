@@ -18761,6 +18761,10 @@ fn rollback_linux_runtime_mapping(address: u64, pages: usize) -> bool {
     })
 }
 
+/// IPC_STAT without the read-permission check, for the *_STAT_ANY
+/// commands (shmctl04, msgctl06, semctl09); never a command of Linux's.
+const LINUX_IPC_STAT_UNCHECKED: u64 = 0xfe;
+
 /// The caller as System V IPC checks it.
 fn linux_ipc_caller() -> crate::linux_sysv_ipc::Caller {
     current_linux_credentials().map_or(
@@ -19000,7 +19004,77 @@ fn linux_shmctl(id: u64, command: u64, address: u64) -> u64 {
     }
     let kind = crate::linux_sysv_ipc::Kind::Segment;
     let caller = linux_ipc_caller();
+    const IPC_INFO: u64 = 3;
+    const SHM_LOCK: u64 = 11;
+    const SHM_UNLOCK: u64 = 12;
+    const SHM_STAT: u64 = 13;
+    const SHM_INFO: u64 = 14;
+    const SHM_STAT_ANY: u64 = 15;
+    const SHM_LOCKED: u16 = 0o2000;
     match command & !IPC_64 {
+        // The limits (shmctl03), or the use (SHM_INFO); both return the
+        // highest id in use, which is its index here.
+        IPC_INFO | SHM_INFO => {
+            let segments = crate::linux_sysv_ipc::segments();
+            let highest = segments.iter().map(|(id, _)| *id).max().unwrap_or(0);
+            let mut output = [0_u8; 48];
+            if command & !IPC_64 == IPC_INFO {
+                let sysctl = |path: &[u8], default: u64| {
+                    linux_proc_sysctl_value(path).map_or(default, |value| value as u64)
+                };
+                let values = [
+                    sysctl(b"sys/kernel/shmmax", 18_446_744_073_692_774_399),
+                    1,
+                    sysctl(b"sys/kernel/shmmni", 4096),
+                    4096,
+                    sysctl(b"sys/kernel/shmall", 18_446_744_073_692_774_399),
+                ];
+                for (index, value) in values.into_iter().enumerate() {
+                    output[index * 8..index * 8 + 8].copy_from_slice(&value.to_ne_bytes());
+                }
+            } else {
+                let pages: u64 = segments
+                    .iter()
+                    .map(|(_, segment)| segment.size.div_ceil(PAGE_SIZE as u64))
+                    .sum();
+                // Resident and swapped pages as /proc/sysvipc/shm lists
+                // them: none counted (shmctl04 sums the listing).
+                output[0..4].copy_from_slice(&(segments.len() as u32).to_ne_bytes());
+                output[8..16].copy_from_slice(&pages.to_ne_bytes());
+            }
+            if copy_to_linux_user(address, &output) {
+                u64::from(highest)
+            } else {
+                LINUX_EFAULT
+            }
+        }
+        // By index (the id here): IPC_STAT's buffer, and the id.
+        SHM_STAT | SHM_STAT_ANY => {
+            let stat = if command & !IPC_64 == SHM_STAT_ANY {
+                LINUX_IPC_STAT_UNCHECKED
+            } else {
+                IPC_STAT
+            };
+            let result = linux_shmctl(id as u64, stat | IPC_64, address);
+            if result == 0 {
+                id as u64
+            } else {
+                result
+            }
+        }
+        // Locking needs the owner, the creator or root (shmctl02, shmctl07).
+        SHM_LOCK | SHM_UNLOCK => {
+            if let Err(error) = crate::linux_sysv_ipc::check_owner(kind, id as u32, caller) {
+                return linux_sysv_ipc_error(error);
+            }
+            let (set, clear) = if command & !IPC_64 == SHM_LOCK {
+                (SHM_LOCKED, 0)
+            } else {
+                (0, SHM_LOCKED)
+            };
+            crate::linux_sysv_ipc::update_mode(kind, id as u32, set, clear)
+                .map_or_else(linux_sysv_ipc_error, |()| 0)
+        }
         IPC_RMID => crate::linux_sysv_ipc::check_owner(kind, id as u32, caller)
             .and_then(|()| {
                 crate::linux_sysv_ipc::mark_for_removal(id as u32, current_linux_process_pid())
@@ -19028,13 +19102,16 @@ fn linux_shmctl(id: u64, command: u64, address: u64) -> u64 {
             )
             .map_or_else(linux_sysv_ipc_error, |()| 0)
         }
-        IPC_STAT => {
+        IPC_STAT | LINUX_IPC_STAT_UNCHECKED => {
             let Ok(segment) = crate::linux_sysv_ipc::segment(id as u32) else {
                 return LINUX_EINVAL;
             };
-            if let Err(error) = crate::linux_sysv_ipc::check_access(kind, id as u32, caller, 0o444)
-            {
-                return linux_sysv_ipc_error(error);
+            if command & !IPC_64 == IPC_STAT {
+                if let Err(error) =
+                    crate::linux_sysv_ipc::check_access(kind, id as u32, caller, 0o444)
+                {
+                    return linux_sysv_ipc_error(error);
+                }
             }
             let mut output = [0_u8; 112];
             linux_ipc_fill_header(&mut output, kind, id as u32, [56, 64, 72]);
@@ -19188,6 +19265,19 @@ fn linux_semop(
             LINUX_EINVAL
         });
     }
+    // Unreadable operations are EFAULT, a semaphore past the set's EFBIG
+    // (semop02), before anything is applied.
+    let Ok(set) = crate::linux_sysv_ipc::semaphore_set(id as u32) else {
+        return Err(LINUX_EINVAL);
+    };
+    for index in 0..count {
+        let Some(operation) = linux_semaphore_operation(operations, index) else {
+            return Err(LINUX_EFAULT);
+        };
+        if u64::from(operation.number) >= set.count {
+            return Err(LINUX_EFBIG);
+        }
+    }
     // Any operation that changes a value needs write permission, waiting
     // for zero read.
     let alters = (0..count).any(|index| {
@@ -19266,7 +19356,59 @@ fn linux_semctl(id: u64, number: u64, command: u64, argument: u64) -> u64 {
             linux_ipc_now(),
         );
     }
+    const IPC_INFO: u64 = 3;
+    const SEM_STAT: u64 = 18;
+    const SEM_INFO: u64 = 19;
+    const SEM_STAT_ANY: u64 = 20;
     match command & !IPC_64 {
+        // struct seminfo: the limits, or with SEM_INFO the sets and
+        // semaphores in use; the highest id in use (semctl01, semop02).
+        IPC_INFO | SEM_INFO => {
+            let sets = crate::linux_sysv_ipc::semaphore_sets();
+            let highest = sets.iter().map(|(id, _)| *id).max().unwrap_or(0);
+            let (usz, aem) = if command & !IPC_64 == IPC_INFO {
+                (20, 32_767)
+            } else {
+                (
+                    sets.len() as i32,
+                    sets.iter().map(|(_, set)| set.count as i32).sum::<i32>(),
+                )
+            };
+            let values = [
+                32_000,
+                crate::linux_sysv_ipc::SEMAPHORE_SET_LIMIT as i32,
+                1_024_000_000,
+                32_000,
+                32_000,
+                500,
+                500,
+                usz,
+                32_767,
+                aem,
+            ];
+            let mut output = [0_u8; 40];
+            for (index, value) in values.into_iter().enumerate() {
+                output[index * 4..index * 4 + 4].copy_from_slice(&value.to_ne_bytes());
+            }
+            if copy_to_linux_user(argument, &output) {
+                u64::from(highest)
+            } else {
+                LINUX_EFAULT
+            }
+        }
+        SEM_STAT | SEM_STAT_ANY => {
+            let stat = if command & !IPC_64 == SEM_STAT_ANY {
+                LINUX_IPC_STAT_UNCHECKED
+            } else {
+                IPC_STAT
+            };
+            let result = linux_semctl(u64::from(id), number as u64, stat | IPC_64, argument);
+            if result == 0 {
+                u64::from(id)
+            } else {
+                result
+            }
+        }
         IPC_RMID => {
             crate::linux_sysv_ipc::semaphore_remove(id).map_or_else(linux_sysv_ipc_error, |()| 0)
         }
@@ -19289,7 +19431,7 @@ fn linux_semctl(id: u64, number: u64, command: u64, argument: u64) -> u64 {
             )
             .map_or_else(linux_sysv_ipc_error, |()| 0)
         }
-        IPC_STAT => {
+        IPC_STAT | LINUX_IPC_STAT_UNCHECKED => {
             let Ok(set) = crate::linux_sysv_ipc::semaphore_set(id) else {
                 return LINUX_EINVAL;
             };
@@ -19505,10 +19647,12 @@ fn linux_msgrcv(id: u64, message: u64, size: u64, selector: u64, flags: u64) -> 
         || flags & !(IPC_NOWAIT | MSG_NOERROR | MSG_EXCEPT | MSG_COPY) != 0
         || flags & MSG_COPY != 0
             && (flags & IPC_NOWAIT == 0 || flags & MSG_EXCEPT != 0 || (selector as i64) < 0)
-        || flags & MSG_EXCEPT != 0 && (selector as i64) <= 0
     {
         return LINUX_EINVAL;
     }
+    // MSG_EXCEPT only changes a positive type's search, as in Linux: a
+    // negative one still takes the lowest type up to it (msgrcv02).
+    let except = flags & MSG_EXCEPT != 0 && (selector as i64) > 0;
     // A negative size (as a long) is EINVAL (msgrcv02).
     if (size as i64) < 0 {
         return LINUX_EINVAL;
@@ -19529,7 +19673,7 @@ fn linux_msgrcv(id: u64, message: u64, size: u64, selector: u64, flags: u64) -> 
         size,
         selector as i64,
         flags & MSG_NOERROR != 0,
-        flags & MSG_EXCEPT != 0,
+        except,
         flags & MSG_COPY != 0,
         current_linux_process_pid(),
         |message_type, offset, bytes| {
@@ -19564,7 +19708,60 @@ fn linux_msgctl(id: u64, command: u64, address: u64) -> u64 {
     let id = id as u32;
     let kind = crate::linux_sysv_ipc::Kind::Messages;
     let caller = linux_ipc_caller();
+    const IPC_INFO: u64 = 3;
+    const MSG_STAT: u64 = 11;
+    const MSG_INFO: u64 = 12;
+    const MSG_STAT_ANY: u64 = 13;
     match command & !IPC_64 {
+        // struct msginfo: the limits, or with MSG_INFO the queues, messages
+        // and bytes in use; the highest id in use, its index (msgctl12).
+        IPC_INFO | MSG_INFO => {
+            let queues = crate::linux_sysv_ipc::message_queues();
+            let highest = queues.iter().map(|(id, _)| *id).max().unwrap_or(0);
+            let msgmni =
+                linux_proc_sysctl_value(b"sys/kernel/msgmni").map_or(32_000, |value| value as i32);
+            let (pool, map, tql) = if command & !IPC_64 == IPC_INFO {
+                (msgmni.saturating_mul(16), 16_384, 16_384)
+            } else {
+                (
+                    queues.len() as i32,
+                    queues
+                        .iter()
+                        .map(|(_, queue)| queue.messages as i32)
+                        .sum::<i32>(),
+                    queues
+                        .iter()
+                        .map(|(_, queue)| queue.bytes as i32)
+                        .sum::<i32>(),
+                )
+            };
+            let mut output = [0_u8; 32];
+            for (index, value) in [pool, map, 8192, 16_384, msgmni, 16, tql]
+                .into_iter()
+                .enumerate()
+            {
+                output[index * 4..index * 4 + 4].copy_from_slice(&value.to_ne_bytes());
+            }
+            output[28..30].copy_from_slice(&u16::MAX.to_ne_bytes());
+            if copy_to_linux_user(address, &output) {
+                u64::from(highest)
+            } else {
+                LINUX_EFAULT
+            }
+        }
+        MSG_STAT | MSG_STAT_ANY => {
+            let stat = if command & !IPC_64 == MSG_STAT_ANY {
+                LINUX_IPC_STAT_UNCHECKED
+            } else {
+                IPC_STAT
+            };
+            let result = linux_msgctl(u64::from(id), stat | IPC_64, address);
+            if result == 0 {
+                u64::from(id)
+            } else {
+                result
+            }
+        }
         IPC_RMID => crate::linux_sysv_ipc::check_owner(kind, id, caller)
             .and_then(|()| crate::linux_sysv_ipc::message_queue_remove(id))
             .map_or_else(linux_sysv_ipc_error, |()| 0),
@@ -19590,12 +19787,14 @@ fn linux_msgctl(id: u64, command: u64, address: u64) -> u64 {
             )
             .map_or_else(linux_sysv_ipc_error, |()| 0)
         }
-        IPC_STAT => {
+        IPC_STAT | LINUX_IPC_STAT_UNCHECKED => {
             let Ok(queue) = crate::linux_sysv_ipc::message_queue_info(id) else {
                 return LINUX_EINVAL;
             };
-            if let Err(error) = crate::linux_sysv_ipc::check_access(kind, id, caller, 0o444) {
-                return linux_sysv_ipc_error(error);
+            if command & !IPC_64 == IPC_STAT {
+                if let Err(error) = crate::linux_sysv_ipc::check_access(kind, id, caller, 0o444) {
+                    return linux_sysv_ipc_error(error);
+                }
             }
             let mut output = [0_u8; 120];
             linux_ipc_fill_header(&mut output, kind, id, [48, 56, 64]);

@@ -1606,10 +1606,36 @@ pub(super) fn linux_queue_process_signal(
         },
         signal >= 32,
     ) {
-        Ok(_) => 0,
+        Ok(_) => {
+            // A signal the target does not block wakes it, as Linux's
+            // signal_wake_up: /proc shows it running until it sleeps again
+            // (shmctl01 waits for its children to sleep after SIGUSR1).
+            if target != current_linux_process_pid()
+                && linux_target_signal_mask(target) & (1 << (signal - 1)) == 0
+            {
+                linux_process::set_live_process_waiting(target, false);
+            }
+            0
+        }
         Err(crate::linux_signal::Error::NoMemory) => LINUX_EAGAIN,
         Err(crate::linux_signal::Error::Invalid) => LINUX_EINVAL,
     }
+}
+
+/// The signal mask of process `target`'s current thread, as its saved
+/// state has it (the caller's own live one for itself).
+fn linux_target_signal_mask(target: u32) -> u64 {
+    if target == current_linux_process_pid() {
+        return X86_RUNTIME.ELF_PROBE_SIGNAL_MASK.load(Ordering::SeqCst);
+    }
+    linux_process_runtime_state(target)
+        .filter(|state| state.valid)
+        .and_then(|state| {
+            linux_process_thread_runtime_state(target)
+                .and_then(|threads| threads.get(usize::from(state.current_thread_slot)))
+                .map(|thread| thread.signal_mask)
+        })
+        .unwrap_or(0)
 }
 
 pub(super) fn linux_kill(

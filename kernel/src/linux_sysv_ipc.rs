@@ -382,6 +382,11 @@ pub(crate) fn set_owner(kind: Kind, id: u32, uid: u32, gid: u32, now: i64) -> Re
     })
 }
 
+/// Sets and clears flag bits of object `id`'s mode (SHM_LOCKED).
+pub(crate) fn update_mode(kind: Kind, id: u32, set: u16, clear: u16) -> Result<(), Error> {
+    with_header(kind, id, |_, _, mode| *mode = *mode & !clear | set)
+}
+
 /// Stamps time `index` of object `id` with `now`.
 pub(crate) fn stamp(kind: Kind, id: u32, index: usize, now: i64) -> Result<(), Error> {
     with_header(kind, id, |_, times, _| times[index] = now)
