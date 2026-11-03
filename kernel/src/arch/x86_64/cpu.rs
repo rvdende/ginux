@@ -14100,6 +14100,14 @@ fn linux_reboot(magic: u64, magic2: u64, command: u64, argument: u64) -> u64 {
     }
 }
 
+/// The time of day as (seconds, nanoseconds) since the epoch, or zero
+/// before the clock is known: what files' times are set to.
+pub(crate) fn linux_realtime_now() -> (i64, i64) {
+    linux_time::linux_realtime_time().map_or((0, 0), |(seconds, nanoseconds)| {
+        (seconds as i64, nanoseconds as i64)
+    })
+}
+
 /// Nanoseconds since boot.
 pub(crate) fn linux_uptime_nanoseconds() -> u64 {
     linux_time::linux_elapsed_nanoseconds().unwrap_or(0)
@@ -19409,7 +19417,13 @@ fn linux_shmget(key: u64, size: u64, flags: u64) -> u64 {
         key == 0 || flags & IPC_CREAT != 0,
         flags & IPC_EXCL != 0,
         current_linux_process_pid(),
-        crate::linux_sysv_ipc::SegmentIds { requested, limit },
+        crate::linux_sysv_ipc::SegmentIds {
+            requested,
+            limit,
+            largest: linux_proc_sysctl_value(b"sys/kernel/shmmax")
+                .and_then(|largest| u64::try_from(largest).ok())
+                .unwrap_or(u64::MAX),
+        },
     );
     // shm_next_id is used up by the segment it named.
     if requested.is_some_and(|id| result == Ok(id)) {
@@ -21090,6 +21104,13 @@ fn linux_io_submit(context: u64, count: u64, pointers: u64) -> u64 {
                 submitted
             };
         }
+        // IOCB_FLAG_RESFD: the completion also signals the eventfd named.
+        const IOCB_FLAG_RESFD: u32 = 1;
+        if u32::from_ne_bytes(control[56..60].try_into().unwrap()) & IOCB_FLAG_RESFD != 0 {
+            linux_eventfd_signal(u64::from(u32::from_ne_bytes(
+                control[60..64].try_into().unwrap(),
+            )));
+        }
         submitted += 1;
     }
     submitted
@@ -21302,6 +21323,11 @@ fn linux_mount_id_request(address: u64) -> Result<(u64, u64), u64> {
         0
     };
     let current_namespace = linux_mount::current_namespace_id().ok_or(LINUX_EINVAL)?;
+    // The first unique mount id is above 2^31 (MNT_UNIQUE_ID_OFFSET);
+    // LSMT_ROOT is all ones.
+    if u64::from_ne_bytes(request[8..16].try_into().unwrap()) <= 1 << 31 {
+        return Err(LINUX_EINVAL);
+    }
     if namespace != 0 && namespace != current_namespace {
         return Err(LINUX_ENOENT);
     }
@@ -21434,6 +21460,10 @@ fn linux_listmount(request_address: u64, output_address: u64, count: u64, flags:
         Ok(request) => request,
         Err(error) => return error,
     };
+    // The first unique mount id is above 2^31 (MNT_UNIQUE_ID_OFFSET).
+    if last != 0 && last <= 1 << 31 {
+        return LINUX_EINVAL;
+    }
     let Some(root) = linux_mount::current_unique_mount_id(1) else {
         return LINUX_EINVAL;
     };
@@ -25548,6 +25578,14 @@ fn linux_runtime_mmap(
     };
     if no_replace && !linux_runtime_range_available(mapping, pages) {
         return LINUX_EEXIST;
+    }
+    // Sealed pages cannot be mapped over (mseal01).
+    if fixed
+        && (0..pages).any(|page| {
+            address_space::current_linux_runtime_page(mapping + (page * PAGE_SIZE) as u64).sealed
+        })
+    {
+        return LINUX_EPERM;
     }
     // A large private anonymous mapping the kernel places, neither
     // populated nor locked, is reserved lazily (LINUX_LAZY_MAPPING_PAGES):
@@ -29832,6 +29870,14 @@ fn linux_fchdir(descriptor: u64) -> u64 {
             if metadata.kind != crate::linux_overlay::NodeKind::Directory {
                 return LINUX_ENOTDIR;
             }
+            // Changing into a directory needs search permission on it.
+            if let Err(error) = linux_check_access(
+                Some(linux_overlay_file_access(metadata)),
+                ginux_credentials::access::EXECUTE,
+                false,
+            ) {
+                return error;
+            }
             X86_RUNTIME
                 .ELF_PROBE_OVERLAY_CWD
                 .store(crate::linux_overlay::generation(handle), Ordering::SeqCst);
@@ -30107,8 +30153,45 @@ fn linux_execveat(
     environment_address: u64,
     flags: u64,
 ) -> u64 {
-    if flags & !LINUX_AT_EMPTY_PATH != 0 {
+    if flags & !(LINUX_AT_EMPTY_PATH | LINUX_AT_SYMLINK_NOFOLLOW) != 0 {
         return LINUX_EINVAL;
+    }
+    // A relative path needs a directory to start from (ENOTDIR).
+    let directory_number = u64::from(directory as u32);
+    if directory_number != u64::from(LINUX_AT_FDCWD) && flags & LINUX_AT_EMPTY_PATH == 0 {
+        let mut first = [0_u8; 1];
+        let relative =
+            copy_from_linux_user(path_address, &mut first) && first[0] != b'/' && first[0] != 0;
+        let not_directory = linux_overlay_descriptor_handle(directory_number)
+            .and_then(crate::linux_overlay::metadata)
+            .map_or(
+                linux_descriptor_open(directory_number)
+                    && linux_device_descriptor(directory_number) & LINUX_DEVICE_DIRECTORY == 0,
+                |metadata| metadata.kind != crate::linux_overlay::NodeKind::Directory,
+            );
+        if relative && not_directory {
+            return LINUX_ENOTDIR;
+        }
+    }
+    // With AT_SYMLINK_NOFOLLOW a path naming a symlink is ELOOP.
+    if flags & LINUX_AT_SYMLINK_NOFOLLOW != 0 {
+        let mut path = [0_u8; LINUX_PATH_MAX];
+        let length = match copy_linux_c_string(path_address, &mut path) {
+            Ok(length) => length,
+            Err(error) => return error,
+        };
+        let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+        if length != 0 {
+            if let Ok(canonical_length) =
+                linux_canonical_path_at(directory, &path[..length], &mut canonical)
+            {
+                if crate::linux_overlay::lookup(&canonical[..canonical_length]).is_some_and(
+                    |metadata| metadata.kind == crate::linux_overlay::NodeKind::Symlink,
+                ) {
+                    return LINUX_ELOOP;
+                }
+            }
+        }
     }
     linux_execve_at(
         directory,
@@ -34630,6 +34713,14 @@ fn linux_linkat(
     if let Err(error) = linux_check_entry_change(destination, false) {
         return error;
     }
+    // The kernel's own filesystems are other devices than the overlay.
+    let old = &old_canonical[..old_length];
+    if ["proc", "sys", "dev"].iter().any(|mount| {
+        old == mount.as_bytes()
+            || old.starts_with(mount.as_bytes()) && old.get(mount.len()) == Some(&b'/')
+    }) {
+        return LINUX_EXDEV;
+    }
     // A file only the image has is copied up first, so both names share the
     // overlay's copy.
     let source = match linux_copy_up_path(&old_canonical[..old_length]) {
@@ -35111,11 +35202,13 @@ fn linux_copy_up_path(path: &[u8]) -> Result<crate::linux_overlay::Handle, u64> 
     if let Some(metadata) = crate::linux_overlay::lookup(path) {
         return Ok(metadata.handle);
     }
+    // A missing file is ENOENT, or ENOTDIR when a directory on the way is
+    // a file (chmod06).
     if crate::linux_overlay::hidden(path) {
-        return Err(LINUX_ENOENT);
+        return Err(linux_missing_path_error(path));
     }
     let (_, entry) = crate::published_rootfs::lookup_at(crate::published_rootfs::ROOT_HANDLE, path)
-        .ok_or(LINUX_ENOENT)?;
+        .ok_or_else(|| linux_missing_path_error(path))?;
     let entry = entry.ok_or(LINUX_EROFS)?;
     linux_copy_up_entry(path, entry)
 }
@@ -36799,6 +36892,12 @@ fn linux_socket_bind(descriptor: u64, address: u64, length: u64) -> u64 {
         Ok(endpoint) => endpoint,
         Err(error) => return error,
     };
+    // Ports below 1024 need CAP_NET_BIND_SERVICE.
+    if (1..1024).contains(&port)
+        && !linux_has_capability(ginux_credentials::capability::NET_BIND_SERVICE)
+    {
+        return LINUX_EACCES;
+    }
     crate::linux_socket::bind(slot, address, port).map_or_else(linux_socket_error, |_| 0)
 }
 
@@ -40776,6 +40875,23 @@ fn linux_eventfd_write(descriptor: u64, address: u64, count: u64) -> Option<u64>
         return Some(LINUX_EFAULT);
     }
     linux_eventfd_write_value(descriptor, u64::from_ne_bytes(bytes), true)
+}
+
+/// The kernel's own signal on an eventfd (an AIO completion): adds one,
+/// stopping at ULLONG_MAX, the overflow state a read returns and poll
+/// reports as POLLERR, as Linux's eventfd_signal does.
+fn linux_eventfd_signal(descriptor: u64) {
+    if !linux_eventfd_descriptor(descriptor) {
+        return;
+    }
+    let Some((counter, _)) = linux_eventfd_state(descriptor) else {
+        return;
+    };
+    counter.store(
+        counter.load(Ordering::SeqCst).saturating_add(1),
+        Ordering::SeqCst,
+    );
+    wake_linux_descriptor_waits();
 }
 
 fn linux_eventfd_write_value(descriptor: u64, increment: u64, wake: bool) -> Option<u64> {
@@ -45011,6 +45127,10 @@ fn linux_descriptor_poll_events(descriptor: i32, requested: u16) -> u16 {
         }
         if counter < u64::MAX - 1 {
             returned |= requested & LINUX_POLLOUT;
+        }
+        // The overflow state an AIO completion can reach (eventfd06).
+        if counter == u64::MAX {
+            returned |= LINUX_POLLERR;
         }
         return returned;
     }
@@ -51300,8 +51420,9 @@ fn linux_statfs_descriptor_kind(descriptor: u64) -> LinuxFilesystemKind {
 }
 
 fn linux_ustat(device: u64, output_address: u64) -> u64 {
-    // The initial Linux mount namespace publishes rootfs as device 0:1.
-    if u64::from(device as u32) != 1 {
+    // The initial Linux mount namespace publishes rootfs as device 0:1;
+    // stat reports the root's device as 0.
+    if !matches!(u64::from(device as u32), 0 | 1) {
         return LINUX_EINVAL;
     }
     // Linux simple_statfs leaves capacity and inode counts undefined (zero)
@@ -53157,6 +53278,8 @@ fn linux_personality(requested: u64) -> u64 {
 }
 
 fn linux_arch_prctl(option: u64, argument: u64) -> u64 {
+    const ARCH_GET_CPUID: u64 = 0x1011;
+    const ARCH_SET_CPUID: u64 = 0x1012;
     match u64::from(option as u32) {
         LINUX_ARCH_SET_FS if argument >= 1 << 47 => LINUX_EPERM,
         LINUX_ARCH_SET_FS => {
@@ -53173,6 +53296,10 @@ fn linux_arch_prctl(option: u64, argument: u64) -> u64 {
                 LINUX_EFAULT
             }
         }
+        // CPUID stays available: Ginux does not offer CPUID faulting
+        // (no "cpuid_fault" in /proc/cpuinfo), so setting it is ENODEV.
+        ARCH_GET_CPUID => 1,
+        ARCH_SET_CPUID => LINUX_ENODEV,
         _ => LINUX_EINVAL,
     }
 }

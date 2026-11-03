@@ -637,7 +637,11 @@ pub(crate) fn get_or_create(
     pid: u32,
     ids: SegmentIds,
 ) -> Result<u32, Error> {
-    let SegmentIds { requested, limit } = ids;
+    let SegmentIds {
+        requested,
+        limit,
+        largest,
+    } = ids;
     let guard = Guard::acquire().ok_or(Error::Invalid)?;
     if key != 0 {
         if let Some(frame) = find_key(guard.instance, key) {
@@ -654,7 +658,7 @@ pub(crate) fn get_or_create(
             return Err(Error::NoEntry);
         }
     }
-    if size == 0 {
+    if size == 0 || size > largest {
         return Err(Error::Invalid);
     }
     let pages = usize::try_from(size.div_ceil(PAGE_SIZE as u64)).map_err(|_| Error::Invalid)?;
@@ -750,6 +754,8 @@ pub(crate) fn get_or_create(
 pub(crate) struct SegmentIds {
     pub(crate) requested: Option<u32>,
     pub(crate) limit: usize,
+    /// The largest segment that may be made (shmmax).
+    pub(crate) largest: u64,
 }
 
 /// Every segment of the current instance with its id, in creation order,
@@ -2612,6 +2618,7 @@ pub(crate) fn verify_shared_memory_lifecycle() -> bool {
         SegmentIds {
             requested: None,
             limit: 4096,
+            largest: u64::MAX,
         },
     ) else {
         return false;
@@ -2662,6 +2669,7 @@ pub(crate) fn verify_shared_memory_lifecycle() -> bool {
             SegmentIds {
                 requested: None,
                 limit: 4096,
+                largest: u64::MAX,
             },
         ) == Err(Error::NoEntry)
 }

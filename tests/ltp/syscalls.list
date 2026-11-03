@@ -431,10 +431,10 @@ getgroups01 getgroups01
 getgroups01_16 getgroups01_16
 getgroups03 getgroups03
 getgroups03_16 getgroups03_16
-gethostbyname_r01 gethostbyname_r01
+!gethostbyname_r01 gethostbyname_r01  # musl's gethostbyname_r turns names over 254 bytes into HOST_NOT_FOUND (0), never ERANGE
 gethostid01 gethostid01
 gethostname01 gethostname01
-gethostname02 gethostname02
+!gethostname02 gethostname02  # musl's gethostname truncates instead of failing with ENAMETOOLONG
 getitimer01 getitimer01
 getitimer02 getitimer02
 getpagesize01 getpagesize01
@@ -892,7 +892,7 @@ madvise11 madvise11
 madvise12 madvise12
 newuname01 newuname01
 pathconf01 pathconf01
-pathconf02 pathconf02
+!pathconf02 pathconf02  # musl's pathconf ignores the path and makes no system call
 pause01 pause01
 pause02 pause02
 personality01 personality01

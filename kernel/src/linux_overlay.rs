@@ -926,6 +926,8 @@ pub(crate) fn set_fifo_socket(handle: Handle, slot: crate::linux_socket::SlotId)
 }
 
 fn create(path: &[u8], kind: NodeKind, mode: u32, initial: &[u8]) -> Option<Handle> {
+    // A new file's times are when it was made.
+    let created = crate::arch::x86_64::cpu::linux_realtime_now();
     valid_path(path)?;
     if lookup(path).is_some() {
         return None;
@@ -970,9 +972,9 @@ fn create(path: &[u8], kind: NodeKind, mode: u32, initial: &[u8]) -> Option<Hand
         cached_page: FrameLease::EMPTY,
         cached_page_index: 0,
         xattr_first: FrameLease::EMPTY,
-        atime: (0, 0),
-        mtime: (0, 0),
-        ctime: (0, 0),
+        atime: created,
+        mtime: created,
+        ctime: created,
         path: stored_path,
     };
     note_path(path);
@@ -1123,7 +1125,17 @@ fn read_node(node: &mut Node, offset: usize, output: &mut [u8]) -> Option<usize>
     Some(copied)
 }
 
+/// Writes `input` at `offset` of the file at `handle`, which marks it
+/// modified now (its mtime and ctime), as a Linux write does.
 pub(crate) fn write(handle: Handle, offset: usize, input: &[u8]) -> Option<usize> {
+    let written = write_data(handle, offset, input)?;
+    if written != 0 {
+        let _ = touch_modified(handle, crate::arch::x86_64::cpu::linux_realtime_now());
+    }
+    Some(written)
+}
+
+fn write_data(handle: Handle, offset: usize, input: &[u8]) -> Option<usize> {
     let end = offset.checked_add(input.len())?;
     if input.is_empty() {
         return Some(0);
@@ -1262,6 +1274,16 @@ pub(crate) fn set_owner(handle: Handle, owner: u32, group: u32) -> bool {
     };
     node.owner = owner;
     node.group = group;
+    true
+}
+
+/// Marks the file at `handle` modified at `time` (its mtime and ctime).
+pub(crate) fn touch_modified(handle: Handle, time: (i64, i64)) -> bool {
+    let Some(node) = node_mut(handle) else {
+        return false;
+    };
+    node.mtime = time;
+    node.ctime = time;
     true
 }
 

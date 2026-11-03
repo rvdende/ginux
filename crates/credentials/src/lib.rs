@@ -203,6 +203,7 @@ pub mod capability {
     pub const SETUID: u32 = 7;
     pub const SETPCAP: u32 = 8;
     pub const LINUX_IMMUTABLE: u32 = 9;
+    pub const NET_BIND_SERVICE: u32 = 10;
     pub const NET_ADMIN: u32 = 12;
     pub const NET_RAW: u32 = 13;
     pub const IPC_LOCK: u32 = 14;

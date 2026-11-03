@@ -5,10 +5,7 @@
 # (tests/qemu/ltp.sh --update-baseline); LTP_STRICT=1 ignores it.
 # From target/ltp-results.txt (2026-11-03), list=tests/ltp/syscalls.list ltp=20260930 kernel=468a6a67.
 accept02 TBROK
-arch_prctl01 TFAIL
-bind02 TFAIL
 bind05 TBROK
-chmod06 TFAIL
 clock_gettime03 TBROK
 leapsec01 TBROK
 clone02 TFAIL
@@ -24,11 +21,8 @@ epoll_wait06 TFAIL
 epoll_wait10 TFAIL
 epoll_wait16 TBROK
 epoll_pwait01 TBROK
-eventfd06 TFAIL
 execve04 TFAIL
-execveat02 TFAIL
 fsetxattr02 TBROK
-fchdir03 TFAIL
 fcntl11 TFAIL
 fcntl11_64 TFAIL
 fcntl17 TBROK
@@ -39,8 +33,6 @@ fcntl31 TFAIL
 fcntl31_64 TFAIL
 fgetxattr02 TBROK
 getcpu01 TFAIL
-gethostbyname_r01 TFAIL
-gethostname02 TFAIL
 get_robust_list01 TFAIL
 getsockopt02 TFAIL
 ioctl01 TBROK
@@ -76,8 +68,6 @@ keyctl29 TBROK
 keyctl30 TBROK
 kcmp03 TFAIL
 link08 TFAIL
-linkat01 TFAIL
-listmount04 TFAIL
 lsm_list_modules01 TFAIL
 mknod07 TFAIL
 mlock05 TBROK
@@ -93,7 +83,6 @@ mount_setattr02 TBROK
 mprotect01 TBROK
 mprotect05 TBROK
 mremap01 TFAIL
-mseal01 TFAIL
 msgstress01 TBROK
 munmap04 TBROK
 name_to_handle_at01 TFAIL
@@ -104,7 +93,6 @@ openat202 TFAIL
 open_by_handle_at01 TFAIL
 open_by_handle_at02 TFAIL
 madvise11 TBROK
-pathconf02 TFAIL
 pidfd_send_signal01 TFAIL
 pidfd_send_signal02 TFAIL
 pivot_root01 TBROK
@@ -130,7 +118,6 @@ setns02 TWARN
 setrlimit06 TFAIL
 setxattr02 TBROK
 setxattr03 TBROK
-shmget02 TFAIL
 sigaction01 TBROK
 signal06 TBROK
 sigtimedwait01 HANG
@@ -142,13 +129,10 @@ times03 TFAIL
 unshare03 TFAIL
 unshare05 TBROK
 userfaultfd03 TBROK
-ustat01 TFAIL
-ustat02 TFAIL
 perf_event_open02 TBROK
 futex_cmp_requeue01 TBROK
 futex_waitv01 TFAIL
 futex_wake05 TFAIL
-copy_file_range03 TFAIL
 io_uring01 TBROK
 io_uring02 TBROK
 io_uring03 TBROK
