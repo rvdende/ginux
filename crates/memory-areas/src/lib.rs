@@ -128,6 +128,10 @@ pub struct Area {
     pub protection: Protection,
     /// `MAP_SHARED`: writes reach the backing and other mappings of it.
     pub shared: bool,
+    /// The mapping may be made writable (Linux's VM_MAYWRITE): false for
+    /// a shared mapping of a file opened without write access or sealed
+    /// against writes, which mprotect may not give PROT_WRITE.
+    pub may_write: bool,
     pub backing: Backing,
 }
 
@@ -152,6 +156,7 @@ impl Area {
             end: end.min(self.end),
             protection: self.protection,
             shared: self.shared,
+            may_write: self.may_write,
             backing: self.backing.advanced(start - self.start),
         }
     }
@@ -161,6 +166,7 @@ impl Area {
         self.end == next.start
             && self.protection == next.protection
             && self.shared == next.shared
+            && self.may_write == next.may_write
             && self.backing.continues_into(self.len(), &next.backing)
     }
 }
@@ -292,6 +298,11 @@ impl Areas {
         Ok(())
     }
 
+    /// Whether some area in `[start, end)` may not be made writable.
+    pub fn write_forbidden(&self, start: u64, end: u64) -> bool {
+        self.overlapping(start, end).any(|area| !area.may_write)
+    }
+
     /// Moves the area at `[old_start, old_start + length)` to `new_start`,
     /// as mremap does when it moves a mapping; the old range must be one
     /// area's part.
@@ -377,6 +388,7 @@ mod tests {
             end: end * PAGE_SIZE,
             protection,
             shared: false,
+            may_write: true,
             backing: Backing::Anonymous,
         }
     }
@@ -387,6 +399,7 @@ mod tests {
             end: end * PAGE_SIZE,
             protection: R,
             shared: false,
+            may_write: true,
             backing: Backing::File {
                 device: 1,
                 inode: 7,

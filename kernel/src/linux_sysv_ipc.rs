@@ -108,6 +108,8 @@ pub(crate) enum Error {
     Access,
     /// Only the object's owner, creator or a privileged caller may (EPERM).
     Permission,
+    /// Another process has registered for the queue's notification (EBUSY).
+    Busy,
 }
 
 #[derive(Clone, Copy)]
@@ -177,7 +179,34 @@ struct MessageQueue {
     owner: Ownership,
     /// msg_stime, msg_rtime, msg_ctime.
     times: [i64; 3],
+    /// A POSIX queue's mq_notify registration: NOTIFY_NONE, or the
+    /// process that registered and what it asked for.
+    notify_kind: u8,
+    notify_signal: u8,
+    _notify_padding: u16,
+    notify_pid: u32,
+    notify_value: u64,
     name: [u8; 256],
+}
+
+const NOTIFY_NONE: u8 = 0;
+const NOTIFY_QUIET: u8 = 1;
+const NOTIFY_SIGNAL: u8 = 2;
+
+/// What mq_notify asks for when a message reaches an empty queue.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum Notification {
+    /// SIGEV_NONE: registered, but told nothing.
+    Quiet,
+    /// SIGEV_SIGNAL: this signal, with this value.
+    Signal { signal: u8, value: u64 },
+}
+
+/// A registration taken for delivery: who registered, and for what.
+#[derive(Clone, Copy)]
+pub(crate) struct Registration {
+    pub(crate) pid: u32,
+    pub(crate) notification: Notification,
 }
 
 #[repr(C)]
@@ -1817,13 +1846,20 @@ fn posix_info(queue: &MessageQueue, created: bool) -> PosixQueueInfo {
     }
 }
 
+/// mq_open: queue `name`, created if `create` allows (EEXIST if
+/// `exclusive`), owned by `caller` then; an existing queue's mode must
+/// grant `caller` the `requested` access (EACCES). A new queue past
+/// `queues_limit` POSIX queues in the domain is ENOSPC.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn posix_queue_open(
     name: &[u8],
     create: bool,
     exclusive: bool,
     mode: u16,
-    max_messages: u32,
-    max_message_size: u32,
+    (max_messages, max_message_size): (u32, u32),
+    caller: Caller,
+    requested: u16,
+    queues_limit: Option<usize>,
 ) -> Result<PosixQueueInfo, Error> {
     if name.is_empty() || name.len() > 255 || max_messages == 0 || max_message_size == 0 {
         return Err(Error::Invalid);
@@ -1845,6 +1881,17 @@ pub(crate) fn posix_queue_open(
             if create && exclusive {
                 return Err(Error::Exists);
             }
+            let wanted = (requested >> 6 | requested >> 3 | requested) & 7;
+            let granted = if caller.uid == queue.owner.uid {
+                queue.mode >> 6
+            } else if caller.gid == queue.owner.gid {
+                queue.mode >> 3
+            } else {
+                queue.mode
+            } & 7;
+            if !caller.privileged && wanted & !granted != 0 {
+                return Err(Error::Access);
+            }
             queue.open_references = queue
                 .open_references
                 .checked_add(1)
@@ -1855,6 +1902,9 @@ pub(crate) fn posix_queue_open(
     }
     if !create {
         return Err(Error::NoEntry);
+    }
+    if queues_limit.is_some_and(|limit| count_posix_queues(guard.instance) >= limit) {
+        return Err(Error::NoSpace);
     }
     let frame = allocate_zeroed().ok_or(Error::NoMemory)?;
     let id = SYSV_IPC_RUNTIME.next_message_ids[guard.instance].fetch_add(1, Ordering::AcqRel);
@@ -1878,6 +1928,13 @@ pub(crate) fn posix_queue_open(
     queue.max_messages = max_messages;
     queue.max_message_size = max_message_size;
     queue.open_references = 1;
+    queue.owner = Ownership {
+        uid: caller.uid,
+        gid: caller.gid,
+        cuid: caller.uid,
+        cgid: caller.gid,
+        adopted: 1,
+    };
     queue.name[..name.len()].copy_from_slice(name);
     let info = posix_info(queue, true);
     publish_root(
@@ -1912,6 +1969,20 @@ pub(crate) fn posix_queue_duplicate(id: u32) -> Result<(), Error> {
     Ok(())
 }
 
+/// Closes a descriptor of queue `id`: the closing process's registration
+/// goes with it, as in Linux; the last close of an unlinked queue frees it.
+pub(crate) fn posix_queue_close_by(id: u32, pid: u32) -> Result<Option<PosixQueueInfo>, Error> {
+    {
+        let guard = Guard::acquire().ok_or(Error::Invalid)?;
+        let (frame, _) = find_message_queue(guard.instance, id).ok_or(Error::Invalid)?;
+        let queue = message_queue_mut(frame).ok_or(Error::Invalid)?;
+        if queue.notify_kind != NOTIFY_NONE && queue.notify_pid == pid {
+            queue.notify_kind = NOTIFY_NONE;
+        }
+    }
+    posix_queue_close(id)
+}
+
 pub(crate) fn posix_queue_close(id: u32) -> Result<Option<PosixQueueInfo>, Error> {
     let guard = Guard::acquire().ok_or(Error::Invalid)?;
     let (frame, previous) = find_message_queue(guard.instance, id).ok_or(Error::Invalid)?;
@@ -1926,6 +1997,138 @@ pub(crate) fn posix_queue_close(id: u32) -> Result<Option<PosixQueueInfo>, Error
     } else {
         Ok(None)
     }
+}
+
+/// The POSIX queues in the domain, linked or not (queues_max counts them).
+fn count_posix_queues(instance: usize) -> usize {
+    let mut current = root(
+        &SYSV_IPC_RUNTIME.message_root_addresses,
+        &SYSV_IPC_RUNTIME.message_root_generations,
+        instance,
+    );
+    let mut count = 0;
+    for _ in 0..WALK_LIMIT {
+        let Some(queue) = current.and_then(message_queue) else {
+            break;
+        };
+        count += usize::from(queue.posix != 0);
+        current = (queue.next_queue != memory::FrameLease::EMPTY).then_some(queue.next_queue);
+    }
+    count
+}
+
+/// mq_notify for queue `id` by `pid`: registers `notification` (EBUSY
+/// while another process holds the registration), or with None removes
+/// `pid`'s own registration.
+pub(crate) fn posix_queue_set_notification(
+    id: u32,
+    pid: u32,
+    notification: Option<Notification>,
+) -> Result<(), Error> {
+    let guard = Guard::acquire().ok_or(Error::Invalid)?;
+    let (frame, _) = find_message_queue(guard.instance, id).ok_or(Error::Invalid)?;
+    let queue = message_queue_mut(frame).ok_or(Error::Invalid)?;
+    if queue.posix == 0 {
+        return Err(Error::Invalid);
+    }
+    let Some(notification) = notification else {
+        if queue.notify_kind != NOTIFY_NONE && queue.notify_pid == pid {
+            queue.notify_kind = NOTIFY_NONE;
+        }
+        return Ok(());
+    };
+    if queue.notify_kind != NOTIFY_NONE {
+        return Err(Error::Busy);
+    }
+    let (kind, signal, value) = match notification {
+        Notification::Quiet => (NOTIFY_QUIET, 0, 0),
+        Notification::Signal { signal, value } => (NOTIFY_SIGNAL, signal, value),
+    };
+    queue.notify_kind = kind;
+    queue.notify_signal = signal;
+    queue.notify_pid = pid;
+    queue.notify_value = value;
+    Ok(())
+}
+
+/// After a send to queue `id`: when the message reached an empty queue
+/// and no receiver waits, the registration, which this removes, as Linux
+/// notifies once.
+pub(crate) fn posix_queue_take_notification(
+    id: u32,
+    receiver_waiting: bool,
+) -> Option<Registration> {
+    let guard = Guard::acquire()?;
+    let (frame, _) = find_message_queue(guard.instance, id)?;
+    let queue = message_queue_mut(frame)?;
+    if queue.posix == 0
+        || queue.notify_kind == NOTIFY_NONE
+        || queue.messages != 1
+        || receiver_waiting
+    {
+        return None;
+    }
+    let notification = match queue.notify_kind {
+        NOTIFY_SIGNAL => Notification::Signal {
+            signal: queue.notify_signal,
+            value: queue.notify_value,
+        },
+        _ => Notification::Quiet,
+    };
+    queue.notify_kind = NOTIFY_NONE;
+    Some(Registration {
+        pid: queue.notify_pid,
+        notification,
+    })
+}
+
+/// Whether some process waits to receive from queue `id` (its wait is
+/// recorded as `id | RECEIVE_WAIT`).
+pub(crate) fn posix_queue_receiver_waiting(id: u32) -> bool {
+    let Some(mut guard) = Guard::acquire() else {
+        return false;
+    };
+    guard
+        .semaphore_processes()
+        .message_waits
+        .iter()
+        .any(|(_, waited)| *waited == id | RECEIVE_WAIT)
+}
+
+/// Marks a recorded message wait as a receiver's (`begin_message_wait`).
+pub(crate) const RECEIVE_WAIT: u32 = 1 << 31;
+
+/// mq_unlink by `caller`: the queue's owner, or a privileged caller
+/// (EACCES otherwise).
+pub(crate) fn posix_queue_unlink_by(
+    name: &[u8],
+    caller: Caller,
+) -> Result<Option<PosixQueueInfo>, Error> {
+    {
+        let guard = Guard::acquire().ok_or(Error::Invalid)?;
+        let mut current = root(
+            &SYSV_IPC_RUNTIME.message_root_addresses,
+            &SYSV_IPC_RUNTIME.message_root_generations,
+            guard.instance,
+        );
+        for _ in 0..WALK_LIMIT {
+            let Some(queue) = current.and_then(message_queue) else {
+                break;
+            };
+            if queue.posix != 0
+                && queue.linked != 0
+                && usize::from(queue.name_length) == name.len()
+                && queue.name[..name.len()] == *name
+            {
+                if !caller.privileged && caller.uid != queue.owner.uid {
+                    return Err(Error::Access);
+                }
+                break;
+            }
+            current = (queue.next_queue != memory::FrameLease::EMPTY).then_some(queue.next_queue);
+        }
+    }
+    posix_queue_unlink(name)
 }
 
 pub(crate) fn posix_queue_unlink(name: &[u8]) -> Result<Option<PosixQueueInfo>, Error> {

@@ -721,7 +721,7 @@ pub(super) const LINUX_FILE_PROC_TASK_STAT: u16 = LINUX_FILE_MASK | LINUX_PROC_T
 /// file exists but cannot be written, and runs it when the file is absent.
 /// `/proc/sys/fs/aio-max-nr`: the most events one io_setup context may hold.
 pub(super) const LINUX_AIO_MAX_NR: u64 = 65_536;
-pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 25] = [
+pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 30] = [
     // System V IPC limits, Linux's defaults; tests read them to size runs.
     (0xb000, b"sys/kernel/shmmni", b"4096\n"),
     (0xb100, b"sys/kernel/shmmax", b"18446744073692774399\n"),
@@ -749,6 +749,14 @@ pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 25] = [
     (0xd400, b"sys/fs/pipe-max-size", b"1048576\n"),
     (0xd200, b"sys/fs/aio-max-nr", b"65536\n"),
     (0xd000, b"sys/fs/pipe-user-pages-soft", b"16384\n"),
+    // POSIX message queue limits (mq_open): the queues a domain may hold,
+    // the largest attributes an unprivileged process may ask for, and what
+    // a queue gets without attributes.
+    (0xa200, b"sys/fs/mqueue/queues_max", b"256\n"),
+    (0xa300, b"sys/fs/mqueue/msg_max", b"10\n"),
+    (0xa400, b"sys/fs/mqueue/msgsize_max", b"8192\n"),
+    (0xa100, b"sys/fs/mqueue/msg_default", b"10\n"),
+    (0xa800, b"sys/fs/mqueue/msgsize_default", b"8192\n"),
     // Values tests read to size themselves (nodes below the input range).
     (0xc000, b"sys/kernel/osrelease", b"6.12.0-ginux.0.1\n"),
     (0xc100, b"sys/kernel/msgmni", b"32000\n"),

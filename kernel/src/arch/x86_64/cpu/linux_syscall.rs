@@ -746,12 +746,20 @@ fn linux_syscall_dispatch(
         LINUX_MSGCTL_SYSCALL => linux_msgctl(first_argument, buffer, count),
         LINUX_MQ_OPEN_SYSCALL => linux_mq_open(first_argument, buffer, count, register(0)),
         LINUX_MQ_UNLINK_SYSCALL => linux_mq_unlink(first_argument),
-        LINUX_MQ_TIMEDSEND_SYSCALL => {
-            linux_mq_timedsend(first_argument, buffer, count, register(0), register(2))
-        }
-        LINUX_MQ_TIMEDRECEIVE_SYSCALL => {
-            linux_mq_timedreceive(first_argument, buffer, count, register(0), register(2))
-        }
+        LINUX_MQ_TIMEDSEND_SYSCALL => linux_mq_wait_live(
+            registers,
+            syscall_return,
+            number,
+            (first_argument, register(2)),
+            || linux_mq_timedsend(first_argument, buffer, count, register(0), register(2)),
+        ),
+        LINUX_MQ_TIMEDRECEIVE_SYSCALL => linux_mq_wait_live(
+            registers,
+            syscall_return,
+            number,
+            (first_argument, register(2)),
+            || linux_mq_timedreceive(first_argument, buffer, count, register(0), register(2)),
+        ),
         LINUX_MQ_NOTIFY_SYSCALL => linux_mq_notify(first_argument, buffer),
         LINUX_MQ_GETSETATTR_SYSCALL => linux_mq_getsetattr(first_argument, buffer, count),
         LINUX_IO_SETUP_SYSCALL => linux_io_setup(first_argument, buffer),
@@ -800,6 +808,20 @@ fn linux_syscall_dispatch(
             linux_remap_file_pages(first_argument, buffer, count, register(0), register(2))
         }
         LINUX_MSYNC_SYSCALL => linux_msync(first_argument, buffer, count),
+        // A shared mapping that may not be written cannot be made writable
+        // (EACCES: Linux's VM_MAYWRITE).
+        LINUX_MPROTECT_SYSCALL
+            if runtime_mode
+                && count & LINUX_PROT_WRITE != 0
+                && crate::linux_areas::write_forbidden(
+                    linux_execution_instance(),
+                    current_linux_process_pid(),
+                    first_argument,
+                    buffer,
+                ) =>
+        {
+            LINUX_EACCES
+        }
         LINUX_MPROTECT_SYSCALL => {
             let result = linux_mprotect(first_argument, buffer, count);
             if result == 0 && runtime_mode {

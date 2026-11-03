@@ -18872,6 +18872,7 @@ fn linux_sysv_ipc_error(error: crate::linux_sysv_ipc::Error) -> u64 {
         crate::linux_sysv_ipc::Error::WouldBlock => LINUX_EAGAIN,
         crate::linux_sysv_ipc::Error::TooBig => LINUX_E2BIG,
         crate::linux_sysv_ipc::Error::Fault => LINUX_EFAULT,
+        crate::linux_sysv_ipc::Error::Busy => LINUX_EBUSY,
     }
 }
 
@@ -19843,10 +19844,20 @@ fn linux_msgctl(id: u64, command: u64, address: u64) -> u64 {
     }
 }
 
+/// A message queue's name as the kernel receives it: the C library drops
+/// the leading slash, so what remains is one path component of at most
+/// NAME_MAX bytes (ENAMETOOLONG); a slash, ".", or ".." is EACCES, as a
+/// lookup in Linux's mqueue filesystem answers.
 fn linux_mq_name(address: u64, output: &mut [u8; 256]) -> Result<usize, u64> {
     let length = copy_linux_c_string(address, output)?;
-    if length < 2 || output[0] != b'/' || output[1..length].contains(&b'/') {
+    let name = &output[..length];
+    // Linux finds no entry for an empty name (ENOENT); glibc reports EINVAL
+    // before asking, and musl does not check, so programs see EINVAL here.
+    if name.is_empty() {
         return Err(LINUX_EINVAL);
+    }
+    if name.contains(&b'/') || name == b"." || name == b".." {
+        return Err(LINUX_EACCES);
     }
     Ok(length)
 }
@@ -19939,6 +19950,13 @@ fn linux_mq_open(name_address: u64, flags: u64, mode: u64, attributes: u64) -> u
         Ok(length) => length,
         Err(error) => return error,
     };
+    // Linux's hard ceilings (HARD_MSGMAX, HARD_MSGSIZEMAX); below them an
+    // unprivileged creator is held to /proc/sys/fs/mqueue's msg_max and
+    // msgsize_max, and to queues_max queues.
+    const HARD_MESSAGES: i64 = 65_536;
+    const HARD_MESSAGE_SIZE: i64 = 16 * 1024 * 1024;
+    let resource_privileged = current_linux_credentials()
+        .is_some_and(|credentials| credentials.has(ginux_credentials::capability::SYS_RESOURCE));
     let (max_messages, max_message_size) = if flags & LINUX_O_CREAT != 0 && attributes != 0 {
         let mut attr = [0_u8; 64];
         if !copy_from_linux_user(attributes, &mut attr) {
@@ -19946,24 +19964,39 @@ fn linux_mq_open(name_address: u64, flags: u64, mode: u64, attributes: u64) -> u
         }
         let max_messages = i64::from_ne_bytes(attr[8..16].try_into().unwrap());
         let max_message_size = i64::from_ne_bytes(attr[16..24].try_into().unwrap());
+        let over_soft = max_messages > linux_mq_limit(b"sys/fs/mqueue/msg_max") as i64
+            || max_message_size > linux_mq_limit(b"sys/fs/mqueue/msgsize_max") as i64;
         if max_messages <= 0
             || max_message_size <= 0
-            || max_messages > i64::from(u32::MAX)
-            || max_message_size > i64::from(u32::MAX)
+            || max_messages > HARD_MESSAGES
+            || max_message_size > HARD_MESSAGE_SIZE
+            || over_soft && !resource_privileged
         {
             return LINUX_EINVAL;
         }
         (max_messages as u32, max_message_size as u32)
     } else {
-        (10, 8192)
+        (
+            linux_mq_limit(b"sys/fs/mqueue/msg_default") as u32,
+            linux_mq_limit(b"sys/fs/mqueue/msgsize_default") as u32,
+        )
     };
+    let requested = match flags & 3 {
+        0 => 0o444,
+        1 => 0o222,
+        _ => 0o666,
+    };
+    let queues_limit =
+        (!resource_privileged).then(|| linux_mq_limit(b"sys/fs/mqueue/queues_max") as usize);
     let info = match crate::linux_sysv_ipc::posix_queue_open(
         &name[..length],
         flags & LINUX_O_CREAT != 0,
         flags & LINUX_O_EXCL != 0,
-        mode as u16,
-        max_messages,
-        max_message_size,
+        mode as u16 & !(X86_RUNTIME.ELF_PROBE_UMASK.load(Ordering::SeqCst) as u16),
+        (max_messages, max_message_size),
+        linux_ipc_caller(),
+        requested,
+        queues_limit,
     ) {
         Ok(info) => info,
         Err(error) => return linux_sysv_ipc_error(error),
@@ -19983,7 +20016,7 @@ fn linux_mq_open(name_address: u64, flags: u64, mode: u64, attributes: u64) -> u
             LINUX_EIO
         };
     }
-    let Some(descriptor) = (LINUX_AUX_DESCRIPTOR_FIRST..LINUX_AUX_DESCRIPTOR_LIMIT)
+    let Some(descriptor) = (LINUX_AUX_DESCRIPTOR_FIRST..linux_nofile_soft_limit())
         .find(|descriptor| linux_aux_descriptor_free(*descriptor))
     else {
         if info.created {
@@ -20013,24 +20046,107 @@ fn linux_mq_unlink(name_address: u64) -> u64 {
         Ok(length) => length,
         Err(error) => return error,
     };
-    match crate::linux_sysv_ipc::posix_queue_unlink(&name[..length]) {
+    match crate::linux_sysv_ipc::posix_queue_unlink_by(&name[..length], linux_ipc_caller()) {
         Ok(destroyed) if linux_release_posix_queue_charge(destroyed) => 0,
         Ok(_) => LINUX_EIO,
         Err(error) => linux_sysv_ipc_error(error),
     }
 }
 
-fn linux_mq_timeout(address: u64) -> Result<(), u64> {
+/// A /proc/sys/fs/mqueue value: as the domain wrote it, else the default.
+fn linux_mq_limit(path: &[u8]) -> u64 {
+    linux_proc_sysctl_value(path)
+        .and_then(|value| u64::try_from(value).ok())
+        .or_else(|| {
+            let (_, _, contents) = LINUX_PROC_SYSCTLS
+                .iter()
+                .find(|(_, name, _)| *name == path)?;
+            core::str::from_utf8(contents).ok()?.trim().parse().ok()
+        })
+        .unwrap_or(0)
+}
+
+/// An mq_timedsend or mq_timedreceive timeout: an absolute CLOCK_REALTIME
+/// time, in nanoseconds; None waits for ever.
+fn linux_mq_timeout(address: u64) -> Result<Option<u64>, u64> {
     if address == 0 {
-        return Ok(());
+        return Ok(None);
     }
     let mut timeout = [0_u8; 16];
     if !copy_from_linux_user(address, &mut timeout) {
         return Err(LINUX_EFAULT);
     }
     linux_timespec_nanoseconds(&timeout)
-        .map(|_| ())
+        .map(Some)
         .ok_or(LINUX_EINVAL)
+}
+
+/// The domain's CLOCK_REALTIME in nanoseconds.
+fn linux_mq_now() -> u64 {
+    linux_realtime_time().map_or(0, |(seconds, nanoseconds)| {
+        seconds
+            .saturating_mul(NANOSECONDS_PER_SECOND)
+            .saturating_add(nanoseconds)
+    })
+}
+
+/// mq_timedsend and mq_timedreceive: `attempt` once, then, while the
+/// queue is full (or empty) and the descriptor blocks, let the rest of
+/// the domain run and try again, until the absolute `timeout` passes
+/// (ETIMEDOUT) or a signal comes (EINTR).
+fn linux_mq_wait_live(
+    output: *mut LinuxSyscallFrame,
+    caller: LinuxUserContext,
+    number: u64,
+    (descriptor, timeout): (u64, u64),
+    mut attempt: impl FnMut() -> u64,
+) -> u64 {
+    let descriptor = u64::from(descriptor as u32);
+    let Some(id) = linux_mq_descriptor_id(descriptor) else {
+        return attempt();
+    };
+    let deadline = match linux_mq_timeout(timeout) {
+        Ok(deadline) => deadline,
+        Err(error) => return error,
+    };
+    let receiving = number == LINUX_MQ_TIMEDRECEIVE_SYSCALL;
+    let waited = if receiving {
+        id | crate::linux_sysv_ipc::RECEIVE_WAIT
+    } else {
+        id
+    };
+    let pid = current_linux_process_pid();
+    loop {
+        let result = attempt();
+        let nonblocking =
+            linux_socket_flags(descriptor).unwrap_or(0) & LINUX_O_NONBLOCK as u32 != 0;
+        if result != LINUX_EAGAIN || nonblocking {
+            crate::linux_sysv_ipc::end_message_wait(pid);
+            return result;
+        }
+        if deadline.is_some_and(|deadline| linux_mq_now() >= deadline) {
+            crate::linux_sysv_ipc::end_message_wait(pid);
+            return LINUX_ETIMEDOUT;
+        }
+        if crate::linux_sysv_ipc::begin_message_wait(pid, waited).is_err() {
+            return LINUX_ENOMEM;
+        }
+        match run_other_linux_processes(output, caller, number) {
+            Some(LinuxBlockedWait::Recheck) => {}
+            // Yielded: the call starts again and finds its wait.
+            Some(LinuxBlockedWait::Return(LINUX_RETURN_TO_KERNEL)) => {
+                return LINUX_RETURN_TO_KERNEL;
+            }
+            Some(LinuxBlockedWait::Return(result)) => {
+                crate::linux_sysv_ipc::end_message_wait(pid);
+                return result;
+            }
+            None => {
+                crate::linux_sysv_ipc::end_message_wait(pid);
+                return LINUX_EINTR;
+            }
+        }
+    }
 }
 
 fn linux_mq_timedsend(
@@ -20051,9 +20167,7 @@ fn linux_mq_timedsend(
     if priority >= 32_768 {
         return LINUX_EINVAL;
     }
-    if let Err(error) = linux_mq_timeout(timeout) {
-        return error;
-    }
+    let _ = timeout;
     let Ok(info) = crate::linux_sysv_ipc::posix_queue_info(id) else {
         return LINUX_EBADF;
     };
@@ -20067,18 +20181,38 @@ fn linux_mq_timedsend(
     let Ok(length_usize) = usize::try_from(length) else {
         return LINUX_EMSGSIZE;
     };
-    crate::linux_sysv_ipc::message_send(
+    if let Err(error) = crate::linux_sysv_ipc::message_send(
         id,
         (32_768 - priority) as i64,
         length_usize,
         current_linux_process_pid(),
         |offset, output| {
-            message
-                .checked_add(offset as u64)
-                .is_some_and(|address| copy_from_linux_user(address, output))
+            // An empty message reads nothing (mq_timedsend01).
+            output.is_empty()
+                || message
+                    .checked_add(offset as u64)
+                    .is_some_and(|address| copy_from_linux_user(address, output))
         },
-    )
-    .map_or_else(linux_sysv_ipc_error, |()| 0)
+    ) {
+        return linux_sysv_ipc_error(error);
+    }
+    // A message reaching an empty queue that no receiver waits on tells the
+    // process registered with mq_notify, once (SI_MESGQ, from the sender).
+    let waiting = crate::linux_sysv_ipc::posix_queue_receiver_waiting(id);
+    if let Some(registration) = crate::linux_sysv_ipc::posix_queue_take_notification(id, waiting) {
+        if let crate::linux_sysv_ipc::Notification::Signal { signal, value } =
+            registration.notification
+        {
+            const SI_MESGQ: i32 = -3;
+            let _ = linux_queue_process_signal(
+                registration.pid,
+                u64::from(signal),
+                SI_MESGQ,
+                Some(value),
+            );
+        }
+    }
+    0
 }
 
 fn linux_mq_timedreceive(
@@ -20095,9 +20229,7 @@ fn linux_mq_timedreceive(
     if linux_device_descriptor(descriptor) & 3 == 1 {
         return LINUX_EBADF;
     }
-    if let Err(error) = linux_mq_timeout(timeout) {
-        return error;
-    }
+    let _ = timeout;
     let Ok(info) = crate::linux_sysv_ipc::posix_queue_info(id) else {
         return LINUX_EBADF;
     };
@@ -20120,31 +20252,52 @@ fn linux_mq_timedreceive(
                 || offset != 0
                 || copy_to_linux_user(priority, &((32_768 - kind) as u32).to_ne_bytes());
             priority_written
-                && message
-                    .checked_add(offset as u64)
-                    .is_some_and(|address| copy_to_linux_user(address, bytes))
+                && (bytes.is_empty()
+                    || message
+                        .checked_add(offset as u64)
+                        .is_some_and(|address| copy_to_linux_user(address, bytes)))
         },
     )
     .map_or_else(linux_sysv_ipc_error, |size| size as u64)
 }
 
+/// mq_notify: SIGEV_NONE or SIGEV_SIGNAL registers the caller for the
+/// queue's next message to an empty queue (EBUSY while another process
+/// holds it), a null event removes its registration. The event is checked
+/// before the descriptor, as Linux does. SIGEV_THREAD's netlink socket is
+/// not supported (EINVAL).
 fn linux_mq_notify(descriptor: u64, event: u64) -> u64 {
+    const SIGEV_SIGNAL: i32 = 0;
+    const SIGEV_NONE: i32 = 1;
     let descriptor = u64::from(descriptor as u32);
-    if linux_mq_descriptor_id(descriptor).is_none() {
-        return LINUX_EBADF;
-    }
-    if event == 0 {
-        return 0;
-    }
-    let mut value = [0_u8; 16];
-    if !copy_from_linux_user(event, &mut value) {
-        return LINUX_EFAULT;
-    }
-    if i32::from_ne_bytes(value[12..16].try_into().unwrap()) == 1 {
-        0
+    let notification = if event == 0 {
+        None
     } else {
-        LINUX_EINVAL
-    }
+        let mut value = [0_u8; 16];
+        if !copy_from_linux_user(event, &mut value) {
+            return LINUX_EFAULT;
+        }
+        let signal = i32::from_ne_bytes(value[8..12].try_into().unwrap());
+        match i32::from_ne_bytes(value[12..16].try_into().unwrap()) {
+            SIGEV_NONE => Some(crate::linux_sysv_ipc::Notification::Quiet),
+            SIGEV_SIGNAL if (1..=LINUX_SIGNAL_COUNT as i32).contains(&signal) => {
+                Some(crate::linux_sysv_ipc::Notification::Signal {
+                    signal: signal as u8,
+                    value: u64::from_ne_bytes(value[..8].try_into().unwrap()),
+                })
+            }
+            _ => return LINUX_EINVAL,
+        }
+    };
+    let Some(id) = linux_mq_descriptor_id(descriptor) else {
+        return LINUX_EBADF;
+    };
+    crate::linux_sysv_ipc::posix_queue_set_notification(
+        id,
+        current_linux_process_pid(),
+        notification,
+    )
+    .map_or_else(linux_sysv_ipc_error, |()| 0)
 }
 
 fn linux_mq_getsetattr(descriptor: u64, new: u64, old: u64) -> u64 {
@@ -25135,6 +25288,7 @@ fn linux_record_exec_image(
                 end: segment.virtual_page + (segment.page_count * PAGE_SIZE) as u64,
                 protection: Protection::from_bits(protection),
                 shared: false,
+                may_write: true,
                 backing: Backing::File {
                     device: 0,
                     inode: 0,
@@ -25159,6 +25313,7 @@ fn linux_record_exec_image(
                 end: stack.end,
                 protection: Protection::from_bits(LINUX_PROT_READ | LINUX_PROT_WRITE),
                 shared: false,
+                may_write: true,
                 backing: Backing::Stack,
             },
         );
@@ -25184,6 +25339,7 @@ fn linux_record_heap(program_break: u64) {
                 end: end.min(limit),
                 protection: Protection::from_bits(LINUX_PROT_READ | LINUX_PROT_WRITE),
                 shared: false,
+                may_write: true,
                 backing: Backing::Heap,
             },
         );
@@ -25213,6 +25369,14 @@ fn linux_record_mapping(
     {
         return;
     }
+    // A shared file mapping may only become writable through a descriptor
+    // with write access, of a file not sealed against writes.
+    let may_write = flags & LINUX_MAP_SHARED == 0
+        || flags & LINUX_MAP_ANONYMOUS != 0
+        || linux_device_descriptor(descriptor) & LINUX_DESCRIPTOR_OUTPUT != 0
+            && !linux_overlay_descriptor_handle(descriptor)
+                .and_then(crate::linux_overlay::file_seals)
+                .is_some_and(|seals| seals & (LINUX_F_SEAL_WRITE | LINUX_F_SEAL_FUTURE_WRITE) != 0);
     let backing = if flags & LINUX_MAP_ANONYMOUS != 0 {
         Backing::Anonymous
     } else {
@@ -25238,6 +25402,7 @@ fn linux_record_mapping(
             end,
             protection: Protection::from_bits(protection),
             shared: flags & LINUX_MAP_SHARED != 0,
+            may_write,
             backing,
         },
     );
@@ -31700,6 +31865,15 @@ fn linux_openat_path(
                 let _ = linux_descriptor_close(reopened);
                 return LINUX_EMFILE;
             }
+            // O_TRUNC empties the file as an open by name would, within its
+            // seals (a shrink-sealed memfd refuses: memfd_create01).
+            if flags & LINUX_O_TRUNC != 0 && access != 0 {
+                let truncated = linux_ftruncate(reopened, 0);
+                if truncated != 0 {
+                    let _ = linux_descriptor_close(reopened);
+                    return truncated;
+                }
+            }
             return reopened;
         }
         // Anything else opens again by its path (the console as
@@ -32444,9 +32618,14 @@ fn linux_memfd_create(name_address: u64, flags: u64) -> u64 {
     if flags & !(MFD_CLOEXEC | MFD_ALLOW_SEALING) != 0 {
         return LINUX_EINVAL;
     }
+    // A name past 249 bytes (NAME_MAX less "memfd:") is EINVAL.
     let mut name = [0_u8; 250];
     if let Err(error) = copy_linux_c_string(name_address, &mut name) {
-        return error;
+        return if error == LINUX_ENAMETOOLONG {
+            LINUX_EINVAL
+        } else {
+            error
+        };
     }
     let Some(descriptor) = (LINUX_AUX_DESCRIPTOR_FIRST..LINUX_AUX_DESCRIPTOR_LIMIT)
         .find(|descriptor| linux_aux_descriptor_free(*descriptor))
@@ -33702,10 +33881,18 @@ fn linux_remove_empty_cgroup_controls(directory: crate::linux_overlay::Handle) -
 fn linux_ftruncate(descriptor: u64, length: u64) -> u64 {
     let descriptor = u64::from(descriptor as u32);
     let state = linux_device_descriptor(descriptor);
-    if state & 3 != LINUX_DESCRIPTOR_OUTPUT && state & 3 != 3 {
+    // Linux's order: a negative length, then a closed descriptor (EBADF),
+    // then one not open for writing or not a regular file (EINVAL:
+    // ftruncate03's read-only file and socket).
+    if length > i64::MAX as u64 {
+        return LINUX_EINVAL;
+    }
+    if !linux_descriptor_open(descriptor) {
         return LINUX_EBADF;
     }
-    if length > i64::MAX as u64 {
+    if state & 3 != LINUX_DESCRIPTOR_OUTPUT && state & 3 != 3
+        || linux_socket_slot(descriptor).is_some()
+    {
         return LINUX_EINVAL;
     }
     let handle = match linux_copy_up_descriptor(descriptor) {
@@ -33719,9 +33906,10 @@ fn linux_ftruncate(descriptor: u64, length: u64) -> u64 {
     let Some(metadata) = crate::linux_overlay::metadata(handle) else {
         return LINUX_EIO;
     };
+    // Only the size seals stop a truncate; a write-sealed memfd may still
+    // shrink and grow, as in Linux (memfd_create01).
     if let Some(seals) = crate::linux_overlay::file_seals(handle) {
-        if seals & (LINUX_F_SEAL_WRITE | LINUX_F_SEAL_FUTURE_WRITE) != 0
-            || length < metadata.size && seals & LINUX_F_SEAL_SHRINK != 0
+        if length < metadata.size && seals & LINUX_F_SEAL_SHRINK != 0
             || length > metadata.size && seals & LINUX_F_SEAL_GROW != 0
         {
             return LINUX_EPERM;
@@ -33744,11 +33932,15 @@ fn linux_fallocate(descriptor: u64, mode: u64, offset: u64, length: u64) -> u64 
     if state & 3 != LINUX_DESCRIPTOR_OUTPUT && state & 3 != 3 {
         return LINUX_EBADF;
     }
-    if mode != 0 {
-        return LINUX_EOPNOTSUPP;
-    }
+    // As tmpfs: allocation, with or without FALLOC_FL_KEEP_SIZE, and
+    // FALLOC_FL_PUNCH_HOLE with KEEP_SIZE, which zeroes the range.
+    const KEEP_SIZE: u64 = 1;
+    const PUNCH_HOLE: u64 = 2;
     if offset > i64::MAX as u64 || length == 0 || length > i64::MAX as u64 {
         return LINUX_EINVAL;
+    }
+    if !matches!(mode, 0 | KEEP_SIZE | 3) {
+        return LINUX_EOPNOTSUPP;
     }
     let Some(end) = offset
         .checked_add(length)
@@ -33766,12 +33958,32 @@ fn linux_fallocate(descriptor: u64, mode: u64, offset: u64, length: u64) -> u64 
     if metadata.kind != crate::linux_overlay::NodeKind::File {
         return LINUX_EISDIR;
     }
+    // Allocating changes no data, so only F_SEAL_GROW stops it (and only
+    // when the size grows); the write seals stop a hole punch.
     if let Some(seals) = crate::linux_overlay::file_seals(handle) {
-        if seals & (LINUX_F_SEAL_WRITE | LINUX_F_SEAL_FUTURE_WRITE) != 0
-            || end as usize > metadata.size && seals & LINUX_F_SEAL_GROW != 0
+        if mode & PUNCH_HOLE != 0 && seals & (LINUX_F_SEAL_WRITE | LINUX_F_SEAL_FUTURE_WRITE) != 0
+            || mode == 0 && end as usize > metadata.size && seals & LINUX_F_SEAL_GROW != 0
         {
             return LINUX_EPERM;
         }
+    }
+    if mode & PUNCH_HOLE != 0 {
+        // The punched range reads back as zeros; past the end there is
+        // nothing to punch.
+        let zeros = [0_u8; 4096];
+        let mut position = offset as usize;
+        let stop = (end as usize).min(metadata.size);
+        while position < stop {
+            let chunk = (stop - position).min(zeros.len());
+            if crate::linux_overlay::write(handle, position, &zeros[..chunk]) != Some(chunk) {
+                return LINUX_EIO;
+            }
+            position += chunk;
+        }
+        return 0;
+    }
+    if mode & KEEP_SIZE != 0 {
+        return 0;
     }
     if metadata.size < end as usize && linux_file_extension_limit(end as usize).is_err() {
         return LINUX_EFBIG;
@@ -45764,7 +45976,7 @@ fn linux_descriptor_close_with_wake_inner(descriptor: u64, wake_waiters: bool) -
         linux_io_uring_release();
     }
     if let Some(id) = linux_mq_descriptor_id(descriptor) {
-        match crate::linux_sysv_ipc::posix_queue_close(id) {
+        match crate::linux_sysv_ipc::posix_queue_close_by(id, current_linux_process_pid()) {
             Ok(destroyed) if linux_release_posix_queue_charge(destroyed) => {}
             Ok(_) => return LINUX_EIO,
             Err(_) => return LINUX_EBADF,

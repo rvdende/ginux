@@ -789,8 +789,8 @@ pub(crate) fn add_file_seals(handle: Handle, seals: u32) -> Option<bool> {
     if node.data != Data::Memfd {
         return None;
     }
-    let added = seals & !node.seals;
-    if added != 0 && node.seals & 1 != 0 {
+    // F_SEAL_SEAL forbids any further F_ADD_SEALS, even of nothing.
+    if node.seals & 1 != 0 {
         return Some(false);
     }
     node.seals |= seals;

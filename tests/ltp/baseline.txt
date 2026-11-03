@@ -44,8 +44,6 @@ epoll_pwait06 TBROK
 eventfd06 TFAIL
 execve04 TFAIL
 execveat02 TFAIL
-fallocate02 TFAIL
-fallocate03 TFAIL
 fsetxattr02 TBROK
 fchdir03 TFAIL
 fcntl07 TWARN
@@ -68,8 +66,6 @@ fcntl39_64 TBROK
 fgetxattr02 TBROK
 fork14 HANG
 fsync03 TWARN
-ftruncate03 TFAIL
-ftruncate03_64 TFAIL
 getcpu01 TFAIL
 gethostbyname_r01 TFAIL
 gethostname02 TFAIL
@@ -150,12 +146,7 @@ mount_setattr02 TBROK
 mprotect01 TBROK
 mprotect05 TBROK
 mq_notify01 TBROK
-mq_notify02 TFAIL
 mq_notify03 TBROK
-mq_open01 TBROK
-mq_timedreceive01 TBROK
-mq_timedsend01 TBROK
-mq_unlink01 TBROK
 mremap01 TFAIL
 mremap03 TFAIL
 mremap05 TFAIL
@@ -266,7 +257,6 @@ futex_cmp_requeue01 TBROK
 futex_waitv01 TFAIL
 futex_wake05 TFAIL
 memfd_create01 TFAIL
-memfd_create02 TFAIL
 copy_file_range03 TFAIL
 statx03 TFAIL
 io_uring01 TBROK
