@@ -14100,6 +14100,34 @@ fn linux_reboot(magic: u64, magic2: u64, command: u64, argument: u64) -> u64 {
     }
 }
 
+/// ioperm(2): checks the range as Linux does, then refuses to open I/O
+/// ports in every domain, privileged ones too, since port access would
+/// reach around the drivers' isolation. Closing ports is a no-op.
+fn linux_ioperm(from: u64, count: u64, turn_on: u64) -> u64 {
+    const PORTS: u64 = 65_536;
+    if from
+        .checked_add(count)
+        .is_none_or(|end| end <= from || end > PORTS)
+    {
+        return LINUX_EINVAL;
+    }
+    if turn_on != 0 {
+        LINUX_EPERM
+    } else {
+        0
+    }
+}
+
+/// iopl(2): levels above 3 are EINVAL; raising the level is refused in
+/// every domain (see `linux_ioperm`), keeping level 0 is allowed.
+fn linux_iopl(level: u64) -> u64 {
+    match level as u32 {
+        0 => 0,
+        1..=3 => LINUX_EPERM,
+        _ => LINUX_EINVAL,
+    }
+}
+
 /// vhangup(2): the caller has no controlling terminal of its own to hang
 /// up in a domain, so it only checks authority.
 fn linux_vhangup() -> u64 {
@@ -29387,6 +29415,11 @@ fn linux_measured_path_kind(path: &[u8]) -> Option<u16> {
 }
 
 fn linux_virtual_mount_path_at(directory: u64, path: &[u8]) -> Option<u16> {
+    // /proc and /sys/fs/cgroup are mounted at the domain's root, which a
+    // process in a chroot does not see.
+    if linux_chrooted() {
+        return None;
+    }
     let relative = path.strip_prefix(b"/").unwrap_or(path);
     let relative = if relative == b"proc/" {
         b"proc"
@@ -29457,14 +29490,118 @@ fn linux_getcwd(address: u64, capacity: u64) -> u64 {
         destination.copy_from_slice(path);
         1 + path.len()
     };
+    // In a chroot the path is shown from the root; a directory outside
+    // it is "(unreachable)" followed by its path, as Linux reports it.
+    let mut root = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    let root_length = linux_root_prefix(&mut root);
+    let mut shown = [0_u8; crate::linux_overlay::PATH_CAPACITY + 16];
+    let length = if root_length == 0 {
+        shown[..length].copy_from_slice(&output[..length]);
+        length
+    } else if linux_root_floor(&output[1..length]) != 0 {
+        // What follows the root is "" (the root itself) or "/...".
+        let rest = &output[1 + root_length..length];
+        if rest.is_empty() {
+            shown[0] = b'/';
+            1
+        } else {
+            shown[..rest.len()].copy_from_slice(rest);
+            rest.len()
+        }
+    } else {
+        const UNREACHABLE: &[u8] = b"(unreachable)";
+        shown[..UNREACHABLE.len()].copy_from_slice(UNREACHABLE);
+        shown[UNREACHABLE.len()..UNREACHABLE.len() + length].copy_from_slice(&output[..length]);
+        UNREACHABLE.len() + length
+    };
+    shown[length] = 0;
     let required = length + 1;
     if capacity < required as u64 {
         return LINUX_ERANGE;
     }
-    if !copy_to_linux_user(address, &output[..required]) {
+    if !copy_to_linux_user(address, &shown[..required]) {
         return LINUX_EFAULT;
     }
     required as u64
+}
+
+/// chroot(2), in a domain set `privileged=true`: makes a directory the
+/// process's root (`linux_process::set_live_process_root`), which its
+/// children inherit. Linux's order: the lookup's errors, then search
+/// permission on the directory (EACCES), then CAP_SYS_CHROOT (EPERM).
+fn linux_chroot(path_address: u64) -> u64 {
+    if !linux_privileged_operation_allowed(linux_user::PrivilegedOperation::ChangeRoot) {
+        return LINUX_EPERM;
+    }
+    let mut path = [0_u8; LINUX_PATH_MAX];
+    let length = match copy_linux_c_string(path_address, &mut path) {
+        Ok(length) => length,
+        Err(error) => return error,
+    };
+    let path = &path[..length];
+    let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    let root = match linux_canonical_path_at(u64::from(LINUX_AT_FDCWD), path, &mut canonical) {
+        // The domain's root itself.
+        Err(LINUX_EISDIR) => Vec::new(),
+        Err(error) => return error,
+        Ok(canonical_length) => {
+            let (length, _, found) =
+                match linux_overlay_lookup_following(&mut canonical, canonical_length, true) {
+                    Ok(found) => found,
+                    Err(error) => return error,
+                };
+            let access = if let Some(metadata) = found {
+                if metadata.kind != crate::linux_overlay::NodeKind::Directory {
+                    return LINUX_ENOTDIR;
+                }
+                linux_overlay_file_access(metadata)
+            } else {
+                let Some((handle, entry)) = linux_rootfs_path_at(u64::from(LINUX_AT_FDCWD), path)
+                else {
+                    return linux_missing_path_error(&canonical[..length]);
+                };
+                if entry.is_some_and(|entry| {
+                    entry.kind != crate::published_rootfs::EntryKind::Directory
+                }) {
+                    return LINUX_ENOTDIR;
+                }
+                let Some(image_length) = crate::published_rootfs::copy_path(handle, &mut canonical)
+                else {
+                    return LINUX_ENOENT;
+                };
+                // Directories of the image are searchable by everyone.
+                let mut root = Vec::new();
+                if root.try_reserve_exact(image_length).is_err() {
+                    return LINUX_ENOMEM;
+                }
+                root.extend_from_slice(&canonical[..image_length]);
+                return linux_finish_chroot(root);
+            };
+            if let Err(error) =
+                linux_check_access(Some(access), ginux_credentials::access::EXECUTE, false)
+            {
+                return error;
+            }
+            let mut root = Vec::new();
+            if root.try_reserve_exact(length).is_err() {
+                return LINUX_ENOMEM;
+            }
+            root.extend_from_slice(&canonical[..length]);
+            root
+        }
+    };
+    linux_finish_chroot(root)
+}
+
+fn linux_finish_chroot(root: Vec<u8>) -> u64 {
+    if !linux_has_capability(ginux_credentials::capability::SYS_CHROOT) {
+        return LINUX_EPERM;
+    }
+    if linux_process::set_live_process_root(current_linux_process_pid(), root) {
+        0
+    } else {
+        LINUX_ESRCH
+    }
 }
 
 fn linux_chdir(path_address: u64) -> u64 {
@@ -31766,6 +31903,8 @@ fn linux_rootfs_path_at(
     if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
         return None;
     }
+    let mut rooted = [0_u8; LINUX_PATH_MAX + crate::linux_overlay::PATH_CAPACITY];
+    let path = linux_rooted_path(path, &mut rooted)?;
     let directory = if path.starts_with(b"/") {
         crate::published_rootfs::ROOT_HANDLE
     } else if directory as u32 == LINUX_AT_FDCWD {
@@ -31846,6 +31985,73 @@ fn linux_copy_up_descriptor(descriptor: u64) -> Result<crate::linux_overlay::Han
     Ok(handle)
 }
 
+/// Writes the current process's root directory (its chroot, a canonical
+/// path without a leading slash) at the start of `output`; its length, 0
+/// for the domain's root. Absolute paths and symlink targets start here.
+fn linux_root_prefix(output: &mut [u8]) -> usize {
+    if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::Relaxed) {
+        return 0;
+    }
+    linux_process::with_live_process_root(current_linux_process_pid(), |root| {
+        match output.get_mut(..root.len()) {
+            Some(start) => {
+                start.copy_from_slice(root);
+                root.len()
+            }
+            None => 0,
+        }
+    })
+    .unwrap_or(0)
+}
+
+/// The length of the current root directory when canonical `path` is at
+/// or under it, else 0: where ".." stops.
+fn linux_root_floor(path: &[u8]) -> usize {
+    if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::Relaxed) {
+        return 0;
+    }
+    linux_process::with_live_process_root(current_linux_process_pid(), |root| {
+        let inside = !root.is_empty()
+            && path.starts_with(root)
+            && (path.len() == root.len() || path[root.len()] == b'/');
+        if inside {
+            root.len()
+        } else {
+            0
+        }
+    })
+    .unwrap_or(0)
+}
+
+/// An absolute `path` as the domain sees it from the current process's
+/// root directory ("/" + root + path), in `buffer`; other paths as given.
+/// None when it does not fit.
+fn linux_rooted_path<'a>(path: &'a [u8], buffer: &'a mut [u8]) -> Option<&'a [u8]> {
+    if !path.starts_with(b"/") {
+        return Some(path);
+    }
+    let Some(root_length) = buffer.get_mut(1..).map(linux_root_prefix) else {
+        return Some(path);
+    };
+    if root_length == 0 {
+        return Some(path);
+    }
+    let length = 1 + root_length + path.len();
+    let destination = buffer.get_mut(1 + root_length..length)?;
+    destination.copy_from_slice(path);
+    buffer[0] = b'/';
+    Some(&buffer[..length])
+}
+
+/// Whether the current process has a root directory of its own (chroot).
+fn linux_chrooted() -> bool {
+    X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::Relaxed)
+        && linux_process::with_live_process_root(current_linux_process_pid(), |root| {
+            !root.is_empty()
+        })
+        .unwrap_or(false)
+}
+
 fn linux_canonical_path_at(
     directory: u64,
     path: &[u8],
@@ -31857,7 +32063,7 @@ fn linux_canonical_path_at(
         return Err(LINUX_ENOENT);
     }
     let length = if path.starts_with(b"/") {
-        0
+        linux_root_prefix(output)
     } else {
         linux_walk_start(directory, output)?
     };
@@ -31963,10 +32169,15 @@ fn linux_walk_path_components(
         .peekable();
     while let Some(component) = components.next() {
         if component == b".." {
-            length = output[..length]
-                .iter()
-                .rposition(|byte| *byte == b'/')
-                .unwrap_or(0);
+            // ".." at the process's root directory stays there (chroot).
+            let floor = linux_root_floor(&output[..length]);
+            if length > floor {
+                length = output[..length]
+                    .iter()
+                    .rposition(|byte| *byte == b'/')
+                    .unwrap_or(0)
+                    .max(floor);
+            }
             continue;
         }
         if component.contains(&0) {
@@ -32003,7 +32214,7 @@ fn linux_walk_path_components(
         let target_length =
             crate::linux_overlay::read(link.handle, 0, &mut target).ok_or(LINUX_EIO)?;
         let base = if target[..target_length].starts_with(b"/") {
-            0
+            linux_root_prefix(output)
         } else {
             linux_parent_path(&output[..length]).len()
         };
@@ -32054,7 +32265,7 @@ fn linux_resolve_link_target(
     output: &mut [u8; crate::linux_overlay::PATH_CAPACITY],
 ) -> Result<usize, u64> {
     let base = if target.starts_with(b"/") {
-        0
+        linux_root_prefix(output)
     } else {
         let parent = linux_parent_path(link);
         output[..parent.len()].copy_from_slice(parent);
@@ -32278,6 +32489,8 @@ fn linux_rootfs_metadata_path_at(
     if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
         return None;
     }
+    let mut rooted = [0_u8; LINUX_PATH_MAX + crate::linux_overlay::PATH_CAPACITY];
+    let path = linux_rooted_path(path, &mut rooted)?;
     let directory = if path.starts_with(b"/") {
         crate::published_rootfs::ROOT_HANDLE
     } else if directory as u32 == LINUX_AT_FDCWD {

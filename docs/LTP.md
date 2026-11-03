@@ -104,11 +104,16 @@ feature rather than a fix:
   (the LTP domain is): root there holds machine-level authority, so
   reboot resets the machine and syslog reads the machine's kernel log
   (`kernel_log.rs`; reboot01-02, syslog11-12, vhangup02 and
-  delete_module02 pass). Still to implement behind the flag: chroot
-  (chroot02-04, pivot_root01, realpath01, listmount03, statmount08 and
-  io_uring02 call it), process accounting (acct01-02) and ptrace. iopl
-  and ioperm (ioperm01-02, iopl01-02) stay refused even there: raw I/O
-  ports would reach around the drivers' isolation.
+  delete_module02 pass). chroot gives a process its own root directory
+  (inherited, kept across exec): absolute paths, `..` and absolute
+  symlink targets resolve inside it, `/proc` is not visible there unless
+  mounted, and getcwd shows paths from it or "(unreachable)" (chroot02-04
+  and realpath01 pass). Still to implement behind the flag: process
+  accounting (acct01-02), ptrace, pivot_root, and listmount/statmount
+  refusing mounts outside the root. iopl and ioperm check their
+  arguments but stay refused even there (ioperm02, iopl02 pass; ioperm01
+  and iopl01 are skipped): raw I/O ports would reach around the drivers'
+  isolation.
 - **Writable and executable memory** is allowed in a domain set
   `write-execute=true` (the LTP domain is); each page is writable or
   executable at a time and flips on the access that needs the other

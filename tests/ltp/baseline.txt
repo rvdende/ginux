@@ -12,9 +12,6 @@ arch_prctl01 TFAIL
 bind02 TFAIL
 bind05 TBROK
 chmod06 TFAIL
-chroot02 TFAIL
-chroot03 TFAIL
-chroot04 TFAIL
 clock_gettime03 TBROK
 leapsec01 TBROK
 clone02 TFAIL
@@ -71,10 +68,6 @@ fanotify07 TBROK
 fanotify11 TBROK
 fanotify12 TBROK
 fanotify25 TBROK
-ioperm01 TFAIL
-ioperm02 TFAIL
-iopl01 TFAIL
-iopl02 TFAIL
 keyctl02 TBROK
 keyctl05 TBROK
 keyctl09 TFAIL
@@ -137,7 +130,6 @@ ptrace09 TBROK
 ptrace10 TBROK
 ptrace11 TBROK
 readlinkat01 TBROK
-realpath01 TBROK
 recvmmsg01 TBROK
 remap_file_pages01 TBROK
 rt_sigaction01 TBROK

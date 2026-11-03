@@ -646,6 +646,11 @@ struct ProcessTable {
     /// Each slot's supplementary groups, sorted, parallel to `processes`:
     /// inherited across fork, emptied when the slot is freed.
     groups: Vec<Vec<u32>>,
+    /// Each slot's root directory (chroot) as a canonical path without a
+    /// leading slash, parallel to `processes`; empty for the domain's root.
+    /// Inherited across fork, kept across exec, emptied when the slot is
+    /// freed.
+    roots: Vec<Vec<u8>>,
     /// seccomp filters, each with the one installed before it; a process
     /// names its newest. One no process reaches is reused (`install`).
     seccomp_filters: Vec<Option<SeccompFilter>>,
@@ -673,6 +678,7 @@ impl ProcessTable {
             processes: Vec::new(),
             generations: Vec::new(),
             groups: Vec::new(),
+            roots: Vec::new(),
             seccomp_filters: Vec::new(),
             next_pid: 1,
             init: None,
@@ -1271,6 +1277,7 @@ impl ProcessTable {
         }
         self.processes[usize::from(handle.slot)] = None;
         self.groups[usize::from(handle.slot)] = Vec::new();
+        self.roots[usize::from(handle.slot)] = Vec::new();
         true
     }
 
@@ -1406,6 +1413,7 @@ impl ProcessTable {
         })?;
         let process = self.processes[slot].take()?;
         self.groups[slot] = Vec::new();
+        self.roots[slot] = Vec::new();
         let ProcessState::Zombie { status } = process.state else {
             return None;
         };
@@ -1671,9 +1679,11 @@ impl ProcessTable {
                 self.processes.try_reserve(1).ok()?;
                 self.generations.try_reserve(1).ok()?;
                 self.groups.try_reserve(1).ok()?;
+                self.roots.try_reserve(1).ok()?;
                 self.processes.push(None);
                 self.generations.push(0);
                 self.groups.push(Vec::new());
+                self.roots.push(Vec::new());
                 self.processes.len() - 1
             }
             None => return None,
@@ -1721,6 +1731,15 @@ impl ProcessTable {
         groups.try_reserve_exact(inherited.len()).ok()?;
         groups.extend_from_slice(inherited);
         self.groups[slot] = groups;
+        // A child starts in its parent's root directory.
+        let mut root = Vec::new();
+        if let Some(parent_root) =
+            parent.and_then(|parent| self.roots.get(usize::from(parent.slot)))
+        {
+            root.try_reserve_exact(parent_root.len()).ok()?;
+            root.extend_from_slice(parent_root);
+        }
+        self.roots[slot] = root;
         self.generations[slot] = generation;
         self.processes[slot] = Some(Process {
             handle,
@@ -2529,6 +2548,7 @@ pub(crate) fn install_live_process_registry(
         (*table).processes.clear();
         (*table).generations.clear();
         (*table).groups.clear();
+        (*table).roots.clear();
         (*table).seccomp_filters.clear();
         core::ptr::addr_of_mut!((*table).next_pid).write(1);
         core::ptr::addr_of_mut!((*table).init).write(None);
@@ -2901,6 +2921,7 @@ pub(crate) fn force_stop_runtime_process_registry() -> bool {
         }
         table.processes[slot] = None;
         table.groups[slot] = Vec::new();
+        table.roots[slot] = Vec::new();
         if table
             .processes
             .iter()
@@ -3060,6 +3081,33 @@ pub(crate) fn with_live_process_groups<R>(
     let handle = table.handle_by_pid(pid)?;
     table.process(handle)?;
     Some(inspect(table.groups.get(usize::from(handle.slot))?))
+}
+
+/// Runs `inspect` on the root directory of `pid` (its chroot, a canonical
+/// path without a leading slash; empty for the domain's root).
+pub(crate) fn with_live_process_root<R>(pid: u32, inspect: impl FnOnce(&[u8]) -> R) -> Option<R> {
+    let table = live_process_table_mut()?;
+    let handle = table.handle_by_pid(pid)?;
+    table.process(handle)?;
+    Some(inspect(table.roots.get(usize::from(handle.slot))?))
+}
+
+/// Makes `root` the root directory of `pid` (chroot).
+pub(crate) fn set_live_process_root(pid: u32, root: Vec<u8>) -> bool {
+    let Some(table) = live_process_table_mut() else {
+        return false;
+    };
+    let Some(handle) = table.handle_by_pid(pid) else {
+        return false;
+    };
+    if table.process(handle).is_none() {
+        return false;
+    }
+    let Some(slot) = table.roots.get_mut(usize::from(handle.slot)) else {
+        return false;
+    };
+    *slot = root;
+    true
 }
 
 /// Replaces the supplementary groups of `pid` with `groups`, sorted.

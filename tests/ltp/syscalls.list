@@ -571,9 +571,9 @@ fanotify12 fanotify12
 !fanotify23 fanotify23  # auto: needs a loop block device (mkfs and mount)
 !fanotify24 fanotify24  # auto: needs a loop block device (mkfs and mount)
 fanotify25 fanotify25
-ioperm01 ioperm01
+!ioperm01 ioperm01  # raw I/O ports stay refused in every domain (driver isolation)
 ioperm02 ioperm02
-iopl01 iopl01
+!iopl01 iopl01  # raw I/O ports stay refused in every domain (driver isolation)
 iopl02 iopl02
 ioprio_get01 ioprio_get01
 ioprio_set01 ioprio_set01
