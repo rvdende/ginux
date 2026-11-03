@@ -46502,6 +46502,23 @@ fn linux_memfd_fcntl(descriptor: u64, command: u64, argument: u64) -> u64 {
     if requested & !LINUX_F_SEAL_MASK != 0 {
         return LINUX_EINVAL;
     }
+    // Sealing takes a descriptor open for writing (EPERM).
+    if linux_device_descriptor(descriptor) & LINUX_DESCRIPTOR_OUTPUT == 0 {
+        return LINUX_EPERM;
+    }
+    // F_SEAL_WRITE waits for no shared mapping that may write (EBUSY).
+    if requested & LINUX_F_SEAL_WRITE != 0
+        && current & LINUX_F_SEAL_SEAL == 0
+        && linux_descriptor_stat(descriptor).is_some_and(|stat| {
+            crate::linux_areas::file_writably_mapped(
+                linux_execution_instance(),
+                u64::from_ne_bytes(stat[..8].try_into().unwrap_or([0; 8])),
+                u64::from_ne_bytes(stat[8..16].try_into().unwrap_or([0; 8])),
+            )
+        })
+    {
+        return LINUX_EBUSY;
+    }
     match crate::linux_overlay::add_file_seals(handle, requested) {
         Some(true) => 0,
         Some(false) => LINUX_EPERM,
@@ -50651,7 +50668,10 @@ fn materialize_linux_runtime_user_range(address: u64, length: usize, writable: b
             continue;
         }
         let mut page = address_space::current_linux_runtime_page(page_address);
-        if !page.occupied && writable && materialize_linux_primary_stack_page(page_address) {
+        // The main stack grows into a page the program has not touched for
+        // a read as for a write (a write(2) from a large, untouched stack
+        // buffer: memfd_create01), as a fault there would grow it.
+        if !page.occupied && materialize_linux_primary_stack_page(page_address) {
             page = address_space::current_linux_runtime_page(page_address);
         }
         let required = if writable {

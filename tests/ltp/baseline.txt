@@ -256,7 +256,6 @@ perf_event_open02 TBROK
 futex_cmp_requeue01 TBROK
 futex_waitv01 TFAIL
 futex_wake05 TFAIL
-memfd_create01 TFAIL
 copy_file_range03 TFAIL
 statx03 TFAIL
 io_uring01 TBROK

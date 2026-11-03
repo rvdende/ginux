@@ -108,6 +108,30 @@ pub(crate) fn write_forbidden(instance: usize, pid: u32, start: u64, length: u64
         .is_some_and(|process| process.areas.write_forbidden(start, end))
 }
 
+/// Whether some process of `instance` maps file (`device`, `inode`)
+/// shared and may write it (Linux's mapping_writably_mapped): such a
+/// mapping keeps a memfd from being sealed against writes (EBUSY).
+pub(crate) fn file_writably_mapped(instance: usize, device: u64, inode: u64) -> bool {
+    PROCESSES
+        .lock()
+        .iter()
+        .filter(|process| process.instance == instance)
+        .any(|process| {
+            process.areas.iter().any(|area| {
+                area.shared
+                    && area.may_write
+                    && matches!(
+                        area.backing,
+                        Backing::File {
+                            device: mapped_device,
+                            inode: mapped_inode,
+                            ..
+                        } if mapped_device == device && mapped_inode == inode
+                    )
+            })
+        })
+}
+
 /// Records that `pid` moved or resized the mapping of `old_length` bytes
 /// at `old_start` to `new_length` bytes at `new_start` (mremap).
 pub(crate) fn remap(
