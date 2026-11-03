@@ -100,12 +100,20 @@ feature rather than a fix:
 - **Shared-resource clones** (clone02, clone05, clone08, clone10,
   clone301, kcmp03): CLONE_VM, CLONE_FILES, CLONE_FS or CLONE_SIGHAND
   without CLONE_THREAD, and CLONE_PARENT. Ginux keeps these per process.
-- **Operations a domain may not do** (chroot02-04, pivot_root01,
-  realpath01, listmount03, statmount08, io_uring02, syslog11-12,
-  reboot01-02, vhangup02, acct01-02, ptrace*): refused by policy. Each
-  could be confined to the domain (a per-process root, a domain kernel
-  log and `/dev/kmsg`, ptrace within the domain); that is a design
-  decision, not a bug.
+- **Privileged operations** now run in a domain set `privileged=true`
+  (the LTP domain is): root there holds machine-level authority, so
+  reboot resets the machine and syslog reads the machine's kernel log
+  (`kernel_log.rs`; reboot01-02, syslog11-12, vhangup02 and
+  delete_module02 pass). Still to implement behind the flag: chroot
+  (chroot02-04, pivot_root01, realpath01, listmount03, statmount08 and
+  io_uring02 call it), process accounting (acct01-02) and ptrace. iopl
+  and ioperm (ioperm01-02, iopl01-02) stay refused even there: raw I/O
+  ports would reach around the drivers' isolation.
+- **Writable and executable memory** is allowed in a domain set
+  `write-execute=true` (the LTP domain is); each page is writable or
+  executable at a time and flips on the access that needs the other
+  (mincore02 passes). mmap04 still fails on a shared anonymous mapping
+  placed over a private one.
 - **io_uring** (io_uring01, 03, 04): one minimal ring per process.
 - **fanotify, keyctl, loop devices, perf events**: missing features or
   kernel config the tests parse (`/proc/config.gz`).

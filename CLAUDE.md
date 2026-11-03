@@ -18,6 +18,13 @@ through a Linux ABI personality. It is not a rewrite of Linux:
   verified OCI roots. Root in a domain may switch to other user ids only when
   the domain is set `user-switching=true`: one flag, checked in one place
   (`linux_user::user_switching_allowed`), so it is the single point to secure.
+  Two more single-point flags, both off by default: `write-execute=true`
+  lets programs map memory writable and executable (JITs), each page still
+  flipping between the two (`linux_write_execute_allowed` in cpu.rs), and
+  `privileged=true` gives the domain's root machine-level authority
+  (reboot resets the machine, syslog reads the machine's kernel log) but
+  never raw I/O ports (`linux_user::domain_privileged`). The LTP domain
+  sets all three.
 - **Small trusted core.** Confine `unsafe` to a minimal layer (page tables,
   context switch, MMIO, DMA) with documented invariants; everything above it
   is safe Rust (the "framekernel" idea).

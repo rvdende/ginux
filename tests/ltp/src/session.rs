@@ -467,7 +467,7 @@ impl Run {
         // LTP's credential tests switch between root and other users (nobody,
         // bin), which a domain allows only with user-switching=true.
         qemu.send(&format!(
-            "domain set ltp image={} init=/bin/sh memory-mib={} cpu={} user-switching=true",
+            "domain set ltp image={} init=/bin/sh memory-mib={} cpu={} user-switching=true write-execute=true privileged=true",
             config.image, config.domain_memory_mib, config.domain_cpus
         ));
         offset = qemu.wait_for(b"settings accepted", 30, offset, &interrupted)?;

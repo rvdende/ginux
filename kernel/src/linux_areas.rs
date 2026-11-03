@@ -153,6 +153,17 @@ pub(crate) fn locked_in(instance: usize, pid: u32, start: u64, length: u64) -> b
         .is_some_and(|process| process.areas.locked_in(start, end))
 }
 
+/// The protection of `pid`'s area covering `address`.
+pub(crate) fn protection_at(instance: usize, pid: u32, address: u64) -> Option<Protection> {
+    PROCESSES
+        .lock()
+        .iter()
+        .find(|process| process.instance == instance && process.pid == pid)?
+        .areas
+        .find(address)
+        .map(|area| area.protection)
+}
+
 /// Whether some area of `pid` overlaps `length` bytes at `start`.
 pub(crate) fn overlaps(instance: usize, pid: u32, start: u64, length: u64) -> bool {
     let Some(end) = start.checked_add(length) else {

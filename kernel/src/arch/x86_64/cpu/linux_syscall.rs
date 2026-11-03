@@ -2059,6 +2059,10 @@ fn linux_syscall_dispatch(
             LINUX_RETURN_TO_KERNEL
         }
         LINUX_UNSHARE_SYSCALL => linux_unshare(first_argument),
+        LINUX_REBOOT_SYSCALL => linux_reboot(first_argument, buffer, count, register(0)),
+        LINUX_VHANGUP_SYSCALL => linux_vhangup(),
+        LINUX_DELETE_MODULE_SYSCALL => linux_delete_module(first_argument),
+        LINUX_SYSLOG_SYSCALL => linux_syslog(first_argument, buffer, count),
         number if linux_privileged_operation(number).is_some() => {
             linux_deny_privileged_operation(number)
         }

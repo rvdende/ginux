@@ -7488,7 +7488,9 @@ pub(crate) fn import_persistent_domain_configuration(
             || flags
                 & !(control_abi::DOMAIN_CONFIG_COMPLETE
                     | control_abi::DOMAIN_CONFIG_AUTOSTART
-                    | control_abi::DOMAIN_CONFIG_USER_SWITCHING)
+                    | control_abi::DOMAIN_CONFIG_USER_SWITCHING
+                    | control_abi::DOMAIN_CONFIG_WRITE_EXECUTE
+                    | control_abi::DOMAIN_CONFIG_PRIVILEGED)
                 != 0
             || flags
                 & (control_abi::DOMAIN_CONFIG_INIT
@@ -14034,6 +14036,145 @@ fn linux_unshare(flags: u64) -> u64 {
     0
 }
 
+/// Whether the current process's domain lets root use `operation` (a
+/// domain set `privileged=true`, `linux_user::domain_privileged`).
+fn linux_privileged_operation_allowed(operation: linux_user::PrivilegedOperation) -> bool {
+    current_linux_user_namespace()
+        .is_some_and(|namespace| !linux_user::privileged_operation_denied(namespace, operation))
+}
+
+fn linux_has_capability(capability: u32) -> bool {
+    current_linux_credentials().is_some_and(|credentials| credentials.has(capability))
+}
+
+/// reboot(2) in a domain set `privileged=true` acts on the machine:
+/// restart, halt and power-off stop the domain and shut the kernel down
+/// cleanly, ending in a cold reset for a restart.
+fn linux_reboot(magic: u64, magic2: u64, command: u64, argument: u64) -> u64 {
+    const MAGIC: u32 = 0xfee1_dead;
+    const MAGIC2: [u32; 4] = [672_274_793, 85_072_278, 369_367_448, 537_993_216];
+    const RESTART: u32 = 0x0123_4567;
+    const HALT: u32 = 0xcdef_0123;
+    const CAD_ON: u32 = 0x89ab_cdef;
+    const CAD_OFF: u32 = 0;
+    const POWER_OFF: u32 = 0x4321_fedc;
+    const RESTART2: u32 = 0xa1b2_c3d4;
+    if !linux_privileged_operation_allowed(linux_user::PrivilegedOperation::ManageKernel)
+        || !linux_has_capability(ginux_credentials::capability::SYS_BOOT)
+    {
+        return LINUX_EPERM;
+    }
+    if magic as u32 != MAGIC || !MAGIC2.contains(&(magic2 as u32)) {
+        return LINUX_EINVAL;
+    }
+    match command as u32 {
+        CAD_ON | CAD_OFF => {
+            crate::machine_control::set_ctrl_alt_del(command as u32 == CAD_ON);
+            0
+        }
+        RESTART | RESTART2 | HALT | POWER_OFF => {
+            if command as u32 == RESTART2 {
+                let mut reason = [0_u8; 256];
+                if copy_linux_c_string(argument, &mut reason) == Err(LINUX_EFAULT) {
+                    return LINUX_EFAULT;
+                }
+            }
+            crate::machine_control::set_reset_kind(
+                if matches!(command as u32, RESTART | RESTART2) {
+                    crate::machine_control::RESET_COLD
+                } else {
+                    crate::machine_control::RESET_SHUTDOWN
+                },
+            );
+            crate::serial_write("ginux: privileged domain requested machine reset\r\n");
+            X86_RUNTIME
+                .CONTAINER_HOST_SHUTDOWN_REQUESTED
+                .store(true, Ordering::SeqCst);
+            if let Some(slot) = active_container_slot() {
+                X86_RUNTIME.CONTAINER_CONTROL_STATES[slot]
+                    .store(control_abi::DOMAIN_STATE_STOPPED as u8, Ordering::SeqCst);
+            }
+            0
+        }
+        _ => LINUX_EINVAL,
+    }
+}
+
+/// vhangup(2): the caller has no controlling terminal of its own to hang
+/// up in a domain, so it only checks authority.
+fn linux_vhangup() -> u64 {
+    if linux_privileged_operation_allowed(linux_user::PrivilegedOperation::ManageTerminal)
+        && linux_has_capability(ginux_credentials::capability::SYS_TTY_CONFIG)
+    {
+        0
+    } else {
+        LINUX_EPERM
+    }
+}
+
+/// delete_module(2): Ginux loads no kernel modules, so none is found.
+fn linux_delete_module(name: u64) -> u64 {
+    if !linux_privileged_operation_allowed(linux_user::PrivilegedOperation::ManageKernel)
+        || !linux_has_capability(ginux_credentials::capability::SYS_MODULE)
+    {
+        return LINUX_EPERM;
+    }
+    // Linux reads at most MODULE_NAME_LEN - 1 bytes of the name.
+    let mut module = [0_u8; 56];
+    match copy_linux_c_string(name, &mut module) {
+        Err(LINUX_EFAULT) => LINUX_EFAULT,
+        _ => LINUX_ENOENT,
+    }
+}
+
+/// syslog(2) on the machine's kernel log (`kernel_log`), for a domain set
+/// `privileged=true`. READ does not wait for new messages.
+fn linux_syslog(action: u64, buffer: u64, length: u64) -> u64 {
+    let (action, length) = (action as i32, length as i32);
+    // Anyone may read the whole log or ask its size (dmesg_restrict off);
+    // the rest needs CAP_SYSLOG (or CAP_SYS_ADMIN).
+    if !linux_privileged_operation_allowed(linux_user::PrivilegedOperation::ObserveKernelLog)
+        || !matches!(action, 3 | 10)
+            && !linux_has_capability(ginux_credentials::capability::SYSLOG)
+            && !linux_has_capability(ginux_credentials::capability::SYS_ADMIN)
+    {
+        return LINUX_EPERM;
+    }
+    match action {
+        0 | 1 | 5..=7 => {
+            if action == 5 {
+                crate::kernel_log::clear();
+            }
+            0
+        }
+        2..=4 => {
+            if buffer == 0 || length < 0 {
+                return LINUX_EINVAL;
+            }
+            if length == 0 {
+                return 0;
+            }
+            let mut bytes = alloc::vec![0_u8; (length as usize).min(crate::kernel_log::CAPACITY)];
+            let count = if action == 2 {
+                crate::kernel_log::read_unread(&mut bytes)
+            } else {
+                crate::kernel_log::read_recent(&mut bytes)
+            };
+            if !copy_to_linux_user(buffer, &bytes[..count]) {
+                return LINUX_EFAULT;
+            }
+            if action == 4 {
+                crate::kernel_log::clear();
+            }
+            count as u64
+        }
+        8 if (1..=8).contains(&length) => 0,
+        9 => crate::kernel_log::unread(),
+        10 => crate::kernel_log::CAPACITY as u64,
+        _ => LINUX_EINVAL,
+    }
+}
+
 fn linux_deny_privileged_operation(number: u64) -> u64 {
     let Some(namespace) = current_linux_user_namespace() else {
         return LINUX_ESRCH;
@@ -14042,9 +14183,30 @@ fn linux_deny_privileged_operation(number: u64) -> u64 {
         return LINUX_ENOSYS;
     };
     if linux_user::privileged_operation_denied(namespace, operation) {
-        LINUX_EPERM
-    } else {
+        return LINUX_EPERM;
+    }
+    // Allowed here but not implemented yet: a caller without the Linux
+    // capability the operation needs is refused as Linux would refuse it.
+    use ginux_credentials::capability;
+    use linux_user::PrivilegedOperation;
+    let needed = match operation {
+        PrivilegedOperation::ChangeRoot => capability::SYS_CHROOT,
+        PrivilegedOperation::RawIo => capability::SYS_RAWIO,
+        PrivilegedOperation::ObserveKernelLog => capability::SYSLOG,
+        PrivilegedOperation::ManageClock => capability::SYS_TIME,
+        PrivilegedOperation::ProcessAccounting => capability::SYS_PACCT,
+        PrivilegedOperation::ManageTerminal => capability::SYS_TTY_CONFIG,
+        PrivilegedOperation::TraceProcesses => capability::SYS_PTRACE,
+        PrivilegedOperation::ManageKernel => capability::SYS_BOOT,
+        PrivilegedOperation::ManageMounts
+        | PrivilegedOperation::ManageNamespaces
+        | PrivilegedOperation::LoadBpf
+        | PrivilegedOperation::ManageStorageQuota => capability::SYS_ADMIN,
+    };
+    if linux_has_capability(needed) {
         LINUX_ENOSYS
+    } else {
+        LINUX_EPERM
     }
 }
 
@@ -18916,7 +19078,7 @@ pub(crate) fn linux_lazy_area_protection(address: u64) -> Option<u8> {
     match protection.bits() {
         0 => Some(0),
         1 => Some(1),
-        2 | 3 => Some(3),
+        2 | 3 | 6 | 7 => Some(3),
         4 | 5 => Some(5),
         _ => None,
     }
@@ -25156,7 +25318,7 @@ fn linux_runtime_mmap(
     {
         return LINUX_EBADF;
     }
-    let protection = linux_implied_protection(protection);
+    let protection = linux_runtime_page_protection(linux_implied_protection(protection));
     if length == 0
         || ![
             0,
@@ -26584,8 +26746,21 @@ fn linux_implied_protection(protection: u64) -> u64 {
     }
 }
 
+/// The page protection for a mapping's `protection`: writable and
+/// executable, allowed only in a `write-execute=true` domain, starts out
+/// writable (`linux_flip_write_execute_page`); otherwise it is refused
+/// as before, by staying a combination the callers reject.
+fn linux_runtime_page_protection(protection: u64) -> u64 {
+    let write_execute = LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC;
+    if protection == write_execute && linux_write_execute_allowed() {
+        LINUX_PROT_READ | LINUX_PROT_WRITE
+    } else {
+        protection
+    }
+}
+
 fn linux_runtime_mprotect(address: u64, length: u64, protection: u64) -> u64 {
-    let protection = linux_implied_protection(protection);
+    let protection = linux_runtime_page_protection(linux_implied_protection(protection));
     if ![
         0,
         LINUX_PROT_READ,
@@ -51577,6 +51752,19 @@ fn materialize_linux_runtime_user_range(address: u64, length: usize, writable: b
         } else {
             LINUX_PROT_READ
         } as u8;
+        // The kernel writing into a page of a writable and executable area
+        // that is executable now flips it, as a user write would.
+        if page.occupied
+            && page.protection & required == 0
+            && linux_write_execute_area(page_address)
+            && linux_runtime_mprotect(
+                page_address,
+                PAGE_SIZE as u64,
+                LINUX_PROT_READ | LINUX_PROT_WRITE,
+            ) == 0
+        {
+            page = address_space::current_linux_runtime_page(page_address);
+        }
         if !page.occupied || page.protection & required == 0 {
             return false;
         }
@@ -54988,6 +55176,24 @@ fn container_control(domain_id: u64, capability: u64, frame: *mut UserTrapFrame)
                 read_u64_at(&request, 24) == 1,
             )
         }
+        control_abi::DOMAIN_SET_WRITE_EXECUTE
+            if configurable_container(requested_slot) && read_u64_at(&request, 24) <= 1 =>
+        {
+            update_container_flag(
+                requested_slot.unwrap_or(0),
+                control_abi::DOMAIN_CONFIG_WRITE_EXECUTE,
+                read_u64_at(&request, 24) == 1,
+            )
+        }
+        control_abi::DOMAIN_SET_PRIVILEGED
+            if configurable_container(requested_slot) && read_u64_at(&request, 24) <= 1 =>
+        {
+            update_container_flag(
+                requested_slot.unwrap_or(0),
+                control_abi::DOMAIN_CONFIG_PRIVILEGED,
+                read_u64_at(&request, 24) == 1,
+            )
+        }
         control_abi::DOMAIN_SET_IMAGE
             if configurable_container(requested_slot)
                 && valid_container_image(container_request_image(&request)) =>
@@ -55621,6 +55827,17 @@ fn update_container_flag(slot: usize, flag: u16, enabled: bool) -> u64 {
     update_container_configuration(slot, 0)
 }
 
+/// The domain in `slot` was configured with `privileged=true`; read only
+/// by `linux_user::domain_privileged`.
+pub(crate) fn container_privileged(slot: usize) -> bool {
+    X86_RUNTIME
+        .CONTAINER_CONFIG_FLAGS
+        .get(slot)
+        .is_some_and(|flags| {
+            flags.load(Ordering::Acquire) & control_abi::DOMAIN_CONFIG_PRIVILEGED != 0
+        })
+}
+
 /// The domain in `slot` was configured with `user-switching=true`; read
 /// only by `linux_user::user_switching_allowed`.
 pub(crate) fn container_user_switching(slot: usize) -> bool {
@@ -55630,6 +55847,59 @@ pub(crate) fn container_user_switching(slot: usize) -> bool {
         .is_some_and(|flags| {
             flags.load(Ordering::Acquire) & control_abi::DOMAIN_CONFIG_USER_SWITCHING != 0
         })
+}
+
+/// The single gate on memory both writable and executable: the current
+/// process's domain was configured with `write-execute=true`. mmap and
+/// mprotect ask here and nowhere else. Even then no page is writable and
+/// executable at once (`linux_flip_write_execute_page`).
+fn linux_write_execute_allowed() -> bool {
+    current_container_slot().is_some_and(|slot| {
+        X86_RUNTIME
+            .CONTAINER_CONFIG_FLAGS
+            .get(slot)
+            .is_some_and(|flags| {
+                flags.load(Ordering::Acquire) & control_abi::DOMAIN_CONFIG_WRITE_EXECUTE != 0
+            })
+    })
+}
+
+/// Whether the current process's memory area at `address` is both
+/// writable and executable (mapped so in a `write-execute=true` domain).
+fn linux_write_execute_area(address: u64) -> bool {
+    crate::sync::rank_available(crate::sync::LockRank::MEMORY_AREAS)
+        && crate::linux_areas::protection_at(
+            linux_execution_instance(),
+            current_linux_process_pid(),
+            address,
+        )
+        .is_some_and(|protection| protection.bits() & 6 == 6)
+}
+
+/// A fault on a page of a writable and executable area: the page is
+/// writable or executable, never both, and flips to whichever the
+/// faulting access needs (a JIT writes code, then runs it). Making it
+/// writable copies a page another process shares, as mprotect does.
+fn linux_flip_write_execute_page(fault: domain::FaultMetadata) -> bool {
+    let (write, fetch) = (fault.error & 2 != 0, fault.error & 16 != 0);
+    if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
+        || fault.vector != 14
+        || fault.address >= 1 << 47
+        || write == fetch
+    {
+        return false;
+    }
+    let page_address = fault.address & !(PAGE_SIZE as u64 - 1);
+    let page = address_space::current_linux_runtime_page(page_address);
+    let wanted = if fetch {
+        LINUX_PROT_READ | LINUX_PROT_EXEC
+    } else {
+        LINUX_PROT_READ | LINUX_PROT_WRITE
+    };
+    page.occupied
+        && u64::from(page.protection) != wanted
+        && linux_write_execute_area(page_address)
+        && linux_runtime_mprotect(page_address, PAGE_SIZE as u64, wanted) == 0
 }
 
 fn write_container_request(
@@ -55964,7 +56234,8 @@ fn handle_user_fault(frame: *mut UserFaultFrame) -> u64 {
         && X86_RUNTIME.ELF_PROBE_ACTIVE.load(Ordering::SeqCst)
         && (materialize_linux_runtime_mapping(fault_metadata)
             || materialize_linux_runtime_stack_page(fault_metadata)
-            || grow_linux_runtime_stack(fault_metadata))
+            || grow_linux_runtime_stack(fault_metadata)
+            || linux_flip_write_execute_page(fault_metadata))
     {
         return 0;
     }

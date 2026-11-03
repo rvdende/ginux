@@ -206,13 +206,20 @@ pub mod capability {
     pub const NET_ADMIN: u32 = 12;
     pub const NET_RAW: u32 = 13;
     pub const IPC_LOCK: u32 = 14;
+    pub const SYS_MODULE: u32 = 16;
+    pub const SYS_RAWIO: u32 = 17;
     pub const SYS_CHROOT: u32 = 18;
+    pub const SYS_PTRACE: u32 = 19;
+    pub const SYS_PACCT: u32 = 20;
     pub const SYS_ADMIN: u32 = 21;
+    pub const SYS_BOOT: u32 = 22;
     pub const SYS_NICE: u32 = 23;
     pub const SYS_RESOURCE: u32 = 24;
     pub const SYS_TIME: u32 = 25;
+    pub const SYS_TTY_CONFIG: u32 = 26;
     pub const MKNOD: u32 = 27;
     pub const MAC_OVERRIDE: u32 = 33;
+    pub const SYSLOG: u32 = 34;
     /// The highest capability Linux defines (CAP_CHECKPOINT_RESTORE).
     pub const LAST: u32 = 40;
     /// Every capability.

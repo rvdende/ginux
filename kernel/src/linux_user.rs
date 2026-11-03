@@ -401,10 +401,29 @@ pub(crate) fn setgroups_file(handle: UserNamespaceHandle) -> &'static [u8] {
     }
 }
 
+/// The single gate on machine-level authority: the domain was configured
+/// with `privileged=true`. Its root, in the domain's own user namespace
+/// (not one made inside it), may then use every privileged operation but
+/// raw I/O ports, which would reach around the drivers' isolation; reboot
+/// resets the machine and syslog reads its kernel log.
+pub(crate) fn domain_privileged(handle: UserNamespaceHandle) -> bool {
+    handle.owner_domain != 0
+        && domain::container_slot_for_domain(handle.owner_domain)
+            .is_some_and(cpu::container_privileged)
+}
+
 pub(crate) fn privileged_operation_denied(
     handle: UserNamespaceHandle,
     operation: PrivilegedOperation,
 ) -> bool {
+    if operation != PrivilegedOperation::RawIo
+        && domain_privileged(handle)
+        && live_table_for_handle(handle)
+            .and_then(|table| table.namespace(handle))
+            .is_some_and(|namespace| namespace.parent.is_none())
+    {
+        return false;
+    }
     // A domain's root user may administer only that domain's mount namespace.
     // The syscall implementation independently requires a live domain context,
     // so this authority can never mutate the control domain or another domain.

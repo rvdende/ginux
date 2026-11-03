@@ -15,7 +15,8 @@ use ginux_native_abi::{
     NATIVE_CONTROL_DISCOVERY_OPERATION, NATIVE_CONTROL_MAX_BUFFERED_CONSOLE_BYTES,
     NATIVE_DOMAIN_ATTACH, NATIVE_DOMAIN_CONFIG_AUTOSTART, NATIVE_DOMAIN_CONFIG_CPU,
     NATIVE_DOMAIN_CONFIG_IMAGE, NATIVE_DOMAIN_CONFIG_INIT, NATIVE_DOMAIN_CONFIG_MEMORY,
-    NATIVE_DOMAIN_CONFIG_PERSONALITY, NATIVE_DOMAIN_CONFIG_USER_SWITCHING,
+    NATIVE_DOMAIN_CONFIG_PERSONALITY, NATIVE_DOMAIN_CONFIG_PRIVILEGED,
+    NATIVE_DOMAIN_CONFIG_USER_SWITCHING, NATIVE_DOMAIN_CONFIG_WRITE_EXECUTE,
     NATIVE_DOMAIN_CONTROL_OPERATION, NATIVE_DOMAIN_CREATE, NATIVE_DOMAIN_CURSOR_END,
     NATIVE_DOMAIN_EXEC, NATIVE_DOMAIN_EXEC_INTERACTIVE, NATIVE_DOMAIN_EXEC_MAX_ARGUMENTS,
     NATIVE_DOMAIN_HOST_SHUTDOWN, NATIVE_DOMAIN_INJECT_FAILURE, NATIVE_DOMAIN_LIMIT,
@@ -24,7 +25,8 @@ use ginux_native_abi::{
     NATIVE_DOMAIN_RUNTIME_ROOTFS_READY, NATIVE_DOMAIN_RUNTIME_SUSPENDED,
     NATIVE_DOMAIN_SET_AUTOSTART, NATIVE_DOMAIN_SET_CPU, NATIVE_DOMAIN_SET_IMAGE,
     NATIVE_DOMAIN_SET_INIT, NATIVE_DOMAIN_SET_MEMORY_MIB, NATIVE_DOMAIN_SET_PERSONALITY,
-    NATIVE_DOMAIN_SET_USER_SWITCHING, NATIVE_DOMAIN_START_ATTACHED, NATIVE_DOMAIN_STATE_BOOTING,
+    NATIVE_DOMAIN_SET_PRIVILEGED, NATIVE_DOMAIN_SET_USER_SWITCHING,
+    NATIVE_DOMAIN_SET_WRITE_EXECUTE, NATIVE_DOMAIN_START_ATTACHED, NATIVE_DOMAIN_STATE_BOOTING,
     NATIVE_DOMAIN_STATE_CONFIGURED, NATIVE_DOMAIN_STATE_CREATED, NATIVE_DOMAIN_STATE_FAILED,
     NATIVE_DOMAIN_STATE_RUNNING, NATIVE_DOMAIN_STATE_STARTING, NATIVE_DOMAIN_STATE_STOPPED,
     NATIVE_DOMAIN_STOP, NATIVE_HOST_INSPECT_OPERATION, NATIVE_HOST_INSPECT_RECORD_SIZE,
@@ -1762,6 +1764,24 @@ fn show_domain_status(console: u64, host: u64, state: u64, request: &NativeDomai
             b"false"
         },
     );
+    write(console, b"\r\nWrite+exec:  ");
+    write(
+        console,
+        if configured(NATIVE_DOMAIN_CONFIG_WRITE_EXECUTE) {
+            b"true"
+        } else {
+            b"false"
+        },
+    );
+    write(console, b"\r\nPrivileged:  ");
+    write(
+        console,
+        if configured(NATIVE_DOMAIN_CONFIG_PRIVILEGED) {
+            b"true"
+        } else {
+            b"false"
+        },
+    );
     write(console, b"\r\nNetworks:    ");
     let mut networks = OutputLine::new();
     append_domain_networks(&mut networks, host, request_name(request));
@@ -2163,6 +2183,24 @@ fn prepare_setting(
             Some((
                 NATIVE_DOMAIN_CONFIG_USER_SWITCHING,
                 NATIVE_DOMAIN_SET_USER_SWITCHING,
+            ))
+        }
+        // Lets programs map memory both writable and executable (JIT
+        // compilers); off by default.
+        (b"write-execute", value @ (b"true" | b"false")) => {
+            request.value = u64::from(value == b"true");
+            Some((
+                NATIVE_DOMAIN_CONFIG_WRITE_EXECUTE,
+                NATIVE_DOMAIN_SET_WRITE_EXECUTE,
+            ))
+        }
+        // Gives root in the domain machine-level authority (reboot resets
+        // the machine, syslog reads its kernel log); off by default.
+        (b"privileged", value @ (b"true" | b"false")) => {
+            request.value = u64::from(value == b"true");
+            Some((
+                NATIVE_DOMAIN_CONFIG_PRIVILEGED,
+                NATIVE_DOMAIN_SET_PRIVILEGED,
             ))
         }
         (b"image", value) if value.iter().all(|byte| byte.is_ascii_graphic()) => {

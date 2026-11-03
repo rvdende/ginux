@@ -25,7 +25,6 @@ clone10 TBROK
 clone301 TBROK
 connect03 TFAIL
 creat07 TFAIL
-delete_module02 TFAIL
 epoll_wait05 TFAIL
 epoll_wait06 TFAIL
 epoll_wait10 TFAIL
@@ -117,7 +116,6 @@ openat03 TBROK
 openat202 TFAIL
 open_by_handle_at01 TFAIL
 open_by_handle_at02 TFAIL
-mincore02 TBROK
 madvise11 TBROK
 pathconf02 TFAIL
 pidfd_send_signal01 TFAIL
@@ -140,8 +138,6 @@ ptrace10 TBROK
 ptrace11 TBROK
 readlinkat01 TBROK
 realpath01 TBROK
-reboot01 TFAIL
-reboot02 TFAIL
 recvmmsg01 TBROK
 remap_file_pages01 TBROK
 rt_sigaction01 TBROK
@@ -163,15 +159,12 @@ splice06 TBROK
 splice09 TFAIL
 statmount03 TBROK
 statmount08 TBROK
-syslog11 TBROK
-syslog12 TFAIL
 times03 TFAIL
 unshare03 TFAIL
 unshare05 TBROK
 userfaultfd03 TBROK
 ustat01 TFAIL
 ustat02 TFAIL
-vhangup02 TFAIL
 waitpid01 TFAIL
 waitid10 TBROK
 perf_event_open02 TBROK

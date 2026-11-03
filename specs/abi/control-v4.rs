@@ -34,6 +34,8 @@ pub const DOMAIN_SET_PERSONALITY: u64 = 13;
 pub const DOMAIN_POLL_BACKGROUND: u64 = 14;
 pub const DOMAIN_EXEC: u64 = 15;
 pub const DOMAIN_SET_USER_SWITCHING: u64 = 16;
+pub const DOMAIN_SET_WRITE_EXECUTE: u64 = 17;
+pub const DOMAIN_SET_PRIVILEGED: u64 = 18;
 pub const DOMAIN_EXEC_REQUEST_SIZE: usize = 40;
 pub const DOMAIN_EXEC_REQUEST_VERSION: u16 = 0;
 pub const DOMAIN_EXEC_INTERACTIVE: u16 = 1 << 0;
@@ -55,6 +57,16 @@ pub const DOMAIN_CONFIG_PERSONALITY: u16 = 1 << 5;
 /// Root in the domain may switch to other user and group ids (setuid and
 /// relatives); off by default, so every process in a domain stays root.
 pub const DOMAIN_CONFIG_USER_SWITCHING: u16 = 1 << 6;
+/// Programs in the domain may map memory both writable and executable
+/// (JIT compilers); off by default. Each page is still never both at
+/// once: it flips between writable and executable on the access that
+/// needs the other.
+pub const DOMAIN_CONFIG_WRITE_EXECUTE: u16 = 1 << 7;
+/// Root in the domain holds machine-level authority: reboot(2) resets the
+/// machine, syslog(2) reads the machine's kernel log, and the other
+/// privileged system calls work, except raw I/O port access; off by
+/// default. Only for domains trusted with the whole machine.
+pub const DOMAIN_CONFIG_PRIVILEGED: u16 = 1 << 8;
 pub const DOMAIN_CONFIG_COMPLETE: u16 = DOMAIN_CONFIG_INIT
     | DOMAIN_CONFIG_CPU
     | DOMAIN_CONFIG_MEMORY

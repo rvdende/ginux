@@ -17,6 +17,7 @@ mod heap;
 mod image_store;
 mod initramfs;
 mod ipc;
+mod kernel_log;
 mod linux_aio;
 mod linux_areas;
 mod linux_drm;
@@ -39,6 +40,7 @@ mod linux_strace;
 mod linux_sysv_ipc;
 mod linux_tmpfs;
 mod linux_user;
+mod machine_control;
 mod manifest;
 mod memory;
 mod native_elf;
@@ -91,7 +93,6 @@ pub(crate) fn kernel_image_range() -> (u64, u64) {
         HOST_CONTROL.kernel_image_size.load(Ordering::Relaxed),
     )
 }
-const EFI_RESET_SHUTDOWN: u32 = 2;
 const EFI_SUCCESS: usize = 0;
 pub(crate) const EFI_LOADER_CODE: u32 = 1;
 const EFI_LOADER_DATA: u32 = 2;
@@ -4469,7 +4470,13 @@ unsafe extern "sysv64" fn kernel_main(boot_info: *const BootInfo) -> ! {
     serial_write("\r\nginux: controller requested clean shutdown");
     serial_write("\r\nGINUX_KERNEL_OK\r\n");
 
-    (boot_info.reset_system)(EFI_RESET_SHUTDOWN, EFI_SUCCESS, 0, core::ptr::null());
+    // A privileged domain's reboot(2) may have asked for a cold reset.
+    (boot_info.reset_system)(
+        machine_control::reset_kind(),
+        EFI_SUCCESS,
+        0,
+        core::ptr::null(),
+    );
     kernel_fail("ginux: firmware shutdown returned unexpectedly\r\n");
 }
 
@@ -4680,6 +4687,7 @@ fn serial_write(message: &str) {
 }
 
 pub(crate) fn serial_write_bytes(bytes: &[u8]) {
+    kernel_log::record(bytes);
     if !cfg!(feature = "verification-boot")
         && !HOST_CONTROL.operator_console_ready.load(Ordering::Acquire)
     {

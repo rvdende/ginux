@@ -623,3 +623,9 @@ interior-mutable	kernel/src/cpu_time.rs	RUNS	per-cpu-arch	allowlist	none	atomic-
 interior-mutable	kernel/src/arch/x86_64/cpu/architecture.rs	CPU_INDEX_SOURCE	bootstrap-init	allowlist	none	atomic-boot-selected-cpu-index-source
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_SYSCTL_OVERRIDES	domain-runtime	allowlist	none	kernel-entry-serialized-domain-sysctls
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_REALTIME_OFFSET_NANOSECONDS	domain-runtime	allowlist	none	kernel-entry-serialized-domain-clock
+interior-mutable	kernel/src/kernel_log.rs	RING	platform-device	allowlist	none	lock-free-kernel-log-ring
+interior-mutable	kernel/src/kernel_log.rs	WRITTEN	platform-device	allowlist	none	lock-free-kernel-log-ring
+interior-mutable	kernel/src/kernel_log.rs	CLEARED	platform-device	allowlist	none	lock-free-kernel-log-ring
+interior-mutable	kernel/src/kernel_log.rs	CONSUMED	platform-device	allowlist	none	lock-free-kernel-log-ring
+interior-mutable	kernel/src/machine_control.rs	RESET_KIND	platform-device	allowlist	none	privileged-domain-machine-control
+interior-mutable	kernel/src/machine_control.rs	CTRL_ALT_DEL	platform-device	allowlist	none	privileged-domain-machine-control
