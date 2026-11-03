@@ -15,6 +15,7 @@
 //! 6. `exit`: the main thread exits (status 7) while others spin on other
 //!    CPUs, which must end them;
 //! 7. `segv`: a thread faults while others spin; the process dies (139).
+//!    Steps 6 and 7 run `EXIT_ROUNDS` times.
 //!
 //! Every wait fails at once on a kernel failure line, a wrong status, or a
 //! step that does not finish within its budget.
@@ -69,6 +70,9 @@ impl Shell {
     }
 }
 
+/// Rounds of the `exit` and `segv` steps.
+const EXIT_ROUNDS: u32 = 5;
+
 #[test]
 fn multithread() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -113,8 +117,13 @@ fn multithread() {
     shell.expect("SLEEP", "ginux-threadtest sleep", 0, Some("THREADTEST OK sleep"));
     shell.expect("QUEUE", "ginux-threadtest queue", 0, Some("THREADTEST OK queue"));
     shell.expect("SPAWN", "ginux-threadtest spawn 10", 0, Some("THREADTEST OK spawn"));
-    shell.expect("EXIT", "ginux-threadtest exit", 7, Some("THREADTEST OK exit"));
-    shell.expect("SEGV", "ginux-threadtest segv", 139, None);
+    // A few rounds: the process ends while its threads run elsewhere, and
+    // the race that lets one of them outlive its memory takes a few tries
+    // to show on a quiet host.
+    for round in 0..EXIT_ROUNDS {
+        shell.expect(&format!("EXIT{round}"), "ginux-threadtest exit", 7, Some("THREADTEST OK exit"));
+        shell.expect(&format!("SEGV{round}"), "ginux-threadtest segv", 139, None);
+    }
     // The shell still works after all that.
     shell.expect("AFTER", "echo still''alive", 0, Some("stillalive"));
 }

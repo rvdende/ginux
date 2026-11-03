@@ -423,7 +423,11 @@ record (the owner on its way out, or the last light thread,
 thread slot, preemption) stays in the CPU's own bank (`ThreadCpuAtomicU8`).
 A process's exit waits for its threads on other CPUs to leave
 (`LINUX_BANK_DYING`, `wait_for_linux_process_threads_to_leave`) before its
-memory goes. SysRq `u` lists the banks and the light-path counters.
+memory goes, on every path that settles an exit: the scheduler's, and a
+fork transaction whose child, run first, exited (it once took the exit
+before the save that waits, so the threads ran on in freed memory and their
+CPU triple-faulted at its next interrupt). SysRq `u` lists the banks and
+the light-path counters.
 
 The futex coordinator spinning (`linux_remote_futex_wait_fast`) and the
 thread-by-interrupt dispatch (`begin_linux_runtime_thread`) that preceded

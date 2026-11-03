@@ -1759,15 +1759,26 @@ fn linux_bank_shared() -> bool {
 /// Before the state of exiting process `pid` goes: its threads running on
 /// other CPUs leave them, told to by `LINUX_BANK_DYING` (their next system
 /// call or timer tick), while this CPU waits with the kernel-entry lock let
-/// go.
+/// go. The bank is the process's live one, whether or not this CPU uses it
+/// (init ending a killed process from its own bank): a CPU left running one
+/// of the threads would go on in the freed memory, and its root, once
+/// freed, maps no kernel either (a triple fault at its next interrupt).
 fn wait_for_linux_process_threads_to_leave(pid: u32) {
-    let bank = linux_cpu_bank();
-    if !linux_bank_holds(bank, pid, linux_execution_instance()) || !linux_bank_shared() {
+    let instance = linux_execution_instance();
+    let Some(bank) = linux_live_process_bank(pid, instance) else {
+        return;
+    };
+    // This CPU's own use of the bank stays until it leaves it.
+    let here = u8::from(linux_cpu_bank() == bank);
+    if LINUX_BANK_USERS[bank].load(Ordering::Acquire) <= here {
         return;
     }
     LINUX_BANK_DYING[bank].store(true, Ordering::Release);
     let started = timer::timestamp_counter();
-    while LINUX_BANK_USERS[bank].load(Ordering::Acquire) > 1 {
+    // The last thread out frees a bank this CPU is not in.
+    while LINUX_BANK_USERS[bank].load(Ordering::Acquire) > here
+        && linux_bank_holds(bank, pid, instance)
+    {
         crate::sync::kernel_entry_leave_to_user();
         core::hint::spin_loop();
         crate::sync::kernel_entry_return_from_user();
@@ -2952,6 +2963,9 @@ fn run_linux_process_on_this_cpu(pid: u32) -> bool {
 /// parent gets SIGCHLD and a zombie to reap, and everything it held goes.
 /// The CPU is left with no process.
 fn settle_linux_process_exit(pid: u32, status: u8) -> bool {
+    // The save before made them leave; nothing of the process may still
+    // run anywhere once its memory goes.
+    wait_for_linux_process_threads_to_leave(pid);
     let process_slot = linux_process::live_process_slot(pid);
     let parent = linux_process::live_process_parent_pid(pid);
     let signals_cleared = process_slot
@@ -6957,6 +6971,13 @@ fn execute_deferred_live_fork() -> bool {
     }
     linux_boot_profile_lifecycle_phase(1, profile_run_started);
     let profile_state_started = cfg!(feature = "linux-boot-profile").then(timer::timestamp_counter);
+    // The child's threads on other CPUs leave before this CPU leaves its
+    // bank for the parent's: the save cannot tell the child exited, its
+    // exit was taken just above, and threads left running would go on in
+    // its memory once the exit below frees it.
+    if child_exited {
+        wait_for_linux_process_threads_to_leave(child.pid);
+    }
     save_current_linux_process_runtime_state(child.pid);
     if !save_linux_process_extended_state(child.pid) {
         return false;
@@ -14982,6 +15003,7 @@ fn linux_init_exit_kill_others_live_return(
         // The scheduler keeps failing to switch to the killed processes, so
         // they cannot run their own exits; end them from here.
         for pid in living.0[..living.1].iter().copied() {
+            wait_for_linux_process_threads_to_leave(pid);
             if linux_process::force_exit_live_process(pid, 128 + LINUX_SIGKILL as u8) {
                 retire_linux_process_record(pid);
                 let _ = linux_process::release_live_process_runtime_slot(pid);
