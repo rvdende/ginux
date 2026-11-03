@@ -13471,6 +13471,18 @@ fn linux_generic_ioctl(descriptor: u64, request: u64, argument: u64) -> Option<u
     if let Some(result) = linux_socket_ioctl(descriptor, request, argument) {
         return Some(result);
     }
+    // RNDGETENTCNT on /dev/random and /dev/urandom: the pool is always
+    // full (Linux reports 256 since 5.18), as entropy_avail says.
+    const RNDGETENTCNT: u64 = 0x8004_5200;
+    if u64::from(request as u32) == RNDGETENTCNT
+        && linux_device_descriptor(descriptor) & !3 == LINUX_DEVICE_RANDOM
+    {
+        return Some(if copy_to_linux_user(argument, &256_i32.to_ne_bytes()) {
+            0
+        } else {
+            LINUX_EFAULT
+        });
+    }
     match u64::from(request as u32) {
         LINUX_FIOCLEX => Some(linux_descriptor_fcntl(
             descriptor,
@@ -25788,13 +25800,18 @@ fn linux_runtime_mmap(
                 });
             let install_started =
                 cfg!(feature = "linux-boot-profile").then(timer::timestamp_counter);
+            // A PROT_NONE page is installed readable, then made inaccessible.
             let installed_page = address_space::install_current_linux_runtime_page(
                 page_address,
                 frame,
-                protection as u8,
+                (protection as u8).max(1),
                 file_backed,
                 replace,
-            );
+            )
+            .filter(|_| {
+                protection != 0
+                    || address_space::protect_current_linux_runtime_page(page_address, 0)
+            });
             linux_boot_profile_lifecycle_phase(14, install_started);
             match installed_page {
                 Some(old) => Some(old),
@@ -25888,10 +25905,12 @@ fn linux_map_shared_memfd(
                 return LINUX_ENOMEM;
             }
         }
+        // A PROT_NONE page is installed readable, then made inaccessible.
         let installed = crate::linux_overlay::memfd_frame(handle, start / PAGE_SIZE + page)
             .is_some_and(|frame| {
-                address_space::install_current_linux_shared_page(address, frame, protection)
-            });
+                address_space::install_current_linux_shared_page(address, frame, protection.max(1))
+            })
+            && (protection != 0 || address_space::protect_current_linux_runtime_page(address, 0));
         if !installed {
             let _ = rollback_linux_runtime_mapping(mapping, page);
             return LINUX_ENOMEM;
@@ -29252,6 +29271,7 @@ fn linux_proc_pid_file_kind(pid: u32, name: &[u8]) -> Option<u16> {
     match (pid, name) {
         (pid, b"fd") if pid == current_linux_process_pid() => Some(LINUX_PROC_FD_DIRECTORY),
         (_, b"cgroup") => Some(LINUX_FILE_PROC_CGROUP),
+        (_, b"coredump_filter") => Some(LINUX_FILE_PROC_COREDUMP_FILTER),
         (_, b"oom_score_adj") => Some(LINUX_FILE_PROC_OOM_SCORE_ADJ),
         (_, b"mounts") => Some(LINUX_FILE_PROC_MOUNTS),
         (1, b"cmdline") if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) => {
@@ -43145,14 +43165,14 @@ fn linux_epoll_event_from(
             continue;
         }
         let ready = linux_descriptor_poll_events(target as i32, requested)
-            & (LINUX_POLLIN | LINUX_POLLOUT | LINUX_POLLERR | LINUX_POLLHUP);
+            & (LINUX_POLLIN | LINUX_POLLOUT | LINUX_POLLERR | LINUX_POLLHUP | LINUX_POLLRDHUP);
         if stored & LINUX_EPOLLET != 0 {
             // Edge-triggered: report only readiness not reported since the
             // descriptor was last used (linux_epoll_rearm_for_syscall) or
-            // seen not ready.
+            // seen not ready. The record keeps the low five event bits.
             let reported = (stored & LINUX_EPOLL_REPORTED_MASK) >> LINUX_EPOLL_REPORTED_SHIFT;
             let now = (stored & !LINUX_EPOLL_REPORTED_MASK)
-                | (u32::from(ready) << LINUX_EPOLL_REPORTED_SHIFT);
+                | (u32::from(ready & 0x1f) << LINUX_EPOLL_REPORTED_SHIFT);
             if consume && now != stored {
                 X86_RUNTIME.ELF_PROBE_EPOLL_EVENTS[slot].store(now, Ordering::SeqCst);
             }
@@ -45162,7 +45182,12 @@ fn linux_descriptor_poll_events(descriptor: i32, requested: u16) -> u16 {
         } else {
             0
         }) | if error { LINUX_POLLERR } else { 0 }
-            | if hangup { LINUX_POLLHUP } else { 0 };
+            | if hangup { LINUX_POLLHUP } else { 0 }
+            | if requested & LINUX_POLLRDHUP != 0 && crate::linux_socket::read_hung_up(slot) {
+                LINUX_POLLRDHUP
+            } else {
+                0
+            };
     }
     let console = u16::from(linux_console_descriptor(descriptor));
     if console != 0 {
@@ -46535,6 +46560,7 @@ fn linux_proc_file(state: u16) -> bool {
             | LINUX_FILE_PROC_PID2_STAT
             | LINUX_FILE_PROC_PID2_STATM
             | LINUX_FILE_PROC_CGROUP
+            | LINUX_FILE_PROC_COREDUMP_FILTER
             | LINUX_FILE_PROC_PROCESS_CMDLINE
             | LINUX_FILE_PROC_PROCESS_ENVIRON
             | LINUX_FILE_PROC_FILE_MAX
@@ -46734,6 +46760,7 @@ fn linux_regular_file(state: u16) -> Option<&'static [u8]> {
         LINUX_FILE_PROC_CONFIG => return Some(&LINUX_PROC_CONFIG_GZ),
         LINUX_FILE_PROC_CMDLINE => return Some(LINUX_PROC_CMDLINE),
         LINUX_FILE_PROC_CGROUP => return Some(LINUX_PROC_CGROUP),
+        LINUX_FILE_PROC_COREDUMP_FILTER => return Some(b"00000000\n"),
         LINUX_FILE_PROC_PROCESS_CMDLINE => return Some(LINUX_PROC_PROCESS_CMDLINE),
         LINUX_FILE_PROC_PROCESS_ENVIRON => return Some(LINUX_PROC_PROCESS_ENVIRON),
         LINUX_FILE_PROC_FILE_MAX => return Some(LINUX_PROC_FILE_MAX),
@@ -46822,6 +46849,7 @@ fn linux_regular_file_inode(state: u16) -> Option<u64> {
         LINUX_FILE_PROC_PID2_STAT => return linux_process::live_process_status(2).map(|_| 34),
         LINUX_FILE_PROC_PID2_STATM => return linux_process::live_process_status(2).map(|_| 35),
         LINUX_FILE_PROC_CGROUP => return Some(37),
+        LINUX_FILE_PROC_COREDUMP_FILTER => return Some(98),
         LINUX_FILE_PROC_PROCESS_CMDLINE => return Some(40),
         LINUX_FILE_PROC_PROCESS_ENVIRON => return Some(41),
         LINUX_FILE_PROC_FILE_MAX => return Some(42),

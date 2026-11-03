@@ -1924,6 +1924,36 @@ impl Sockets {
         Ok((copied, payload.len(), Some(endpoint)))
     }
 
+    fn read_hung_up(&mut self, id: SlotId) -> bool {
+        let Some(state) = self.slot(id) else {
+            return false;
+        };
+        if state.read_shutdown {
+            return true;
+        }
+        if state.kind == Kind::Unix || state.peer.is_some() {
+            return state.unix_type != 2
+                && state.peer.is_some()
+                && state
+                    .peer
+                    .and_then(|peer| self.slot(peer))
+                    .is_none_or(|peer| peer.write_shutdown);
+        }
+        if state.kind != Kind::Tcp {
+            return false;
+        }
+        let (Some(runtime), Some(handle)) = (self.runtime.as_ref(), state.handle) else {
+            return false;
+        };
+        matches!(
+            runtime.sockets.get::<tcp::Socket>(handle).state(),
+            tcp::State::CloseWait
+                | tcp::State::LastAck
+                | tcp::State::Closing
+                | tcp::State::TimeWait
+        )
+    }
+
     fn readiness(&mut self, id: SlotId) -> Option<(bool, bool, bool)> {
         if let Some(state) = self.slot(id).filter(|state| state.kind == Kind::Netlink) {
             return Some((!state.netlink_messages.is_empty(), true, false));
@@ -2904,6 +2934,12 @@ fn report_timeout(operation: &str) {
 
 pub(crate) fn readiness(id: SlotId) -> Option<(bool, bool, bool)> {
     SOCKETS.lock().readiness(id)
+}
+
+/// Whether nothing more can arrive to read on socket `id` (POLLRDHUP): it
+/// was shut down for reading, or its peer shut down writing or went away.
+pub(crate) fn read_hung_up(id: SlotId) -> bool {
+    SOCKETS.lock().read_hung_up(id)
 }
 
 pub(crate) fn local_peer_write_closed(id: SlotId) -> Option<bool> {

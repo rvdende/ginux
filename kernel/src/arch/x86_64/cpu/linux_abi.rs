@@ -599,6 +599,8 @@ pub(super) const LINUX_POLLIN: u16 = 1;
 pub(super) const LINUX_POLLOUT: u16 = 4;
 pub(super) const LINUX_POLLERR: u16 = 8;
 pub(super) const LINUX_POLLHUP: u16 = 0x10;
+/// The peer shut down writing, or reading was shut down (EPOLLRDHUP).
+pub(super) const LINUX_POLLRDHUP: u16 = 0x2000;
 pub(super) const LINUX_POLLNVAL: u16 = 0x20;
 pub(super) const LINUX_EPOLL_CTL_ADD: u64 = 1;
 pub(super) const LINUX_EPOLL_CTL_DEL: u64 = 2;
@@ -724,7 +726,10 @@ pub(super) const LINUX_FILE_PROC_TASK_STAT: u16 = LINUX_FILE_MASK | LINUX_PROC_T
 /// file exists but cannot be written, and runs it when the file is absent.
 /// `/proc/sys/fs/aio-max-nr`: the most events one io_setup context may hold.
 pub(super) const LINUX_AIO_MAX_NR: u64 = 65_536;
-pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 34] = [
+pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 36] = [
+    // The random pool is always full, as Linux reports it since 5.18.
+    (0xac00, b"sys/kernel/random/entropy_avail", b"256\n"),
+    (0xad00, b"sys/kernel/random/poolsize", b"256\n"),
     // Core files are "core" in the dumping process's directory.
     (0xaa00, b"sys/kernel/core_pattern", b"core\n"),
     (0xab00, b"sys/kernel/core_uses_pid", b"0\n"),
@@ -865,6 +870,11 @@ pub(super) const LINUX_PROC_PID2_STAT_NODE: u16 = 0xef00;
 pub(super) const LINUX_FILE_PROC_PID2_STAT: u16 = LINUX_FILE_MASK | LINUX_PROC_PID2_STAT_NODE;
 pub(super) const LINUX_PROC_PID2_STATM_NODE: u16 = 0xee00;
 pub(super) const LINUX_FILE_PROC_PID2_STATM: u16 = LINUX_FILE_MASK | LINUX_PROC_PID2_STATM_NODE;
+/// /proc/PID/coredump_filter: which memory core files hold. Ginux's hold
+/// none (an ELF header and a process-information note), so it is 0.
+pub(super) const LINUX_PROC_COREDUMP_FILTER_NODE: u16 = 0xae00;
+pub(super) const LINUX_FILE_PROC_COREDUMP_FILTER: u16 =
+    LINUX_FILE_MASK | LINUX_PROC_COREDUMP_FILTER_NODE;
 pub(super) const LINUX_PROC_CGROUP_NODE: u16 = 0xec00;
 pub(super) const LINUX_FILE_PROC_CGROUP: u16 = LINUX_FILE_MASK | LINUX_PROC_CGROUP_NODE;
 pub(super) const LINUX_PROC_PROCESS_CMDLINE_NODE: u16 = 0xea00;
@@ -1109,7 +1119,7 @@ use super::PAGE_SIZE;
 /// The fixed file nodes and the `/proc/sys` nodes are distinct and clear of
 /// the `/dev/input/eventN` range, so no file is taken for another.
 const _: () = {
-    const NODES: [u16; 45] = [
+    const NODES: [u16; 46] = [
         LINUX_PROC_TASK_DIRECTORY_NODE,
         LINUX_PROC_TASK_COMM_NODE,
         LINUX_PROC_TASK_STAT_NODE,
@@ -1128,6 +1138,7 @@ const _: () = {
         LINUX_PROC_LOADAVG_NODE,
         LINUX_PROC_FILESYSTEMS_NODE,
         LINUX_PROC_CONFIG_NODE,
+        LINUX_PROC_COREDUMP_FILTER_NODE,
         LINUX_PROC_CMDLINE_NODE,
         LINUX_PROC_PID1_STAT_NODE,
         LINUX_PROC_PID1_STATM_NODE,
