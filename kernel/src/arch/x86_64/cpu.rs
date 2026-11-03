@@ -15598,7 +15598,17 @@ fn linux_waitid(id_type: u64, id: u64, information: u64, options: u64, rusage: u
             status,
             signal,
         } => {
-            if signal != 0 {
+            // Bit 7 of the signal marks a core dump (CLD_DUMPED).
+            const LINUX_CLD_DUMPED: i32 = 3;
+            if signal & 0x80 != 0 {
+                (
+                    pid,
+                    u32::from(signal & 0x7f),
+                    status,
+                    LINUX_CLD_DUMPED,
+                    true,
+                )
+            } else if signal != 0 {
                 (pid, u32::from(signal), status, LINUX_CLD_KILLED, true)
             } else {
                 (pid, u32::from(status), status, LINUX_CLD_EXITED, true)
@@ -49164,6 +49174,78 @@ fn linux_default_resource_limit(resource: u64, runtime: bool) -> Option<[u64; 2]
         _ => return None,
     };
     Some([value, value])
+}
+
+/// Writes a core file for the current process, ending by a core-dumping
+/// signal, when its RLIMIT_CORE allows: "core" in its working directory
+/// (core_pattern), a minimal ELF core with the process's NT_PRPSINFO note
+/// and no memory segments. Whether one was written, which the wait
+/// status reports (WCOREDUMP, CLD_DUMPED).
+fn linux_write_core_file() -> bool {
+    const RLIMIT_CORE: u64 = 4;
+    const O_WRONLY: u64 = 1;
+    const O_TRUNC: u64 = 0o1000;
+    const NOTE_SIZE: usize = 20 + 136;
+    const SIZE: usize = 64 + 56 + NOTE_SIZE;
+    let limit = linux_resource_limit_values(RLIMIT_CORE, true).map_or(0, |values| values[0]);
+    if limit < SIZE as u64 {
+        return false;
+    }
+    let pid = current_linux_process_pid();
+    let mut core = [0_u8; SIZE];
+    // ELF header: 64-bit, little-endian, ET_CORE for x86-64, one program
+    // header (PT_NOTE) right after it.
+    core[..7].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1]);
+    core[16..18].copy_from_slice(&4_u16.to_le_bytes());
+    core[18..20].copy_from_slice(&62_u16.to_le_bytes());
+    core[20..24].copy_from_slice(&1_u32.to_le_bytes());
+    core[32..40].copy_from_slice(&64_u64.to_le_bytes());
+    core[52..54].copy_from_slice(&64_u16.to_le_bytes());
+    core[54..56].copy_from_slice(&56_u16.to_le_bytes());
+    core[56..58].copy_from_slice(&1_u16.to_le_bytes());
+    core[58..60].copy_from_slice(&64_u16.to_le_bytes());
+    let header = 64;
+    core[header..header + 4].copy_from_slice(&4_u32.to_le_bytes());
+    core[header + 8..header + 16].copy_from_slice(&120_u64.to_le_bytes());
+    core[header + 32..header + 40].copy_from_slice(&(NOTE_SIZE as u64).to_le_bytes());
+    core[header + 48..header + 56].copy_from_slice(&4_u64.to_le_bytes());
+    // NT_PRPSINFO: name "CORE", then elf_prpsinfo.
+    let note = 120;
+    core[note..note + 4].copy_from_slice(&5_u32.to_le_bytes());
+    core[note + 4..note + 8].copy_from_slice(&136_u32.to_le_bytes());
+    core[note + 8..note + 12].copy_from_slice(&3_u32.to_le_bytes());
+    core[note + 12..note + 16].copy_from_slice(b"CORE");
+    let info = note + 20;
+    core[info] = b'R';
+    core[info + 1] = b'R';
+    if let Some(credentials) = current_linux_credentials() {
+        core[info + 16..info + 20].copy_from_slice(&credentials.user.real.to_le_bytes());
+        core[info + 20..info + 24].copy_from_slice(&credentials.group.real.to_le_bytes());
+    }
+    core[info + 24..info + 28].copy_from_slice(&pid.to_le_bytes());
+    let parent = linux_process::live_process_parent_pid(pid).unwrap_or(0);
+    core[info + 28..info + 32].copy_from_slice(&parent.to_le_bytes());
+    let mut name = [0_u8; 16];
+    let name = linux_process_name(pid, &mut name);
+    let length = name.len().min(15);
+    core[info + 40..info + 40 + length].copy_from_slice(&name[..length]);
+    core[info + 56..info + 56 + length].copy_from_slice(&name[..length]);
+    let mut path = [0_u8; LINUX_PATH_MAX];
+    path[..4].copy_from_slice(b"core");
+    let descriptor = linux_openat_path(
+        u64::from(LINUX_AT_FDCWD),
+        path,
+        4,
+        O_WRONLY | LINUX_O_CREAT | O_TRUNC,
+        0o600,
+    );
+    if descriptor > u64::MAX - 4096 {
+        return false;
+    }
+    let written = linux_overlay_descriptor_handle(descriptor)
+        .is_some_and(|handle| crate::linux_overlay::write(handle, 0, &core) == Some(SIZE));
+    let _ = linux_descriptor_close(descriptor);
+    written
 }
 
 fn linux_resource_limit_values(resource: u64, runtime: bool) -> Option<[u64; 2]> {

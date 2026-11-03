@@ -723,7 +723,10 @@ pub(super) const LINUX_FILE_PROC_TASK_STAT: u16 = LINUX_FILE_MASK | LINUX_PROC_T
 /// file exists but cannot be written, and runs it when the file is absent.
 /// `/proc/sys/fs/aio-max-nr`: the most events one io_setup context may hold.
 pub(super) const LINUX_AIO_MAX_NR: u64 = 65_536;
-pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 32] = [
+pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 34] = [
+    // Core files are "core" in the dumping process's directory.
+    (0xaa00, b"sys/kernel/core_pattern", b"core\n"),
+    (0xab00, b"sys/kernel/core_uses_pid", b"0\n"),
     // Console log levels (syslog's CONSOLE_LEVEL; syslog11 saves them).
     (0xa600, b"sys/kernel/printk", b"7\t4\t1\t7\n"),
     // System V IPC limits, Linux's defaults; tests read them to size runs.

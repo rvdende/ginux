@@ -194,6 +194,17 @@ pub(super) fn linux_rt_sigqueueinfo(
     let thread = thread.map(|thread| u64::from(thread as u32));
     let signal = u64::from(signal as u32);
     let current_process = u64::from(current_linux_process_pid());
+    // rt_sigqueueinfo's pid may be one of the caller's thread ids, which
+    // names the caller's process (rt_sigqueueinfo01).
+    let process = if thread.is_none()
+        && process != current_process
+        && linux_process::live_process_slot(process as u32).is_none()
+        && linux_tgkill_target(current_process, process).is_ok()
+    {
+        current_process
+    } else {
+        process
+    };
     let resolved_thread = if let Some(thread) = thread {
         match linux_tgkill_target(process, thread) {
             Ok(target) => Some(target),
@@ -1418,12 +1429,26 @@ pub(super) fn verify_linux_default_signal_dispositions() -> bool {
 }
 
 pub(super) fn linux_terminate_by_default_signal(signal: u64) -> u64 {
+    linux_terminate_by_signal(signal, true)
+}
+
+/// Ends the current process by `signal`, writing a core file for a
+/// core-dumping one when `may_dump` (not from a CPU fault's handler, which
+/// does not write files).
+fn linux_terminate_by_signal(signal: u64, may_dump: bool) -> u64 {
     if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) && current_linux_process_pid() != 1 {
         let pid = current_linux_process_pid();
         if !clear_current_linux_process_signal_queues() {
             return LINUX_EIO;
         }
-        let _ = linux_process::set_live_process_killed_by_signal(pid, signal.min(127) as u8);
+        // The signals whose default action dumps core do, when RLIMIT_CORE
+        // allows; bit 7 of the recorded signal says one was written.
+        let dumps_core = matches!(signal, 3..=8 | 11 | 24 | 25 | 31);
+        let dumped = dumps_core && may_dump && linux_write_core_file();
+        let _ = linux_process::set_live_process_killed_by_signal(
+            pid,
+            signal.min(127) as u8 | if dumped { 0x80 } else { 0 },
+        );
         X86_RUNTIME
             .LINUX_PROCESS_CHILD_STATUS
             .store((128 + signal.min(127)) as u8, Ordering::SeqCst);
@@ -1510,6 +1535,15 @@ pub(super) fn linux_signal_targets(
             targets[count] = pid;
             count += 1;
         }
+    }
+    // A thread id names its process, as Linux's find_vpid does: here, one
+    // of the caller's own threads.
+    if count == 0
+        && selector > 0
+        && linux_tgkill_target(u64::from(current), selector as u64).is_ok()
+    {
+        targets[0] = current;
+        count = 1;
     }
     (count != 0).then_some((targets, count)).ok_or(LINUX_ESRCH)
 }
@@ -2887,7 +2921,7 @@ pub(super) fn terminate_linux_process_for_fault(fault: domain::FaultMetadata) ->
         return false;
     }
     abort_linux_signal();
-    linux_terminate_by_default_signal(linux_fault_signal(fault.vector)) == LINUX_RETURN_TO_KERNEL
+    linux_terminate_by_signal(linux_fault_signal(fault.vector), false) == LINUX_RETURN_TO_KERNEL
 }
 
 /// Kills the faulting process with SIGKILL when a page it may touch could
