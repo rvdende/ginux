@@ -89,6 +89,7 @@ interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_ELF_PROBE_DEP
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_ELF_PROBE_DESCRIPTOR_OFFSETS	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_ELF_PROBE_DEVICE_DESCRIPTORS	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_ELF_PROBE_DUMPABLE	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
+interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_ELF_PROBE_TSC_SIGSEGV	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_ELF_PROBE_EPOLL_DATA	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_ELF_PROBE_EPOLL_DESCRIPTOR	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_ELF_PROBE_EPOLL_EVENTS	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
@@ -624,6 +625,9 @@ interior-mutable	kernel/src/cpu_time.rs	LOCK_WAIT	per-cpu-arch	allowlist	none	at
 interior-mutable	kernel/src/cpu_time.rs	USER_SINCE	per-cpu-arch	allowlist	none	atomic-per-cpu-time-accounting
 interior-mutable	kernel/src/cpu_time.rs	STARTED	per-cpu-arch	allowlist	none	atomic-per-cpu-time-accounting
 interior-mutable	kernel/src/cpu_time.rs	RUNS	per-cpu-arch	allowlist	none	atomic-per-cpu-time-accounting
+interior-mutable	kernel/src/cpu_time.rs	PROCESS_PID	per-cpu-arch	allowlist	none	atomic-per-cpu-time-accounting
+interior-mutable	kernel/src/cpu_time.rs	PROCESS_SINCE	per-cpu-arch	allowlist	none	atomic-per-cpu-time-accounting
+interior-mutable	kernel/src/cpu_time.rs	PROCESS_USER_SINCE	per-cpu-arch	allowlist	none	atomic-per-cpu-time-accounting
 interior-mutable	kernel/src/arch/x86_64/cpu/architecture.rs	CPU_INDEX_SOURCE	bootstrap-init	allowlist	none	atomic-boot-selected-cpu-index-source
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_SYSCTL_OVERRIDES	domain-runtime	allowlist	none	kernel-entry-serialized-domain-sysctls
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_REALTIME_OFFSET_NANOSECONDS	domain-runtime	allowlist	none	kernel-entry-serialized-domain-clock

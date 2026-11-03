@@ -1052,6 +1052,9 @@ pub(super) const LINUX_O_NONBLOCK: u64 = 0x800;
 pub(super) const LINUX_O_ACCMODE: u64 = 3;
 pub(super) const LINUX_PRIVATE_SECRET_DESCRIPTOR: u32 = 1 << 31;
 pub(super) const LINUX_PRIVATE_IO_URING_DESCRIPTOR: u32 = 1 << 29;
+/// An O_PATH | O_NOFOLLOW descriptor of a /proc fd entry: it names the
+/// entry (a magic link) rather than the file the entry leads to.
+pub(super) const LINUX_PRIVATE_PROC_LINK_DESCRIPTOR: u32 = 1 << 28;
 pub(super) const LINUX_O_LARGEFILE: u64 = 0x8000;
 pub(super) const LINUX_O_NOFOLLOW: u64 = 0x20000;
 pub(super) const LINUX_O_NOATIME: u64 = 0x40000;
@@ -1072,6 +1075,10 @@ pub(super) const LINUX_PR_GET_SECUREBITS: u64 = 27;
 pub(super) const LINUX_PR_SET_SECUREBITS: u64 = 28;
 pub(super) const LINUX_PR_SET_NO_NEW_PRIVS: u64 = 38;
 pub(super) const LINUX_PR_GET_NO_NEW_PRIVS: u64 = 39;
+pub(super) const LINUX_PR_GET_TSC: u64 = 25;
+pub(super) const LINUX_PR_SET_TSC: u64 = 26;
+pub(super) const LINUX_PR_TSC_ENABLE: u64 = 1;
+pub(super) const LINUX_PR_TSC_SIGSEGV: u64 = 2;
 pub(super) const LINUX_PR_SET_TIMERSLACK: u64 = 29;
 pub(super) const LINUX_PR_GET_TIMERSLACK: u64 = 30;
 pub(super) const LINUX_SECUREBITS_VALID_MASK: u32 = 0xff;

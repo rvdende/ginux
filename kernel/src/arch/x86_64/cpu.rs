@@ -126,6 +126,7 @@ const CR4_OSFXSR: u64 = 1 << 9;
 const CR4_OSXMMEXCPT: u64 = 1 << 10;
 const CR4_OSXSAVE: u64 = 1 << 18;
 const CR4_UMIP: u64 = 1 << 11;
+const CR4_TSD: u64 = 1 << 2;
 const CR4_SMEP: u64 = 1 << 20;
 const CR4_SMAP: u64 = 1 << 21;
 const EFER_MSR: u32 = 0xc000_0080;
@@ -258,6 +259,7 @@ struct X86RuntimeOwner {
     ELF_PROBE_DEVICE_DESCRIPTORS:
         RuntimeRef<CpuBankedAtomicArray<AtomicU16, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
     ELF_PROBE_DUMPABLE: RuntimeRef<CpuBankedAtomicBool>,
+    ELF_PROBE_TSC_SIGSEGV: RuntimeRef<CpuBankedAtomicBool>,
     ELF_PROBE_EPOLL_DATA:
         RuntimeRef<CpuBankedAtomicArray<AtomicU64, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>>,
     ELF_PROBE_EPOLL_DESCRIPTOR: RuntimeRef<CpuBankedAtomicU16>,
@@ -735,6 +737,7 @@ static X86_RUNTIME: X86RuntimeOwner = X86RuntimeOwner {
     ELF_PROBE_DESCRIPTOR_OFFSETS: RuntimeRef(&X86_RUNTIME_BACKING_ELF_PROBE_DESCRIPTOR_OFFSETS),
     ELF_PROBE_DEVICE_DESCRIPTORS: RuntimeRef(&X86_RUNTIME_BACKING_ELF_PROBE_DEVICE_DESCRIPTORS),
     ELF_PROBE_DUMPABLE: RuntimeRef(&X86_RUNTIME_BACKING_ELF_PROBE_DUMPABLE),
+    ELF_PROBE_TSC_SIGSEGV: RuntimeRef(&X86_RUNTIME_BACKING_ELF_PROBE_TSC_SIGSEGV),
     ELF_PROBE_EPOLL_DATA: RuntimeRef(&X86_RUNTIME_BACKING_ELF_PROBE_EPOLL_DATA),
     ELF_PROBE_EPOLL_DESCRIPTOR: RuntimeRef(&X86_RUNTIME_BACKING_ELF_PROBE_EPOLL_DESCRIPTOR),
     ELF_PROBE_EPOLL_EVENTS: RuntimeRef(&X86_RUNTIME_BACKING_ELF_PROBE_EPOLL_EVENTS),
@@ -2257,7 +2260,7 @@ fn run_linux_light_thread(cpu: usize, bank: usize, slot: usize) -> bool {
         .LINUX_CURRENT_THREAD_SLOT
         .store(LINUX_THREAD_SLOT_NONE, Ordering::SeqCst);
     LINUX_PROCESS_SLICE[cpu].store(0, Ordering::SeqCst);
-    linux_process::start_live_process_cpu(timer::timestamp_counter());
+    linux_process::start_live_process_cpu(pid, timer::timestamp_counter());
     linux_mark_thread_cpu();
     let ran = run_linux_light_thread_here(cpu, bank, pid, slot);
     linux_charge_thread_cpu(slot);
@@ -2265,7 +2268,7 @@ fn run_linux_light_thread(cpu: usize, bank: usize, slot: usize) -> bool {
         // Not run: left to the owner rather than tried again at once.
         X86_RUNTIME.LINUX_THREAD_OWNER_ONLY[slot].store(1, Ordering::SeqCst);
     }
-    linux_process::charge_live_process_cpu(pid, timer::timestamp_counter());
+    linux_process::charge_live_process_cpu(timer::timestamp_counter());
     LINUX_LIGHT_THREAD_BANK[cpu].store(LINUX_BANK_NONE, Ordering::Release);
     LINUX_LIGHT_THREAD_SLOT[cpu].store(LINUX_THREAD_SLOT_NONE, Ordering::Release);
     X86_RUNTIME
@@ -3774,6 +3777,10 @@ static X86_RUNTIME_BACKING_ELF_PROBE_PROCESS_NAME_LOW: CpuBankedAtomicU64 =
 static X86_RUNTIME_BACKING_ELF_PROBE_PROCESS_NAME_HIGH: CpuBankedAtomicU64 =
     CpuBankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_DUMPABLE: CpuBankedAtomicBool = CpuBankedAtomicBool::new(true);
+/// PR_SET_TSC's PR_TSC_SIGSEGV: rdtsc in the process's user mode faults
+/// (CR4.TSD while its code runs). Inherited across fork, kept across exec.
+static X86_RUNTIME_BACKING_ELF_PROBE_TSC_SIGSEGV: CpuBankedAtomicBool =
+    CpuBankedAtomicBool::new(false);
 static X86_RUNTIME_BACKING_ELF_PROBE_SECUREBITS: CpuBankedAtomicU32 = CpuBankedAtomicU32::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_PERSONALITY: CpuBankedAtomicU32 = CpuBankedAtomicU32::new(0);
 // Linux exposes nice values in the signed range -20..=19. Store nice + 20 so
@@ -4595,9 +4602,11 @@ pub(super) unsafe fn process_user_enter(
 ) {
     crate::sync::kernel_entry_leave_to_user();
     crate::cpu_time::leave_for_user();
+    set_user_time_stamp_access(linux_user_time_stamp_allowed());
     ginux_process_user_enter(entry, stack, general, rflags);
     // A return the entry stub refused (a non-canonical user address) comes
     // back here without passing the system call's lock re-entry.
+    set_user_time_stamp_access(true);
     crate::cpu_time::back_from_user();
     crate::sync::kernel_entry_return_from_user();
 }
@@ -4803,6 +4812,31 @@ pub(crate) fn enable_user_mode_instruction_prevention() -> bool {
         asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack, preserves_flags));
     }
     user_mode_instruction_prevention_enabled()
+}
+
+/// Lets this CPU's user mode read the timestamp counter, or makes rdtsc
+/// and rdtscp fault there (CR4.TSD) while a process that asked for that
+/// with PR_SET_TSC runs: set as the CPU leaves for such a process's user
+/// mode, cleared as it comes back, and written only when it changes.
+pub(super) fn set_user_time_stamp_access(allowed: bool) {
+    let mut cr4: u64;
+    unsafe {
+        asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+    }
+    if (cr4 & CR4_TSD == 0) == allowed {
+        return;
+    }
+    cr4 ^= CR4_TSD;
+    unsafe {
+        asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// Whether the Linux process this CPU is about to run in user mode may read
+/// the timestamp counter (PR_SET_TSC).
+pub(super) fn linux_user_time_stamp_allowed() -> bool {
+    !(X86_RUNTIME.ELF_PROBE_ACTIVE.load(Ordering::Relaxed)
+        && X86_RUNTIME.ELF_PROBE_TSC_SIGSEGV.load(Ordering::Relaxed))
 }
 
 pub(crate) fn user_mode_instruction_prevention_enabled() -> bool {
@@ -10761,6 +10795,9 @@ pub(crate) fn verify_linux_elf_entry(execution: &LinuxElfExecution<'_>) -> Linux
         .ELF_PROBE_PROCESS_NAME_HIGH
         .store(0, Ordering::SeqCst);
     X86_RUNTIME.ELF_PROBE_DUMPABLE.store(true, Ordering::SeqCst);
+    X86_RUNTIME
+        .ELF_PROBE_TSC_SIGSEGV
+        .store(false, Ordering::SeqCst);
     X86_RUNTIME.ELF_PROBE_SECUREBITS.store(0, Ordering::SeqCst);
     X86_RUNTIME.ELF_PROBE_PERSONALITY.store(0, Ordering::SeqCst);
     X86_RUNTIME.ELF_PROBE_NICE.store(20, Ordering::SeqCst);
@@ -17712,6 +17749,7 @@ struct LinuxProcessRuntimeState {
     rlimits: [u64; LINUX_RLIMIT_WORDS],
     process_name: [u64; 2],
     dumpable: bool,
+    tsc_sigsegv: bool,
     securebits: u32,
     personality: u32,
     nice: u8,
@@ -17762,6 +17800,7 @@ impl LinuxProcessRuntimeState {
         rlimits: [0; LINUX_RLIMIT_WORDS],
         process_name: [0; 2],
         dumpable: true,
+        tsc_sigsegv: false,
         securebits: 0,
         personality: 0,
         nice: 20,
@@ -18110,7 +18149,7 @@ fn save_current_linux_process_runtime_state(pid: u32) {
 
 fn save_current_linux_process_runtime_state_now(pid: u32) {
     let started = cfg!(feature = "linux-boot-profile").then(timer::timestamp_counter);
-    linux_process::charge_live_process_cpu(pid, timer::timestamp_counter());
+    linux_process::charge_live_process_cpu(timer::timestamp_counter());
     if let Some(slot) = current_linux_thread_slot() {
         linux_charge_thread_cpu(slot);
     }
@@ -18154,7 +18193,7 @@ fn restore_saved_linux_process_runtime_state_now(pid: u32) -> bool {
     let Some(attached) = attach_linux_process_bank(pid, true) else {
         return false;
     };
-    linux_process::start_live_process_cpu(timer::timestamp_counter());
+    linux_process::start_live_process_cpu(pid, timer::timestamp_counter());
     linux_mark_thread_cpu();
     if attached == BankAttach::Live {
         // Threads of the process run on other CPUs: the bank is its state,
@@ -18473,6 +18512,7 @@ fn capture_linux_process_runtime_state_for(thread_slot: u8) -> Option<LinuxProce
                 .load(Ordering::SeqCst),
         ],
         dumpable: X86_RUNTIME.ELF_PROBE_DUMPABLE.load(Ordering::SeqCst),
+        tsc_sigsegv: X86_RUNTIME.ELF_PROBE_TSC_SIGSEGV.load(Ordering::SeqCst),
         securebits: X86_RUNTIME.ELF_PROBE_SECUREBITS.load(Ordering::SeqCst),
         personality: X86_RUNTIME.ELF_PROBE_PERSONALITY.load(Ordering::SeqCst),
         nice: X86_RUNTIME.ELF_PROBE_NICE.load(Ordering::SeqCst),
@@ -18599,6 +18639,9 @@ fn restore_linux_process_runtime_state(state: &LinuxProcessRuntimeState) {
     X86_RUNTIME
         .ELF_PROBE_DUMPABLE
         .store(state.dumpable, Ordering::SeqCst);
+    X86_RUNTIME
+        .ELF_PROBE_TSC_SIGSEGV
+        .store(state.tsc_sigsegv, Ordering::SeqCst);
     X86_RUNTIME
         .ELF_PROBE_SECUREBITS
         .store(state.securebits, Ordering::SeqCst);
@@ -21337,18 +21380,29 @@ fn linux_lsm_set_self_attr(attribute: u64, _context: u64, _size: u64, flags: u64
     }
 }
 
-fn linux_lsm_list_modules(_identifiers: u64, size: u64, flags: u64) -> u64 {
+/// lsm_list_modules: the active security modules' ids. Ginux has the one
+/// every Linux has, the capability module (LSM_ID_CAPABILITY); `size`
+/// gets the bytes the list takes, and a smaller buffer is E2BIG.
+fn linux_lsm_list_modules(identifiers: u64, size: u64, flags: u64) -> u64 {
+    const LSM_ID_CAPABILITY: u64 = 100;
     let flags = u64::from(flags as u32);
     if flags != 0 {
         return LINUX_EINVAL;
     }
     let mut available = [0_u8; 4];
+    let total = size_of::<u64>() as u32;
     if !copy_from_linux_user(size, &mut available)
-        || !copy_to_linux_user(size, &0_u32.to_ne_bytes())
+        || !copy_to_linux_user(size, &total.to_ne_bytes())
     {
         return LINUX_EFAULT;
     }
-    0
+    if u32::from_ne_bytes(available) < total {
+        return LINUX_E2BIG;
+    }
+    if !copy_to_linux_user(identifiers, &LSM_ID_CAPABILITY.to_ne_bytes()) {
+        return LINUX_EFAULT;
+    }
+    1
 }
 
 fn linux_mount_id_request(address: u64) -> Result<(u64, u64), u64> {
@@ -24279,10 +24333,14 @@ fn verify_linux_aio_syscalls() -> bool {
         && linux_io_destroy(context) == 0;
     const UPPER_REGISTER_BITS: u64 = 1_u64 << 32;
     let lsm = copy_to_linux_user(mapping + 512, &8_u32.to_ne_bytes())
-        && linux_lsm_list_modules(mapping + 544, mapping + 512, UPPER_REGISTER_BITS) == 0
+        && linux_lsm_list_modules(mapping + 544, mapping + 512, UPPER_REGISTER_BITS) == 1
         && {
             let mut size = [1_u8; 4];
-            copy_from_linux_user(mapping + 512, &mut size) && u32::from_ne_bytes(size) == 0
+            let mut identifier = [0_u8; 8];
+            copy_from_linux_user(mapping + 512, &mut size)
+                && u32::from_ne_bytes(size) == 8
+                && copy_from_linux_user(mapping + 544, &mut identifier)
+                && u64::from_ne_bytes(identifier) == 100
         }
         && (100..=105).all(|attribute| {
             copy_to_linux_user(mapping + 512, &16_u32.to_ne_bytes())
@@ -27757,6 +27815,11 @@ fn linux_mprotect(address: u64, length: u64, protection: u64) -> u64 {
     {
         return linux_runtime_mprotect(address, length, protection);
     }
+    if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
+        if let Some(result) = linux_mprotect_image(address, length, protection) {
+            return result;
+        }
+    }
     let relro = X86_RUNTIME.ELF_PROBE_RELRO.load(Ordering::SeqCst);
     let relro_size = X86_RUNTIME.ELF_PROBE_RELRO_SIZE.load(Ordering::SeqCst);
     let relro_active_index = linux_active_image_writable_index(address);
@@ -27802,6 +27865,75 @@ fn linux_mprotect(address: u64, length: u64, protection: u64) -> u64 {
         }
     }
     linux_mprotect_mmap(address, length, protection)
+}
+
+/// mprotect of program-image pages (the data and bss of the program a
+/// process runs, below the runtime's mappings) between read-only and
+/// read-write (signal06 makes a static array read-only and writable again).
+/// The page tables, the process's image records and its registered mappings
+/// change together, so fork and exit, which check each against the others,
+/// see one protection. None when the range is not all such pages (code
+/// pages among them) or the protection is another, for the other paths.
+fn linux_mprotect_image(address: u64, length: u64, protection: u64) -> Option<u64> {
+    let writable = match protection {
+        LINUX_PROT_READ => false,
+        _ if protection == LINUX_PROT_READ | LINUX_PROT_WRITE => true,
+        _ => return None,
+    };
+    let count = usize::from(
+        X86_RUNTIME
+            .ELF_PROBE_ACTIVE_IMAGE_COUNT
+            .load(Ordering::SeqCst),
+    )
+    .min(LINUX_ACTIVE_IMAGE_MAPPING_LIMIT);
+    let end = address
+        .checked_add(length)?
+        .checked_next_multiple_of(PAGE_SIZE as u64)?;
+    let record = |page: u64| -> Option<(usize, memory::FrameLease)> {
+        let index = X86_RUNTIME.ELF_PROBE_ACTIVE_IMAGE_ADDRESSES[..count]
+            .iter()
+            .position(|candidate| candidate.load(Ordering::SeqCst) == page)?;
+        if X86_RUNTIME.ELF_PROBE_ACTIVE_IMAGE_FLAGS[index].load(Ordering::SeqCst) & 2 != 0 {
+            return None;
+        }
+        let frame = memory::FrameLease::from_parts(
+            X86_RUNTIME.ELF_PROBE_ACTIVE_IMAGE_FRAMES[index].load(Ordering::SeqCst),
+            X86_RUNTIME.ELF_PROBE_ACTIVE_IMAGE_GENERATIONS[index].load(Ordering::SeqCst),
+        )?;
+        (address_space::current_linux_mapping_frame_address(page) == Some(frame.address())
+            && address_space::current_linux_active_mapping(page)
+                .is_some_and(|mapping| !mapping.executable))
+        .then_some((index, frame))
+    };
+    if !(address..end)
+        .step_by(PAGE_SIZE)
+        .all(|page| record(page).is_some())
+    {
+        return None;
+    }
+    let pid = current_linux_process_pid();
+    for page in (address..end).step_by(PAGE_SIZE) {
+        let Some((index, frame)) = record(page) else {
+            return Some(LINUX_EINVAL);
+        };
+        if !address_space::set_current_linux_image_page_writable(page, frame, writable) {
+            return Some(LINUX_EINVAL);
+        }
+        X86_RUNTIME.ELF_PROBE_ACTIVE_IMAGE_FLAGS[index].store(u8::from(writable), Ordering::SeqCst);
+        // A registry without this page (or that cannot take the change)
+        // is read from the page tables instead.
+        if !linux_process::replace_live_process_mapping(
+            pid,
+            page as usize,
+            frame,
+            frame,
+            writable,
+            false,
+        ) {
+            let _ = linux_process::mark_live_process_address_space_stale(pid);
+        }
+    }
+    Some(0)
 }
 
 fn linux_mseal(address: u64, length: u64, flags: u64) -> u64 {
@@ -32760,6 +32892,11 @@ fn linux_overlay_file_open_for_write(generation: u32) -> bool {
 }
 
 fn linux_overlay_descriptor_handle(descriptor: u64) -> Option<crate::linux_overlay::Handle> {
+    // A /proc file's generation slot holds its own value (a pid, a
+    // descriptor, a mount-table change count), never an overlay node's.
+    if linux_proc_generation_kind(linux_device_descriptor(descriptor)) {
+        return None;
+    }
     let generation = if let Some(generation) = usize::try_from(descriptor)
         .ok()
         .and_then(|index| X86_RUNTIME.ELF_PROBE_STDIO_TMP_FILE_GENERATIONS.get(index))
@@ -33492,6 +33629,33 @@ fn linux_openat_path(
         if !linux_descriptor_open(descriptor) {
             return LINUX_ENOENT;
         }
+        // O_PATH | O_NOFOLLOW names the /proc fd entry itself, a link no
+        // file system mounts on: the descriptor opens the file it leads
+        // to, marked as that entry's (mount08).
+        let link_flags = LINUX_O_PATH | LINUX_O_NOFOLLOW;
+        if flags & link_flags == link_flags {
+            let opened = linux_openat_path(
+                directory,
+                path,
+                path_length,
+                flags & !LINUX_O_NOFOLLOW,
+                mode,
+            );
+            if opened < LINUX_RETURN_TO_KERNEL {
+                let flags = usize::try_from(opened)
+                    .ok()
+                    .and_then(|index| X86_RUNTIME.ELF_PROBE_STDIO_SOCKET_FLAGS.get(index))
+                    .or_else(|| {
+                        X86_RUNTIME
+                            .ELF_PROBE_SOCKET_FLAGS
+                            .get(linux_socket_descriptor_index(opened)?)
+                    });
+                if let Some(flags) = flags {
+                    flags.fetch_or(LINUX_PRIVATE_PROC_LINK_DESCRIPTOR, Ordering::SeqCst);
+                }
+            }
+            return opened;
+        }
         // A pipe end opens again as itself, with this open's flags. Linux
         // would also open the other end; opening a socket is ENXIO.
         if linux_pipe_descriptor(descriptor) {
@@ -33598,6 +33762,12 @@ fn linux_openat_path(
                 .filter(|rest| rest.ends_with(b"/stat"))
                 .and_then(linux_leading_decimal)
                 .unwrap_or(pid)
+        })
+        // A process's own directory keeps its pid too: Linux takes the
+        // descriptor as a pidfd (pidfd_send_signal01).
+        .or_else(|| match path {
+            b"/proc/self" | b"/proc/self/" => Some(current_linux_process_pid()),
+            _ => linux_proc_pid_directory(path, true),
         });
     let virtual_device =
         LinuxCharacterDevice::from_path(path).is_some() || linux_graphics_path_kind(path).is_some();
@@ -46483,15 +46653,24 @@ fn linux_pidfd_send_signal(
     interrupted: LinuxUserContext,
     return_registers: (u64, u64),
 ) -> u64 {
+    const SI_TKILL: i32 = -6;
     let signal = u64::from(signal as u32);
     let flags = u64::from(flags as u32);
     if flags != 0 {
         return LINUX_EINVAL;
     }
-    if !linux_pidfd_descriptor(descriptor) {
+    // A pidfd, or a process's /proc directory.
+    let process = if linux_pidfd_descriptor(descriptor) {
+        linux_pidfd_process(descriptor)
+    } else if matches!(
+        linux_device_descriptor(descriptor) & !3,
+        LINUX_PROC_PID1_DIRECTORY | LINUX_PROC_PID2_DIRECTORY
+    ) {
+        linux_proc_directory_descriptor_process(descriptor)
+    } else {
         return LINUX_EBADF;
-    }
-    let Some(process) = linux_pidfd_process(descriptor) else {
+    };
+    let Some(process) = process else {
         return LINUX_ESRCH;
     };
     let generated = if information == 0 {
@@ -46501,8 +46680,14 @@ fn linux_pidfd_send_signal(
         if !copy_from_linux_user(information, &mut bytes) {
             return LINUX_EFAULT;
         }
+        // The information names the signal sent (EINVAL otherwise); only
+        // a process signalling itself may pass a code the kernel's own
+        // signals use (si_code >= 0, or SI_TKILL).
+        if u64::from(u32::from_ne_bytes(bytes[..4].try_into().unwrap())) != signal {
+            return LINUX_EINVAL;
+        }
         let code = i32::from_ne_bytes(bytes[8..12].try_into().unwrap());
-        if code >= 0 {
+        if process != current_linux_process_pid() && (code >= 0 || code == SI_TKILL) {
             return LINUX_EPERM;
         }
         (
@@ -48253,6 +48438,45 @@ fn append_linux_hex(output: &mut [u8], used: &mut usize, value: u64) -> bool {
     }
     *used += digits;
     true
+}
+
+/// Whether descriptors of kind `state` keep a /proc value of their own in
+/// the generation slot open fills (`linux_openat_path`) instead of an
+/// overlay or tmpfs node's generation.
+fn linux_proc_generation_kind(state: u16) -> bool {
+    matches!(
+        state & !3,
+        LINUX_FILE_PROC_DYNAMIC_STAT
+            | LINUX_FILE_PROC_DYNAMIC_STATUS
+            | LINUX_FILE_PROC_DYNAMIC_STATM
+            | LINUX_FILE_PROC_DYNAMIC_MAPS
+            | LINUX_FILE_PROC_DYNAMIC_SMAPS
+            | LINUX_FILE_PROC_DYNAMIC_PAGEMAP
+            | LINUX_FILE_PROC_OOM_SCORE_ADJ
+            | LINUX_FILE_PROC_TASK_COMM
+            | LINUX_FILE_PROC_TASK_STAT
+            | LINUX_PROC_TASK_DIRECTORY
+            | LINUX_PROC_PID1_DIRECTORY
+            | LINUX_PROC_PID2_DIRECTORY
+            | LINUX_FILE_PROC_FDINFO
+            | LINUX_FILE_PROC_MOUNTS
+    )
+}
+
+/// The process whose /proc directory `descriptor` has open (`/proc/PID`
+/// or `/proc/self`), while that process lives: Linux's pidfd_send_signal
+/// takes such a descriptor as a pidfd.
+fn linux_proc_directory_descriptor_process(descriptor: u64) -> Option<u32> {
+    if !matches!(
+        linux_device_descriptor(descriptor) & !3,
+        LINUX_PROC_PID1_DIRECTORY | LINUX_PROC_PID2_DIRECTORY
+    ) {
+        return None;
+    }
+    let pid = linux_descriptor_tmp_generation(descriptor)?.checked_sub(1)?;
+    linux_process::live_process_status(pid)
+        .filter(|status| status.state != linux_process::LiveProcessState::Zombie)
+        .map(|_| pid)
 }
 
 fn linux_proc_dynamic_descriptor_pid(descriptor: u64) -> Option<u32> {
@@ -50241,7 +50465,9 @@ fn linux_descriptor_fcntl(descriptor: u64, command: u64, argument: u64) -> u64 {
             u64::from(access)
                 | u64::from(
                     linux_socket_flags(descriptor).unwrap_or(0)
-                        & !(LINUX_PRIVATE_SECRET_DESCRIPTOR | LINUX_PRIVATE_IO_URING_DESCRIPTOR),
+                        & !(LINUX_PRIVATE_SECRET_DESCRIPTOR
+                            | LINUX_PRIVATE_IO_URING_DESCRIPTOR
+                            | LINUX_PRIVATE_PROC_LINK_DESCRIPTOR),
                 )
         }
         LINUX_F_SETFL => {
@@ -53630,6 +53856,13 @@ fn linux_mount_filesystem(
     let target = if let Some(descriptor) =
         linux_descriptor_link_at(LINUX_AT_FDCWD.into(), &target[..target_length], true)
     {
+        // A descriptor of a /proc fd entry itself leads to that entry,
+        // which is no mount point (Linux's ENOENT).
+        if linux_socket_flags(descriptor)
+            .is_some_and(|flags| flags & LINUX_PRIVATE_PROC_LINK_DESCRIPTOR != 0)
+        {
+            return LINUX_ENOENT;
+        }
         let Some(length) = linux_descriptor_path(descriptor, &mut resolved_target) else {
             return LINUX_ENOENT;
         };
@@ -55592,6 +55825,25 @@ fn linux_prctl(option: u64, argument2: u64, argument3: u64, argument4: u64, argu
                 .drop_bounding(argument2.min(u64::from(u32::MAX)) as u32)
                 .map(|()| 0)
         }),
+        LINUX_PR_GET_TSC => {
+            let mode = if X86_RUNTIME.ELF_PROBE_TSC_SIGSEGV.load(Ordering::SeqCst) {
+                LINUX_PR_TSC_SIGSEGV
+            } else {
+                LINUX_PR_TSC_ENABLE
+            };
+            if copy_to_linux_user(argument2, &(mode as u32).to_ne_bytes()) {
+                0
+            } else {
+                LINUX_EFAULT
+            }
+        }
+        LINUX_PR_SET_TSC if matches!(argument2, LINUX_PR_TSC_ENABLE | LINUX_PR_TSC_SIGSEGV) => {
+            X86_RUNTIME
+                .ELF_PROBE_TSC_SIGSEGV
+                .store(argument2 == LINUX_PR_TSC_SIGSEGV, Ordering::SeqCst);
+            0
+        }
+        LINUX_PR_SET_TSC => LINUX_EINVAL,
         // The timer slack is kept per process for prctl to read back; the
         // timers themselves fire on the tick (prctl08).
         LINUX_PR_SET_TIMERSLACK => {
@@ -58942,6 +59194,7 @@ fn exit_result(caller_domain: u64, frame: *mut UserTrapFrame) -> u64 {
 }
 
 extern "sysv64" fn user_fault_handler(frame: *mut UserFaultFrame) -> u64 {
+    set_user_time_stamp_access(true);
     crate::cpu_time::back_from_user();
     crate::sync::kernel_entry_return_from_user();
     let result = crate::linux_profile::span(crate::linux_profile::Span::UserFault, || {
@@ -58951,6 +59204,7 @@ extern "sysv64" fn user_fault_handler(frame: *mut UserFaultFrame) -> u64 {
     if result != u64::MAX {
         crate::sync::kernel_entry_leave_to_user();
         crate::cpu_time::leave_for_user();
+        set_user_time_stamp_access(linux_user_time_stamp_allowed());
     }
     result
 }

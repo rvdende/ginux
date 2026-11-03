@@ -511,13 +511,37 @@ pub(super) fn linux_process_cpu_cycles(pid: u32) -> u64 {
 
 /// The CPU time process `pid` has used, in clock ticks (USER_HZ).
 pub(super) fn linux_process_cpu_ticks(pid: u32) -> u64 {
+    linux_cycles_to_clock_ticks(linux_process_cpu_cycles(pid))
+}
+
+/// The user and system time process `pid` has used, in timestamp-counter
+/// cycles.
+pub(super) fn linux_process_cpu_times(pid: u32) -> (u64, u64) {
+    linux_process::live_process_cpu_times(
+        pid,
+        pid == current_linux_process_pid(),
+        timer::timestamp_counter(),
+    )
+    .unwrap_or((0, 0))
+}
+
+/// `cycles` of the timestamp counter in clock ticks (USER_HZ).
+fn linux_cycles_to_clock_ticks(cycles: u64) -> u64 {
     let frequency = X86_RUNTIME.ELF_PROBE_CLOCK_FREQUENCY.load(Ordering::SeqCst);
     if frequency == 0 {
         return 0;
     }
-    let cycles = linux_process_cpu_cycles(pid);
     cycles / frequency * LINUX_CLOCK_TICKS_PER_SECOND
         + cycles % frequency * LINUX_CLOCK_TICKS_PER_SECOND / frequency
+}
+
+/// `cycles` of the timestamp counter as a timeval: seconds and
+/// microseconds.
+fn linux_cycles_to_timeval(cycles: u64, frequency: u64) -> [u8; 16] {
+    let mut timeval = [0_u8; 16];
+    timeval[..8].copy_from_slice(&(cycles / frequency).to_ne_bytes());
+    timeval[8..].copy_from_slice(&(cycles % frequency * 1_000_000 / frequency).to_ne_bytes());
+    timeval
 }
 
 pub(super) fn linux_times(output_address: u64) -> u64 {
@@ -530,9 +554,20 @@ pub(super) fn linux_times(output_address: u64) -> u64 {
     let ticks = elapsed / frequency * LINUX_CLOCK_TICKS_PER_SECOND
         + elapsed % frequency * LINUX_CLOCK_TICKS_PER_SECOND / frequency;
     if output_address != 0 {
+        // tms_utime, tms_stime, tms_cutime and tms_cstime.
+        let pid = current_linux_process_pid();
+        let (user, system) = linux_process_cpu_times(pid);
+        let (children_user, children_system) =
+            linux_process::live_process_children_cpu_times(pid).unwrap_or((0, 0));
         let mut accounting = [0_u8; 32];
-        accounting[..8]
-            .copy_from_slice(&linux_process_cpu_ticks(current_linux_process_pid()).to_ne_bytes());
+        for (field, cycles) in accounting.as_chunks_mut::<8>().0.iter_mut().zip([
+            user,
+            system,
+            children_user,
+            children_system,
+        ]) {
+            field.copy_from_slice(&linux_cycles_to_clock_ticks(cycles).to_ne_bytes());
+        }
         if !copy_to_linux_user(output_address, &accounting) {
             return LINUX_EFAULT;
         }
@@ -598,15 +633,20 @@ pub(super) fn linux_getrusage(who: u64, output_address: u64) -> u64 {
         return LINUX_EINVAL;
     }
     let mut usage = [0_u8; 144];
+    let frequency = X86_RUNTIME.ELF_PROBE_CLOCK_FREQUENCY.load(Ordering::SeqCst);
+    if frequency == 0 {
+        return LINUX_ENOSYS;
+    }
+    // ru_utime and ru_stime: the process's own, or its waited children's.
+    let (user, system) = if children {
+        linux_process::live_process_children_cpu_times(current_linux_process_pid())
+            .unwrap_or((0, 0))
+    } else {
+        linux_process_cpu_times(current_linux_process_pid())
+    };
+    usage[..16].copy_from_slice(&linux_cycles_to_timeval(user, frequency));
+    usage[16..32].copy_from_slice(&linux_cycles_to_timeval(system, frequency));
     if !children {
-        let frequency = X86_RUNTIME.ELF_PROBE_CLOCK_FREQUENCY.load(Ordering::SeqCst);
-        if frequency == 0 {
-            return LINUX_ENOSYS;
-        }
-        let cycles = linux_process_cpu_cycles(current_linux_process_pid());
-        let microseconds = cycles % frequency * 1_000_000 / frequency;
-        usage[..8].copy_from_slice(&(cycles / frequency).to_ne_bytes());
-        usage[8..16].copy_from_slice(&microseconds.to_ne_bytes());
         let pid = current_linux_process_pid();
         linux_process::note_live_process_rss(pid, linux_current_resident_kib());
         let peak = linux_process::live_process_maxrss(pid).map_or(0, |(own, _)| own);

@@ -54,6 +54,7 @@ pub(super) extern "sysv64" fn linux_syscall_handler(
 ) -> u64 {
     // Back in the kernel at the depth this CPU had when it left for user
     // mode, in case the call returns to the kernel.
+    set_user_time_stamp_access(true);
     crate::cpu_time::back_from_user();
     crate::sync::kernel_entry_return_from_user();
     linux_syscall_entries_here().fetch_add(1, Ordering::Relaxed);
@@ -94,6 +95,7 @@ pub(super) extern "sysv64" fn linux_syscall_handler(
     if result != LINUX_RETURN_TO_KERNEL {
         crate::sync::kernel_entry_leave_to_user();
         crate::cpu_time::leave_for_user();
+        set_user_time_stamp_access(linux_user_time_stamp_allowed());
     }
     result
 }

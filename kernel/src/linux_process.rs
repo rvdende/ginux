@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 use core::{
     cell::UnsafeCell,
     mem::{size_of, MaybeUninit},
-    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering},
 };
 
 use crate::{address_space, arch::x86_64::cpu, control_abi, linux_user, memory, scheduler};
@@ -50,9 +50,6 @@ struct ProcessRuntimeState {
     fork_child_executed: AtomicBool,
     fork_execution_stage: AtomicU32,
     fork_child_diagnostic: AtomicU32,
-    /// Timestamp-counter cycles up to which the running process's CPU time
-    /// is charged, or 0 before the first charge.
-    cpu_mark: AtomicU64,
     tables: UnsafeCell<[ProcessTable; PROCESS_INSTANCE_LIMIT]>,
     test_table: UnsafeCell<MaybeUninit<ProcessTable>>,
 }
@@ -115,7 +112,6 @@ static PROCESS_RUNTIME: ProcessRuntimeOwner =
         fork_child_executed: AtomicBool::new(false),
         fork_execution_stage: AtomicU32::new(0),
         fork_child_diagnostic: AtomicU32::new(0),
-        cpu_mark: AtomicU64::new(0),
         tables: UnsafeCell::new([const { ProcessTable::new() }; PROCESS_INSTANCE_LIMIT]),
         test_table: UnsafeCell::new(MaybeUninit::uninit()),
     }));
@@ -569,8 +565,14 @@ struct Process {
     /// Gave up the CPU in a blocking system call and has not been dispatched
     /// since: Linux's interruptible sleep ('S').
     waiting: bool,
-    /// CPU time used, in timestamp-counter cycles.
+    /// CPU time used, in timestamp-counter cycles, and the part of it in
+    /// user mode (the rest is system time).
     cpu_cycles: u64,
+    user_cycles: u64,
+    /// The user and system time of the children it waited for, theirs
+    /// included (times' tms_cutime and tms_cstime). A new child starts
+    /// with none.
+    children_cycles: (u64, u64),
     /// When the process was created, in nanoseconds since boot (process
     /// accounting's start time and elapsed time).
     started_nanoseconds: u64,
@@ -1453,6 +1455,21 @@ impl ProcessTable {
         let ProcessState::Zombie { status } = process.state else {
             return None;
         };
+        // The child's CPU time, and its own children's, joins the parent's
+        // children's, as Linux adds it when a wait reaps the child.
+        if let Some(parent) = self.process_mut(parent) {
+            let system = process.cpu_cycles.saturating_sub(process.user_cycles);
+            parent.children_cycles.0 = parent
+                .children_cycles
+                .0
+                .saturating_add(process.user_cycles)
+                .saturating_add(process.children_cycles.0);
+            parent.children_cycles.1 = parent
+                .children_cycles
+                .1
+                .saturating_add(system)
+                .saturating_add(process.children_cycles.1);
+        }
         if self
             .processes
             .iter()
@@ -1809,6 +1826,8 @@ impl ProcessTable {
             shares_parent_vm: false,
             waiting: false,
             cpu_cycles: 0,
+            user_cycles: 0,
+            children_cycles: (0, 0),
             started_nanoseconds: crate::arch::x86_64::cpu::linux_uptime_nanoseconds(),
             posix_timers: [None; POSIX_TIMER_LIMIT],
             itimers: [None; 4],
@@ -3214,29 +3233,36 @@ pub(crate) fn live_process_status(pid: u32) -> Option<LiveProcessStatus> {
     })
 }
 
-/// Charges the CPU time since the last charge to `pid`, the process that
-/// ran meanwhile, at timestamp `now`. Saving a process's state charges it;
-/// switching another one in starts its interval.
-pub(crate) fn charge_live_process_cpu(pid: u32, now: u64) {
-    let mark = process_runtime().cpu_mark.swap(now, Ordering::Relaxed);
-    if mark == 0 || now <= mark {
-        return;
+/// Charges the CPU time since the last charge to the process that ran
+/// meanwhile, at timestamp `now`. Saving a process's state charges it;
+/// switching another one in starts its interval. Each CPU keeps its own
+/// interval (`cpu_time::process_interval`), so the threads of one process
+/// on several CPUs each add theirs, and an interval goes to the process it
+/// was opened for.
+pub(crate) fn charge_live_process_cpu(now: u64) {
+    if let Some(interval) = crate::cpu_time::process_interval(now, true) {
+        charge_process_interval(interval);
     }
+}
+
+fn charge_process_interval(interval: crate::cpu_time::ProcessInterval) {
     if let Some(process) = live_process_table_mut().and_then(|table| {
-        let handle = table.handle_by_pid(pid)?;
+        let handle = table.handle_by_pid(interval.pid)?;
         table.process_mut(handle)
     }) {
-        process.cpu_cycles = process.cpu_cycles.saturating_add(now - mark);
+        process.cpu_cycles = process.cpu_cycles.saturating_add(interval.total);
+        process.user_cycles = process.user_cycles.saturating_add(interval.user);
     }
 }
 
-/// Starts the CPU interval of a process switched in at timestamp `now`.
-pub(crate) fn start_live_process_cpu(now: u64) {
-    process_runtime().cpu_mark.store(now, Ordering::Relaxed);
+/// Starts the CPU interval of process `pid`, switched in at timestamp
+/// `now`; the interval open until then goes to its process.
+pub(crate) fn start_live_process_cpu(pid: u32, now: u64) {
+    if let Some(open) = crate::cpu_time::start_process_interval(pid, now) {
+        charge_process_interval(open);
+    }
 }
 
-/// The CPU time `pid` has used, in timestamp-counter cycles, at `now`; for
-/// the running process this includes its current interval.
 /// When `pid` was created, in nanoseconds since boot.
 pub(crate) fn live_process_started_nanoseconds(pid: u32) -> Option<u64> {
     let table = live_process_table_mut()?;
@@ -3247,18 +3273,35 @@ pub(crate) fn live_process_started_nanoseconds(pid: u32) -> Option<u64> {
     )
 }
 
+/// The CPU time `pid` has used, in timestamp-counter cycles, at `now`; for
+/// the running process this includes its current interval.
 pub(crate) fn live_process_cpu_cycles(pid: u32, running: bool, now: u64) -> Option<u64> {
+    live_process_cpu_times(pid, running, now).map(|(user, system)| user + system)
+}
+
+/// The user and system time `pid` has used, in timestamp-counter cycles,
+/// at `now`, as `live_process_cpu_cycles` counts it.
+pub(crate) fn live_process_cpu_times(pid: u32, running: bool, now: u64) -> Option<(u64, u64)> {
     let table = live_process_table_mut()?;
-    let cycles = table.process(table.handle_by_pid(pid)?)?.cpu_cycles;
-    if !running {
-        return Some(cycles);
+    let process = table.process(table.handle_by_pid(pid)?)?;
+    let (mut total, mut user) = (process.cpu_cycles, process.user_cycles);
+    if running {
+        if let Some(interval) =
+            crate::cpu_time::process_interval(now, false).filter(|interval| interval.pid == pid)
+        {
+            total = total.saturating_add(interval.total);
+            user = user.saturating_add(interval.user);
+        }
     }
-    let mark = process_runtime().cpu_mark.load(Ordering::Relaxed);
-    if mark == 0 {
-        process_runtime().cpu_mark.store(now, Ordering::Relaxed);
-        return Some(cycles);
-    }
-    Some(cycles.saturating_add(now.saturating_sub(mark)))
+    let user = user.min(total);
+    Some((user, total - user))
+}
+
+/// The user and system time of the children `pid` waited for, theirs
+/// included, in timestamp-counter cycles.
+pub(crate) fn live_process_children_cpu_times(pid: u32) -> Option<(u64, u64)> {
+    let table = live_process_table_mut()?;
+    Some(table.process(table.handle_by_pid(pid)?)?.children_cycles)
 }
 
 /// Records whether a process waits in a blocking system call: set when it

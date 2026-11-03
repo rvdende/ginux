@@ -4,7 +4,7 @@
 //! Linux does; SysRq `u` writes all four to the kernel log, which shows how
 //! much the CPUs of a multi-CPU domain hold each other up.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::arch::x86_64::{cpu, timer};
 
@@ -20,6 +20,12 @@ static RUNS: [AtomicU64; CPU_LIMIT] = [const { AtomicU64::new(0) }; CPU_LIMIT];
 static USER_SINCE: [AtomicU64; CPU_LIMIT] = [const { AtomicU64::new(0) }; CPU_LIMIT];
 /// When accounting began for each CPU.
 static STARTED: [AtomicU64; CPU_LIMIT] = [const { AtomicU64::new(0) }; CPU_LIMIT];
+/// The interval of CPU time of the process each CPU runs: whose it is (0:
+/// none open), when it began and the CPU's user time then, so it splits
+/// into user and kernel time (`process_interval`).
+static PROCESS_PID: [AtomicU32; CPU_LIMIT] = [const { AtomicU32::new(0) }; CPU_LIMIT];
+static PROCESS_SINCE: [AtomicU64; CPU_LIMIT] = [const { AtomicU64::new(0) }; CPU_LIMIT];
+static PROCESS_USER_SINCE: [AtomicU64; CPU_LIMIT] = [const { AtomicU64::new(0) }; CPU_LIMIT];
 
 fn slot() -> Option<usize> {
     cpu::current_cpu_index_checked().filter(|cpu| *cpu < CPU_LIMIT)
@@ -47,6 +53,67 @@ pub(crate) fn back_from_user() {
             USER[cpu].fetch_add(now.saturating_sub(since), Ordering::Relaxed);
         }
     }
+}
+
+/// CPU `cpu`'s user time so far, the current stretch in user mode included.
+fn user_cycles(cpu: usize, now: u64) -> u64 {
+    let since = USER_SINCE[cpu].load(Ordering::Acquire);
+    let running = if since == 0 {
+        0
+    } else {
+        now.saturating_sub(since)
+    };
+    USER[cpu].load(Ordering::Relaxed) + running
+}
+
+/// A process's interval of CPU time on one CPU, in timestamp-counter
+/// ticks.
+#[derive(Clone, Copy)]
+pub(crate) struct ProcessInterval {
+    pub(crate) pid: u32,
+    pub(crate) total: u64,
+    pub(crate) user: u64,
+}
+
+/// This CPU starts running process `pid` at timestamp `now`: its interval
+/// of CPU time begins. The interval open until now, if any, is closed and
+/// returned for its process to be charged (a process run nested inside
+/// another's call starts without the other's being charged first).
+pub(crate) fn start_process_interval(pid: u32, now: u64) -> Option<ProcessInterval> {
+    let cpu = slot()?;
+    let open = process_interval(now, true);
+    PROCESS_PID[cpu].store(pid, Ordering::Relaxed);
+    open
+}
+
+/// This CPU's process interval up to `now`; None while none is open.
+/// `close` ends it, for a charge: the CPU's time is no process's until
+/// the next starts (`start_process_interval`).
+pub(crate) fn process_interval(now: u64, close: bool) -> Option<ProcessInterval> {
+    let cpu = slot()?;
+    let user = user_cycles(cpu, now);
+    let (pid, since, user_since) = if close {
+        (
+            PROCESS_PID[cpu].swap(0, Ordering::Relaxed),
+            PROCESS_SINCE[cpu].swap(now, Ordering::Relaxed),
+            PROCESS_USER_SINCE[cpu].swap(user, Ordering::Relaxed),
+        )
+    } else {
+        (
+            PROCESS_PID[cpu].load(Ordering::Relaxed),
+            PROCESS_SINCE[cpu].load(Ordering::Relaxed),
+            PROCESS_USER_SINCE[cpu].load(Ordering::Relaxed),
+        )
+    };
+    if since == 0 || pid == 0 {
+        return None;
+    }
+    let total = now.saturating_sub(since);
+    Some(ProcessInterval {
+        pid,
+        total,
+        user: user.saturating_sub(user_since).min(total),
+    })
 }
 
 /// This CPU idled for `ticks` timestamp-counter ticks.

@@ -5744,6 +5744,47 @@ fn promote_linux_cow_page_in_root_address(
     }
 }
 
+/// Makes the program-image page at `address`, which maps `frame` and is not
+/// executable, read-only or writable again (mprotect). A page that becomes
+/// writable while another address space or the runtime image also holds
+/// its frame (a fork shares a read-only page) is copy-on-write instead, so
+/// the first write gives it a copy of its own. Whether the leaf now says so.
+pub(crate) fn set_current_linux_image_page_writable(
+    address: u64,
+    frame: memory::FrameLease,
+    writable: bool,
+) -> bool {
+    if address >= 1 << 47 || !address.is_multiple_of(PAGE_SIZE as u64) {
+        return false;
+    }
+    let Some(entry) = current_linux_leaf(address) else {
+        return false;
+    };
+    let value = entry.read();
+    if value & (ADDRESS_MASK | PRESENT | USER | NO_EXECUTE)
+        != frame.address() | PRESENT | USER | NO_EXECUTE
+    {
+        return false;
+    }
+    let logically_writable = value & (WRITABLE | LINUX_RUNTIME_COW) != 0;
+    if logically_writable == writable {
+        return true;
+    }
+    let updated = if !writable {
+        value & !(WRITABLE | LINUX_RUNTIME_COW)
+    } else if linux_private_page_counted(frame) && !memory::frame_is_shared(frame) {
+        value | WRITABLE
+    } else {
+        value | LINUX_RUNTIME_COW
+    };
+    entry.write(updated);
+    // SAFETY: invlpg only drops this CPU's translation of the page.
+    unsafe {
+        asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
+    }
+    entry.read() == updated
+}
+
 pub(crate) fn current_linux_address_executable(address: u64) -> bool {
     if address >= 1 << 47 {
         return false;
