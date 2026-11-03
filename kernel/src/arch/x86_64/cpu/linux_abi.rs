@@ -1115,6 +1115,11 @@ pub(super) const LINUX_SA_RESTORER: u64 = 0x0400_0000;
 pub(super) const LINUX_SA_ONSTACK: u64 = 0x0800_0000;
 pub(super) const LINUX_SA_NODEFER: u64 = 0x4000_0000;
 pub(super) const LINUX_SA_RESETHAND: u64 = 0x8000_0000;
+/// The sigaction flags Linux keeps (UAPI_SA_FLAGS on x86-64): SA_NOCLDSTOP,
+/// SA_NOCLDWAIT, SA_SIGINFO, SA_EXPOSE_TAGBITS, SA_RESTORER, SA_ONSTACK,
+/// SA_RESTART, SA_NODEFER and SA_RESETHAND; others are cleared.
+pub(super) const LINUX_UAPI_SA_FLAGS: u64 =
+    0x1 | 0x2 | 0x4 | 0x800 | 0x0400_0000 | 0x0800_0000 | 0x1000_0000 | 0x4000_0000 | 0x8000_0000;
 pub(super) const LINUX_SIGNAL_FRAME_SIZE: usize = 440;
 pub(super) const LINUX_SIGNAL_FRAME_INFO_OFFSET: u64 = 312;
 pub(super) const LINUX_SIGNAL_FRAME_CONTEXT_OFFSET: u64 = 8;

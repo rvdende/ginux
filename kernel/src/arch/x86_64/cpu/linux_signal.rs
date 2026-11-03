@@ -41,6 +41,11 @@ pub(super) fn linux_rt_sigaction(signal: u64, action: u64, old_action: u64, set_
     if old_action != 0 {
         let mut bytes = [0_u8; LINUX_SIGNAL_ACTION_SIZE];
         for (offset, word) in current.into_iter().enumerate() {
+            let word = if offset == 1 {
+                word & LINUX_UAPI_SA_FLAGS
+            } else {
+                word
+            };
             bytes[offset * 8..offset * 8 + 8].copy_from_slice(&word.to_ne_bytes());
         }
         if !copy_to_linux_user(old_action, &bytes) {
@@ -49,7 +54,12 @@ pub(super) fn linux_rt_sigaction(signal: u64, action: u64, old_action: u64, set_
     }
     if let Some([handler, flags, restorer, mask]) = new_action {
         X86_RUNTIME.ELF_PROBE_SIGNAL_HANDLERS[index].store(handler, Ordering::SeqCst);
-        X86_RUNTIME.ELF_PROBE_SIGNAL_FLAGS[index].store(flags, Ordering::SeqCst);
+        // Only the flags Linux knows are kept, as it masks them: musl
+        // widens an int sa_flags, so SA_RESETHAND arrives sign-extended
+        // (0xffffffff80000000), and unknown bits must not make the handler
+        // undeliverable (sigaction01, perf_event_open02's SIGALRM).
+        X86_RUNTIME.ELF_PROBE_SIGNAL_FLAGS[index]
+            .store(flags & LINUX_UAPI_SA_FLAGS, Ordering::SeqCst);
         X86_RUNTIME.ELF_PROBE_SIGNAL_RESTORERS[index].store(restorer, Ordering::SeqCst);
         X86_RUNTIME.ELF_PROBE_SIGNAL_ACTION_MASKS[index].store(mask, Ordering::SeqCst);
     }
@@ -1362,11 +1372,10 @@ pub(super) fn linux_apply_delivered_signal_action(
         0
     };
     store_current_linux_signal_mask(old_mask | action_mask | automatic_mask);
+    // SA_RESETHAND puts back the default action only: the flags,
+    // restorer and mask stay, as sigaction then reports them (sigaction01).
     if flags & LINUX_SA_RESETHAND != 0 {
         X86_RUNTIME.ELF_PROBE_SIGNAL_HANDLERS[index].store(0, Ordering::SeqCst);
-        X86_RUNTIME.ELF_PROBE_SIGNAL_FLAGS[index].store(0, Ordering::SeqCst);
-        X86_RUNTIME.ELF_PROBE_SIGNAL_RESTORERS[index].store(0, Ordering::SeqCst);
-        X86_RUNTIME.ELF_PROBE_SIGNAL_ACTION_MASKS[index].store(0, Ordering::SeqCst);
     }
 }
 

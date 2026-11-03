@@ -74,7 +74,6 @@ remap_file_pages01 TBROK
 sbrk01 TFAIL
 setns02 TWARN
 setxattr03 TBROK
-sigaction01 TBROK
 signal06 TBROK
 sigtimedwait01 HANG
 sigwaitinfo01 HANG
@@ -83,7 +82,6 @@ times03 TFAIL
 unshare03 TFAIL
 unshare05 TBROK
 userfaultfd03 TBROK
-perf_event_open02 TBROK
 futex_cmp_requeue01 TBROK
 futex_wake05 TFAIL
 io_uring01 TBROK
