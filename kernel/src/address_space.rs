@@ -4244,12 +4244,38 @@ fn install_linux_fork_cow(
         parent.write((parent_value & !WRITABLE) | LINUX_RUNTIME_COW);
         child.write((child_value & !WRITABLE) | LINUX_RUNTIME_COW);
     }
-    // The child maps every private page the parent does. Count its mappings
-    // so each page lives until both have released it.
+    // A wipe-on-fork page starts empty in the child (MADV_WIPEONFORK): a
+    // reservation, zero-filled when first touched, instead of a share of
+    // the parent's page.
+    let wiped = |mapping: &cpu::LinuxActiveImageMapping| {
+        linux_leaf_in_root(parent_root.address(), mapping.address as u64)
+            .is_some_and(|entry| entry.read() & LINUX_RUNTIME_WIPEONFORK != 0)
+    };
+    for mapping in mappings
+        .iter()
+        .filter(|mapping| !mapping.dontfork && !mapping.shared && wiped(mapping))
+    {
+        let Some(child) = linux_leaf_in_root(child_root.address(), mapping.address as u64) else {
+            return false;
+        };
+        child.write(
+            LINUX_RUNTIME_RESERVED
+                | USER
+                | LINUX_RUNTIME_DEMAND
+                | LINUX_RUNTIME_WIPEONFORK
+                | if mapping.writable { WRITABLE } else { 0 }
+                | if mapping.executable { 0 } else { NO_EXECUTE },
+        );
+    }
+    // The child maps every other private page the parent does. Count its
+    // mappings so each page lives until both have released it.
     let mut shared = [memory::FrameLease::EMPTY; 64];
     let mut count = 0;
     for mapping in mappings.iter().filter(|mapping| {
-        !mapping.dontfork && !mapping.shared && linux_private_page_counted(mapping.frame)
+        !mapping.dontfork
+            && !mapping.shared
+            && !wiped(mapping)
+            && linux_private_page_counted(mapping.frame)
     }) {
         shared[count] = mapping.frame;
         count += 1;
@@ -6153,9 +6179,35 @@ fn ensure_current_linux_leaf(address: u64) -> Option<PageEntry> {
 }
 
 pub(crate) fn current_linux_runtime_page(address: u64) -> LinuxRuntimePage {
-    current_linux_leaf(address).map_or(LinuxRuntimePage::EMPTY, |entry| {
+    let page = current_linux_leaf(address).map_or(LinuxRuntimePage::EMPTY, |entry| {
         linux_runtime_page_from_value(entry.read())
+    });
+    if page.occupied {
+        return page;
+    }
+    lazy_linux_runtime_page(address).unwrap_or(page)
+}
+
+/// A page of a lazily reserved anonymous mapping (one only the process's
+/// memory areas record, with no page-table entry yet): reserved, with the
+/// area's protection, as if a reservation entry were there.
+fn lazy_linux_runtime_page(address: u64) -> Option<LinuxRuntimePage> {
+    let protection = cpu::linux_lazy_area_protection(address & !(PAGE_SIZE as u64 - 1))?;
+    Some(LinuxRuntimePage {
+        occupied: true,
+        protection,
+        ..LinuxRuntimePage::EMPTY
     })
+}
+
+/// Whether `address` holds no page-table entry but a lazily reserved
+/// anonymous page (`lazy_linux_runtime_page`).
+fn current_linux_page_is_lazy(address: u64) -> Option<u8> {
+    let empty = current_linux_leaf(address).is_none_or(|entry| entry.read() == 0);
+    empty
+        .then(|| lazy_linux_runtime_page(address))
+        .flatten()
+        .map(|page| page.protection)
 }
 
 pub(crate) fn refresh_current_linux_runtime_translation(
@@ -6306,6 +6358,34 @@ pub(crate) fn install_current_linux_runtime_page(
             | if protection & 2 != 0 { WRITABLE } else { 0 }
             | if protection & 4 != 0 { 0 } else { NO_EXECUTE })
     .then_some(old.frame)
+}
+
+/// Moves the page-table entry at `source` to `target`, which must hold no
+/// page, keeping every bit of it (copy-on-write, sharing, file and fork
+/// flags), so the frame's mapping count is unchanged: mremap moving a
+/// mapping. A lazily reserved source becomes a reservation at `target`.
+pub(crate) fn move_current_linux_runtime_page(source: u64, target: u64) -> bool {
+    if let Some(protection) = current_linux_page_is_lazy(source) {
+        return reserve_current_linux_runtime_page(target, protection, false, false).is_some();
+    }
+    let Some(from) = current_linux_leaf(source) else {
+        return false;
+    };
+    let value = from.read();
+    if value & (PRESENT | LINUX_RUNTIME_RESERVED) == 0 {
+        return false;
+    }
+    let Some(to) = ensure_current_linux_leaf(target) else {
+        return false;
+    };
+    let old_target = to.read();
+    if linux_runtime_page_from_value(old_target).occupied {
+        return false;
+    }
+    to.write(value);
+    from.write(0);
+    invalidate_changed_runtime_translation(source, value)
+        && invalidate_changed_runtime_translation(target, old_target)
 }
 
 pub(crate) fn install_current_linux_shared_page(
@@ -6519,6 +6599,15 @@ fn invalidate_changed_runtime_translation(address: u64, old_value: u64) -> bool 
 }
 
 pub(crate) fn remove_current_linux_runtime_page(address: u64) -> LinuxRuntimePage {
+    // A lazily reserved page has nothing in the page tables to remove; its
+    // memory area goes with the unmap.
+    if let Some(protection) = current_linux_page_is_lazy(address) {
+        return LinuxRuntimePage {
+            occupied: true,
+            protection,
+            ..LinuxRuntimePage::EMPTY
+        };
+    }
     let Some(entry) = current_linux_leaf(address) else {
         return LinuxRuntimePage::EMPTY;
     };
@@ -6609,6 +6698,11 @@ pub(crate) fn prune_current_linux_page_tables(start: u64, end: u64) -> bool {
 pub(crate) fn protect_current_linux_runtime_page(address: u64, protection: u8) -> bool {
     if !matches!(protection, 0 | 1 | 3 | 5) {
         return false;
+    }
+    // A lazily reserved page takes its new protection from its memory area,
+    // which mprotect updates.
+    if current_linux_page_is_lazy(address).is_some() {
+        return true;
     }
     let Some(entry) = current_linux_leaf(address) else {
         return false;
@@ -6769,6 +6863,12 @@ pub(crate) fn materialize_current_linux_runtime_page(
         || !memory::frames_owned_by(memory::FrameOwner::KERNEL, &[frame])
     {
         return false;
+    }
+    // A lazily reserved page gets its reservation entry first.
+    if let Some(lazy) = current_linux_page_is_lazy(address) {
+        if reserve_current_linux_runtime_page(address, lazy, false, false).is_none() {
+            return false;
+        }
     }
     let Some(entry) = current_linux_leaf(address) else {
         return false;

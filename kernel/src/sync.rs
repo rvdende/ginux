@@ -19,9 +19,10 @@ impl LockRank {
     /// The mounts domains made; ranks below the heap so the table may grow
     /// while held, and above ARCHITECTURE, which system calls run under.
     pub(crate) const MOUNTS: Self = Self(105);
-    /// Processes' memory areas; ranks below the heap so the sets may grow
-    /// while held.
-    pub(crate) const MEMORY_AREAS: Self = Self(130);
+    /// Processes' memory areas; ranks just below the heap so the sets may
+    /// grow while held, and above the socket, inotify and futex locks, under
+    /// which a copy to user memory may look up a lazily reserved page.
+    pub(crate) const MEMORY_AREAS: Self = Self(185);
     /// The executables behind /proc/PID/exe; ranks below the heap so the
     /// list may grow while held.
     pub(crate) const EXECUTABLES: Self = Self(110);
@@ -505,6 +506,12 @@ fn restore_interrupts(state: InterruptState) {
 fn cpu_slot() -> usize {
     crate::arch::x86_64::cpu::current_cpu_index_checked()
         .unwrap_or_else(|| usize::from((__cpuid(1).ebx >> 24) as u8))
+}
+
+/// Whether this CPU may take a lock of `rank` now: it holds none ranked
+/// at or above it.
+pub(crate) fn rank_available(rank: LockRank) -> bool {
+    HELD_RANKS[cpu_slot()].load(Ordering::Acquire) < rank.0
 }
 
 fn enter_rank(rank: LockRank) -> u16 {

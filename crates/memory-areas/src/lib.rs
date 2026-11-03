@@ -132,6 +132,8 @@ pub struct Area {
     /// a shared mapping of a file opened without write access or sealed
     /// against writes, which mprotect may not give PROT_WRITE.
     pub may_write: bool,
+    /// Locked in memory (Linux's VM_LOCKED): mlock, mlockall or MAP_LOCKED.
+    pub locked: bool,
     pub backing: Backing,
 }
 
@@ -157,6 +159,7 @@ impl Area {
             protection: self.protection,
             shared: self.shared,
             may_write: self.may_write,
+            locked: self.locked,
             backing: self.backing.advanced(start - self.start),
         }
     }
@@ -167,6 +170,7 @@ impl Area {
             && self.protection == next.protection
             && self.shared == next.shared
             && self.may_write == next.may_write
+            && self.locked == next.locked
             && self.backing.continues_into(self.len(), &next.backing)
     }
 }
@@ -185,6 +189,8 @@ pub enum Error {
 #[derive(Clone, Debug, Default)]
 pub struct Areas {
     areas: Vec<Area>,
+    /// mlockall(MCL_FUTURE): areas mapped from now on are locked.
+    lock_future: bool,
 }
 
 fn valid_range(start: u64, end: u64) -> Result<(), Error> {
@@ -197,7 +203,10 @@ fn valid_range(start: u64, end: u64) -> Result<(), Error> {
 
 impl Areas {
     pub const fn new() -> Self {
-        Self { areas: Vec::new() }
+        Self {
+            areas: Vec::new(),
+            lock_future: false,
+        }
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &Area> {
@@ -237,12 +246,27 @@ impl Areas {
             .try_reserve_exact(self.areas.len())
             .map_err(|_| Error::NoMemory)?;
         areas.extend(self.areas.iter().cloned());
-        Ok(Self { areas })
+        Ok(Self {
+            areas,
+            lock_future: self.lock_future,
+        })
+    }
+
+    /// The copy a forked child gets: the same areas, none of them locked,
+    /// as memory locks are not inherited across fork.
+    pub fn forked(&self) -> Result<Self, Error> {
+        let mut copy = Self {
+            lock_future: false,
+            ..self.try_clone()?
+        };
+        copy.lock_all(false);
+        Ok(copy)
     }
 
     /// Maps `area`, replacing whatever it overlaps.
-    pub fn map(&mut self, area: Area) -> Result<(), Error> {
+    pub fn map(&mut self, mut area: Area) -> Result<(), Error> {
         valid_range(area.start, area.end)?;
+        area.locked |= self.lock_future;
         // Unmapping can split one area in two, and the new area is one more.
         self.areas.try_reserve(2).map_err(|_| Error::NoMemory)?;
         self.remove_range(area.start, area.end);
@@ -264,6 +288,48 @@ impl Areas {
 
     /// Gives `[start, end)` `protection`, which must be wholly mapped.
     pub fn protect(&mut self, start: u64, end: u64, protection: Protection) -> Result<(), Error> {
+        self.change(start, end, |area| area.protection = protection)
+    }
+
+    /// Locks or unlocks `[start, end)`, which must be wholly mapped.
+    pub fn lock(&mut self, start: u64, end: u64, locked: bool) -> Result<(), Error> {
+        self.change(start, end, |area| area.locked = locked)
+    }
+
+    /// Locks or unlocks every area (mlockall's MCL_CURRENT, munlockall).
+    pub fn lock_all(&mut self, locked: bool) {
+        for area in &mut self.areas {
+            area.locked = locked;
+        }
+        for index in (0..self.areas.len()).rev() {
+            if index < self.areas.len() {
+                self.merge_around(index);
+            }
+        }
+    }
+
+    /// Sets whether areas mapped from now on are locked (MCL_FUTURE).
+    pub fn set_lock_future(&mut self, locked: bool) {
+        self.lock_future = locked;
+    }
+
+    /// The bytes of locked areas (VmLck).
+    pub fn locked_bytes(&self) -> u64 {
+        self.areas
+            .iter()
+            .filter(|area| area.locked)
+            .map(Area::len)
+            .sum()
+    }
+
+    /// Whether some area overlapping `[start, end)` is locked.
+    pub fn locked_in(&self, start: u64, end: u64) -> bool {
+        self.overlapping(start, end).any(|area| area.locked)
+    }
+
+    /// Applies `apply` to the parts of areas within `[start, end)`, which
+    /// must be wholly mapped, splitting and merging areas around them.
+    fn change(&mut self, start: u64, end: u64, apply: impl Fn(&mut Area)) -> Result<(), Error> {
         valid_range(start, end)?;
         if !self.covers(start, end) {
             return Err(Error::Unmapped);
@@ -274,9 +340,10 @@ impl Areas {
             changed
                 .try_reserve_exact(count)
                 .map_err(|_| Error::NoMemory)?;
-            changed.extend(self.overlapping(start, end).map(|area| Area {
-                protection,
-                ..area.clipped(start, end)
+            changed.extend(self.overlapping(start, end).map(|area| {
+                let mut part = area.clipped(start, end);
+                apply(&mut part);
+                part
             }));
             changed
         };
@@ -389,6 +456,7 @@ mod tests {
             protection,
             shared: false,
             may_write: true,
+            locked: false,
             backing: Backing::Anonymous,
         }
     }
@@ -400,6 +468,7 @@ mod tests {
             protection: R,
             shared: false,
             may_write: true,
+            locked: false,
             backing: Backing::File {
                 device: 1,
                 inode: 7,
@@ -544,5 +613,28 @@ mod tests {
         child.unmap(0, PAGE_SIZE).unwrap();
         assert_eq!(ranges(&areas), [(0, 4, 3)]);
         assert_eq!(ranges(&child), [(1, 4, 3)]);
+    }
+
+    #[test]
+    fn locking_splits_and_merges_and_is_not_inherited() {
+        let mut areas = Areas::new();
+        areas.map(anonymous(0, 8, RW)).unwrap();
+        areas.lock(2 * PAGE_SIZE, 5 * PAGE_SIZE, true).unwrap();
+        assert_eq!(areas.len(), 3);
+        assert_eq!(areas.locked_bytes(), 3 * PAGE_SIZE);
+        assert!(areas.locked_in(4 * PAGE_SIZE, 6 * PAGE_SIZE));
+        assert!(!areas.locked_in(5 * PAGE_SIZE, 8 * PAGE_SIZE));
+        assert_eq!(
+            areas.lock(7 * PAGE_SIZE, 9 * PAGE_SIZE, true),
+            Err(Error::Unmapped)
+        );
+        let child = areas.forked().unwrap();
+        assert_eq!(child.locked_bytes(), 0);
+        assert_eq!(child.len(), 1);
+        areas.lock_all(false);
+        assert_eq!(areas.len(), 1);
+        areas.set_lock_future(true);
+        areas.map(anonymous(10, 12, RW)).unwrap();
+        assert_eq!(areas.locked_bytes(), 2 * PAGE_SIZE);
     }
 }

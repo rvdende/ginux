@@ -1483,7 +1483,7 @@ fn linux_syscall_dispatch(
         LINUX_MUNLOCK_SYSCALL => linux_memory_lock(first_argument, buffer, 0, false),
         LINUX_MLOCK2_SYSCALL => linux_memory_lock(first_argument, buffer, count, true),
         LINUX_MLOCKALL_SYSCALL => linux_mlockall(first_argument),
-        LINUX_MUNLOCKALL_SYSCALL => 0,
+        LINUX_MUNLOCKALL_SYSCALL => linux_munlockall(),
         LINUX_PRCTL_SYSCALL => linux_prctl(first_argument, buffer, count, register(0), register(2)),
         LINUX_ARCH_PRCTL_SYSCALL => linux_arch_prctl(first_argument, buffer),
         LINUX_MODIFY_LDT_SYSCALL => linux_modify_ldt(first_argument, buffer, count),

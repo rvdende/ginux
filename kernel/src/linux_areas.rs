@@ -95,6 +95,81 @@ pub(crate) fn protect(instance: usize, pid: u32, start: u64, length: u64, protec
     });
 }
 
+/// The protection of `pid`'s private anonymous area covering `address`:
+/// a page of it the page tables do not hold yet is made, zeroed, when it
+/// is first touched (a large mapping is only recorded here; see
+/// `linux_runtime_mmap`).
+pub(crate) fn anonymous_protection(instance: usize, pid: u32, address: u64) -> Option<Protection> {
+    PROCESSES
+        .lock()
+        .iter()
+        .find(|process| process.instance == instance && process.pid == pid)?
+        .areas
+        .find(address)
+        .filter(|area| !area.shared && matches!(area.backing, Backing::Anonymous))
+        .map(|area| area.protection)
+}
+
+/// Locks or unlocks `length` bytes at `start` of `pid` (mlock, munlock).
+pub(crate) fn lock(instance: usize, pid: u32, start: u64, length: u64, locked: bool) {
+    let start = start & !(PAGE_SIZE - 1);
+    let Some(end) = page_end(start, length) else {
+        return;
+    };
+    update(instance, pid, |areas| {
+        let _ = areas.lock(start, end, locked);
+    });
+}
+
+/// Locks or unlocks every area of `pid` when `current` is given, and
+/// sets whether its later mappings are locked (mlockall, munlockall).
+pub(crate) fn lock_all(instance: usize, pid: u32, current: Option<bool>, future: bool) {
+    update(instance, pid, |areas| {
+        if let Some(locked) = current {
+            areas.lock_all(locked);
+        }
+        areas.set_lock_future(future);
+    });
+}
+
+/// The bytes of `pid`'s locked areas (VmLck).
+pub(crate) fn locked_bytes(instance: usize, pid: u32) -> u64 {
+    PROCESSES
+        .lock()
+        .iter()
+        .find(|process| process.instance == instance && process.pid == pid)
+        .map_or(0, |process| process.areas.locked_bytes())
+}
+
+/// Whether some locked area of `pid` overlaps `length` bytes at `start`.
+pub(crate) fn locked_in(instance: usize, pid: u32, start: u64, length: u64) -> bool {
+    let Some(end) = page_end(start, length) else {
+        return false;
+    };
+    PROCESSES
+        .lock()
+        .iter()
+        .find(|process| process.instance == instance && process.pid == pid)
+        .is_some_and(|process| process.areas.locked_in(start, end))
+}
+
+/// Whether some area of `pid` overlaps `length` bytes at `start`.
+pub(crate) fn overlaps(instance: usize, pid: u32, start: u64, length: u64) -> bool {
+    let Some(end) = start.checked_add(length) else {
+        return true;
+    };
+    PROCESSES
+        .lock()
+        .iter()
+        .find(|process| process.instance == instance && process.pid == pid)
+        .is_some_and(|process| {
+            process
+                .areas
+                .iter()
+                .any(|area| area.start < end && start < area.end)
+        })
+}
+
 /// Whether part of `length` bytes at `start` of `pid` may not be made
 /// writable (a shared mapping of a read-only or write-sealed file).
 pub(crate) fn write_forbidden(instance: usize, pid: u32, start: u64, length: u64) -> bool {
@@ -171,6 +246,7 @@ pub(crate) fn remap(
             protection: area.protection,
             shared: area.shared,
             may_write: area.may_write,
+            locked: area.locked,
             backing,
         });
     });
@@ -186,7 +262,7 @@ pub(crate) fn fork(instance: usize, parent: u32, child: u32) {
         else {
             return;
         };
-        match parent.areas.try_clone() {
+        match parent.areas.forked() {
             Ok(copy) => copy,
             Err(_) => return,
         }

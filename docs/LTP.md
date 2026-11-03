@@ -84,18 +84,19 @@ full run are kept in `target/ltp-baseline/` (not committed).
 
 ## What remains (full run 13, 97c546ab)
 
-192 known failures and one hang. The larger groups, each needing a
+192 known failures and one hang (fork14, since fixed). The larger groups, each needing a
 feature rather than a fix:
 
-- **fork14 (the hang): reservations cost page-table entries.** An
-  anonymous mapping writes a reservation entry for every 4 KiB page, and
-  fork copies them all, so 16,384 one-GiB mappings make fork quadratic.
-  The fix is reservation markers in the upper tables (a whole 2 MiB or
-  1 GiB range reserved by one non-present PD or PDPT entry, 1 GiB
-  mappings placed 1 GiB-aligned), split on first touch; every walker in
-  `address_space.rs` (the leaf walks, fork's copy, release, snapshots and
-  the free-range search) must read them. That is the roadmap's step of
-  letting memory areas, not page-table bits, answer for reservations.
+- **fork14 (fixed after run 13): lazy reservations.** An anonymous
+  mapping used to write a reservation entry for every 4 KiB page, and fork
+  copied them all, so 16,384 one-GiB mappings made fork quadratic. Large
+  private anonymous mappings (64 MiB or more, placed by the kernel,
+  neither populated nor locked) are now recorded only as memory areas: a
+  page with no table entry inside such an area reads as reserved with the
+  area's protection (`lazy_linux_runtime_page` in `address_space.rs`), and
+  it is made when first touched. Placement also avoids recorded areas.
+  Smaller mappings still reserve each page; moving them to areas too is
+  the roadmap's next memory step.
 - **Shared-resource clones** (clone02, clone05, clone08, clone10,
   clone301, kcmp03): CLONE_VM, CLONE_FILES, CLONE_FS or CLONE_SIGHAND
   without CLONE_THREAD, and CLONE_PARENT. Ginux keeps these per process.

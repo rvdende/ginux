@@ -18750,7 +18750,9 @@ fn linux_runtime_mapping_range(address: u64, length: u64) -> Option<(u64, usize)
     let in_low_window = (LINUX_LOW_MMAP_BASE..LINUX_LOW_MMAP_LIMIT).contains(&address);
     if length == 0
         || !address.is_multiple_of(PAGE_SIZE as u64)
-        || address < LINUX_RUNTIME_DYNAMIC_MMAP_BASE && !in_low_window
+        || address < LINUX_RUNTIME_DYNAMIC_MMAP_BASE
+            && !in_low_window
+            && !linux_runtime_heap_contains(address)
     {
         return None;
     }
@@ -18761,7 +18763,10 @@ fn linux_runtime_mapping_range(address: u64, length: u64) -> Option<(u64, usize)
     // mappings lie in the second gigabyte.
     let in_high_image = address >= LINUX_EXEC_HIGH_LOAD_BASE && mapped_end <= LINUX_EXEC_HIGH_LIMIT;
     let in_low_window = in_low_window && mapped_end <= LINUX_LOW_MMAP_LIMIT;
-    (pages != 0 && (mapped_end <= end || in_high_image || in_low_window))
+    // The heap up to the break may be protected and unmapped too (brk02).
+    let in_heap =
+        linux_runtime_heap_contains(address) && linux_runtime_heap_contains(mapped_end - 1);
+    (pages != 0 && (mapped_end <= end || in_high_image || in_low_window || in_heap))
         .then_some((mapped_end, pages))
 }
 
@@ -18814,6 +18819,14 @@ fn linux_runtime_brk(requested: u64) -> u64 {
             }
         }
     } else if new_end < old_end {
+        // Pages below the initial limit stay reserved, but a later break
+        // must find them read-write again even if mprotect changed them.
+        for page in (new_end..old_end.min(initial_limit)).step_by(PAGE_SIZE) {
+            let state = address_space::current_linux_runtime_page(page);
+            if state.occupied && state.protection != 3 {
+                let _ = address_space::protect_current_linux_runtime_page(page, 3);
+            }
+        }
         let start = new_end.max(initial_limit);
         let pages = (old_end.saturating_sub(start) / PAGE_SIZE as u64) as usize;
         for page in 0..pages {
@@ -18868,6 +18881,45 @@ fn linux_runtime_heap_contains(address: u64) -> bool {
 
 fn linux_runtime_range_available(address: u64, pages: usize) -> bool {
     address_space::current_linux_range_unoccupied(address, pages)
+        && !(X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
+            && crate::linux_areas::overlaps(
+                linux_execution_instance(),
+                current_linux_process_pid(),
+                address,
+                (pages as u64).saturating_mul(PAGE_SIZE as u64),
+            ))
+}
+
+/// Mappings at least this large (private, anonymous, placed by the kernel,
+/// neither populated nor locked) are reserved lazily: only the memory
+/// areas record them, and a page is made when first touched. Reserving
+/// each page in the page tables, which fork copies, made fork's cost grow
+/// with every untouched gigabyte (fork14).
+const LINUX_LAZY_MAPPING_PAGES: usize = (64 << 20) / PAGE_SIZE;
+
+/// The page protection (0, R, RW or RX as page entries hold it) of the
+/// current process's private anonymous memory area covering `address`,
+/// for a page the page tables do not hold yet.
+pub(crate) fn linux_lazy_area_protection(address: u64) -> Option<u8> {
+    if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::Relaxed)
+        || address < LINUX_RUNTIME_DYNAMIC_MMAP_BASE
+        || address >= linux_runtime_mmap_end()?
+        || !crate::sync::rank_available(crate::sync::LockRank::MEMORY_AREAS)
+    {
+        return None;
+    }
+    let protection = crate::linux_areas::anonymous_protection(
+        linux_execution_instance(),
+        current_linux_process_pid(),
+        address,
+    )?;
+    match protection.bits() {
+        0 => Some(0),
+        1 => Some(1),
+        2 | 3 => Some(3),
+        4 | 5 => Some(5),
+        _ => None,
+    }
 }
 
 /// `low` for MAP_32BIT: the first free range in the second gigabyte, or
@@ -25096,6 +25148,14 @@ fn linux_runtime_mmap(
     fd: u64,
     offset: u64,
 ) -> u64 {
+    // A file mapping looks its descriptor up first: a closed one is EBADF
+    // whatever else is wrong (mmap08).
+    if flags & LINUX_MAP_ANONYMOUS == 0
+        && offset.is_multiple_of(PAGE_SIZE as u64)
+        && !linux_descriptor_open(u64::from(fd as u32))
+    {
+        return LINUX_EBADF;
+    }
     let protection = linux_implied_protection(protection);
     if length == 0
         || ![
@@ -25177,6 +25237,25 @@ fn linux_runtime_mmap(
     };
     if no_replace && !linux_runtime_range_available(mapping, pages) {
         return LINUX_EEXIST;
+    }
+    // A large private anonymous mapping the kernel places, neither
+    // populated nor locked, is reserved lazily (LINUX_LAZY_MAPPING_PAGES):
+    // the dispatcher records its memory area, and its pages are made as
+    // they are touched.
+    let lazy = anonymous
+        && sharing == LINUX_MAP_PRIVATE
+        && !fixed
+        && !no_replace
+        && flags & (LINUX_MAP_POPULATE | LINUX_MAP_LOCKED) == 0
+        && matches!(protection, 0 | 1 | 3)
+        && pages >= LINUX_LAZY_MAPPING_PAGES
+        && X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst);
+    if lazy {
+        return if linux_address_space_limit_allows(pages) {
+            mapping
+        } else {
+            LINUX_ENOMEM
+        };
     }
     let additional_pages = (0..pages)
         .filter(|page| {
@@ -25556,6 +25635,7 @@ fn linux_record_exec_image(
                 protection: Protection::from_bits(protection),
                 shared: false,
                 may_write: true,
+                locked: false,
                 backing: Backing::File {
                     device: 0,
                     inode: 0,
@@ -25581,6 +25661,7 @@ fn linux_record_exec_image(
                 protection: Protection::from_bits(LINUX_PROT_READ | LINUX_PROT_WRITE),
                 shared: false,
                 may_write: true,
+                locked: false,
                 backing: Backing::Stack,
             },
         );
@@ -25607,6 +25688,7 @@ fn linux_record_heap(program_break: u64) {
                 protection: Protection::from_bits(LINUX_PROT_READ | LINUX_PROT_WRITE),
                 shared: false,
                 may_write: true,
+                locked: false,
                 backing: Backing::Heap,
             },
         );
@@ -25670,6 +25752,7 @@ fn linux_record_mapping(
             protection: Protection::from_bits(protection),
             shared: flags & LINUX_MAP_SHARED != 0,
             may_write,
+            locked: flags & LINUX_MAP_LOCKED != 0,
             backing,
         },
     );
@@ -25711,32 +25794,6 @@ fn linux_runtime_munmap_pages(address: u64, length: u64) -> u64 {
     0
 }
 
-fn install_linux_runtime_page(address: u64, page: address_space::LinuxRuntimePage) -> bool {
-    let installed = match page.frame {
-        Some(frame) => {
-            address_space::install_current_linux_runtime_page(
-                address,
-                frame,
-                page.protection,
-                page.file,
-                false,
-            ) == Some(None)
-        }
-        None => {
-            address_space::reserve_current_linux_runtime_page(
-                address,
-                page.protection,
-                page.file,
-                false,
-            ) == Some(None)
-        }
-    };
-    installed
-        && (!page.dontfork || address_space::set_current_linux_runtime_page_dontfork(address, true))
-        && (!page.wipeonfork
-            || address_space::set_current_linux_runtime_page_wipeonfork(address, true))
-}
-
 fn linux_mremap(
     old_address: u64,
     old_length: u64,
@@ -25750,27 +25807,75 @@ fn linux_mremap(
     if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
         return LINUX_ENOSYS;
     }
+    if flags & !(MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP) != 0
+        || flags & MREMAP_FIXED != 0 && flags & MREMAP_MAYMOVE == 0
+        || flags & MREMAP_DONTUNMAP != 0
+    {
+        return LINUX_EINVAL;
+    }
     let Some((old_end, old_pages)) = linux_runtime_mapping_range(old_address, old_length) else {
         return LINUX_EINVAL;
     };
     let Ok(new_pages) = usize::try_from(new_length.div_ceil(PAGE_SIZE as u64)) else {
         return LINUX_ENOMEM;
     };
-    if new_length == 0
-        || flags & !(MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP) != 0
-        || flags & MREMAP_FIXED != 0 && flags & MREMAP_MAYMOVE == 0
-        || flags & MREMAP_DONTUNMAP != 0
-        || (0..old_pages).any(|page| {
-            !address_space::current_linux_runtime_page(old_address + (page * PAGE_SIZE) as u64)
-                .occupied
-        })
+    if new_length == 0 {
+        return LINUX_EINVAL;
+    }
+    let fixed = flags & MREMAP_FIXED != 0;
+    let new_bytes = (new_pages as u64).saturating_mul(PAGE_SIZE as u64);
+    // MREMAP_FIXED's destination is page aligned, in the user half of the
+    // address space and apart from the source (mremap05).
+    if fixed
+        && (!fixed_address.is_multiple_of(PAGE_SIZE as u64)
+            || fixed_address
+                .checked_add(new_bytes)
+                .is_none_or(|end| end > 1 << 47 || fixed_address < old_end && old_address < end))
     {
         return LINUX_EINVAL;
+    }
+    // A source that is not wholly mapped is EFAULT (mremap03).
+    if (0..old_pages).any(|page| {
+        !address_space::current_linux_runtime_page(old_address + (page * PAGE_SIZE) as u64).occupied
+    }) {
+        return LINUX_EFAULT;
     }
     if (0..old_pages).any(|page| {
         address_space::current_linux_runtime_page(old_address + (page * PAGE_SIZE) as u64).sealed
     }) {
         return LINUX_EPERM;
+    }
+    let template = address_space::current_linux_runtime_page(old_address);
+    if fixed {
+        if template.file && new_pages > old_pages {
+            return LINUX_ENOMEM;
+        }
+        // The destination is unmapped first, as Linux does (mremap08),
+        // and a shrinking source loses its tail before it moves.
+        let unmapped = linux_munmap(fixed_address, new_bytes);
+        if unmapped != 0 {
+            return unmapped;
+        }
+        crate::linux_areas::unmap(
+            linux_execution_instance(),
+            current_linux_process_pid(),
+            fixed_address,
+            new_bytes,
+        );
+        for page in new_pages..old_pages {
+            if !release_linux_runtime_page(address_space::remove_current_linux_runtime_page(
+                old_address + (page * PAGE_SIZE) as u64,
+            )) {
+                return LINUX_EINVAL;
+            }
+        }
+        return linux_mremap_move(
+            old_address,
+            old_pages.min(new_pages),
+            new_pages,
+            fixed_address,
+            &template,
+        );
     }
     if old_pages == new_pages {
         return old_address;
@@ -25786,7 +25891,6 @@ fn linux_mremap(
         return old_address;
     }
 
-    let template = address_space::current_linux_runtime_page(old_address);
     let extension_pages = new_pages - old_pages;
     if !linux_address_space_limit_allows(extension_pages) {
         return LINUX_ENOMEM;
@@ -25825,36 +25929,51 @@ fn linux_mremap(
     if flags & MREMAP_MAYMOVE == 0 {
         return LINUX_ENOMEM;
     }
-    let fixed = flags & MREMAP_FIXED != 0;
-    let Some(destination) = linux_runtime_select_mapping(fixed_address, new_pages, fixed, false)
-    else {
+    let Some(destination) = linux_runtime_select_mapping(0, new_pages, false, false) else {
         return LINUX_ENOMEM;
     };
-    let Some(destination_end) = destination.checked_add((new_pages * PAGE_SIZE) as u64) else {
+    if !linux_runtime_range_available(destination, new_pages) {
         return LINUX_ENOMEM;
-    };
-    if destination < old_end && old_address < destination_end
-        || !linux_runtime_range_available(destination, new_pages)
-    {
-        return if fixed { LINUX_EINVAL } else { LINUX_ENOMEM };
     }
+    linux_mremap_move(old_address, old_pages, new_pages, destination, &template)
+}
 
+/// Moves the first `old_pages` pages at `old_address` to `destination`
+/// and reserves the rest up to `new_pages` like `template`, undoing the
+/// move if a page cannot be placed.
+fn linux_mremap_move(
+    old_address: u64,
+    old_pages: usize,
+    new_pages: usize,
+    destination: u64,
+    template: &address_space::LinuxRuntimePage,
+) -> u64 {
     for page_index in 0..old_pages {
         let source = old_address + (page_index * PAGE_SIZE) as u64;
         let target = destination + (page_index * PAGE_SIZE) as u64;
-        let page = address_space::remove_current_linux_runtime_page(source);
-        if !page.occupied || !install_linux_runtime_page(target, page) {
-            if page.occupied {
-                let _ = install_linux_runtime_page(source, page);
-            }
+        if !address_space::move_current_linux_runtime_page(source, target) {
             for rollback in 0..page_index {
-                let moved = address_space::remove_current_linux_runtime_page(
+                let _ = address_space::move_current_linux_runtime_page(
                     destination + (rollback * PAGE_SIZE) as u64,
+                    old_address + (rollback * PAGE_SIZE) as u64,
                 );
-                let _ =
-                    install_linux_runtime_page(old_address + (rollback * PAGE_SIZE) as u64, moved);
             }
             return LINUX_ENOMEM;
+        }
+    }
+    // A page of a shared file or shmem mapping keeps its place in the file
+    // at its new address.
+    let pid = current_linux_process_pid();
+    for page_index in 0..old_pages {
+        let source = old_address + (page_index * PAGE_SIZE) as u64;
+        if let Some((handle, offset)) = crate::linux_overlay::shared_mapping(pid, source) {
+            let _ = crate::linux_overlay::remove_shared_mapping(pid, source);
+            let _ = crate::linux_overlay::register_shared_mapping(
+                pid,
+                destination + (page_index * PAGE_SIZE) as u64,
+                handle,
+                offset,
+            );
         }
     }
     for page in old_pages..new_pages {
@@ -25873,11 +25992,10 @@ fn linux_mremap(
                     ));
             }
             for rollback in 0..old_pages {
-                let moved = address_space::remove_current_linux_runtime_page(
+                let _ = address_space::move_current_linux_runtime_page(
                     destination + (rollback * PAGE_SIZE) as u64,
+                    old_address + (rollback * PAGE_SIZE) as u64,
                 );
-                let _ =
-                    install_linux_runtime_page(old_address + (rollback * PAGE_SIZE) as u64, moved);
             }
             return LINUX_ENOMEM;
         }
@@ -25908,9 +26026,23 @@ fn linux_msync(address: u64, length: u64, flags: u64) -> u64 {
     if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
         return LINUX_ENOSYS;
     }
+    if !address.is_multiple_of(PAGE_SIZE as u64) {
+        return LINUX_EINVAL;
+    }
     let Some((_, pages)) = linux_runtime_mapping_range(address, length) else {
         return LINUX_ENOMEM;
     };
+    // Pages locked in memory cannot be invalidated.
+    if flags & MS_INVALIDATE != 0
+        && crate::linux_areas::locked_in(
+            linux_execution_instance(),
+            current_linux_process_pid(),
+            address,
+            length,
+        )
+    {
+        return LINUX_EBUSY;
+    }
     for page in 0..pages {
         let page_address = address + (page * PAGE_SIZE) as u64;
         if !address_space::current_linux_runtime_page(page_address).occupied {
@@ -26840,7 +26972,7 @@ fn linux_mprotect(address: u64, length: u64, protection: u64) -> u64 {
         return LINUX_EINVAL;
     }
     if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
-        && address >= LINUX_RUNTIME_DYNAMIC_MMAP_BASE
+        && (address >= LINUX_RUNTIME_DYNAMIC_MMAP_BASE || linux_runtime_heap_contains(address))
     {
         return linux_runtime_mprotect(address, length, protection);
     }
@@ -27610,6 +27742,30 @@ fn linux_munmap(address: u64, length: u64) -> u64 {
 
 fn linux_madvise(address: u64, length: u64, advice: u64) -> u64 {
     let advice = u64::from(advice as u32);
+    if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
+        // Ginux has no same-page merging: Linux built without CONFIG_KSM
+        // refuses the advice (madvise02).
+        if matches!(advice, LINUX_MADV_MERGEABLE | LINUX_MADV_UNMERGEABLE) {
+            return LINUX_EINVAL;
+        }
+        if length == 0
+            && address.is_multiple_of(PAGE_SIZE as u64)
+            && matches!(advice, LINUX_MADV_WIPEONFORK | LINUX_MADV_KEEPONFORK)
+        {
+            return 0;
+        }
+        // Locked pages may not be dropped.
+        if matches!(advice, LINUX_MADV_DONTNEED | LINUX_MADV_FREE)
+            && crate::linux_areas::locked_in(
+                linux_execution_instance(),
+                current_linux_process_pid(),
+                address & !(PAGE_SIZE as u64 - 1),
+                length,
+            )
+        {
+            return LINUX_EINVAL;
+        }
+    }
     if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
         && matches!(
             advice,
@@ -38094,7 +38250,14 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
                     && append_linux_decimal(&mut file, &mut used, u64::from(status.parent_pid))
                     && append_linux_bytes(&mut file, &mut used, b"\n")
                     && append_linux_credentials_status(&mut file, &mut used)
-                    && append_linux_bytes(&mut file, &mut used, b"VmLck:\t0 kB\nVmSwap:\t0 kB\n")
+                    && append_linux_bytes(&mut file, &mut used, b"VmLck:\t")
+                    && append_linux_decimal(
+                        &mut file,
+                        &mut used,
+                        crate::linux_areas::locked_bytes(linux_execution_instance(), status.pid)
+                            / 1024,
+                    )
+                    && append_linux_bytes(&mut file, &mut used, b" kB\nVmSwap:\t0 kB\n")
             }
             LINUX_FILE_PROC_DYNAMIC_STAT => {
                 append_linux_decimal(&mut file, &mut used, u64::from(status.pid))
@@ -49583,13 +49746,17 @@ fn linux_memory_lock(address: u64, length: u64, flags: u64, lock: bool) -> u64 {
             return LINUX_ENOMEM;
         }
     }
-    if materialize_linux_runtime_user_range(address, length, false) {
-        // Ginux has no swapping or reclaim path: every mapped page is already
-        // resident, so locking and unlocking do not require additional state.
-        0
-    } else {
-        LINUX_ENOMEM
+    // MLOCK_ONFAULT locks pages as they are touched instead of now; Ginux
+    // has no reclaim, so a touched page stays resident either way.
+    const MLOCK_ONFAULT: u32 = 1;
+    if lock
+        && flags & MLOCK_ONFAULT == 0
+        && !materialize_linux_runtime_user_range(address, length, false)
+    {
+        return LINUX_ENOMEM;
     }
+    crate::linux_areas::lock(linux_execution_instance(), pid, start, end - start, lock);
+    0
 }
 
 fn linux_mlockall(flags: u64) -> u64 {
@@ -49626,7 +49793,28 @@ fn linux_mlockall(flags: u64) -> u64 {
         }
     }
     // Every present and future Ginux userspace mapping is resident because the
-    // kernel has no swap or page-reclaim path.
+    // kernel has no swap or page-reclaim path; the areas record the locks
+    // (VmLck) and whether later mappings are locked.
+    if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
+        crate::linux_areas::lock_all(
+            linux_execution_instance(),
+            current_linux_process_pid(),
+            (flags & MCL_CURRENT != 0).then_some(true),
+            flags & MCL_FUTURE != 0,
+        );
+    }
+    0
+}
+
+fn linux_munlockall() -> u64 {
+    if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
+        crate::linux_areas::lock_all(
+            linux_execution_instance(),
+            current_linux_process_pid(),
+            Some(false),
+            false,
+        );
+    }
     0
 }
 
