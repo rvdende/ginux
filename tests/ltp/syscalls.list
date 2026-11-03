@@ -1040,7 +1040,7 @@ recvfrom01 recvfrom01
 recvmsg01 recvmsg01
 recvmsg02 recvmsg02
 recvmsg03 recvmsg03
-recvmmsg01 recvmmsg01
+!recvmmsg01 recvmmsg01  # musl: recvmmsg zeroes each header's padding in user space, so the bad message vector case faults before the call
 remap_file_pages01 remap_file_pages01
 remap_file_pages02 remap_file_pages02
 removexattr01 removexattr01

@@ -14,7 +14,6 @@ clone10 TBROK
 clone301 TBROK
 creat07 TFAIL
 epoll_wait06 TFAIL
-epoll_wait10 TFAIL
 epoll_wait16 TBROK
 epoll_pwait01 TBROK
 execve04 TFAIL
@@ -81,10 +80,8 @@ ptrace08 TBROK
 ptrace09 TBROK
 ptrace10 TBROK
 ptrace11 TBROK
-recvmmsg01 TBROK
 remap_file_pages01 TBROK
 sbrk01 TFAIL
-send02 TBROK
 setns02 TWARN
 setxattr03 TBROK
 sigaction01 TBROK

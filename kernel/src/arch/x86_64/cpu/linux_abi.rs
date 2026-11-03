@@ -597,6 +597,9 @@ pub(super) const LINUX_FANOTIFY_MARK_LIMIT: usize = 16;
 pub(super) const LINUX_DESCRIPTOR_FLAG_WORD_COUNT: usize =
     LINUX_DESCRIPTOR_TABLE_LIMIT.div_ceil(u64::BITS as u64) as usize;
 pub(super) const LINUX_POLLIN: u16 = 1;
+/// Urgent or exceptional data (a /proc/mounts change).
+pub(super) const LINUX_POLLPRI: u16 = 2;
+pub(super) const LINUX_POLLRDNORM: u16 = 0x40;
 pub(super) const LINUX_POLLOUT: u16 = 4;
 pub(super) const LINUX_POLLERR: u16 = 8;
 pub(super) const LINUX_POLLHUP: u16 = 0x10;

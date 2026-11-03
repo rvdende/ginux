@@ -338,6 +338,9 @@ struct Slot {
     icmp_filter: u32,
     /// The TTL of the datagram an ICMP socket received last.
     received_ttl: u8,
+    /// What MSG_MORE sends held back: they go out with the next send
+    /// without it, as one datagram on UDP.
+    corked: Vec<u8>,
     /// A Unix datagram socket's destination for the send in progress, a
     /// socket bound to the name sendto or sendmsg gave (else its peer).
     send_target: Option<SlotId>,
@@ -383,6 +386,7 @@ impl Slot {
             icmp_filter: 0,
             received_ttl: 0,
             groups: Vec::new(),
+            corked: Vec::new(),
             send_target: None,
             last_sender: Vec::new(),
             netlink_protocol: 0,
@@ -1656,6 +1660,9 @@ impl Sockets {
         if kind == Kind::Icmp {
             return self.send_icmp(id, input, remote.or(connected).ok_or(Error::NotConnected)?);
         }
+        if kind == Kind::Udp {
+            self.bind_udp_ephemeral(id)?;
+        }
         let runtime = self.runtime()?;
         let handle = handle.ok_or(Error::Invalid)?;
         match kind {
@@ -1687,6 +1694,32 @@ impl Sockets {
             }
             Kind::Icmp | Kind::Unix | Kind::Object | Kind::Netlink => Err(Error::Invalid),
         }
+    }
+
+    /// Binds UDP socket `id` to a free ephemeral port if it has none, as
+    /// Linux does on its first send (send02's sendto from a fresh socket).
+    fn bind_udp_ephemeral(&mut self, id: SlotId) -> Result<(), Error> {
+        let index = usize::from(id);
+        let Self { runtime, slots, .. } = self;
+        let runtime = runtime.as_mut().ok_or(Error::Unavailable)?;
+        let state = slot_in(slots, id).ok_or(Error::Invalid)?;
+        let handle = state.handle.ok_or(Error::Invalid)?;
+        if runtime.sockets.get::<udp::Socket>(handle).is_open() {
+            return Ok(());
+        }
+        let local_port = if state.local_port == 0 {
+            allocate_ephemeral_port(&mut runtime.next_port, slots, Kind::Udp, index)
+                .ok_or(Error::Exhausted)?
+        } else {
+            state.local_port
+        };
+        runtime
+            .sockets
+            .get_mut::<udp::Socket>(handle)
+            .bind(local_port)
+            .map_err(|_| Error::Invalid)?;
+        slot_in_mut(slots, id).ok_or(Error::Invalid)?.local_port = local_port;
+        Ok(())
     }
 
     /// Sends `input`, an ICMP message, to `remote`'s address in an IPv4
@@ -2719,6 +2752,26 @@ pub(crate) fn connect_unix(
 }
 
 /// The path a Unix socket is bound to, empty when it has none.
+/// Holds `input` back for socket `id`'s next send without MSG_MORE.
+pub(crate) fn cork(id: SlotId, input: &[u8]) -> Result<usize, Error> {
+    let mut sockets = SOCKETS.lock();
+    let corked = &mut sockets.slot_mut(id).ok_or(Error::Invalid)?.corked;
+    corked
+        .try_reserve(input.len())
+        .map_err(|_| Error::Exhausted)?;
+    corked.extend_from_slice(input);
+    Ok(input.len())
+}
+
+/// Takes what socket `id`'s MSG_MORE sends held back.
+pub(crate) fn take_corked(id: SlotId) -> Vec<u8> {
+    SOCKETS
+        .lock()
+        .slot_mut(id)
+        .map(|state| core::mem::take(&mut state.corked))
+        .unwrap_or_default()
+}
+
 /// The datagram socket bound to `path` that `id` may send to.
 pub(crate) fn unix_datagram_target(id: SlotId, path: &[u8]) -> Result<SlotId, Error> {
     SOCKETS.lock().unix_datagram_target(id, path)

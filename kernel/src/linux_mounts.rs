@@ -42,6 +42,10 @@ pub(crate) struct Mount {
 
 struct Mounts {
     mounts: Vec<Mount>,
+    /// How often each domain's mount table changed (mount, remount,
+    /// unmount): a /proc/mounts reader that saw an older count is told of
+    /// the change (POLLPRI).
+    changes: Vec<(usize, u32)>,
     /// Ids continue after the kernel's own mounts (root, /proc, cgroup).
     next_id: u32,
 }
@@ -50,6 +54,7 @@ static MOUNTS: SpinLock<Mounts> = SpinLock::new(
     LockRank::MOUNTS,
     Mounts {
         mounts: Vec::new(),
+        changes: Vec::new(),
         next_id: 4,
     },
 );
@@ -82,6 +87,7 @@ pub(crate) fn mount(
     let id = table.next_id;
     table.next_id = id.wrapping_add(1);
     table.mounts.push(Mount { id, ..mount });
+    changed(&mut table, instance);
     Ok(id)
 }
 
@@ -99,6 +105,7 @@ pub(crate) fn remount(instance: usize, path: &[u8], flags: u32) -> Result<(), Er
     let mut table = MOUNTS.lock();
     let index = topmost(&table, instance, path).ok_or(Error::NotMounted)?;
     table.mounts[index].flags = flags;
+    changed(&mut table, instance);
     Ok(())
 }
 
@@ -107,7 +114,32 @@ pub(crate) fn remount(instance: usize, path: &[u8], flags: u32) -> Result<(), Er
 pub(crate) fn unmount(instance: usize, path: &[u8]) -> Result<Vec<u8>, Error> {
     let mut table = MOUNTS.lock();
     let index = topmost(&table, instance, path).ok_or(Error::NotMounted)?;
-    Ok(table.mounts.remove(index).filesystem)
+    let filesystem = table.mounts.remove(index).filesystem;
+    changed(&mut table, instance);
+    Ok(filesystem)
+}
+
+/// Counts a change to `instance`'s mount table.
+fn changed(table: &mut Mounts, instance: usize) {
+    if let Some((_, count)) = table
+        .changes
+        .iter_mut()
+        .find(|(owner, _)| *owner == instance)
+    {
+        *count = count.wrapping_add(1);
+    } else if table.changes.try_reserve(1).is_ok() {
+        table.changes.push((instance, 1));
+    }
+}
+
+/// How often `instance`'s mount table has changed.
+pub(crate) fn changes(instance: usize) -> u32 {
+    MOUNTS
+        .lock()
+        .changes
+        .iter()
+        .find(|(owner, _)| *owner == instance)
+        .map_or(0, |(_, count)| *count)
 }
 
 /// Something is mounted at canonical `path`.
@@ -150,8 +182,7 @@ fn covers(point: &[u8], path: &[u8]) -> bool {
 
 /// Drops `instance`'s mounts when its domain stops.
 pub(crate) fn forget_instance(instance: usize) {
-    MOUNTS
-        .lock()
-        .mounts
-        .retain(|mount| mount.instance != instance);
+    let mut table = MOUNTS.lock();
+    table.mounts.retain(|mount| mount.instance != instance);
+    table.changes.retain(|(owner, _)| *owner != instance);
 }

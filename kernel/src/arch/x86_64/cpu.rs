@@ -33474,8 +33474,13 @@ fn linux_openat_path(
         }
         return LINUX_EMFILE;
     };
+    // /proc/mounts remembers the mount table it was opened on: a later
+    // change is POLLPRI until it is read again (epoll_wait10).
+    let mounts_seen = (kind & !3 == LINUX_FILE_PROC_MOUNTS)
+        .then(|| u64::from(crate::linux_mounts::changes(linux_execution_instance())));
     let tmp_generation = proc_fdinfo_target
         .or(proc_dynamic_pid.map(u64::from))
+        .or(mounts_seen)
         .map_or_else(
             || {
                 overlay_handle.map_or_else(
@@ -37282,7 +37287,7 @@ fn linux_socket_sendto(
     destination_length: u64,
 ) -> u64 {
     const MSG_OOB: u64 = 1;
-    const SUPPORTED_FLAGS: u64 = MSG_OOB | 0x40 | 0x4000;
+    const SUPPORTED_FLAGS: u64 = MSG_OOB | 0x40 | 0x4000 | LINUX_MSG_MORE;
     // The largest UDP payload over IPv4.
     const UDP_PAYLOAD_LIMIT: u64 = 65_507;
     let flags = u64::from(flags as u32);
@@ -37373,11 +37378,7 @@ fn linux_socket_sendto(
     } else {
         None
     };
-    let result = if flags & 0x40 != 0 || linux_socket_nonblocking(descriptor) {
-        crate::linux_socket::send(slot, &bytes[..length], remote)
-    } else {
-        crate::linux_socket::send_blocking(slot, &bytes[..length], remote)
-    };
+    let result = linux_socket_send_corked(slot, descriptor, flags, &bytes[..length], remote);
     match result {
         Ok(written) => {
             if let Some(credentials) = automatic_credentials {
@@ -37538,7 +37539,7 @@ fn linux_socket_recvfrom(
 
 fn linux_socket_sendmsg(descriptor: u64, message: u64, flags: u64) -> u64 {
     const MSG_OOB: u64 = 1;
-    const SUPPORTED_FLAGS: u64 = 0x40 | 0x4000;
+    const SUPPORTED_FLAGS: u64 = 0x40 | 0x4000 | LINUX_MSG_MORE;
     let flags = u64::from(flags as u32);
     let Some(slot) = linux_socket_slot(descriptor) else {
         return linux_not_socket_error(descriptor);
@@ -37761,11 +37762,7 @@ fn linux_socket_sendmsg(descriptor: u64, message: u64, flags: u64) -> u64 {
             return LINUX_ENFILE;
         }
     }
-    let result = if flags & 0x40 != 0 || linux_socket_nonblocking(descriptor) {
-        crate::linux_socket::send(slot, &bytes[..used], remote)
-    } else {
-        crate::linux_socket::send_blocking(slot, &bytes[..used], remote)
-    };
+    let result = linux_socket_send_corked(slot, descriptor, flags, &bytes[..used], remote);
     match result {
         Ok(written) => {
             if passed_right_count != 0 {
@@ -38333,6 +38330,51 @@ fn linux_write_unnamed_unix_address(address: u64, length_address: u64) -> bool {
     let length = u32::from_ne_bytes(supplied).min(2) as usize;
     copy_to_linux_user(address, &1_u16.to_ne_bytes()[..length])
         && copy_to_linux_user(length_address, &2_u32.to_ne_bytes())
+}
+
+/// MSG_MORE: more data follows, so the send is held back.
+const LINUX_MSG_MORE: u64 = 0x8000;
+
+/// Sends `payload` on socket `slot` (descriptor `descriptor`), waiting
+/// unless MSG_DONTWAIT or the descriptor says not to. On TCP and UDP,
+/// MSG_MORE holds the data back, and the next send without it goes out
+/// with what was held, as one datagram on UDP (send02); the count returned
+/// is this call's.
+fn linux_socket_send_corked(
+    slot: crate::linux_socket::SlotId,
+    descriptor: u64,
+    flags: u64,
+    payload: &[u8],
+    remote: Option<smoltcp::wire::IpEndpoint>,
+) -> Result<usize, crate::linux_socket::Error> {
+    let corks = matches!(
+        crate::linux_socket::kind(slot),
+        Some(crate::linux_socket::Kind::Tcp | crate::linux_socket::Kind::Udp)
+    );
+    if corks && flags & LINUX_MSG_MORE != 0 {
+        return crate::linux_socket::cork(slot, payload);
+    }
+    let mut corked = if corks {
+        crate::linux_socket::take_corked(slot)
+    } else {
+        Vec::new()
+    };
+    let held = corked.len();
+    let combined = if held == 0 {
+        payload
+    } else {
+        corked
+            .try_reserve(payload.len())
+            .map_err(|_| crate::linux_socket::Error::Exhausted)?;
+        corked.extend_from_slice(payload);
+        &corked
+    };
+    let sent = if flags & 0x40 != 0 || linux_socket_nonblocking(descriptor) {
+        crate::linux_socket::send(slot, combined, remote)
+    } else {
+        crate::linux_socket::send_blocking(slot, combined, remote)
+    };
+    sent.map(|written| written.saturating_sub(held))
 }
 
 /// A Unix datagram socket's send to a name in progress: its sends go to the
@@ -39091,6 +39133,12 @@ fn linux_resolv_conf() -> ([u8; 32], usize) {
 
 fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset: u64) -> u64 {
     let state = linux_device_descriptor(descriptor);
+    if state & !3 == LINUX_FILE_PROC_MOUNTS {
+        linux_set_descriptor_tmp_generation(
+            descriptor,
+            crate::linux_mounts::changes(linux_execution_instance()).wrapping_add(1),
+        );
+    }
     if linux_path_descriptor(descriptor) {
         return LINUX_EBADF;
     }
@@ -43547,7 +43595,12 @@ fn linux_epoll_event_from(
             continue;
         }
         let ready = linux_descriptor_poll_events(target as i32, requested)
-            & (LINUX_POLLIN | LINUX_POLLOUT | LINUX_POLLERR | LINUX_POLLHUP | LINUX_POLLRDHUP);
+            & (LINUX_POLLIN
+                | LINUX_POLLPRI
+                | LINUX_POLLOUT
+                | LINUX_POLLERR
+                | LINUX_POLLHUP
+                | LINUX_POLLRDHUP);
         if stored & LINUX_EPOLLET != 0 {
             // Edge-triggered: report only readiness not reported since the
             // descriptor was last used (linux_epoll_rearm_for_syscall) or
@@ -45480,6 +45533,16 @@ fn linux_descriptor_poll_events(descriptor: i32, requested: u16) -> u16 {
         }
         None => {}
     }
+    // /proc/mounts reads at once, and a mount table change since it was
+    // last read is POLLPRI and POLLERR, as in Linux.
+    if linux_device_descriptor(descriptor) & !3 == LINUX_FILE_PROC_MOUNTS {
+        let readable = requested & (LINUX_POLLIN | LINUX_POLLRDNORM);
+        return if linux_proc_mounts_changed(descriptor) {
+            readable | LINUX_POLLPRI | LINUX_POLLERR
+        } else {
+            readable
+        };
+    }
     if linux_pidfd_descriptor(descriptor) {
         let Some(process) = linux_pidfd_process(descriptor) else {
             return LINUX_POLLHUP;
@@ -46713,6 +46776,34 @@ fn linux_proc_fdinfo_descriptor_target(descriptor: u64) -> Option<u64> {
     }
     linux_descriptor_tmp_generation(descriptor)
         .and_then(|encoded| u64::from(encoded).checked_sub(1))
+}
+
+/// Sets the value `linux_descriptor_tmp_generation` reads.
+fn linux_set_descriptor_tmp_generation(descriptor: u64, value: u32) {
+    if let Some(slot) = usize::try_from(descriptor)
+        .ok()
+        .and_then(|index| X86_RUNTIME.ELF_PROBE_STDIO_TMP_FILE_GENERATIONS.get(index))
+    {
+        slot.store(value, Ordering::SeqCst);
+    } else if let Some(slot) =
+        descriptor
+            .checked_sub(LINUX_AUX_DESCRIPTOR_FIRST)
+            .and_then(|index| {
+                X86_RUNTIME
+                    .ELF_PROBE_TMP_FILE_GENERATIONS
+                    .get(index as usize)
+            })
+    {
+        slot.store(value, Ordering::SeqCst);
+    }
+}
+
+/// Whether /proc/mounts descriptor `descriptor` was opened or last read
+/// before the mount table's latest change.
+fn linux_proc_mounts_changed(descriptor: u64) -> bool {
+    linux_descriptor_tmp_generation(descriptor).is_some_and(|seen| {
+        seen != crate::linux_mounts::changes(linux_execution_instance()).wrapping_add(1)
+    })
 }
 
 fn linux_descriptor_tmp_generation(descriptor: u64) -> Option<u32> {
