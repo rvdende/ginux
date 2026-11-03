@@ -843,8 +843,8 @@ nanosleep04 nanosleep04
 name_to_handle_at01 name_to_handle_at01
 name_to_handle_at02 name_to_handle_at02
 name_to_handle_at03 name_to_handle_at03
-nftw01 nftw01
-nftw6401 nftw6401
+!nftw01 nftw01  # musl: nftw follows symlinks without remembering the files it reported (glibc dedupes by device and inode)
+!nftw6401 nftw6401  # musl: nftw follows symlinks without remembering the files it reported (glibc dedupes by device and inode)
 nice01 nice01
 nice02 nice02
 nice03 nice03

@@ -54,8 +54,6 @@ mount_setattr02 TBROK
 mprotect01 TBROK
 mremap01 TFAIL
 msgstress01 TBROK
-nftw01 TFAIL
-nftw6401 TFAIL
 openat03 TBROK
 madvise11 TBROK
 pidfd_send_signal01 TFAIL
@@ -75,8 +73,6 @@ sbrk01 TFAIL
 setns02 TWARN
 setxattr03 TBROK
 signal06 TBROK
-sigtimedwait01 HANG
-sigwaitinfo01 HANG
 statmount03 TBROK
 times03 TFAIL
 unshare03 TFAIL
