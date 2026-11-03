@@ -29311,6 +29311,7 @@ fn linux_proc_pid_file_kind(pid: u32, name: &[u8]) -> Option<u16> {
         (_, b"stat") => Some(LINUX_FILE_PROC_DYNAMIC_STAT),
         (_, b"statm") => Some(LINUX_FILE_PROC_DYNAMIC_STATM),
         (_, b"maps") => Some(LINUX_FILE_PROC_DYNAMIC_MAPS),
+        (_, b"smaps") => Some(LINUX_FILE_PROC_DYNAMIC_SMAPS),
         (_, b"comm") => Some(LINUX_FILE_PROC_TASK_COMM),
         (_, b"task" | b"task/") => Some(LINUX_PROC_TASK_DIRECTORY),
         (_, name) if name.starts_with(b"task/") => linux_proc_task_file_kind(pid, &name[5..]),
@@ -32999,6 +33000,7 @@ fn linux_openat_path(
                     | b"stat"
                     | b"statm"
                     | b"maps"
+                    | b"smaps"
                     | b"oom_score_adj"
                     | b"comm"
                     | b"task"
@@ -38719,6 +38721,7 @@ fn linux_descriptor_read(descriptor: u64, address: u64, count: u64) -> u64 {
             | LINUX_FILE_PROC_DYNAMIC_STATUS
             | LINUX_FILE_PROC_DYNAMIC_STATM
             | LINUX_FILE_PROC_DYNAMIC_MAPS
+            | LINUX_FILE_PROC_DYNAMIC_SMAPS
             | LINUX_FILE_PROC_OOM_SCORE_ADJ
             | LINUX_FILE_PROC_TASK_COMM
             | LINUX_FILE_PROC_TASK_STAT
@@ -38963,11 +38966,14 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
             LINUX_EFAULT
         };
     }
-    if state & !3 == LINUX_FILE_PROC_DYNAMIC_MAPS {
+    if matches!(
+        state & !3,
+        LINUX_FILE_PROC_DYNAMIC_MAPS | LINUX_FILE_PROC_DYNAMIC_SMAPS
+    ) {
         let Some(pid) = linux_proc_dynamic_descriptor_pid(descriptor) else {
             return LINUX_EBADF;
         };
-        let Some(maps) = linux_proc_maps(pid) else {
+        let Some(maps) = linux_proc_maps(pid, state & !3 == LINUX_FILE_PROC_DYNAMIC_SMAPS) else {
             return LINUX_ENOENT;
         };
         let start = usize::try_from(offset)
@@ -46496,6 +46502,107 @@ fn append_linux_maps_line(
     Some(())
 }
 
+/// For /proc/PID/smaps (`details` is Some, true for the calling process,
+/// whose pages can be counted): the sizes of the area `[start, end)`.
+/// Rss counts the pages present (in the caller's own address space; a
+/// lazily reserved area of 64 MiB or more is not walked), and Locked is
+/// Rss for a locked area.
+fn append_linux_smaps_details(
+    text: &mut Vec<u8>,
+    (start, end): (u64, u64),
+    area: &address_space::LinuxMemoryArea,
+    recorded: Option<&crate::linux_areas::Area>,
+    details: Option<bool>,
+) -> Option<()> {
+    let Some(countable) = details else {
+        return Some(());
+    };
+    let size = (end - start) / 1024;
+    let resident = if countable && end - start < 64 << 20 {
+        (start..end)
+            .step_by(PAGE_SIZE)
+            .filter(|page| {
+                address_space::current_linux_runtime_page(*page)
+                    .frame
+                    .is_some()
+            })
+            .count() as u64
+            * (PAGE_SIZE as u64 / 1024)
+    } else {
+        0
+    };
+    let locked = if recorded.is_some_and(|part| part.locked) {
+        resident
+    } else {
+        0
+    };
+    let anonymous = if area.shared { 0 } else { resident };
+    let fields: [(&[u8], u64); 18] = [
+        (b"Size", size),
+        (b"KernelPageSize", PAGE_SIZE as u64 / 1024),
+        (b"MMUPageSize", PAGE_SIZE as u64 / 1024),
+        (b"Rss", resident),
+        (b"Pss", resident),
+        (b"Pss_Dirty", resident),
+        (b"Shared_Clean", 0),
+        (b"Shared_Dirty", 0),
+        (b"Private_Clean", 0),
+        (b"Private_Dirty", resident),
+        (b"Referenced", resident),
+        (b"Anonymous", anonymous),
+        (b"LazyFree", 0),
+        (b"AnonHugePages", 0),
+        (b"ShmemPmdMapped", 0),
+        (b"Swap", 0),
+        (b"SwapPss", 0),
+        (b"Locked", locked),
+    ];
+    for (name, value) in fields {
+        let mut line = [0_u8; 64];
+        let mut used = 0;
+        let mut value_text = [0_u8; 24];
+        let mut value_used = 0;
+        if !append_linux_decimal(&mut value_text, &mut value_used, value) {
+            return None;
+        }
+        // "Name:" padded to 16 columns, the value right-aligned in 8.
+        let label_ok = append_linux_bytes(&mut line, &mut used, name)
+            && append_linux_bytes(&mut line, &mut used, b":");
+        if !label_ok {
+            return None;
+        }
+        let pad = 16_usize.saturating_sub(used) + 8_usize.saturating_sub(value_used);
+        text.try_reserve(used + pad + value_used + 4).ok()?;
+        text.extend_from_slice(&line[..used]);
+        text.extend(core::iter::repeat_n(b' ', pad.max(1)));
+        text.extend_from_slice(&value_text[..value_used]);
+        text.extend_from_slice(b" kB\n");
+    }
+    let mut flags = Vec::new();
+    flags.try_reserve(40).ok()?;
+    flags.extend_from_slice(b"VmFlags:");
+    for (bit, flag) in [
+        (LINUX_PROT_READ as u8, &b" rd"[..]),
+        (LINUX_PROT_WRITE as u8, &b" wr"[..]),
+        (LINUX_PROT_EXEC as u8, &b" ex"[..]),
+    ] {
+        if area.protection & bit != 0 {
+            flags.extend_from_slice(flag);
+        }
+    }
+    if area.shared {
+        flags.extend_from_slice(b" sh");
+    }
+    flags.extend_from_slice(b" mr mw me");
+    if recorded.is_some_and(|part| part.locked) {
+        flags.extend_from_slice(b" lo");
+    }
+    flags.push(b'\n');
+    text.try_reserve(flags.len()).ok()?;
+    text.extend_from_slice(&flags);
+    Some(())
+}
+
 /// Appends `value` in lowercase hex, zero-padded to at least `width` digits.
 fn append_linux_padded_hex(output: &mut [u8], used: &mut usize, value: u64, width: usize) -> bool {
     let digits = (64 - value.leading_zeros() as usize).div_ceil(4).max(width);
@@ -46519,8 +46626,11 @@ fn append_linux_padded_hex(output: &mut [u8], used: &mut usize, value: u64, widt
     true
 }
 
-fn linux_proc_maps(pid: u32) -> Option<Vec<u8>> {
+/// /proc/PID/maps, or with `smaps` /proc/PID/smaps: each line followed by
+/// the area's sizes.
+fn linux_proc_maps(pid: u32, smaps: bool) -> Option<Vec<u8>> {
     let current = pid == current_linux_process_pid();
+    let details = smaps.then_some(current);
     let root = if current {
         address_space::current_root_address()
     } else {
@@ -46555,14 +46665,17 @@ fn linux_proc_maps(pid: u32) -> Option<Vec<u8>> {
         {
             if part.start > cursor {
                 append_linux_maps_line(&mut text, (cursor, part.start), &area, None, name)?;
+                append_linux_smaps_details(&mut text, (cursor, part.start), &area, None, details)?;
             }
             let start = cursor.max(part.start);
             let end = part.end.min(area.end);
             append_linux_maps_line(&mut text, (start, end), &area, Some(part), name)?;
+            append_linux_smaps_details(&mut text, (start, end), &area, Some(part), details)?;
             cursor = end;
         }
         if cursor < area.end {
             append_linux_maps_line(&mut text, (cursor, area.end), &area, None, name)?;
+            append_linux_smaps_details(&mut text, (cursor, area.end), &area, None, details)?;
         }
     }
     Some(text)
@@ -46590,6 +46703,7 @@ fn linux_proc_dynamic_descriptor_pid(descriptor: u64) -> Option<u32> {
             | LINUX_FILE_PROC_DYNAMIC_STATUS
             | LINUX_FILE_PROC_DYNAMIC_STATM
             | LINUX_FILE_PROC_DYNAMIC_MAPS
+            | LINUX_FILE_PROC_DYNAMIC_SMAPS
             | LINUX_FILE_PROC_OOM_SCORE_ADJ
             | LINUX_FILE_PROC_TASK_COMM
             | LINUX_FILE_PROC_TASK_STAT
@@ -46641,6 +46755,7 @@ fn linux_proc_file(state: u16) -> bool {
             | LINUX_FILE_PROC_DYNAMIC_STATUS
             | LINUX_FILE_PROC_DYNAMIC_STATM
             | LINUX_FILE_PROC_DYNAMIC_MAPS
+            | LINUX_FILE_PROC_DYNAMIC_SMAPS
             | LINUX_FILE_PROC_TASK_COMM
             | LINUX_FILE_PROC_TASK_STAT
             | LINUX_FILE_PROC_MOUNTS
@@ -46839,6 +46954,7 @@ fn linux_regular_file(state: u16) -> Option<&'static [u8]> {
         | LINUX_FILE_PROC_DYNAMIC_STATUS
         | LINUX_FILE_PROC_DYNAMIC_STATM
         | LINUX_FILE_PROC_DYNAMIC_MAPS
+        | LINUX_FILE_PROC_DYNAMIC_SMAPS
         | LINUX_FILE_PROC_TASK_COMM
         | LINUX_FILE_PROC_TASK_STAT => return None,
         LINUX_FILE_PROC_PID1_STAT => return Some(LINUX_PROC_PID1_STAT),
@@ -46929,7 +47045,8 @@ fn linux_regular_file_inode(state: u16) -> Option<u64> {
         LINUX_FILE_PROC_DYNAMIC_STAT
         | LINUX_FILE_PROC_DYNAMIC_STATUS
         | LINUX_FILE_PROC_DYNAMIC_STATM
-        | LINUX_FILE_PROC_DYNAMIC_MAPS => return Some(48),
+        | LINUX_FILE_PROC_DYNAMIC_MAPS
+        | LINUX_FILE_PROC_DYNAMIC_SMAPS => return Some(48),
         LINUX_FILE_PROC_TASK_COMM => return Some(95),
         LINUX_FILE_PROC_TASK_STAT => return Some(96),
         _ => {}
@@ -49321,6 +49438,7 @@ fn linux_getdents(descriptor: u64, address: u64, count: u64, legacy: bool) -> u6
                 (40, 8, b"cmdline"),
                 (41, 8, b"environ"),
                 (file(LINUX_FILE_PROC_DYNAMIC_MAPS), 8, b"maps"),
+                (file(LINUX_FILE_PROC_DYNAMIC_SMAPS), 8, b"smaps"),
                 (file(LINUX_FILE_PROC_MOUNTS), 8, b"mounts"),
                 (file(LINUX_FILE_PROC_OOM_SCORE_ADJ), 8, b"oom_score_adj"),
                 (

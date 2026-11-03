@@ -56,7 +56,6 @@ keyctl30 TBROK
 kcmp03 TFAIL
 link08 TFAIL
 lsm_list_modules01 TFAIL
-mlock05 TBROK
 mlock201 TFAIL
 mmap04 TBROK
 mmap12 TFAIL
