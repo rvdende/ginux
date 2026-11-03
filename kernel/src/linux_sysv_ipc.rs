@@ -7,7 +7,7 @@ use crate::{control_abi, linux_process, memory};
 const PAGE_SIZE: usize = 4096;
 const INSTANCE_LIMIT: usize = control_abi::DOMAIN_LIMIT + 1;
 const FRAME_CAPACITY: usize = 320;
-const SEMAPHORE_CAPACITY: usize = 250;
+const SEMAPHORE_CAPACITY: usize = 240;
 const MESSAGE_CAPACITY: usize = 4048;
 const WALK_LIMIT: usize = 262_144;
 pub(crate) const SEM_VALUE_MAX: u16 = 32_767;
@@ -104,6 +104,10 @@ pub(crate) enum Error {
     WouldBlock,
     TooBig,
     Fault,
+    /// The caller may not use the object that way (EACCES).
+    Access,
+    /// Only the object's owner, creator or a privileged caller may (EPERM).
+    Permission,
 }
 
 #[derive(Clone, Copy)]
@@ -170,6 +174,9 @@ struct MessageQueue {
     max_messages: u32,
     max_message_size: u32,
     open_references: u64,
+    owner: Ownership,
+    /// msg_stime, msg_rtime, msg_ctime.
+    times: [i64; 3],
     name: [u8; 256],
 }
 
@@ -206,6 +213,9 @@ struct SemaphorePage {
     creator_pid: u32,
     last_pid: u32,
     _padding: [u8; 4],
+    owner: Ownership,
+    /// sem_otime, unused, sem_ctime.
+    times: [i64; 3],
     values: [Semaphore; SEMAPHORE_CAPACITY],
 }
 
@@ -224,6 +234,9 @@ struct SegmentPage {
     attachments: u64,
     frames_used: u16,
     _padding: [u8; 6],
+    owner: Ownership,
+    /// shm_atime, shm_dtime, shm_ctime.
+    times: [i64; 3],
     frames: [memory::FrameLease; FRAME_CAPACITY],
 }
 
@@ -241,6 +254,138 @@ const _: () = assert!(core::mem::size_of::<Attachment>() <= PAGE_SIZE);
 const _: () = assert!(core::mem::size_of::<SemaphorePage>() <= PAGE_SIZE);
 const _: () = assert!(core::mem::size_of::<MessageQueue>() <= PAGE_SIZE);
 const _: () = assert!(core::mem::size_of::<MessagePage>() == PAGE_SIZE);
+
+/// An object's `ipc_perm` owner and creator, set by the first caller to
+/// get it after it was made (`adopt`): its creator.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
+pub(crate) struct Ownership {
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    pub(crate) cuid: u32,
+    pub(crate) cgid: u32,
+    adopted: u32,
+}
+
+/// Who asks: effective user and group, and whether privileged (root).
+#[derive(Clone, Copy)]
+pub(crate) struct Caller {
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    pub(crate) privileged: bool,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum Kind {
+    Segment,
+    Semaphores,
+    Messages,
+}
+
+/// Indexes into an object's times.
+pub(crate) const TIME_OPERATION: usize = 0;
+pub(crate) const TIME_DETACH: usize = 1;
+pub(crate) const TIME_RECEIVE: usize = 1;
+pub(crate) const TIME_CHANGE: usize = 2;
+
+/// Runs `body` on object `id`'s owner, times and mode under the lock.
+fn with_header<R>(
+    kind: Kind,
+    id: u32,
+    body: impl FnOnce(&mut Ownership, &mut [i64; 3], &mut u16) -> R,
+) -> Result<R, Error> {
+    let guard = Guard::acquire().ok_or(Error::Invalid)?;
+    match kind {
+        Kind::Segment => {
+            let (frame, _) = find_segment(guard.instance, id).ok_or(Error::Invalid)?;
+            let page = segment_page_mut(frame).ok_or(Error::Invalid)?;
+            Ok(body(&mut page.owner, &mut page.times, &mut page.mode))
+        }
+        Kind::Semaphores => {
+            let (frame, _) = find_semaphore_set(guard.instance, id).ok_or(Error::Invalid)?;
+            let page = semaphore_page_mut(frame).ok_or(Error::Invalid)?;
+            Ok(body(&mut page.owner, &mut page.times, &mut page.mode))
+        }
+        Kind::Messages => {
+            let (frame, _) = find_message_queue(guard.instance, id).ok_or(Error::Invalid)?;
+            let queue = message_queue_mut(frame).ok_or(Error::Invalid)?;
+            Ok(body(&mut queue.owner, &mut queue.times, &mut queue.mode))
+        }
+    }
+}
+
+/// The first get of a new object makes its caller owner and creator and
+/// stamps its change time; true then (the caller created it).
+pub(crate) fn adopt(kind: Kind, id: u32, caller: Caller, now: i64) -> Result<bool, Error> {
+    with_header(kind, id, |owner, times, _| {
+        if owner.adopted != 0 {
+            return false;
+        }
+        *owner = Ownership {
+            uid: caller.uid,
+            gid: caller.gid,
+            cuid: caller.uid,
+            cgid: caller.gid,
+            adopted: 1,
+        };
+        times[TIME_CHANGE] = now;
+        true
+    })
+}
+
+/// Whether `caller` may use object `id` as `requested` asks (permission
+/// bits, as in a mode: 0o444 to read, 0o222 to write), as Linux's
+/// ipcperms decides: the owner's bits for its owner or creator, the
+/// group's for its group, else the others'; root may always.
+pub(crate) fn check_access(
+    kind: Kind,
+    id: u32,
+    caller: Caller,
+    requested: u16,
+) -> Result<(), Error> {
+    with_header(kind, id, |owner, _, mode| {
+        let requested = (requested >> 6 | requested >> 3 | requested) & 7;
+        let granted = if caller.uid == owner.uid || caller.uid == owner.cuid {
+            *mode >> 6
+        } else if caller.gid == owner.gid || caller.gid == owner.cgid {
+            *mode >> 3
+        } else {
+            *mode
+        } & 7;
+        caller.privileged || requested & !granted == 0
+    })?
+    .then_some(())
+    .ok_or(Error::Access)
+}
+
+/// Whether `caller` may change or remove object `id`: its owner, its
+/// creator, or a privileged caller (EPERM otherwise).
+pub(crate) fn check_owner(kind: Kind, id: u32, caller: Caller) -> Result<(), Error> {
+    with_header(kind, id, |owner, _, _| {
+        caller.privileged || caller.uid == owner.uid || caller.uid == owner.cuid
+    })?
+    .then_some(())
+    .ok_or(Error::Permission)
+}
+
+/// Object `id`'s owner and times.
+pub(crate) fn header(kind: Kind, id: u32) -> Result<(Ownership, [i64; 3]), Error> {
+    with_header(kind, id, |owner, times, _| (*owner, *times))
+}
+
+/// IPC_SET's owner, stamped with its change time.
+pub(crate) fn set_owner(kind: Kind, id: u32, uid: u32, gid: u32, now: i64) -> Result<(), Error> {
+    with_header(kind, id, |owner, times, _| {
+        owner.uid = uid;
+        owner.gid = gid;
+        times[TIME_CHANGE] = now;
+    })
+}
+
+/// Stamps time `index` of object `id` with `now`.
+pub(crate) fn stamp(kind: Kind, id: u32, index: usize, now: i64) -> Result<(), Error> {
+    with_header(kind, id, |_, times, _| times[index] = now)
+}
 
 struct Guard {
     instance: usize,

@@ -18761,8 +18761,76 @@ fn rollback_linux_runtime_mapping(address: u64, pages: usize) -> bool {
     })
 }
 
+/// The caller as System V IPC checks it.
+fn linux_ipc_caller() -> crate::linux_sysv_ipc::Caller {
+    current_linux_credentials().map_or(
+        crate::linux_sysv_ipc::Caller {
+            uid: 0,
+            gid: 0,
+            privileged: true,
+        },
+        |credentials| crate::linux_sysv_ipc::Caller {
+            uid: credentials.user.effective,
+            gid: credentials.group.effective,
+            privileged: credentials.privileged(),
+        },
+    )
+}
+
+/// Wall-clock seconds for IPC times.
+fn linux_ipc_now() -> i64 {
+    linux_realtime_time().map_or(0, |(seconds, _)| seconds as i64)
+}
+
+/// After a get: the first get of a new object makes the caller its owner
+/// and creator; a get of an existing key needs the access its mode bits
+/// ask for (EACCES: msgget02, semget02, shmget04).
+fn linux_ipc_got(
+    kind: crate::linux_sysv_ipc::Kind,
+    result: Result<u32, crate::linux_sysv_ipc::Error>,
+    key: i32,
+    flags: u64,
+) -> u64 {
+    let id = match result {
+        Ok(id) => id,
+        Err(error) => return linux_sysv_ipc_error(error),
+    };
+    let caller = linux_ipc_caller();
+    match crate::linux_sysv_ipc::adopt(kind, id, caller, linux_ipc_now()) {
+        Ok(false) if key != 0 => {
+            crate::linux_sysv_ipc::check_access(kind, id, caller, flags as u16 & 0o777)
+                .map_or_else(linux_sysv_ipc_error, |()| u64::from(id))
+        }
+        _ => u64::from(id),
+    }
+}
+
+/// Fills an `ipc_perm`'s owner fields and an object's times into a
+/// `*id_ds` (times at `time_offsets`, 0 to leave one out).
+fn linux_ipc_fill_header(
+    output: &mut [u8],
+    kind: crate::linux_sysv_ipc::Kind,
+    id: u32,
+    time_offsets: [usize; 3],
+) {
+    let Ok((owner, times)) = crate::linux_sysv_ipc::header(kind, id) else {
+        return;
+    };
+    output[4..8].copy_from_slice(&owner.uid.to_ne_bytes());
+    output[8..12].copy_from_slice(&owner.gid.to_ne_bytes());
+    output[12..16].copy_from_slice(&owner.cuid.to_ne_bytes());
+    output[16..20].copy_from_slice(&owner.cgid.to_ne_bytes());
+    for (offset, time) in time_offsets.into_iter().zip(times) {
+        if offset != 0 {
+            output[offset..offset + 8].copy_from_slice(&time.to_ne_bytes());
+        }
+    }
+}
+
 fn linux_sysv_ipc_error(error: crate::linux_sysv_ipc::Error) -> u64 {
     match error {
+        crate::linux_sysv_ipc::Error::Access => LINUX_EACCES,
+        crate::linux_sysv_ipc::Error::Permission => LINUX_EPERM,
         crate::linux_sysv_ipc::Error::Exists => LINUX_EEXIST,
         crate::linux_sysv_ipc::Error::Invalid => LINUX_EINVAL,
         crate::linux_sysv_ipc::Error::NoEntry => LINUX_ENOENT,
@@ -18801,7 +18869,7 @@ fn linux_shmget(key: u64, size: u64, flags: u64) -> u64 {
     if requested.is_some_and(|id| result == Ok(id)) {
         linux_proc_sysctl_set(b"sys/kernel/shm_next_id", -1);
     }
-    result.map_or_else(linux_sysv_ipc_error, u64::from)
+    linux_ipc_got(crate::linux_sysv_ipc::Kind::Segment, result, key, flags)
 }
 
 fn linux_shmat(id: u64, requested: u64, flags: u64) -> u64 {
@@ -18827,6 +18895,26 @@ fn linux_shmat(id: u64, requested: u64, flags: u64) -> u64 {
     let Ok(segment) = crate::linux_sysv_ipc::segment(id as u32) else {
         return LINUX_EINVAL;
     };
+    // Reading needs read permission, and writing write (shmat02).
+    let wanted = if flags & SHM_RDONLY != 0 {
+        0o444
+    } else {
+        0o666
+    };
+    if let Err(error) = crate::linux_sysv_ipc::check_access(
+        crate::linux_sysv_ipc::Kind::Segment,
+        id as u32,
+        linux_ipc_caller(),
+        wanted,
+    ) {
+        return linux_sysv_ipc_error(error);
+    }
+    let _ = crate::linux_sysv_ipc::stamp(
+        crate::linux_sysv_ipc::Kind::Segment,
+        id as u32,
+        crate::linux_sysv_ipc::TIME_OPERATION,
+        linux_ipc_now(),
+    );
     let Ok(pages) = usize::try_from(segment.size.div_ceil(PAGE_SIZE as u64)) else {
         return LINUX_ENOMEM;
     };
@@ -18881,7 +18969,7 @@ fn linux_shmdt(address: u64) -> u64 {
     {
         return LINUX_EINVAL;
     }
-    let Ok((_, length)) =
+    let Ok((id, length)) =
         crate::linux_sysv_ipc::attachment_at(address, current_linux_process_pid())
     else {
         return LINUX_EINVAL;
@@ -18890,6 +18978,12 @@ fn linux_shmdt(address: u64) -> u64 {
     if result != 0 {
         return result;
     }
+    let _ = crate::linux_sysv_ipc::stamp(
+        crate::linux_sysv_ipc::Kind::Segment,
+        id,
+        crate::linux_sysv_ipc::TIME_DETACH,
+        linux_ipc_now(),
+    );
     crate::linux_sysv_ipc::detach(address, current_linux_process_pid())
         .map_or_else(linux_sysv_ipc_error, |()| 0)
 }
@@ -18904,14 +18998,29 @@ fn linux_shmctl(id: u64, command: u64, address: u64) -> u64 {
     if id < 0 || command & !(IPC_64 | 0xff) != 0 {
         return LINUX_EINVAL;
     }
+    let kind = crate::linux_sysv_ipc::Kind::Segment;
+    let caller = linux_ipc_caller();
     match command & !IPC_64 {
-        IPC_RMID => crate::linux_sysv_ipc::mark_for_removal(id as u32, current_linux_process_pid())
+        IPC_RMID => crate::linux_sysv_ipc::check_owner(kind, id as u32, caller)
+            .and_then(|()| {
+                crate::linux_sysv_ipc::mark_for_removal(id as u32, current_linux_process_pid())
+            })
             .map_or_else(linux_sysv_ipc_error, |()| 0),
         IPC_SET => {
             let mut input = [0_u8; 112];
             if !copy_from_linux_user(address, &mut input) {
                 return LINUX_EFAULT;
             }
+            if let Err(error) = crate::linux_sysv_ipc::check_owner(kind, id as u32, caller) {
+                return linux_sysv_ipc_error(error);
+            }
+            let _ = crate::linux_sysv_ipc::set_owner(
+                kind,
+                id as u32,
+                u32::from_ne_bytes(input[4..8].try_into().unwrap()),
+                u32::from_ne_bytes(input[8..12].try_into().unwrap()),
+                linux_ipc_now(),
+            );
             crate::linux_sysv_ipc::set_mode(
                 id as u32,
                 u16::from_ne_bytes(input[20..22].try_into().unwrap()),
@@ -18923,7 +19032,12 @@ fn linux_shmctl(id: u64, command: u64, address: u64) -> u64 {
             let Ok(segment) = crate::linux_sysv_ipc::segment(id as u32) else {
                 return LINUX_EINVAL;
             };
+            if let Err(error) = crate::linux_sysv_ipc::check_access(kind, id as u32, caller, 0o444)
+            {
+                return linux_sysv_ipc_error(error);
+            }
             let mut output = [0_u8; 112];
+            linux_ipc_fill_header(&mut output, kind, id as u32, [56, 64, 72]);
             output[0..4].copy_from_slice(&segment.key.to_ne_bytes());
             output[20..22].copy_from_slice(&segment.mode.to_ne_bytes());
             output[48..56].copy_from_slice(&segment.size.to_ne_bytes());
@@ -18950,15 +19064,15 @@ fn linux_semget(key: u64, count: u64, flags: u64) -> u64 {
         return LINUX_EINVAL;
     }
     let key = key as u32 as i32;
-    crate::linux_sysv_ipc::semaphore_get_or_create(
+    let result = crate::linux_sysv_ipc::semaphore_get_or_create(
         key,
         count as u64,
         flags as u16,
         key == 0 || flags & IPC_CREAT != 0,
         flags & IPC_EXCL != 0,
         current_linux_process_pid(),
-    )
-    .map_or_else(linux_sysv_ipc_error, u64::from)
+    );
+    linux_ipc_got(crate::linux_sysv_ipc::Kind::Semaphores, result, key, flags)
 }
 
 fn linux_semaphore_operation(
@@ -19074,10 +19188,35 @@ fn linux_semop(
             LINUX_EINVAL
         });
     }
-    crate::linux_sysv_ipc::semaphore_apply(id as u32, count, current_linux_process_pid(), |index| {
+    // Any operation that changes a value needs write permission, waiting
+    // for zero read.
+    let alters = (0..count).any(|index| {
         linux_semaphore_operation(operations, index)
-    })
-    .map_err(linux_sysv_ipc_error)
+            .is_some_and(|operation| operation.operation != 0)
+    });
+    crate::linux_sysv_ipc::check_access(
+        crate::linux_sysv_ipc::Kind::Semaphores,
+        id as u32,
+        linux_ipc_caller(),
+        if alters { 0o222 } else { 0o444 },
+    )
+    .map_err(linux_sysv_ipc_error)?;
+    let applied = crate::linux_sysv_ipc::semaphore_apply(
+        id as u32,
+        count,
+        current_linux_process_pid(),
+        |index| linux_semaphore_operation(operations, index),
+    )
+    .map_err(linux_sysv_ipc_error)?;
+    if applied.is_none() {
+        let _ = crate::linux_sysv_ipc::stamp(
+            crate::linux_sysv_ipc::Kind::Semaphores,
+            id as u32,
+            crate::linux_sysv_ipc::TIME_OPERATION,
+            linux_ipc_now(),
+        );
+    }
+    Ok(applied)
 }
 
 fn linux_semctl(id: u64, number: u64, command: u64, argument: u64) -> u64 {
@@ -19100,6 +19239,33 @@ fn linux_semctl(id: u64, number: u64, command: u64, argument: u64) -> u64 {
     }
     let id = id as u32;
     let number = number as usize;
+    let kind = crate::linux_sysv_ipc::Kind::Semaphores;
+    let caller = linux_ipc_caller();
+    // Reading values needs read permission, changing them write
+    // (semctl02, semctl04).
+    let wanted = match command & !IPC_64 {
+        IPC_STAT | GETPID | GETVAL | GETALL | GETNCNT | GETZCNT => Some(0o444),
+        SETVAL | SETALL => Some(0o222),
+        _ => None,
+    };
+    if let Some(wanted) = wanted {
+        if let Err(error) = crate::linux_sysv_ipc::check_access(kind, id, caller, wanted) {
+            return linux_sysv_ipc_error(error);
+        }
+    }
+    if matches!(command & !IPC_64, IPC_RMID | IPC_SET) {
+        if let Err(error) = crate::linux_sysv_ipc::check_owner(kind, id, caller) {
+            return linux_sysv_ipc_error(error);
+        }
+    }
+    if matches!(command & !IPC_64, SETVAL | SETALL) {
+        let _ = crate::linux_sysv_ipc::stamp(
+            kind,
+            id,
+            crate::linux_sysv_ipc::TIME_CHANGE,
+            linux_ipc_now(),
+        );
+    }
     match command & !IPC_64 {
         IPC_RMID => {
             crate::linux_sysv_ipc::semaphore_remove(id).map_or_else(linux_sysv_ipc_error, |()| 0)
@@ -19109,6 +19275,13 @@ fn linux_semctl(id: u64, number: u64, command: u64, argument: u64) -> u64 {
             if !copy_from_linux_user(argument, &mut input) {
                 return LINUX_EFAULT;
             }
+            let _ = crate::linux_sysv_ipc::set_owner(
+                kind,
+                id,
+                u32::from_ne_bytes(input[4..8].try_into().unwrap()),
+                u32::from_ne_bytes(input[8..12].try_into().unwrap()),
+                linux_ipc_now(),
+            );
             crate::linux_sysv_ipc::semaphore_set_mode(
                 id,
                 u16::from_ne_bytes(input[20..22].try_into().unwrap()),
@@ -19121,6 +19294,7 @@ fn linux_semctl(id: u64, number: u64, command: u64, argument: u64) -> u64 {
                 return LINUX_EINVAL;
             };
             let mut output = [0_u8; 104];
+            linux_ipc_fill_header(&mut output, kind, id, [48, 0, 64]);
             output[0..4].copy_from_slice(&set.key.to_ne_bytes());
             output[20..22].copy_from_slice(&set.mode.to_ne_bytes());
             output[80..88].copy_from_slice(&set.count.to_ne_bytes());
@@ -19213,7 +19387,7 @@ fn linux_msgget(key: u64, flags: u64) -> u64 {
     if requested.is_some_and(|id| result == Ok(id)) {
         linux_proc_sysctl_set(b"sys/kernel/msg_next_id", -1);
     }
-    result.map_or_else(linux_sysv_ipc_error, u64::from)
+    linux_ipc_got(crate::linux_sysv_ipc::Kind::Messages, result, key, flags)
 }
 
 /// msgsnd and msgrcv: `attempt` runs the call once. Without IPC_NOWAIT a
@@ -19285,11 +19459,19 @@ fn linux_msgsnd(id: u64, message: u64, size: u64, flags: u64) -> u64 {
     if size > LINUX_MSGMAX {
         return LINUX_EINVAL;
     }
+    if let Err(error) = crate::linux_sysv_ipc::check_access(
+        crate::linux_sysv_ipc::Kind::Messages,
+        id as u32,
+        linux_ipc_caller(),
+        0o222,
+    ) {
+        return linux_sysv_ipc_error(error);
+    }
     let mut message_type = [0_u8; 8];
     if !copy_from_linux_user(message, &mut message_type) {
         return LINUX_EFAULT;
     }
-    crate::linux_sysv_ipc::message_send(
+    let sent = crate::linux_sysv_ipc::message_send(
         id as u32,
         i64::from_ne_bytes(message_type),
         size,
@@ -19300,8 +19482,16 @@ fn linux_msgsnd(id: u64, message: u64, size: u64, flags: u64) -> u64 {
                 .and_then(|address| address.checked_add(offset as u64))
                 .is_some_and(|address| copy_from_linux_user(address, output))
         },
-    )
-    .map_or_else(linux_sysv_ipc_error, |()| 0)
+    );
+    if sent.is_ok() {
+        let _ = crate::linux_sysv_ipc::stamp(
+            crate::linux_sysv_ipc::Kind::Messages,
+            id as u32,
+            crate::linux_sysv_ipc::TIME_OPERATION,
+            linux_ipc_now(),
+        );
+    }
+    sent.map_or_else(linux_sysv_ipc_error, |()| 0)
 }
 
 fn linux_msgrcv(id: u64, message: u64, size: u64, selector: u64, flags: u64) -> u64 {
@@ -19319,10 +19509,22 @@ fn linux_msgrcv(id: u64, message: u64, size: u64, selector: u64, flags: u64) -> 
     {
         return LINUX_EINVAL;
     }
+    // A negative size (as a long) is EINVAL (msgrcv02).
+    if (size as i64) < 0 {
+        return LINUX_EINVAL;
+    }
     let Ok(size) = usize::try_from(size) else {
         return LINUX_EINVAL;
     };
-    crate::linux_sysv_ipc::message_receive(
+    if let Err(error) = crate::linux_sysv_ipc::check_access(
+        crate::linux_sysv_ipc::Kind::Messages,
+        id as u32,
+        linux_ipc_caller(),
+        0o444,
+    ) {
+        return linux_sysv_ipc_error(error);
+    }
+    let received = crate::linux_sysv_ipc::message_receive(
         id as u32,
         size,
         selector as i64,
@@ -19337,8 +19539,16 @@ fn linux_msgrcv(id: u64, message: u64, size: u64, selector: u64, flags: u64) -> 
                     .and_then(|address| address.checked_add(offset as u64))
                     .is_some_and(|address| copy_to_linux_user(address, bytes))
         },
-    )
-    .map_or_else(linux_sysv_ipc_error, |size| size as u64)
+    );
+    if received.is_ok() && flags & MSG_COPY == 0 {
+        let _ = crate::linux_sysv_ipc::stamp(
+            crate::linux_sysv_ipc::Kind::Messages,
+            id as u32,
+            crate::linux_sysv_ipc::TIME_RECEIVE,
+            linux_ipc_now(),
+        );
+    }
+    received.map_or_else(linux_sysv_ipc_error, |size| size as u64)
 }
 
 fn linux_msgctl(id: u64, command: u64, address: u64) -> u64 {
@@ -19352,14 +19562,27 @@ fn linux_msgctl(id: u64, command: u64, address: u64) -> u64 {
         return LINUX_EINVAL;
     }
     let id = id as u32;
+    let kind = crate::linux_sysv_ipc::Kind::Messages;
+    let caller = linux_ipc_caller();
     match command & !IPC_64 {
-        IPC_RMID => crate::linux_sysv_ipc::message_queue_remove(id)
+        IPC_RMID => crate::linux_sysv_ipc::check_owner(kind, id, caller)
+            .and_then(|()| crate::linux_sysv_ipc::message_queue_remove(id))
             .map_or_else(linux_sysv_ipc_error, |()| 0),
         IPC_SET => {
             let mut input = [0_u8; 120];
             if !copy_from_linux_user(address, &mut input) {
                 return LINUX_EFAULT;
             }
+            if let Err(error) = crate::linux_sysv_ipc::check_owner(kind, id, caller) {
+                return linux_sysv_ipc_error(error);
+            }
+            let _ = crate::linux_sysv_ipc::set_owner(
+                kind,
+                id,
+                u32::from_ne_bytes(input[4..8].try_into().unwrap()),
+                u32::from_ne_bytes(input[8..12].try_into().unwrap()),
+                linux_ipc_now(),
+            );
             crate::linux_sysv_ipc::message_queue_set(
                 id,
                 u16::from_ne_bytes(input[20..22].try_into().unwrap()),
@@ -19371,7 +19594,11 @@ fn linux_msgctl(id: u64, command: u64, address: u64) -> u64 {
             let Ok(queue) = crate::linux_sysv_ipc::message_queue_info(id) else {
                 return LINUX_EINVAL;
             };
+            if let Err(error) = crate::linux_sysv_ipc::check_access(kind, id, caller, 0o444) {
+                return linux_sysv_ipc_error(error);
+            }
             let mut output = [0_u8; 120];
+            linux_ipc_fill_header(&mut output, kind, id, [48, 56, 64]);
             output[0..4].copy_from_slice(&queue.key.to_ne_bytes());
             output[20..22].copy_from_slice(&queue.mode.to_ne_bytes());
             output[72..80].copy_from_slice(&queue.bytes.to_ne_bytes());
