@@ -409,6 +409,17 @@ the way to user mode and taken again on the way back). Two kinds of work:
   the light path saves its context in its thread slot, as a thread switch
   on one CPU does, so any CPU can take it up next.
 
+The owner's timer tick preempts its current thread for a ready sibling
+even when nothing can take a yield of the process (the scheduler nesting
+of the bank it runs in is 0), and it checks the bank's descriptor and
+timed waits as the boot CPU's tick does: with every thread of a process
+busy, the thread the registry holds (only the owner runs it) and a thread
+blocked in a pipe read were otherwise never run again (dirtyc0w_shmem).
+Still open there: a process owned by an application processor whose
+threads never all block does not yield, and in that test the child's
+checkpoint FUTEX_WAKE keeps finding no waiter while its parent either
+waits for it (ETIMEDOUT) or never gets to its wait.
+
 **Process banks.** The per-process kernel state the runtime keeps in
 `X86_RUNTIME` (descriptors, threads, signal and address-space bookkeeping)
 lives in banks (`linux_cpu_bank`). A process live on any CPU has one bank,

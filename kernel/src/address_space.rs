@@ -5785,6 +5785,45 @@ pub(crate) fn set_current_linux_image_page_writable(
     entry.read() == updated
 }
 
+/// Gives a present, read-only private page of the current address space
+/// the frame `replacement` in place of `expected`, every other bit of its
+/// entry kept: the private copy a forced write (/proc/PID/mem) makes, so
+/// the page it shared with the file cache or another process stays as it
+/// was.
+pub(crate) fn replace_current_linux_read_only_page(
+    address: u64,
+    expected: memory::FrameLease,
+    replacement: memory::FrameLease,
+) -> bool {
+    if address >= 1 << 47
+        || !address.is_multiple_of(PAGE_SIZE as u64)
+        || expected == replacement
+        || !memory::frames_owned_by(memory::FrameOwner::KERNEL, &[replacement])
+    {
+        return false;
+    }
+    let Some(entry) = current_linux_leaf(address) else {
+        return false;
+    };
+    let old = entry.read();
+    if old & (ADDRESS_MASK | PRESENT | USER | WRITABLE | LINUX_RUNTIME_COW | LINUX_RUNTIME_SHARED)
+        != expected.address() | PRESENT | USER
+    {
+        return false;
+    }
+    entry.write(replacement.address() | old & !ADDRESS_MASK);
+    if !invalidate_changed_runtime_translation(address, old) {
+        // SAFETY: the entry is put back as it was and its translation
+        // dropped from this CPU's TLB.
+        unsafe {
+            entry.write(old);
+            asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
+        }
+        return false;
+    }
+    true
+}
+
 pub(crate) fn current_linux_address_executable(address: u64) -> bool {
     if address >= 1 << 47 {
         return false;

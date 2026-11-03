@@ -1130,6 +1130,15 @@ pub(crate) fn expire_linux_waits_from_timer(frame: &mut UserInterruptFrame) {
     let Some(interrupted) = frame.user_context(USER_CODE_SELECTOR, USER_DATA_SELECTOR) else {
         return;
     };
+    // A thread the timer just sent to the preemption entry (an interrupt
+    // was pending as it got there) stays: its real context is the one the
+    // entry's call takes on this CPU, and resumed elsewhere at the entry it
+    // would find none.
+    if crate::linux_elf::vdso_preempt_entry()
+        .is_some_and(|entry| (entry..entry + 9).contains(&interrupted.rip))
+    {
+        return;
+    }
     if let (Some(current), Some(target)) =
         (current_linux_thread_handle(), ready_linux_thread_handle())
     {
@@ -1681,6 +1690,25 @@ pub(super) fn linux_queue_process_signal_from(
     signal_value: Option<u64>,
     (sender_pid, sender_uid): (u32, u32),
 ) -> u64 {
+    // SIGCONT discards the stop signals still pending for the process, as
+    // Linux's prepare_signal does (a tracer's SIGSTOP queued at
+    // PTRACE_ATTACH to a process already stopped would stop it again).
+    if signal == LINUX_SIGCONT {
+        const STOP_SIGNALS: u64 = 0xf << 18;
+        if target == current_linux_process_pid() {
+            X86_RUNTIME
+                .ELF_PROBE_PENDING_SIGNALS
+                .fetch_and(!STOP_SIGNALS, Ordering::SeqCst);
+        }
+        if let Some(process) = linux_process::live_process_slot(target) {
+            while let Ok(Some(_)) = crate::linux_signal::dequeue(
+                linux_signal_instance(),
+                crate::linux_signal::Scope::Process,
+                process,
+                STOP_SIGNALS,
+            ) {}
+        }
+    }
     // SIGCONT continues a stopped process as it is sent, whatever its
     // disposition (ignored by default); the parent's wait (WCONTINUED) is told.
     if signal == LINUX_SIGCONT && linux_process::continue_live_process(target) {
@@ -1810,8 +1838,9 @@ pub(super) fn linux_kill(
 /// (SIGCHLD with CLD_STOPPED, a wait with WUNTRACED) and the call waits as
 /// pause does, other processes running, until SIGCONT continues it, when
 /// it returns 0. Only SIGKILL and SIGCONT reach the process meanwhile; the
-/// rest wait for its mask to come back. ENOSYS for init and a thread on
-/// the light path.
+/// rest wait for its mask to come back. ENOSYS for a thread on the light
+/// path, and for init unless traced (a traced init stops for its tracer as
+/// in Linux, the rest of the domain running meanwhile).
 fn linux_stop_in_call(
     signal: u64,
     output: *mut LinuxSyscallFrame,
@@ -1821,7 +1850,7 @@ fn linux_stop_in_call(
     /// si_code of a tracee's stop, as its tracer's SIGCHLD reports it.
     const LINUX_CLD_TRAPPED: i32 = 4;
     let pid = current_linux_process_pid();
-    if pid == 1
+    if pid == 1 && !traced
         || output.is_null()
         || linux_light_thread_here().is_some()
         || !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
@@ -1873,10 +1902,13 @@ fn linux_stop_in_call(
 /// PTRACE_ATTACH make a tracer, which then sees each signal its tracee
 /// gets as a stop (`linux_kill_current`) and resumes it with PTRACE_CONT
 /// (delivering the signal it names, or none), PTRACE_DETACH or
-/// PTRACE_KILL. Reading and writing the tracee's memory and registers is
-/// not implemented yet (EIO).
-pub(super) fn linux_ptrace(request: u64, pid: u64, _address: u64, data: u64) -> u64 {
+/// PTRACE_KILL. PTRACE_PEEKUSER and PTRACE_POKEUSER reach the debug
+/// registers in `struct user` (`linux_debug_registers`); the tracee's
+/// memory and general registers are not implemented yet (EIO).
+pub(super) fn linux_ptrace(request: u64, pid: u64, address: u64, data: u64) -> u64 {
     const TRACEME: u64 = 0;
+    const PEEKUSER: u64 = 3;
+    const POKEUSER: u64 = 6;
     const CONT: u64 = 7;
     const KILL: u64 = 8;
     const ATTACH: u64 = 16;
@@ -1906,9 +1938,7 @@ pub(super) fn linux_ptrace(request: u64, pid: u64, _address: u64, data: u64) -> 
         // Only another process, not traced yet, that the caller may signal
         // (the same user, or CAP_SYS_PTRACE); init only with the
         // capability.
-        // Init is not traced: stopping it would stop the domain, and a
-        // tracer may only wait for its own children here.
-        if pid == caller || pid == 1 || linux_process::live_process_tracer(pid).is_some() {
+        if pid == caller || linux_process::live_process_tracer(pid).is_some() {
             return LINUX_EPERM;
         }
         let may_trace = super::current_linux_credentials().is_some_and(|credentials| {
@@ -1954,6 +1984,43 @@ pub(super) fn linux_ptrace(request: u64, pid: u64, _address: u64, data: u64) -> 
             let _ = linux_process::continue_live_process(pid);
             linux_process::set_live_process_waiting(pid, false);
             0
+        }
+        PEEKUSER | POKEUSER => {
+            /// `struct user`: the end of its general registers, where
+            /// `u_debugreg[8]` starts, and its size.
+            const GENERAL_REGISTERS_END: u64 = 216;
+            const DEBUG_REGISTERS: u64 = 848;
+            const USER_SIZE: u64 = 912;
+            // The general registers are not reachable yet.
+            if !address.is_multiple_of(8)
+                || !(GENERAL_REGISTERS_END..USER_SIZE).contains(&address)
+                || request == POKEUSER && address < DEBUG_REGISTERS
+            {
+                return LINUX_EIO;
+            }
+            let index = (address.saturating_sub(DEBUG_REGISTERS) / 8) as usize;
+            if request == POKEUSER {
+                return match linux_process::set_live_process_debug_register(pid, index, data) {
+                    Some(Ok(())) => 0,
+                    Some(Err(crate::linux_debug_registers::Error::Invalid)) => LINUX_EINVAL,
+                    Some(Err(crate::linux_debug_registers::Error::NoRegister)) => LINUX_EIO,
+                    None => LINUX_ESRCH,
+                };
+            }
+            // The rest of the user area reads as 0, as in Linux.
+            let value = if address >= DEBUG_REGISTERS {
+                let Some(value) = linux_process::live_process_debug_register(pid, index) else {
+                    return LINUX_ESRCH;
+                };
+                value
+            } else {
+                0
+            };
+            if copy_to_linux_user(data, &value.to_ne_bytes()) {
+                0
+            } else {
+                LINUX_EFAULT
+            }
         }
         _ => LINUX_EIO,
     }

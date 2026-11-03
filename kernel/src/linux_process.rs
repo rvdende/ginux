@@ -5,6 +5,7 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering},
 };
 
+use crate::linux_debug_registers::{DebugRegisters, Error as DebugRegisterError};
 use crate::{address_space, arch::x86_64::cpu, control_abi, linux_user, memory, scheduler};
 
 /// Processes a domain's table holds, zombies included. The table grows on
@@ -556,6 +557,9 @@ struct Process {
     /// its trace stop (0: none), and whether that delivery is past the stop.
     ptrace_resume_signal: u8,
     ptrace_bypass: bool,
+    /// The debug registers its tracer set (PTRACE_POKEUSER): none in a new
+    /// child or after exec.
+    debug_registers: DebugRegisters,
     state: ProcessState,
     wait_event: Option<ProcessWaitEvent>,
     /// A child forked onto its parent's pages (CLONE_VM, or a vfork child
@@ -1527,23 +1531,28 @@ impl ProcessTable {
         if self.process(parent)?.state != ProcessState::Running {
             return None;
         }
-        let mut children = self
-            .processes
-            .iter()
-            .flatten()
-            .filter(|process| process.parent == Some(parent) && matches(process));
-        // A tracer is told of its tracee's stops without WUNTRACED.
+        // A tracer waits for its tracees as for its children.
         let parent_pid = parent.pid;
+        let mut children = self.processes.iter().flatten().filter(|process| {
+            (process.parent == Some(parent) || process.tracer == parent_pid && parent_pid != 0)
+                && matches(process)
+        });
+        // A tracer is told of its tracee's stops without WUNTRACED.
         let stops_reported =
             |process: &Process| report_stopped || process.tracer == parent_pid && parent_pid != 0;
         let child = children
             .clone()
-            .find(|process| report_exited && matches!(process.state, ProcessState::Zombie { .. }))
+            .find(|process| {
+                report_exited
+                    && process.parent == Some(parent)
+                    && matches!(process.state, ProcessState::Zombie { .. })
+            })
             .or_else(|| {
                 children.clone().find(|process| {
                     stops_reported(process)
                         && matches!(process.wait_event, Some(ProcessWaitEvent::Stopped { .. }))
                         || report_continued
+                            && process.parent == Some(parent)
                             && process.wait_event == Some(ProcessWaitEvent::Continued)
                 })
             })
@@ -1555,6 +1564,11 @@ impl ProcessTable {
                     signal,
                 });
             }
+        }
+        // A tracee that is not a child is the tracer's to see stop only:
+        // its parent reaps it.
+        if child.parent != Some(parent) {
+            return Some(ChildWaitState::Running);
         }
         if report_continued && child.wait_event == Some(ProcessWaitEvent::Continued) {
             return Some(ChildWaitState::Continued {
@@ -1617,7 +1631,8 @@ impl ProcessTable {
         let Some(process) = self.process_mut(handle) else {
             return false;
         };
-        if process.parent != Some(parent) || process.wait_event.is_none() {
+        let traced = process.tracer == parent.pid && parent.pid != 0;
+        if process.parent != Some(parent) && !traced || process.wait_event.is_none() {
             return false;
         }
         process.wait_event = None;
@@ -1821,6 +1836,7 @@ impl ProcessTable {
             tracer: 0,
             ptrace_resume_signal: 0,
             ptrace_bypass: false,
+            debug_registers: DebugRegisters::RESET,
             state,
             wait_event: None,
             shares_parent_vm: false,
@@ -1929,6 +1945,7 @@ impl ProcessTable {
         };
         process.executed = true;
         process.posix_timers = [None; POSIX_TIMER_LIMIT];
+        process.debug_registers = DebugRegisters::RESET;
         true
     }
 
@@ -1959,6 +1976,7 @@ impl ProcessTable {
         process.context = Some(context);
         process.executed = true;
         process.posix_timers = [None; POSIX_TIMER_LIMIT];
+        process.debug_registers = DebugRegisters::RESET;
         process.shares_parent_vm = false;
         true
     }
@@ -4018,6 +4036,26 @@ pub(crate) fn set_live_process_ptrace_bypass(pid: u32, bypass: bool) {
     }) {
         process.ptrace_bypass = bypass;
     }
+}
+
+/// Tracee `pid`'s debug register `index` (PTRACE_PEEKUSER).
+pub(crate) fn live_process_debug_register(pid: u32, index: usize) -> Option<u64> {
+    let table = live_process_table_mut()?;
+    let process = table.process(table.handle_by_pid(pid)?)?;
+    Some(process.debug_registers.read(index))
+}
+
+/// Writes tracee `pid`'s debug register `index` (PTRACE_POKEUSER); None
+/// for no such process.
+pub(crate) fn set_live_process_debug_register(
+    pid: u32,
+    index: usize,
+    value: u64,
+) -> Option<Result<(), DebugRegisterError>> {
+    let table = live_process_table_mut()?;
+    let handle = table.handle_by_pid(pid)?;
+    let process = table.process_mut(handle)?;
+    Some(process.debug_registers.write(index, value))
 }
 
 pub(crate) fn take_live_process_ptrace_bypass(pid: u32) -> bool {

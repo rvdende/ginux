@@ -16344,7 +16344,14 @@ pub(crate) fn linux_application_processor_tick(frame: &mut UserInterruptFrame) {
         .and_then(|cpu| linux_light_thread_here().map(|(bank, _)| (cpu, bank)))
     {
         Some((cpu, bank)) => linux_preempt_light_thread_from_timer(cpu, bank, frame),
-        None => linux_preempt_process_from_timer(frame),
+        None => {
+            // The process this CPU owns has its blocked threads' waits
+            // checked here, as the boot CPU's tick checks its own: a pipe
+            // read whose writer went away while every thread kept a CPU busy
+            // was never woken (dirtyc0w_shmem's popen of zcat).
+            let _ = wake_linux_descriptor_waits() + expire_linux_waits();
+            linux_preempt_process_from_timer(frame)
+        }
     }
 }
 
@@ -16377,20 +16384,15 @@ fn linux_preempt_process_from_timer(frame: &mut UserInterruptFrame) {
     let Some(entry) = crate::linux_elf::vdso_preempt_entry() else {
         return;
     };
-    let nesting = X86_RUNTIME
-        .LINUX_PROCESS_SCHEDULER_NESTING
-        .load(Ordering::SeqCst);
     let signal = X86_RUNTIME.LINUX_SIGNAL_ACTIVE.load(Ordering::SeqCst);
-    // Someone takes the yield: the scheduler that entered the process, or the
-    // fork transaction running it as its child (once it has its own memory).
-    let transaction_child = X86_RUNTIME
-        .LINUX_PROCESS_CHILD_YIELD_PID
-        .load(Ordering::SeqCst)
-        == pid;
-    let yieldable =
-        (nesting != 0 || transaction_child) && !linux_process::live_process_shares_parent_vm(pid);
+    // A process nobody can take the yield of still lets a ready sibling
+    // thread have the CPU: the switch stays inside the process (a busy
+    // thread on the owner's path otherwise kept the thread the registry
+    // holds, which only the owner runs, from ever running: dirtyc0w_shmem's
+    // eight busy threads).
+    let preemptible = linux_preemption_yield_taken(pid) || ready_linux_thread_handle().is_some();
     if (entry..entry + 9).contains(&context.rip)
-        || !signal_due && (pid == 1 || !yieldable || signal)
+        || !signal_due && (pid == 1 || !preemptible || signal)
     {
         return;
     }
@@ -16425,6 +16427,20 @@ fn linux_preempt_process_from_timer(frame: &mut UserInterruptFrame) {
             LINUX_PROCESS_SLICE[linux_cpu_slot()].store(0, Ordering::SeqCst);
         }
     }
+}
+
+/// Whether a timer preemption of process `pid` can yield it: the scheduler
+/// that entered it takes the yield, or the fork transaction running it as
+/// its child (once it has its own memory).
+fn linux_preemption_yield_taken(pid: u32) -> bool {
+    let nesting = X86_RUNTIME
+        .LINUX_PROCESS_SCHEDULER_NESTING
+        .load(Ordering::SeqCst);
+    let transaction_child = X86_RUNTIME
+        .LINUX_PROCESS_CHILD_YIELD_PID
+        .load(Ordering::SeqCst)
+        == pid;
+    (nesting != 0 || transaction_child) && !linux_process::live_process_shares_parent_vm(pid)
 }
 
 /// The preemption entry's system call (`user_rip` just after it): records
@@ -16471,17 +16487,20 @@ fn linux_complete_timer_preemption(output: *mut LinuxSyscallFrame, user_rip: u64
     if let Some(result) = linux_preempted_owner_switches_to_kept_thread(output, &preempted) {
         return Some(result);
     }
-    let recorded = live_runtime_linux_process_address_space_snapshot().is_some_and(|snapshot| {
-        linux_process::refresh_validated_runtime_process_registry(
-            pid,
-            snapshot,
-            preempted.general,
-            preempted.rip,
-            preempted.rsp,
-            preempted.rflags,
-            active_fs_base(),
-        )
-    });
+    // With nobody to take a yield, the process carries on where the tick
+    // interrupted it.
+    let recorded = linux_preemption_yield_taken(pid)
+        && live_runtime_linux_process_address_space_snapshot().is_some_and(|snapshot| {
+            linux_process::refresh_validated_runtime_process_registry(
+                pid,
+                snapshot,
+                preempted.general,
+                preempted.rip,
+                preempted.rsp,
+                preempted.rflags,
+                active_fs_base(),
+            )
+        });
     if !recorded {
         // Carry on where the tick interrupted the process instead.
         return Some(
@@ -27377,6 +27396,164 @@ fn linux_ptrace_access_permitted(pid: u32) -> bool {
         && (caller.privileged() || linux_ids_match(&caller, &target))
 }
 
+/// /proc/PID/mem: reads, or writes, `count` bytes of process `pid`'s
+/// memory at `offset` (a virtual address) from or to `buffer`, page by
+/// page through its page tables, as a tracer's forced access does. A page
+/// the process may only read is still written, to a private copy put in
+/// its place first when the page is shared (copy-on-write broken), so a
+/// page of the file cache or of another process is never written; a shared
+/// mapping the process may not write is not. The transfer stops at the
+/// first page it cannot reach: EIO when that is the first.
+fn linux_proc_mem_transfer(pid: u32, buffer: u64, count: u64, offset: u64, write: bool) -> u64 {
+    let own = pid == current_linux_process_pid();
+    if !own
+        && linux_process::live_process_status(pid).is_none_or(|status| !status.state.is_running())
+    {
+        return 0;
+    }
+    let count = usize::try_from(count).unwrap_or(usize::MAX);
+    let mut bytes = [0_u8; PAGE_SIZE];
+    let mut done = 0_usize;
+    while done < count {
+        let Some(address) = offset
+            .checked_add(done as u64)
+            .filter(|address| *address < 1 << 47)
+        else {
+            break;
+        };
+        let start = (address % PAGE_SIZE as u64) as usize;
+        let length = (count - done).min(PAGE_SIZE - start);
+        let chunk = &mut bytes[..length];
+        let user = buffer.wrapping_add(done as u64);
+        if write && !copy_from_linux_user(user, chunk) {
+            return if done == 0 { LINUX_EFAULT } else { done as u64 };
+        }
+        if !linux_proc_mem_page(pid, own, address - start as u64, start, chunk, write) {
+            break;
+        }
+        if !write && !copy_to_linux_user(user, chunk) {
+            return if done == 0 { LINUX_EFAULT } else { done as u64 };
+        }
+        done += length;
+    }
+    if done == 0 && count != 0 {
+        LINUX_EIO
+    } else {
+        done as u64
+    }
+}
+
+/// One page's part of a /proc/PID/mem transfer: `bytes` read from, or
+/// written to, `page` + `start` in process `pid` (`own`: the caller).
+fn linux_proc_mem_page(
+    pid: u32,
+    own: bool,
+    page: u64,
+    start: usize,
+    bytes: &mut [u8],
+    write: bool,
+) -> bool {
+    if own {
+        let state = address_space::current_linux_runtime_page(page);
+        if !state.occupied || state.secret {
+            return false;
+        }
+        // A page never touched is brought in as a read would.
+        if state.frame.is_none() && !materialize_linux_runtime_user_range(page, PAGE_SIZE, false) {
+            return false;
+        }
+        // A writable page is written as the process would write it.
+        if write && state.protection & LINUX_PROT_WRITE as u8 != 0 {
+            return materialize_linux_runtime_user_range(page, PAGE_SIZE, true)
+                && copy_to_linux_user(page + start as u64, bytes);
+        }
+    }
+    // Another process's pages are reached through its own page tables.
+    let root = if own {
+        None
+    } else {
+        match linux_process::live_process_root(pid) {
+            Some(root) => Some(root),
+            None => return false,
+        }
+    };
+    let Some(mapping) = root.map_or_else(
+        || address_space::current_linux_active_mapping(page),
+        |root| address_space::linux_active_mapping_in_root(root, page),
+    ) else {
+        return false;
+    };
+    if write && mapping.writable {
+        return linux_process::copy_to_live_process(pid, page + start as u64, bytes);
+    }
+    if write && mapping.shared {
+        return false;
+    }
+    let frame = if write {
+        match linux_forced_write_frame(pid, root, mapping) {
+            Some(frame) => frame,
+            None => return false,
+        }
+    } else {
+        mapping.frame
+    };
+    let Some(target) = frame.direct_map_address() else {
+        return false;
+    };
+    // SAFETY: the frame is mapped by the target's page tables (or is its
+    // private copy just mapped there), stays mapped while the kernel-entry
+    // lock is held, and `start + bytes.len()` stays within the page.
+    unsafe {
+        let page_bytes = (target as *mut u8).add(start);
+        if write {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), page_bytes, bytes.len());
+        } else {
+            core::ptr::copy_nonoverlapping(page_bytes, bytes.as_mut_ptr(), bytes.len());
+        }
+    }
+    true
+}
+
+/// The frame a forced write to read-only private `mapping` of process
+/// `pid` (page tables `root`, None for the current ones) may write: its own
+/// frame when no other mapping or the file cache holds it, else a copy put
+/// in its place.
+fn linux_forced_write_frame(
+    pid: u32,
+    root: Option<memory::FrameLease>,
+    mapping: LinuxActiveImageMapping,
+) -> Option<memory::FrameLease> {
+    let frame = mapping.frame;
+    if address_space::linux_private_page_counted(frame) && !memory::frame_is_shared(frame) {
+        return Some(frame);
+    }
+    let [replacement] = memory::allocate_user_frames::<1>()?;
+    let page = mapping.address as u64;
+    let replace = || address_space::replace_current_linux_read_only_page(page, frame, replacement);
+    let replaced = address_space::copy_linux_frame(frame, replacement)
+        && root.map_or_else(replace, |root| {
+            address_space::with_live_linux_process_root(root, replace).unwrap_or(false)
+        });
+    if !replaced {
+        let _ = memory::scrub_and_release_frames(memory::FrameOwner::KERNEL, &[replacement]);
+        return None;
+    }
+    // A registered mapping list that does not have the page is stale: the
+    // live tables are then the record.
+    if !linux_process::replace_live_process_mapping(
+        pid,
+        mapping.address,
+        frame,
+        replacement,
+        false,
+        mapping.executable,
+    ) {
+        let _ = linux_process::mark_live_process_address_space_stale(pid);
+    }
+    let _ = address_space::release_linux_private_page(frame);
+    Some(replacement)
+}
+
 /// Linux's UIO_MAXIOV: the most vectors process_vm_readv and
 /// process_vm_writev take.
 const LINUX_PROCESS_VM_IOV_LIMIT: usize = 1024;
@@ -30380,6 +30557,7 @@ fn linux_proc_pid_file_kind(pid: u32, name: &[u8]) -> Option<u16> {
         (_, b"maps") => Some(LINUX_FILE_PROC_DYNAMIC_MAPS),
         (_, b"smaps") => Some(LINUX_FILE_PROC_DYNAMIC_SMAPS),
         (_, b"pagemap") => Some(LINUX_FILE_PROC_DYNAMIC_PAGEMAP),
+        (_, b"mem") => Some(LINUX_FILE_PROC_DYNAMIC_MEM),
         (_, b"comm") => Some(LINUX_FILE_PROC_TASK_COMM),
         (_, b"task" | b"task/") => Some(LINUX_PROC_TASK_DIRECTORY),
         (_, name) if name.starts_with(b"task/") => linux_proc_task_file_kind(pid, &name[5..]),
@@ -34202,6 +34380,7 @@ fn linux_openat_path(
                     | b"maps"
                     | b"smaps"
                     | b"pagemap"
+                    | b"mem"
                     | b"oom_score_adj"
                     | b"comm"
                     | b"task"
@@ -34613,6 +34792,12 @@ fn linux_openat_path(
         && !linux_tmp_file(kind)
         && !linux_writable_proc_file(kind)
         && linux_graphics_device(kind).is_none()
+    {
+        return LINUX_EACCES;
+    }
+    // /proc/PID/mem opens only for a process the caller may trace.
+    if kind & !3 == LINUX_FILE_PROC_DYNAMIC_MEM
+        && proc_dynamic_pid.is_some_and(|pid| !linux_ptrace_access_permitted(pid))
     {
         return LINUX_EACCES;
     }
@@ -40333,6 +40518,7 @@ fn linux_descriptor_read(descriptor: u64, address: u64, count: u64) -> u64 {
             | LINUX_FILE_PROC_DYNAMIC_MAPS
             | LINUX_FILE_PROC_DYNAMIC_SMAPS
             | LINUX_FILE_PROC_DYNAMIC_PAGEMAP
+            | LINUX_FILE_PROC_DYNAMIC_MEM
             | LINUX_FILE_PROC_OOM_SCORE_ADJ
             | LINUX_FILE_PROC_TASK_COMM
             | LINUX_FILE_PROC_TASK_STAT
@@ -40582,6 +40768,12 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
         } else {
             LINUX_EFAULT
         };
+    }
+    if state & !3 == LINUX_FILE_PROC_DYNAMIC_MEM {
+        let Some(pid) = linux_proc_dynamic_descriptor_pid(descriptor) else {
+            return LINUX_EBADF;
+        };
+        return linux_proc_mem_transfer(pid, address, count, offset, false);
     }
     // /proc/PID/pagemap: an entry of eight bytes for each virtual page,
     // made for the range read: bit 63 when the page is present (another
@@ -41043,6 +41235,12 @@ fn linux_regular_file_write_at(descriptor: u64, address: u64, count: u64, offset
     }
     if !matches!(state & 3, LINUX_DESCRIPTOR_OUTPUT | 3) {
         return LINUX_EBADF;
+    }
+    if state & !3 == LINUX_FILE_PROC_DYNAMIC_MEM {
+        let Some(pid) = linux_proc_dynamic_descriptor_pid(descriptor) else {
+            return LINUX_EBADF;
+        };
+        return linux_proc_mem_transfer(pid, address, count, offset, true);
     }
     let Some(handle) = linux_overlay_descriptor_handle(descriptor) else {
         return if linux_descriptor_open(descriptor) {
@@ -46371,6 +46569,8 @@ fn linux_userfaultfd_ioctl(descriptor: u64, request: u64, argument: u64) -> u64 
     const UFFDIO_API: u64 = 0xc018_aa3f;
     const API: u64 = 0xaa;
     let descriptor = u64::from(descriptor as u32);
+    // The request is an unsigned int: libc may pass it sign-extended.
+    let request = u64::from(request as u32);
     if !linux_userfaultfd_descriptor(descriptor) {
         return LINUX_EBADF;
     }
@@ -47904,6 +48104,15 @@ fn linux_descriptor_write(descriptor: u64, address: u64, count: u64) -> u64 {
     if device & !3 == LINUX_FILE_PROC_OOM_SCORE_ADJ {
         return linux_proc_oom_score_adj_write(descriptor, device, address, count);
     }
+    if device & !3 == LINUX_FILE_PROC_DYNAMIC_MEM {
+        let offset = linux_descriptor_offset(descriptor).load(Ordering::SeqCst);
+        let result = linux_regular_file_write_at(descriptor, address, count, offset);
+        if result < LINUX_RETURN_TO_KERNEL {
+            linux_descriptor_offset(descriptor)
+                .store(offset.saturating_add(result), Ordering::SeqCst);
+        }
+        return result;
+    }
     if let Some(index) = linux_proc_sysctl_index(device) {
         if LINUX_PROC_SYSCTLS[index].1 == b"sys/kernel/domainname" {
             return linux_proc_domainname_write(device, address, count);
@@ -48358,6 +48567,7 @@ fn linux_descriptor_writev(descriptor: u64, vectors: u64, count: u64) -> u64 {
     if linux_overlay_descriptor_handle(descriptor).is_some()
         || linux_tmp_file(device)
         || device & !3 == LINUX_FILE_PROC_OOM_SCORE_ADJ
+        || device & !3 == LINUX_FILE_PROC_DYNAMIC_MEM
         || device & !3 == LINUX_FILE_PROC_SYSRQ_TRIGGER
         || linux_proc_sysctl_index(device).is_some()
     {
@@ -49428,6 +49638,7 @@ fn linux_proc_dynamic_descriptor_pid(descriptor: u64) -> Option<u32> {
             | LINUX_FILE_PROC_DYNAMIC_MAPS
             | LINUX_FILE_PROC_DYNAMIC_SMAPS
             | LINUX_FILE_PROC_DYNAMIC_PAGEMAP
+            | LINUX_FILE_PROC_DYNAMIC_MEM
             | LINUX_FILE_PROC_OOM_SCORE_ADJ
             | LINUX_FILE_PROC_TASK_COMM
             | LINUX_FILE_PROC_TASK_STAT
@@ -49482,6 +49693,7 @@ fn linux_proc_file(state: u16) -> bool {
             | LINUX_FILE_PROC_DYNAMIC_MAPS
             | LINUX_FILE_PROC_DYNAMIC_SMAPS
             | LINUX_FILE_PROC_DYNAMIC_PAGEMAP
+            | LINUX_FILE_PROC_DYNAMIC_MEM
             | LINUX_FILE_PROC_TASK_COMM
             | LINUX_FILE_PROC_TASK_STAT
             | LINUX_FILE_PROC_MOUNTS
@@ -49498,6 +49710,7 @@ fn linux_writable_proc_file(state: u16) -> bool {
         LINUX_FILE_PROC_FILE_MAX
             | LINUX_FILE_PROC_NR_OPEN
             | LINUX_FILE_PROC_OOM_SCORE_ADJ
+            | LINUX_FILE_PROC_DYNAMIC_MEM
             | LINUX_FILE_PROC_SYSRQ_TRIGGER
             | LINUX_FILE_PROC_UID_MAP
             | LINUX_FILE_PROC_GID_MAP
@@ -49683,6 +49896,7 @@ fn linux_regular_file(state: u16) -> Option<&'static [u8]> {
         | LINUX_FILE_PROC_DYNAMIC_MAPS
         | LINUX_FILE_PROC_DYNAMIC_SMAPS
         | LINUX_FILE_PROC_DYNAMIC_PAGEMAP
+        | LINUX_FILE_PROC_DYNAMIC_MEM
         | LINUX_FILE_PROC_TASK_COMM
         | LINUX_FILE_PROC_TASK_STAT => return None,
         LINUX_FILE_PROC_PID1_STAT => return Some(LINUX_PROC_PID1_STAT),
@@ -49776,7 +49990,8 @@ fn linux_regular_file_inode(state: u16) -> Option<u64> {
         | LINUX_FILE_PROC_DYNAMIC_STATM
         | LINUX_FILE_PROC_DYNAMIC_MAPS
         | LINUX_FILE_PROC_DYNAMIC_SMAPS
-        | LINUX_FILE_PROC_DYNAMIC_PAGEMAP => return Some(48),
+        | LINUX_FILE_PROC_DYNAMIC_PAGEMAP
+        | LINUX_FILE_PROC_DYNAMIC_MEM => return Some(48),
         LINUX_FILE_PROC_TASK_COMM => return Some(95),
         LINUX_FILE_PROC_TASK_STAT => return Some(96),
         _ => {}
@@ -54921,13 +55136,34 @@ fn linux_mount_filesystem(
     if linux_kernel_mount_point(canonical_target) {
         return 0;
     }
+    // A new tmpfs's root is the mounter's, mode 1777, as in Linux; the
+    // directory it covers gets its own attributes back at unmount.
+    let tmpfs_root = matches!(filesystem, b"tmpfs" | b"ramfs" | b"devtmpfs")
+        .then(|| crate::linux_overlay::lookup(canonical_target))
+        .flatten()
+        .filter(|metadata| metadata.kind == crate::linux_overlay::NodeKind::Directory);
+    let covered = tmpfs_root.map(|metadata| crate::linux_mounts::Attributes {
+        mode: metadata.mode,
+        owner: metadata.owner,
+        group: metadata.group,
+    });
     match crate::linux_mounts::mount(
         linux_execution_instance(),
         canonical_target,
         filesystem,
         mount_flags,
+        covered,
     ) {
-        Ok(_) => 0,
+        Ok(_) => {
+            if let Some(metadata) = tmpfs_root {
+                let (owner, group) = current_linux_credentials().map_or((0, 0), |credentials| {
+                    (credentials.user.filesystem, credentials.group.filesystem)
+                });
+                let _ = crate::linux_overlay::set_mode(metadata.handle, 0o1777)
+                    && crate::linux_overlay::set_owner(metadata.handle, owner, group);
+            }
+            0
+        }
         Err(_) => LINUX_ENOMEM,
     }
 }
@@ -54978,9 +55214,18 @@ fn linux_umount(target_address: u64, flags: u64) -> u64 {
         return linux_missing_path_error(canonical);
     }
     match crate::linux_mounts::unmount(linux_execution_instance(), canonical) {
-        Ok(filesystem) => {
+        Ok((filesystem, covered)) => {
             if matches!(filesystem.as_slice(), b"tmpfs" | b"ramfs" | b"devtmpfs") {
                 crate::linux_overlay::unlink_below(canonical);
+            }
+            if let Some((covered, metadata)) = covered.zip(crate::linux_overlay::lookup(canonical))
+            {
+                let _ = crate::linux_overlay::set_mode(metadata.handle, covered.mode)
+                    && crate::linux_overlay::set_owner(
+                        metadata.handle,
+                        covered.owner,
+                        covered.group,
+                    );
             }
             0
         }
@@ -60224,6 +60469,20 @@ fn handle_user_fault(frame: *mut UserFaultFrame) -> u64 {
             return u64::MAX;
         }
     }
+    // int3 and a debug trap raise SIGTRAP, which stops a traced process
+    // for its tracer rather than ending it.
+    if fault_domain.is_none()
+        && X86_RUNTIME.ELF_PROBE_ACTIVE.load(Ordering::SeqCst)
+        && X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
+        && (fault_metadata.vector == 1 || linux_user_breakpoint(frame, fault_metadata))
+    {
+        if linux_light_thread_here().is_some() {
+            return fault_linux_light_thread(frame, fault_metadata, LINUX_SIGTRAP);
+        }
+        if trap_linux_user_to_signal_entry(frame) {
+            return 0;
+        }
+    }
     if fault_domain.is_none() && X86_RUNTIME.ELF_PROBE_ACTIVE.load(Ordering::SeqCst) {
         serial_write("ginux: Linux user fault vector/error/address/rip:");
         serial_write_u64(fault_metadata.vector);
@@ -60604,6 +60863,87 @@ fn grow_linux_growsdown_area(fault: domain::FaultMetadata) -> bool {
                 .fetch_add(old_start - page, Ordering::SeqCst);
         }
     }
+    true
+}
+
+/// Whether user fault `fault` is a breakpoint, int3 (or `int 3`), and if
+/// so moves `frame` past it, where Linux reports the trap. Only INT 0x80
+/// is a user gate here, so a user int3 reaches the kernel as a general
+/// protection fault on IDT entry 3, at the instruction.
+fn linux_user_breakpoint(frame: &mut UserFaultFrame, fault: domain::FaultMetadata) -> bool {
+    /// A #GP error code naming IDT entry 3.
+    const IDT_BREAKPOINT_ERROR: u64 = 3 << 3 | 2;
+    if fault.vector == 3 {
+        return true;
+    }
+    if fault.vector != 13 || fault.error != IDT_BREAKPOINT_ERROR {
+        return false;
+    }
+    let mut first = [0_u8; 1];
+    let mut second = [0_u8; 1];
+    let length = match copy_from_linux_user(fault.instruction, &mut first).then_some(first[0]) {
+        Some(0xcc) => 1,
+        Some(0xcd)
+            if copy_from_linux_user(fault.instruction.wrapping_add(1), &mut second)
+                && second[0] == 3 =>
+        {
+            2
+        }
+        _ => return false,
+    };
+    frame.redirect(
+        fault.instruction.wrapping_add(length),
+        USER_CODE_SELECTOR,
+        USER_DATA_SELECTOR,
+    )
+}
+
+/// A user int3 or debug trap on the owner's path: SIGTRAP is queued for
+/// the process and the thread goes to the vDSO's preemption entry, whose
+/// system call delivers it with the trapping context (rip past the int3),
+/// as a timer-delivered signal is: a traced process stops there for its
+/// tracer, another runs its handler or ends. False when the signal cannot
+/// be delivered that way (a handler is running), for the caller to end the
+/// process as before.
+fn trap_linux_user_to_signal_entry(frame: &mut UserFaultFrame) -> bool {
+    let Some(entry) = crate::linux_elf::vdso_preempt_entry() else {
+        return false;
+    };
+    if X86_RUNTIME.LINUX_SIGNAL_ACTIVE.load(Ordering::SeqCst) {
+        return false;
+    }
+    let pid = current_linux_process_pid();
+    let context = frame.context();
+    if (entry..entry + 9).contains(&context.rip)
+        || linux_queue_process_signal(pid, LINUX_SIGTRAP, LINUX_SI_KERNEL, None) != 0
+        || !frame.redirect(entry, USER_CODE_SELECTOR, USER_DATA_SELECTOR)
+    {
+        return false;
+    }
+    *LINUX_PREEMPTED_CONTEXT[linux_cpu_slot()].lock() = Some(LinuxPreemptedContext {
+        pid,
+        general: [
+            context.rax,
+            context.rbx,
+            context.rcx,
+            context.rdx,
+            context.rsi,
+            context.rdi,
+            context.rbp,
+            context.r8,
+            context.r9,
+            context.r10,
+            context.r11,
+            context.r12,
+            context.r13,
+            context.r14,
+            context.r15,
+        ],
+        rip: context.rip,
+        rsp: context.rsp,
+        rflags: context.rflags,
+        signal: true,
+    });
     true
 }
 

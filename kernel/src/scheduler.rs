@@ -201,6 +201,16 @@ impl UserFaultFrame {
         }
     }
 
+    /// Sends the interrupted user code to `rip` instead, its registers
+    /// kept.
+    pub(crate) fn redirect(&mut self, rip: u64, code_selector: u16, data_selector: u16) -> bool {
+        if !self.selectors_match(code_selector, data_selector) || rip == 0 || rip >= 1 << 47 {
+            return false;
+        }
+        self.rip = rip;
+        true
+    }
+
     pub(crate) fn enter_signal_handler(
         &mut self,
         handler: u64,

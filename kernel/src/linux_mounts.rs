@@ -38,6 +38,17 @@ pub(crate) struct Mount {
     pub(crate) path: Vec<u8>,
     pub(crate) filesystem: Vec<u8>,
     pub(crate) flags: u32,
+    /// The mode, owner and group the mount point directory had before the
+    /// mount's root took its place, to give back at unmount.
+    pub(crate) covered: Option<Attributes>,
+}
+
+/// A directory's mode, owner and group.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Attributes {
+    pub(crate) mode: u32,
+    pub(crate) owner: u32,
+    pub(crate) group: u32,
 }
 
 struct Mounts {
@@ -68,12 +79,14 @@ fn copy(bytes: &[u8]) -> Result<Vec<u8>, Error> {
 }
 
 /// Mounts `filesystem` at canonical `path` in `instance`, on top of
-/// whatever is mounted there; returns the mount's id.
+/// whatever is mounted there (`covered`: the mount point's own attributes,
+/// when the mount's root replaces them); returns the mount's id.
 pub(crate) fn mount(
     instance: usize,
     path: &[u8],
     filesystem: &[u8],
     flags: u32,
+    covered: Option<Attributes>,
 ) -> Result<u32, Error> {
     let mount = Mount {
         instance,
@@ -81,6 +94,7 @@ pub(crate) fn mount(
         path: copy(path)?,
         filesystem: copy(filesystem)?,
         flags,
+        covered,
     };
     let mut table = MOUNTS.lock();
     table.mounts.try_reserve(1).map_err(|_| Error::NoMemory)?;
@@ -110,13 +124,16 @@ pub(crate) fn remount(instance: usize, path: &[u8], flags: u32) -> Result<(), Er
 }
 
 /// Removes the topmost mount at canonical `path` and returns its filesystem
-/// type.
-pub(crate) fn unmount(instance: usize, path: &[u8]) -> Result<Vec<u8>, Error> {
+/// type and the mount point attributes it covered.
+pub(crate) fn unmount(
+    instance: usize,
+    path: &[u8],
+) -> Result<(Vec<u8>, Option<Attributes>), Error> {
     let mut table = MOUNTS.lock();
     let index = topmost(&table, instance, path).ok_or(Error::NotMounted)?;
-    let filesystem = table.mounts.remove(index).filesystem;
+    let mount = table.mounts.remove(index);
     changed(&mut table, instance);
-    Ok(filesystem)
+    Ok((mount.filesystem, mount.covered))
 }
 
 /// Counts a change to `instance`'s mount table.

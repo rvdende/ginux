@@ -755,6 +755,7 @@ fn linux_syscall_dispatch(
                 || linux_regular_file(device).is_some()
                 || linux_tmp_file(device)
                 || device & !3 == LINUX_FILE_PROC_DYNAMIC_PAGEMAP
+                || device & !3 == LINUX_FILE_PROC_DYNAMIC_MEM
             {
                 linux_regular_file_seek(first_argument, device, buffer, count)
             } else if device & LINUX_DEVICE_DIRECTORY != 0 {
