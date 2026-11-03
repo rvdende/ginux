@@ -53,6 +53,8 @@ pub(crate) struct Metadata {
     pub(crate) links: u32,
     /// A device file's device number, as mknod(2) and stat(2) encode it.
     pub(crate) device: u32,
+    /// FS_*_FL attributes (see [`set_attributes`]).
+    pub(crate) attributes: u32,
     pub(crate) size: usize,
     pub(crate) atime: (i64, i64),
     pub(crate) mtime: (i64, i64),
@@ -179,6 +181,9 @@ struct Node {
     device: u32,
     /// A memfd's seals (F_SEAL_*, which all fit a byte).
     seals: u8,
+    /// The file's attributes (FS_IOC_GETFLAGS: FS_IMMUTABLE_FL,
+    /// FS_APPEND_FL, FS_NODUMP_FL and FS_NOATIME_FL, which fit a byte).
+    attributes: u8,
     /// The pipe socket behind a FIFO, plus one; 0 before one opens it.
     fifo_socket: u16,
     handle: Handle,
@@ -215,6 +220,7 @@ impl Node {
         links: 0,
         device: 0,
         seals: 0,
+        attributes: 0,
         fifo_socket: 0,
         handle: Handle {
             generation: 0,
@@ -252,6 +258,7 @@ impl Node {
                 u32::from(self.links.saturating_sub(1))
             },
             device: self.device,
+            attributes: u32::from(self.attributes),
             size: self.size,
             atime: self.atime,
             mtime: self.mtime,
@@ -984,6 +991,7 @@ fn create(path: &[u8], kind: NodeKind, mode: u32, initial: &[u8]) -> Option<Hand
         links: 1,
         device: 0,
         seals: 0,
+        attributes: 0,
         fifo_socket: 0,
         handle,
         size: 0,
@@ -1062,6 +1070,7 @@ pub(crate) fn whiteout(path: &[u8]) -> bool {
         links: 0,
         device: 0,
         seals: 0,
+        attributes: 0,
         fifo_socket: 0,
         handle: Handle { generation, inode },
         size: 0,
@@ -1286,6 +1295,16 @@ pub(crate) fn set_mode(handle: Handle, mode: u32) -> bool {
         return false;
     };
     node.mode = mode & 0o7777;
+    true
+}
+
+/// Sets a file's attributes (FS_IOC_SETFLAGS): FS_*_FL bits, of which
+/// the file keeps those that fit a byte.
+pub(crate) fn set_attributes(handle: Handle, attributes: u32) -> bool {
+    let Some(node) = node_mut(handle) else {
+        return false;
+    };
+    node.attributes = attributes as u8;
     true
 }
 
@@ -1704,6 +1723,10 @@ pub(crate) fn unlink(handle: Handle) -> bool {
 }
 
 pub(crate) fn teardown() -> bool {
+    // The domain's loop devices are backed by its files, and its RAM disks
+    // go with them.
+    crate::linux_loop::forget_domain();
+    crate::linux_ramdisk::forget_domain();
     let overlay = live_mut();
     *node_hints() = BTreeMap::new();
     *path_hints() = BTreeMap::new();

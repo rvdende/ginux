@@ -11,18 +11,10 @@ clone08 TBROK
 clone09 TBROK
 clone10 TBROK
 clone301 TBROK
-fsetxattr02 TBROK
-fgetxattr02 TBROK
 getcpu01 TFAIL
 ioctl01 TBROK
 ioctl02 TBROK
-ioctl_loop01 TBROK
-ioctl_loop02 TBROK
-ioctl_loop03 TBROK
-ioctl_loop04 TBROK
 ioctl_loop05 TBROK
-ioctl_loop06 TBROK
-ioctl_loop07 TBROK
 ioctl_ns01 TBROK
 ioctl_ns02 TBROK
 ioctl_ns03 TBROK
@@ -64,7 +56,6 @@ ptrace09 TBROK
 ptrace10 TBROK
 ptrace11 TBROK
 setns02 TWARN
-setxattr03 TBROK
 signal06 TBROK
 statmount03 TBROK
 times03 TFAIL

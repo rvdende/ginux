@@ -124,8 +124,14 @@ feature rather than a fix:
   executable at a time and flips on the access that needs the other
   (mincore02 passes).
 - **io_uring** (io_uring01, 03, 04): one minimal ring per process.
-- **fanotify, keyctl, loop devices, perf events**: missing features or
-  kernel config the tests parse (`/proc/config.gz`).
+- **fanotify, keyctl, perf events**: missing features or kernel config
+  the tests parse (`/proc/config.gz`).
+- **Loop devices** (`kernel/src/linux_loop.rs`: /dev/loop-control,
+  /dev/loopN backed by overlay files, /sys/block/loopN) and RAM disks
+  (`linux_ramdisk.rs`, /dev/ramN) pass ioctl_loop01-04, 06 and 07.
+  ioctl_loop05 needs TMPDIR on a block-backed filesystem (Ginux's root is
+  a RAM filesystem, device 0), and the device tests below need a
+  filesystem made on a loop device and mounted.
 - **Memory details**: mmap, madvise, mremap, msync, mlock and mseal
   corner cases, `/proc/self/smaps`, `/proc/PID/pagemap`. MAP_32BIT
   cannot place anything (mmap24): the kernel's identity map holds the
@@ -487,8 +493,8 @@ loop block device (`.needs_device`, `.mount_device`, `.format_device`,
 mounts a filesystem image), or that need loadable kernel modules. Lines with
 any other note are curated by hand and survive regeneration, so to skip a
 test permanently write `!TAG COMMAND  # reason`. To run the device tests
-again (once Ginux has loop devices), delete the rule from `SKIP_RULES` in
-`tools/ltp/make-list.py`.
+again (Ginux has loop devices; mounting a filesystem made on one is what
+is missing), delete the rule from `SKIP_RULES` in `tools/ltp/make-list.py`.
 
 Tests of Policy-denied operations (setting the clock, loading modules; see
 [LINUX-COMPATIBILITY.md](LINUX-COMPATIBILITY.md)) are deliberately not

@@ -469,6 +469,18 @@ fn linux_syscall_dispatch(
         {
             linux_graphics_syscall(number, first_argument, buffer, count)
         }
+        LINUX_READ_SYSCALL
+        | LINUX_WRITE_SYSCALL
+        | LINUX_IOCTL_SYSCALL
+        | LINUX_LSEEK_SYSCALL
+        | LINUX_PREAD64_SYSCALL
+        | LINUX_PWRITE64_SYSCALL
+        | LINUX_FSYNC_SYSCALL
+        | LINUX_FDATASYNC_SYSCALL
+            if runtime_mode && linux_block_descriptor(first_argument).is_some() =>
+        {
+            linux_block_syscall(number, first_argument, buffer, count, register(0))
+        }
         LINUX_READ_SYSCALL | LINUX_WRITE_SYSCALL | LINUX_IOCTL_SYSCALL
             if runtime_mode && linux_object_descriptor(first_argument).is_some() =>
         {
@@ -934,6 +946,9 @@ fn linux_syscall_dispatch(
         LINUX_PKEY_FREE_SYSCALL => linux_pkey_free(first_argument),
         LINUX_IOCTL_SYSCALL => {
             if let Some(result) = linux_generic_ioctl(first_argument, buffer, count) {
+                return result;
+            }
+            if let Some(result) = linux_file_attributes_ioctl(first_argument, buffer, count) {
                 return result;
             }
             if linux_userfaultfd_descriptor(first_argument) {

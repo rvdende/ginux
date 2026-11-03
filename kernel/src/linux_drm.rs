@@ -72,7 +72,7 @@ pub(crate) fn available() -> bool {
 
 /// Opens a render node file; returns its object slot.
 pub(crate) fn open() -> Option<crate::linux_socket::SlotId> {
-    collect();
+    crate::arch::x86_64::cpu::linux_release_objects();
     let id = insert(&mut DRM.lock().files, File::new())?;
     match crate::linux_socket::open_object(CLASS_FILE, id) {
         Ok(slot) => Some(slot),
@@ -103,28 +103,27 @@ pub(crate) fn dmabuf(id: u64) -> Option<DmaBuf> {
     DRM.lock().dmabufs.get(id as usize).copied().flatten()
 }
 
-/// Releases the files and dma-bufs whose last descriptor has closed.
-pub(crate) fn collect() {
-    for (class, id) in crate::linux_socket::take_released_objects() {
-        match class {
-            CLASS_FILE => {
-                let file = DRM.lock().files.get_mut(id as usize).and_then(Option::take);
-                if let Some(mut file) = file {
-                    file.close(&mut VirtioGpu);
-                }
+/// Releases object `class`/`id` after its last descriptor closed: a render
+/// node file or a dma-buf. Objects of other classes are not this module's.
+pub(crate) fn release(class: u8, id: u64) {
+    match class {
+        CLASS_FILE => {
+            let file = DRM.lock().files.get_mut(id as usize).and_then(Option::take);
+            if let Some(mut file) = file {
+                file.close(&mut VirtioGpu);
             }
-            CLASS_DMABUF => {
-                let dmabuf = DRM
-                    .lock()
-                    .dmabufs
-                    .get_mut(id as usize)
-                    .and_then(Option::take);
-                if let Some(dmabuf) = dmabuf {
-                    VirtioGpu.release(dmabuf.resource);
-                }
-            }
-            _ => {}
         }
+        CLASS_DMABUF => {
+            let dmabuf = DRM
+                .lock()
+                .dmabufs
+                .get_mut(id as usize)
+                .and_then(Option::take);
+            if let Some(dmabuf) = dmabuf {
+                VirtioGpu.release(dmabuf.resource);
+            }
+        }
+        _ => {}
     }
 }
 

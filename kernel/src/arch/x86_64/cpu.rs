@@ -32914,6 +32914,12 @@ fn linux_canonical_path_at(
     }
     if &output[..length] == b"dev" || output[..length].starts_with(b"dev/") {
         linux_ensure_dev_nodes();
+        crate::linux_loop::ensure_nodes();
+    } else if &output[..length] == b"sys"
+        || output[..length].starts_with(b"sys/block")
+        || output[..length].starts_with(b"sys/dev")
+    {
+        crate::linux_loop::ensure_nodes();
     }
     // Root may search every directory; anyone else needs search permission
     // on each directory the walk passes through.
@@ -33722,6 +33728,18 @@ fn linux_openat_path(
     {
         return LINUX_EEXIST;
     }
+    if let Some(attributes) = overlay_metadata
+        .filter(|_| flags & LINUX_O_PATH == 0)
+        .map(|metadata| metadata.attributes)
+    {
+        let truncate = flags & LINUX_O_TRUNC != 0;
+        if attributes & LINUX_FS_IMMUTABLE_FL != 0 && (access != 0 || truncate)
+            || attributes & LINUX_FS_APPEND_FL != 0
+                && (access != 0 && flags & LINUX_O_APPEND == 0 || truncate)
+        {
+            return LINUX_EPERM;
+        }
+    }
     if let Some(length) = canonical_length.filter(|_| flags & LINUX_O_PATH == 0) {
         let path = &canonical[..length];
         let check = if overlay_metadata.is_some() || rootfs_at_path.is_some() {
@@ -33890,9 +33908,15 @@ fn linux_openat_path(
                 kind @ (crate::linux_overlay::NodeKind::CharacterDevice
                 | crate::linux_overlay::NodeKind::BlockDevice),
             ) => match linux_device_node_kind(handle, kind) {
-                Ok(kind) => {
+                Ok(LinuxDeviceNode::Character(kind)) => {
                     overlay_handle = None;
                     kind
+                }
+                Ok(LinuxDeviceNode::Block(major, minor)) => {
+                    return linux_open_block_device(major, minor, flags)
+                }
+                Ok(LinuxDeviceNode::LoopControl) => {
+                    return linux_open_object(crate::linux_loop::CLASS_CONTROL, 0, flags)
                 }
                 Err(error) => return error,
             },
@@ -35126,13 +35150,30 @@ fn linux_device_numbers(device: u32) -> (u32, u32) {
     )
 }
 
+/// The device number of `major`:`minor` as stat(2) encodes it (Linux's
+/// new_encode_dev).
+pub(crate) fn linux_device_number(major: u32, minor: u32) -> u32 {
+    (minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)
+}
+
+/// A device a device file opens.
+enum LinuxDeviceNode {
+    /// One of the kernel's character devices, by descriptor kind.
+    Character(u16),
+    /// Block device `major`:`minor`: a loop device (7) or RAM disk (1).
+    Block(u32, u32),
+    /// /dev/loop-control (10:237).
+    LoopControl,
+}
+
 /// What opening the device file `handle` opens: the kernel's null, zero and
-/// console devices for their numbers; no other device is reachable through
-/// a device file (ENXIO), and none on a nodev mount (EACCES).
+/// console devices, loop devices and RAM disks for their numbers; no other device
+/// is reachable through a device file (ENXIO), and none on a nodev mount
+/// (EACCES).
 fn linux_device_node_kind(
     handle: crate::linux_overlay::Handle,
     kind: crate::linux_overlay::NodeKind,
-) -> Result<u16, u64> {
+) -> Result<LinuxDeviceNode, u64> {
     let mut path = [0_u8; crate::linux_overlay::PATH_CAPACITY];
     let length = crate::linux_overlay::copy_path(handle, &mut path).ok_or(LINUX_ENOENT)?;
     if crate::linux_mounts::flags_at(linux_execution_instance(), &path[..length])
@@ -35145,13 +35186,21 @@ fn linux_device_node_kind(
         .ok_or(LINUX_ENOENT)?
         .device;
     match (kind, linux_device_numbers(device)) {
+        (
+            crate::linux_overlay::NodeKind::BlockDevice,
+            (major @ (crate::linux_loop::MAJOR | crate::linux_ramdisk::MAJOR), minor),
+        ) => Ok(LinuxDeviceNode::Block(major, minor)),
+        (
+            crate::linux_overlay::NodeKind::CharacterDevice,
+            (crate::linux_loop::CONTROL_MAJOR, crate::linux_loop::CONTROL_MINOR),
+        ) => Ok(LinuxDeviceNode::LoopControl),
         (crate::linux_overlay::NodeKind::CharacterDevice, numbers) => LinuxCharacterDevice::ALL
             .into_iter()
             .find(|device| {
                 let (_, major, minor, _) = device.identity();
                 (major, minor) == numbers
             })
-            .map(LinuxCharacterDevice::kind)
+            .map(|device| LinuxDeviceNode::Character(device.kind()))
             .ok_or(LINUX_ENXIO),
         _ => Err(LINUX_ENXIO),
     }
@@ -35565,6 +35614,9 @@ fn linux_unlinkat(directory: u64, path_address: u64, flags: u64) -> u64 {
             linux_missing_path_error(&canonical[..length])
         };
     };
+    if metadata.attributes & (LINUX_FS_IMMUTABLE_FL | LINUX_FS_APPEND_FL) != 0 {
+        return LINUX_EPERM;
+    }
     if flags == LINUX_AT_REMOVEDIR && metadata.kind != crate::linux_overlay::NodeKind::Directory {
         return LINUX_ENOTDIR;
     }
@@ -35659,6 +35711,9 @@ fn linux_ftruncate(descriptor: u64, length: u64) -> u64 {
     let Some(metadata) = crate::linux_overlay::metadata(handle) else {
         return LINUX_EIO;
     };
+    if metadata.attributes & (LINUX_FS_IMMUTABLE_FL | LINUX_FS_APPEND_FL) != 0 {
+        return LINUX_EPERM;
+    }
     // Only the size seals stop a truncate; a write-sealed memfd may still
     // shrink and grow, as in Linux (memfd_create01).
     if let Some(seals) = crate::linux_overlay::file_seals(handle) {
@@ -35786,6 +35841,9 @@ fn linux_overlay_chmod(handle: crate::linux_overlay::Handle, mut mode: u32) -> u
     if let Err(error) = linux_check_writable_handle(handle) {
         return error;
     }
+    if metadata.attributes & (LINUX_FS_IMMUTABLE_FL | LINUX_FS_APPEND_FL) != 0 {
+        return LINUX_EPERM;
+    }
     let file = linux_overlay_file_access(metadata);
     if let Some(credentials) = current_linux_credentials() {
         if !credentials.owns(file) {
@@ -35817,6 +35875,9 @@ fn linux_overlay_chown(handle: crate::linux_overlay::Handle, owner: u32, group: 
     };
     if let Err(error) = linux_check_writable_handle(handle) {
         return error;
+    }
+    if metadata.attributes & (LINUX_FS_IMMUTABLE_FL | LINUX_FS_APPEND_FL) != 0 {
+        return LINUX_EPERM;
     }
     let file = linux_overlay_file_access(metadata);
     let (Some(namespace), Some(credentials)) =
@@ -35996,6 +36057,79 @@ fn linux_xattr_name(address: u64, output: &mut [u8; 256]) -> Result<usize, u64> 
 
 /// The overlay file an xattr call's path names: the symlink itself for
 /// the l* calls, what it leads to for the others (`follow`).
+/// FS_IOC_GETFLAGS attributes: a file that may not change at all, or only
+/// grow.
+const LINUX_FS_IMMUTABLE_FL: u32 = 0x10;
+const LINUX_FS_APPEND_FL: u32 = 0x20;
+/// The attributes a file keeps, as tmpfs does: immutable, append-only,
+/// no-dump and no-atime.
+const LINUX_FS_MODIFIABLE_FLAGS: u32 = LINUX_FS_IMMUTABLE_FL | LINUX_FS_APPEND_FL | 0x40 | 0x80;
+
+/// An overlay file's FS_*_FL attributes.
+fn linux_overlay_attributes(handle: crate::linux_overlay::Handle) -> u32 {
+    crate::linux_overlay::metadata(handle).map_or(0, |metadata| metadata.attributes)
+}
+
+/// FS_IOC_GETFLAGS and FS_IOC_SETFLAGS (chattr and lsattr) on a file or
+/// directory of the domain's filesystem; None for other requests and
+/// descriptors.
+fn linux_file_attributes_ioctl(descriptor: u64, request: u64, argument: u64) -> Option<u64> {
+    const FS_IOC_GETFLAGS: u32 = 0x8008_6601;
+    const FS_IOC_SETFLAGS: u32 = 0x4008_6602;
+    const FS_IOC32_GETFLAGS: u32 = 0x8004_6601;
+    const FS_IOC32_SETFLAGS: u32 = 0x4004_6602;
+    let request = request as u32;
+    let get = matches!(request, FS_IOC_GETFLAGS | FS_IOC32_GETFLAGS);
+    if !get && !matches!(request, FS_IOC_SETFLAGS | FS_IOC32_SETFLAGS) {
+        return None;
+    }
+    let handle = linux_overlay_descriptor_handle(descriptor);
+    let image_file = handle.is_none() && linux_rootfs_entry(descriptor).is_some();
+    if handle.is_none() && !image_file {
+        return None;
+    }
+    if get {
+        let attributes = handle.map_or(0, linux_overlay_attributes);
+        return Some(if copy_to_linux_user(argument, &attributes.to_ne_bytes()) {
+            0
+        } else {
+            LINUX_EFAULT
+        });
+    }
+    let mut value = [0_u8; 4];
+    if !copy_from_linux_user(argument, &mut value) {
+        return Some(LINUX_EFAULT);
+    }
+    let attributes = u32::from_ne_bytes(value);
+    let handle = match handle.map_or_else(|| linux_copy_up_descriptor(descriptor), Ok) {
+        Ok(handle) => handle,
+        Err(error) => return Some(error),
+    };
+    let Some(metadata) = crate::linux_overlay::metadata(handle) else {
+        return Some(LINUX_EBADF);
+    };
+    let credentials = current_linux_credentials();
+    if !credentials.is_some_and(|credentials| credentials.owns(linux_overlay_file_access(metadata)))
+    {
+        return Some(LINUX_EPERM);
+    }
+    if (metadata.attributes ^ attributes) & (LINUX_FS_IMMUTABLE_FL | LINUX_FS_APPEND_FL) != 0
+        && !credentials.is_some_and(|credentials| {
+            credentials.has(ginux_credentials::capability::LINUX_IMMUTABLE)
+        })
+    {
+        return Some(LINUX_EPERM);
+    }
+    if attributes & !LINUX_FS_MODIFIABLE_FLAGS != 0 {
+        return Some(LINUX_EOPNOTSUPP);
+    }
+    if let Err(error) = linux_check_writable_handle(handle) {
+        return Some(error);
+    }
+    let _ = crate::linux_overlay::set_attributes(handle, attributes);
+    Some(0)
+}
+
 fn linux_xattr_path_handle(
     path_address: u64,
     follow: bool,
@@ -36044,51 +36178,33 @@ fn linux_fsetxattr(
     if value_size > LINUX_XATTR_SIZE_MAX {
         return LINUX_E2BIG;
     }
-    let Some(handle) = linux_overlay_descriptor_handle(descriptor) else {
-        return if linux_descriptor_open(descriptor) {
-            LINUX_EROFS
-        } else {
-            LINUX_EBADF
-        };
-    };
+    if let Some(handle) = linux_overlay_descriptor_handle(descriptor) {
+        return linux_fsetxattr_handle(
+            handle,
+            name_address,
+            value_address,
+            value_size as u64,
+            flags,
+        );
+    }
+    if !linux_descriptor_open(descriptor) {
+        return LINUX_EBADF;
+    }
     let mut name = [0_u8; 256];
     let name_length = match linux_xattr_name(name_address, &mut name) {
         Ok(length) => length,
         Err(error) => return error,
     };
-    let name = &name[..name_length];
-    let exists = crate::linux_overlay::get_xattr_chunk(handle, name, 0, &mut []).is_some();
-    if flags == LINUX_XATTR_CREATE && exists {
-        return LINUX_EEXIST;
-    }
-    if flags == LINUX_XATTR_REPLACE && !exists {
-        return LINUX_ENODATA;
-    }
-    let mut faulted = false;
-    let stored = crate::linux_overlay::set_xattr_from(
-        handle,
-        name,
-        value_size,
-        false,
-        false,
-        |offset, output| {
-            let Some(address) = value_address.checked_add(offset as u64) else {
-                faulted = true;
-                return false;
-            };
-            if !copy_from_linux_user(address, output) {
-                faulted = true;
-                return false;
-            }
-            true
-        },
-    );
-    if stored {
-        0
-    } else if faulted {
-        LINUX_EFAULT
+    // A device, pipe or socket takes no user.* attributes (EPERM); the
+    // kernel's other files take none at all.
+    let special = linux_descriptor_stat(descriptor).is_some_and(|stat| {
+        let kind = u32::from_ne_bytes(stat[24..28].try_into().unwrap_or_default()) & 0o170_000;
+        !matches!(kind, 0o100_000 | 0o040_000)
+    });
+    if special && name[..name_length].starts_with(b"user.") {
+        LINUX_EPERM
     } else {
-        LINUX_ENOSPC
+        LINUX_EROFS
     }
 }
 
@@ -36135,6 +36251,9 @@ fn linux_fsetxattr_handle(
         Err(error) => return error,
     };
     let name = &name[..name_length];
+    if linux_overlay_attributes(handle) & (LINUX_FS_IMMUTABLE_FL | LINUX_FS_APPEND_FL) != 0 {
+        return LINUX_EPERM;
+    }
     // user.* attributes belong to regular files and directories only
     // (Linux's xattr_permission: EPERM elsewhere).
     if name.starts_with(b"user.")
@@ -36340,6 +36459,9 @@ fn linux_fremovexattr_handle(handle: crate::linux_overlay::Handle, name_address:
         Ok(length) => length,
         Err(error) => return error,
     };
+    if linux_overlay_attributes(handle) & (LINUX_FS_IMMUTABLE_FL | LINUX_FS_APPEND_FL) != 0 {
+        return LINUX_EPERM;
+    }
     if crate::linux_overlay::remove_xattr(handle, &name[..name_length]) {
         0
     } else {
@@ -42577,8 +42699,19 @@ fn linux_pipe(address: u64, flags: u64) -> u64 {
     0
 }
 
+/// Releases the kernel objects whose last descriptor has closed: DRM
+/// render node files and dma-bufs, open loop devices and RAM disks.
+pub(crate) fn linux_release_objects() {
+    for (class, id) in crate::linux_socket::take_released_objects() {
+        crate::linux_drm::release(class, id);
+        crate::linux_loop::release(class, id);
+        crate::linux_ramdisk::release(class, id);
+    }
+}
+
 /// The kernel object (class and id) an object descriptor refers to: a
-/// DRM render node file, a GPU fence or a dma-buf.
+/// DRM render node file, a GPU fence or a dma-buf, an open loop device or
+/// /dev/loop-control.
 fn linux_object_descriptor(descriptor: u64) -> Option<(u8, u64)> {
     linux_socket_slot(descriptor).and_then(crate::linux_socket::object)
 }
@@ -42589,7 +42722,7 @@ fn linux_install_object_descriptor(slot: crate::linux_socket::SlotId, flags: u64
         .find(|descriptor| linux_aux_descriptor_free(*descriptor))
     else {
         let _ = crate::linux_socket::close(slot);
-        crate::linux_drm::collect();
+        linux_release_objects();
         return LINUX_EMFILE;
     };
     let index = (descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
@@ -42608,6 +42741,257 @@ fn linux_open_render_node(flags: u64) -> u64 {
         Some(slot) => linux_install_object_descriptor(slot, flags),
         None => LINUX_ENOMEM,
     }
+}
+
+/// Opens block device `major`:`minor`: a loop device (/dev/loopN) or a RAM
+/// disk (/dev/ramN).
+fn linux_open_block_device(major: u32, minor: u32, flags: u64) -> u64 {
+    let access = flags & 3;
+    let (readable, writable) = (access != 1, access != 0);
+    let (class, opened) = if major == crate::linux_ramdisk::MAJOR {
+        (
+            crate::linux_ramdisk::CLASS_DISK,
+            crate::linux_ramdisk::open(minor, readable, writable),
+        )
+    } else {
+        (
+            crate::linux_loop::CLASS_DEVICE,
+            crate::linux_loop::open(minor, readable, writable),
+        )
+    };
+    let id = match opened {
+        Ok(id) => id,
+        Err(error) => return linux_loop_errno(error),
+    };
+    match crate::linux_socket::open_object(class, id) {
+        Ok(slot) => linux_install_object_descriptor(slot, flags),
+        Err(_) => {
+            crate::linux_loop::release(class, id);
+            crate::linux_ramdisk::release(class, id);
+            LINUX_ENOMEM
+        }
+    }
+}
+
+fn linux_loop_errno(error: crate::linux_loop::Error) -> u64 {
+    error.number().wrapping_neg()
+}
+
+/// The class and id of a block device (loop device or RAM disk) or
+/// /dev/loop-control descriptor.
+fn linux_block_descriptor(descriptor: u64) -> Option<(u8, u64)> {
+    linux_object_descriptor(descriptor).filter(|(class, _)| {
+        matches!(
+            *class,
+            crate::linux_loop::CLASS_DEVICE
+                | crate::linux_loop::CLASS_CONTROL
+                | crate::linux_ramdisk::CLASS_DISK
+        )
+    })
+}
+
+/// The device number (as stat(2) shows it) and whether it is a block
+/// device, of block device or /dev/loop-control descriptor `class`/`id`.
+fn linux_block_descriptor_device(class: u8, id: u64) -> Option<(u32, bool)> {
+    match class {
+        crate::linux_loop::CLASS_DEVICE => crate::linux_loop::minor(id)
+            .map(|minor| (linux_device_number(crate::linux_loop::MAJOR, minor), true)),
+        crate::linux_ramdisk::CLASS_DISK => crate::linux_ramdisk::minor(id).map(|minor| {
+            (
+                linux_device_number(crate::linux_ramdisk::MAJOR, minor),
+                true,
+            )
+        }),
+        crate::linux_loop::CLASS_CONTROL => Some((
+            linux_device_number(
+                crate::linux_loop::CONTROL_MAJOR,
+                crate::linux_loop::CONTROL_MINOR,
+            ),
+            false,
+        )),
+        _ => None,
+    }
+}
+
+/// The calling process, for a block device ioctl.
+struct LinuxLoopCaller;
+
+impl crate::linux_loop::Caller for LinuxLoopCaller {
+    fn copy_in(&self, address: u64, output: &mut [u8]) -> bool {
+        copy_from_linux_user(address, output)
+    }
+
+    fn copy_out(&mut self, address: u64, input: &[u8]) -> bool {
+        copy_to_linux_user(address, input)
+    }
+
+    fn backing(
+        &mut self,
+        descriptor: u32,
+    ) -> Result<crate::linux_loop::Backing, crate::linux_loop::Error> {
+        use crate::linux_loop::{Backing, Error};
+        let descriptor = u64::from(descriptor);
+        if !linux_descriptor_open(descriptor) || linux_path_descriptor(descriptor) {
+            return Err(Error::BadDescriptor);
+        }
+        if let Some((crate::linux_loop::CLASS_DEVICE, id)) = linux_object_descriptor(descriptor) {
+            return Ok(Backing::Loop(id));
+        }
+        let writable = linux_device_descriptor(descriptor) & LINUX_DESCRIPTOR_OUTPUT != 0;
+        let regular_image_file = linux_rootfs_entry(descriptor).is_some_and(|entry| {
+            matches!(
+                entry.kind,
+                crate::published_rootfs::EntryKind::File
+                    | crate::published_rootfs::EntryKind::Hardlink
+            )
+        });
+        let handle = match linux_overlay_descriptor_handle(descriptor) {
+            Some(handle) => handle,
+            // An image file is copied up to have a handle to keep.
+            None if regular_image_file => {
+                linux_copy_up_descriptor(descriptor).map_err(|_| Error::Io)?
+            }
+            None => return Ok(Backing::Other),
+        };
+        Ok(
+            match crate::linux_overlay::metadata(handle).map(|metadata| metadata.kind) {
+                Some(crate::linux_overlay::NodeKind::File) => Backing::File { handle, writable },
+                _ => Backing::Other,
+            },
+        )
+    }
+
+    fn administrator(&self) -> bool {
+        current_linux_credentials()
+            .is_some_and(|credentials| credentials.has(ginux_credentials::capability::SYS_ADMIN))
+    }
+}
+
+/// read, write, lseek, pread64, pwrite64, fsync, fdatasync and ioctl on a
+/// block device or /dev/loop-control descriptor; `offset` is pread64's and
+/// pwrite64's.
+fn linux_block_syscall(number: u64, descriptor: u64, buffer: u64, count: u64, offset: u64) -> u64 {
+    let Some((class, id)) = linux_block_descriptor(descriptor) else {
+        return LINUX_EBADF;
+    };
+    if number == LINUX_IOCTL_SYSCALL {
+        if let Some(result) = linux_generic_ioctl(descriptor, buffer, count) {
+            return result;
+        }
+    }
+    let disk = class == crate::linux_ramdisk::CLASS_DISK;
+    let result = if class == crate::linux_loop::CLASS_CONTROL {
+        match number {
+            LINUX_IOCTL_SYSCALL => crate::linux_loop::control(buffer as u32, count),
+            // The control device has no data, and seeking it does nothing.
+            LINUX_LSEEK_SYSCALL => Ok(0),
+            _ => Err(crate::linux_loop::Error::Invalid),
+        }
+    } else {
+        match number {
+            LINUX_IOCTL_SYSCALL if disk => {
+                crate::linux_ramdisk::ioctl(id, buffer as u32, count, &mut LinuxLoopCaller)
+            }
+            LINUX_IOCTL_SYSCALL => {
+                crate::linux_loop::ioctl(id, buffer as u32, count, &mut LinuxLoopCaller)
+            }
+            LINUX_LSEEK_SYSCALL if disk => {
+                crate::linux_ramdisk::seek(id, buffer as i64, count as u32)
+            }
+            LINUX_LSEEK_SYSCALL => crate::linux_loop::seek(id, buffer as i64, count as u32),
+            LINUX_READ_SYSCALL => {
+                return linux_block_transfer(class, id, buffer, count, None, false)
+            }
+            LINUX_WRITE_SYSCALL => {
+                return linux_block_transfer(class, id, buffer, count, None, true)
+            }
+            LINUX_PREAD64_SYSCALL | LINUX_PWRITE64_SYSCALL if (offset as i64) < 0 => {
+                Err(crate::linux_loop::Error::Invalid)
+            }
+            LINUX_PREAD64_SYSCALL => {
+                return linux_block_transfer(class, id, buffer, count, Some(offset), false)
+            }
+            LINUX_PWRITE64_SYSCALL => {
+                return linux_block_transfer(class, id, buffer, count, Some(offset), true)
+            }
+            // Writes reach the backing file or memory at once.
+            _ => Ok(0),
+        }
+    };
+    result.unwrap_or_else(linux_loop_errno)
+}
+
+/// Reads or writes `count` bytes at `address` from or to the block device
+/// of open `class`/`id`, at `offset` or else at (and advancing) the file
+/// position.
+fn linux_block_transfer(
+    class: u8,
+    id: u64,
+    address: u64,
+    count: u64,
+    offset: Option<u64>,
+    write: bool,
+) -> u64 {
+    let disk = class == crate::linux_ramdisk::CLASS_DISK;
+    let position = || {
+        if disk {
+            crate::linux_ramdisk::position(id)
+        } else {
+            crate::linux_loop::position(id)
+        }
+    };
+    let start = match offset.map_or_else(position, Ok) {
+        Ok(start) => start,
+        Err(error) => return linux_loop_errno(error),
+    };
+    let requested = count.min(i64::MAX as u64 & !(PAGE_SIZE as u64 - 1));
+    let mut buffer = [0_u8; PAGE_SIZE];
+    let mut total = 0_u64;
+    // A zero-length transfer still checks the descriptor and the device.
+    loop {
+        let chunk = (requested - total).min(PAGE_SIZE as u64) as usize;
+        let at = start + total;
+        let result = if write {
+            if !copy_from_linux_user(address.wrapping_add(total), &mut buffer[..chunk]) {
+                Err(crate::linux_loop::Error::Fault)
+            } else if disk {
+                crate::linux_ramdisk::write_at(id, at, &buffer[..chunk])
+            } else {
+                crate::linux_loop::write_at(id, at, &buffer[..chunk])
+            }
+        } else {
+            let read = if disk {
+                crate::linux_ramdisk::read_at(id, at, &mut buffer[..chunk])
+            } else {
+                crate::linux_loop::read_at(id, at, &mut buffer[..chunk])
+            };
+            read.and_then(|length| {
+                if copy_to_linux_user(address.wrapping_add(total), &buffer[..length]) {
+                    Ok(length)
+                } else {
+                    Err(crate::linux_loop::Error::Fault)
+                }
+            })
+        };
+        match result {
+            Ok(length) => {
+                total += length as u64;
+                if length < chunk || total == requested {
+                    break;
+                }
+            }
+            Err(error) if total == 0 => return linux_loop_errno(error),
+            Err(_) => break,
+        }
+    }
+    if offset.is_none() {
+        if disk {
+            crate::linux_ramdisk::set_position(id, start + total);
+        } else {
+            crate::linux_loop::set_position(id, start + total);
+        }
+    }
+    total
 }
 
 /// A new descriptor for object `class`/`id`, given its first reference.
@@ -48921,7 +49305,7 @@ fn linux_descriptor_close_with_wake_inner(descriptor: u64, wake_waiters: bool) -
     linux_epoll_forget_descriptor(descriptor);
     if let Some(slot) = linux_socket_slot(descriptor) {
         let closed = crate::linux_socket::close(slot);
-        crate::linux_drm::collect();
+        linux_release_objects();
         if let Some(index) = usize::try_from(descriptor)
             .ok()
             .filter(|index| *index < X86_RUNTIME.ELF_PROBE_STDIO_SOCKET_SLOTS.len())
@@ -52875,11 +53259,20 @@ fn linux_descriptor_stat(descriptor: u64) -> Option<[u8; LINUX_STAT_SIZE]> {
     if linux_pipe_descriptor(descriptor) {
         return Some(linux_stat(LINUX_STAT_FIFO_MODE, socket_inode()));
     }
-    if let Some((class, _)) = linux_object_descriptor(descriptor) {
+    if let Some((class, id)) = linux_object_descriptor(descriptor) {
         if class == crate::linux_drm::CLASS_FILE {
             // A character device, 226:128.
             let mut stat = linux_stat(0o020_666, 50);
             stat[40..48].copy_from_slice(&u64::from(crate::linux_drm::NODE_DEVICE).to_ne_bytes());
+            return Some(stat);
+        }
+        if let Some((device, block)) = linux_block_descriptor_device(class, id) {
+            // A block device (7:N, 1:N) or /dev/loop-control (10:237),
+            // owned by root and the disk group.
+            let kind = if block { 0o060_000 } else { 0o020_000 };
+            let mut stat = linux_stat(kind | 0o660, 0x2000 + u64::from(device));
+            stat[32..36].copy_from_slice(&6_u32.to_ne_bytes());
+            stat[40..48].copy_from_slice(&u64::from(device).to_ne_bytes());
             return Some(stat);
         }
         return Some(linux_stat(LINUX_STAT_ANONYMOUS_MODE, 4));
@@ -53577,8 +53970,20 @@ fn linux_descriptor_link_target(
     let inode = linux_descriptor_stat(descriptor).map_or(0, |stat| {
         u64::from_ne_bytes(stat[8..16].try_into().unwrap_or([0; 8]))
     });
+    let block = linux_block_descriptor(descriptor);
+    let block_minor = block.and_then(|(class, id)| match class {
+        crate::linux_loop::CLASS_DEVICE => crate::linux_loop::minor(id),
+        crate::linux_ramdisk::CLASS_DISK => crate::linux_ramdisk::minor(id),
+        _ => None,
+    });
     let (prefix, numbered): (&[u8], bool) = if linux_pipe_descriptor(descriptor) {
         (b"pipe:[", true)
+    } else if let Some((class, _)) = block {
+        match class {
+            crate::linux_loop::CLASS_DEVICE => (b"/dev/loop", true),
+            crate::linux_ramdisk::CLASS_DISK => (b"/dev/ram", true),
+            _ => (b"/dev/loop-control", false),
+        }
     } else if linux_socket_slot(descriptor).is_some() {
         (b"socket:[", true)
     } else if linux_epoll_descriptor(descriptor) {
@@ -53624,8 +54029,9 @@ fn linux_descriptor_link_target(
     output.get_mut(..prefix.len())?.copy_from_slice(prefix);
     let mut length = prefix.len();
     if numbered {
-        let number = match linux_graphics_device(state) {
-            Some(LinuxGraphicsDevice::Input(device)) => device as u64,
+        let number = match (linux_graphics_device(state), block_minor) {
+            (_, Some(minor)) => u64::from(minor),
+            (Some(LinuxGraphicsDevice::Input(device)), _) => device as u64,
             _ => inode,
         };
         let mut digits = [0_u8; 20];
