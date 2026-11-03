@@ -464,6 +464,7 @@ pub(super) const LINUX_ENOTTY: u64 = u64::MAX - 24;
 pub(super) const LINUX_ERANGE: u64 = u64::MAX - 33;
 pub(super) const LINUX_EDOM: u64 = u64::MAX - 32;
 pub(super) const LINUX_ENOLCK: u64 = u64::MAX - 36;
+pub(super) const LINUX_EDEADLK: u64 = u64::MAX - 34;
 pub(super) const LINUX_ENOMSG: u64 = u64::MAX - 41;
 pub(super) const LINUX_EIDRM: u64 = u64::MAX - 42;
 pub(super) const LINUX_EOVERFLOW: u64 = u64::MAX - 74;

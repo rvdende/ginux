@@ -48581,7 +48581,24 @@ fn linux_fcntl_lock(descriptor: u64, command: u64, address: u64) -> u64 {
         return LINUX_EBADF;
     }
     match crate::linux_record_lock::set(file, owner, pid, (kind, start, end), alive) {
-        Ok(()) => 0,
+        Ok(()) => {
+            crate::linux_record_lock::stop_waiting(pid);
+            0
+        }
+        // A process lock F_SETLKW would wait for, held by a process that
+        // (through others) waits for this one, is EDEADLK.
+        Err(crate::linux_record_lock::Error::Conflict(blocking))
+            if command == LINUX_F_SETLKW
+                && matches!(owner, Owner::Process(_))
+                && match blocking.owner {
+                    Owner::Process(holder) => {
+                        crate::linux_record_lock::wait_would_deadlock(pid, holder, alive)
+                    }
+                    _ => false,
+                } =>
+        {
+            LINUX_EDEADLK
+        }
         Err(crate::linux_record_lock::Error::Conflict(_)) => LINUX_EAGAIN,
         Err(crate::linux_record_lock::Error::NoMemory) => LINUX_ENOLCK,
     }

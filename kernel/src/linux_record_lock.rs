@@ -59,6 +59,43 @@ impl Lock {
 
 static LOCKS: SpinLock<Vec<Lock>> = SpinLock::new(LockRank::RECORD_LOCKS, Vec::new());
 
+/// Processes waiting in F_SETLKW and the process whose lock they wait for
+/// (waiter, holder): what deadlock detection follows. Never held with
+/// `LOCKS`.
+static WAITING: SpinLock<Vec<(u32, u32)>> = SpinLock::new(LockRank::RECORD_LOCKS, Vec::new());
+
+/// Whether process `waiter` waiting for a lock `holder` holds would close a
+/// cycle of waits back to it (EDEADLK, as Linux's posix_locks_deadlock).
+/// Otherwise records the wait. Waits of processes `alive` no longer knows
+/// are dropped first.
+pub(crate) fn wait_would_deadlock(waiter: u32, holder: u32, alive: impl Fn(u32) -> bool) -> bool {
+    let mut waiting = WAITING.lock();
+    waiting.retain(|(pid, _)| alive(*pid) && *pid != waiter);
+    // Linux follows at most MAX_DEADLK_ITERATIONS (10) waits.
+    let mut next = holder;
+    for _ in 0..10 {
+        if next == waiter {
+            return true;
+        }
+        match waiting.iter().find(|(pid, _)| *pid == next) {
+            Some((_, blocked_by)) => next = *blocked_by,
+            None => break,
+        }
+    }
+    if next == waiter {
+        return true;
+    }
+    if waiting.try_reserve(1).is_ok() {
+        waiting.push((waiter, holder));
+    }
+    false
+}
+
+/// Process `pid` no longer waits for a lock (it got it, or gave up).
+pub(crate) fn stop_waiting(pid: u32) {
+    WAITING.lock().retain(|(waiter, _)| *waiter != pid);
+}
+
 /// The first lock, by its start in the file, of another owner that keeps
 /// `owner` from taking `kind` on `[start, end)` of `file`: what F_GETLK
 /// reports, as Linux finds it in its start-ordered lock list. Locks of
