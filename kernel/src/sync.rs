@@ -47,6 +47,12 @@ impl LockRank {
     /// inotify instances, watches and queues; ranks below the heap so the
     /// queues may grow while held.
     pub(crate) const INOTIFY: Self = Self(165);
+    /// fanotify groups, marks, queues and permission requests; ranks below
+    /// the heap so the queues may grow while held.
+    pub(crate) const FANOTIFY: Self = Self(166);
+    /// io_uring rings and their registered buffers; ranks below the heap
+    /// so the tables may grow while held.
+    pub(crate) const IO_URING: Self = Self(167);
     /// The pool of Linux activation stacks; ranks below the heap so the
     /// pool may grow while held.
     pub(crate) const KERNEL_STACKS: Self = Self(170);

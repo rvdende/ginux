@@ -441,11 +441,6 @@ struct X86RuntimeOwner {
     LINUX_EVENTFD_WRITE_INTERRUPT_COUNT: RuntimeRef<BankedAtomicU32>,
     LINUX_EVENTFD_WRITE_WAKE_COUNT: RuntimeRef<BankedAtomicU32>,
     LINUX_EXECUTION_INSTANCE: RuntimeRef<PerCpuAtomicU8>,
-    LINUX_FANOTIFY_MARK_MASKS: RuntimeRef<[BankedAtomicU64; LINUX_FANOTIFY_MARK_LIMIT]>,
-    LINUX_FANOTIFY_MARK_PATHS: RuntimeRef<[BankedAtomicU64; LINUX_FANOTIFY_MARK_LIMIT]>,
-    LINUX_FANOTIFY_PENDING_DESCRIPTOR: RuntimeRef<BankedAtomicU64>,
-    LINUX_FANOTIFY_PENDING_MASK: RuntimeRef<BankedAtomicU64>,
-    LINUX_FANOTIFY_REFS: RuntimeRef<BankedAtomicU16>,
     LINUX_FIRST_CHILD_TID: RuntimeRef<CpuBankedAtomicU32>,
     LINUX_FORK_CGROUP_GENERATION: RuntimeRef<CpuBankedAtomicU32>,
     LINUX_FORK_CHILD_STACK: RuntimeRef<CpuBankedAtomicU64>,
@@ -468,12 +463,6 @@ struct X86RuntimeOwner {
     LINUX_FUTEX_WAIT_BLOCK_COUNT: RuntimeRef<BankedAtomicU32>,
     LINUX_FUTEX_WAIT_TIMEOUT_COUNT: RuntimeRef<BankedAtomicU32>,
     LINUX_INIT_EXIT_KILL_ROUNDS: RuntimeRef<BankedAtomicU32>,
-    LINUX_IO_URING_CQ_ENTRIES: RuntimeRef<BankedAtomicU32>,
-    LINUX_IO_URING_CQ_RING: RuntimeRef<BankedAtomicU64>,
-    LINUX_IO_URING_ENTRIES: RuntimeRef<BankedAtomicU32>,
-    LINUX_IO_URING_REFS: RuntimeRef<BankedAtomicU16>,
-    LINUX_IO_URING_SQES: RuntimeRef<BankedAtomicU64>,
-    LINUX_IO_URING_SQ_RING: RuntimeRef<BankedAtomicU64>,
     LINUX_LAST_PREEMPTED_THREAD_SLOT: RuntimeRef<ThreadCpuAtomicU8>,
     LINUX_LIVE_RETURN_VALIDATED: RuntimeRef<CpuBankedAtomicBool>,
     LINUX_MASKED_WAIT_INTERRUPT_COUNT: RuntimeRef<BankedAtomicU32>,
@@ -971,13 +960,6 @@ static X86_RUNTIME: X86RuntimeOwner = X86RuntimeOwner {
     ),
     LINUX_EVENTFD_WRITE_WAKE_COUNT: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_EVENTFD_WRITE_WAKE_COUNT),
     LINUX_EXECUTION_INSTANCE: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_EXECUTION_INSTANCE),
-    LINUX_FANOTIFY_MARK_MASKS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_FANOTIFY_MARK_MASKS),
-    LINUX_FANOTIFY_MARK_PATHS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_FANOTIFY_MARK_PATHS),
-    LINUX_FANOTIFY_PENDING_DESCRIPTOR: RuntimeRef(
-        &X86_RUNTIME_BACKING_LINUX_FANOTIFY_PENDING_DESCRIPTOR,
-    ),
-    LINUX_FANOTIFY_PENDING_MASK: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_FANOTIFY_PENDING_MASK),
-    LINUX_FANOTIFY_REFS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_FANOTIFY_REFS),
     LINUX_FIRST_CHILD_TID: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_FIRST_CHILD_TID),
     LINUX_FORK_CGROUP_GENERATION: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_FORK_CGROUP_GENERATION),
     LINUX_FORK_CHILD_STACK: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_FORK_CHILD_STACK),
@@ -998,12 +980,6 @@ static X86_RUNTIME: X86RuntimeOwner = X86RuntimeOwner {
     LINUX_FUTEX_WAIT_BLOCK_COUNT: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_FUTEX_WAIT_BLOCK_COUNT),
     LINUX_FUTEX_WAIT_TIMEOUT_COUNT: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_FUTEX_WAIT_TIMEOUT_COUNT),
     LINUX_INIT_EXIT_KILL_ROUNDS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_INIT_EXIT_KILL_ROUNDS),
-    LINUX_IO_URING_CQ_ENTRIES: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_IO_URING_CQ_ENTRIES),
-    LINUX_IO_URING_CQ_RING: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_IO_URING_CQ_RING),
-    LINUX_IO_URING_ENTRIES: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_IO_URING_ENTRIES),
-    LINUX_IO_URING_REFS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_IO_URING_REFS),
-    LINUX_IO_URING_SQES: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_IO_URING_SQES),
-    LINUX_IO_URING_SQ_RING: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_IO_URING_SQ_RING),
     LINUX_LAST_PREEMPTED_THREAD_SLOT: RuntimeRef(
         &X86_RUNTIME_BACKING_LINUX_LAST_PREEMPTED_THREAD_SLOT,
     ),
@@ -3657,20 +3633,6 @@ static X86_RUNTIME_BACKING_ELF_PROBE_TMP_FILE_GENERATIONS: CpuBankedAtomicArray<
     AtomicU32,
     LINUX_DEVICE_DESCRIPTOR_COUNT,
 > = CpuBankedAtomicArray::<AtomicU32, LINUX_DEVICE_DESCRIPTOR_COUNT>::new();
-static X86_RUNTIME_BACKING_LINUX_FANOTIFY_REFS: BankedAtomicU16 = BankedAtomicU16::new(0);
-static X86_RUNTIME_BACKING_LINUX_FANOTIFY_MARK_PATHS: [BankedAtomicU64; LINUX_FANOTIFY_MARK_LIMIT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_FANOTIFY_MARK_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_FANOTIFY_MARK_MASKS: [BankedAtomicU64; LINUX_FANOTIFY_MARK_LIMIT] =
-    [const { BankedAtomicU64::new(0) }; LINUX_FANOTIFY_MARK_LIMIT];
-static X86_RUNTIME_BACKING_LINUX_FANOTIFY_PENDING_MASK: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_LINUX_FANOTIFY_PENDING_DESCRIPTOR: BankedAtomicU64 =
-    BankedAtomicU64::new(u64::MAX);
-static X86_RUNTIME_BACKING_LINUX_IO_URING_REFS: BankedAtomicU16 = BankedAtomicU16::new(0);
-static X86_RUNTIME_BACKING_LINUX_IO_URING_ENTRIES: BankedAtomicU32 = BankedAtomicU32::new(0);
-static X86_RUNTIME_BACKING_LINUX_IO_URING_CQ_ENTRIES: BankedAtomicU32 = BankedAtomicU32::new(0);
-static X86_RUNTIME_BACKING_LINUX_IO_URING_SQ_RING: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_LINUX_IO_URING_CQ_RING: BankedAtomicU64 = BankedAtomicU64::new(0);
-static X86_RUNTIME_BACKING_LINUX_IO_URING_SQES: BankedAtomicU64 = BankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_STDIO_DEVICE_DESCRIPTORS: [CpuBankedAtomicU16; 3] =
     [const { CpuBankedAtomicU16::new(0) }; 3];
 static X86_RUNTIME_BACKING_ELF_PROBE_STDIO_ROOTFS_DESCRIPTORS: [CpuBankedAtomicU16; 3] =
@@ -10638,35 +10600,12 @@ pub(crate) fn verify_linux_elf_entry(execution: &LinuxElfExecution<'_>) -> Linux
     for generation in &X86_RUNTIME.ELF_PROBE_TMP_FILE_GENERATIONS {
         generation.store(0, Ordering::SeqCst);
     }
-    // A runtime starts with no inotify instances of its domain.
-    crate::linux_inotify::release(linux_execution_instance(), None, 0);
-    X86_RUNTIME.LINUX_FANOTIFY_REFS.store(0, Ordering::SeqCst);
-    for path in &X86_RUNTIME.LINUX_FANOTIFY_MARK_PATHS {
-        path.store(0, Ordering::SeqCst);
-    }
-    for mask in &X86_RUNTIME.LINUX_FANOTIFY_MARK_MASKS {
-        mask.store(0, Ordering::SeqCst);
-    }
-    X86_RUNTIME
-        .LINUX_FANOTIFY_PENDING_MASK
-        .store(0, Ordering::SeqCst);
-    X86_RUNTIME
-        .LINUX_FANOTIFY_PENDING_DESCRIPTOR
-        .store(u64::MAX, Ordering::SeqCst);
-    X86_RUNTIME.LINUX_IO_URING_REFS.store(0, Ordering::SeqCst);
-    X86_RUNTIME
-        .LINUX_IO_URING_ENTRIES
-        .store(0, Ordering::SeqCst);
-    X86_RUNTIME
-        .LINUX_IO_URING_CQ_ENTRIES
-        .store(0, Ordering::SeqCst);
-    X86_RUNTIME
-        .LINUX_IO_URING_SQ_RING
-        .store(0, Ordering::SeqCst);
-    X86_RUNTIME
-        .LINUX_IO_URING_CQ_RING
-        .store(0, Ordering::SeqCst);
-    X86_RUNTIME.LINUX_IO_URING_SQES.store(0, Ordering::SeqCst);
+    // A runtime starts with no inotify instances, fanotify groups or
+    // io_uring rings of its domain.
+    let domain = linux_execution_instance();
+    crate::linux_inotify::release(domain, None, 0);
+    crate::linux_fanotify::release(domain, None, 0);
+    crate::linux_io_uring::release(domain, None, 0);
     for descriptor in &X86_RUNTIME.ELF_PROBE_STDIO_DEVICE_DESCRIPTORS {
         descriptor.store(0, Ordering::SeqCst);
     }
@@ -23055,7 +22994,7 @@ fn verify_linux_io_uring_syscalls() -> bool {
             && u32::from_ne_bytes(output[..4].try_into().unwrap()) == 4
             && u32::from_ne_bytes(output[4..8].try_into().unwrap()) == 8
             && u32::from_ne_bytes(output[64..68].try_into().unwrap()) == 24
-            && u32::from_ne_bytes(output[100..104].try_into().unwrap()) == 20
+            && u32::from_ne_bytes(output[100..104].try_into().unwrap()) == 32
     };
     let map = |offset| {
         linux_io_uring_mmap(
@@ -23096,7 +23035,7 @@ fn verify_linux_io_uring_syscalls() -> bool {
         let mut completion = [0_u8; 16];
         copy_from_linux_user(cq + 4, &mut tail)
             && u32::from_ne_bytes(tail) == 1
-            && copy_from_linux_user(cq + 20, &mut completion)
+            && copy_from_linux_user(cq + 32, &mut completion)
             && u64::from_ne_bytes(completion[..8].try_into().unwrap()) == 0x4749_4e55_5852_494f
             && i32::from_ne_bytes(completion[8..12].try_into().unwrap()) == 0
     };
@@ -23121,7 +23060,7 @@ fn verify_linux_io_uring_syscalls() -> bool {
     let read_completed = read_sqe && {
         let mut completion = [0_u8; 16];
         let mut bytes = [1_u8; 16];
-        copy_from_linux_user(cq + 36, &mut completion)
+        copy_from_linux_user(cq + 48, &mut completion)
             && u64::from_ne_bytes(completion[..8].try_into().unwrap()) == 0x5245_4144
             && i32::from_ne_bytes(completion[8..12].try_into().unwrap()) == 16
             && copy_from_linux_user(parameters + 1024, &mut bytes)
@@ -23142,7 +23081,7 @@ fn verify_linux_io_uring_syscalls() -> bool {
     };
     let io_completed = write_sqe && {
         let mut completion = [0_u8; 16];
-        copy_from_linux_user(cq + 52, &mut completion)
+        copy_from_linux_user(cq + 64, &mut completion)
             && u64::from_ne_bytes(completion[..8].try_into().unwrap()) == 0x0057_5249_5445
             && i32::from_ne_bytes(completion[8..12].try_into().unwrap()) == 16
             && linux_descriptor_close(io_descriptor) == 0
@@ -23157,7 +23096,7 @@ fn verify_linux_io_uring_syscalls() -> bool {
         && {
             let mut output = [0_u8; 16 + 24 * 8];
             copy_from_linux_user(parameters + 256, &mut output)
-                && output[0] == 23
+                && output[0] == LINUX_IORING_OP_LAST
                 && output[1] == 24
                 && u16::from_ne_bytes(output[2..4].try_into().unwrap()) == 0
                 && output[16] == 0
@@ -23200,64 +23139,120 @@ fn linux_io_uring_descriptor(descriptor: u64) -> bool {
         .is_some_and(|flags| flags & LINUX_PRIVATE_IO_URING_DESCRIPTOR != 0)
 }
 
-fn linux_io_uring_setup(entries: u64, parameters: u64) -> u64 {
-    let entries = u64::from(entries as u32);
-    if entries == 0 || entries > 64 || X86_RUNTIME.LINUX_IO_URING_REFS.load(Ordering::SeqCst) != 0 {
-        return if entries == 0 || entries > 64 {
-            LINUX_EINVAL
-        } else {
-            LINUX_EMFILE
-        };
+/// The ring a descriptor stands for: its domain and its open file
+/// description's id.
+fn linux_io_uring_key(descriptor: u64) -> Option<(usize, u64)> {
+    if !linux_io_uring_descriptor(descriptor) {
+        return None;
     }
-    let mut input = [0_u8; 120];
-    if !copy_from_linux_user(parameters, &mut input) {
+    linux_descriptor_open_file_id(descriptor).map(|id| (linux_execution_instance(), id))
+}
+
+/// Whether the current process may make a ring, as
+/// /proc/sys/kernel/io_uring_disabled decides: 0 lets everyone, 1 only
+/// those with CAP_SYS_ADMIN, 2 nobody.
+fn linux_io_uring_allowed() -> bool {
+    match linux_proc_sysctl_value(b"sys/kernel/io_uring_disabled").unwrap_or(0) {
+        0 => true,
+        1 => linux_has_capability(ginux_credentials::capability::SYS_ADMIN),
+        _ => false,
+    }
+}
+
+fn linux_io_uring_setup(entries: u64, parameters: u64) -> u64 {
+    use crate::linux_io_uring::{
+        CQ_CQES, CQ_FLAGS, CQ_HEAD, CQ_OVERFLOW, CQ_RING_ENTRIES, CQ_RING_MASK, CQ_TAIL, SQ_ARRAY,
+        SQ_DROPPED, SQ_FLAGS, SQ_HEAD, SQ_RING_ENTRIES, SQ_RING_MASK, SQ_TAIL,
+    };
+    const SETUP_CQSIZE: u32 = 1 << 3;
+    const SETUP_CLAMP: u32 = 1 << 4;
+    const FEAT_NODROP: u32 = 1 << 1;
+    const FEAT_SUBMIT_STABLE: u32 = 1 << 2;
+    const FEAT_RW_CUR_POS: u32 = 1 << 3;
+    let entries = entries as u32;
+    if !linux_io_uring_allowed() {
+        return LINUX_EPERM;
+    }
+    let mut params = [0_u8; 120];
+    if !copy_from_linux_user(parameters, &mut params) {
         return LINUX_EFAULT;
     }
-    if input[8..].iter().any(|byte| *byte != 0) {
+    let field = |params: &[u8; 120], offset: usize| {
+        u32::from_ne_bytes(params[offset..offset + 4].try_into().unwrap())
+    };
+    let flags = field(&params, 8);
+    // Polling threads, other ring layouts and the rest are not offered.
+    if flags & !(SETUP_CQSIZE | SETUP_CLAMP) != 0 || params[28..40].iter().any(|byte| *byte != 0) {
         return LINUX_EINVAL;
     }
-    let entries = (entries as u32).next_power_of_two();
-    let cq_entries = entries * 2;
+    let cq_entries = (flags & SETUP_CQSIZE != 0).then(|| field(&params, 4));
+    let Some((sq_entries, cq_entries)) =
+        crate::linux_io_uring::sizes(entries, cq_entries, flags & SETUP_CLAMP != 0)
+    else {
+        return LINUX_EINVAL;
+    };
     let Some(descriptor) = (LINUX_AUX_DESCRIPTOR_FIRST..LINUX_AUX_DESCRIPTOR_LIMIT)
         .find(|descriptor| linux_aux_descriptor_free(*descriptor))
     else {
         return LINUX_EMFILE;
     };
-    let mut output = [0_u8; 120];
-    output[..4].copy_from_slice(&entries.to_ne_bytes());
-    output[4..8].copy_from_slice(&cq_entries.to_ne_bytes());
-    for (offset, value) in [
-        (40, 0_u32),
-        (44, 4),
-        (48, 8),
-        (52, 12),
-        (56, 16),
-        (60, 20),
-        (64, 24),
-    ] {
-        output[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+    params[..4].copy_from_slice(&sq_entries.to_ne_bytes());
+    params[4..8].copy_from_slice(&cq_entries.to_ne_bytes());
+    params[20..24]
+        .copy_from_slice(&(FEAT_NODROP | FEAT_SUBMIT_STABLE | FEAT_RW_CUR_POS).to_ne_bytes());
+    let sq_offsets = [
+        SQ_HEAD,
+        SQ_TAIL,
+        SQ_RING_MASK,
+        SQ_RING_ENTRIES,
+        SQ_FLAGS,
+        SQ_DROPPED,
+        SQ_ARRAY,
+    ];
+    let cq_offsets = [
+        CQ_HEAD,
+        CQ_TAIL,
+        CQ_RING_MASK,
+        CQ_RING_ENTRIES,
+        CQ_OVERFLOW,
+        CQ_CQES,
+        CQ_FLAGS,
+    ];
+    for (base, offsets) in [(40, &sq_offsets), (80, &cq_offsets)] {
+        params[base..base + 40].fill(0);
+        for (index, offset) in offsets.iter().enumerate() {
+            let at = base + index * 4;
+            params[at..at + 4].copy_from_slice(&(*offset as u32).to_ne_bytes());
+        }
     }
-    for (offset, value) in [(80, 0_u32), (84, 4), (88, 8), (92, 12), (96, 16), (100, 20)] {
-        output[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
-    }
-    if !copy_to_linux_user(parameters, &output) {
+    if !copy_to_linux_user(parameters, &params) {
         return LINUX_EFAULT;
     }
     let index = (descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
     X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index].store(LINUX_DEVICE_ZERO | 3, Ordering::SeqCst);
     X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index]
         .store(LINUX_PRIVATE_IO_URING_DESCRIPTOR, Ordering::SeqCst);
+    let created = linux_descriptor_open_file_id(descriptor).is_some_and(|id| {
+        crate::linux_io_uring::create(
+            linux_execution_instance(),
+            id,
+            current_linux_process_pid(),
+            sq_entries,
+            cq_entries,
+        )
+    });
+    if !created {
+        X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index].store(0, Ordering::SeqCst);
+        X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index].store(0, Ordering::SeqCst);
+        return LINUX_ENOMEM;
+    }
+    // A ring's descriptor is always close-on-exec, as in Linux.
     set_linux_descriptor_close_on_exec(descriptor, true);
-    X86_RUNTIME.LINUX_IO_URING_REFS.store(1, Ordering::SeqCst);
-    X86_RUNTIME
-        .LINUX_IO_URING_ENTRIES
-        .store(entries, Ordering::SeqCst);
-    X86_RUNTIME
-        .LINUX_IO_URING_CQ_ENTRIES
-        .store(cq_entries, Ordering::SeqCst);
     descriptor
 }
 
+/// mmap of a ring's descriptor: a shared area for the submission ring,
+/// the completion ring or the submission entries, by `offset`.
 fn linux_io_uring_mmap(
     address: u64,
     length: u64,
@@ -23266,14 +23261,25 @@ fn linux_io_uring_mmap(
     descriptor: u64,
     offset: u64,
 ) -> u64 {
-    const SQ_RING_OFFSET: u64 = 0;
-    const CQ_RING_OFFSET: u64 = 0x0800_0000;
-    const SQES_OFFSET: u64 = 0x1000_0000;
-    if !linux_io_uring_descriptor(descriptor)
-        || flags != LINUX_MAP_SHARED
-        || protection & (LINUX_PROT_READ | LINUX_PROT_WRITE) != (LINUX_PROT_READ | LINUX_PROT_WRITE)
-        || length < PAGE_SIZE as u64
-        || !matches!(offset, SQ_RING_OFFSET | CQ_RING_OFFSET | SQES_OFFSET)
+    use crate::linux_io_uring::{
+        Region, CQ_RING_ENTRIES, CQ_RING_MASK, SQ_RING_ENTRIES, SQ_RING_MASK,
+    };
+    const MAP_TYPE: u64 = 0xf;
+    let Some((domain, id)) = linux_io_uring_key(descriptor) else {
+        return LINUX_EBADF;
+    };
+    let Some(region) = Region::from_offset(offset) else {
+        return LINUX_EINVAL;
+    };
+    let Some(rings) = crate::linux_io_uring::rings(domain, id) else {
+        return LINUX_EBADF;
+    };
+    if length == 0
+        || length > region.size(&rings).next_multiple_of(PAGE_SIZE as u64)
+        || !matches!(
+            flags & MAP_TYPE,
+            LINUX_MAP_SHARED | LINUX_MAP_SHARED_VALIDATE
+        )
     {
         return LINUX_EINVAL;
     }
@@ -23281,43 +23287,195 @@ fn linux_io_uring_mmap(
         address,
         length,
         protection,
-        LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
+        flags & !MAP_TYPE | LINUX_MAP_SHARED | LINUX_MAP_ANONYMOUS,
         u64::MAX,
         0,
     );
     if mapping >= LINUX_RETURN_TO_KERNEL {
         return mapping;
     }
-    let entries = X86_RUNTIME.LINUX_IO_URING_ENTRIES.load(Ordering::SeqCst);
-    let cq_entries = X86_RUNTIME.LINUX_IO_URING_CQ_ENTRIES.load(Ordering::SeqCst);
-    let initialized = match offset {
-        SQ_RING_OFFSET => {
-            X86_RUNTIME
-                .LINUX_IO_URING_SQ_RING
-                .store(mapping, Ordering::SeqCst);
-            copy_to_linux_user(mapping + 8, &(entries - 1).to_ne_bytes())
-                && copy_to_linux_user(mapping + 12, &entries.to_ne_bytes())
-        }
-        CQ_RING_OFFSET => {
-            X86_RUNTIME
-                .LINUX_IO_URING_CQ_RING
-                .store(mapping, Ordering::SeqCst);
-            copy_to_linux_user(mapping + 8, &(cq_entries - 1).to_ne_bytes())
-                && copy_to_linux_user(mapping + 12, &cq_entries.to_ne_bytes())
-        }
-        SQES_OFFSET => {
-            X86_RUNTIME
-                .LINUX_IO_URING_SQES
-                .store(mapping, Ordering::SeqCst);
-            true
-        }
-        _ => false,
+    let (entries, mask, count) = match region {
+        Region::SubmissionRing => (rings.sq_entries, SQ_RING_MASK, SQ_RING_ENTRIES),
+        Region::CompletionRing => (rings.cq_entries, CQ_RING_MASK, CQ_RING_ENTRIES),
+        Region::SubmissionEntries => (0, 0, 0),
     };
-    if initialized {
+    let initialized = entries == 0
+        || copy_to_linux_user(mapping + mask, &(entries - 1).to_ne_bytes())
+            && copy_to_linux_user(mapping + count, &entries.to_ne_bytes());
+    if initialized && crate::linux_io_uring::mapped(domain, id, region, mapping) {
         mapping
     } else {
         let _ = linux_runtime_munmap(mapping, length);
         LINUX_EFAULT
+    }
+}
+
+/// One submission entry (struct io_uring_sqe), as io_uring_enter reads it.
+struct LinuxIoUringEntry {
+    opcode: u8,
+    flags: u8,
+    descriptor: u64,
+    offset: u64,
+    address: u64,
+    length: u64,
+    operation_flags: u64,
+    user_data: [u8; 8],
+    buffer_index: u16,
+}
+
+impl LinuxIoUringEntry {
+    fn parse(sqe: &[u8; 64]) -> Self {
+        let word = |offset: usize| u32::from_ne_bytes(sqe[offset..offset + 4].try_into().unwrap());
+        let double =
+            |offset: usize| u64::from_ne_bytes(sqe[offset..offset + 8].try_into().unwrap());
+        Self {
+            opcode: sqe[0],
+            flags: sqe[1],
+            descriptor: u64::from(word(4)),
+            offset: double(8),
+            address: double(16),
+            length: u64::from(word(24)),
+            operation_flags: u64::from(word(28)),
+            user_data: sqe[32..40].try_into().unwrap(),
+            buffer_index: u16::from_ne_bytes(sqe[40..42].try_into().unwrap()),
+        }
+    }
+}
+
+const LINUX_IORING_OP_NOP: u8 = 0;
+const LINUX_IORING_OP_READV: u8 = 1;
+const LINUX_IORING_OP_WRITEV: u8 = 2;
+const LINUX_IORING_OP_FSYNC: u8 = 3;
+const LINUX_IORING_OP_READ_FIXED: u8 = 4;
+const LINUX_IORING_OP_WRITE_FIXED: u8 = 5;
+const LINUX_IORING_OP_SENDMSG: u8 = 9;
+const LINUX_IORING_OP_READ: u8 = 22;
+const LINUX_IORING_OP_WRITE: u8 = 23;
+/// The operations a ring runs, as IORING_REGISTER_PROBE reports them.
+const LINUX_IORING_SUPPORTED_OPS: [u8; 9] = [
+    LINUX_IORING_OP_NOP,
+    LINUX_IORING_OP_READV,
+    LINUX_IORING_OP_WRITEV,
+    LINUX_IORING_OP_FSYNC,
+    LINUX_IORING_OP_READ_FIXED,
+    LINUX_IORING_OP_WRITE_FIXED,
+    LINUX_IORING_OP_SENDMSG,
+    LINUX_IORING_OP_READ,
+    LINUX_IORING_OP_WRITE,
+];
+/// The highest operation Linux 6.12 knows (IORING_OP_LAST - 1).
+const LINUX_IORING_OP_LAST: u8 = 57;
+
+/// Runs one submission entry of ring `ring` and returns its result.
+fn linux_io_uring_run(ring: (usize, u64), entry: &LinuxIoUringEntry) -> u64 {
+    const FIXED_FILE: u8 = 1 << 0;
+    const BUFFER_SELECT: u8 = 1 << 5;
+    const VALID_FLAGS: u8 = 0x7f;
+    if entry.flags & !VALID_FLAGS != 0 || entry.flags & BUFFER_SELECT != 0 {
+        return LINUX_EINVAL;
+    }
+    // No files are registered, so no fixed file index names one.
+    if entry.flags & FIXED_FILE != 0 {
+        return LINUX_EBADF;
+    }
+    let descriptor = entry.descriptor;
+    // A file without a position (a pipe or socket) reads and writes at its
+    // stream whatever the offset; -1 uses and moves the file position.
+    let positioned = |result: u64, streamed: &dyn Fn() -> u64| {
+        if result == LINUX_ESPIPE {
+            streamed()
+        } else {
+            result
+        }
+    };
+    match entry.opcode {
+        LINUX_IORING_OP_NOP => 0,
+        LINUX_IORING_OP_READV | LINUX_IORING_OP_WRITEV => {
+            let write = entry.opcode == LINUX_IORING_OP_WRITEV;
+            let streamed = || {
+                if write {
+                    linux_descriptor_writev(descriptor, entry.address, entry.length)
+                } else {
+                    linux_descriptor_readv(descriptor, entry.address, entry.length)
+                }
+            };
+            if entry.offset == u64::MAX {
+                streamed()
+            } else {
+                positioned(
+                    linux_positioned_iov(
+                        descriptor,
+                        entry.address,
+                        entry.length,
+                        entry.offset,
+                        entry.operation_flags,
+                        write,
+                    ),
+                    &streamed,
+                )
+            }
+        }
+        LINUX_IORING_OP_FSYNC => {
+            const FSYNC_DATASYNC: u64 = 1;
+            if entry.operation_flags & !FSYNC_DATASYNC != 0 {
+                LINUX_EINVAL
+            } else {
+                linux_fsync(descriptor)
+            }
+        }
+        LINUX_IORING_OP_READ_FIXED
+        | LINUX_IORING_OP_WRITE_FIXED
+        | LINUX_IORING_OP_READ
+        | LINUX_IORING_OP_WRITE => {
+            let fixed = matches!(
+                entry.opcode,
+                LINUX_IORING_OP_READ_FIXED | LINUX_IORING_OP_WRITE_FIXED
+            );
+            if fixed
+                && !crate::linux_io_uring::buffer(ring.0, ring.1, usize::from(entry.buffer_index))
+                    .is_some_and(|buffer| buffer.holds(entry.address, entry.length))
+            {
+                return LINUX_EFAULT;
+            }
+            let write = matches!(
+                entry.opcode,
+                LINUX_IORING_OP_WRITE_FIXED | LINUX_IORING_OP_WRITE
+            );
+            let streamed = || {
+                if write {
+                    linux_descriptor_write(descriptor, entry.address, entry.length)
+                } else {
+                    linux_descriptor_read(descriptor, entry.address, entry.length)
+                }
+            };
+            if entry.offset == u64::MAX {
+                streamed()
+            } else if write {
+                positioned(
+                    linux_regular_file_write_at(
+                        descriptor,
+                        entry.address,
+                        entry.length,
+                        linux_pwrite_offset(descriptor, entry.offset),
+                    ),
+                    &streamed,
+                )
+            } else {
+                positioned(
+                    linux_regular_file_read_at(
+                        descriptor,
+                        entry.address,
+                        entry.length,
+                        entry.offset,
+                    ),
+                    &streamed,
+                )
+            }
+        }
+        LINUX_IORING_OP_SENDMSG => {
+            linux_socket_sendmsg(descriptor, entry.address, entry.operation_flags)
+        }
+        _ => LINUX_EINVAL,
     }
 }
 
@@ -23326,169 +23484,314 @@ fn linux_io_uring_enter(
     to_submit: u64,
     minimum_complete: u64,
     flags: u64,
-    signal_mask: u64,
-    signal_size: u64,
+    argument: u64,
+    argument_size: u64,
 ) -> u64 {
-    const GETEVENTS: u64 = 1;
+    use crate::linux_io_uring::{
+        CQE_SIZE, CQ_CQES, CQ_HEAD, CQ_TAIL, SQE_SIZE, SQ_ARRAY, SQ_DROPPED, SQ_HEAD, SQ_TAIL,
+    };
+    const GETEVENTS: u64 = 1 << 0;
+    const SQ_WAKEUP: u64 = 1 << 1;
+    const SQ_WAIT: u64 = 1 << 2;
+    const EXT_ARG: u64 = 1 << 3;
+    const REGISTERED_RING: u64 = 1 << 4;
+    const IO_LINK: u8 = 1 << 2;
+    const IO_HARDLINK: u8 = 1 << 3;
+    const CQE_SKIP_SUCCESS: u8 = 1 << 6;
     let descriptor = u64::from(descriptor as u32);
-    let to_submit = u64::from(to_submit as u32);
-    let minimum_complete = u64::from(minimum_complete as u32);
+    let to_submit = to_submit as u32;
+    let minimum_complete = minimum_complete as u32;
     let flags = u64::from(flags as u32);
-    if !linux_io_uring_descriptor(descriptor) {
+    if flags & !(GETEVENTS | SQ_WAKEUP | SQ_WAIT | EXT_ARG | REGISTERED_RING) != 0 {
+        return LINUX_EINVAL;
+    }
+    // No ring descriptors are registered (IORING_REGISTER_RING_FDS).
+    if flags & REGISTERED_RING != 0 {
+        return if descriptor >= 16 {
+            LINUX_EINVAL
+        } else {
+            LINUX_EBADF
+        };
+    }
+    let Some(ring) = linux_io_uring_key(descriptor) else {
+        return if linux_descriptor_open(descriptor) {
+            LINUX_EOPNOTSUPP
+        } else {
+            LINUX_EBADF
+        };
+    };
+    // Extended arguments (IORING_FEAT_EXT_ARG) are not offered.
+    if flags & EXT_ARG != 0 {
+        return LINUX_EINVAL;
+    }
+    let Some(rings) = crate::linux_io_uring::rings(ring.0, ring.1) else {
         return LINUX_EBADF;
-    }
-    if flags & !GETEVENTS != 0 || signal_mask != 0 || signal_size != 0 {
-        return LINUX_EINVAL;
-    }
-    let entries = u64::from(X86_RUNTIME.LINUX_IO_URING_ENTRIES.load(Ordering::SeqCst));
-    let cq_entries = u64::from(X86_RUNTIME.LINUX_IO_URING_CQ_ENTRIES.load(Ordering::SeqCst));
-    if to_submit > entries || minimum_complete > cq_entries {
-        return LINUX_EINVAL;
-    }
-    let sq = X86_RUNTIME.LINUX_IO_URING_SQ_RING.load(Ordering::SeqCst);
-    let cq = X86_RUNTIME.LINUX_IO_URING_CQ_RING.load(Ordering::SeqCst);
-    let sqes = X86_RUNTIME.LINUX_IO_URING_SQES.load(Ordering::SeqCst);
-    if sq == 0 || cq == 0 || sqes == 0 {
-        return LINUX_EFAULT;
-    }
+    };
     let read_u32 = |address| {
         let mut value = [0_u8; 4];
         copy_from_linux_user(address, &mut value).then(|| u32::from_ne_bytes(value))
     };
-    let Some(mut sq_head) = read_u32(sq) else {
-        return LINUX_EFAULT;
-    };
-    let Some(sq_tail) = read_u32(sq + 4) else {
-        return LINUX_EFAULT;
-    };
-    let Some(cq_head) = read_u32(cq) else {
-        return LINUX_EFAULT;
-    };
-    let Some(mut cq_tail) = read_u32(cq + 4) else {
-        return LINUX_EFAULT;
-    };
-    let available = sq_tail.wrapping_sub(sq_head).min(entries as u32);
-    let submit = available.min(to_submit as u32);
-    if cq_tail.wrapping_sub(cq_head).saturating_add(submit) > cq_entries as u32 {
-        return LINUX_EBUSY;
-    }
-    for _ in 0..submit {
-        let Some(index) = read_u32(sq + 24 + u64::from(sq_head & (entries as u32 - 1)) * 4) else {
+    let mut submitted = 0_u32;
+    if to_submit != 0 {
+        if rings.sq == 0 || rings.cq == 0 || rings.sqes == 0 {
+            return LINUX_EFAULT;
+        }
+        let (Some(mut sq_head), Some(sq_tail), Some(mut cq_tail)) = (
+            read_u32(rings.sq + SQ_HEAD),
+            read_u32(rings.sq + SQ_TAIL),
+            read_u32(rings.cq + CQ_TAIL),
+        ) else {
             return LINUX_EFAULT;
         };
-        if u64::from(index) >= entries {
+        let available = sq_tail.wrapping_sub(sq_head).min(rings.sq_entries);
+        // A link chain whose earlier entry failed ends its later entries
+        // with ECANCELED.
+        let mut chain_failed = false;
+        for _ in 0..available.min(to_submit) {
+            // The completion ring holds what is not yet reaped; a full one
+            // stops the submissions (EBUSY when none went in).
+            let Some(cq_head) = read_u32(rings.cq + CQ_HEAD) else {
+                return LINUX_EFAULT;
+            };
+            if cq_tail.wrapping_sub(cq_head) >= rings.cq_entries {
+                if submitted == 0 {
+                    return LINUX_EBUSY;
+                }
+                break;
+            }
+            let slot = u64::from(sq_head & (rings.sq_entries - 1));
+            let Some(index) = read_u32(rings.sq + SQ_ARRAY + slot * 4) else {
+                return LINUX_EFAULT;
+            };
+            sq_head = sq_head.wrapping_add(1);
+            if index >= rings.sq_entries {
+                // An index past the entries is dropped and counted.
+                let dropped = read_u32(rings.sq + SQ_DROPPED).unwrap_or(0);
+                let _ = copy_to_linux_user(
+                    rings.sq + SQ_DROPPED,
+                    &dropped.wrapping_add(1).to_ne_bytes(),
+                );
+                continue;
+            }
+            let mut sqe = [0_u8; SQE_SIZE as usize];
+            if !copy_from_linux_user(rings.sqes + u64::from(index) * SQE_SIZE, &mut sqe) {
+                return LINUX_EFAULT;
+            }
+            let entry = LinuxIoUringEntry::parse(&sqe);
+            let result = if chain_failed {
+                LINUX_ECANCELED
+            } else {
+                linux_io_uring_run(ring, &entry)
+            };
+            let failed = result >= LINUX_RETURN_TO_KERNEL;
+            if entry.flags & (IO_LINK | IO_HARDLINK) == 0 {
+                chain_failed = false;
+            } else if failed && entry.flags & IO_HARDLINK == 0 {
+                chain_failed = true;
+            }
+            submitted += 1;
+            if !failed && entry.flags & CQE_SKIP_SUCCESS != 0 {
+                continue;
+            }
+            let mut cqe = [0_u8; CQE_SIZE as usize];
+            cqe[..8].copy_from_slice(&entry.user_data);
+            cqe[8..12].copy_from_slice(&(result as i32).to_ne_bytes());
+            let slot = u64::from(cq_tail & (rings.cq_entries - 1));
+            if !copy_to_linux_user(rings.cq + CQ_CQES + slot * CQE_SIZE, &cqe) {
+                return LINUX_EFAULT;
+            }
+            cq_tail = cq_tail.wrapping_add(1);
+            if !copy_to_linux_user(rings.cq + CQ_TAIL, &cq_tail.to_ne_bytes()) {
+                return LINUX_EFAULT;
+            }
+        }
+        if !copy_to_linux_user(rings.sq + SQ_HEAD, &sq_head.to_ne_bytes()) {
+            return LINUX_EFAULT;
+        }
+    }
+    // Every entry completes as it is submitted, so there is nothing to wait
+    // for; a signal mask for the wait must still be a sigset_t's size.
+    if flags & GETEVENTS != 0 && minimum_complete != 0 && rings.cq != 0 {
+        let ready = match (read_u32(rings.cq + CQ_HEAD), read_u32(rings.cq + CQ_TAIL)) {
+            (Some(head), Some(tail)) => tail.wrapping_sub(head),
+            _ => return LINUX_EFAULT,
+        };
+        if ready < minimum_complete.min(rings.cq_entries) && argument != 0 && argument_size != 8 {
             return LINUX_EINVAL;
         }
-        let mut sqe = [0_u8; 64];
-        if !copy_from_linux_user(sqes + u64::from(index) * 64, &mut sqe) {
-            return LINUX_EFAULT;
-        }
-        let descriptor = u32::from_ne_bytes(sqe[4..8].try_into().unwrap()) as u64;
-        let offset = u64::from_ne_bytes(sqe[8..16].try_into().unwrap());
-        let address = u64::from_ne_bytes(sqe[16..24].try_into().unwrap());
-        let length = u32::from_ne_bytes(sqe[24..28].try_into().unwrap()) as u64;
-        let operation_flags = u32::from_ne_bytes(sqe[28..32].try_into().unwrap());
-        let result = match sqe[0] {
-            0 => 0,
-            1 if offset == u64::MAX && operation_flags == 0 => {
-                linux_descriptor_readv(descriptor, address, length)
-            }
-            2 if offset == u64::MAX && operation_flags == 0 => {
-                linux_descriptor_writev(descriptor, address, length)
-            }
-            3 if operation_flags & !1 == 0 => {
-                if linux_descriptor_open(descriptor) {
-                    0
-                } else {
-                    LINUX_EBADF
-                }
-            }
-            22 if offset == u64::MAX && operation_flags == 0 => {
-                linux_descriptor_read(descriptor, address, length)
-            }
-            23 if offset == u64::MAX && operation_flags == 0 => {
-                linux_descriptor_write(descriptor, address, length)
-            }
-            _ => LINUX_EINVAL,
-        };
-        let mut cqe = [0_u8; 16];
-        cqe[..8].copy_from_slice(&sqe[32..40]);
-        cqe[8..12].copy_from_slice(&(result as i32).to_ne_bytes());
-        let cqe_address = cq + 20 + u64::from(cq_tail & (cq_entries as u32 - 1)) * 16;
-        if !copy_to_linux_user(cqe_address, &cqe) {
-            return LINUX_EFAULT;
-        }
-        sq_head = sq_head.wrapping_add(1);
-        cq_tail = cq_tail.wrapping_add(1);
     }
-    if !copy_to_linux_user(sq, &sq_head.to_ne_bytes())
-        || !copy_to_linux_user(cq + 4, &cq_tail.to_ne_bytes())
-    {
-        return LINUX_EFAULT;
-    }
-    if flags & GETEVENTS != 0 && cq_tail.wrapping_sub(cq_head) < minimum_complete as u32 {
-        return LINUX_EAGAIN;
-    }
-    u64::from(submit)
+    u64::from(submitted)
 }
 
 fn linux_io_uring_register(descriptor: u64, opcode: u64, argument: u64, count: u64) -> u64 {
-    const REGISTER_PROBE: u64 = 8;
+    const REGISTER_BUFFERS: u32 = 0;
+    const UNREGISTER_BUFFERS: u32 = 1;
+    const REGISTER_PROBE: u32 = 8;
+    const REGISTER_CLONE_BUFFERS: u32 = 30;
+    const REGISTER_USE_REGISTERED_RING: u32 = 1 << 31;
     let descriptor = u64::from(descriptor as u32);
-    let opcode = u64::from(opcode as u32);
-    let count = u64::from(count as u32);
-    if !linux_io_uring_descriptor(descriptor) {
-        return LINUX_EBADF;
+    let opcode = opcode as u32;
+    let count = count as u32;
+    if opcode & REGISTER_USE_REGISTERED_RING != 0 {
+        return if descriptor >= 16 {
+            LINUX_EINVAL
+        } else {
+            LINUX_EBADF
+        };
     }
-    if opcode != REGISTER_PROBE {
-        return LINUX_EOPNOTSUPP;
+    let Some((domain, id)) = linux_io_uring_key(descriptor) else {
+        return if linux_descriptor_open(descriptor) {
+            LINUX_EOPNOTSUPP
+        } else {
+            LINUX_EBADF
+        };
+    };
+    match opcode {
+        REGISTER_BUFFERS => {
+            if argument == 0 || count == 0 || count > crate::linux_io_uring::MAX_BUFFERS {
+                return LINUX_EINVAL;
+            }
+            let mut buffers = Vec::new();
+            if buffers.try_reserve_exact(count as usize).is_err() {
+                return LINUX_ENOMEM;
+            }
+            for index in 0..u64::from(count) {
+                let mut iovec = [0_u8; 16];
+                if !copy_from_linux_user(argument + index * 16, &mut iovec) {
+                    return LINUX_EFAULT;
+                }
+                let address = u64::from_ne_bytes(iovec[..8].try_into().unwrap());
+                let length = u64::from_ne_bytes(iovec[8..].try_into().unwrap());
+                // A null buffer of no length is a sparse slot; any other
+                // must be mapped user memory of at most 1 GiB.
+                let valid = address == 0 && length == 0
+                    || address != 0
+                        && length != 0
+                        && length <= crate::linux_io_uring::MAX_BUFFER_LENGTH
+                        && linux_writable_user_range_contains(address, length as usize);
+                if !valid {
+                    return LINUX_EFAULT;
+                }
+                buffers.push(crate::linux_io_uring::Buffer { address, length });
+            }
+            match crate::linux_io_uring::register_buffers(domain, id, buffers) {
+                Ok(()) => 0,
+                Err(crate::linux_io_uring::Error::Busy) => LINUX_EBUSY,
+                Err(_) => LINUX_EBADF,
+            }
+        }
+        UNREGISTER_BUFFERS => {
+            if argument != 0 || count != 0 {
+                return LINUX_EINVAL;
+            }
+            match crate::linux_io_uring::unregister_buffers(domain, id) {
+                Ok(()) => 0,
+                Err(crate::linux_io_uring::Error::NoBuffers) => LINUX_ENXIO,
+                Err(_) => LINUX_EBADF,
+            }
+        }
+        REGISTER_PROBE => linux_io_uring_probe(argument, count),
+        REGISTER_CLONE_BUFFERS => {
+            const SOURCE_REGISTERED: u32 = 1 << 0;
+            const DESTINATION_REPLACE: u32 = 1 << 1;
+            if count != 1 {
+                return LINUX_EINVAL;
+            }
+            let mut clone = [0_u8; 32];
+            if !copy_from_linux_user(argument, &mut clone) {
+                return LINUX_EFAULT;
+            }
+            let field = |index: usize| {
+                u32::from_ne_bytes(clone[index * 4..index * 4 + 4].try_into().unwrap())
+            };
+            let flags = field(1);
+            if flags & !(SOURCE_REGISTERED | DESTINATION_REPLACE) != 0
+                || clone[20..].iter().any(|byte| *byte != 0)
+            {
+                return LINUX_EINVAL;
+            }
+            let source = u64::from(field(0));
+            if flags & SOURCE_REGISTERED != 0 {
+                return if source >= 16 {
+                    LINUX_EINVAL
+                } else {
+                    LINUX_EBADF
+                };
+            }
+            let Some((_, source_id)) = linux_io_uring_key(source) else {
+                return if linux_descriptor_open(source) {
+                    LINUX_EOPNOTSUPP
+                } else {
+                    LINUX_EBADF
+                };
+            };
+            match crate::linux_io_uring::clone_buffers(
+                domain,
+                id,
+                source_id,
+                (field(2), field(3), field(4)),
+                flags & DESTINATION_REPLACE != 0,
+            ) {
+                Ok(()) => 0,
+                Err(crate::linux_io_uring::Error::Busy) => LINUX_EBUSY,
+                Err(crate::linux_io_uring::Error::NoBuffers) => LINUX_ENXIO,
+                Err(crate::linux_io_uring::Error::NoMemory) => LINUX_ENOMEM,
+                Err(crate::linux_io_uring::Error::NotFound) => LINUX_EBADF,
+                Err(crate::linux_io_uring::Error::Invalid) => LINUX_EINVAL,
+            }
+        }
+        _ => LINUX_EINVAL,
     }
-    if count == 0 {
+}
+
+/// IORING_REGISTER_PROBE: which of the operations Linux knows the ring
+/// runs (struct io_uring_probe with `count` entries at most).
+fn linux_io_uring_probe(argument: u64, count: u32) -> u64 {
+    const PROBE_HEADER: usize = 16;
+    const PROBE_ENTRY: usize = 8;
+    const OP_SUPPORTED: u16 = 1;
+    const OPERATIONS: usize = LINUX_IORING_OP_LAST as usize + 1;
+    // Entries past the operations Linux knows are left alone.
+    let entries = (count as usize).min(OPERATIONS);
+    let mut probe = [0_u8; PROBE_HEADER + OPERATIONS * PROBE_ENTRY];
+    let size = PROBE_HEADER + entries * PROBE_ENTRY;
+    if !copy_from_linux_user(argument, &mut probe[..size]) {
+        return LINUX_EFAULT;
+    }
+    // The structure must come zeroed.
+    if probe[..size].iter().any(|byte| *byte != 0) {
         return LINUX_EINVAL;
     }
-    const OPERATION_COUNT: usize = 24;
-    const SUPPORTED: [u8; 6] = [0, 1, 2, 3, 22, 23];
-    let entries = usize::try_from(count)
-        .unwrap_or(usize::MAX)
-        .min(OPERATION_COUNT);
-    let mut probe = [0_u8; 16 + OPERATION_COUNT * 8];
-    probe[0] = (OPERATION_COUNT - 1) as u8;
+    probe[0] = LINUX_IORING_OP_LAST;
     probe[1] = entries as u8;
     for operation in 0..entries {
-        let offset = 16 + operation * 8;
+        let offset = PROBE_HEADER + operation * PROBE_ENTRY;
         probe[offset] = operation as u8;
-        if SUPPORTED.contains(&(operation as u8)) {
-            probe[offset + 2..offset + 4].copy_from_slice(&1_u16.to_ne_bytes());
+        if LINUX_IORING_SUPPORTED_OPS.contains(&(operation as u8)) {
+            probe[offset + 2..offset + 4].copy_from_slice(&OP_SUPPORTED.to_ne_bytes());
         }
     }
-    if copy_to_linux_user(argument, &probe[..16 + entries * 8]) {
+    if copy_to_linux_user(argument, &probe[..size]) {
         0
     } else {
         LINUX_EFAULT
     }
 }
 
-fn linux_io_uring_release() {
-    if X86_RUNTIME
-        .LINUX_IO_URING_REFS
-        .fetch_add(u16::MAX, Ordering::SeqCst)
-        != 1
-    {
+/// Closing a ring's descriptor: the ring goes when its creator closes its
+/// last descriptor of it.
+fn linux_io_uring_release(descriptor: u64) {
+    let Some((domain, id)) = linux_io_uring_key(descriptor) else {
+        return;
+    };
+    if (0..LINUX_DESCRIPTOR_TABLE_LIMIT).any(|candidate| {
+        candidate != descriptor
+            && linux_io_uring_descriptor(candidate)
+            && linux_descriptor_open_file_id(candidate) == Some(id)
+    }) {
         return;
     }
-    X86_RUNTIME
-        .LINUX_IO_URING_ENTRIES
-        .store(0, Ordering::SeqCst);
-    X86_RUNTIME
-        .LINUX_IO_URING_CQ_ENTRIES
-        .store(0, Ordering::SeqCst);
-    X86_RUNTIME
-        .LINUX_IO_URING_SQ_RING
-        .store(0, Ordering::SeqCst);
-    X86_RUNTIME
-        .LINUX_IO_URING_CQ_RING
-        .store(0, Ordering::SeqCst);
-    X86_RUNTIME.LINUX_IO_URING_SQES.store(0, Ordering::SeqCst);
+    crate::linux_io_uring::release(domain, Some(id), current_linux_process_pid());
 }
 
 fn verify_linux_fanotify_syscalls() -> bool {
@@ -23533,9 +23836,15 @@ fn verify_linux_fanotify_syscalls() -> bool {
             UPPER_REGISTER_BITS | u64::from(LINUX_AT_FDCWD),
             mapping,
         ) == 0;
-    let notified = marked
-        && linux_descriptor_write(source, mapping + 64, 3) == 3
-        && linux_fanotify_read(group, mapping + 128, 24) == Some(24);
+    // The write system call's hook reports the modification.
+    let wrote = |source| {
+        linux_descriptor_write(source, mapping + 64, 3) == 3 && {
+            linux_fanotify_event(b"ginux-fanotify", crate::linux_fanotify::FAN_MODIFY);
+            true
+        }
+    };
+    let notified =
+        marked && wrote(source) && linux_fanotify_read(group, mapping + 128, 24) == Some(24);
     let mut event = [0_u8; 24];
     let event_descriptor = if notified && copy_from_linux_user(mapping + 128, &mut event) {
         u32::from_ne_bytes(event[16..20].try_into().unwrap()) as u64
@@ -23550,7 +23859,7 @@ fn verify_linux_fanotify_syscalls() -> bool {
         && linux_descriptor_open(event_descriptor);
     let removed = event_valid
         && linux_fanotify_mark(group, 2, 2, u64::from(LINUX_AT_FDCWD), mapping) == 0
-        && linux_descriptor_write(source, mapping + 64, 3) == 3
+        && wrote(source)
         && linux_fanotify_read(group, mapping + 128, 24) == Some(LINUX_EAGAIN);
     let closed = event_descriptor < LINUX_AUX_DESCRIPTOR_LIMIT
         && linux_descriptor_close(event_descriptor) == 0
@@ -29579,6 +29888,10 @@ fn linux_proc_sysctl_write_bytes(device: u16, index: usize, text: &[u8]) -> Resu
         .next()
         .and_then(|text| linux_parse_kernel_integer(text.trim_ascii()))
         .ok_or(LINUX_EINVAL)?;
+    // io_uring_disabled takes 0, 1 or 2 (proc_dointvec_minmax).
+    if LINUX_PROC_SYSCTLS[index].1 == b"sys/kernel/io_uring_disabled" && !(0..=2).contains(&value) {
+        return Err(LINUX_EINVAL);
+    }
     LINUX_SYSCTL_OVERRIDES[slot][index].store(value, Ordering::Release);
     Ok(text.len())
 }
@@ -30969,6 +31282,11 @@ fn linux_rootfs_execve_source(
             Ok(image) => overlay_image = image,
             Err(error) => return error,
         }
+        // The program's file is opened to run it.
+        linux_fanotify_event(
+            path.strip_prefix(b"/").unwrap_or(path),
+            crate::linux_fanotify::FAN_OPEN | crate::linux_fanotify::FAN_OPEN_EXEC,
+        );
     }
     let overlay_bytes = overlay_image
         .as_mut()
@@ -37767,6 +38085,22 @@ fn linux_socket_bind_address(address: u64, length: u64) -> Result<(u32, u16), u6
     ))
 }
 
+/// The canonical path of the file Unix socket pathname `path` leads to,
+/// from the caller's root and directory as Linux walks it: the walk's
+/// error, or ENOENT when nothing is there.
+fn linux_unix_socket_file(
+    path: &[u8],
+    canonical: &mut [u8; crate::linux_overlay::PATH_CAPACITY],
+) -> Result<usize, u64> {
+    let length = linux_canonical_path_at(u64::from(LINUX_AT_FDCWD), path, canonical)?;
+    let file = &canonical[..length];
+    if crate::linux_overlay::lookup(file).is_some() || linux_path_access(file).is_some() {
+        Ok(length)
+    } else {
+        Err(LINUX_ENOENT)
+    }
+}
+
 fn linux_unix_socket_path(address: u64, length: u64, output: &mut [u8; 108]) -> Result<usize, u64> {
     let length = usize::try_from(u64::from(length as u32)).map_err(|_| LINUX_EINVAL)?;
     if !(3..=110).contains(&length) {
@@ -38018,24 +38352,24 @@ fn linux_socket_connect(descriptor: u64, address: u64, length: u64) -> u64 {
             Ok(length) => length,
             Err(error) => return error,
         };
-        // Connecting through a socket file needs write permission on it.
+        // A pathname names the socket file the caller's path walk reaches
+        // (from its root: a chrooted process cannot reach sockets outside),
+        // and connecting through it needs write permission on it.
         if path[0] != 0 {
             let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
-            if let Ok(length) = linux_canonical_path_at(
-                u64::from(LINUX_AT_FDCWD),
-                &path[..path_length],
-                &mut canonical,
-            ) {
-                if let Some(metadata) = crate::linux_overlay::lookup(&canonical[..length])
-                    .filter(|metadata| metadata.kind == crate::linux_overlay::NodeKind::Socket)
-                {
-                    if let Err(error) = linux_check_access(
-                        Some(linux_overlay_file_access(metadata)),
-                        ginux_credentials::access::WRITE,
-                        false,
-                    ) {
-                        return error;
-                    }
+            let length = match linux_unix_socket_file(&path[..path_length], &mut canonical) {
+                Ok(length) => length,
+                Err(error) => return error,
+            };
+            if let Some(metadata) = crate::linux_overlay::lookup(&canonical[..length])
+                .filter(|metadata| metadata.kind == crate::linux_overlay::NodeKind::Socket)
+            {
+                if let Err(error) = linux_check_access(
+                    Some(linux_overlay_file_access(metadata)),
+                    ginux_credentials::access::WRITE,
+                    false,
+                ) {
+                    return error;
                 }
             }
         }
@@ -39214,6 +39548,11 @@ fn linux_unix_send_target(
         } else {
             LINUX_EOPNOTSUPP
         });
+    }
+    // A pathname must lead to a file from the sender's root.
+    if path[0] != 0 {
+        let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+        linux_unix_socket_file(&path[..path_length], &mut canonical)?;
     }
     let target = match crate::linux_socket::unix_datagram_target(slot, &path[..path_length]) {
         Ok(target) => target,
@@ -41607,11 +41946,11 @@ fn linux_descriptor_read_live_return(
         }
         return LINUX_RETURN_TO_KERNEL;
     }
-    // An inotify descriptor opened without IN_NONBLOCK waits for an event
-    // as other blocking reads wait: the rest of the domain runs and the read
-    // starts again (inotify11).
+    // An inotify or fanotify descriptor opened without IN_NONBLOCK or
+    // FAN_NONBLOCK waits for an event as other blocking reads wait: the
+    // rest of the domain runs and the read starts again (inotify11).
     if immediate == LINUX_EAGAIN
-        && linux_inotify_descriptor(descriptor)
+        && (linux_inotify_descriptor(descriptor) || linux_fanotify_descriptor(descriptor))
         && !linux_socket_flags(descriptor).is_some_and(|flags| flags & LINUX_O_NONBLOCK as u32 != 0)
     {
         return linux_retry_later_live_return(output, caller, LINUX_READ_SYSCALL);
@@ -45849,17 +46188,74 @@ fn linux_fanotify_descriptor(descriptor: u64) -> bool {
     linux_device_descriptor(descriptor) & !3 == LINUX_DEVICE_FANOTIFY
 }
 
+/// The group a descriptor stands for: its domain and its open file
+/// description's id.
+fn linux_fanotify_key(descriptor: u64) -> Option<(usize, u64)> {
+    if !linux_fanotify_descriptor(descriptor) {
+        return None;
+    }
+    linux_descriptor_open_file_id(descriptor).map(|id| (linux_execution_instance(), id))
+}
+
 fn linux_fanotify_init(flags: u64, event_flags: u64) -> u64 {
-    const FAN_CLOEXEC: u64 = 1;
-    const FAN_NONBLOCK: u64 = 2;
-    const EVENT_FLAGS: u64 = LINUX_O_LARGEFILE | LINUX_O_CLOEXEC | LINUX_O_NONBLOCK;
-    let flags = u64::from(flags as u32);
-    let event_flags = u64::from(event_flags as u32);
-    if flags & !(FAN_CLOEXEC | FAN_NONBLOCK) != 0 || event_flags & !EVENT_FLAGS != 0 {
+    const FAN_CLOEXEC: u32 = 0x1;
+    const FAN_NONBLOCK: u32 = 0x2;
+    const CLASS_BITS: u32 = 0xc;
+    const FAN_UNLIMITED_QUEUE: u32 = 0x10;
+    const FAN_UNLIMITED_MARKS: u32 = 0x20;
+    const FAN_REPORT_PIDFD: u32 = 0x80;
+    const FAN_REPORT_FID: u32 = 0x200;
+    const FAN_REPORT_DIR_FID: u32 = 0x400;
+    const FAN_REPORT_NAME: u32 = 0x800;
+    const FAN_REPORT_TARGET_FID: u32 = 0x1000;
+    const FID_BITS: u32 =
+        FAN_REPORT_FID | FAN_REPORT_DIR_FID | FAN_REPORT_NAME | FAN_REPORT_TARGET_FID;
+    const INIT_FLAGS: u32 = FAN_CLOEXEC
+        | FAN_NONBLOCK
+        | CLASS_BITS
+        | FID_BITS
+        | crate::linux_fanotify::FAN_REPORT_TID
+        | FAN_REPORT_PIDFD
+        | FAN_UNLIMITED_QUEUE
+        | FAN_UNLIMITED_MARKS;
+    const ADMIN_FLAGS: u32 = CLASS_BITS | FAN_UNLIMITED_QUEUE | FAN_UNLIMITED_MARKS;
+    const O_DSYNC: u32 = 0x1000;
+    const O_SYNC: u32 = 0x10_1000;
+    const EVENT_FLAGS: u32 = 3
+        | LINUX_O_APPEND as u32
+        | LINUX_O_NONBLOCK as u32
+        | O_SYNC
+        | O_DSYNC
+        | LINUX_O_CLOEXEC as u32
+        | LINUX_O_LARGEFILE as u32
+        | LINUX_O_NOATIME as u32;
+    let flags = flags as u32;
+    let event_flags = event_flags as u32;
+    let fid_mode = flags & FID_BITS;
+    // Without CAP_SYS_ADMIN only a notification group reporting file
+    // handles may be made, as in Linux (the kernel outside a process is
+    // root).
+    let privileged = current_linux_credentials()
+        .is_none_or(|credentials| credentials.has(ginux_credentials::capability::SYS_ADMIN));
+    if !privileged && (flags & ADMIN_FLAGS != 0 || fid_mode == 0) {
+        return LINUX_EPERM;
+    }
+    if flags & !INIT_FLAGS != 0
+        || flags & FAN_REPORT_PIDFD != 0 && flags & crate::linux_fanotify::FAN_REPORT_TID != 0
+        || event_flags & !EVENT_FLAGS != 0
+        || event_flags & 3 == 3
+        || fid_mode != 0 && flags & CLASS_BITS != 0
+        || fid_mode & FAN_REPORT_NAME != 0 && fid_mode & FAN_REPORT_DIR_FID == 0
+        || fid_mode & FAN_REPORT_TARGET_FID != 0
+            && fid_mode & (FAN_REPORT_NAME | FAN_REPORT_FID) != FAN_REPORT_NAME | FAN_REPORT_FID
+        || flags & CLASS_BITS == CLASS_BITS
+    {
         return LINUX_EINVAL;
     }
-    if X86_RUNTIME.LINUX_FANOTIFY_REFS.load(Ordering::SeqCst) != 0 {
-        return LINUX_EMFILE;
+    // Events with file handles or pidfds are not reported yet: such a
+    // group is refused as by a kernel without them.
+    if fid_mode != 0 || flags & FAN_REPORT_PIDFD != 0 {
+        return LINUX_EINVAL;
     }
     let Some(descriptor) = (LINUX_AUX_DESCRIPTOR_FIRST..LINUX_AUX_DESCRIPTOR_LIMIT)
         .find(|descriptor| linux_aux_descriptor_free(*descriptor))
@@ -45867,10 +46263,8 @@ fn linux_fanotify_init(flags: u64, event_flags: u64) -> u64 {
         return LINUX_EMFILE;
     };
     let index = (descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
-    X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index].store(
-        LINUX_DEVICE_FANOTIFY | LINUX_DESCRIPTOR_INPUT,
-        Ordering::SeqCst,
-    );
+    X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index]
+        .store(LINUX_DEVICE_FANOTIFY | 3, Ordering::SeqCst);
     X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index].store(
         if flags & FAN_NONBLOCK != 0 {
             LINUX_O_NONBLOCK as u32
@@ -45879,9 +46273,162 @@ fn linux_fanotify_init(flags: u64, event_flags: u64) -> u64 {
         },
         Ordering::SeqCst,
     );
+    let created = match linux_descriptor_open_file_id(descriptor) {
+        Some(id) => crate::linux_fanotify::create(
+            linux_execution_instance(),
+            id,
+            current_linux_process_pid(),
+            (flags, event_flags | LINUX_O_LARGEFILE as u32),
+        ),
+        None => Err(crate::linux_fanotify::Error::NoMemory),
+    };
+    if let Err(error) = created {
+        X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index].store(0, Ordering::SeqCst);
+        X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index].store(0, Ordering::SeqCst);
+        return match error {
+            crate::linux_fanotify::Error::TooMany => LINUX_EMFILE,
+            _ => LINUX_ENOMEM,
+        };
+    }
     set_linux_descriptor_close_on_exec(descriptor, flags & FAN_CLOEXEC != 0);
-    X86_RUNTIME.LINUX_FANOTIFY_REFS.store(1, Ordering::SeqCst);
     descriptor
+}
+
+/// Whether canonical `path` names something fanotify reports with a
+/// descriptor: a regular file (false) or a directory (true).
+fn linux_fanotify_object_kind(path: &[u8]) -> Option<bool> {
+    if path.is_empty() {
+        return Some(true);
+    }
+    if let Some(metadata) = crate::linux_overlay::lookup(path) {
+        return match metadata.kind {
+            crate::linux_overlay::NodeKind::File => Some(false),
+            crate::linux_overlay::NodeKind::Directory => Some(true),
+            _ => None,
+        };
+    }
+    if crate::linux_overlay::hidden(path) {
+        return None;
+    }
+    let (_, entry) =
+        crate::published_rootfs::lookup_metadata_at(crate::published_rootfs::ROOT_HANDLE, path)?;
+    match entry.map(|entry| entry.kind) {
+        None | Some(crate::published_rootfs::EntryKind::Directory) => Some(true),
+        Some(
+            crate::published_rootfs::EntryKind::File | crate::published_rootfs::EntryKind::Hardlink,
+        ) => Some(false),
+        Some(crate::published_rootfs::EntryKind::Symlink) => None,
+    }
+}
+
+/// The object at canonical `path` as fanotify's marks see it, when it is
+/// one fanotify reports.
+fn linux_fanotify_object(path: &[u8]) -> Option<crate::linux_fanotify::Object<'_>> {
+    let directory = linux_fanotify_object_kind(path)?;
+    let mount = if crate::linux_fanotify::mount_marks() {
+        crate::linux_mounts::mount_id_at(linux_execution_instance(), path)
+    } else {
+        0
+    };
+    Some(crate::linux_fanotify::Object {
+        path,
+        directory,
+        mount,
+    })
+}
+
+/// The process and thread making the current call.
+fn linux_fanotify_cause() -> crate::linux_fanotify::Cause {
+    let pid = current_linux_process_pid();
+    crate::linux_fanotify::Cause {
+        pid,
+        tid: current_linux_tid().unwrap_or(pid),
+    }
+}
+
+/// Events `mask` happened to the file or directory at canonical `path`.
+fn linux_fanotify_event(path: &[u8], mask: u32) {
+    if !crate::linux_fanotify::active() {
+        return;
+    }
+    let Some(object) = linux_fanotify_object(path) else {
+        return;
+    };
+    if crate::linux_fanotify::notify(
+        linux_execution_instance(),
+        object,
+        mask,
+        linux_fanotify_cause(),
+    ) {
+        wake_linux_descriptor_waits();
+    }
+}
+
+/// Before system call `number` with `arguments`: an open (FAN_OPEN_PERM)
+/// or a read (FAN_ACCESS_PERM) of a file that a permission mark covers
+/// waits until the groups that heard of it answer. Returns the call's
+/// result when it does not go on: EPERM when a group denied it, or a
+/// restart while one has not answered.
+fn linux_fanotify_permission_check(
+    number: u64,
+    arguments: [u64; 3],
+    output: *mut LinuxSyscallFrame,
+    caller: LinuxUserContext,
+) -> Option<u64> {
+    use crate::linux_fanotify::{Permission, FAN_ACCESS_PERM, FAN_OPEN_PERM};
+    let at = u64::from(LINUX_AT_FDCWD);
+    let (path, mask) = match number {
+        LINUX_READ_SYSCALL
+        | LINUX_PREAD64_SYSCALL
+        | LINUX_READV_SYSCALL
+        | LINUX_PREADV_SYSCALL
+        | LINUX_PREADV2_SYSCALL => {
+            if linux_device_descriptor(u64::from(arguments[0] as u32)) & LINUX_DESCRIPTOR_INPUT == 0
+            {
+                return None;
+            }
+            (
+                linux_inotify_descriptor_path(arguments[0])?,
+                FAN_ACCESS_PERM,
+            )
+        }
+        // Only a file already there is asked about: one the call creates
+        // is not there to check yet.
+        LINUX_OPEN_SYSCALL | LINUX_CREAT_SYSCALL | LINUX_OPENAT_SYSCALL => {
+            let (directory, address, flags) = match number {
+                LINUX_OPEN_SYSCALL => (at, arguments[0], arguments[1]),
+                LINUX_CREAT_SYSCALL => (at, arguments[0], 0),
+                _ => (arguments[0], arguments[1], arguments[2]),
+            };
+            let (mut path, length) = linux_inotify_path_at(directory, address)?;
+            let length = if flags & LINUX_O_NOFOLLOW == 0 {
+                linux_overlay_lookup_following(&mut path, length, true)
+                    .ok()?
+                    .0
+            } else {
+                length
+            };
+            ((path, length), FAN_OPEN_PERM)
+        }
+        _ => return None,
+    };
+    let (path, length) = path;
+    let object = linux_fanotify_object(&path[..length])
+        .filter(|object| mask == FAN_OPEN_PERM || !object.directory)?;
+    match crate::linux_fanotify::permission(
+        linux_execution_instance(),
+        object,
+        mask,
+        linux_fanotify_cause(),
+    ) {
+        Permission::Allowed => None,
+        Permission::Denied => Some(LINUX_EPERM),
+        Permission::Asked => {
+            wake_linux_descriptor_waits();
+            Some(linux_retry_later_live_return(output, caller, number))
+        }
+        Permission::Waiting => Some(linux_retry_later_live_return(output, caller, number)),
+    }
 }
 
 fn linux_fanotify_mark(
@@ -45891,170 +46438,324 @@ fn linux_fanotify_mark(
     directory: u64,
     path_address: u64,
 ) -> u64 {
-    const FAN_MARK_ADD: u64 = 1;
-    const FAN_MARK_REMOVE: u64 = 2;
-    const FAN_MARK_FLUSH: u64 = 0x80;
-    const FAN_MODIFY: u64 = 2;
+    use crate::linux_fanotify::{
+        Change, Command, MarkKind, EVENT_FLAGS, FAN_EVENT_ON_CHILD, FAN_FS_ERROR, FAN_ONDIR,
+        INODE_EVENTS, PATH_EVENTS, PERMISSION_EVENTS, VALID_MASK,
+    };
+    const FAN_MARK_ADD: u32 = 0x1;
+    const FAN_MARK_REMOVE: u32 = 0x2;
+    const FAN_MARK_DONT_FOLLOW: u32 = 0x4;
+    const FAN_MARK_ONLYDIR: u32 = 0x8;
+    const FAN_MARK_MOUNT: u32 = 0x10;
+    const FAN_MARK_IGNORED_MASK: u32 = 0x20;
+    const FAN_MARK_IGNORED_SURV_MODIFY: u32 = 0x40;
+    const FAN_MARK_FLUSH: u32 = 0x80;
+    const FAN_MARK_FILESYSTEM: u32 = 0x100;
+    const FAN_MARK_EVICTABLE: u32 = 0x200;
+    const FAN_MARK_IGNORE: u32 = 0x400;
+    const TYPE_BITS: u32 = FAN_MARK_MOUNT | FAN_MARK_FILESYSTEM;
+    const COMMAND_BITS: u32 = FAN_MARK_ADD | FAN_MARK_REMOVE | FAN_MARK_FLUSH;
+    const IGNORE_BITS: u32 = FAN_MARK_IGNORED_MASK | FAN_MARK_IGNORE;
+    const VALID_FLAGS: u32 = TYPE_BITS
+        | COMMAND_BITS
+        | IGNORE_BITS
+        | FAN_MARK_DONT_FOLLOW
+        | FAN_MARK_ONLYDIR
+        | FAN_MARK_IGNORED_SURV_MODIFY
+        | FAN_MARK_EVICTABLE;
+    const CLASS_BITS: u32 = 0xc;
     let descriptor = u64::from(descriptor as u32);
-    let flags = u64::from(flags as u32);
-    let directory = u64::from(directory as u32);
-    if !linux_fanotify_descriptor(descriptor) {
-        return LINUX_EBADF;
-    }
-    if flags == FAN_MARK_FLUSH {
-        if mask != 0 {
-            return LINUX_EINVAL;
+    let flags = flags as u32;
+    // Only the lower 32 bits of the mask mean anything yet.
+    let Ok(mut mask) = u32::try_from(mask) else {
+        return LINUX_EINVAL;
+    };
+    let mark_type = flags & TYPE_BITS;
+    let command = flags & COMMAND_BITS;
+    let ignore = flags & IGNORE_BITS;
+    if flags & !VALID_FLAGS != 0
+        || mark_type == TYPE_BITS
+        || match command {
+            FAN_MARK_ADD | FAN_MARK_REMOVE => mask == 0,
+            FAN_MARK_FLUSH => flags & !(TYPE_BITS | FAN_MARK_FLUSH) != 0,
+            _ => true,
         }
-        for path in &X86_RUNTIME.LINUX_FANOTIFY_MARK_PATHS {
-            path.store(0, Ordering::SeqCst);
-        }
-        for mark_mask in &X86_RUNTIME.LINUX_FANOTIFY_MARK_MASKS {
-            mark_mask.store(0, Ordering::SeqCst);
-        }
-        return 0;
-    }
-    if !matches!(flags, FAN_MARK_ADD | FAN_MARK_REMOVE) || mask == 0 || mask & !FAN_MODIFY != 0 {
+        || mask & !VALID_MASK != 0
+        || ignore == IGNORE_BITS
+    {
         return LINUX_EINVAL;
     }
-    let mut path = [0_u8; LINUX_PATH_MAX];
-    let path_length = match copy_linux_c_string(path_address, &mut path) {
-        Ok(length) => length,
-        Err(error) => return error,
+    // A legacy ignore mask has no event flags.
+    if ignore == FAN_MARK_IGNORED_MASK {
+        mask &= !EVENT_FLAGS;
+    }
+    if !linux_descriptor_open(descriptor) {
+        return LINUX_EBADF;
+    }
+    let Some((domain, group)) = linux_fanotify_key(descriptor) else {
+        return LINUX_EINVAL;
     };
+    let Some((group_flags, _)) = crate::linux_fanotify::flags(domain, group) else {
+        return LINUX_EINVAL;
+    };
+    // Permission events need a content class; an error event a filesystem
+    // mark; an evictable mark an inode; and the events without a file to
+    // open a group reporting file handles, which Ginux does not make.
+    if mask & PERMISSION_EVENTS != 0 && group_flags & CLASS_BITS == 0
+        || mask & FAN_FS_ERROR != 0 && mark_type != FAN_MARK_FILESYSTEM
+        || flags & FAN_MARK_EVICTABLE != 0 && mark_type != 0
+        || mask & !(PATH_EVENTS | PERMISSION_EVENTS | EVENT_FLAGS) != 0
+    {
+        return LINUX_EINVAL;
+    }
+    if command == FAN_MARK_FLUSH {
+        return match crate::linux_fanotify::flush(
+            domain,
+            group,
+            mark_type == FAN_MARK_MOUNT,
+            mark_type == FAN_MARK_FILESYSTEM,
+        ) {
+            Ok(()) => 0,
+            Err(_) => LINUX_EINVAL,
+        };
+    }
     let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
-    let length = match linux_canonical_path_at(directory, &path[..path_length], &mut canonical) {
-        Ok(length) => length,
-        Err(error) => return error,
+    let length = if path_address == 0 {
+        // No path: the mark goes on what `directory` refers to.
+        let directory = u64::from(directory as u32);
+        if let Some((path, length)) = (directory != u64::from(LINUX_AT_FDCWD))
+            .then(|| linux_descriptor_canonical_path(directory))
+            .flatten()
+        {
+            canonical[..length].copy_from_slice(&path[..length]);
+            length
+        } else {
+            match linux_walk_start(directory, &mut canonical) {
+                Ok(length) => length,
+                Err(error) => return error,
+            }
+        }
+    } else {
+        let mut path = [0_u8; LINUX_PATH_MAX];
+        let path_length = match copy_linux_c_string(path_address, &mut path) {
+            Ok(length) => length,
+            Err(error) => return error,
+        };
+        let length = match linux_canonical_path_at(directory, &path[..path_length], &mut canonical)
+        {
+            Ok(length) => length,
+            // The root has an empty canonical path.
+            Err(LINUX_EISDIR) => 0,
+            Err(error) => return error,
+        };
+        if flags & FAN_MARK_DONT_FOLLOW == 0 {
+            match linux_overlay_lookup_following(&mut canonical, length, true) {
+                Ok((length, ..)) => length,
+                Err(error) => return error,
+            }
+        } else {
+            length
+        }
     };
-    let overlay = crate::linux_overlay::lookup(&canonical[..length]);
-    let oci = crate::published_rootfs::lookup_metadata_at(
-        crate::published_rootfs::ROOT_HANDLE,
-        &canonical[..length],
+    let path = &canonical[..length];
+    let exists = linux_inotify_exists(path)
+        || LinuxCharacterDevice::from_canonical(path).is_some()
+        || linux_api_directory(path);
+    if !exists {
+        return LINUX_ENOENT;
+    }
+    let is_directory = linux_inotify_is_directory(path) || linux_api_directory(path);
+    if flags & FAN_MARK_ONLYDIR != 0 && !is_directory {
+        return LINUX_ENOTDIR;
+    }
+    let inode = mark_type == 0;
+    if command == FAN_MARK_ADD {
+        // FAN_MARK_IGNORE is strict about events only a directory has.
+        let directory_only = FAN_ONDIR | FAN_EVENT_ON_CHILD | INODE_EVENTS;
+        if ignore == FAN_MARK_IGNORE && inode && !is_directory && mask & directory_only != 0 {
+            return LINUX_ENOTDIR;
+        }
+        if ignore == FAN_MARK_IGNORE
+            && flags & FAN_MARK_IGNORED_SURV_MODIFY == 0
+            && (!inode || is_directory)
+        {
+            return if inode { LINUX_EISDIR } else { LINUX_EINVAL };
+        }
+    }
+    // Only a directory's inode mark hears its entries.
+    if !inode || !is_directory {
+        mask &= !FAN_EVENT_ON_CHILD;
+    }
+    let kind = match mark_type {
+        FAN_MARK_MOUNT => MarkKind::Mount(crate::linux_mounts::mount_id_at(domain, path)),
+        FAN_MARK_FILESYSTEM => MarkKind::Filesystem(crate::linux_mounts::mount_id_at(domain, path)),
+        _ => MarkKind::Inode,
+    };
+    let change = Change {
+        mask,
+        ignore: ignore != 0,
+        ignore_flags: ignore == FAN_MARK_IGNORE,
+        survive_modify: flags & FAN_MARK_IGNORED_SURV_MODIFY != 0,
+    };
+    let command = if command == FAN_MARK_ADD {
+        Command::Add
+    } else {
+        Command::Remove
+    };
+    match crate::linux_fanotify::mark(domain, group, command, kind, path, change) {
+        Ok(()) => 0,
+        Err(crate::linux_fanotify::Error::NotFound) => LINUX_ENOENT,
+        Err(crate::linux_fanotify::Error::NoMemory) => LINUX_ENOMEM,
+        Err(crate::linux_fanotify::Error::TooMany) => LINUX_ENOSPC,
+        Err(crate::linux_fanotify::Error::Invalid) => LINUX_EINVAL,
+    }
+}
+
+/// The kernel's own directories under /sys that are there without the
+/// overlay holding them (mount points for their filesystems).
+fn linux_api_directory(path: &[u8]) -> bool {
+    matches!(
+        path,
+        b"sys"
+            | b"sys/fs/cgroup"
+            | b"sys/fs/bpf"
+            | b"sys/kernel/debug"
+            | b"sys/kernel/tracing"
+            | b"sys/kernel/security"
+            | b"sys/fs/pstore"
+    )
+}
+
+/// Opens canonical `path` for a listener, with its group's event_f_flags;
+/// what the listener does with it raises no events.
+fn linux_fanotify_open(path: &[u8], flags: u32) -> Option<i32> {
+    let mut absolute = [0_u8; LINUX_PATH_MAX];
+    let length = path.len() + 1;
+    absolute.get_mut(1..length)?.copy_from_slice(path);
+    absolute[0] = b'/';
+    let descriptor = linux_openat_path(
+        u64::from(LINUX_AT_FDCWD),
+        absolute,
+        length,
+        u64::from(flags),
+        0,
     );
-    let virtual_device = LinuxCharacterDevice::from_canonical(&canonical[..length]).is_some()
-        || LinuxCharacterDevice::from_path(&path[..path_length]).is_some();
-    if overlay.is_none() && oci.is_none() && !virtual_device {
-        return LINUX_ENOENT;
+    let event_descriptor = i32::try_from(descriptor).ok()?;
+    let flags = usize::try_from(descriptor)
+        .ok()
+        .and_then(|index| X86_RUNTIME.ELF_PROBE_STDIO_SOCKET_FLAGS.get(index))
+        .or_else(|| {
+            X86_RUNTIME
+                .ELF_PROBE_SOCKET_FLAGS
+                .get(linux_socket_descriptor_index(descriptor)?)
+        });
+    if let Some(flags) = flags {
+        flags.fetch_or(LINUX_PRIVATE_NONOTIFY_DESCRIPTOR, Ordering::SeqCst);
     }
-    let hash = linux_inotify_path_hash(&canonical[..length]);
-    if let Some(index) = (0..LINUX_FANOTIFY_MARK_LIMIT)
-        .find(|index| X86_RUNTIME.LINUX_FANOTIFY_MARK_PATHS[*index].load(Ordering::SeqCst) == hash)
-    {
-        if flags == FAN_MARK_ADD {
-            X86_RUNTIME.LINUX_FANOTIFY_MARK_MASKS[index].fetch_or(mask, Ordering::SeqCst);
-            return 0;
-        }
-        let old = X86_RUNTIME.LINUX_FANOTIFY_MARK_MASKS[index].load(Ordering::SeqCst);
-        if old & mask == 0 {
-            return LINUX_ENOENT;
-        }
-        let new = old & !mask;
-        X86_RUNTIME.LINUX_FANOTIFY_MARK_MASKS[index].store(new, Ordering::SeqCst);
-        if new == 0 {
-            X86_RUNTIME.LINUX_FANOTIFY_MARK_PATHS[index].store(0, Ordering::SeqCst);
-        }
-        return 0;
-    }
-    if flags == FAN_MARK_REMOVE {
-        return LINUX_ENOENT;
-    }
-    let Some(index) = (0..LINUX_FANOTIFY_MARK_LIMIT)
-        .find(|index| X86_RUNTIME.LINUX_FANOTIFY_MARK_PATHS[*index].load(Ordering::SeqCst) == 0)
-    else {
-        return LINUX_ENOSPC;
-    };
-    X86_RUNTIME.LINUX_FANOTIFY_MARK_MASKS[index].store(mask, Ordering::SeqCst);
-    X86_RUNTIME.LINUX_FANOTIFY_MARK_PATHS[index].store(hash, Ordering::SeqCst);
-    0
+    Some(event_descriptor)
 }
 
-fn linux_fanotify_notify_path_hash(path_hash: u64, source: u64, event: u64) {
-    if X86_RUNTIME.LINUX_FANOTIFY_REFS.load(Ordering::SeqCst) == 0
-        || !(0..LINUX_FANOTIFY_MARK_LIMIT).any(|index| {
-            X86_RUNTIME.LINUX_FANOTIFY_MARK_PATHS[index].load(Ordering::SeqCst) == path_hash
-                && X86_RUNTIME.LINUX_FANOTIFY_MARK_MASKS[index].load(Ordering::SeqCst) & event != 0
-        })
-    {
-        return;
-    }
-    if X86_RUNTIME
-        .LINUX_FANOTIFY_PENDING_DESCRIPTOR
-        .load(Ordering::SeqCst)
-        == u64::MAX
-    {
-        let duplicate = linux_console_dup(source);
-        if duplicate >= LINUX_AUX_DESCRIPTOR_LIMIT {
-            return;
-        }
-        X86_RUNTIME
-            .LINUX_FANOTIFY_PENDING_DESCRIPTOR
-            .store(duplicate, Ordering::SeqCst);
-    }
-    X86_RUNTIME
-        .LINUX_FANOTIFY_PENDING_MASK
-        .fetch_or(event, Ordering::SeqCst);
-    wake_linux_descriptor_waits();
-}
-
+/// read(2) on a group: as many queued events as fit, each with a
+/// descriptor of its object opened for the reader.
 fn linux_fanotify_read(descriptor: u64, address: u64, count: u64) -> Option<u64> {
-    const EVENT_SIZE: u64 = 24;
-    if !linux_fanotify_descriptor(descriptor) {
-        return None;
+    use crate::linux_fanotify::EVENT_METADATA_SIZE;
+    const METADATA_VERSION: u8 = 3;
+    let (domain, group) = linux_fanotify_key(descriptor)?;
+    let (_, event_flags) = crate::linux_fanotify::flags(domain, group)?;
+    let capacity = usize::try_from(count).unwrap_or(usize::MAX) / EVENT_METADATA_SIZE;
+    if capacity == 0 {
+        return Some(if crate::linux_fanotify::ready(domain, group) {
+            LINUX_EINVAL
+        } else {
+            LINUX_EAGAIN
+        });
     }
-    if count < EVENT_SIZE {
-        return Some(LINUX_EINVAL);
-    }
-    let event_descriptor = X86_RUNTIME
-        .LINUX_FANOTIFY_PENDING_DESCRIPTOR
-        .load(Ordering::SeqCst);
-    let mask = X86_RUNTIME
-        .LINUX_FANOTIFY_PENDING_MASK
-        .load(Ordering::SeqCst);
-    if event_descriptor == u64::MAX || mask == 0 {
+    let events = match crate::linux_fanotify::take(domain, group, capacity) {
+        Ok(events) => events,
+        Err(_) => return Some(LINUX_ENOMEM),
+    };
+    if events.is_empty() {
         return Some(LINUX_EAGAIN);
     }
-    let mut event = [0_u8; EVENT_SIZE as usize];
-    event[..4].copy_from_slice(&(EVENT_SIZE as u32).to_ne_bytes());
-    event[4] = 3;
-    event[6..8].copy_from_slice(&(EVENT_SIZE as u16).to_ne_bytes());
-    event[8..16].copy_from_slice(&mask.to_ne_bytes());
-    event[16..20].copy_from_slice(&(event_descriptor as i32).to_ne_bytes());
-    event[20..24].copy_from_slice(&current_linux_process_pid().to_ne_bytes());
-    if !copy_to_linux_user(address, &event) {
-        return Some(LINUX_EFAULT);
+    let mut written = 0_u64;
+    for event in events {
+        // An object that cannot be opened (one unlinked meanwhile) is
+        // reported without a descriptor (FAN_NOFD).
+        let event_descriptor = event
+            .path
+            .as_deref()
+            .and_then(|path| linux_fanotify_open(path, event_flags));
+        let mut metadata = [0_u8; EVENT_METADATA_SIZE];
+        metadata[..4].copy_from_slice(&(EVENT_METADATA_SIZE as u32).to_ne_bytes());
+        metadata[4] = METADATA_VERSION;
+        metadata[6..8].copy_from_slice(&(EVENT_METADATA_SIZE as u16).to_ne_bytes());
+        metadata[8..16].copy_from_slice(&u64::from(event.mask).to_ne_bytes());
+        metadata[16..20].copy_from_slice(&event_descriptor.unwrap_or(-1).to_ne_bytes());
+        metadata[20..24].copy_from_slice(&event.pid.to_ne_bytes());
+        let copied = copy_to_linux_user(address + written, &metadata);
+        if !copied {
+            if let Some(event_descriptor) = event_descriptor {
+                let _ = linux_descriptor_close(event_descriptor as u64);
+            }
+        }
+        if let Some(request) = event.request {
+            crate::linux_fanotify::delivered(
+                domain,
+                group,
+                request,
+                event_descriptor.filter(|_| copied),
+            );
+        }
+        if !copied {
+            return Some(if written == 0 { LINUX_EFAULT } else { written });
+        }
+        written += EVENT_METADATA_SIZE as u64;
     }
-    X86_RUNTIME
-        .LINUX_FANOTIFY_PENDING_DESCRIPTOR
-        .store(u64::MAX, Ordering::SeqCst);
-    X86_RUNTIME
-        .LINUX_FANOTIFY_PENDING_MASK
-        .store(0, Ordering::SeqCst);
-    Some(EVENT_SIZE)
+    Some(written)
 }
 
-fn linux_fanotify_release() {
-    if X86_RUNTIME
-        .LINUX_FANOTIFY_REFS
-        .fetch_add(u16::MAX, Ordering::SeqCst)
-        != 1
-    {
+/// write(2) on a group: a struct fanotify_response answering a
+/// permission event.
+fn linux_fanotify_write(descriptor: u64, address: u64, count: u64) -> Option<u64> {
+    const RESPONSE_SIZE: u64 = 8;
+    let (domain, group) = linux_fanotify_key(descriptor)?;
+    if count < RESPONSE_SIZE {
+        return Some(LINUX_EINVAL);
+    }
+    let mut response = [0_u8; RESPONSE_SIZE as usize];
+    if !copy_from_linux_user(address, &mut response) {
+        return Some(LINUX_EFAULT);
+    }
+    let event_descriptor = i32::from_ne_bytes(response[..4].try_into().unwrap());
+    let answer = u32::from_ne_bytes(response[4..].try_into().unwrap());
+    Some(
+        match crate::linux_fanotify::respond(domain, group, event_descriptor, answer) {
+            Ok(()) => RESPONSE_SIZE,
+            Err(crate::linux_fanotify::Error::NotFound) => LINUX_ENOENT,
+            Err(_) => LINUX_EINVAL,
+        },
+    )
+}
+
+fn linux_fanotify_ready(descriptor: u64) -> bool {
+    linux_fanotify_key(descriptor)
+        .is_some_and(|(domain, group)| crate::linux_fanotify::ready(domain, group))
+}
+
+/// Closing a group's descriptor: the group goes when its creator closes
+/// its last descriptor of it.
+fn linux_fanotify_release(descriptor: u64) {
+    let Some((domain, group)) = linux_fanotify_key(descriptor) else {
+        return;
+    };
+    if (0..LINUX_DESCRIPTOR_TABLE_LIMIT).any(|candidate| {
+        candidate != descriptor
+            && linux_fanotify_descriptor(candidate)
+            && linux_descriptor_open_file_id(candidate) == Some(group)
+    }) {
         return;
     }
-    let pending = X86_RUNTIME
-        .LINUX_FANOTIFY_PENDING_DESCRIPTOR
-        .swap(u64::MAX, Ordering::SeqCst);
-    if pending != u64::MAX {
-        let _ = linux_descriptor_close(pending);
-    }
-    X86_RUNTIME
-        .LINUX_FANOTIFY_PENDING_MASK
-        .store(0, Ordering::SeqCst);
-    for path in &X86_RUNTIME.LINUX_FANOTIFY_MARK_PATHS {
-        path.store(0, Ordering::SeqCst);
-    }
-    for mask in &X86_RUNTIME.LINUX_FANOTIFY_MARK_MASKS {
-        mask.store(0, Ordering::SeqCst);
-    }
+    crate::linux_fanotify::release(domain, Some(group), current_linux_process_pid());
 }
 
 fn linux_inotify_instance(descriptor: u64) -> Option<usize> {
@@ -46114,15 +46815,6 @@ fn linux_inotify_init(flags: u64) -> u64 {
     }
     set_linux_descriptor_close_on_exec(descriptor, flags & IN_CLOEXEC != 0);
     descriptor
-}
-
-fn linux_inotify_path_hash(path: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in path {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100_0000_01b3);
-    }
-    hash.max(1)
 }
 
 fn linux_inotify_add_watch(descriptor: u64, path_address: u64, mask: u64) -> u64 {
@@ -46235,8 +46927,20 @@ fn linux_inotify_path_at(directory: u64, address: u64) -> Option<LinuxInotifyPat
     Some((canonical, canonical_length))
 }
 
-/// The canonical path of an open descriptor's file, if it has one.
+/// The canonical path of an open descriptor's file, for the events done
+/// through it: none for a descriptor fanotify opened for a listener, whose
+/// use raises no events (FMODE_NONOTIFY).
 fn linux_inotify_descriptor_path(descriptor: u64) -> Option<LinuxInotifyPath> {
+    if linux_socket_flags(u64::from(descriptor as u32))
+        .is_some_and(|flags| flags & LINUX_PRIVATE_NONOTIFY_DESCRIPTOR != 0)
+    {
+        return None;
+    }
+    linux_descriptor_canonical_path(descriptor)
+}
+
+/// The canonical path of an open descriptor's file, if it has one.
+fn linux_descriptor_canonical_path(descriptor: u64) -> Option<LinuxInotifyPath> {
     let descriptor = u64::from(descriptor as u32);
     if linux_overlay_descriptor_handle(descriptor).is_none()
         && linux_rootfs_descriptor(descriptor) == 0
@@ -46307,7 +47011,9 @@ pub(super) struct LinuxInotifyCall {
 
 /// Before system call `number` with `arguments`, when inotify has watches.
 pub(super) fn linux_inotify_before(number: u64, arguments: [u64; 6]) -> Option<LinuxInotifyCall> {
-    if !crate::linux_inotify::active() || !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::Relaxed) {
+    if !(crate::linux_inotify::active() || crate::linux_fanotify::active())
+        || !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::Relaxed)
+    {
         return None;
     }
     const AT_REMOVEDIR: u64 = 0x200;
@@ -46364,8 +47070,11 @@ pub(super) fn linux_inotify_before(number: u64, arguments: [u64; 6]) -> Option<L
     })
 }
 
-/// After the call: the events its result stands for.
+/// After the call: the inotify and fanotify events its result stands for.
 pub(super) fn linux_inotify_after(call: LinuxInotifyCall, result: u64) {
+    use crate::linux_fanotify::{
+        FAN_ACCESS, FAN_CLOSE_NOWRITE, FAN_CLOSE_WRITE, FAN_MODIFY, FAN_OPEN,
+    };
     use crate::linux_inotify::{
         IN_ACCESS, IN_ATTRIB, IN_CLOSE_NOWRITE, IN_CLOSE_WRITE, IN_MODIFY, IN_OPEN,
     };
@@ -46393,12 +47102,18 @@ pub(super) fn linux_inotify_after(call: LinuxInotifyCall, result: u64) {
             crate::linux_inotify::created(domain, &path[..length], directory);
         }
     };
+    let fanotify = |path: &Option<LinuxInotifyPath>, mask: u32| {
+        if let Some((path, length)) = path {
+            linux_fanotify_event(&path[..*length], mask);
+        }
+    };
     match call.number {
         LINUX_OPEN_SYSCALL | LINUX_OPENAT_SYSCALL | LINUX_CREAT_SYSCALL | LINUX_OPENAT2_SYSCALL => {
             let path = linux_inotify_descriptor_path(result);
             if linux_descriptor_flag(&X86_RUNTIME.ELF_PROBE_DESCRIPTOR_CREATED, result) {
                 created(path, false);
             }
+            fanotify(&path, FAN_OPEN);
             object(path, IN_OPEN);
         }
         LINUX_READ_SYSCALL
@@ -46408,7 +47123,9 @@ pub(super) fn linux_inotify_after(call: LinuxInotifyCall, result: u64) {
         | LINUX_PREADV2_SYSCALL
             if result != 0 =>
         {
-            object(linux_inotify_descriptor_path(arguments[0]), IN_ACCESS);
+            let path = linux_inotify_descriptor_path(arguments[0]);
+            fanotify(&path, FAN_ACCESS);
+            object(path, IN_ACCESS);
         }
         LINUX_WRITE_SYSCALL
         | LINUX_PWRITE64_SYSCALL
@@ -46417,12 +47134,20 @@ pub(super) fn linux_inotify_after(call: LinuxInotifyCall, result: u64) {
         | LINUX_PWRITEV2_SYSCALL
             if result != 0 =>
         {
-            object(linux_inotify_descriptor_path(arguments[0]), IN_MODIFY);
+            let path = linux_inotify_descriptor_path(arguments[0]);
+            fanotify(&path, FAN_MODIFY);
+            object(path, IN_MODIFY);
         }
         LINUX_FTRUNCATE_SYSCALL | LINUX_FALLOCATE_SYSCALL => {
-            object(linux_inotify_descriptor_path(arguments[0]), IN_MODIFY);
+            let path = linux_inotify_descriptor_path(arguments[0]);
+            fanotify(&path, FAN_MODIFY);
+            object(path, IN_MODIFY);
         }
-        LINUX_TRUNCATE_SYSCALL => object(linux_inotify_path_at(at, arguments[0]), IN_MODIFY),
+        LINUX_TRUNCATE_SYSCALL => {
+            let path = linux_inotify_path_at(at, arguments[0]);
+            fanotify(&path, FAN_MODIFY);
+            object(path, IN_MODIFY);
+        }
         LINUX_CHMOD_SYSCALL
         | LINUX_CHOWN_SYSCALL
         | LINUX_LCHOWN_SYSCALL
@@ -46477,6 +47202,12 @@ pub(super) fn linux_inotify_after(call: LinuxInotifyCall, result: u64) {
             }
         }
         LINUX_CLOSE_SYSCALL => {
+            let closed = if call.writer {
+                FAN_CLOSE_WRITE
+            } else {
+                FAN_CLOSE_NOWRITE
+            };
+            fanotify(&call.first, closed);
             if let Some((path, length)) = call.first {
                 let mask = if call.writer {
                     IN_CLOSE_WRITE
@@ -46763,11 +47494,7 @@ fn linux_descriptor_poll_events(descriptor: i32, requested: u16) -> u16 {
         };
     }
     if linux_fanotify_descriptor(descriptor) {
-        return if X86_RUNTIME
-            .LINUX_FANOTIFY_PENDING_MASK
-            .load(Ordering::SeqCst)
-            != 0
-        {
+        return if linux_fanotify_ready(descriptor) {
             requested & LINUX_POLLIN
         } else {
             0
@@ -46928,6 +47655,9 @@ fn linux_descriptor_poll_events(descriptor: i32, requested: u16) -> u16 {
 fn linux_descriptor_write(descriptor: u64, address: u64, count: u64) -> u64 {
     if linux_io_uring_descriptor(descriptor) {
         return LINUX_EINVAL;
+    }
+    if let Some(result) = linux_fanotify_write(descriptor, address, count) {
+        return result;
     }
     if linux_userfaultfd_descriptor(descriptor) {
         return LINUX_EINVAL;
@@ -48988,11 +49718,6 @@ fn linux_overlay_write(descriptor: u64, state: u16, address: u64, count: u64) ->
             start.saturating_add(result as usize) as u64,
             Ordering::SeqCst,
         );
-        if result != 0 {
-            if let Some(path_hash) = crate::linux_overlay::path_hash(handle) {
-                linux_fanotify_notify_path_hash(path_hash, descriptor, 0x0000_0002);
-            }
-        }
     }
     Some(result)
 }
@@ -49572,10 +50297,10 @@ fn linux_descriptor_close_with_wake_inner(descriptor: u64, wake_waiters: bool) -
         linux_inotify_release(descriptor);
     }
     if linux_fanotify_descriptor(descriptor) {
-        linux_fanotify_release();
+        linux_fanotify_release(descriptor);
     }
     if linux_io_uring_descriptor(descriptor) {
-        linux_io_uring_release();
+        linux_io_uring_release(descriptor);
     }
     if let Some(id) = linux_mq_descriptor_id(descriptor) {
         match crate::linux_sysv_ipc::posix_queue_close_by(id, current_linux_process_pid()) {
@@ -49940,16 +50665,6 @@ fn linux_console_dup2(source: u64, target: u64) -> u64 {
                 .store(source_tmp, Ordering::SeqCst);
             X86_RUNTIME.ELF_PROBE_STDIO_SOCKET_FLAGS[index].store(source_flags, Ordering::SeqCst);
             X86_RUNTIME.ELF_PROBE_STDIO_OFFSETS[index].store(source_offset, Ordering::SeqCst);
-        }
-        if linux_fanotify_descriptor(source) {
-            X86_RUNTIME
-                .LINUX_FANOTIFY_REFS
-                .fetch_add(1, Ordering::SeqCst);
-        }
-        if linux_io_uring_descriptor(source) {
-            X86_RUNTIME
-                .LINUX_IO_URING_REFS
-                .fetch_add(1, Ordering::SeqCst);
         }
         set_linux_descriptor_close_on_exec(target, false);
         return linux_finish_descriptor_dup(source, target);
@@ -50467,7 +51182,8 @@ fn linux_descriptor_fcntl(descriptor: u64, command: u64, argument: u64) -> u64 {
                     linux_socket_flags(descriptor).unwrap_or(0)
                         & !(LINUX_PRIVATE_SECRET_DESCRIPTOR
                             | LINUX_PRIVATE_IO_URING_DESCRIPTOR
-                            | LINUX_PRIVATE_PROC_LINK_DESCRIPTOR),
+                            | LINUX_PRIVATE_PROC_LINK_DESCRIPTOR
+                            | LINUX_PRIVATE_NONOTIFY_DESCRIPTOR),
                 )
         }
         LINUX_F_SETFL => {
@@ -53745,12 +54461,17 @@ fn linux_statfs(path_address: u64, stat_address: u64) -> u64 {
         None => None,
     };
     let virtual_path = linux_virtual_mount_path_at(u64::from(LINUX_AT_FDCWD), path);
+    // The kernel's mount points under /sys are there even when the image
+    // has no directory for them.
+    let api_directory =
+        canonical_length.is_some_and(|length| linux_api_directory(&canonical[..length]));
     if overlay.is_none()
         && linux_rootfs_path_at(u64::from(LINUX_AT_FDCWD), path).is_none()
         && virtual_path.is_none()
         && linux_root_directory_kind(path).is_none()
         && !canonical_is_proc
         && !canonical_is_cgroup
+        && !api_directory
     {
         return canonical_length.map_or(LINUX_ENOENT, |length| {
             linux_missing_path_error(&canonical[..length])
@@ -54030,7 +54751,10 @@ fn linux_umount(target_address: u64, flags: u64) -> u64 {
         Err(error) => return error,
     };
     let canonical = &canonical[..length];
-    if linux_path_access(canonical).is_none() && !linux_kernel_mount_point(canonical) {
+    if linux_path_access(canonical).is_none()
+        && !linux_kernel_mount_point(canonical)
+        && !linux_api_directory(canonical)
+    {
         return linux_missing_path_error(canonical);
     }
     match crate::linux_mounts::unmount(linux_execution_instance(), canonical) {

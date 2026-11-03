@@ -480,6 +480,7 @@ pub(super) const LINUX_ENODATA: u64 = u64::MAX - 60;
 pub(super) const LINUX_EMSGSIZE: u64 = u64::MAX - 89;
 pub(super) const LINUX_ENOTSOCK: u64 = u64::MAX - 87;
 pub(super) const LINUX_EOPNOTSUPP: u64 = u64::MAX - 94;
+pub(super) const LINUX_ECANCELED: u64 = u64::MAX - 124;
 pub(super) const LINUX_ENAMETOOLONG: u64 = u64::MAX - 35;
 pub(super) const LINUX_ENOSYS: u64 = u64::MAX - 37;
 pub(super) const LINUX_ENOTEMPTY: u64 = u64::MAX - 38;
@@ -596,7 +597,6 @@ pub(super) const LINUX_SELECT_WORD_LIMIT: usize =
 pub(super) const LINUX_DESCRIPTOR_TABLE_LIMIT: u64 = 1024;
 pub(super) const LINUX_DEVICE_DESCRIPTOR_COUNT: usize =
     LINUX_DESCRIPTOR_TABLE_LIMIT as usize - LINUX_AUX_DESCRIPTOR_FIRST as usize;
-pub(super) const LINUX_FANOTIFY_MARK_LIMIT: usize = 16;
 pub(super) const LINUX_DESCRIPTOR_FLAG_WORD_COUNT: usize =
     LINUX_DESCRIPTOR_TABLE_LIMIT.div_ceil(u64::BITS as u64) as usize;
 pub(super) const LINUX_POLLIN: u16 = 1;
@@ -736,15 +736,14 @@ pub(super) const LINUX_FILE_PROC_TASK_COMM: u16 = LINUX_FILE_MASK | LINUX_PROC_T
 /// own state (its descriptor keeps the thread id).
 pub(super) const LINUX_PROC_TASK_STAT_NODE: u16 = 0xb800;
 pub(super) const LINUX_FILE_PROC_TASK_STAT: u16 = LINUX_FILE_MASK | LINUX_PROC_TASK_STAT_NODE;
-/// Read-only `/proc/sys` values: node, path under `/proc`, contents. Values
-/// match what Ginux implements (four user namespaces). Leave out values that
-/// tests save and restore (io_uring_disabled): LTP skips a test when such a
-/// file exists but cannot be written, and runs it when the file is absent.
+/// `/proc/sys` values: node, path under `/proc`, contents. Values match
+/// what Ginux implements (four user namespaces); root may write them, and
+/// the kernel acts on those it reads back (`linux_proc_sysctl_value`).
 /// `/proc/sys/fs/aio-max-nr`: the most events one io_setup context may hold.
 pub(super) const LINUX_AIO_MAX_NR: u64 = 65_536;
 /// `/proc/sys/vm/max_map_count`: the most memory areas a process may have.
 pub(super) const LINUX_MAX_MAP_COUNT: usize = 65_530;
-pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 37] = [
+pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 38] = [
     // The most memory areas a process may have (LINUX_MAX_MAP_COUNT).
     (0xa000, b"sys/vm/max_map_count", b"65530\n"),
     // The random pool is always full, as Linux reports it since 5.18.
@@ -777,6 +776,8 @@ pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 37] = [
     (0xcb00, b"sys/kernel/msg_next_id", b"-1\n"),
     (0xcc00, b"sys/kernel/shm_next_id", b"-1\n"),
     (0xd700, b"sys/kernel/pid_max", b"4194304\n"),
+    // Who may make io_uring rings: 0 everyone, 1 CAP_SYS_ADMIN, 2 nobody.
+    (0xb900, b"sys/kernel/io_uring_disabled", b"0\n"),
     (0xd600, b"sys/kernel/tainted", b"0\n"),
     (0xd500, b"sys/user/max_user_namespaces", b"3\n"),
     (0xd400, b"sys/fs/pipe-max-size", b"1048576\n"),
@@ -1055,6 +1056,9 @@ pub(super) const LINUX_PRIVATE_IO_URING_DESCRIPTOR: u32 = 1 << 29;
 /// An O_PATH | O_NOFOLLOW descriptor of a /proc fd entry: it names the
 /// entry (a magic link) rather than the file the entry leads to.
 pub(super) const LINUX_PRIVATE_PROC_LINK_DESCRIPTOR: u32 = 1 << 28;
+/// A descriptor fanotify opened for a listener (FMODE_NONOTIFY): what is
+/// done through it raises no inotify or fanotify events.
+pub(super) const LINUX_PRIVATE_NONOTIFY_DESCRIPTOR: u32 = 1 << 30;
 pub(super) const LINUX_O_LARGEFILE: u64 = 0x8000;
 pub(super) const LINUX_O_NOFOLLOW: u64 = 0x20000;
 pub(super) const LINUX_O_NOATIME: u64 = 0x40000;

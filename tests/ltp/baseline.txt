@@ -20,12 +20,6 @@ ioctl_ns02 TBROK
 ioctl_ns03 TBROK
 ioctl_ns05 TBROK
 ioctl_ns06 TBROK
-fanotify02 TBROK
-fanotify04 TBROK
-fanotify07 TBROK
-fanotify11 TBROK
-fanotify12 TBROK
-fanotify25 TBROK
 kcmp03 TFAIL
 mmap18 TBROK
 mmap24 TFAIL
@@ -47,7 +41,3 @@ unshare03 TFAIL
 unshare05 TBROK
 userfaultfd03 TBROK
 futex_cmp_requeue01 TBROK
-io_uring01 TBROK
-io_uring02 TBROK
-io_uring03 TBROK
-io_uring04 TBROK

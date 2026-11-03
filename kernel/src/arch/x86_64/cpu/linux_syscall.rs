@@ -465,6 +465,18 @@ fn linux_syscall_dispatch(
     {
         linux_reap_ignored_children();
     }
+    // An open or read a fanotify permission mark covers waits for its
+    // listeners.
+    if runtime_mode && crate::linux_fanotify::permission_active() {
+        if let Some(result) = linux_fanotify_permission_check(
+            number,
+            [first_argument, buffer, count],
+            registers,
+            syscall_return,
+        ) {
+            return result;
+        }
+    }
     let result = match number {
         LINUX_READ_SYSCALL | LINUX_WRITE_SYSCALL | LINUX_IOCTL_SYSCALL
             if linux_graphics_descriptor(first_argument).is_some() =>
