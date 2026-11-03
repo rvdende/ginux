@@ -17963,18 +17963,25 @@ struct LinuxForkParentRuntime {
     nice: u8,
 }
 
-/// The outer fork transaction's exec policy and the process whose exec it
-/// waits for. A child that forks starts a nested transaction, which points
-/// the exec pid at the grandchild; when the child resumes inside that
-/// transaction (after the grandchild exits or execs), its own exec (a
+/// The outer fork transaction's exec policy and the process whose exit,
+/// exec and yield it waits for. A child that forks starts a nested
+/// transaction, which points these at the grandchild; when the child
+/// resumes inside that transaction (after the grandchild exits, execs or
+/// yields), it is the outer transaction's child again: its own exec (a
 /// subshell that runs a pipeline, then execs its last command) must reach
-/// the outer transaction again.
+/// the outer transaction, and so must a yield. The timer yields a process
+/// only when its yield is taken (`linux_preemption_yield_taken`): a
+/// multithreaded child that had forked once was otherwise never preempted
+/// back to the parent waiting in the outer transaction, which then never
+/// ran (dirtyc0w_shmem).
 struct LinuxForkExecFlagGuard {
     previous: bool,
+    exit_pid: u32,
     exec_pid: u32,
-    /// Whether `resume_parent` already gave the exec pid back: an exec the
-    /// parent reports after that must not be overwritten.
-    exec_pid_restored: core::cell::Cell<bool>,
+    yield_pid: u32,
+    /// Whether `resume_parent` already gave the pids back: a report the
+    /// parent makes after that must not be overwritten.
+    pids_restored: core::cell::Cell<bool>,
 }
 
 /// Marks a domain-exec fork transaction as running. It re-runs only the
@@ -18006,10 +18013,16 @@ impl LinuxForkExecFlagGuard {
             previous: X86_RUNTIME
                 .LINUX_PROCESS_RELEASE_PARENT_ON_EXEC
                 .load(Ordering::SeqCst),
+            exit_pid: X86_RUNTIME
+                .LINUX_PROCESS_CHILD_EXIT_PID
+                .load(Ordering::SeqCst),
             exec_pid: X86_RUNTIME
                 .LINUX_PROCESS_CHILD_EXEC_PID
                 .load(Ordering::SeqCst),
-            exec_pid_restored: core::cell::Cell::new(false),
+            yield_pid: X86_RUNTIME
+                .LINUX_PROCESS_CHILD_YIELD_PID
+                .load(Ordering::SeqCst),
+            pids_restored: core::cell::Cell::new(false),
         }
     }
 }
@@ -18024,13 +18037,32 @@ impl Drop for LinuxForkExecFlagGuard {
 }
 
 impl LinuxForkExecFlagGuard {
-    /// Points the exec pid back at the outer transaction's child before the
-    /// parent resumes inside this transaction; once only.
+    /// Points the exit, exec and yield pids back at the outer transaction's
+    /// child before the parent resumes inside this transaction; once only.
+    /// The flags stay as they are (this transaction took its child's
+    /// report), and an exit or yield reported meanwhile keeps its pid.
     fn resume_parent(&self) {
-        if !self.exec_pid_restored.replace(true) {
+        if self.pids_restored.replace(true) {
+            return;
+        }
+        X86_RUNTIME
+            .LINUX_PROCESS_CHILD_EXEC_PID
+            .store(self.exec_pid, Ordering::SeqCst);
+        if !X86_RUNTIME
+            .LINUX_PROCESS_CHILD_EXITED
+            .load(Ordering::SeqCst)
+        {
             X86_RUNTIME
-                .LINUX_PROCESS_CHILD_EXEC_PID
-                .store(self.exec_pid, Ordering::SeqCst);
+                .LINUX_PROCESS_CHILD_EXIT_PID
+                .store(self.exit_pid, Ordering::SeqCst);
+        }
+        if !X86_RUNTIME
+            .LINUX_PROCESS_CHILD_YIELDED
+            .load(Ordering::SeqCst)
+        {
+            X86_RUNTIME
+                .LINUX_PROCESS_CHILD_YIELD_PID
+                .store(self.yield_pid, Ordering::SeqCst);
         }
     }
 }
@@ -53814,7 +53846,7 @@ fn linux_sched_setaffinity_live_return(
     if target != current_linux_process_pid() {
         return 0;
     }
-    let cpu = current_linux_runtime_cpu_index();
+    let cpu = linux_cpu_slot();
     let excluded = linux_process::live_process_cpu_affinity(target)
         .is_some_and(|mask| mask & (1_u64 << cpu) == 0);
     if !excluded {
@@ -55638,9 +55670,10 @@ fn copy_linux_cpu_location(cpu_address: u64, node_address: u64) -> bool {
     {
         return false;
     }
-    // The CPU this thread runs on right now (one NUMA node): a thread
-    // pinned with sched_setaffinity sees the CPU it was pinned to.
-    let cpu = current_linux_runtime_cpu_index() as u32;
+    // The CPU this thread runs on right now (one NUMA node), on the owner's
+    // path as on the light path: a thread pinned with sched_setaffinity sees
+    // the CPU it was pinned to.
+    let cpu = linux_cpu_slot() as u32;
     (cpu_address == 0 || copy_to_linux_user(cpu_address, &cpu.to_ne_bytes()))
         && (node_address == 0 || copy_to_linux_user(node_address, &0_u32.to_ne_bytes()))
 }

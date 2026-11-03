@@ -415,10 +415,6 @@ of the bank it runs in is 0), and it checks the bank's descriptor and
 timed waits as the boot CPU's tick does: with every thread of a process
 busy, the thread the registry holds (only the owner runs it) and a thread
 blocked in a pipe read were otherwise never run again (dirtyc0w_shmem).
-Still open there: a process owned by an application processor whose
-threads never all block does not yield, and in that test the child's
-checkpoint FUTEX_WAKE keeps finding no waiter while its parent either
-waits for it (ETIMEDOUT) or never gets to its wait.
 
 **Process banks.** The per-process kernel state the runtime keeps in
 `X86_RUNTIME` (descriptors, threads, signal and address-space bookkeeping)
@@ -439,6 +435,18 @@ fork transaction whose child, run first, exited (it once took the exit
 before the save that waits, so the threads ran on in freed memory and their
 CPU triple-faulted at its next interrupt). SysRq `u` lists the banks and
 the light-path counters.
+
+The fork transaction's markers (the child whose exit, exec or yield it
+waits for) are one set per bank. A child that forks runs a nested
+transaction, which points them at the grandchild; they are put back for
+the outer transaction when the child resumes inside the nested one
+(`LinuxForkExecFlagGuard`). The timer yields a process only when someone
+takes the yield (`linux_preemption_yield_taken`), so a multithreaded child
+that had forked once was never preempted back to its parent, which waited
+for it in the outer transaction forever (dirtyc0w_shmem). getcpu reports
+the CPU a call runs on, the owner's path included, and sched_setaffinity
+leaves a CPU the new mask excludes by that CPU's own index: the run queue
+already keeps a process to the CPUs its mask allows (getcpu01).
 
 The futex coordinator spinning (`linux_remote_futex_wait_fast`) and the
 thread-by-interrupt dispatch (`begin_linux_runtime_thread`) that preceded

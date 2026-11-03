@@ -11,7 +11,6 @@ clone08 TBROK
 clone09 TBROK
 clone10 TBROK
 clone301 TBROK
-getcpu01 TFAIL
 ioctl01 TBROK
 ioctl02 TBROK
 ioctl_loop05 TBROK
@@ -26,7 +25,6 @@ mount_setattr02 TBROK
 msgstress01 TBROK
 pivot_root01 TBROK
 prot_hsymlinks TBROK
-dirtyc0w_shmem HANG
 setns02 TWARN
 statmount03 TBROK
 unshare03 TFAIL
