@@ -28055,6 +28055,104 @@ fn linux_madvise_reclaim_hint(address: u64, length: u64) -> u64 {
     0
 }
 
+/// MADV_SOFT_OFFLINE (CONFIG_MEMORY_FAILURE): soft-offlines each page of
+/// the range, as Linux does memory that reports correctable errors. The
+/// page is faulted in if need be, its contents move to a fresh frame that
+/// its mapping then maps, and the frame it left is taken out of service
+/// (`memory_failure`); each is logged as Linux logs it. The frames are the
+/// machine's, so only root of a domain set `privileged=true` may: EPERM
+/// otherwise, as for a caller without CAP_SYS_ADMIN. EFAULT for a page
+/// nothing maps; EBUSY for one that cannot move (memory another process
+/// shares, file cache, System V or secret memory).
+fn linux_madvise_soft_offline(address: u64, length: u64) -> u64 {
+    if !address.is_multiple_of(PAGE_SIZE as u64) {
+        return LINUX_EINVAL;
+    }
+    let Some(end) = length
+        .checked_next_multiple_of(PAGE_SIZE as u64)
+        .and_then(|length| address.checked_add(length))
+    else {
+        return LINUX_EINVAL;
+    };
+    if end == address {
+        return 0;
+    }
+    if !linux_privileged_operation_allowed(linux_user::PrivilegedOperation::ManageKernel)
+        || !linux_has_capability(ginux_credentials::capability::SYS_ADMIN)
+    {
+        return LINUX_EPERM;
+    }
+    for page in (address..end).step_by(PAGE_SIZE) {
+        let mut state = address_space::current_linux_runtime_page(page);
+        if !state.occupied || state.protection == 0 {
+            return LINUX_EFAULT;
+        }
+        if state.frame.is_none() {
+            if !materialize_linux_runtime_user_range(page, PAGE_SIZE, false) {
+                return LINUX_EFAULT;
+            }
+            state = address_space::current_linux_runtime_page(page);
+        }
+        let Some(frame) = state.frame else {
+            return LINUX_EFAULT;
+        };
+        crate::serial_write_bytes(
+            alloc::format!(
+                "Soft offlining pfn {:#x} at process virtual address {page:#x}\n",
+                frame.address() / PAGE_SIZE as u64
+            )
+            .as_bytes(),
+        );
+        if let Err(error) = linux_soft_offline_page(page, state, frame) {
+            return error;
+        }
+    }
+    0
+}
+
+/// Moves page `page` of the current process, `state` in its page table and
+/// held in `frame`, to a fresh frame and retires `frame`.
+fn linux_soft_offline_page(
+    page: u64,
+    state: address_space::LinuxRuntimePage,
+    frame: memory::FrameLease,
+) -> Result<(), u64> {
+    if state.secret || crate::linux_file_cache::contains(frame) {
+        return Err(LINUX_EBUSY);
+    }
+    // A shared page is a paged file's (anonymous shared memory's, a
+    // memfd's, a file's): its frame index moves with it, which only this
+    // mapping may map, as no other address space can be changed from here.
+    let file_page = if state.shared {
+        let pid = current_linux_process_pid();
+        let (handle, offset) =
+            crate::linux_overlay::shared_mapping(pid, page).ok_or(LINUX_EBUSY)?;
+        if crate::linux_overlay::paged_frame(handle, offset / PAGE_SIZE) != Some(frame)
+            || !crate::linux_overlay::sole_shared_mapping(handle, offset, pid, page)
+        {
+            return Err(LINUX_EBUSY);
+        }
+        Some((handle, offset / PAGE_SIZE))
+    } else {
+        // A private page another address space still maps copy-on-write.
+        if memory::frame_is_shared(frame) {
+            return Err(LINUX_EBUSY);
+        }
+        None
+    };
+    let [replacement] = memory::allocate_user_frames::<1>().ok_or(LINUX_ENOMEM)?;
+    if address_space::migrate_current_linux_runtime_page(page, replacement) != Some(frame) {
+        let _ = release_linux_runtime_frame(replacement);
+        return Err(LINUX_EBUSY);
+    }
+    if let Some((handle, index)) = file_page {
+        // Checked above, with the kernel held since: it cannot fail.
+        let _ = crate::linux_overlay::replace_paged_frame(handle, index, frame, replacement);
+    }
+    crate::memory_failure::retire(frame);
+    Ok(())
+}
+
 fn linux_runtime_mincore(address: u64, length: u64, vector: u64) -> u64 {
     if length == 0 || !address.is_multiple_of(PAGE_SIZE as u64) {
         return LINUX_EINVAL;
@@ -29041,6 +29139,9 @@ fn linux_madvise(address: u64, length: u64, advice: u64) -> u64 {
     {
         return linux_madvise_reclaim_hint(address, length);
     }
+    if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) && advice == LINUX_MADV_SOFT_OFFLINE {
+        return linux_madvise_soft_offline(address, length);
+    }
     if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) && address >= LINUX_FIXED_LOW_BASE {
         return linux_runtime_madvise(address, length, advice);
     }
@@ -29956,6 +30057,7 @@ fn linux_proc_root_file_kind(name: &[u8]) -> Option<u16> {
         b"uptime" => Some(LINUX_FILE_PROC_UPTIME),
         b"loadavg" => Some(LINUX_FILE_PROC_LOADAVG),
         b"filesystems" => Some(LINUX_FILE_PROC_FILESYSTEMS),
+        b"modules" => Some(LINUX_FILE_PROC_MODULES),
         b"config.gz" => Some(LINUX_FILE_PROC_CONFIG),
         b"cmdline" => Some(LINUX_FILE_PROC_CMDLINE),
         b"sysrq-trigger" => Some(LINUX_FILE_PROC_SYSRQ_TRIGGER),
@@ -34439,6 +34541,7 @@ fn linux_openat_path(
                 Ok(LinuxDeviceNode::LoopControl) => {
                     return linux_open_object(crate::linux_loop::CLASS_CONTROL, 0, flags)
                 }
+                Ok(LinuxDeviceNode::KernelLog) => return linux_open_kernel_log(flags),
                 Err(error) => return error,
             },
             None => return LINUX_ENOENT,
@@ -35515,6 +35618,14 @@ fn linux_ensure_dev_nodes() {
             ));
         }
     }
+    if crate::linux_overlay::lookup(b"dev/kmsg").is_none() {
+        root_owned(crate::linux_overlay::create_device(
+            b"dev/kmsg",
+            crate::linux_overlay::NodeKind::CharacterDevice,
+            0o644,
+            linux_device_number(crate::linux_kmsg::MAJOR, crate::linux_kmsg::MINOR),
+        ));
+    }
     for (name, target) in LINKS {
         if crate::linux_overlay::lookup(name).is_none() {
             root_owned(crate::linux_overlay::create_symlink(name, target));
@@ -35685,6 +35796,8 @@ enum LinuxDeviceNode {
     Block(u32, u32),
     /// /dev/loop-control (10:237).
     LoopControl,
+    /// /dev/kmsg (1:11).
+    KernelLog,
 }
 
 /// What opening the device file `handle` opens: the kernel's null, zero and
@@ -35715,6 +35828,10 @@ fn linux_device_node_kind(
             crate::linux_overlay::NodeKind::CharacterDevice,
             (crate::linux_loop::CONTROL_MAJOR, crate::linux_loop::CONTROL_MINOR),
         ) => Ok(LinuxDeviceNode::LoopControl),
+        (
+            crate::linux_overlay::NodeKind::CharacterDevice,
+            (crate::linux_kmsg::MAJOR, crate::linux_kmsg::MINOR),
+        ) => Ok(LinuxDeviceNode::KernelLog),
         (crate::linux_overlay::NodeKind::CharacterDevice, numbers) => LinuxCharacterDevice::ALL
             .into_iter()
             .find(|device| {
@@ -43242,12 +43359,14 @@ fn linux_pipe(address: u64, flags: u64) -> u64 {
 }
 
 /// Releases the kernel objects whose last descriptor has closed: DRM
-/// render node files and dma-bufs, open loop devices and RAM disks.
+/// render node files and dma-bufs, open loop devices, RAM disks and
+/// /dev/kmsg.
 pub(crate) fn linux_release_objects() {
     for (class, id) in crate::linux_socket::take_released_objects() {
         crate::linux_drm::release(class, id);
         crate::linux_loop::release(class, id);
         crate::linux_ramdisk::release(class, id);
+        crate::linux_kmsg::release(class, id);
     }
 }
 
@@ -43285,6 +43404,24 @@ fn linux_open_render_node(flags: u64) -> u64 {
     }
 }
 
+/// Opens /dev/kmsg: the machine's kernel log, which only a domain set
+/// `privileged=true` reads or writes (EPERM, as Linux refuses a reader that
+/// syslog would).
+fn linux_open_kernel_log(flags: u64) -> u64 {
+    if !linux_privileged_operation_allowed(linux_user::PrivilegedOperation::ObserveKernelLog) {
+        return LINUX_EPERM;
+    }
+    let access = flags & 3;
+    let id = crate::linux_kmsg::open(access != 1, access != 0);
+    match crate::linux_socket::open_object(crate::linux_kmsg::CLASS_READER, id) {
+        Ok(slot) => linux_install_object_descriptor(slot, flags),
+        Err(_) => {
+            crate::linux_kmsg::release(crate::linux_kmsg::CLASS_READER, id);
+            LINUX_ENOMEM
+        }
+    }
+}
+
 /// Opens block device `major`:`minor`: a loop device (/dev/loopN) or a RAM
 /// disk (/dev/ramN).
 fn linux_open_block_device(major: u32, minor: u32, flags: u64) -> u64 {
@@ -43319,8 +43456,8 @@ fn linux_loop_errno(error: crate::linux_loop::Error) -> u64 {
     error.number().wrapping_neg()
 }
 
-/// The class and id of a block device (loop device or RAM disk) or
-/// /dev/loop-control descriptor.
+/// The class and id of a block device (loop device or RAM disk),
+/// /dev/loop-control or /dev/kmsg descriptor.
 fn linux_block_descriptor(descriptor: u64) -> Option<(u8, u64)> {
     linux_object_descriptor(descriptor).filter(|(class, _)| {
         matches!(
@@ -43328,8 +43465,45 @@ fn linux_block_descriptor(descriptor: u64) -> Option<(u8, u64)> {
             crate::linux_loop::CLASS_DEVICE
                 | crate::linux_loop::CLASS_CONTROL
                 | crate::linux_ramdisk::CLASS_DISK
+                | crate::linux_kmsg::CLASS_READER
         )
     })
+}
+
+/// read, write and lseek on /dev/kmsg open `id`: a record at a time.
+fn linux_kernel_log_syscall(number: u64, id: u64, buffer: u64, count: u64) -> u64 {
+    let result = match number {
+        LINUX_READ_SYSCALL => match crate::linux_kmsg::read(id, count as usize) {
+            Ok(record) if !copy_to_linux_user(buffer, &record) => return LINUX_EFAULT,
+            Ok(record) => Ok(record.len() as u64),
+            Err(error) => Err(error),
+        },
+        // Linux refuses a write longer than a record before reading it.
+        LINUX_WRITE_SYSCALL if count > crate::linux_kmsg::RECORD_MAX as u64 => {
+            Err(crate::linux_kmsg::Error::Invalid)
+        }
+        LINUX_WRITE_SYSCALL => {
+            let mut input = alloc::vec![0_u8; count as usize];
+            if !copy_from_linux_user(buffer, &mut input) {
+                return LINUX_EFAULT;
+            }
+            crate::linux_kmsg::write(id, &input).map(|written| written as u64)
+        }
+        LINUX_LSEEK_SYSCALL => crate::linux_kmsg::seek(id, buffer as i64, count as u32),
+        LINUX_PREAD64_SYSCALL | LINUX_PWRITE64_SYSCALL => return LINUX_ESPIPE,
+        LINUX_IOCTL_SYSCALL => return LINUX_ENOTTY,
+        _ => Ok(0),
+    };
+    result.unwrap_or_else(|error| error.number().wrapping_neg())
+}
+
+/// Whether a read of /dev/kmsg descriptor `descriptor` that found no new
+/// record waits for one (no O_NONBLOCK).
+fn linux_kernel_log_read_waits(number: u64, descriptor: u64) -> bool {
+    number == LINUX_READ_SYSCALL
+        && linux_block_descriptor(descriptor)
+            .is_some_and(|(class, _)| class == crate::linux_kmsg::CLASS_READER)
+        && linux_socket_flags(descriptor).is_some_and(|flags| flags & LINUX_O_NONBLOCK as u32 == 0)
 }
 
 /// The device number (as stat(2) shows it) and whether it is a block
@@ -43420,6 +43594,9 @@ fn linux_block_syscall(number: u64, descriptor: u64, buffer: u64, count: u64, of
         if let Some(result) = linux_generic_ioctl(descriptor, buffer, count) {
             return result;
         }
+    }
+    if class == crate::linux_kmsg::CLASS_READER {
+        return linux_kernel_log_syscall(number, id, buffer, count);
     }
     let disk = class == crate::linux_ramdisk::CLASS_DISK;
     let result = if class == crate::linux_loop::CLASS_CONTROL {
@@ -49280,6 +49457,7 @@ fn linux_proc_file(state: u16) -> bool {
             | LINUX_FILE_PROC_UPTIME
             | LINUX_FILE_PROC_LOADAVG
             | LINUX_FILE_PROC_FILESYSTEMS
+            | LINUX_FILE_PROC_MODULES
             | LINUX_FILE_PROC_CONFIG
             | LINUX_FILE_PROC_CMDLINE
             | LINUX_FILE_PROC_PID1_STAT
@@ -49486,6 +49664,7 @@ fn linux_regular_file(state: u16) -> Option<&'static [u8]> {
         LINUX_FILE_PROC_UPTIME => return Some(linux_proc_uptime()),
         LINUX_FILE_PROC_LOADAVG => return Some(LINUX_PROC_LOADAVG),
         LINUX_FILE_PROC_FILESYSTEMS => return Some(LINUX_PROC_FILESYSTEMS),
+        LINUX_FILE_PROC_MODULES => return Some(b""),
         LINUX_FILE_PROC_CONFIG => return Some(&LINUX_PROC_CONFIG_GZ),
         LINUX_FILE_PROC_CMDLINE => return Some(LINUX_PROC_CMDLINE),
         LINUX_FILE_PROC_CGROUP => return Some(LINUX_PROC_CGROUP),
@@ -49573,6 +49752,7 @@ fn linux_regular_file_inode(state: u16) -> Option<u64> {
         LINUX_FILE_PROC_UPTIME => return Some(28),
         LINUX_FILE_PROC_LOADAVG => return Some(29),
         LINUX_FILE_PROC_FILESYSTEMS => return Some(30),
+        LINUX_FILE_PROC_MODULES => return Some(99),
         LINUX_FILE_PROC_CONFIG => return Some(97),
         LINUX_FILE_PROC_CMDLINE => return Some(31),
         LINUX_FILE_PROC_PID1_STAT => return Some(32),
@@ -54241,6 +54421,13 @@ fn linux_descriptor_stat(descriptor: u64) -> Option<[u8; LINUX_STAT_SIZE]> {
             stat[40..48].copy_from_slice(&u64::from(crate::linux_drm::NODE_DEVICE).to_ne_bytes());
             return Some(stat);
         }
+        if class == crate::linux_kmsg::CLASS_READER {
+            // A character device, 1:11, owned by root.
+            let device = linux_device_number(crate::linux_kmsg::MAJOR, crate::linux_kmsg::MINOR);
+            let mut stat = linux_stat(0o020_644, 0x2000 + u64::from(device));
+            stat[40..48].copy_from_slice(&u64::from(device).to_ne_bytes());
+            return Some(stat);
+        }
         if let Some((device, block)) = linux_block_descriptor_device(class, id) {
             // A block device (7:N, 1:N) or /dev/loop-control (10:237),
             // owned by root and the disk group.
@@ -54972,6 +55159,7 @@ fn linux_descriptor_link_target(
         match class {
             crate::linux_loop::CLASS_DEVICE => (b"/dev/loop", true),
             crate::linux_ramdisk::CLASS_DISK => (b"/dev/ram", true),
+            crate::linux_kmsg::CLASS_READER => (b"/dev/kmsg", false),
             _ => (b"/dev/loop-control", false),
         }
     } else if linux_socket_slot(descriptor).is_some() {

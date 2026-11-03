@@ -28,6 +28,7 @@ kernel/crypto/asymmetric_keys/asymmetric_keys.ko
 kernel/crypto/asymmetric_keys/public_key.ko
 kernel/crypto/asymmetric_keys/x509_key_parser.ko
 kernel/crypto/asymmetric_keys/pkcs8_key_parser.ko
+kernel/mm/hwpoison-inject.ko
 kernel/net/dns_resolver/dns_resolver.ko
 kernel/security/keys/encrypted-keys/encrypted-keys.ko
 EOF

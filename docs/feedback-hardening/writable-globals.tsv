@@ -450,6 +450,7 @@ interior-mutable	kernel/src/linux_file_cache.rs	FILE_CACHE_RUNTIME	domain-runtim
 interior-mutable	kernel/src/linux_keyring.rs	KEYRINGS	domain-runtime	allowlist	none	ranked-per-domain-keyrings
 interior-mutable	kernel/src/linux_drm.rs	DRM	domain-runtime	allowlist	none	ranked-drm-files-and-dmabufs
 interior-mutable	kernel/src/linux_drm.rs	MAKING_NODES	domain-runtime	allowlist	none	atomic-reentrancy-guard
+interior-mutable	kernel/src/linux_kmsg.rs	OPENS	domain-runtime	allowlist	none	ranked-kmsg-readers
 interior-mutable	kernel/src/linux_loop.rs	LOOPS	domain-runtime	allowlist	none	ranked-loop-devices-and-opens
 interior-mutable	kernel/src/linux_loop.rs	MAKING_NODES	domain-runtime	allowlist	none	atomic-reentrancy-guard
 interior-mutable	kernel/src/linux_ramdisk.rs	RAM_DISKS	domain-runtime	allowlist	none	ranked-ram-disks-and-opens
@@ -631,6 +632,8 @@ interior-mutable	kernel/src/kernel_log.rs	RING	platform-device	allowlist	none	lo
 interior-mutable	kernel/src/kernel_log.rs	WRITTEN	platform-device	allowlist	none	lock-free-kernel-log-ring
 interior-mutable	kernel/src/kernel_log.rs	CLEARED	platform-device	allowlist	none	lock-free-kernel-log-ring
 interior-mutable	kernel/src/kernel_log.rs	CONSUMED	platform-device	allowlist	none	lock-free-kernel-log-ring
+interior-mutable	kernel/src/kernel_log.rs	LINES	platform-device	allowlist	none	lock-free-kernel-log-ring
+interior-mutable	kernel/src/memory_failure.rs	RETIRED	platform-device	allowlist	none	ranked-retired-frames
 interior-mutable	kernel/src/machine_control.rs	RESET_KIND	platform-device	allowlist	none	privileged-domain-machine-control
 interior-mutable	kernel/src/machine_control.rs	CTRL_ALT_DEL	platform-device	allowlist	none	privileged-domain-machine-control
 interior-mutable	kernel/src/linux_accounting.rs	FILES	process-runtime	allowlist	none	per-domain-accounting-file-generation

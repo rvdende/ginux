@@ -41,6 +41,9 @@ impl LockRank {
     /// Each domain's loop devices and their opens; ranks below the heap so
     /// the tables may grow while held.
     pub(crate) const LOOP: Self = Self(150);
+    /// Open /dev/kmsg readers; ranks below the heap so the table may grow
+    /// while held.
+    pub(crate) const KMSG: Self = Self(155);
     /// The record (fcntl) lock table; ranks below the heap so the table may
     /// grow while held.
     pub(crate) const RECORD_LOCKS: Self = Self(160);
@@ -56,6 +59,9 @@ impl LockRank {
     /// The pool of Linux activation stacks; ranks below the heap so the
     /// pool may grow while held.
     pub(crate) const KERNEL_STACKS: Self = Self(170);
+    /// Frames taken out of service (`memory_failure`); ranks below the
+    /// heap so the list may grow while held.
+    pub(crate) const MEMORY_FAILURE: Self = Self(175);
     pub(crate) const FUTEX_COORDINATION: Self = Self(180);
     /// The kernel heap refills from the frame allocator while holding its
     /// lock, so it ranks just below it.

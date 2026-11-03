@@ -6930,6 +6930,45 @@ pub(crate) fn replace_current_linux_runtime_page(
         .then_some(old_frame)
 }
 
+/// Moves the present page at `address` of the current address space to
+/// `frame`: its contents are copied there and the entry, every other bit
+/// kept, maps it instead; the frame it mapped is returned. The entry is
+/// made non-present and every CPU's translation dropped before the copy,
+/// so a thread writing the page on another CPU faults (and waits for the
+/// kernel) rather than writing the old frame after it was copied: Linux's
+/// page migration.
+pub(crate) fn migrate_current_linux_runtime_page(
+    address: u64,
+    frame: memory::FrameLease,
+) -> Option<memory::FrameLease> {
+    if !memory::frames_owned_by(memory::FrameOwner::KERNEL, &[frame]) {
+        return None;
+    }
+    let entry = current_linux_leaf(address)?;
+    let old_value = entry.read();
+    if old_value & (PRESENT | USER) != PRESENT | USER {
+        return None;
+    }
+    let old_frame = linux_runtime_page_from_value(old_value).frame?;
+    entry.write(old_value & !PRESENT);
+    if !invalidate_changed_runtime_translation(address, old_value) {
+        unsafe {
+            entry.write(old_value);
+            asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
+        }
+        return None;
+    }
+    if !copy_linux_frame(old_frame, frame) {
+        entry.write(old_value);
+        return None;
+    }
+    entry.write(old_value & !ADDRESS_MASK | frame.address());
+    // SAFETY: invalidating a translation has no effect beyond the TLB; no
+    // CPU caches the non-present entry it replaces.
+    unsafe { asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags)) };
+    Some(old_frame)
+}
+
 pub(crate) fn seal_current_linux_runtime_page(address: u64) -> bool {
     let Some(entry) = current_linux_leaf(address) else {
         return false;

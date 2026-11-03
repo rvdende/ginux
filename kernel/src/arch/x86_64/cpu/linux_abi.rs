@@ -577,6 +577,7 @@ pub(super) const LINUX_MADV_PAGEOUT: u64 = 21;
 pub(super) const LINUX_MADV_POPULATE_READ: u64 = 22;
 pub(super) const LINUX_MADV_POPULATE_WRITE: u64 = 23;
 pub(super) const LINUX_MADV_DONTNEED_LOCKED: u64 = 24;
+pub(super) const LINUX_MADV_SOFT_OFFLINE: u64 = 101;
 pub(super) const LINUX_STAT_SIZE: usize = 144;
 pub(super) const LINUX_STAT_CHARACTER_DEVICE_MODE: u32 = 0o020600;
 pub(super) const LINUX_STAT_DIRECTORY_MODE: u32 = 0o040555;
@@ -817,6 +818,10 @@ pub(super) const LINUX_PROC_LOADAVG_NODE: u16 = 0xf400;
 pub(super) const LINUX_FILE_PROC_LOADAVG: u16 = LINUX_FILE_MASK | LINUX_PROC_LOADAVG_NODE;
 pub(super) const LINUX_PROC_FILESYSTEMS_NODE: u16 = 0xf300;
 pub(super) const LINUX_FILE_PROC_FILESYSTEMS: u16 = LINUX_FILE_MASK | LINUX_PROC_FILESYSTEMS_NODE;
+/// /proc/modules: the loaded modules, none (everything Ginux has is built
+/// in, as /lib/modules/RELEASE/modules.builtin lists it).
+pub(super) const LINUX_PROC_MODULES_NODE: u16 = 0xba00;
+pub(super) const LINUX_FILE_PROC_MODULES: u16 = LINUX_FILE_MASK | LINUX_PROC_MODULES_NODE;
 /// /proc/config.gz: Ginux's kernel configuration (`kernel_config`).
 pub(super) const LINUX_PROC_CONFIG_NODE: u16 = 0xa900;
 pub(super) const LINUX_FILE_PROC_CONFIG: u16 = LINUX_FILE_MASK | LINUX_PROC_CONFIG_NODE;
@@ -1166,7 +1171,7 @@ use super::PAGE_SIZE;
 /// The fixed file nodes and the `/proc/sys` nodes are distinct and clear of
 /// the `/dev/input/eventN` range, so no file is taken for another.
 const _: () = {
-    const NODES: [u16; 48] = [
+    const NODES: [u16; 49] = [
         LINUX_PROC_TASK_DIRECTORY_NODE,
         LINUX_PROC_TASK_COMM_NODE,
         LINUX_PROC_TASK_STAT_NODE,
@@ -1184,6 +1189,7 @@ const _: () = {
         LINUX_PROC_UPTIME_NODE,
         LINUX_PROC_LOADAVG_NODE,
         LINUX_PROC_FILESYSTEMS_NODE,
+        LINUX_PROC_MODULES_NODE,
         LINUX_PROC_CONFIG_NODE,
         LINUX_PROC_COREDUMP_FILTER_NODE,
         LINUX_PROC_CMDLINE_NODE,

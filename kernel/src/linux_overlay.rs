@@ -691,6 +691,69 @@ pub(crate) fn paged_frame(handle: Handle, index: usize) -> Option<FrameLease> {
     memfd_page(node, index, false)
 }
 
+/// Puts `replacement` in place of `expected` as the frame holding page
+/// `index` of a paged file, as page migration does; false (and nothing
+/// changed) if `expected` does not hold it. The caller keeps `expected`.
+pub(crate) fn replace_paged_frame(
+    handle: Handle,
+    index: usize,
+    expected: FrameLease,
+    replacement: FrameLease,
+) -> bool {
+    let Some(node) = node_mut(handle).filter(|node| node.paged()) else {
+        return false;
+    };
+    if node.first_page == FrameLease::EMPTY {
+        return false;
+    }
+    let mut page = node.first_page;
+    for _ in 0..index / FRAME_INDEX_CAPACITY {
+        match frame_index_page_mut(page) {
+            Some(entries) if entries.next != FrameLease::EMPTY => page = entries.next,
+            _ => return false,
+        }
+    }
+    let Some(entry) =
+        frame_index_page_mut(page).map(|entries| &mut entries.frames[index % FRAME_INDEX_CAPACITY])
+    else {
+        return false;
+    };
+    if *entry != expected {
+        return false;
+    }
+    *entry = replacement;
+    true
+}
+
+/// Whether process `pid` at `address` is the only shared mapping of the
+/// page at `offset` of `handle` registered.
+pub(crate) fn sole_shared_mapping(handle: Handle, offset: usize, pid: u32, address: u64) -> bool {
+    let Some(overlay) = live() else {
+        return false;
+    };
+    let mut page = overlay.first_mapping_page;
+    let mut found = false;
+    while page != FrameLease::EMPTY {
+        let Some(mappings) = mapping_page(page) else {
+            return false;
+        };
+        for mapping in &mappings.mappings {
+            if !mapping.active
+                || mapping.handle != handle
+                || mapping.offset / PAGE_SIZE != offset / PAGE_SIZE
+            {
+                continue;
+            }
+            if mapping.pid != pid || mapping.address != address {
+                return false;
+            }
+            found = true;
+        }
+        page = mappings.next;
+    }
+    found
+}
+
 /// The paged file whose inode is `inode` (not a hard link's name for it):
 /// the file a shared mapping recorded by inode maps.
 pub(crate) fn paged_file(inode: u64) -> Option<Handle> {

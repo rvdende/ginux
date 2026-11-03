@@ -493,7 +493,14 @@ fn linux_syscall_dispatch(
         | LINUX_FDATASYNC_SYSCALL
             if runtime_mode && linux_block_descriptor(first_argument).is_some() =>
         {
-            linux_block_syscall(number, first_argument, buffer, count, register(0))
+            match linux_block_syscall(number, first_argument, buffer, count, register(0)) {
+                // A blocking read of /dev/kmsg with no new record: let the
+                // rest of the domain run, then read again.
+                LINUX_EAGAIN if linux_kernel_log_read_waits(number, first_argument) => {
+                    linux_retry_later_live_return(registers, syscall_return, number)
+                }
+                result => result,
+            }
         }
         LINUX_READ_SYSCALL | LINUX_WRITE_SYSCALL | LINUX_IOCTL_SYSCALL
             if runtime_mode && linux_object_descriptor(first_argument).is_some() =>
