@@ -82,6 +82,39 @@ waiting for a signal), poll02, ppoll01, pause01, tgkill01 and
 rt_tgsigqueueinfo01. Results of a
 full run are kept in `target/ltp-baseline/` (not committed).
 
+## What remains (full run 13, 97c546ab)
+
+192 known failures and one hang. The larger groups, each needing a
+feature rather than a fix:
+
+- **fork14 (the hang): reservations cost page-table entries.** An
+  anonymous mapping writes a reservation entry for every 4 KiB page, and
+  fork copies them all, so 16,384 one-GiB mappings make fork quadratic.
+  The fix is reservation markers in the upper tables (a whole 2 MiB or
+  1 GiB range reserved by one non-present PD or PDPT entry, 1 GiB
+  mappings placed 1 GiB-aligned), split on first touch; every walker in
+  `address_space.rs` (the leaf walks, fork's copy, release, snapshots and
+  the free-range search) must read them. That is the roadmap's step of
+  letting memory areas, not page-table bits, answer for reservations.
+- **Shared-resource clones** (clone02, clone05, clone08, clone10,
+  clone301, kcmp03): CLONE_VM, CLONE_FILES, CLONE_FS or CLONE_SIGHAND
+  without CLONE_THREAD, and CLONE_PARENT. Ginux keeps these per process.
+- **Operations a domain may not do** (chroot02-04, pivot_root01,
+  realpath01, listmount03, statmount08, io_uring02, syslog11-12,
+  reboot01-02, vhangup02, acct01-02, ptrace*): refused by policy. Each
+  could be confined to the domain (a per-process root, a domain kernel
+  log and `/dev/kmsg`, ptrace within the domain); that is a design
+  decision, not a bug.
+- **io_uring** (io_uring01, 03, 04): one minimal ring per process.
+- **fanotify, keyctl, loop devices, perf events**: missing features or
+  kernel config the tests parse (`/proc/config.gz`).
+- **Memory details**: mmap, madvise, mremap, msync, mlock and mseal
+  corner cases, `/proc/self/smaps`, `/proc/PID/pagemap`.
+- **musl, not the kernel**: tests that cannot pass with musl are skipped
+  in `tests/ltp/syscalls.list` with the reason (fork() is the fork system
+  call, readlink with size 0 gets a one-byte buffer, fchmod retries
+  through /proc/self/fd, NGROUPS is 32, sched_getscheduler is ENOSYS).
+
 ## Baseline (2026-10-31)
 
 Ginux at `d1f41667` (no kernel change since), LTP 20260930,
