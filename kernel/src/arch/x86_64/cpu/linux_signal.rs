@@ -1037,6 +1037,7 @@ pub(crate) fn expire_linux_waits_from_timer(frame: &mut UserInterruptFrame) {
             serial_write("\r\n");
         }
         write_linux_runtime_syscall_trace();
+        linux_write_stall_diagnostic();
     }
     let descriptor_wakes = wake_linux_descriptor_waits();
     let expired = expire_linux_waits();

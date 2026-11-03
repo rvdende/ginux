@@ -108,12 +108,20 @@ report, rerun under `QEMU_ACCEL=tcg GINUX_QEMU_LOG=... GINUX_QEMU_LOG_INTERRUPTS
 
 For a hang or a slow domain, `echo t > /proc/sysrq-trigger` lists every
 task's threads (state, wait kind and key, saved registers), `echo u` each
-CPU's user/kernel/idle/lock-wait time, the process banks in use and the
-threads run on other CPUs (docs/SCHEDULER.md), and `echo l`
+CPU's user/kernel/idle/lock-wait time, the process banks in use, the
+threads run on other CPUs and each live bank's thread table as the bank
+holds it (the saved record of a process whose threads run elsewhere is
+stale; docs/SCHEDULER.md), and `echo l`
 profiles the runtime CPU for 1000 ticks (system calls, lock ranks, DRM
 ioctls, timed spans in `kernel/src/linux_profile.rs`). Tick samples miss
 kernel work done with interrupts off; sample CPU 0 from the host instead
-(monitor `info registers`, symbolized as above).
+(monitor `info registers`, symbolized as above). A domain that has run
+sixty seconds writes one stall diagnostic to the kernel log (from the
+timer, or the runtime loop when CPU 0 only halts): the newest entries of
+the futex trace ring (`linux_trace_futex` in cpu.rs: per CPU, who waited
+at the thread or process level, who woke, with addresses and results),
+the live banks, and the task states. That trace found a thread exit
+whose tid-word wake never reached a joiner parked at the process level.
 
 To see which system call a Linux program trips on, run it with
 `GINUX_STRACE=1` in its environment: that process and every process it

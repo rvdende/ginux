@@ -502,6 +502,7 @@ interior-mutable	kernel/src/framebuffer.rs	READY	platform-device	allowlist	none	
 interior-mutable	kernel/src/lib.rs	SERIAL_PRESENT	platform-device	allowlist	none	immutable-after-boot-serial-presence
 interior-mutable	kernel/src/linux_input.rs	BUSY	platform-device	allowlist	none	evdev-queue-reentrancy-latch
 interior-mutable	kernel/src/linux_process.rs	PROCESS_SCRATCH	process-runtime	allowlist	none	explicit-process-fork-scratch-owner-root
+interior-mutable	kernel/src/linux_process.rs	REFRESH_REJECTIONS	process-runtime	allowlist	none	diagnostic-counter
 static-mut	boot/efi/src/main.rs	BOOT_INFO	bootstrap-init	allowlist	none	firmware-single-writer
 static-mut	kernel/src/arch/x86_64/cpu.rs	MEMINFO	shared-runtime	allowlist	none	serialized-proc-meminfo-render-buffer
 static-mut	kernel/src/arch/x86_64/cpu.rs	UPTIME	shared-runtime	allowlist	none	serialized-proc-uptime-render-buffer
@@ -598,6 +599,9 @@ interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_LIGHT_THREAD_YIELDED	per-cp
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_LIGHT_RUNS	per-cpu-arch	allowlist	none	diagnostic-counter
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_LIGHT_MIGRATIONS	per-cpu-arch	allowlist	none	diagnostic-counter
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_LIGHT_LAST_MIGRATION	per-cpu-arch	allowlist	none	diagnostic-counter
+interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_FUTEX_TRACE	per-cpu-arch	allowlist	none	diagnostic-counter
+interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_FUTEX_TRACE_NEXT	per-cpu-arch	allowlist	none	diagnostic-counter
+interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_REFRESH_FAILURES	per-cpu-arch	allowlist	none	diagnostic-counter
 interior-mutable	kernel/src/cpu_time.rs	USER	per-cpu-arch	allowlist	none	atomic-per-cpu-time-accounting
 interior-mutable	kernel/src/cpu_time.rs	IDLE	per-cpu-arch	allowlist	none	atomic-per-cpu-time-accounting
 interior-mutable	kernel/src/cpu_time.rs	LOCK_WAIT	per-cpu-arch	allowlist	none	atomic-per-cpu-time-accounting

@@ -1623,6 +1623,81 @@ fn linux_report_process_banks() {
     serial_write("\r\n");
 }
 
+/// SysRq `u` and the sixty-second snapshot: the threads of every process
+/// live in a bank as the bank holds them (the saved record of a process
+/// whose threads run on other CPUs is stale), with the process's activation
+/// state, and whether each CPU's light thread yielded.
+fn linux_report_live_bank_threads() {
+    serial_write("ginux: sysrq: live banks bank/pid/parked/running-activation:\r\n");
+    for bank in 0..LINUX_CPU_BANK_LIMIT {
+        let pid = LINUX_BANK_PID[bank].load(Ordering::Acquire);
+        if LINUX_BANK_USERS[bank].load(Ordering::Acquire) == 0 || pid == 0 {
+            continue;
+        }
+        serial_write("ginux: bank ");
+        let owner = linux_activation_owner(pid);
+        for value in [
+            bank as u64,
+            u64::from(pid),
+            u64::from(activation::is_parked(owner)),
+            u64::from(activation::is_running(owner)),
+        ] {
+            serial_write_u64(value);
+            serial_write(" ");
+        }
+        serial_write("\r\n");
+        for slot in 0..LINUX_THREAD_LIMIT {
+            let state = X86_RUNTIME.LINUX_THREAD_STATES[slot]
+                .at_bank(bank)
+                .load(Ordering::Acquire);
+            if state == LINUX_THREAD_FREE {
+                continue;
+            }
+            serial_write("ginux:   thread slot/tid/state/wait/key/deadline/owner-only: ");
+            for value in [
+                slot as u64,
+                u64::from(
+                    X86_RUNTIME.LINUX_THREAD_TIDS[slot]
+                        .at_bank(bank)
+                        .load(Ordering::Acquire),
+                ),
+                u64::from(state),
+                u64::from(
+                    X86_RUNTIME.LINUX_THREAD_WAIT_KINDS[slot]
+                        .at_bank(bank)
+                        .load(Ordering::Acquire),
+                ),
+                X86_RUNTIME.LINUX_THREAD_WAIT_KEYS[slot]
+                    .at_bank(bank)
+                    .load(Ordering::Acquire),
+                X86_RUNTIME.LINUX_THREAD_WAIT_DEADLINES[slot]
+                    .at_bank(bank)
+                    .load(Ordering::Acquire),
+                u64::from(
+                    X86_RUNTIME.LINUX_THREAD_OWNER_ONLY.at_bank(bank)[slot].load(Ordering::Acquire),
+                ),
+            ] {
+                serial_write_u64(value);
+                serial_write(" ");
+            }
+            serial_write("\r\n");
+        }
+    }
+    serial_write("ginux: sysrq: light cpus cpu/yielded/slice-ticks:\r\n");
+    for cpu in 0..CPU_ENTRY_STATE_LIMIT {
+        serial_write("ginux: cpu ");
+        for value in [
+            cpu as u64,
+            u64::from(LINUX_LIGHT_THREAD_YIELDED[cpu].load(Ordering::Acquire)),
+            u64::from(LINUX_PROCESS_SLICE[cpu].load(Ordering::Relaxed)),
+        ] {
+            serial_write_u64(value);
+            serial_write(" ");
+        }
+        serial_write("\r\n");
+    }
+}
+
 /// Makes the threads of the current process that run on other CPUs leave
 /// them, as `wait_for_linux_process_threads_to_leave` does for an exiting
 /// process, for an exec that ends them: they are told by `LINUX_BANK_DYING`
@@ -6229,7 +6304,7 @@ fn refresh_live_linux_process_registry(context: LinuxUserContext) -> bool {
             serial_write("\r\n");
             return false;
         };
-        return linux_process::refresh_validated_runtime_process_registry(
+        let refreshed = linux_process::refresh_validated_runtime_process_registry(
             current_linux_process_pid(),
             snapshot,
             context
@@ -6240,6 +6315,11 @@ fn refresh_live_linux_process_registry(context: LinuxUserContext) -> bool {
             context.rflags,
             context.fs_base,
         );
+        if !refreshed && LINUX_REFRESH_FAILURES.fetch_add(1, Ordering::Relaxed) == 7 {
+            serial_write("ginux: registry refresh failures diagnostic\r\n");
+            linux_write_stall_diagnostic();
+        }
+        return refreshed;
     }
     refresh_nonruntime_linux_process_registry(context)
 }
@@ -8645,8 +8725,101 @@ fn block_current_linux_thread(kind: u8, key: u64, output: u64, deadline: u64) ->
     true
 }
 
+/// A ring of recent futex events for the sixty-second snapshot: who waited
+/// and who woke whom, with the CPU, to find a lost wakeup.
+const LINUX_FUTEX_TRACE_LIMIT: usize = 512;
+static LINUX_FUTEX_TRACE: [[AtomicU64; 4]; LINUX_FUTEX_TRACE_LIMIT] =
+    [const { [const { AtomicU64::new(0) }; 4] }; LINUX_FUTEX_TRACE_LIMIT];
+static LINUX_FUTEX_TRACE_NEXT: AtomicU64 = AtomicU64::new(0);
+
+fn linux_trace_futex(event: u8, address: u64, detail: u64) {
+    let index =
+        LINUX_FUTEX_TRACE_NEXT.fetch_add(1, Ordering::Relaxed) as usize % LINUX_FUTEX_TRACE_LIMIT;
+    let cpu = linux_bank_cpu() as u64;
+    let pid = u64::from(current_linux_process_pid());
+    let tid = u64::from(current_linux_tid().unwrap_or(0));
+    let entry = &LINUX_FUTEX_TRACE[index];
+    entry[0].store(
+        cpu << 56 | u64::from(event) << 48 | pid << 24 | tid,
+        Ordering::Relaxed,
+    );
+    entry[1].store(address, Ordering::Relaxed);
+    entry[2].store(detail, Ordering::Relaxed);
+    entry[3].store(
+        linux_elapsed_nanoseconds().unwrap_or(0) / 1000,
+        Ordering::Relaxed,
+    );
+}
+
+fn linux_report_futex_trace() {
+    serial_write("ginux: futex trace cpu/event/pid/tid/address/detail/us (oldest first):\r\n");
+    let next = LINUX_FUTEX_TRACE_NEXT.load(Ordering::Relaxed) as usize;
+    let count = next.min(LINUX_FUTEX_TRACE_LIMIT).min(48);
+    for step in 0..count {
+        let index = (next + LINUX_FUTEX_TRACE_LIMIT - count + step) % LINUX_FUTEX_TRACE_LIMIT;
+        let entry = &LINUX_FUTEX_TRACE[index];
+        let head = entry[0].load(Ordering::Relaxed);
+        serial_write("ginux: futex ");
+        for value in [
+            head >> 56,
+            head >> 48 & 0xff,
+            head >> 24 & 0xff_ffff,
+            head & 0xff_ffff,
+            entry[1].load(Ordering::Relaxed),
+            entry[2].load(Ordering::Relaxed),
+            entry[3].load(Ordering::Relaxed),
+        ] {
+            serial_write_u64(value);
+            serial_write(" ");
+        }
+        serial_write("\r\n");
+    }
+}
+
+/// The runtime loop's stall diagnostic: once the domain has run sixty
+/// seconds, the futex trace, banks and task states, from the loop itself,
+/// which runs while the boot CPU only halts between ticks (the timer's
+/// snapshot needs a tick in user mode).
+fn linux_stall_diagnostic_from_loop() {
+    if X86_RUNTIME
+        .LINUX_RUNTIME_STALLED_DIAGNOSTIC_WRITTEN
+        .load(Ordering::SeqCst)
+        || !linux_elapsed_nanoseconds().is_some_and(|elapsed| elapsed >= 60_000_000_000)
+        || X86_RUNTIME
+            .LINUX_RUNTIME_STALLED_DIAGNOSTIC_WRITTEN
+            .swap(true, Ordering::SeqCst)
+    {
+        return;
+    }
+    serial_write("ginux: Linux runtime loop sixty-second diagnostic\r\n");
+    linux_write_stall_diagnostic();
+}
+
+/// The futex trace, live bank threads, banks and task states: the most
+/// telling first, in case the console is cut off.
+fn linux_write_stall_diagnostic() {
+    linux_report_futex_trace();
+    linux_report_live_bank_threads();
+    linux_report_process_banks();
+    linux_show_task_states();
+}
+
+/// Registry refreshes that failed; the eighth writes the stall diagnostic.
+static LINUX_REFRESH_FAILURES: AtomicU32 = AtomicU32::new(0);
+
+/// Wakes up to `limit` waiters on the futex word at `address` from the
+/// kernel's own side (a thread's exit clearing its tid word, a robust mutex
+/// whose owner died): threads of this process blocked on it, then waits
+/// recorded at the process level, which is how a thread with no ready
+/// sibling waits while the rest of its process runs on other CPUs. A joiner
+/// waiting that way for musl's thread-list lock was never woken by the
+/// thread's exit, and its process slept on with the thread gone.
 fn wake_linux_futex(address: u64, limit: u32) -> u32 {
-    wake_linux_futex_masked(address, u32::MAX, limit)
+    if address == 0 || limit == 0 {
+        return 0;
+    }
+    let threads = wake_linux_futex_masked(address, u32::MAX, limit);
+    threads + wake_linux_process_futex_waits(linux_futex_key(address), u32::MAX, limit - threads)
 }
 
 fn wake_linux_futex_masked(address: u64, mask: u32, limit: u32) -> u32 {
@@ -8675,6 +8848,7 @@ fn wake_linux_futex_masked_locked(address: u64, mask: u32, limit: u32) -> u32 {
             X86_RUNTIME.LINUX_THREAD_WAIT_OUTPUTS[slot].store(0, Ordering::SeqCst);
             X86_RUNTIME.LINUX_THREAD_WAIT_DEADLINES[slot].store(0, Ordering::SeqCst);
             X86_RUNTIME.LINUX_THREAD_STATES[slot].store(LINUX_THREAD_READY, Ordering::SeqCst);
+            linux_trace_futex(8, address, slot as u64);
             woken += 1;
         }
     }
@@ -14197,6 +14371,7 @@ fn linux_exit_child_to_parent(output: *mut LinuxSyscallFrame, caller: LinuxUserC
         let _ = copy_to_linux_user(clear_child_tid, &0_u32.to_ne_bytes());
     }
     let woken = wake_linux_futex(clear_child_tid, 1);
+    linux_trace_futex(7, clear_child_tid, u64::from(woken));
     exit_linux_robust_list(tid, robust_list);
     if !set_current_linux_clear_child_tid(0) || !set_current_linux_robust_list(0) {
         return LINUX_ESRCH;
@@ -16065,6 +16240,7 @@ fn run_linux_runtime_loop() -> bool {
         if !activation::is_parked(linux_activation_owner(1)) {
             return true;
         }
+        linux_stall_diagnostic_from_loop();
         if !X86_RUNTIME.LINUX_RUNTIME_SUSPENDED.load(Ordering::Acquire)
             && !run_one_other_linux_process(1)
         {
@@ -41883,6 +42059,7 @@ fn linux_sysrq_trigger_write(address: u64, count: u64) -> u64 {
         b'u' => {
             crate::cpu_time::report();
             linux_report_process_banks();
+            linux_report_live_bank_threads();
         }
         _ => {}
     }

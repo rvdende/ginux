@@ -2732,26 +2732,64 @@ fn refresh_live_process_registry_inner(
         crate::serial_write("ginux: live registry refresh rejected address space\r\n");
         return false;
     };
-    let refreshed = table.refresh_process_inner(
-        handle,
-        address_space,
-        ProcessExecutionContext {
-            general,
-            rip,
-            rsp,
-            rflags,
-            fs_base,
-        },
-        validate_address_space,
-    );
+    let context = ProcessExecutionContext {
+        general,
+        rip,
+        rsp,
+        rflags,
+        fs_base,
+    };
+    let context_error = context.validation_error(&address_space);
+    let refreshed =
+        table.refresh_process_inner(handle, address_space, context, validate_address_space);
     if refreshed {
         let instance = active_process_instance().unwrap_or(HOST_PROCESS_INSTANCE);
         process_runtime().refresh_count[instance].fetch_add(1, Ordering::SeqCst);
-    } else {
-        crate::serial_write("ginux: live registry refresh rejected process context\r\n");
+    } else if REFRESH_REJECTIONS.fetch_add(1, Ordering::Relaxed) < 8 {
+        // Reported for the first few only: a call that retries after a
+        // rejection would otherwise flood the serial console.
+        crate::serial_write(
+            "ginux: live registry refresh rejected process context pid/state/error/rip/rsp/rflags: ",
+        );
+        let (state, retiring) = table
+            .process(handle)
+            .map(|process| {
+                (
+                    match process.state {
+                        ProcessState::Preparing => 1,
+                        ProcessState::Running => 2,
+                        ProcessState::Stopped { .. } => 3,
+                        ProcessState::Exiting => 4,
+                        ProcessState::Zombie { .. } => 5,
+                    },
+                    u64::from(process.retiring_address_space.is_some()),
+                )
+            })
+            .unwrap_or((0, 0));
+        let error =
+            u64::from(context_error.unwrap_or(0))
+                | u64::from(table.process(handle).is_some_and(|process| {
+                    linux_user::credentials(process.user_namespace).is_none()
+                })) << 4
+                | (address_space.mapping_count as u64) << 16;
+        for value in [
+            u64::from(pid),
+            state,
+            error | retiring << 8,
+            rip,
+            rsp,
+            rflags,
+        ] {
+            crate::serial_write_u64(value);
+            crate::serial_write(" ");
+        }
+        crate::serial_write("\r\n");
     }
     refreshed
 }
+
+/// Registry refreshes rejected, for the report above.
+static REFRESH_REJECTIONS: AtomicU32 = AtomicU32::new(0);
 
 pub(crate) fn finish_live_process_registry(refresh_floor: u32) -> bool {
     finish_live_process_registry_with_refresh_floor(refresh_floor)

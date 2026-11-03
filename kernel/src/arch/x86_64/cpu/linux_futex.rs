@@ -29,7 +29,7 @@ pub(super) struct LinuxProcessFutexWait {
 /// Identifies a futex word across processes by the page it is on, so
 /// processes sharing the page (MAP_SHARED, or not yet copied after fork)
 /// meet on it.
-fn linux_futex_key(address: u64) -> u64 {
+pub(super) fn linux_futex_key(address: u64) -> u64 {
     let page = address & !(PAGE_SIZE as u64 - 1);
     address_space::current_linux_runtime_page(page)
         .frame
@@ -52,7 +52,7 @@ fn take_linux_process_futex_wait(
 
 /// Marks up to `limit` processes waiting on `key` woken, dropping records of
 /// processes that are gone.
-fn wake_linux_process_futex_waits(key: u64, mask: u32, limit: u32) -> u32 {
+pub(super) fn wake_linux_process_futex_waits(key: u64, mask: u32, limit: u32) -> u32 {
     let mut waits = LINUX_FUTEX_COORDINATION.lock();
     waits.retain(|wait| {
         linux_process::live_process_status(wait.pid).is_some_and(|status| status.state.is_running())
@@ -67,6 +67,7 @@ fn wake_linux_process_futex_waits(key: u64, mask: u32, limit: u32) -> u32 {
         }
         wait.woken = true;
         linux_process::set_live_process_waiting(wait.pid, false);
+        linux_trace_futex(2, key, u64::from(wait.pid) << 32 | u64::from(wait.tid));
         woken += 1;
     }
     woken
@@ -227,6 +228,11 @@ pub(super) fn linux_futex_live_return(
         let threads = wake_linux_futex_masked(address, mask, limit);
         let woken = threads
             + wake_linux_process_futex_waits(linux_futex_key(address), mask, limit - threads);
+        linux_trace_futex(
+            3,
+            address,
+            u64::from(threads) << 32 | u64::from(woken - threads),
+        );
         if woken != 0 {
             X86_RUNTIME
                 .LINUX_FUTEX_EXPLICIT_WAKE_COUNT
@@ -245,6 +251,11 @@ pub(super) fn linux_futex_live_return(
     let tid = current_linux_tid().unwrap_or(0);
     let earlier = take_linux_process_futex_wait(&mut LINUX_FUTEX_COORDINATION.lock(), pid, tid)
         .filter(|wait| wait.address == address);
+    linux_trace_futex(
+        5,
+        address,
+        earlier.map_or(2, |wait| u64::from(wait.woken)) | u64::from(u32::from_ne_bytes(bytes)) << 8,
+    );
     if earlier.is_some_and(|wait| wait.woken) {
         return 0;
     }
@@ -252,6 +263,7 @@ pub(super) fn linux_futex_live_return(
     // only the 32-bit futex word. A wait resumed after a restart compared
     // it when it began, and may since have been requeued to another word.
     if earlier.is_none() && u32::from_ne_bytes(bytes) != value as u32 {
+        linux_trace_futex(9, address, value);
         return LINUX_EAGAIN;
     }
     let Some(current) = current_linux_thread_handle() else {
@@ -341,6 +353,7 @@ pub(super) fn linux_futex_live_return(
                 woken: false,
             });
         }
+        linux_trace_futex(1, address, key);
         let result = loop {
             match run_other_linux_processes(output, caller, LINUX_FUTEX_SYSCALL) {
                 // Yielded: the call starts again and finds its wait.
@@ -370,6 +383,11 @@ pub(super) fn linux_futex_live_return(
             }
         };
         let wait = take_linux_process_futex_wait(&mut LINUX_FUTEX_COORDINATION.lock(), pid, tid);
+        linux_trace_futex(
+            6,
+            address,
+            result.unwrap_or(u64::MAX - 1) | u64::from(wait.is_some_and(|wait| wait.woken)) << 62,
+        );
         if let Some(result) = result {
             return result;
         }
@@ -397,6 +415,11 @@ pub(super) fn linux_futex_live_return(
         return LINUX_EINVAL;
     }
     drop(coordination);
+    linux_trace_futex(
+        4,
+        address,
+        target.map_or(255, |target| u64::from(target.slot)),
+    );
     let Some(target) = target else {
         X86_RUNTIME
             .LINUX_FUTEX_WAIT_BLOCK_COUNT
