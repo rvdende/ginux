@@ -976,6 +976,9 @@ fn linux_syscall_dispatch(
             if linux_userfaultfd_descriptor(first_argument) {
                 return linux_userfaultfd_ioctl(first_argument, buffer, count);
             }
+            if linux_namespace_descriptor(first_argument) {
+                return linux_namespace_ioctl(first_argument, buffer, count);
+            }
             if linux_pipe_descriptor(first_argument) {
                 if buffer != LINUX_FIONREAD {
                     return LINUX_ENOTTY;
@@ -1235,9 +1238,8 @@ fn linux_syscall_dispatch(
             LINUX_EPERM
         }
         LINUX_CLONE_SYSCALL
-            if (saved_registers.rdi & !(LINUX_CLONE_NEWNS | LINUX_CLONE_NEWUSER)
-                == LINUX_SIGCHLD
-                || saved_registers.rdi & !(LINUX_CLONE_NEWNS | LINUX_CLONE_NEWUSER)
+            if (saved_registers.rdi & !LINUX_CLONE_PROCESS_NAMESPACES == LINUX_SIGCHLD
+                || saved_registers.rdi & !LINUX_CLONE_PROCESS_NAMESPACES
                     == LINUX_SIGCHLD | LINUX_CLONE_CHILD_SETTID | LINUX_CLONE_CHILD_CLEARTID)
                 && saved_registers.rsi == 0 =>
         {
@@ -1277,8 +1279,7 @@ fn linux_syscall_dispatch(
                 let result = linux_request_process_fork(
                     runtime_mode,
                     syscall_return,
-                    saved_registers.rdi & LINUX_CLONE_NEWNS != 0,
-                    saved_registers.rdi & LINUX_CLONE_NEWUSER != 0,
+                    saved_registers.rdi & LINUX_CLONE_PROCESS_NAMESPACES,
                     0,
                     saved_registers.rdi & LINUX_CLONE_VM != 0,
                     0,
@@ -1312,7 +1313,8 @@ fn linux_syscall_dispatch(
             // the child's pages its own copy as a fork's.
             let flags = saved_registers.rdi;
             let child_stack = saved_registers.rsi;
-            if flags & !(0xff | LINUX_CLONE_VM | LINUX_CLONE_VFORK) != 0
+            if flags & !(0xff | LINUX_CLONE_VM | LINUX_CLONE_VFORK | LINUX_CLONE_PROCESS_NAMESPACES)
+                != 0
                 || (flags & LINUX_CLONE_VM != 0 && flags & LINUX_CLONE_VFORK == 0)
                 || child_stack == 0
             {
@@ -1327,8 +1329,7 @@ fn linux_syscall_dispatch(
                 linux_request_process_fork(
                     true,
                     syscall_return,
-                    false,
-                    false,
+                    flags & LINUX_CLONE_PROCESS_NAMESPACES,
                     child_stack,
                     false,
                     0,
@@ -1385,27 +1386,17 @@ fn linux_syscall_dispatch(
         LINUX_FORK_SYSCALL => linux_request_process_fork(
             runtime_mode,
             syscall_return,
-            false,
-            false,
-            0,
-            false,
             0,
             0,
             false,
-            false,
-        ),
-        LINUX_VFORK_SYSCALL => linux_request_process_fork(
-            runtime_mode,
-            syscall_return,
-            false,
-            false,
-            0,
-            true,
             0,
             0,
             false,
             false,
         ),
+        LINUX_VFORK_SYSCALL => {
+            linux_request_process_fork(runtime_mode, syscall_return, 0, 0, true, 0, 0, false, false)
+        }
         LINUX_EXECVE_SYSCALL => {
             if runtime_mode && !refresh_live_linux_process_registry(syscall_return) {
                 LINUX_EIO
@@ -1413,23 +1404,28 @@ fn linux_syscall_dispatch(
                 linux_execve(first_argument, buffer, count)
             }
         }
-        LINUX_KILL_SYSCALL => linux_kill(
-            first_argument,
-            (buffer, LINUX_SI_USER, None),
-            registers,
-            syscall_return,
-            (user_rip, user_rflags),
-        ),
+        LINUX_KILL_SYSCALL => {
+            let Ok(target) = linux_pid_argument(first_argument) else {
+                return LINUX_ESRCH;
+            };
+            linux_kill(
+                target,
+                (buffer, LINUX_SI_USER, None),
+                registers,
+                syscall_return,
+                (user_rip, user_rflags),
+            )
+        }
         LINUX_TGKILL_SYSCALL => linux_tgkill(
-            first_argument,
-            buffer,
+            linux_tid_argument(first_argument),
+            linux_tid_argument(buffer),
             count,
             registers,
             syscall_return,
             (user_rip, user_rflags),
         ),
         LINUX_TKILL_SYSCALL => linux_tkill(
-            first_argument,
+            linux_tid_argument(first_argument),
             buffer,
             registers,
             syscall_return,
@@ -1443,7 +1439,10 @@ fn linux_syscall_dispatch(
                 linux_execveat(first_argument, buffer, count, register(0), register(2))
             }
         }
-        LINUX_GETPID_SYSCALL => u64::from(current_linux_process_pid()),
+        LINUX_GETPID_SYSCALL => {
+            let pid = current_linux_process_pid();
+            u64::from(linux_pid_seen_by(pid, pid))
+        }
         LINUX_GETTID_SYSCALL => {
             let Some(tid) = current_linux_tid() else {
                 return LINUX_ESRCH;
@@ -1453,11 +1452,14 @@ fn linux_syscall_dispatch(
                     .LINUX_CHILD_GETTID_COUNT
                     .fetch_add(1, Ordering::SeqCst);
             }
-            u64::from(tid)
+            u64::from(linux_tid_seen(tid))
         }
+        // A parent outside the caller's PID namespace shows as 0.
         LINUX_GETPPID_SYSCALL => {
-            linux_process::live_process_parent_pid(current_linux_process_pid())
-                .map_or(LINUX_ESRCH, u64::from)
+            let pid = current_linux_process_pid();
+            linux_process::live_process_parent_pid(pid).map_or(LINUX_ESRCH, |parent| {
+                u64::from(linux_pid_seen_by(pid, parent))
+            })
         }
         LINUX_SETPGID_SYSCALL => linux_setpgid(first_argument, buffer),
         LINUX_SETSID_SYSCALL => {
@@ -1492,7 +1494,7 @@ fn linux_syscall_dispatch(
             if !set_current_linux_clear_child_tid(first_argument) {
                 return LINUX_ESRCH;
             }
-            current_linux_tid().map_or(LINUX_ESRCH, u64::from)
+            current_linux_tid().map_or(LINUX_ESRCH, |tid| u64::from(linux_tid_seen(tid)))
         }
         LINUX_SET_ROBUST_LIST_SYSCALL => {
             if buffer != LINUX_ROBUST_LIST_HEAD_SIZE as u64 {
@@ -2153,6 +2155,7 @@ fn linux_syscall_dispatch(
             LINUX_RETURN_TO_KERNEL
         }
         LINUX_UNSHARE_SYSCALL => linux_unshare(first_argument),
+        LINUX_SETNS_SYSCALL => linux_setns(first_argument, buffer),
         LINUX_REBOOT_SYSCALL => linux_reboot(first_argument, buffer, count, register(0)),
         LINUX_CHROOT_SYSCALL => linux_chroot(first_argument),
         LINUX_ACCT_SYSCALL => linux_acct(first_argument),

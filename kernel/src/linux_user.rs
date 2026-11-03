@@ -44,6 +44,36 @@ pub(crate) struct UserNamespaceHandle {
     id: u32,
 }
 
+impl UserNamespaceHandle {
+    /// The namespace's number in its domain, which its nsfs inode is made of.
+    pub(crate) fn id(self) -> u32 {
+        self.id
+    }
+
+    /// The handle as a word a /proc/PID/ns descriptor keeps (`from_word`).
+    pub(crate) fn to_word(self) -> u64 {
+        u64::from(self.slot) << 24 | u64::from(self.generation & 0xff_ffff)
+    }
+}
+
+/// The live user namespace of the current domain that `to_word` gave `word` for.
+pub(crate) fn from_word(word: u64) -> Option<UserNamespaceHandle> {
+    let (index, owner_domain) = current_instance_and_owner()?;
+    let table = live_table_at(index)?;
+    if table.owner_domain != owner_domain {
+        return None;
+    }
+    let slot = usize::try_from(word >> 24).ok()?;
+    let namespace = table.namespaces.get(slot)?.as_ref()?;
+    (u64::from(namespace.handle.generation & 0xff_ffff) == word & 0xff_ffff)
+        .then_some(namespace.handle)
+}
+
+/// The namespace `handle` was made in: `None` for the domain's initial one.
+pub(crate) fn parent(handle: UserNamespaceHandle) -> Option<UserNamespaceHandle> {
+    live_table_for_handle(handle)?.namespace(handle)?.parent
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PrivilegedOperation {
     ChangeRoot,

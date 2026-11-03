@@ -463,6 +463,8 @@ pub(super) const LINUX_ESPIPE: u64 = u64::MAX - 28;
 pub(super) const LINUX_EMFILE: u64 = u64::MAX - 23;
 pub(super) const LINUX_EINVAL: u64 = u64::MAX - 21;
 pub(super) const LINUX_ENOTTY: u64 = u64::MAX - 24;
+/// Too many users: setns into a time namespace from a threaded process.
+pub(super) const LINUX_EUSERS: u64 = u64::MAX - 86;
 pub(super) const LINUX_ERANGE: u64 = u64::MAX - 33;
 pub(super) const LINUX_EDOM: u64 = u64::MAX - 32;
 pub(super) const LINUX_ENOLCK: u64 = u64::MAX - 36;
@@ -689,6 +691,9 @@ pub(super) const LINUX_DEVICE_POSIX_MQ: u16 = 1 << 10;
 pub(super) const LINUX_DEVICE_INOTIFY: u16 = 1 << 11;
 pub(super) const LINUX_DEVICE_PIDFD: u16 = 1 << 13;
 pub(super) const LINUX_DEVICE_SIGNALFD: u16 = 1 << 12;
+/// A /proc/PID/ns descriptor (nsfs): the pidfd and signalfd bits together,
+/// which those kinds only ever use alone (compared exactly).
+pub(super) const LINUX_DEVICE_NAMESPACE: u16 = LINUX_DEVICE_PIDFD | LINUX_DEVICE_SIGNALFD;
 pub(super) const LINUX_DEVICE_PIPE: u16 = 1 << 14;
 pub(super) const LINUX_DEVICE_SOCKET: u16 = 1 << 15;
 pub(super) const LINUX_FILE_INIT: u16 = 1 << 5;
@@ -744,7 +749,7 @@ pub(super) const LINUX_FILE_PROC_TASK_STAT: u16 = LINUX_FILE_MASK | LINUX_PROC_T
 pub(super) const LINUX_AIO_MAX_NR: u64 = 65_536;
 /// `/proc/sys/vm/max_map_count`: the most memory areas a process may have.
 pub(super) const LINUX_MAX_MAP_COUNT: usize = 65_530;
-pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 38] = [
+pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 39] = [
     // The most memory areas a process may have (LINUX_MAX_MAP_COUNT).
     (0xa000, b"sys/vm/max_map_count", b"65530\n"),
     // The random pool is always full, as Linux reports it since 5.18.
@@ -783,6 +788,9 @@ pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 38] = [
     (0xd500, b"sys/user/max_user_namespaces", b"3\n"),
     (0xd400, b"sys/fs/pipe-max-size", b"1048576\n"),
     (0xd200, b"sys/fs/aio-max-nr", b"65536\n"),
+    // The most descriptors a process may have (LINUX_NR_OPEN); unsharing a
+    // descriptor table holding one above it fails (unshare03).
+    (LINUX_PROC_NR_OPEN_NODE, b"sys/fs/nr_open", b"1048576\n"),
     (0xd000, b"sys/fs/pipe-user-pages-soft", b"16384\n"),
     // Seconds a lease holder has to give up its lease (fcntl33 saves it).
     (0xa500, b"sys/fs/lease-break-time", b"45\n"),
@@ -914,6 +922,11 @@ pub(super) const LINUX_FILE_PROC_FILE_MAX: u16 = LINUX_FILE_MASK | LINUX_PROC_FI
 pub(super) const LINUX_PROC_NR_OPEN_NODE: u16 = 0xe700;
 pub(super) const LINUX_FILE_PROC_NR_OPEN: u16 = LINUX_FILE_MASK | LINUX_PROC_NR_OPEN_NODE;
 pub(super) const LINUX_PROC_OOM_SCORE_ADJ_NODE: u16 = 0xe600;
+/// `/proc/PID/timens_offsets`: the offsets of the time namespace PID's
+/// children are born into.
+pub(super) const LINUX_PROC_TIMENS_OFFSETS_NODE: u16 = 0xbc00;
+pub(super) const LINUX_FILE_PROC_TIMENS_OFFSETS: u16 =
+    LINUX_FILE_MASK | LINUX_PROC_TIMENS_OFFSETS_NODE;
 pub(super) const LINUX_FILE_PROC_OOM_SCORE_ADJ: u16 =
     LINUX_FILE_MASK | LINUX_PROC_OOM_SCORE_ADJ_NODE;
 pub(super) const LINUX_PROC_USER_NAMESPACE_NODE: u16 = 0xe500;
@@ -1204,8 +1217,8 @@ const _: () = {
         LINUX_PROC_PROCESS_CMDLINE_NODE,
         LINUX_PROC_PROCESS_ENVIRON_NODE,
         LINUX_PROC_FILE_MAX_NODE,
-        LINUX_PROC_NR_OPEN_NODE,
         LINUX_PROC_OOM_SCORE_ADJ_NODE,
+        LINUX_PROC_TIMENS_OFFSETS_NODE,
         LINUX_PROC_USER_NAMESPACE_NODE,
         LINUX_PROC_FDINFO_NODE,
         LINUX_PROC_HOSTNAME_NODE,

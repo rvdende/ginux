@@ -6,7 +6,9 @@ use core::{
 };
 
 use crate::linux_debug_registers::{DebugRegisters, Error as DebugRegisterError};
-use crate::{address_space, arch::x86_64::cpu, control_abi, linux_user, memory, scheduler};
+use crate::{
+    address_space, arch::x86_64::cpu, control_abi, linux_namespace, linux_user, memory, scheduler,
+};
 
 /// Processes a domain's table holds, zombies included. The table grows on
 /// demand up to this (slots are u8).
@@ -506,6 +508,17 @@ struct Process {
     session: u32,
     executed: bool,
     user_namespace: linux_user::UserNamespaceHandle,
+    /// Its UTS, IPC, PID and time namespaces: a child starts in its
+    /// parent's (those for children, of PID and time).
+    namespaces: linux_namespace::Set,
+    /// The namespaces a clone it asked for made for its next child (clone
+    /// with CLONE_NEWPID and the like), taken when that child is made.
+    child_namespaces: Option<linux_namespace::Set>,
+    /// Made by clone with CLONE_FILES: its descriptor table counts as its
+    /// parent's (copied here) until it unshares one or execs.
+    shares_descriptors: bool,
+    /// Its next child is made with CLONE_FILES.
+    child_shares_descriptors: bool,
     /// Its user and group ids: inherited across fork, kept across exec.
     credentials: linux_user::Credentials,
     runtime_slot: Option<u8>,
@@ -1296,6 +1309,7 @@ impl ProcessTable {
         self.processes[usize::from(handle.slot)] = None;
         self.groups[usize::from(handle.slot)] = Vec::new();
         self.roots[usize::from(handle.slot)] = Vec::new();
+        linux_namespace::forget_pid(cpu::current_linux_execution_instance(), handle.pid);
         true
     }
 
@@ -1482,6 +1496,8 @@ impl ProcessTable {
         {
             let _ = linux_user::retire(process.user_namespace);
         }
+        linux_namespace::forget_pid(cpu::current_linux_execution_instance(), pid);
+        self.collect_namespaces();
         Some(WaitResult { pid, status })
     }
 
@@ -1794,6 +1810,24 @@ impl ProcessTable {
         let seccomp_filter = parent
             .and_then(|parent| self.process(parent))
             .map_or(0, |parent| parent.seccomp_filter);
+        let (namespaces, shares_descriptors) =
+            match parent.and_then(|parent| self.process_mut(parent)) {
+                Some(parent) => (
+                    parent
+                        .child_namespaces
+                        .take()
+                        .unwrap_or_else(|| parent.namespaces.for_child()),
+                    core::mem::take(&mut parent.child_shares_descriptors),
+                ),
+                None => (linux_namespace::Set::default(), false),
+            };
+        // A child born into a PID namespace gets its numbers there, and the
+        // time namespace it enters keeps its offsets from now on.
+        let instance = cpu::current_linux_execution_instance();
+        linux_namespace::enter_pid(instance, namespaces.pid, pid).ok()?;
+        if namespaces.time != 0 {
+            linux_namespace::freeze_time(instance, namespaces.time);
+        }
         // A new process's groups are its parent's; the first is in group 0.
         let inherited: &[u32] = match parent {
             Some(parent) => self.groups.get(usize::from(parent.slot))?,
@@ -1820,6 +1854,10 @@ impl ProcessTable {
             session,
             executed: false,
             user_namespace,
+            namespaces,
+            child_namespaces: None,
+            shares_descriptors,
+            child_shares_descriptors: false,
             credentials,
             runtime_slot: address_space.map(|space| space.storage_slot),
             address_space,
@@ -1852,6 +1890,25 @@ impl ProcessTable {
             deadline_parameters: [0; 3],
         });
         Some(handle)
+    }
+
+    /// Drops the namespaces no process of the table uses any more.
+    fn collect_namespaces(&self) {
+        let mut sets = Vec::new();
+        if sets.try_reserve(self.processes.len()).is_err() {
+            return;
+        }
+        sets.extend(
+            self.processes
+                .iter()
+                .flatten()
+                .map(|process| process.namespaces),
+        );
+        linux_namespace::collect(
+            cpu::current_linux_execution_instance(),
+            &sets,
+            crate::linux_sysv_ipc::release_instance,
+        );
     }
 
     fn process_group(&self, pid: u32) -> Option<(u32, u32)> {
@@ -1944,6 +2001,8 @@ impl ProcessTable {
             return false;
         };
         process.executed = true;
+        // exec gives the process a descriptor table of its own.
+        process.shares_descriptors = false;
         process.posix_timers = [None; POSIX_TIMER_LIMIT];
         process.debug_registers = DebugRegisters::RESET;
         true
@@ -1975,6 +2034,8 @@ impl ProcessTable {
         }
         process.context = Some(context);
         process.executed = true;
+        // exec gives the process a descriptor table of its own.
+        process.shares_descriptors = false;
         process.posix_timers = [None; POSIX_TIMER_LIMIT];
         process.debug_registers = DebugRegisters::RESET;
         process.shares_parent_vm = false;
@@ -3206,6 +3267,88 @@ pub(crate) fn set_live_process_groups(pid: u32, groups: Vec<u32>) -> bool {
         return false;
     };
     *slot = groups;
+    true
+}
+
+/// Whether process `pid` was made sharing its parent's descriptor table
+/// and has not unshared it since.
+pub(crate) fn live_process_shares_descriptors(pid: u32) -> bool {
+    live_process_table_mut()
+        .and_then(|table| Some(table.process(table.handle_by_pid(pid)?)?.shares_descriptors))
+        .unwrap_or(false)
+}
+
+/// Whether process `pid`'s next child is made with CLONE_FILES.
+pub(crate) fn set_live_process_child_shares_descriptors(pid: u32, shares: bool) -> bool {
+    let Some(table) = live_process_table_mut() else {
+        return false;
+    };
+    let Some(process) = table
+        .handle_by_pid(pid)
+        .and_then(|handle| table.process_mut(handle))
+    else {
+        return false;
+    };
+    process.child_shares_descriptors = shares;
+    true
+}
+
+pub(crate) fn set_live_process_shares_descriptors(pid: u32, shares: bool) -> bool {
+    let Some(table) = live_process_table_mut() else {
+        return false;
+    };
+    let Some(process) = table
+        .handle_by_pid(pid)
+        .and_then(|handle| table.process_mut(handle))
+    else {
+        return false;
+    };
+    process.shares_descriptors = shares;
+    true
+}
+
+/// Sets the namespaces process `pid`'s next child is made in (`None`:
+/// its own, as a fork's child has).
+pub(crate) fn set_live_process_child_namespaces(
+    pid: u32,
+    namespaces: Option<linux_namespace::Set>,
+) -> bool {
+    let Some(table) = live_process_table_mut() else {
+        return false;
+    };
+    let Some(process) = table
+        .handle_by_pid(pid)
+        .and_then(|handle| table.process_mut(handle))
+    else {
+        return false;
+    };
+    process.child_namespaces = namespaces;
+    true
+}
+
+/// Process `pid`'s UTS, IPC, PID and time namespaces.
+pub(crate) fn live_process_namespaces(pid: u32) -> Option<linux_namespace::Set> {
+    let table = live_process_table_mut()?;
+    Some(table.process(table.handle_by_pid(pid)?)?.namespaces)
+}
+
+/// Moves running process `pid` to `namespaces`, then drops the ones it
+/// left that nothing else uses.
+pub(crate) fn set_live_process_namespaces(pid: u32, namespaces: linux_namespace::Set) -> bool {
+    let Some(table) = live_process_table_mut() else {
+        return false;
+    };
+    let Some(process) = table
+        .handle_by_pid(pid)
+        .and_then(|handle| table.process_mut(handle))
+    else {
+        return false;
+    };
+    if process.state != ProcessState::Running {
+        return false;
+    }
+    process.namespaces = namespaces;
+    table.collect_namespaces();
     true
 }
 
@@ -4892,7 +5035,17 @@ pub(crate) fn begin_live_fork(
     process_runtime()
         .fork_execution_stage
         .store(12, Ordering::Release);
-    if !table.set_return_value(parent_handle, u64::from(child_handle.pid)) {
+    // fork returns the child's number in the parent's PID namespace.
+    let parent_namespace = table
+        .process(parent_handle)
+        .map_or(0, |parent| parent.namespaces.pid);
+    let child_seen = linux_namespace::pid_seen_from(
+        cpu::current_linux_execution_instance(),
+        parent_namespace,
+        child_handle.pid,
+    )
+    .unwrap_or(child_handle.pid);
+    if !table.set_return_value(parent_handle, u64::from(child_seen)) {
         process_runtime()
             .fork_execution_stage
             .store(121, Ordering::Release);
@@ -6059,8 +6212,19 @@ fn current_process_instance() -> usize {
     cpu::current_container_slot().unwrap_or(HOST_PROCESS_INSTANCE)
 }
 
+/// The System V instance the current process's IPC namespace keeps its
+/// objects in: the domain's own unless it made one.
 pub(crate) fn current_ipc_instance() -> usize {
-    current_process_instance()
+    let instance = current_process_instance();
+    if !linux_namespace::any(linux_namespace::Kind::Ipc) {
+        return instance;
+    }
+    live_process_namespaces(cpu::current_linux_process_id())
+        .filter(|set| set.ipc != 0)
+        .and_then(|set| {
+            linux_namespace::ipc_instance(cpu::current_linux_execution_instance(), set.ipc)
+        })
+        .unwrap_or(instance)
 }
 
 fn active_process_instance() -> Option<usize> {

@@ -2,10 +2,13 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use crate::{control_abi, linux_process, memory};
+use crate::{linux_namespace, linux_process, memory};
 
 const PAGE_SIZE: usize = 4096;
-const INSTANCE_LIMIT: usize = control_abi::DOMAIN_LIMIT + 1;
+/// One instance per domain, the host's, and one per IPC namespace made
+/// inside a domain (`linux_namespace` hands those out).
+const INSTANCE_LIMIT: usize =
+    linux_namespace::IPC_INSTANCE_FIRST + linux_namespace::IPC_INSTANCE_LIMIT;
 const FRAME_CAPACITY: usize = 320;
 const SEMAPHORE_CAPACITY: usize = 240;
 const MESSAGE_CAPACITY: usize = 4048;
@@ -434,7 +437,10 @@ struct Guard {
 
 impl Guard {
     fn acquire() -> Option<Self> {
-        let instance = linux_process::current_ipc_instance();
+        Self::acquire_at(linux_process::current_ipc_instance())
+    }
+
+    fn acquire_at(instance: usize) -> Option<Self> {
         let lock = SYSV_IPC_RUNTIME.locks.get(instance)?;
         while lock
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -1149,9 +1155,33 @@ pub(crate) fn end_semaphore_wait(pid: u32) {
 }
 
 pub(crate) fn teardown() -> bool {
-    let Some(mut guard) = Guard::acquire() else {
+    Guard::acquire().is_some_and(teardown_held)
+}
+
+/// Releases every object of IPC namespace instance `instance`, which no
+/// process uses any more: not while a process still has one of its
+/// segments attached (it may have left the namespace with it).
+pub(crate) fn release_instance(instance: usize) -> bool {
+    let Some(guard) = Guard::acquire_at(instance) else {
         return false;
     };
+    if root(
+        &SYSV_IPC_RUNTIME.attachment_root_addresses,
+        &SYSV_IPC_RUNTIME.attachment_root_generations,
+        guard.instance,
+    )
+    .is_some()
+    {
+        return false;
+    }
+    let released = teardown_held(guard);
+    SYSV_IPC_RUNTIME.next_ids[instance].store(1, Ordering::Release);
+    SYSV_IPC_RUNTIME.next_semaphore_ids[instance].store(1, Ordering::Release);
+    SYSV_IPC_RUNTIME.next_message_ids[instance].store(1, Ordering::Release);
+    released
+}
+
+fn teardown_held(mut guard: Guard) -> bool {
     *guard.semaphore_processes() = SemaphoreProcesses::EMPTY;
     let mut attachments = root(
         &SYSV_IPC_RUNTIME.attachment_root_addresses,

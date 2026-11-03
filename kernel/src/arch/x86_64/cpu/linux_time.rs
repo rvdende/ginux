@@ -56,6 +56,43 @@ fn linux_cycles_time(cycles: u64) -> (u64, u64) {
     )
 }
 
+/// The current process's time namespace offset of `clock`, in nanoseconds:
+/// CLOCK_MONOTONIC's for the monotonic clocks, CLOCK_BOOTTIME's for the
+/// boot-time ones, none for the others.
+pub(super) fn linux_time_namespace_offset(clock: u64) -> i64 {
+    if !linux_namespace::any(linux_namespace::Kind::Time) {
+        return 0;
+    }
+    let [monotonic, boottime] =
+        linux_namespace::time_offsets(linux_execution_instance(), current_linux_namespaces().time);
+    match clock {
+        LINUX_CLOCK_MONOTONIC | LINUX_CLOCK_MONOTONIC_RAW | LINUX_CLOCK_MONOTONIC_COARSE => {
+            monotonic
+        }
+        LINUX_CLOCK_BOOTTIME | LINUX_CLOCK_BOOTTIME_ALARM => boottime,
+        _ => 0,
+    }
+}
+
+/// An absolute `clock` time the current process gave (as its time
+/// namespace shows the clock) as the kernel's clock counts it.
+pub(super) fn linux_time_namespace_host(clock: u64, nanoseconds: u64) -> u64 {
+    nanoseconds.saturating_add_signed(linux_time_namespace_offset(clock).saturating_neg())
+}
+
+/// (seconds, nanoseconds) moved by `offset` nanoseconds, no earlier than 0.
+fn linux_shift_time((seconds, nanoseconds): (u64, u64), offset: i64) -> (u64, u64) {
+    if offset == 0 {
+        return (seconds, nanoseconds);
+    }
+    let total = (i128::from(seconds) * i128::from(NANOSECONDS_PER_SECOND)
+        + i128::from(nanoseconds)
+        + i128::from(offset))
+    .max(0);
+    let second = i128::from(NANOSECONDS_PER_SECOND);
+    ((total / second) as u64, (total % second) as u64)
+}
+
 pub(super) fn linux_clock_gettime(clock: u64, output_address: u64) -> u64 {
     let clock = u64::from(clock as u32);
     let cpu_clock = match linux_cpu_clock_cycles(clock) {
@@ -78,6 +115,7 @@ pub(super) fn linux_clock_gettime(clock: u64, output_address: u64) -> u64 {
             linux_realtime_time()
         } else {
             linux_elapsed_time()
+                .map(|time| linux_shift_time(time, linux_time_namespace_offset(clock)))
         }
     }) else {
         return LINUX_ENOSYS;
@@ -394,16 +432,25 @@ pub(crate) fn refresh_linux_vvar() -> bool {
                 ),
                 frame,
             )| {
+                // A process in a time namespace reads its clocks through the
+                // system call, which adds the namespace's offsets: an empty
+                // page tells the vDSO to fall back to it.
+                let in_time_namespace = linux_namespace::any(linux_namespace::Kind::Time)
+                    && current_linux_namespaces().time != 0;
                 address_space::update_linux_vvar(
                     frame,
-                    [
-                        multiplier,
-                        now,
-                        monotonic_seconds,
-                        monotonic_nanoseconds,
-                        realtime_seconds,
-                        realtime_nanoseconds,
-                    ],
+                    if in_time_namespace {
+                        [0; 6]
+                    } else {
+                        [
+                            multiplier,
+                            now,
+                            monotonic_seconds,
+                            monotonic_nanoseconds,
+                            realtime_seconds,
+                            realtime_nanoseconds,
+                        ]
+                    },
                 )
             },
         )
@@ -579,7 +626,12 @@ pub(super) fn linux_sysinfo(output_address: u64) -> u64 {
     let Some(processes) = linux_process::live_process_count() else {
         return LINUX_ESRCH;
     };
-    let Some(uptime) = linux_elapsed_time() else {
+    // The uptime is CLOCK_BOOTTIME's, as the caller's time namespace shows
+    // it, in whole seconds rounded up (as Linux's sysinfo rounds).
+    let Some(uptime) = linux_elapsed_time()
+        .map(|time| linux_shift_time(time, linux_time_namespace_offset(LINUX_CLOCK_BOOTTIME)))
+        .map(|(seconds, nanoseconds)| (seconds + u64::from(nanoseconds != 0), 0))
+    else {
         return LINUX_ENOSYS;
     };
     let information = match linux_sysinfo_information(processes, uptime) {
@@ -955,6 +1007,7 @@ fn linux_sleep_live_return(
     const CLOCK_BOOTTIME: u64 = 7;
     let clock = u64::from(clock as u32);
     let flags = u64::from(flags as u32);
+    let namespace_clock = clock;
     // A thread's CPU clock cannot be slept on (Linux has no nsleep for it:
     // EOPNOTSUPP); CLOCK_BOOTTIME runs as CLOCK_MONOTONIC, with no suspend.
     if clock == CLOCK_THREAD_CPUTIME_ID && flags & !LINUX_TIMER_ABSTIME == 0 {
@@ -1001,7 +1054,8 @@ fn linux_sleep_live_return(
     } else if absolute && clock == LINUX_CLOCK_REALTIME {
         monotonic_now.saturating_add(requested.saturating_sub(realtime_now))
     } else if absolute {
-        requested
+        // An absolute time of the caller's time namespace's clock.
+        linux_time_namespace_host(namespace_clock, requested)
     } else {
         let Some(deadline) = monotonic_now.checked_add(requested) else {
             return LINUX_EINVAL;

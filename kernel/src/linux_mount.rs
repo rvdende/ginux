@@ -391,3 +391,31 @@ fn live_table_mut() -> Option<&'static mut MountNamespaceTable> {
     }
     Some(unsafe { &mut *MOUNT_RUNTIME.table.get().cast::<MountNamespaceTable>() })
 }
+
+impl MountNamespaceHandle {
+    /// The namespace's number, which its nsfs inode is made of.
+    pub(crate) fn id(self) -> u32 {
+        self.id
+    }
+
+    /// The handle as a word a /proc/PID/ns descriptor keeps (`from_word`).
+    pub(crate) fn to_word(self) -> u64 {
+        u64::from(self.slot) << 24 | u64::from(self.generation & 0xff_ffff)
+    }
+}
+
+/// The live mount namespace that `to_word` gave `word` for.
+pub(crate) fn from_word(word: u64) -> Option<MountNamespaceHandle> {
+    let table = live_table()?;
+    let namespace = table
+        .namespaces
+        .get(usize::try_from(word >> 24).ok()?)?
+        .as_ref()?;
+    // A descriptor never names another domain's namespace.
+    let domain = cpu::current_container_slot()
+        .and_then(cpu::container_domain_id)
+        .unwrap_or(0);
+    (namespace.owner_domain == domain
+        && u64::from(namespace.handle.generation & 0xff_ffff) == word & 0xff_ffff)
+        .then_some(namespace.handle)
+}

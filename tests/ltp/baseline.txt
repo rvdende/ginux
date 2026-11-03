@@ -4,7 +4,6 @@
 # the run. Rewrite it from a run with LTP_UPDATE_BASELINE=1
 # (tests/qemu/ltp.sh --update-baseline); LTP_STRICT=1 ignores it.
 # From target/ltp-results.txt (2026-11-03), list=tests/ltp/syscalls.list ltp=20260930 kernel=468a6a67.
-clock_gettime03 TBROK
 clone02 TFAIL
 clone05 TFAIL
 clone08 TBROK
@@ -14,19 +13,11 @@ clone301 TBROK
 ioctl01 TBROK
 ioctl02 TBROK
 ioctl_loop05 TBROK
-ioctl_ns01 TBROK
-ioctl_ns02 TBROK
-ioctl_ns03 TBROK
-ioctl_ns05 TBROK
-ioctl_ns06 TBROK
 kcmp03 TFAIL
 mount_setattr02 TBROK
 msgstress01 TBROK
 pivot_root01 TBROK
 prot_hsymlinks TBROK
-setns02 TWARN
 statmount03 TBROK
-unshare03 TFAIL
-unshare05 TBROK
 userfaultfd03 TBROK
 futex_cmp_requeue01 TBROK

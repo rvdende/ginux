@@ -19,6 +19,9 @@ impl LockRank {
     /// The mounts domains made; ranks below the heap so the table may grow
     /// while held, and above ARCHITECTURE, which system calls run under.
     pub(crate) const MOUNTS: Self = Self(105);
+    /// The UTS, IPC, PID and time namespaces domains made; ranks below the
+    /// heap so the table may grow while held.
+    pub(crate) const NAMESPACES: Self = Self(107);
     /// Processes' memory areas; ranks just below the heap so the sets may
     /// grow while held, and above the socket, inotify and futex locks, under
     /// which a copy to user memory may look up a lazily reserved page.

@@ -49,8 +49,8 @@ use linux_time::*;
 use crate::{
     address_space,
     capability::Rights,
-    control_abi, domain, image_store, initramfs, ipc, linux_mount, linux_process, linux_tmpfs,
-    linux_user, memory, network, scheduler,
+    control_abi, domain, image_store, initramfs, ipc, linux_mount, linux_namespace, linux_process,
+    linux_tmpfs, linux_user, memory, network, scheduler,
     scheduler::{
         RuntimeAction, UserFaultContext, UserFaultFrame, UserInterruptFrame, UserTrapFrame,
     },
@@ -2968,6 +2968,7 @@ fn settle_linux_process_exit(pid: u32, status: u8) -> bool {
     // The save before made them leave; nothing of the process may still
     // run anywhere once its memory goes.
     wait_for_linux_process_threads_to_leave(pid);
+    linux_end_pid_namespace(pid);
     let process_slot = linux_process::live_process_slot(pid);
     let parent = linux_process::live_process_parent_pid(pid);
     let signals_cleared = process_slot
@@ -6702,6 +6703,7 @@ fn execute_deferred_live_fork() -> bool {
         X86_RUNTIME
             .LINUX_FORK_OWN_PAGES
             .store(false, Ordering::SeqCst);
+        let _ = linux_process::set_live_process_child_namespaces(parent_pid, None);
         if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
             serial_write("ginux: runtime fork preparation failed at stage ");
             serial_write_u64(u64::from(linux_process::live_fork_execution_stage()));
@@ -6714,6 +6716,18 @@ fn execute_deferred_live_fork() -> bool {
     };
     if !clone_linux_process_extended_state(parent_pid, child.pid) {
         return false;
+    }
+    // The child's number in the parent's PID namespace, which fork returns
+    // (begin_live_fork set it).
+    let child_seen_by_parent = linux_pid_seen_by(parent_pid, child.pid);
+    // A child in a time namespace reads its clocks through the system call,
+    // which adds the namespace's offsets: its vDSO page says to fall back.
+    if linux_process::live_process_namespaces(child.pid).is_some_and(|set| set.time != 0) {
+        if let Some(vvar) =
+            linux_process::live_process_mapping(child.pid, crate::linux_elf::VVAR_ADDRESS as usize)
+        {
+            let _ = address_space::update_linux_vvar(vvar.frame, [0; 6]);
+        }
     }
     let pidfd_address = X86_RUNTIME
         .LINUX_FORK_PIDFD_ADDRESS
@@ -6868,9 +6882,17 @@ fn execute_deferred_live_fork() -> bool {
         .LINUX_FORK_PARENT_TID_ADDRESS
         .swap(0, Ordering::SeqCst);
     let child_tid_ready = (child_tid_address == 0
-        || linux_process::write_live_process_u32(child.pid, child_tid_address, child.pid))
+        || linux_process::write_live_process_u32(
+            child.pid,
+            child_tid_address,
+            linux_pid_seen_by(child.pid, child.pid),
+        ))
         && (parent_tid_address == 0
-            || linux_process::write_live_process_u32(parent_pid, parent_tid_address, child.pid));
+            || linux_process::write_live_process_u32(
+                parent_pid,
+                parent_tid_address,
+                child_seen_by_parent,
+            ));
     if parent_first {
         return child_tid_ready
             && resume_linux_fork_parent_first(parent_pid, child.pid, parent_runtime.stack);
@@ -7082,7 +7104,7 @@ fn execute_deferred_live_fork() -> bool {
     }
     wake_linux_descriptor_waits();
     linux_boot_profile_lifecycle_phase(4, profile_cleanup_started);
-    if parent.pid != parent_pid || parent.general[0] != u64::from(child.pid) {
+    if parent.pid != parent_pid || parent.general[0] != u64::from(child_seen_by_parent) {
         return false;
     }
     X86_RUNTIME
@@ -7421,6 +7443,10 @@ pub(crate) fn stop_configured_container() {
     crate::linux_exe::forget_instance(X86_RUNTIME.LINUX_EXECUTION_INSTANCE.load(Ordering::SeqCst));
     crate::linux_areas::forget_instance(linux_execution_instance());
     crate::linux_mounts::forget_instance(linux_execution_instance());
+    linux_namespace::forget_instance(
+        linux_execution_instance(),
+        crate::linux_sysv_ipc::release_instance,
+    );
     if let Some(slot) = active_container_slot() {
         if matches!(
             u64::from(X86_RUNTIME.CONTAINER_CONTROL_STATES[slot].load(Ordering::SeqCst)),
@@ -14003,22 +14029,552 @@ fn linux_privileged_operation(number: u64) -> Option<linux_user::PrivilegedOpera
     }
 }
 
-/// unshare(2). Unsharing what a single-threaded process already has alone
-/// (its descriptors, filesystem context, signal handlers, address space,
-/// SysV semaphore undo) does nothing; a new user namespace or (as root) a
-/// new mount namespace replaces the caller's. The other namespaces
-/// (UTS, IPC, network, PID, cgroup, time) are not implemented yet.
-fn linux_unshare(flags: u64) -> u64 {
-    const CLONE_NEWTIME: u64 = 0x80;
-    const CLONE_NEWCGROUP: u64 = 0x0200_0000;
-    const CLONE_NEWUTS: u64 = 0x0400_0000;
-    const CLONE_NEWIPC: u64 = 0x0800_0000;
-    const CLONE_NEWPID: u64 = 0x2000_0000;
+/// The namespace `/proc/PID/ns/NAME` names: process PID's (`self` and
+/// `thread-self` for the caller) namespace of that kind. `None` for any
+/// other path; `Some(Err(ENOENT))` when the process or the name is unknown.
+fn linux_proc_namespace_at(path: &[u8]) -> Option<Result<linux_namespace::Reference, u64>> {
+    use linux_namespace::{Kind, Reference};
+    let rest = path.strip_prefix(b"/proc/")?;
+    let slash = rest.iter().position(|byte| *byte == b'/')?;
+    let name = rest[slash + 1..].strip_prefix(b"ns/")?;
+    let owner = &rest[..slash];
+    let pid = match owner {
+        b"self" | b"thread-self" => current_linux_process_pid(),
+        digits if !digits.is_empty() && digits.iter().all(u8::is_ascii_digit) => {
+            core::str::from_utf8(digits).ok()?.parse::<u32>().ok()?
+        }
+        _ => return None,
+    };
+    let Some(set) = linux_process::live_process_namespaces(pid) else {
+        return Some(Err(LINUX_ENOENT));
+    };
+    let other = |kind, id| {
+        Ok(Reference {
+            kind,
+            id,
+            handle: 0,
+        })
+    };
+    Some(match name {
+        b"user" => linux_process::live_process_user_namespace(pid)
+            .map(|handle| Reference {
+                kind: Kind::User,
+                id: handle.id(),
+                handle: handle.to_word(),
+            })
+            .ok_or(LINUX_ENOENT),
+        b"mnt" => if pid == current_linux_process_pid() {
+            linux_mount::current_handle()
+        } else {
+            linux_process_runtime_state(pid)
+                .filter(|state| state.valid)
+                .and_then(|state| state.mount_namespace)
+        }
+        .map(|handle| Reference {
+            kind: Kind::Mount,
+            id: handle.id(),
+            handle: handle.to_word(),
+        })
+        .ok_or(LINUX_ENOENT),
+        b"uts" => other(Kind::Uts, set.uts),
+        b"ipc" => other(Kind::Ipc, set.ipc),
+        b"pid" => other(Kind::Pid, set.pid),
+        b"pid_for_children" => other(Kind::Pid, set.pid_for_children),
+        b"time" => other(Kind::Time, set.time),
+        b"time_for_children" => other(Kind::Time, set.time_for_children),
+        // One network and one cgroup namespace per domain so far.
+        b"net" => other(Kind::Net, 0),
+        b"cgroup" => other(Kind::Cgroup, 0),
+        _ => Err(LINUX_ENOENT),
+    })
+}
+
+/// What readlink shows for a namespace: `uts:[4026531838]`.
+fn linux_namespace_link(reference: linux_namespace::Reference, output: &mut [u8; 32]) -> usize {
+    let mut used = 0;
+    let _ = append_linux_bytes(output, &mut used, reference.kind.name())
+        && append_linux_bytes(output, &mut used, b":[")
+        && append_linux_decimal(output, &mut used, reference.inode())
+        && append_linux_bytes(output, &mut used, b"]");
+    used
+}
+
+/// stat of a namespace file (nsfs): a read-only regular file whose inode
+/// tells namespaces apart; or with `follow` false, of the /proc/PID/ns
+/// link to it.
+fn linux_namespace_stat(
+    reference: linux_namespace::Reference,
+    follow: bool,
+) -> [u8; LINUX_STAT_SIZE] {
+    const NSFS_DEVICE: u64 = 4;
+    if !follow {
+        let mut link = [0_u8; 32];
+        let length = linux_namespace_link(reference, &mut link);
+        let mut stat = linux_stat(0o120_777, 0);
+        stat[48..56].copy_from_slice(&(length as u64).to_ne_bytes());
+        return stat;
+    }
+    let mut stat = linux_stat(0o100_444, reference.inode());
+    stat[..8].copy_from_slice(&NSFS_DEVICE.to_ne_bytes());
+    stat
+}
+
+/// stat, lstat (`follow` false) and statx of a /proc/PID/ns path: `None`
+/// for any other path.
+fn linux_proc_namespace_stat(
+    path: &[u8],
+    follow: bool,
+) -> Option<Result<[u8; LINUX_STAT_SIZE], u64>> {
+    Some(linux_proc_namespace_at(path)?.map(|reference| linux_namespace_stat(reference, follow)))
+}
+
+fn linux_namespace_descriptor(descriptor: u64) -> bool {
+    linux_device_descriptor(descriptor) & !3 == LINUX_DEVICE_NAMESPACE
+}
+
+/// The namespace a namespace descriptor (from /proc/PID/ns) refers to.
+fn linux_namespace_reference(descriptor: u64) -> Option<linux_namespace::Reference> {
+    if !linux_namespace_descriptor(descriptor) {
+        return None;
+    }
+    linux_namespace::Reference::from_word(
+        linux_descriptor_offset(descriptor).load(Ordering::SeqCst),
+    )
+}
+
+/// A new descriptor for namespace `reference`, as opening /proc/PID/ns/NAME
+/// or a NS_GET_* ioctl makes one.
+fn linux_open_namespace(reference: linux_namespace::Reference, close_on_exec: bool) -> u64 {
+    let Some(descriptor) = (LINUX_AUX_DESCRIPTOR_FIRST..linux_nofile_soft_limit())
+        .find(|descriptor| linux_aux_descriptor_free(*descriptor))
+    else {
+        return LINUX_EMFILE;
+    };
+    let index = (descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
+    X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index].store(
+        LINUX_DEVICE_NAMESPACE | LINUX_DESCRIPTOR_INPUT,
+        Ordering::SeqCst,
+    );
+    X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index].store(0, Ordering::SeqCst);
+    X86_RUNTIME.ELF_PROBE_DESCRIPTOR_OFFSETS[index].store(reference.to_word(), Ordering::SeqCst);
+    set_linux_descriptor_close_on_exec(descriptor, close_on_exec);
+    descriptor
+}
+
+/// Whether the caller holds CAP_SYS_ADMIN over a namespace owned by
+/// `owner` (`None`: the domain's initial user namespace): it does in its
+/// own user namespace and in those made below it.
+fn linux_namespace_capable(owner: Option<linux_user::UserNamespaceHandle>) -> bool {
+    let Some(caller) = current_linux_user_namespace() else {
+        return false;
+    };
+    linux_has_capability(ginux_credentials::capability::SYS_ADMIN)
+        && match owner {
+            Some(owner) => linux_user::may_signal(caller, owner),
+            None => linux_user::parent(caller).is_none(),
+        }
+}
+
+/// The user namespace owning namespace `reference` (for a user namespace,
+/// the one it was made in), if the caller's user namespace is it or lies
+/// above it (EPERM otherwise, as Linux's ns_get_owner).
+fn linux_namespace_owner(
+    reference: linux_namespace::Reference,
+) -> Result<linux_namespace::Reference, u64> {
+    let caller = current_linux_user_namespace().ok_or(LINUX_EPERM)?;
+    let owner = match reference.kind {
+        linux_namespace::Kind::User => linux_user::from_word(reference.handle)
+            .and_then(linux_user::parent)
+            .ok_or(LINUX_EPERM)?,
+        _ => linux_namespace::owner(linux_execution_instance(), reference.id)
+            .or_else(linux_user::initial)
+            .ok_or(LINUX_EPERM)?,
+    };
+    if !linux_user::may_signal(caller, owner) {
+        return Err(LINUX_EPERM);
+    }
+    Ok(linux_namespace::Reference {
+        kind: linux_namespace::Kind::User,
+        id: owner.id(),
+        handle: owner.to_word(),
+    })
+}
+
+/// The nsfs ioctls (Linux's fs/nsfs.c): the owning user namespace, the
+/// parent PID or user namespace (each as a new descriptor), the kind, and
+/// a user namespace's owner.
+fn linux_namespace_ioctl(descriptor: u64, request: u64, argument: u64) -> u64 {
+    const NS_GET_USERNS: u32 = 0xb701;
+    const NS_GET_PARENT: u32 = 0xb702;
+    const NS_GET_NSTYPE: u32 = 0xb703;
+    const NS_GET_OWNER_UID: u32 = 0xb704;
+    let Some(reference) = linux_namespace_reference(descriptor) else {
+        return LINUX_EBADF;
+    };
+    let related = match request as u32 {
+        NS_GET_USERNS => linux_namespace_owner(reference),
+        NS_GET_PARENT => match reference.kind {
+            linux_namespace::Kind::User => linux_namespace_owner(reference),
+            // The parent must be the caller's PID namespace or lie below it.
+            linux_namespace::Kind::Pid => {
+                let instance = linux_execution_instance();
+                let own = current_linux_namespaces().pid;
+                linux_namespace::pid_parent(instance, reference.id)
+                    .filter(|parent| linux_namespace::pid_within(instance, own, *parent))
+                    .map(|parent| linux_namespace::Reference {
+                        id: parent,
+                        ..reference
+                    })
+                    .ok_or(LINUX_EPERM)
+            }
+            _ => Err(LINUX_EINVAL),
+        },
+        NS_GET_NSTYPE => return reference.kind.clone_flag(),
+        NS_GET_OWNER_UID => {
+            if reference.kind != linux_namespace::Kind::User {
+                return LINUX_EINVAL;
+            }
+            // Root of the domain makes every user namespace here.
+            return if copy_to_linux_user(argument, &0_u32.to_ne_bytes()) {
+                0
+            } else {
+                LINUX_EFAULT
+            };
+        }
+        _ => return LINUX_ENOTTY,
+    };
+    match related {
+        Ok(related) => linux_open_namespace(related, true),
+        Err(error) => error,
+    }
+}
+
+/// setns(2) with a /proc/PID/ns descriptor: joins that namespace, checked
+/// as Linux's install operations check (EINVAL for a kind other than
+/// `kind` asks for, EPERM without CAP_SYS_ADMIN over it). A pidfd joins
+/// the namespaces of `kind` its process is in.
+fn linux_setns(descriptor: u64, kind: u64) -> u64 {
     const CLONE_NEWNET: u64 = 0x4000_0000;
-    const UNIMPLEMENTED: u64 =
-        CLONE_NEWTIME | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWPID | CLONE_NEWNET;
+    const CLONE_NEWCGROUP: u64 = 0x0200_0000;
+    const JOINABLE: u64 = LINUX_CLONE_NEWNS
+        | LINUX_CLONE_NEWUSER
+        | LINUX_CLONE_NEW_KEPT
+        | CLONE_NEWNET
+        | CLONE_NEWCGROUP;
+    let descriptor = u64::from(descriptor as u32);
+    let kind = u64::from(kind as u32);
+    if !linux_descriptor_open(descriptor) {
+        return LINUX_EBADF;
+    }
+    if let Some(reference) = linux_namespace_reference(descriptor) {
+        if kind != 0 && kind != reference.kind.clone_flag() {
+            return LINUX_EINVAL;
+        }
+        return linux_setns_join(reference);
+    }
+    if !linux_pidfd_descriptor(descriptor) || kind == 0 || kind & !JOINABLE != 0 {
+        return LINUX_EINVAL;
+    }
+    let Some(pid) = linux_pidfd_process(descriptor) else {
+        return LINUX_ESRCH;
+    };
+    // The user namespace first, which may grant the rights for the rest.
+    let mut kinds = linux_namespace::Kind::ALL;
+    kinds.sort_by_key(|candidate| *candidate != linux_namespace::Kind::User);
+    for candidate in kinds {
+        if kind & candidate.clone_flag() == 0 {
+            continue;
+        }
+        let mut path = [0_u8; 48];
+        let mut used = 0;
+        let built = append_linux_bytes(&mut path, &mut used, b"/proc/")
+            && append_linux_decimal(&mut path, &mut used, u64::from(pid))
+            && append_linux_bytes(&mut path, &mut used, b"/ns/")
+            && append_linux_bytes(&mut path, &mut used, candidate.name());
+        let reference = match built
+            .then(|| linux_proc_namespace_at(&path[..used]))
+            .flatten()
+        {
+            Some(Ok(reference)) => reference,
+            _ => return LINUX_ESRCH,
+        };
+        // Joining the user namespace the caller is in already changes nothing.
+        if candidate == linux_namespace::Kind::User
+            && current_linux_user_namespace().is_some_and(|own| own.to_word() == reference.handle)
+        {
+            continue;
+        }
+        let joined = linux_setns_join(reference);
+        if joined != 0 {
+            return joined;
+        }
+    }
+    0
+}
+
+/// Moves the calling process into namespace `reference`.
+fn linux_setns_join(reference: linux_namespace::Reference) -> u64 {
+    use linux_namespace::Kind;
+    let pid = current_linux_process_pid();
+    let instance = linux_execution_instance();
+    let threads = X86_RUNTIME
+        .LINUX_THREAD_STATES
+        .iter()
+        .filter(|state| state.load(Ordering::SeqCst) != LINUX_THREAD_FREE)
+        .count();
+    match reference.kind {
+        Kind::User => {
+            let Some(target) = linux_user::from_word(reference.handle) else {
+                return LINUX_EINVAL;
+            };
+            if current_linux_user_namespace() == Some(target) || threads > 1 {
+                return LINUX_EINVAL;
+            }
+            if !linux_namespace_capable(Some(target)) {
+                return LINUX_EPERM;
+            }
+            return if linux_process::set_live_process_user_namespace(pid, target) {
+                0
+            } else {
+                LINUX_ESRCH
+            };
+        }
+        Kind::Mount => {
+            let Some(target) = linux_mount::from_word(reference.handle) else {
+                return LINUX_EINVAL;
+            };
+            if threads > 1 {
+                return LINUX_EINVAL;
+            }
+            if !linux_namespace_capable(None) {
+                return LINUX_EPERM;
+            }
+            let Some(state) = linux_process_runtime_state(pid).filter(|state| state.valid) else {
+                return LINUX_ESRCH;
+            };
+            if !linux_mount::switch_to(target) {
+                return LINUX_ENOMEM;
+            }
+            state.mount_namespace = Some(target);
+            return 0;
+        }
+        // One network and one cgroup namespace per domain: joining it
+        // changes nothing.
+        Kind::Net | Kind::Cgroup => {
+            return if linux_namespace_capable(None) {
+                0
+            } else {
+                LINUX_EPERM
+            };
+        }
+        Kind::Uts | Kind::Ipc | Kind::Pid | Kind::Time => {}
+    }
+    if !linux_namespace::exists(instance, reference.kind, reference.id) {
+        return LINUX_EINVAL;
+    }
+    if reference.kind == Kind::Time && threads > 1 {
+        return LINUX_EUSERS;
+    }
+    if !linux_namespace_capable(linux_namespace::owner(instance, reference.id)) {
+        return LINUX_EPERM;
+    }
+    let mut set = current_linux_namespaces();
+    match reference.kind {
+        Kind::Uts => set.uts = reference.id,
+        Kind::Ipc => set.ipc = reference.id,
+        // Children are born into a PID namespace at or below the caller's.
+        Kind::Pid => {
+            if !linux_namespace::pid_within(instance, set.pid, reference.id) {
+                return LINUX_EINVAL;
+            }
+            set.pid_for_children = reference.id;
+        }
+        _ => {
+            set.time = reference.id;
+            set.time_for_children = reference.id;
+        }
+    }
+    if !linux_process::set_live_process_namespaces(pid, set) {
+        return LINUX_ESRCH;
+    }
+    if reference.kind == Kind::Time {
+        linux_namespace::freeze_time(instance, reference.id);
+        let _ = refresh_linux_vvar();
+    }
+    0
+}
+
+/// CLONE_NEWUTS, CLONE_NEWIPC, CLONE_NEWPID and CLONE_NEWTIME: the
+/// namespaces `linux_namespace` keeps.
+const LINUX_CLONE_NEW_KEPT: u64 =
+    LINUX_CLONE_NEWUTS | LINUX_CLONE_NEWIPC | LINUX_CLONE_NEWPID | LINUX_CLONE_NEWTIME;
+const LINUX_CLONE_NEWTIME: u64 = 0x80;
+/// The namespaces clone(2) (not clone3) may make for a new process; its
+/// CLONE_NEWTIME bit is the exit signal's.
+const LINUX_CLONE_PROCESS_NAMESPACES: u64 = LINUX_CLONE_NEWNS
+    | LINUX_CLONE_NEWUSER
+    | LINUX_CLONE_NEWUTS
+    | LINUX_CLONE_NEWIPC
+    | LINUX_CLONE_NEWPID;
+const LINUX_CLONE_NEWUTS: u64 = 0x0400_0000;
+const LINUX_CLONE_NEWIPC: u64 = 0x0800_0000;
+const LINUX_CLONE_NEWPID: u64 = 0x2000_0000;
+
+/// Process `global` as process `observer` sees it: its number in the PID
+/// namespace `observer` lives in, or 0 when it lies outside that one.
+fn linux_pid_seen_by(observer: u32, global: u32) -> u32 {
+    if !linux_namespace::any(linux_namespace::Kind::Pid) {
+        return global;
+    }
+    let namespace = linux_process::live_process_namespaces(observer).map_or(0, |set| set.pid);
+    linux_namespace::pid_seen_from(linux_execution_instance(), namespace, global).unwrap_or(0)
+}
+
+/// The process the current process calls `local` (its own PID namespace's
+/// number), by global number: `None` when it sees no such process.
+fn linux_pid_from_caller(local: u32) -> Option<u32> {
+    if !linux_namespace::any(linux_namespace::Kind::Pid) {
+        return Some(local);
+    }
+    linux_namespace::pid_global(
+        linux_execution_instance(),
+        current_linux_namespaces().pid,
+        local,
+    )
+}
+
+/// A pid argument of the current process's (kill, wait4) as the kernel
+/// numbers processes: positive ones are translated from its PID namespace,
+/// and one it sees no process for is `Err(())`.
+fn linux_pid_argument(argument: u64) -> Result<u64, ()> {
+    let pid = argument as i32;
+    if pid <= 0 {
+        return Ok(argument);
+    }
+    linux_pid_from_caller(pid as u32).map(u64::from).ok_or(())
+}
+
+/// A thread id of the current process's: a process's main thread by its
+/// number in the caller's PID namespace; other threads keep their ids.
+fn linux_tid_argument(argument: u64) -> u64 {
+    let tid = argument as i32;
+    if tid <= 0 {
+        return argument;
+    }
+    linux_pid_from_caller(tid as u32).map_or(argument, u64::from)
+}
+
+/// The current thread's id as it sees it: the main thread's is its
+/// process's number in its PID namespace.
+fn linux_tid_seen(tid: u32) -> u32 {
+    let pid = current_linux_process_pid();
+    if tid == pid {
+        linux_pid_seen_by(pid, pid)
+    } else {
+        tid
+    }
+}
+
+/// A PID namespace's first process (its init, number 1 there) exiting
+/// takes every other process of the namespace with it (SIGKILL), as Linux's
+/// zap_pid_ns_processes does.
+fn linux_end_pid_namespace(pid: u32) {
+    if !linux_namespace::any(linux_namespace::Kind::Pid) {
+        return;
+    }
+    let Some(namespace) = linux_process::live_process_namespaces(pid)
+        .map(|set| set.pid)
+        .filter(|namespace| *namespace != 0)
+    else {
+        return;
+    };
+    if linux_pid_seen_by(pid, pid) != 1 {
+        return;
+    }
+    for member in linux_namespace::pid_members(linux_execution_instance(), namespace) {
+        if member != pid
+            && linux_process::live_process_status(member)
+                .is_some_and(|status| status.state != linux_process::LiveProcessState::Zombie)
+        {
+            let _ = linux_queue_process_signal(member, LINUX_SIGKILL, LINUX_SI_KERNEL, None);
+        }
+    }
+}
+
+/// The namespaces of the current process (all initial when it has none).
+fn current_linux_namespaces() -> linux_namespace::Set {
+    linux_process::live_process_namespaces(current_linux_process_pid()).unwrap_or_default()
+}
+
+/// `set` with the new namespaces CLONE_NEWUTS, CLONE_NEWIPC, CLONE_NEWPID
+/// and CLONE_NEWTIME in `flags` ask for, owned by `owner`, and copied from
+/// the current process's: as a fork child's (`child`), which lives in the
+/// new PID and time namespaces, or as unshare's caller's, whose children
+/// will.
+fn linux_create_namespaces(
+    mut set: linux_namespace::Set,
+    flags: u64,
+    owner: linux_user::UserNamespaceHandle,
+    child: bool,
+) -> Result<linux_namespace::Set, u64> {
+    let instance = linux_execution_instance();
+    let failed = |error| match error {
+        linux_namespace::Error::NoMemory => LINUX_ENOMEM,
+        linux_namespace::Error::Invalid => LINUX_EINVAL,
+        _ => LINUX_ENOSPC,
+    };
+    if flags & LINUX_CLONE_NEWUTS != 0 {
+        let mut host = [0_u8; LINUX_UTS_NAME_CAPACITY];
+        let mut domain = [0_u8; LINUX_UTS_NAME_CAPACITY];
+        let host_length = linux_uts_name(LINUX_UTS_HOST, &mut host);
+        let domain_length = linux_uts_name(LINUX_UTS_DOMAIN, &mut domain);
+        set.uts = linux_namespace::create_uts(
+            instance,
+            owner,
+            &host[..host_length],
+            &domain[..domain_length],
+        )
+        .map_err(failed)?;
+    }
+    if flags & LINUX_CLONE_NEWIPC != 0 {
+        set.ipc = linux_namespace::create_ipc(instance, owner).map_err(failed)?;
+    }
+    if flags & LINUX_CLONE_NEWPID != 0 {
+        // Only a process whose children are born where it lives makes one
+        // below it (Linux's copy_pid_ns).
+        if !child && set.pid_for_children != set.pid {
+            return Err(LINUX_EINVAL);
+        }
+        set.pid_for_children =
+            linux_namespace::create_pid(instance, owner, set.pid_for_children).map_err(failed)?;
+        if child {
+            set.pid = set.pid_for_children;
+        }
+    }
+    if flags & LINUX_CLONE_NEWTIME != 0 {
+        set.time_for_children =
+            linux_namespace::create_time(instance, owner, set.time_for_children).map_err(failed)?;
+        if child {
+            set.time = set.time_for_children;
+        }
+    }
+    Ok(set)
+}
+
+/// unshare(2). Unsharing what a single-threaded process already has alone
+/// (its filesystem context, signal handlers, address space, SysV semaphore
+/// undo) does nothing; a descriptor table a CLONE_FILES child was given
+/// becomes its own (EMFILE if it holds a descriptor above nr_open); a new
+/// user, mount, UTS or IPC namespace replaces the caller's, and a new PID
+/// or time namespace is where its children will be born. Network and
+/// cgroup namespaces are not implemented yet.
+fn linux_unshare(flags: u64) -> u64 {
+    const CLONE_NEWCGROUP: u64 = 0x0200_0000;
+    const CLONE_NEWNET: u64 = 0x4000_0000;
+    const UNIMPLEMENTED: u64 = CLONE_NEWCGROUP | CLONE_NEWNET;
     const SHARED_WITH_THREADS: u64 = LINUX_CLONE_THREAD | LINUX_CLONE_SIGHAND | LINUX_CLONE_VM;
     const KNOWN: u64 = UNIMPLEMENTED
+        | LINUX_CLONE_NEW_KEPT
         | SHARED_WITH_THREADS
         | LINUX_CLONE_FS
         | LINUX_CLONE_FILES
@@ -14044,7 +14600,7 @@ fn linux_unshare(flags: u64) -> u64 {
     };
     // Making namespaces other than a user namespace needs CAP_SYS_ADMIN,
     // which a new user namespace grants its creator.
-    let new_namespaces = flags & (UNIMPLEMENTED | LINUX_CLONE_NEWNS);
+    let new_namespaces = flags & (UNIMPLEMENTED | LINUX_CLONE_NEW_KEPT | LINUX_CLONE_NEWNS);
     if new_namespaces != 0
         && flags & LINUX_CLONE_NEWUSER == 0
         && !credentials.has(ginux_credentials::capability::SYS_ADMIN)
@@ -14055,6 +14611,16 @@ fn linux_unshare(flags: u64) -> u64 {
         return LINUX_EINVAL;
     }
     let pid = current_linux_process_pid();
+    // Copying a table shared with another process fails when it holds a
+    // descriptor at or above nr_open (Linux's dup_fd); a table the process
+    // has alone stays as it is.
+    if flags & LINUX_CLONE_FILES != 0 && linux_process::live_process_shares_descriptors(pid) {
+        if (linux_nr_open()..LINUX_AUX_DESCRIPTOR_LIMIT).any(linux_descriptor_open) {
+            return LINUX_EMFILE;
+        }
+        let _ = linux_process::set_live_process_shares_descriptors(pid, false);
+    }
+    let mut owner = namespace;
     if flags & LINUX_CLONE_NEWUSER != 0 {
         let Some(child) = linux_user::clone_namespace(namespace) else {
             return LINUX_ENOSPC;
@@ -14062,6 +14628,17 @@ fn linux_unshare(flags: u64) -> u64 {
         if !linux_process::set_live_process_user_namespace(pid, child) {
             let _ = linux_user::retire(child);
             return LINUX_ENOMEM;
+        }
+        owner = child;
+    }
+    if flags & LINUX_CLONE_NEW_KEPT != 0 {
+        let namespaces =
+            match linux_create_namespaces(current_linux_namespaces(), flags, owner, false) {
+                Ok(namespaces) => namespaces,
+                Err(error) => return error,
+            };
+        if !linux_process::set_live_process_namespaces(pid, namespaces) {
+            return LINUX_ESRCH;
         }
     }
     if flags & LINUX_CLONE_NEWNS != 0 {
@@ -14399,8 +14976,7 @@ fn linux_deny_privileged_operation(number: u64) -> u64 {
 fn linux_request_process_fork(
     runtime_mode: bool,
     caller: LinuxUserContext,
-    new_mount_namespace: bool,
-    new_user_namespace: bool,
+    clone_flags: u64,
     child_stack: u64,
     share_vm: bool,
     pidfd_address: u64,
@@ -14408,6 +14984,35 @@ fn linux_request_process_fork(
     clear_sighand: bool,
     own_pages: bool,
 ) -> u64 {
+    // A CLONE_FILES child counts as sharing its parent's descriptor table.
+    if !linux_process::set_live_process_child_shares_descriptors(
+        current_linux_process_pid(),
+        clone_flags & LINUX_CLONE_FILES != 0,
+    ) {
+        return LINUX_ESRCH;
+    }
+    // The child's new UTS, IPC, PID and time namespaces are made now, in
+    // the caller, so a failure is the call's; the fork takes them.
+    if clone_flags & LINUX_CLONE_NEW_KEPT != 0 {
+        let Some(owner) = current_linux_user_namespace() else {
+            return LINUX_ESRCH;
+        };
+        let namespaces = match linux_create_namespaces(
+            current_linux_namespaces().for_child(),
+            clone_flags,
+            owner,
+            true,
+        ) {
+            Ok(namespaces) => namespaces,
+            Err(error) => return error,
+        };
+        if !linux_process::set_live_process_child_namespaces(
+            current_linux_process_pid(),
+            Some(namespaces),
+        ) {
+            return LINUX_ESRCH;
+        }
+    }
     // vfork/CLONE_VM inherits the already-owned address space. Updating only
     // the execution context avoids manufacturing a page-per-leaf snapshot for
     // a child that will share the parent's mappings until exec or exit.
@@ -14487,14 +15092,15 @@ fn linux_request_process_fork(
             }
             serial_write("\r\n");
         }
+        let _ = linux_process::set_live_process_child_namespaces(current_linux_process_pid(), None);
         LINUX_EAGAIN
     } else {
         X86_RUNTIME
             .LINUX_FORK_NEW_MOUNT_NAMESPACE
-            .store(new_mount_namespace, Ordering::SeqCst);
+            .store(clone_flags & LINUX_CLONE_NEWNS != 0, Ordering::SeqCst);
         X86_RUNTIME
             .LINUX_FORK_NEW_USER_NAMESPACE
-            .store(new_user_namespace, Ordering::SeqCst);
+            .store(clone_flags & LINUX_CLONE_NEWUSER != 0, Ordering::SeqCst);
         X86_RUNTIME
             .LINUX_FORK_CHILD_STACK
             .store(child_stack, Ordering::SeqCst);
@@ -14606,7 +15212,10 @@ fn linux_clone3(
         return LINUX_EPERM;
     }
     if set_tid_size != 0
-        || flags & NAMESPACE_FLAGS & !(LINUX_CLONE_NEWNS | LINUX_CLONE_NEWUSER) != 0
+        || flags
+            & NAMESPACE_FLAGS
+            & !(LINUX_CLONE_NEWNS | LINUX_CLONE_NEWUSER | LINUX_CLONE_NEW_KEPT)
+            != 0
     {
         return LINUX_EINVAL;
     }
@@ -14620,6 +15229,7 @@ fn linux_clone3(
         | LINUX_CLONE_VFORK
         | LINUX_CLONE_NEWNS
         | LINUX_CLONE_NEWUSER
+        | LINUX_CLONE_NEW_KEPT
         | LINUX_CLONE_CLEAR_SIGHAND
         | LINUX_CLONE_INTO_CGROUP
         | LINUX_CLONE_FS
@@ -14670,8 +15280,7 @@ fn linux_clone3(
         let result = linux_request_process_fork(
             true,
             caller,
-            flags & LINUX_CLONE_NEWNS != 0,
-            flags & LINUX_CLONE_NEWUSER != 0,
+            flags,
             child_stack,
             flags & LINUX_CLONE_VM != 0,
             if flags & LINUX_CLONE_PIDFD != 0 {
@@ -15177,6 +15786,11 @@ fn linux_exit_child_to_parent(output: *mut LinuxSyscallFrame, caller: LinuxUserC
 
 fn current_linux_process_pid() -> u32 {
     X86_RUNTIME.LINUX_CURRENT_PROCESS_PID.load(Ordering::SeqCst)
+}
+
+/// The process this CPU runs (0: none).
+pub(crate) fn current_linux_process_id() -> u32 {
+    current_linux_process_pid()
 }
 
 fn linux_child_exited(pid: u32) -> bool {
@@ -15746,13 +16360,27 @@ fn linux_wait4_live(
     rusage: u64,
     caller: LinuxUserContext,
 ) -> u64 {
+    let Ok(pid) = linux_pid_argument(pid) else {
+        return LINUX_ECHILD;
+    };
+    // The child's number as the waiting process sees it.
+    let seen = |result: u64| {
+        if (1..=u64::from(u32::MAX)).contains(&result) {
+            u64::from(linux_pid_seen_by(
+                current_linux_process_pid(),
+                result as u32,
+            ))
+        } else {
+            result
+        }
+    };
     loop {
         let result = linux_wait4(pid, status_address, options, rusage);
         if options as u32 as u64 & LINUX_WNOHANG != 0 {
-            return linux_wait_nohang_live_return(result, caller);
+            return seen(linux_wait_nohang_live_return(result, caller));
         }
         if result != LINUX_ENOSYS {
-            return result;
+            return seen(result);
         }
         match run_other_linux_processes(output, caller, LINUX_WAIT4_SYSCALL) {
             Some(LinuxBlockedWait::Recheck) => {}
@@ -29722,6 +30350,20 @@ fn linux_readlink_at(
             LINUX_EFAULT
         };
     }
+    if let Some(reference) = linux_proc_namespace_at(path) {
+        let reference = match reference {
+            Ok(reference) => reference,
+            Err(error) => return error,
+        };
+        let mut link = [0_u8; 32];
+        let length = linux_namespace_link(reference, &mut link)
+            .min(usize::try_from(output_size).unwrap_or(usize::MAX));
+        return if copy_to_linux_user(output_address, &link[..length]) {
+            length as u64
+        } else {
+            LINUX_EFAULT
+        };
+    }
     if let Some(descriptor) = linux_descriptor_link_at(directory, path, false) {
         let mut target = [0_u8; crate::linux_overlay::PATH_CAPACITY];
         let Some(target_length) = linux_descriptor_link_target(descriptor, &mut target) else {
@@ -30047,9 +30689,17 @@ static LINUX_UTS_NAMES: [[[AtomicU8; LINUX_UTS_NAME_CAPACITY]; 2]; control_abi::
 static LINUX_UTS_LENGTHS: [[AtomicU8; 2]; control_abi::DOMAIN_LIMIT] =
     [const { [const { AtomicU8::new(0) }; 2] }; control_abi::DOMAIN_LIMIT];
 
-/// The current domain's host (`LINUX_UTS_HOST`) or domain name into
-/// `output`, its length returned.
+/// The current process's host (`LINUX_UTS_HOST`) or domain name into
+/// `output`, its length returned: its UTS namespace's, or the domain's.
 fn linux_uts_name(kind: usize, output: &mut [u8; LINUX_UTS_NAME_CAPACITY]) -> usize {
+    let namespace = current_linux_namespaces().uts;
+    if namespace != 0 {
+        if let Some(length) =
+            linux_namespace::uts_name(linux_execution_instance(), namespace, kind, output)
+        {
+            return length;
+        }
+    }
     let set = current_container_slot().and_then(|slot| {
         let length = usize::from(LINUX_UTS_LENGTHS[slot][kind].load(Ordering::Acquire));
         (length != 0).then(|| {
@@ -30075,6 +30725,10 @@ fn linux_uts_name(kind: usize, output: &mut [u8; LINUX_UTS_NAME_CAPACITY]) -> us
 }
 
 fn linux_uts_set(kind: usize, name: &[u8]) -> bool {
+    let namespace = current_linux_namespaces().uts;
+    if namespace != 0 {
+        return linux_namespace::set_uts_name(linux_execution_instance(), namespace, kind, name);
+    }
     let Some(slot) = current_container_slot() else {
         return false;
     };
@@ -30140,6 +30794,14 @@ fn linux_proc_sysctl_set(path: &[u8], value: i64) {
         return;
     };
     LINUX_SYSCTL_OVERRIDES[slot][index].store(value, Ordering::Release);
+}
+
+/// The most descriptors a process of the current domain may have:
+/// `/proc/sys/fs/nr_open` as written, else the built-in.
+fn linux_nr_open() -> u64 {
+    linux_proc_sysctl_value(b"sys/fs/nr_open")
+        .and_then(|value| u64::try_from(value).ok())
+        .unwrap_or(LINUX_NR_OPEN)
 }
 
 /// The most memory areas a process of the current domain may have:
@@ -30568,6 +31230,7 @@ fn linux_proc_pid_file_kind(pid: u32, name: &[u8]) -> Option<u16> {
         (_, b"cgroup") => Some(LINUX_FILE_PROC_CGROUP),
         (_, b"coredump_filter") => Some(LINUX_FILE_PROC_COREDUMP_FILTER),
         (_, b"oom_score_adj") => Some(LINUX_FILE_PROC_OOM_SCORE_ADJ),
+        (_, b"timens_offsets") => Some(LINUX_FILE_PROC_TIMENS_OFFSETS),
         (_, b"mounts") => Some(LINUX_FILE_PROC_MOUNTS),
         (1, b"cmdline") if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) => {
             Some(LINUX_FILE_PROC_PROCESS_CMDLINE)
@@ -34408,6 +35071,14 @@ fn linux_openat_path(
     if access != 0 && linux_path_executing(directory, path) {
         return LINUX_ETXTBSY;
     }
+    // /proc/PID/ns/NAME opens the namespace (nsfs), read-only.
+    if let Some(reference) = linux_proc_namespace_at(path) {
+        return match reference {
+            Ok(_) if access != 0 || flags & LINUX_O_CREAT != 0 => LINUX_EACCES,
+            Ok(reference) => linux_open_namespace(reference, flags & LINUX_O_CLOEXEC != 0),
+            Err(error) => error,
+        };
+    }
     let tmp_path = path == b"/tmp/ginux-ready";
     let proc_fdinfo_target = linux_proc_fdinfo_target(path);
     let proc_dynamic_pid = linux_proc_process_file(path)
@@ -34422,6 +35093,7 @@ fn linux_openat_path(
                     | b"pagemap"
                     | b"mem"
                     | b"oom_score_adj"
+                    | b"timens_offsets"
                     | b"comm"
                     | b"task"
                     | b"task/"
@@ -35611,6 +36283,13 @@ fn linux_newfstatat(directory: u64, path_address: u64, stat_address: u64, flags:
             0
         } else {
             LINUX_EFAULT
+        };
+    }
+    if let Some(stat) = linux_proc_namespace_stat(path, flags & LINUX_AT_SYMLINK_NOFOLLOW == 0) {
+        return match stat {
+            Ok(stat) if copy_to_linux_user(stat_address, &stat) => 0,
+            Ok(_) => LINUX_EFAULT,
+            Err(error) => error,
         };
     }
     if path.is_empty() {
@@ -37709,6 +38388,14 @@ fn linux_faccessat(directory: u64, path_address: u64, mode: u64, flags: u64) -> 
             || mode & 1 != 0 && permissions & 0o111 == 0;
         return if denied { LINUX_EACCES } else { 0 };
     }
+    // Namespace files are read-only (0444), which root may still write.
+    if let Some(reference) = linux_proc_namespace_at(path) {
+        return match reference {
+            Ok(_) if mode & 1 != 0 => LINUX_EACCES,
+            Ok(_) => 0,
+            Err(error) => error,
+        };
+    }
     if let Some(kind) = linux_virtual_mount_path_at(directory, path) {
         // A /proc file the domain may write (sysctls and the like) is
         // writable by root, as its 0644 mode says (shmget02's save of
@@ -37859,6 +38546,13 @@ fn linux_statx(directory: u64, path_address: u64, flags: u64, mask: u64, stat_ad
             0
         } else {
             LINUX_EFAULT
+        };
+    }
+    if let Some(stat) = linux_proc_namespace_stat(path, flags & LINUX_AT_SYMLINK_NOFOLLOW == 0) {
+        return match stat {
+            Ok(stat) if copy_to_linux_user(stat_address, &linux_statx_from_stat(&stat)) => 0,
+            Ok(_) => LINUX_EFAULT,
+            Err(error) => error,
         };
     }
     if let Some(stat) =
@@ -40560,6 +41254,7 @@ fn linux_descriptor_read(descriptor: u64, address: u64, count: u64) -> u64 {
             | LINUX_FILE_PROC_DYNAMIC_PAGEMAP
             | LINUX_FILE_PROC_DYNAMIC_MEM
             | LINUX_FILE_PROC_OOM_SCORE_ADJ
+            | LINUX_FILE_PROC_TIMENS_OFFSETS
             | LINUX_FILE_PROC_TASK_COMM
             | LINUX_FILE_PROC_TASK_STAT
     ) || linux_proc_sysctl_index(device).is_some()
@@ -40882,6 +41577,7 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
             | LINUX_FILE_PROC_DYNAMIC_STATUS
             | LINUX_FILE_PROC_DYNAMIC_STATM
             | LINUX_FILE_PROC_OOM_SCORE_ADJ
+            | LINUX_FILE_PROC_TIMENS_OFFSETS
             | LINUX_FILE_PROC_TASK_COMM
     ) {
         let Some(pid) = linux_proc_dynamic_descriptor_pid(descriptor) else {
@@ -40953,6 +41649,9 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
             LINUX_FILE_PROC_TASK_COMM => {
                 append_linux_bytes(&mut file, &mut used, linux_process_name(pid, &mut name))
                     && append_linux_bytes(&mut file, &mut used, b"\n")
+            }
+            LINUX_FILE_PROC_TIMENS_OFFSETS => {
+                linux_proc_timens_offsets(pid, &mut file, &mut used)
             }
             LINUX_FILE_PROC_OOM_SCORE_ADJ => {
                 linux_process::live_process_oom_score_adj(pid).is_some_and(|value| {
@@ -43244,7 +43943,7 @@ fn linux_timer_settime(timer: u64, flags: u64, new_address: u64, old_address: u6
             now.saturating_sub(wall_now - value).max(1)
         }
     } else {
-        value.max(1)
+        linux_time_namespace_host(u64::from(current.clock), value).max(1)
     };
     if old_address != 0 && !copy_to_linux_user(old_address, &old) {
         return LINUX_EFAULT;
@@ -43414,7 +44113,7 @@ fn linux_timerfd_settime(descriptor: u64, flags: u64, new_address: u64, old_addr
         };
         now.saturating_add(value.saturating_sub(realtime_now))
     } else if flags & LINUX_TFD_TIMER_ABSTIME != 0 {
-        value
+        linux_time_namespace_host(clock, value)
     } else {
         let Some(deadline) = now.checked_add(value) else {
             return LINUX_EINVAL;
@@ -48153,6 +48852,9 @@ fn linux_descriptor_write(descriptor: u64, address: u64, count: u64) -> u64 {
         }
         return result;
     }
+    if device & !3 == LINUX_FILE_PROC_TIMENS_OFFSETS {
+        return linux_proc_timens_offsets_write(descriptor, device, address, count);
+    }
     if let Some(index) = linux_proc_sysctl_index(device) {
         if LINUX_PROC_SYSCTLS[index].1 == b"sys/kernel/domainname" {
             return linux_proc_domainname_write(device, address, count);
@@ -48541,6 +49243,122 @@ fn linux_show_thread_state(thread: &LinuxThreadRuntimeState) {
     serial_write("\r\n");
 }
 
+/// `/proc/PID/timens_offsets`: the CLOCK_MONOTONIC and CLOCK_BOOTTIME
+/// offsets of the time namespace process `pid`'s children are born into,
+/// as Linux prints them (`monotonic  SECONDS NANOSECONDS`).
+fn linux_proc_timens_offsets(pid: u32, file: &mut [u8], used: &mut usize) -> bool {
+    let Some(set) = linux_process::live_process_namespaces(pid) else {
+        return false;
+    };
+    let offsets = linux_namespace::time_offsets(linux_execution_instance(), set.time_for_children);
+    let field = |bytes: &[u8], width: usize, file: &mut [u8], used: &mut usize| {
+        (bytes.len()..width).all(|_| append_linux_bytes(file, used, b" "))
+            && append_linux_bytes(file, used, bytes)
+    };
+    [
+        (b"monotonic" as &[u8], offsets[0]),
+        (b"boottime", offsets[1]),
+    ]
+    .into_iter()
+    .all(|(name, offset)| {
+        let seconds = offset.div_euclid(NANOSECONDS_PER_SECOND as i64);
+        let nanoseconds = offset.rem_euclid(NANOSECONDS_PER_SECOND as i64);
+        let mut number = [0_u8; 24];
+        let mut length = 0;
+        let mut nanosecond_text = [0_u8; 24];
+        let mut nanosecond_length = 0;
+        append_linux_bytes(file, used, name)
+            && (name.len()..10).all(|_| append_linux_bytes(file, used, b" "))
+            && append_linux_bytes(file, used, b" ")
+            && (seconds >= 0 || append_linux_bytes(&mut number, &mut length, b"-"))
+            && append_linux_decimal(&mut number, &mut length, seconds.unsigned_abs())
+            && field(&number[..length], 10, file, used)
+            && append_linux_bytes(file, used, b" ")
+            && append_linux_decimal(
+                &mut nanosecond_text,
+                &mut nanosecond_length,
+                nanoseconds as u64,
+            )
+            && field(&nanosecond_text[..nanosecond_length], 9, file, used)
+            && append_linux_bytes(file, used, b"\n")
+    })
+}
+
+/// Sets the offsets `/proc/PID/timens_offsets` shows, from lines of a clock
+/// (`monotonic` or 1, `boottime` or 7), seconds and nanoseconds: only
+/// before a process entered the namespace (EACCES), and only for root over
+/// it (EPERM).
+fn linux_proc_timens_offsets_write(descriptor: u64, device: u16, address: u64, count: u64) -> u64 {
+    if device & 3 & LINUX_DESCRIPTOR_OUTPUT == 0 {
+        return LINUX_EBADF;
+    }
+    let Some(pid) = linux_proc_dynamic_descriptor_pid(descriptor) else {
+        return LINUX_EBADF;
+    };
+    let mut text = [0_u8; 128];
+    let Some(length) = usize::try_from(count)
+        .ok()
+        .filter(|length| *length < text.len())
+    else {
+        return LINUX_EINVAL;
+    };
+    if !copy_from_linux_user(address, &mut text[..length]) {
+        return LINUX_EFAULT;
+    }
+    let mut offsets = [None; 2];
+    for line in text[..length]
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .take(2)
+    {
+        let mut fields = line
+            .split(|byte| byte.is_ascii_whitespace())
+            .filter(|field| !field.is_empty());
+        let (Some(clock), Some(seconds), Some(nanoseconds)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            return LINUX_EINVAL;
+        };
+        let index = match clock {
+            b"monotonic" | b"1" => 0,
+            b"boottime" | b"7" => 1,
+            _ => return LINUX_EINVAL,
+        };
+        let parse = |field: &[u8]| core::str::from_utf8(field).ok()?.parse::<i64>().ok();
+        let (Some(seconds), Some(nanoseconds)) = (parse(seconds), parse(nanoseconds)) else {
+            return LINUX_EINVAL;
+        };
+        if !(0..NANOSECONDS_PER_SECOND as i64).contains(&nanoseconds) {
+            return LINUX_EINVAL;
+        }
+        // The clock moved by the offset stays within what it can show.
+        let Some(offset) = seconds
+            .checked_mul(NANOSECONDS_PER_SECOND as i64)
+            .and_then(|offset| offset.checked_add(nanoseconds))
+            .filter(|offset| {
+                linux_elapsed_nanoseconds()
+                    .is_some_and(|now| i128::from(now) + i128::from(*offset) >= 0)
+            })
+        else {
+            return LINUX_ERANGE;
+        };
+        offsets[index] = Some(offset);
+    }
+    let Some(set) = linux_process::live_process_namespaces(pid) else {
+        return LINUX_ESRCH;
+    };
+    let instance = linux_execution_instance();
+    if !linux_namespace_capable(linux_namespace::owner(instance, set.time_for_children)) {
+        return LINUX_EPERM;
+    }
+    match linux_namespace::set_time_offsets(instance, set.time_for_children, offsets[0], offsets[1])
+    {
+        Ok(()) => count,
+        Err(linux_namespace::Error::Frozen) => LINUX_EACCES,
+        Err(_) => LINUX_EINVAL,
+    }
+}
+
 fn linux_proc_oom_score_adj_write(descriptor: u64, device: u16, address: u64, count: u64) -> u64 {
     if device & 3 & LINUX_DESCRIPTOR_OUTPUT == 0 {
         return LINUX_EBADF;
@@ -48608,6 +49426,7 @@ fn linux_descriptor_writev(descriptor: u64, vectors: u64, count: u64) -> u64 {
         || linux_tmp_file(device)
         || device & !3 == LINUX_FILE_PROC_OOM_SCORE_ADJ
         || device & !3 == LINUX_FILE_PROC_DYNAMIC_MEM
+        || device & !3 == LINUX_FILE_PROC_TIMENS_OFFSETS
         || device & !3 == LINUX_FILE_PROC_SYSRQ_TRIGGER
         || linux_proc_sysctl_index(device).is_some()
     {
@@ -49680,6 +50499,7 @@ fn linux_proc_dynamic_descriptor_pid(descriptor: u64) -> Option<u32> {
             | LINUX_FILE_PROC_DYNAMIC_PAGEMAP
             | LINUX_FILE_PROC_DYNAMIC_MEM
             | LINUX_FILE_PROC_OOM_SCORE_ADJ
+            | LINUX_FILE_PROC_TIMENS_OFFSETS
             | LINUX_FILE_PROC_TASK_COMM
             | LINUX_FILE_PROC_TASK_STAT
             | LINUX_PROC_TASK_DIRECTORY
@@ -49722,6 +50542,7 @@ fn linux_proc_file(state: u16) -> bool {
             | LINUX_FILE_PROC_FILE_MAX
             | LINUX_FILE_PROC_NR_OPEN
             | LINUX_FILE_PROC_OOM_SCORE_ADJ
+            | LINUX_FILE_PROC_TIMENS_OFFSETS
             | LINUX_FILE_PROC_SYSRQ_TRIGGER
             | LINUX_FILE_PROC_USER_NAMESPACE
             | LINUX_FILE_PROC_FDINFO
@@ -49751,6 +50572,7 @@ fn linux_writable_proc_file(state: u16) -> bool {
             | LINUX_FILE_PROC_NR_OPEN
             | LINUX_FILE_PROC_OOM_SCORE_ADJ
             | LINUX_FILE_PROC_DYNAMIC_MEM
+            | LINUX_FILE_PROC_TIMENS_OFFSETS
             | LINUX_FILE_PROC_SYSRQ_TRIGGER
             | LINUX_FILE_PROC_UID_MAP
             | LINUX_FILE_PROC_GID_MAP
@@ -49772,7 +50594,11 @@ fn linux_user_namespace_file(state: u16) -> Option<&'static [u8]> {
 /// account and reports as zero.
 fn linux_proc_uptime() -> &'static [u8] {
     static mut UPTIME: [u8; 32] = [0; 32];
-    let centiseconds = linux_elapsed_nanoseconds().unwrap_or(0) / 10_000_000;
+    // CLOCK_BOOTTIME as the reader's time namespace shows it.
+    let centiseconds = linux_elapsed_nanoseconds()
+        .unwrap_or(0)
+        .saturating_add_signed(linux_time_namespace_offset(LINUX_CLOCK_BOOTTIME))
+        / 10_000_000;
     let mut digits = [0_u8; 20];
     let mut value = centiseconds / 100;
     let mut count = 0;
@@ -49925,7 +50751,6 @@ fn linux_regular_file(state: u16) -> Option<&'static [u8]> {
         LINUX_FILE_PROC_PROCESS_CMDLINE => return Some(LINUX_PROC_PROCESS_CMDLINE),
         LINUX_FILE_PROC_PROCESS_ENVIRON => return Some(LINUX_PROC_PROCESS_ENVIRON),
         LINUX_FILE_PROC_FILE_MAX => return Some(LINUX_PROC_FILE_MAX),
-        LINUX_FILE_PROC_NR_OPEN => return Some(LINUX_PROC_NR_OPEN),
         LINUX_FILE_PROC_USER_NAMESPACE => return Some(b""),
         LINUX_FILE_PROC_FDINFO => return Some(b""),
         LINUX_FILE_PROC_HOSTNAME => return Some(b"ginux\n"),
@@ -50020,6 +50845,7 @@ fn linux_regular_file_inode(state: u16) -> Option<u64> {
         LINUX_FILE_PROC_FILE_MAX => return Some(42),
         LINUX_FILE_PROC_NR_OPEN => return Some(43),
         LINUX_FILE_PROC_OOM_SCORE_ADJ => return Some(44),
+        LINUX_FILE_PROC_TIMENS_OFFSETS => return Some(99),
         LINUX_FILE_PROC_USER_NAMESPACE => return Some(45),
         LINUX_FILE_PROC_FDINFO => return Some(46),
         LINUX_FILE_PROC_HOSTNAME => return Some(47),
@@ -52415,6 +53241,7 @@ fn linux_getdents(descriptor: u64, address: u64, count: u64, legacy: bool) -> u6
                 (file(LINUX_FILE_PROC_DYNAMIC_PAGEMAP), 8, b"pagemap"),
                 (file(LINUX_FILE_PROC_MOUNTS), 8, b"mounts"),
                 (file(LINUX_FILE_PROC_OOM_SCORE_ADJ), 8, b"oom_score_adj"),
+                (file(LINUX_FILE_PROC_TIMENS_OFFSETS), 8, b"timens_offsets"),
                 (
                     linux_root_directory_inode(LINUX_PROC_FD_DIRECTORY).unwrap_or(0),
                     4,
@@ -52831,7 +53658,7 @@ fn linux_set_process_resource_limit(pid: u32, resource: u64, requested: [u64; 2]
     // raises RLIMIT_NOFILE past nr_open (setrlimit03).
     if requested[1] > current[1]
         && !current_linux_credentials().is_some_and(|credentials| credentials.privileged())
-        || resource == LINUX_RLIMIT_NOFILE && requested[1] > LINUX_NR_OPEN
+        || resource == LINUX_RLIMIT_NOFILE && requested[1] > linux_nr_open()
     {
         return LINUX_EPERM;
     }
@@ -54696,6 +55523,9 @@ fn linux_descriptor_stat(descriptor: u64) -> Option<[u8; LINUX_STAT_SIZE]> {
     }
     if linux_socket_slot(descriptor).is_some() {
         return Some(linux_stat(LINUX_STAT_SOCKET_MODE, socket_inode()));
+    }
+    if let Some(reference) = linux_namespace_reference(descriptor) {
+        return Some(linux_namespace_stat(reference, true));
     }
     if linux_epoll_descriptor(descriptor)
         || linux_eventfd_descriptor(descriptor)
