@@ -13487,6 +13487,13 @@ fn linux_generic_ioctl(descriptor: u64, request: u64, argument: u64) -> Option<u
     if let Some(result) = linux_socket_ioctl(descriptor, request, argument) {
         return Some(result);
     }
+    // PROCMAP_QUERY (_IOWR('f', 17, struct procmap_query)) on /proc/PID/maps.
+    const PROCMAP_QUERY: u64 = 0xc068_6611;
+    if u64::from(request as u32) == PROCMAP_QUERY
+        && linux_device_descriptor(descriptor) & !3 == LINUX_FILE_PROC_DYNAMIC_MAPS
+    {
+        return Some(linux_procmap_query(descriptor, argument));
+    }
     // RNDGETENTCNT on /dev/random and /dev/urandom: the pool is always
     // full (Linux reports 256 since 5.18), as entropy_avail says.
     const RNDGETENTCNT: u64 = 0x8004_5200;
@@ -33978,9 +33985,6 @@ fn linux_name_to_handle_at(
     {
         return LINUX_EINVAL;
     }
-    if flags & AT_SYMLINK_FOLLOW != 0 {
-        return LINUX_EOPNOTSUPP;
-    }
     let mut header = [0_u8; 8];
     if !copy_from_linux_user(handle_address, &mut header) {
         return LINUX_EFAULT;
@@ -34016,7 +34020,13 @@ fn linux_name_to_handle_at(
         }
     } else {
         let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
-        match linux_canonical_path_at(directory, &path[..length], &mut canonical) {
+        // AT_SYMLINK_FOLLOW names what a final symlink points to.
+        let resolved = if flags & AT_SYMLINK_FOLLOW != 0 {
+            linux_resolve_restricted(directory, &path[..length], 0, true, &mut canonical)
+        } else {
+            linux_canonical_path_at(directory, &path[..length], &mut canonical)
+        };
+        match resolved {
             Ok(canonical_length) => crate::linux_overlay::lookup(&canonical[..canonical_length])
                 .map(|metadata| (1_u32, crate::linux_overlay::generation(metadata.handle)))
                 .or_else(|| {
@@ -34090,6 +34100,17 @@ fn linux_open_by_handle_at(mount_descriptor: u64, handle_address: u64, flags: u6
     {
         return LINUX_EBADF;
     }
+    // Decoding a handle needs CAP_DAC_READ_SEARCH, checked before the
+    // handle is read, as Linux does (open_by_handle_at02).
+    if !linux_has_capability(ginux_credentials::capability::DAC_READ_SEARCH) {
+        return LINUX_EPERM;
+    }
+    // The handles name files of the root's filesystems: a descriptor on
+    // anything else (a pipe, a socket, the console) names another
+    // filesystem, where they are stale.
+    let stale_mount = mount_descriptor as u32 != LINUX_AT_FDCWD
+        && linux_overlay_descriptor_handle(mount_descriptor).is_none()
+        && linux_rootfs_descriptor(mount_descriptor) == 0;
     let mut handle = [0_u8; 16];
     if !copy_from_linux_user(handle_address, &mut handle[..8]) {
         return LINUX_EFAULT;
@@ -34099,7 +34120,7 @@ fn linux_open_by_handle_at(mount_descriptor: u64, handle_address: u64, flags: u6
     if size == 0 || size > 128 {
         return LINUX_EINVAL;
     }
-    if size != 8 || handle_type != HANDLE_TYPE {
+    if size != 8 || handle_type != HANDLE_TYPE || stale_mount {
         return LINUX_ESTALE;
     }
     if !copy_from_linux_user(handle_address + 8, &mut handle[8..]) {
@@ -44086,45 +44107,59 @@ fn linux_epoll_wait_duration_live_return(
             {
                 // epoll_wait waits as poll does: other processes run, the
                 // call restarts with its deadline, and a signal interrupts
-                // it (EINTR). epoll_pwait's temporary mask is not carried
-                // across a restart, so it still returns no events instead.
-                if temporary_signal_mask.is_none() {
-                    let deadline = take_linux_restart_deadline(caller.rip).or_else(|| {
-                        duration.and_then(|duration| {
-                            linux_elapsed_nanoseconds().and_then(|now| now.checked_add(duration))
-                        })
-                    });
-                    // Resumed after a park with no signal, the call looks
-                    // at the instance and its deadline again. Once a sibling
-                    // thread is ready, this thread waits as a thread wait
-                    // while it runs.
-                    loop {
-                        if deadline.is_some_and(|deadline| {
-                            linux_elapsed_nanoseconds().is_some_and(|now| now >= deadline)
-                        }) {
-                            return 0;
+                // it (EINTR). epoll_pwait waits under its temporary mask as
+                // ppoll does: a signal it blocks stays pending, one it
+                // unblocks ends the wait (epoll_pwait01), and a handler's
+                // frame restores the caller's mask.
+                let deadline = take_linux_restart_deadline(caller.rip).or_else(|| {
+                    duration.and_then(|duration| {
+                        linux_elapsed_nanoseconds().and_then(|now| now.checked_add(duration))
+                    })
+                });
+                let slot = usize::from(current.slot);
+                let prior = temporary_signal_mask.map(|mask| {
+                    begin_linux_lone_masked_wait(slot, LINUX_THREAD_WAIT_SIGSUSPEND, mask)
+                });
+                // Resumed after a park with no signal, the call looks at
+                // the instance and its deadline again. Once a sibling thread
+                // is ready, this thread waits as a thread wait while it runs.
+                let ended = loop {
+                    if deadline.is_some_and(|deadline| {
+                        linux_elapsed_nanoseconds().is_some_and(|now| now >= deadline)
+                    }) {
+                        break Ok(0);
+                    }
+                    let turn = linux_timed_wait_run_others(output, caller, number, deadline);
+                    if let LinuxWaitTurn::Done(result) = turn {
+                        break Ok(result);
+                    }
+                    if let Some(target) = ready_linux_thread_handle() {
+                        break Err((target, deadline));
+                    }
+                    match linux_epoll_collect(input.epoll, input.address, input.maximum) {
+                        Ok(0) => {}
+                        Ok(count) => break Ok(count),
+                        Err(error) => break Ok(error),
+                    }
+                    // Nothing else can run: halt until an interrupt (the
+                    // deadline's tick, or a waker on another CPU).
+                    if let LinuxWaitTurn::Idle = turn {
+                        if let Some((deadline, now)) = deadline.zip(linux_elapsed_nanoseconds()) {
+                            timer::request_linux_tick_within(deadline.saturating_sub(now));
                         }
-                        if let LinuxWaitTurn::Done(result) =
-                            linux_timed_wait_run_others(output, caller, number, deadline)
-                        {
-                            return result;
-                        }
-                        if let Some(target) = ready_linux_thread_handle() {
-                            continued_deadline = Some(deadline.unwrap_or(0));
-                            break 'target target;
-                        }
-                        match linux_epoll_collect(input.epoll, input.address, input.maximum) {
-                            Ok(0) => {}
-                            Ok(count) => return count,
-                            Err(error) => return error,
-                        }
+                        linux_wait_for_interrupt();
+                    }
+                };
+                if let Some(prior) = prior {
+                    end_linux_lone_masked_wait(slot, prior);
+                }
+                match ended {
+                    Ok(result) => return result,
+                    Err((target, deadline)) => {
+                        continued_deadline = Some(deadline.unwrap_or(0));
+                        break 'target target;
                     }
                 }
-                return if yield_current_linux_process(caller, 0) {
-                    LINUX_RETURN_TO_KERNEL
-                } else {
-                    0
-                };
             }
             let parent_pid = current_linux_process_pid();
             if refresh_linux_process_registry_for_wait(caller)
@@ -47029,6 +47064,154 @@ fn append_linux_padded_hex(output: &mut [u8], used: &mut usize, value: u64, widt
 
 /// /proc/PID/maps, or with `smaps` /proc/PID/smaps: each line followed by
 /// the area's sizes.
+/// PROCMAP_QUERY: the memory area of the process a /proc/PID/maps
+/// descriptor names that holds `query_addr` (or, with
+/// COVERING_OR_NEXT_VMA, the first one ending above it) and has the
+/// permissions `query_flags` asks for, as /proc/PID/maps shows it: its
+/// range, permissions, file offset, device, inode and name (ioctl10).
+fn linux_procmap_query(descriptor: u64, argument: u64) -> u64 {
+    const QUERY_SIZE: usize = 104;
+    const VMA_READABLE: u64 = 1;
+    const VMA_WRITABLE: u64 = 2;
+    const VMA_EXECUTABLE: u64 = 4;
+    const VMA_SHARED: u64 = 8;
+    const COVERING_OR_NEXT_VMA: u64 = 0x10;
+    const FILE_BACKED_VMA: u64 = 0x20;
+    let mut query = [0_u8; QUERY_SIZE];
+    if !copy_from_linux_user(argument, &mut query[..8]) {
+        return LINUX_EFAULT;
+    }
+    let size = u64::from_ne_bytes(query[..8].try_into().unwrap());
+    if size < 24 {
+        return LINUX_EINVAL;
+    }
+    if size > PAGE_SIZE as u64 {
+        return LINUX_E2BIG;
+    }
+    let used = (size as usize).min(QUERY_SIZE);
+    if !copy_from_linux_user(argument, &mut query[..used]) {
+        return LINUX_EFAULT;
+    }
+    let field = |offset: usize| u64::from_ne_bytes(query[offset..offset + 8].try_into().unwrap());
+    let flags = field(8);
+    let address = field(16);
+    let name_size = u32::from_ne_bytes(query[80..84].try_into().unwrap());
+    let name_address = field(88);
+    if flags
+        & !(VMA_READABLE
+            | VMA_WRITABLE
+            | VMA_EXECUTABLE
+            | VMA_SHARED
+            | COVERING_OR_NEXT_VMA
+            | FILE_BACKED_VMA)
+        != 0
+        || name_size != 0 && name_address == 0
+    {
+        return LINUX_EINVAL;
+    }
+    let Some(pid) = linux_proc_dynamic_descriptor_pid(descriptor) else {
+        return LINUX_ESRCH;
+    };
+    let Some(maps) = linux_proc_maps(pid, false) else {
+        return LINUX_ESRCH;
+    };
+    let hex = |text: &[u8]| {
+        text.iter().try_fold(0_u64, |value, byte| {
+            let digit = char::from(*byte).to_digit(16)?;
+            value.checked_mul(16)?.checked_add(u64::from(digit))
+        })
+    };
+    let wanted = flags & (VMA_READABLE | VMA_WRITABLE | VMA_EXECUTABLE | VMA_SHARED);
+    for line in maps.split(|byte| *byte == b'\n') {
+        let mut fields = line
+            .split(|byte| *byte == b' ')
+            .filter(|field| !field.is_empty());
+        let (Some(range), Some(permissions), Some(offset), Some(device), Some(inode)) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            continue;
+        };
+        let name = fields.next().unwrap_or(&[]);
+        let Some(dash) = range.iter().position(|byte| *byte == b'-') else {
+            continue;
+        };
+        let (Some(start), Some(end), Some(offset)) =
+            (hex(&range[..dash]), hex(&range[dash + 1..]), hex(offset))
+        else {
+            continue;
+        };
+        if end <= address || flags & COVERING_OR_NEXT_VMA == 0 && start > address {
+            continue;
+        }
+        let vma_flags = [
+            (b'r', VMA_READABLE),
+            (b'w', VMA_WRITABLE),
+            (b'x', VMA_EXECUTABLE),
+            (b's', VMA_SHARED),
+        ]
+        .into_iter()
+        .filter(|(letter, _)| permissions.contains(letter))
+        .fold(0, |flags, (_, flag)| flags | flag);
+        let inode = core::str::from_utf8(inode)
+            .ok()
+            .and_then(|inode| inode.parse::<u64>().ok())
+            .unwrap_or(0);
+        let matches = vma_flags & wanted == wanted && (flags & FILE_BACKED_VMA == 0 || inode != 0);
+        if !matches {
+            if flags & COVERING_OR_NEXT_VMA != 0 {
+                continue;
+            }
+            return LINUX_ENOENT;
+        }
+        let (major, minor) = device
+            .iter()
+            .position(|byte| *byte == b':')
+            .map_or((0, 0), |colon| {
+                (
+                    hex(&device[..colon]).unwrap_or(0),
+                    hex(&device[colon + 1..]).unwrap_or(0),
+                )
+            });
+        query[24..32].copy_from_slice(&start.to_ne_bytes());
+        query[32..40].copy_from_slice(&end.to_ne_bytes());
+        query[40..48].copy_from_slice(&vma_flags.to_ne_bytes());
+        query[48..56].copy_from_slice(&(PAGE_SIZE as u64).to_ne_bytes());
+        query[56..64].copy_from_slice(&offset.to_ne_bytes());
+        query[64..72].copy_from_slice(&inode.to_ne_bytes());
+        query[72..76].copy_from_slice(&(major as u32).to_ne_bytes());
+        query[76..80].copy_from_slice(&(minor as u32).to_ne_bytes());
+        // No build ID is kept.
+        query[84..88].copy_from_slice(&0_u32.to_ne_bytes());
+        if name_size != 0 {
+            let named = if name.is_empty() {
+                0
+            } else {
+                if (name.len() + 1) as u64 > u64::from(name_size) {
+                    return LINUX_ENAMETOOLONG;
+                }
+                let mut text = [0_u8; 512];
+                let length = name.len().min(text.len() - 1);
+                text[..length].copy_from_slice(&name[..length]);
+                if !copy_to_linux_user(name_address, &text[..length + 1]) {
+                    return LINUX_EFAULT;
+                }
+                length as u32 + 1
+            };
+            query[80..84].copy_from_slice(&named.to_ne_bytes());
+        }
+        return if copy_to_linux_user(argument, &query[..used]) {
+            0
+        } else {
+            LINUX_EFAULT
+        };
+    }
+    LINUX_ENOENT
+}
+
 fn linux_proc_maps(pid: u32, smaps: bool) -> Option<Vec<u8>> {
     let current = pid == current_linux_process_pid();
     let details = smaps.then_some(current);

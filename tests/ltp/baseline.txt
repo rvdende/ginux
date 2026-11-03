@@ -15,14 +15,12 @@ clone301 TBROK
 creat07 TFAIL
 epoll_wait06 TFAIL
 epoll_wait16 TBROK
-epoll_pwait01 TBROK
 execve04 TFAIL
 fsetxattr02 TBROK
 fgetxattr02 TBROK
 getcpu01 TFAIL
 ioctl01 TBROK
 ioctl02 TBROK
-ioctl10 TFAIL
 ioctl_loop01 TBROK
 ioctl_loop02 TBROK
 ioctl_loop03 TBROK
@@ -61,12 +59,9 @@ mount_setattr02 TBROK
 mprotect01 TBROK
 mremap01 TFAIL
 msgstress01 TBROK
-name_to_handle_at01 TFAIL
 nftw01 TFAIL
 nftw6401 TFAIL
 openat03 TBROK
-open_by_handle_at01 TFAIL
-open_by_handle_at02 TFAIL
 madvise11 TBROK
 pidfd_send_signal01 TFAIL
 pidfd_send_signal02 TFAIL
