@@ -322,6 +322,7 @@ interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_RUNTIME
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_RUNTIME_EINVAL_SYSCALLS	domain-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_RUNTIME_EPOLL_ACTIVE	domain-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_RUNTIME_EPOLL_WATCH_EPOLL	domain-runtime	allowlist	none	explicit-x86-runtime-owner-backing
+interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_RUNTIME_EPOLL_WATCH_SEEN	domain-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_RUNTIME_EPOLL_WATCH_TARGET	domain-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_RUNTIME_EVENTFD_ACTIVE	domain-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_RUNTIME_EXIT_STATUS	domain-runtime	allowlist	none	explicit-x86-runtime-owner-backing

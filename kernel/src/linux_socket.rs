@@ -355,6 +355,16 @@ struct Slot {
     netlink_protocol: u8,
     netlink_port: u32,
     netlink_messages: VecDeque<Vec<u8>>,
+    /// Wakeups, counted as Linux's wait queues deliver them to epoll's
+    /// edge-triggered watches: an input event is something new to read (a
+    /// write, a datagram, a connection, a hangup), an output event room a
+    /// read made for a writer or a change in the connection. The counts
+    /// only grow (wrapping); a watch remembers the counts it last saw.
+    input_events: u32,
+    output_events: u32,
+    /// The input event an EPOLLEXCLUSIVE watch claimed last: each event
+    /// wakes one exclusive watcher, not all of them.
+    exclusive_claim: Option<u32>,
 }
 
 impl Slot {
@@ -392,7 +402,36 @@ impl Slot {
             netlink_protocol: 0,
             netlink_port: 0,
             netlink_messages: VecDeque::new(),
+            input_events: 0,
+            output_events: 0,
+            exclusive_claim: None,
         }
+    }
+
+    fn note_input(&mut self) {
+        self.input_events = self.input_events.wrapping_add(1);
+    }
+
+    fn note_output(&mut self) {
+        self.output_events = self.output_events.wrapping_add(1);
+    }
+
+    /// A change either side of the socket may wait for: a hangup, a
+    /// shutdown, a connection made.
+    fn note_change(&mut self) {
+        self.note_input();
+        self.note_output();
+    }
+
+    /// The bytes a writer that must not block may still queue for this
+    /// socket's reader.
+    fn local_room(&self) -> usize {
+        let capacity = if self.local_capacity == 0 {
+            LOCAL_QUEUE_CAPACITY
+        } else {
+            self.local_capacity as usize
+        };
+        capacity.saturating_sub(self.local.len())
     }
 
     /// Whether the socket's bytes go through local queues: a Unix socket,
@@ -643,7 +682,10 @@ fn append_local_data(
     }
     match state.local.push(&input[..input.len().min(room)]) {
         0 => Err(Error::Exhausted),
-        queued => Ok(queued),
+        queued => {
+            state.note_input();
+            Ok(queued)
+        }
     }
 }
 
@@ -1061,6 +1103,7 @@ impl Sockets {
                 if other.peer == Some(id) {
                     other.peer = None;
                     other.peer_closed = true;
+                    other.note_change();
                 }
                 other.pending.retain(|pending| *pending != id);
             }
@@ -1123,6 +1166,12 @@ impl Sockets {
         let peer_connected = state.peer.is_some_and(|peer| self.slot(peer).is_some());
         if state.remote.is_none() && !peer_connected {
             return Err(Error::NotConnected);
+        }
+        let peer = state.peer;
+        for end in [Some(id), peer].into_iter().flatten() {
+            if let Some(end) = self.slot_mut(end) {
+                end.note_change();
+            }
         }
         let state = slot_in_mut(&mut self.slots, id).ok_or(Error::NotConnected)?;
         if matches!(how, 0 | 2) {
@@ -1637,7 +1686,10 @@ impl Sockets {
                 }
                 return match peer_state.local.push_message(input, &sender) {
                     0 if !input.is_empty() => Err(Error::Exhausted),
-                    queued => Ok(queued),
+                    queued => {
+                        peer_state.note_input();
+                        Ok(queued)
+                    }
                 };
             }
             let Some(peer_state) = self
@@ -1867,12 +1919,15 @@ impl Sockets {
             return Ok((0, None));
         }
         if state.is_local() {
+            let room = state.local_room();
             if let Some((received, _, sender)) = state.local.pop_message(output) {
                 state.last_sender = sender;
+                self.note_drained(id, room, true);
                 return Ok((received, None));
             }
             let received = state.local.pop(output);
             if received != 0 {
+                self.note_drained(id, room, false);
                 return Ok((received, None));
             }
             let state = self.slot(id).ok_or(Error::Invalid)?;
@@ -1923,13 +1978,23 @@ impl Sockets {
     /// The bytes a write to the pipe end `id` can still queue: the room
     /// left in its reader's queue (its own, for a FIFO's loopback slot).
     fn pipe_room(&self, id: SlotId) -> Option<usize> {
-        let reader = self.slot(self.slot(id)?.peer?)?;
-        let capacity = if reader.local_capacity == 0 {
-            LOCAL_QUEUE_CAPACITY
-        } else {
-            reader.local_capacity as usize
-        };
-        Some(capacity.saturating_sub(reader.local.len()))
+        Some(self.slot(self.slot(id)?.peer?)?.local_room())
+    }
+
+    /// After a read took from `id`'s queue, which had `room` free before:
+    /// the sockets writing into it get an output event when the read may
+    /// have made room for a write that was refused, as Linux wakes a pipe's
+    /// writers when a read frees a slot of a full pipe (fs/pipe.c), and a
+    /// datagram socket's on every message read.
+    fn note_drained(&mut self, id: SlotId, room: usize, datagram: bool) {
+        if room >= LOCAL_ATOMIC_WRITE && !datagram {
+            return;
+        }
+        for writer in self.slots.iter_mut().flatten() {
+            if writer.peer == Some(id) {
+                writer.note_output();
+            }
+        }
     }
 
     fn local_capacity(&self, id: SlotId) -> Result<usize, Error> {
@@ -1964,6 +2029,7 @@ impl Sockets {
         for end in ends.into_iter().flatten() {
             if let Some(end) = self.slot_mut(end) {
                 end.local_capacity = capacity as u32;
+                end.note_output();
             }
         }
         Ok(capacity)
@@ -2072,9 +2138,13 @@ impl Sockets {
                         state.last_sender = name;
                         return Ok((copied, length, None));
                     }
-                } else if let Some((copied, length, sender)) = state.local.pop_message(output) {
-                    state.last_sender = sender;
-                    return Ok((copied, length, None));
+                } else {
+                    let room = state.local_room();
+                    if let Some((copied, length, sender)) = state.local.pop_message(output) {
+                        state.last_sender = sender;
+                        self.note_drained(id, room, true);
+                        return Ok((copied, length, None));
+                    }
                 }
             }
         }
@@ -2613,6 +2683,7 @@ pub(crate) fn deliver_netlink(id: SlotId, message: &[u8]) -> bool {
     }
     copy.extend_from_slice(message);
     state.netlink_messages.push_back(copy);
+    state.note_input();
     true
 }
 
@@ -2648,6 +2719,7 @@ fn answer_netlink_requests(state: &mut Slot, input: &[u8]) -> Result<(), Error> 
                 .try_reserve(1)
                 .map_err(|_| Error::Exhausted)?;
             state.netlink_messages.push_back(answer);
+            state.note_input();
         }
         // Messages are 4-byte aligned (NLMSG_ALIGN).
         offset += (length + 3) & !3;
@@ -3203,6 +3275,36 @@ fn report_timeout(operation: &str) {
 
 pub(crate) fn readiness(id: SlotId) -> Option<(bool, bool, bool)> {
     SOCKETS.lock().readiness(id)
+}
+
+/// The input and output wakeup counts of socket `id` (see
+/// `Slot::input_events`), or `None` for one whose wakeups they do not
+/// cover: a socket smoltcp carries, a TCP listener, an object.
+pub(crate) fn event_counts(id: SlotId) -> Option<(u32, u32)> {
+    let sockets = SOCKETS.lock();
+    let state = sockets.slot(id)?;
+    let counted = match state.kind {
+        Kind::Unix | Kind::Netlink => true,
+        Kind::Tcp => state.is_local(),
+        Kind::Udp | Kind::Icmp | Kind::Object => false,
+    };
+    counted.then_some((state.input_events, state.output_events))
+}
+
+/// Whether input wakeup `count` of socket `id` is not yet taken by an
+/// EPOLLEXCLUSIVE watch; with `take`, takes it.
+pub(crate) fn claim_exclusive_event(id: SlotId, count: u32, take: bool) -> bool {
+    let mut sockets = SOCKETS.lock();
+    let Some(state) = sockets.slot_mut(id) else {
+        return false;
+    };
+    if state.exclusive_claim == Some(count) {
+        return false;
+    }
+    if take {
+        state.exclusive_claim = Some(count);
+    }
+    true
 }
 
 /// Whether nothing more can arrive to read on socket `id` (POLLRDHUP): it

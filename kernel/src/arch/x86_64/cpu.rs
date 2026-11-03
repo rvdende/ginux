@@ -520,6 +520,8 @@ struct X86RuntimeOwner {
         RuntimeRef<CpuBankedAtomicArray<AtomicU16, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
     LINUX_RUNTIME_EPOLL_WATCH_EPOLL:
         RuntimeRef<CpuBankedAtomicArray<AtomicU16, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>>,
+    LINUX_RUNTIME_EPOLL_WATCH_SEEN:
+        RuntimeRef<CpuBankedAtomicArray<AtomicU64, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>>,
     LINUX_RUNTIME_EPOLL_WATCH_TARGET:
         RuntimeRef<CpuBankedAtomicArray<AtomicU16, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>>,
     LINUX_RUNTIME_EVENTFD_ACTIVE:
@@ -1071,6 +1073,7 @@ static X86_RUNTIME: X86RuntimeOwner = X86RuntimeOwner {
     LINUX_RUNTIME_EPOLL_WATCH_EPOLL: RuntimeRef(
         &X86_RUNTIME_BACKING_LINUX_RUNTIME_EPOLL_WATCH_EPOLL,
     ),
+    LINUX_RUNTIME_EPOLL_WATCH_SEEN: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_RUNTIME_EPOLL_WATCH_SEEN),
     LINUX_RUNTIME_EPOLL_WATCH_TARGET: RuntimeRef(
         &X86_RUNTIME_BACKING_LINUX_RUNTIME_EPOLL_WATCH_TARGET,
     ),
@@ -3718,6 +3721,13 @@ static X86_RUNTIME_BACKING_LINUX_RUNTIME_EPOLL_WATCH_TARGET: CpuBankedAtomicArra
     AtomicU16,
     { LINUX_DESCRIPTOR_TABLE_LIMIT as usize },
 > = CpuBankedAtomicArray::<AtomicU16, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>::new();
+/// Per edge-triggered watch, the event counts of its socket or pipe it saw
+/// last (input low, output high; see `linux_epoll_event_counts`), valid
+/// while the watch's events word has LINUX_EPOLL_SEEN_VALID.
+static X86_RUNTIME_BACKING_LINUX_RUNTIME_EPOLL_WATCH_SEEN: CpuBankedAtomicArray<
+    AtomicU64,
+    { LINUX_DESCRIPTOR_TABLE_LIMIT as usize },
+> = CpuBankedAtomicArray::<AtomicU64, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>::new();
 static X86_RUNTIME_BACKING_ELF_PROBE_EVENTFD_DESCRIPTOR: BankedAtomicU16 = BankedAtomicU16::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_EVENTFD_COUNTER: BankedAtomicU64 = BankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_EVENTFD_FLAGS: BankedAtomicU32 = BankedAtomicU32::new(0);
@@ -17538,6 +17548,7 @@ struct LinuxDescriptorRuntimeState {
     runtime_epoll_active: [u8; LINUX_DEVICE_DESCRIPTOR_COUNT],
     runtime_epoll_aliases: [u16; LINUX_DEVICE_DESCRIPTOR_COUNT],
     runtime_epoll_watch_epoll: [u16; LINUX_DESCRIPTOR_TABLE_LIMIT as usize],
+    runtime_epoll_watch_seen: [u64; LINUX_DESCRIPTOR_TABLE_LIMIT as usize],
     runtime_epoll_watch_target: [u16; LINUX_DESCRIPTOR_TABLE_LIMIT as usize],
     runtime_eventfd_active: [u64; LINUX_DESCRIPTOR_FLAG_WORD_COUNT],
     runtime_timerfd_active: [u64; LINUX_DESCRIPTOR_FLAG_WORD_COUNT],
@@ -17584,6 +17595,7 @@ impl LinuxDescriptorRuntimeState {
         runtime_epoll_active: [0; LINUX_DEVICE_DESCRIPTOR_COUNT],
         runtime_epoll_aliases: [0; LINUX_DEVICE_DESCRIPTOR_COUNT],
         runtime_epoll_watch_epoll: [0; LINUX_DESCRIPTOR_TABLE_LIMIT as usize],
+        runtime_epoll_watch_seen: [0; LINUX_DESCRIPTOR_TABLE_LIMIT as usize],
         runtime_epoll_watch_target: [0; LINUX_DESCRIPTOR_TABLE_LIMIT as usize],
         runtime_eventfd_active: [0; LINUX_DESCRIPTOR_FLAG_WORD_COUNT],
         runtime_timerfd_active: [0; LINUX_DESCRIPTOR_FLAG_WORD_COUNT],
@@ -18730,6 +18742,7 @@ fn capture_linux_descriptor_runtime_state() -> LinuxDescriptorRuntimeState {
         runtime_epoll_active: X86_RUNTIME.LINUX_RUNTIME_EPOLL_ACTIVE.snapshot(),
         runtime_epoll_aliases: X86_RUNTIME.LINUX_RUNTIME_EPOLL_ALIASES.snapshot(),
         runtime_epoll_watch_epoll: X86_RUNTIME.LINUX_RUNTIME_EPOLL_WATCH_EPOLL.snapshot(),
+        runtime_epoll_watch_seen: X86_RUNTIME.LINUX_RUNTIME_EPOLL_WATCH_SEEN.snapshot(),
         runtime_epoll_watch_target: X86_RUNTIME.LINUX_RUNTIME_EPOLL_WATCH_TARGET.snapshot(),
         runtime_eventfd_active: linux_descriptor_bitmap(
             &X86_RUNTIME.LINUX_RUNTIME_EVENTFD_ACTIVE.snapshot(),
@@ -18956,6 +18969,9 @@ fn install_linux_descriptor_runtime_state(state: &LinuxDescriptorRuntimeState) {
     X86_RUNTIME
         .LINUX_RUNTIME_EPOLL_WATCH_EPOLL
         .install(&state.runtime_epoll_watch_epoll);
+    X86_RUNTIME
+        .LINUX_RUNTIME_EPOLL_WATCH_SEEN
+        .install(&state.runtime_epoll_watch_seen);
     X86_RUNTIME
         .LINUX_RUNTIME_EPOLL_WATCH_TARGET
         .install(&state.runtime_epoll_watch_target);
@@ -43593,6 +43609,21 @@ fn linux_epoll_ctl(epoll: u64, operation: u64, descriptor: u64, event_address: u
     if events & !LINUX_EPOLL_SUPPORTED_EVENTS != 0 {
         return LINUX_EINVAL;
     }
+    // EPOLLEXCLUSIVE is given at EPOLL_CTL_ADD only, never for an epoll
+    // instance and with no events beyond LINUX_EPOLLEXCLUSIVE_OK_BITS; an
+    // exclusive watch cannot be modified either.
+    let exclusive_refused = events & LINUX_EPOLLEXCLUSIVE != 0
+        && (operation == LINUX_EPOLL_CTL_MOD
+            || linux_epoll_descriptor(descriptor)
+            || events & !LINUX_EPOLLEXCLUSIVE_OK_BITS != 0);
+    let exclusive_modified = operation == LINUX_EPOLL_CTL_MOD
+        && existing.is_some_and(|slot| {
+            X86_RUNTIME.ELF_PROBE_EPOLL_EVENTS[slot].load(Ordering::SeqCst) & LINUX_EPOLLEXCLUSIVE
+                != 0
+        });
+    if exclusive_refused || exclusive_modified {
+        return LINUX_EINVAL;
+    }
     let data = u64::from_ne_bytes(event[4..].try_into().unwrap());
     let slot = if let Some(slot) = existing {
         slot
@@ -43667,12 +43698,28 @@ fn linux_descriptor_epollable(descriptor: u64) -> bool {
 /// for an edge-triggered (EPOLLET) watch; Linux defines no epoll flags there.
 const LINUX_EPOLL_REPORTED_SHIFT: u32 = 16;
 const LINUX_EPOLL_REPORTED_MASK: u32 = 0x1f << LINUX_EPOLL_REPORTED_SHIFT;
+/// Set in an edge-triggered watch's events word once
+/// LINUX_RUNTIME_EPOLL_WATCH_SEEN holds the event counts it saw; clear after
+/// EPOLL_CTL_ADD or MOD, which report readiness at once as Linux does.
+const LINUX_EPOLL_SEEN_VALID: u32 = 1 << 21;
+/// The events an input wakeup (new data, a hangup) concerns.
+const LINUX_EPOLL_INPUT_EVENTS: u16 =
+    LINUX_POLLIN | LINUX_POLLPRI | LINUX_POLLRDNORM | 0x80 | LINUX_POLLRDHUP;
+
+/// The wakeup counts of the socket or pipe behind `descriptor`, input in
+/// the low half and output in the high (see `linux_socket::event_counts`),
+/// or None for a descriptor whose wakeups are not counted.
+fn linux_epoll_event_counts(descriptor: u64) -> Option<u64> {
+    let (input, output) = crate::linux_socket::event_counts(linux_socket_slot(descriptor)?)?;
+    Some(u64::from(input) | u64::from(output) << 32)
+}
 
 /// Re-arms the edge-triggered watches on the descriptor a system call is
 /// about to read, write, accept on or reap (a pidfd for waitid), so that
 /// readiness after the call is reported again. Linux reports an edge for
 /// each new event; consumers such as mio read until EAGAIN, so re-arming on
-/// use reports every new event and at most adds a spurious one.
+/// use reports every new event and at most adds a spurious one. Sockets and
+/// pipes need none: their wakeups are counted (linux_epoll_event_counts).
 pub(super) fn linux_epoll_rearm_for_syscall(number: u64, first: u64, second: u64) {
     let descriptor = match number {
         LINUX_READ_SYSCALL
@@ -43706,12 +43753,16 @@ pub(super) fn linux_epoll_rearm_for_syscall(number: u64, first: u64, second: u64
     else {
         return;
     };
+    let mut counted = None;
     for slot in 0..LINUX_DESCRIPTOR_TABLE_LIMIT as usize {
         if X86_RUNTIME.LINUX_RUNTIME_EPOLL_WATCH_TARGET[slot].load(Ordering::SeqCst) != target {
             continue;
         }
         let events = X86_RUNTIME.ELF_PROBE_EPOLL_EVENTS[slot].load(Ordering::SeqCst);
         if events & LINUX_EPOLL_REPORTED_MASK != 0 {
+            if *counted.get_or_insert_with(|| linux_epoll_event_counts(descriptor).is_some()) {
+                return;
+            }
             X86_RUNTIME.ELF_PROBE_EPOLL_EVENTS[slot]
                 .store(events & !LINUX_EPOLL_REPORTED_MASK, Ordering::SeqCst);
         }
@@ -43807,6 +43858,13 @@ fn linux_epoll_event_from(
         if requested == 0 {
             continue;
         }
+        // Taken before the readiness, so that a wakeup in between is seen
+        // again next time rather than lost.
+        let counts = if stored & LINUX_EPOLLET != 0 {
+            linux_epoll_event_counts(target as u64)
+        } else {
+            None
+        };
         let ready = linux_descriptor_poll_events(target as i32, requested)
             & (LINUX_POLLIN
                 | LINUX_POLLPRI
@@ -43815,16 +43873,47 @@ fn linux_epoll_event_from(
                 | LINUX_POLLHUP
                 | LINUX_POLLRDHUP);
         if stored & LINUX_EPOLLET != 0 {
-            // Edge-triggered: report only readiness not reported since the
-            // descriptor was last used (linux_epoll_rearm_for_syscall) or
-            // seen not ready. The record keeps the low five event bits.
+            // Edge-triggered: report readiness not reported since it was
+            // last seen absent (the record keeps the low five event bits),
+            // or since the descriptor was last used
+            // (linux_epoll_rearm_for_syscall).
             let reported = (stored & LINUX_EPOLL_REPORTED_MASK) >> LINUX_EPOLL_REPORTED_SHIFT;
-            let now = (stored & !LINUX_EPOLL_REPORTED_MASK)
+            let mut now = (stored & !LINUX_EPOLL_REPORTED_MASK)
                 | (u32::from(ready & 0x1f) << LINUX_EPOLL_REPORTED_SHIFT);
+            let mut edge = u32::from(ready) & !reported != 0;
+            if let Some(counts) = counts {
+                // A socket or pipe also has an edge on each wakeup since the
+                // watch last looked, ready as it may have stayed: a write to
+                // it, room a read made for its writer, a hangup. Linux queues
+                // the watch on every such wakeup that concerns its events
+                // (ep_poll_callback).
+                now |= LINUX_EPOLL_SEEN_VALID;
+                let seen = X86_RUNTIME.LINUX_RUNTIME_EPOLL_WATCH_SEEN[slot].load(Ordering::SeqCst);
+                let added = stored & LINUX_EPOLL_SEEN_VALID == 0;
+                let input =
+                    counts as u32 != seen as u32 && requested & LINUX_EPOLL_INPUT_EVENTS != 0;
+                let output = counts >> 32 != seen >> 32 && requested & LINUX_POLLOUT != 0;
+                edge = if stored & LINUX_EPOLLEXCLUSIVE != 0 && input && !added {
+                    // One exclusive watch takes each input wakeup: the
+                    // first to look, which in a waiting instance is the
+                    // first woken.
+                    crate::linux_socket::claim_exclusive_event(
+                        linux_socket_slot(target as u64).unwrap_or_default(),
+                        counts as u32,
+                        consume,
+                    )
+                } else {
+                    edge || added || input || output
+                };
+                if consume && counts != seen {
+                    X86_RUNTIME.LINUX_RUNTIME_EPOLL_WATCH_SEEN[slot]
+                        .store(counts, Ordering::SeqCst);
+                }
+            }
             if consume && now != stored {
                 X86_RUNTIME.ELF_PROBE_EPOLL_EVENTS[slot].store(now, Ordering::SeqCst);
             }
-            if u32::from(ready) & !reported == 0 {
+            if !edge {
                 continue;
             }
         }

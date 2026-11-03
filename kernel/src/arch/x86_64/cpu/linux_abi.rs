@@ -626,6 +626,15 @@ pub(super) const LINUX_EPOLL_SUPPORTED_EVENTS: u32 =
         | 0x8000_0000;
 pub(super) const LINUX_EPOLLET: u32 = 0x8000_0000;
 pub(super) const LINUX_EPOLLONESHOT: u32 = 0x4000_0000;
+/// One event wakes one of the epoll instances watching a file this way.
+pub(super) const LINUX_EPOLLEXCLUSIVE: u32 = 0x1000_0000;
+/// What an EPOLLEXCLUSIVE watch may ask for (Linux's EPOLLEXCLUSIVE_OK_BITS):
+/// in, out, error, hangup, EPOLLWAKEUP, EPOLLET and itself.
+pub(super) const LINUX_EPOLLEXCLUSIVE_OK_BITS: u32 =
+    (LINUX_POLLIN | LINUX_POLLOUT | LINUX_POLLERR | LINUX_POLLHUP) as u32
+        | 0x2000_0000
+        | LINUX_EPOLLET
+        | LINUX_EPOLLEXCLUSIVE;
 pub(super) const LINUX_EFD_SEMAPHORE: u64 = 1;
 pub(super) const LINUX_EFD_NONBLOCK: u64 = 0x800;
 pub(super) const LINUX_TFD_TIMER_ABSTIME: u64 = 1;
