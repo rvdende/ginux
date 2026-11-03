@@ -21,12 +21,8 @@ epoll_wait16 TBROK
 epoll_pwait01 TBROK
 execve04 TFAIL
 fsetxattr02 TBROK
-fcntl11 TFAIL
-fcntl11_64 TFAIL
 fcntl17 TBROK
 fcntl17_64 TBROK
-fcntl21 TFAIL
-fcntl21_64 TFAIL
 fcntl31 TFAIL
 fcntl31_64 TFAIL
 fgetxattr02 TBROK

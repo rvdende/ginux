@@ -59,9 +59,11 @@ impl Lock {
 
 static LOCKS: SpinLock<Vec<Lock>> = SpinLock::new(LockRank::RECORD_LOCKS, Vec::new());
 
-/// The first lock of another owner that keeps `owner` from taking `kind` on
-/// `[start, end)` of `file`. Locks of processes `alive` no longer knows are
-/// dropped first, which is how an exiting process gives its locks up.
+/// The first lock, by its start in the file, of another owner that keeps
+/// `owner` from taking `kind` on `[start, end)` of `file`: what F_GETLK
+/// reports, as Linux finds it in its start-ordered lock list. Locks of
+/// processes `alive` no longer knows are dropped first, which is how an
+/// exiting process gives its locks up.
 pub(crate) fn conflict(
     file: File,
     owner: Owner,
@@ -72,7 +74,8 @@ pub(crate) fn conflict(
     locks.retain(|lock| alive(lock.pid));
     locks
         .iter()
-        .find(|lock| lock.overlaps(file, start, end) && lock.blocks(owner, kind))
+        .filter(|lock| lock.overlaps(file, start, end) && lock.blocks(owner, kind))
+        .min_by_key(|lock| lock.start)
         .copied()
 }
 
