@@ -21,6 +21,7 @@ mod kernel_log;
 mod linux_accounting;
 mod linux_aio;
 mod linux_areas;
+mod linux_async_io;
 mod linux_drm;
 mod linux_elf;
 mod linux_event_files;

@@ -21,8 +21,6 @@ epoll_wait16 TBROK
 epoll_pwait01 TBROK
 execve04 TFAIL
 fsetxattr02 TBROK
-fcntl31 TFAIL
-fcntl31_64 TFAIL
 fgetxattr02 TBROK
 getcpu01 TFAIL
 get_robust_list01 TFAIL

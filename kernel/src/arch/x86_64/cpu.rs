@@ -37278,6 +37278,9 @@ fn linux_socket_sendto(
                     return linux_socket_error(error);
                 }
             }
+            if written != 0 {
+                linux_notify_async_io(slot);
+            }
             written as u64
         }
         // A TCP socket never connected cannot send: EPIPE, as Linux's
@@ -47516,6 +47519,11 @@ fn linux_descriptor_close_with_wake(descriptor: u64, wake_waiters: bool) -> u64 
         current_linux_process_pid(),
         descriptor as u32,
     );
+    crate::linux_async_io::closed(
+        linux_execution_instance(),
+        current_linux_process_pid(),
+        descriptor as u32,
+    );
     // Closing any descriptor of a file drops the process's record locks on
     // it, and closing a description's descriptor drops its OFD locks.
     let owners = [
@@ -48159,6 +48167,110 @@ fn linux_memfd_fcntl(descriptor: u64, command: u64, argument: u64) -> u64 {
     }
 }
 
+/// fcntl's F_SETOWN (8), F_GETOWN (9), F_SETOWN_EX (15), F_GETOWN_EX (16),
+/// and F_SETSIG and F_GETSIG for pipes and sockets (`linux_async_io`).
+fn linux_fcntl_owner(descriptor: u64, command: u64, argument: u64) -> u64 {
+    use crate::linux_async_io::Owner;
+    const F_OWNER_TID: i32 = 0;
+    const F_OWNER_PID: i32 = 1;
+    const F_OWNER_PGRP: i32 = 2;
+    let (domain, pid) = (linux_execution_instance(), current_linux_process_pid());
+    let slot = linux_socket_slot(descriptor).unwrap_or(crate::linux_socket::SlotId::MAX);
+    let fd = descriptor as u32;
+    match command {
+        8 => {
+            let id = argument as i32;
+            let owner = match id {
+                0 => None,
+                id if id > 0 => Some(Owner::Process(id as u32)),
+                id => Some(Owner::Group(id.unsigned_abs())),
+            };
+            crate::linux_async_io::set_owner(domain, pid, fd, slot, owner);
+            0
+        }
+        9 => match crate::linux_async_io::owner(domain, pid, fd) {
+            Some(Owner::Process(id) | Owner::Thread(id)) => u64::from(id),
+            Some(Owner::Group(group)) => (-i64::from(group)) as u64,
+            None => 0,
+        },
+        15 => {
+            let mut request = [0_u8; 8];
+            if !copy_from_linux_user(argument, &mut request) {
+                return LINUX_EFAULT;
+            }
+            let kind = i32::from_ne_bytes(request[..4].try_into().unwrap());
+            let id = i32::from_ne_bytes(request[4..].try_into().unwrap());
+            if id < 0 {
+                return LINUX_EINVAL;
+            }
+            let owner = match (kind, id as u32) {
+                (F_OWNER_TID | F_OWNER_PID | F_OWNER_PGRP, 0) => None,
+                (F_OWNER_TID, id) => Some(Owner::Thread(id)),
+                (F_OWNER_PID, id) => Some(Owner::Process(id)),
+                (F_OWNER_PGRP, id) => Some(Owner::Group(id)),
+                _ => return LINUX_EINVAL,
+            };
+            crate::linux_async_io::set_owner(domain, pid, fd, slot, owner);
+            0
+        }
+        16 => {
+            let (kind, id) = match crate::linux_async_io::owner(domain, pid, fd) {
+                Some(Owner::Thread(id)) => (F_OWNER_TID, id),
+                Some(Owner::Process(id)) => (F_OWNER_PID, id),
+                Some(Owner::Group(id)) => (F_OWNER_PGRP, id),
+                None => (F_OWNER_PID, 0),
+            };
+            let mut reply = [0_u8; 8];
+            reply[..4].copy_from_slice(&kind.to_ne_bytes());
+            reply[4..].copy_from_slice(&id.to_ne_bytes());
+            if copy_to_linux_user(argument, &reply) {
+                0
+            } else {
+                LINUX_EFAULT
+            }
+        }
+        LINUX_F_SETSIG => {
+            if argument > LINUX_SIGNAL_COUNT as u64 {
+                LINUX_EINVAL
+            } else if crate::linux_inotify::set_notice_signal(domain, pid, fd, argument as u8) {
+                0
+            } else {
+                LINUX_ENOMEM
+            }
+        }
+        LINUX_F_GETSIG => u64::from(crate::linux_inotify::notice_signal(domain, pid, fd)),
+        _ => LINUX_EINVAL,
+    }
+}
+
+/// Signals the owners of O_ASYNC descriptors reading socket `slot`'s peer
+/// (data written to `slot` arrived there): F_SETSIG's signal or SIGIO, to
+/// a process, its group, or a thread's process.
+fn linux_notify_async_io(slot: crate::linux_socket::SlotId) {
+    const SIGIO: u64 = 29;
+    const POLL_IN: i32 = 1;
+    let Some(peer) = crate::linux_socket::local_peer_slot(slot) else {
+        return;
+    };
+    let domain = linux_execution_instance();
+    for (pid, fd, owner) in crate::linux_async_io::listeners(domain, peer) {
+        let signal = match crate::linux_inotify::notice_signal(domain, pid, fd) {
+            0 => SIGIO,
+            signal => u64::from(signal),
+        };
+        let selector = match owner {
+            crate::linux_async_io::Owner::Process(id)
+            | crate::linux_async_io::Owner::Thread(id) => id as i32,
+            crate::linux_async_io::Owner::Group(group) => -(group as i32),
+        };
+        if let Ok((targets, count)) = linux_signal_targets(selector) {
+            for target in &targets[..count] {
+                let _ = linux_queue_process_signal(*target, signal, POLL_IN, None);
+            }
+        }
+    }
+}
+
 fn linux_descriptor_fcntl(descriptor: u64, command: u64, argument: u64) -> u64 {
     let descriptor = u64::from(descriptor as u32);
     let command = u64::from(command as u32);
@@ -48175,6 +48287,17 @@ fn linux_descriptor_fcntl(descriptor: u64, command: u64, argument: u64) -> u64 {
             | LINUX_F_OFD_SETLKW
     ) {
         return linux_fcntl_lock(descriptor, command, argument);
+    }
+    // Signal-driven I/O's owner (any descriptor), and F_SETSIG on pipes
+    // and sockets, whose own commands come below.
+    if matches!(command, 8 | 9 | 15 | 16)
+        || matches!(command, LINUX_F_SETSIG | LINUX_F_GETSIG)
+            && linux_socket_slot(descriptor).is_some()
+    {
+        if !linux_descriptor_open(descriptor) {
+            return LINUX_EBADF;
+        }
+        return linux_fcntl_owner(descriptor, command, argument);
     }
     if descriptor == 2 && X86_RUNTIME.ELF_PROBE_STDERR_OPEN.load(Ordering::SeqCst) {
         return match command {
@@ -48212,7 +48335,20 @@ fn linux_descriptor_fcntl(descriptor: u64, command: u64, argument: u64) -> u64 {
                 linux_fcntl_descriptor_flags(descriptor, command, argument)
             }
             LINUX_F_GETFL => pipe_access | u64::from(flags.load(Ordering::SeqCst)),
-            LINUX_F_SETFL => linux_descriptor_set_nonblocking(flags, argument),
+            // O_ASYNC: data arriving signals the descriptor's owner.
+            LINUX_F_SETFL => {
+                const O_ASYNC: u64 = 0o20000;
+                if let Some(slot) = linux_socket_slot(descriptor) {
+                    crate::linux_async_io::set_async(
+                        linux_execution_instance(),
+                        current_linux_process_pid(),
+                        descriptor as u32,
+                        slot,
+                        argument & O_ASYNC != 0,
+                    );
+                }
+                linux_descriptor_set_status_flags(flags, argument, LINUX_O_NONBLOCK | O_ASYNC)
+            }
             LINUX_F_GETPIPE_SZ if state & LINUX_DEVICE_PIPE != 0 => linux_socket_slot(descriptor)
                 .map_or(LINUX_EBADF, |slot| {
                     crate::linux_socket::local_capacity(slot)
