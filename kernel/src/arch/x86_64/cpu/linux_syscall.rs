@@ -1629,22 +1629,34 @@ fn linux_syscall_dispatch(
         LINUX_FCHOWNAT_SYSCALL => {
             linux_fchownat(first_argument, buffer, count, register(0), register(2))
         }
-        LINUX_SETXATTR_SYSCALL | LINUX_LSETXATTR_SYSCALL => {
-            linux_setxattr_path(first_argument, buffer, count, register(0), register(2))
-        }
+        LINUX_SETXATTR_SYSCALL | LINUX_LSETXATTR_SYSCALL => linux_setxattr_path(
+            first_argument,
+            buffer,
+            count,
+            register(0),
+            register(2),
+            number == LINUX_SETXATTR_SYSCALL,
+        ),
         LINUX_FSETXATTR_SYSCALL => {
             linux_fsetxattr(first_argument, buffer, count, register(0), register(2))
         }
-        LINUX_GETXATTR_SYSCALL | LINUX_LGETXATTR_SYSCALL => {
-            linux_getxattr_path(first_argument, buffer, count, register(0))
-        }
+        LINUX_GETXATTR_SYSCALL | LINUX_LGETXATTR_SYSCALL => linux_getxattr_path(
+            first_argument,
+            buffer,
+            count,
+            register(0),
+            number == LINUX_GETXATTR_SYSCALL,
+        ),
         LINUX_FGETXATTR_SYSCALL => linux_fgetxattr(first_argument, buffer, count, register(0)),
-        LINUX_LISTXATTR_SYSCALL | LINUX_LLISTXATTR_SYSCALL => {
-            linux_listxattr_path(first_argument, buffer, count)
-        }
+        LINUX_LISTXATTR_SYSCALL | LINUX_LLISTXATTR_SYSCALL => linux_listxattr_path(
+            first_argument,
+            buffer,
+            count,
+            number == LINUX_LISTXATTR_SYSCALL,
+        ),
         LINUX_FLISTXATTR_SYSCALL => linux_flistxattr(first_argument, buffer, count),
         LINUX_REMOVEXATTR_SYSCALL | LINUX_LREMOVEXATTR_SYSCALL => {
-            linux_removexattr_path(first_argument, buffer)
+            linux_removexattr_path(first_argument, buffer, number == LINUX_REMOVEXATTR_SYSCALL)
         }
         LINUX_FREMOVEXATTR_SYSCALL => linux_fremovexattr(first_argument, buffer),
         LINUX_EPOLL_CREATE1_SYSCALL => linux_epoll_create1(first_argument),

@@ -492,6 +492,7 @@ pub(super) const LINUX_EAFNOSUPPORT: u64 = u64::MAX - 96;
 pub(super) const LINUX_ESOCKTNOSUPPORT: u64 = u64::MAX - 93;
 pub(super) const LINUX_EPROTONOSUPPORT: u64 = u64::MAX - 92;
 pub(super) const LINUX_ENOPROTOOPT: u64 = u64::MAX - 91;
+pub(super) const LINUX_EPROTOTYPE: u64 = u64::MAX - 90;
 pub(super) const LINUX_ENETUNREACH: u64 = u64::MAX - 100;
 pub(super) const LINUX_ENFILE: u64 = u64::MAX - 22;
 pub(super) const LINUX_EADDRINUSE: u64 = u64::MAX - 97;

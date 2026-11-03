@@ -28498,6 +28498,27 @@ fn linux_readlink_at(
         Err(error) => return error,
     };
     let path = &path[..path_length];
+    // An empty path reads the symlink an O_PATH descriptor names.
+    if path.is_empty() {
+        let Some(link) = linux_overlay_descriptor_handle(directory)
+            .and_then(crate::linux_overlay::metadata)
+            .filter(|metadata| metadata.kind == crate::linux_overlay::NodeKind::Symlink)
+        else {
+            return LINUX_ENOENT;
+        };
+        let mut target = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+        let Some(target_length) = crate::linux_overlay::read(link.handle, 0, &mut target) else {
+            return LINUX_EIO;
+        };
+        let output_length = usize::try_from(output_size)
+            .unwrap_or(usize::MAX)
+            .min(target_length);
+        return if copy_to_linux_user(output_address, &target[..output_length]) {
+            output_length as u64
+        } else {
+            LINUX_EFAULT
+        };
+    }
     if let Some(descriptor) = linux_descriptor_link_at(directory, path, false) {
         let mut target = [0_u8; crate::linux_overlay::PATH_CAPACITY];
         let Some(target_length) = linux_descriptor_link_target(descriptor, &mut target) else {
@@ -32996,6 +33017,10 @@ fn linux_openat_path(
     {
         const LINK_LIMIT: usize = 40;
         followed += 1;
+        // O_PATH with O_NOFOLLOW opens the symlink itself (readlinkat01).
+        if flags & (LINUX_O_PATH | LINUX_O_NOFOLLOW) == LINUX_O_PATH | LINUX_O_NOFOLLOW {
+            break;
+        }
         if flags & LINUX_O_NOFOLLOW != 0 || followed > LINK_LIMIT {
             return LINUX_ELOOP;
         }
@@ -33216,6 +33241,10 @@ fn linux_openat_path(
         match crate::linux_overlay::metadata(handle).map(|metadata| metadata.kind) {
             Some(crate::linux_overlay::NodeKind::File) => LINUX_FILE_TMP_SCRATCH,
             Some(crate::linux_overlay::NodeKind::Directory) => LINUX_ROOT_MEASURED_DIRECTORY,
+            // O_PATH | O_NOFOLLOW names the symlink itself.
+            Some(crate::linux_overlay::NodeKind::Symlink) if flags & LINUX_O_PATH != 0 => {
+                LINUX_FILE_TMP_SCRATCH
+            }
             Some(crate::linux_overlay::NodeKind::Symlink) => return LINUX_EINVAL,
             Some(crate::linux_overlay::NodeKind::Fifo) if flags & LINUX_O_PATH != 0 => {
                 LINUX_FILE_TMP_SCRATCH
@@ -34500,6 +34529,7 @@ fn linux_mknodat(directory: u64, path_address: u64, mode: u64, device: u64) -> u
     const S_IFCHR: u64 = 0o020000;
     const S_IFBLK: u64 = 0o060000;
     const S_IFREG: u64 = 0o100000;
+    const S_IFSOCK: u64 = 0o140000;
 
     let kind = mode & S_IFMT;
     // Device files are inert names here (opening one reaches only the
@@ -34510,7 +34540,7 @@ fn linux_mknodat(directory: u64, path_address: u64, mode: u64, device: u64) -> u
     {
         return LINUX_EPERM;
     }
-    if !matches!(kind, 0 | S_IFREG | S_IFIFO | S_IFCHR | S_IFBLK) {
+    if !matches!(kind, 0 | S_IFREG | S_IFIFO | S_IFCHR | S_IFBLK | S_IFSOCK) {
         return LINUX_EINVAL;
     }
     let mut path = [0_u8; LINUX_PATH_MAX];
@@ -34540,6 +34570,7 @@ fn linux_mknodat(directory: u64, path_address: u64, mode: u64, device: u64) -> u
         (mode as u32) & 0o7777 & !(X86_RUNTIME.ELF_PROBE_UMASK.load(Ordering::SeqCst) as u32);
     let created = match kind {
         S_IFIFO => crate::linux_overlay::create_fifo(path, permissions),
+        S_IFSOCK => crate::linux_overlay::create_socket(path, permissions),
         S_IFCHR => crate::linux_overlay::create_device(
             path,
             crate::linux_overlay::NodeKind::CharacterDevice,
@@ -35324,7 +35355,12 @@ fn linux_xattr_name(address: u64, output: &mut [u8; 256]) -> Result<usize, u64> 
     }
 }
 
-fn linux_xattr_path_handle(path_address: u64) -> Result<crate::linux_overlay::Handle, u64> {
+/// The overlay file an xattr call's path names: the symlink itself for
+/// the l* calls, what it leads to for the others (`follow`).
+fn linux_xattr_path_handle(
+    path_address: u64,
+    follow: bool,
+) -> Result<crate::linux_overlay::Handle, u64> {
     let mut path = [0_u8; LINUX_PATH_MAX];
     let path_length = copy_linux_c_string(path_address, &mut path)?;
     let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
@@ -35333,6 +35369,7 @@ fn linux_xattr_path_handle(path_address: u64) -> Result<crate::linux_overlay::Ha
         &path[..path_length],
         &mut canonical,
     )?;
+    let (length, _, _) = linux_overlay_lookup_following(&mut canonical, length, follow)?;
     if let Some(metadata) = crate::linux_overlay::lookup(&canonical[..length]) {
         return Ok(metadata.handle);
     }
@@ -35422,9 +35459,10 @@ fn linux_setxattr_path(
     value_address: u64,
     value_size: u64,
     flags: u64,
+    follow: bool,
 ) -> u64 {
     let flags = u64::from(flags as u32);
-    let handle = match linux_xattr_path_handle(path_address) {
+    let handle = match linux_xattr_path_handle(path_address, follow) {
         Ok(handle) => handle,
         Err(error) => return error,
     };
@@ -35458,6 +35496,18 @@ fn linux_fsetxattr_handle(
         Err(error) => return error,
     };
     let name = &name[..name_length];
+    // user.* attributes belong to regular files and directories only
+    // (Linux's xattr_permission: EPERM elsewhere).
+    if name.starts_with(b"user.")
+        && crate::linux_overlay::metadata(handle).is_some_and(|metadata| {
+            !matches!(
+                metadata.kind,
+                crate::linux_overlay::NodeKind::File | crate::linux_overlay::NodeKind::Directory
+            )
+        })
+    {
+        return LINUX_EPERM;
+    }
     let exists = crate::linux_overlay::get_xattr_chunk(handle, name, 0, &mut []).is_some();
     if flags == LINUX_XATTR_CREATE && exists {
         return LINUX_EEXIST;
@@ -35510,8 +35560,9 @@ fn linux_getxattr_path(
     name_address: u64,
     value_address: u64,
     value_size: u64,
+    follow: bool,
 ) -> u64 {
-    let handle = match linux_xattr_path_handle(path_address) {
+    let handle = match linux_xattr_path_handle(path_address, follow) {
         Ok(handle) => handle,
         Err(LINUX_EROFS) => return LINUX_ENODATA,
         Err(error) => return error,
@@ -35578,8 +35629,8 @@ fn linux_flistxattr(descriptor: u64, list_address: u64, list_size: u64) -> u64 {
     linux_flistxattr_handle(handle, list_address, list_size)
 }
 
-fn linux_listxattr_path(path_address: u64, list_address: u64, list_size: u64) -> u64 {
-    let handle = match linux_xattr_path_handle(path_address) {
+fn linux_listxattr_path(path_address: u64, list_address: u64, list_size: u64, follow: bool) -> u64 {
+    let handle = match linux_xattr_path_handle(path_address, follow) {
         Ok(handle) => handle,
         Err(LINUX_EROFS) => return 0,
         Err(error) => return error,
@@ -35635,8 +35686,8 @@ fn linux_fremovexattr(descriptor: u64, name_address: u64) -> u64 {
     linux_fremovexattr_handle(handle, name_address)
 }
 
-fn linux_removexattr_path(path_address: u64, name_address: u64) -> u64 {
-    let handle = match linux_xattr_path_handle(path_address) {
+fn linux_removexattr_path(path_address: u64, name_address: u64, follow: bool) -> u64 {
+    let handle = match linux_xattr_path_handle(path_address, follow) {
         Ok(handle) => handle,
         Err(LINUX_EROFS) => return LINUX_ENODATA,
         Err(error) => return error,
@@ -36469,6 +36520,7 @@ fn linux_socket_slot(descriptor: u64) -> Option<crate::linux_socket::SlotId> {
 
 fn linux_socket_error(error: crate::linux_socket::Error) -> u64 {
     match error {
+        crate::linux_socket::Error::WrongType => LINUX_EPROTOTYPE,
         crate::linux_socket::Error::Unavailable => LINUX_ENETUNREACH,
         crate::linux_socket::Error::Exhausted => LINUX_ENFILE,
         crate::linux_socket::Error::AddressInUse => LINUX_EADDRINUSE,
@@ -37035,10 +37087,38 @@ fn linux_socket_connect(descriptor: u64, address: u64, length: u64) -> u64 {
             Ok(length) => length,
             Err(error) => return error,
         };
+        // Connecting through a socket file needs write permission on it.
+        if path[0] != 0 {
+            let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+            if let Ok(length) = linux_canonical_path_at(
+                u64::from(LINUX_AT_FDCWD),
+                &path[..path_length],
+                &mut canonical,
+            ) {
+                if let Some(metadata) = crate::linux_overlay::lookup(&canonical[..length])
+                    .filter(|metadata| metadata.kind == crate::linux_overlay::NodeKind::Socket)
+                {
+                    if let Err(error) = linux_check_access(
+                        Some(linux_overlay_file_access(metadata)),
+                        ginux_credentials::access::WRITE,
+                        false,
+                    ) {
+                        return error;
+                    }
+                }
+            }
+        }
+        let credentials = current_linux_credentials().map_or((0, 0), |credentials| {
+            (credentials.user.effective, credentials.group.effective)
+        });
         // No socket bound to the name: Linux fails a path that does not
         // exist with ENOENT and an abstract name with ECONNREFUSED (musl's
         // nscd lookup treats both as "no daemon").
-        return match crate::linux_socket::connect_unix(slot, &path[..path_length]) {
+        return match crate::linux_socket::connect_unix(
+            slot,
+            &path[..path_length],
+            (current_linux_process_pid(), credentials.0, credentials.1),
+        ) {
             Ok(()) => 0,
             Err(crate::linux_socket::Error::NotConnected) if path[0] == 0 => LINUX_ECONNREFUSED,
             // A socket file nothing is bound to any more refuses; a path

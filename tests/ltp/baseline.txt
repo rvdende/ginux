@@ -14,7 +14,6 @@ clone08 TBROK
 clone09 TBROK
 clone10 TBROK
 clone301 TBROK
-connect03 TFAIL
 creat07 TFAIL
 epoll_wait05 TFAIL
 epoll_wait06 TFAIL
@@ -34,7 +33,6 @@ fcntl31_64 TFAIL
 fgetxattr02 TBROK
 getcpu01 TFAIL
 get_robust_list01 TFAIL
-getsockopt02 TFAIL
 ioctl01 TBROK
 ioctl02 TBROK
 ioctl07 TBROK
@@ -69,7 +67,6 @@ keyctl30 TBROK
 kcmp03 TFAIL
 link08 TFAIL
 lsm_list_modules01 TFAIL
-mknod07 TFAIL
 mlock05 TBROK
 mlock201 TFAIL
 mmap04 TBROK
@@ -106,7 +103,6 @@ ptrace08 TBROK
 ptrace09 TBROK
 ptrace10 TBROK
 ptrace11 TBROK
-readlinkat01 TBROK
 recvmmsg01 TBROK
 remap_file_pages01 TBROK
 rt_sigaction01 TBROK
@@ -116,7 +112,6 @@ sendmsg01 TBROK
 sendto01 TFAIL
 setns02 TWARN
 setrlimit06 TFAIL
-setxattr02 TBROK
 setxattr03 TBROK
 sigaction01 TBROK
 signal06 TBROK

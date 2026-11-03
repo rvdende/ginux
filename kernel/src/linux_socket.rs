@@ -112,6 +112,8 @@ pub(crate) enum Kind {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum Error {
+    /// A Unix socket of another type is bound to the name (EPROTOTYPE).
+    WrongType,
     Unavailable,
     Exhausted,
     AddressInUse,
@@ -856,7 +858,12 @@ impl Sockets {
         Ok(())
     }
 
-    fn connect_unix(&mut self, id: SlotId, path: &[u8]) -> Result<(), Error> {
+    fn connect_unix(
+        &mut self,
+        id: SlotId,
+        path: &[u8],
+        credentials: (u32, u32, u32),
+    ) -> Result<(), Error> {
         let state = self.unix(id).ok_or(Error::Invalid)?;
         if state.peer.is_some() {
             return Err(Error::Invalid);
@@ -876,7 +883,20 @@ impl Sockets {
                     })
             })
             .map(|(candidate, _)| candidate as SlotId)
-            .ok_or(Error::NotConnected)?;
+            .ok_or_else(|| {
+                // A socket of another type at the name is EPROTOTYPE.
+                let other_type = self.slots.iter().flatten().any(|slot| {
+                    slot.owner == owner
+                        && slot.kind == Kind::Unix
+                        && slot.unix_type != unix_type
+                        && slot.unix_path == path
+                });
+                if other_type {
+                    Error::WrongType
+                } else {
+                    Error::NotConnected
+                }
+            })?;
         if unix_type == 2 {
             unix_in_mut(&mut self.slots, id).ok_or(Error::Invalid)?.peer = Some(peer);
             return Ok(());
@@ -890,6 +910,7 @@ impl Sockets {
         accepted.peer = Some(id);
         accepted.options = listener.options;
         accepted.unix_type = listener.unix_type;
+        accepted.peer_credentials = Some(credentials);
         slot_in_mut(&mut self.slots, peer)
             .ok_or(Error::Invalid)?
             .pending
@@ -2475,8 +2496,14 @@ pub(crate) fn bind_unix(id: SlotId, path: &[u8]) -> Result<(), Error> {
     SOCKETS.lock().bind_unix(id, path)
 }
 
-pub(crate) fn connect_unix(id: SlotId, path: &[u8]) -> Result<(), Error> {
-    SOCKETS.lock().connect_unix(id, path)
+/// Connects Unix socket `id` to the socket bound to `path`; the connector's
+/// (pid, uid, gid) become the accepted end's peer credentials (SO_PEERCRED).
+pub(crate) fn connect_unix(
+    id: SlotId,
+    path: &[u8],
+    credentials: (u32, u32, u32),
+) -> Result<(), Error> {
+    SOCKETS.lock().connect_unix(id, path, credentials)
 }
 
 /// The path a Unix socket is bound to, empty when it has none.
