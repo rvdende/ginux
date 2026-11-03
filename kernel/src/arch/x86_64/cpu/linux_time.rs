@@ -209,9 +209,12 @@ pub(super) fn linux_settimeofday(timeval_address: u64, _timezone_address: u64) -
 /// ADJ_OFFSET_SINGLESHOT move the clock by the offset and ADJ_SETOFFSET by
 /// the time field (at once, there is no slewing); the other parameters are
 /// checked as Linux does (the tick within 900000..=1100000) and not kept.
-/// The state read back is a synchronized clock at Linux's default tick.
+/// ADJ_STATUS keeps the NTP status word (a leap second asked for with
+/// STA_INS is reported, TIME_INS then TIME_WAIT, though the clock is not
+/// stepped), and the call returns the clock state (leapsec01).
 pub(super) fn linux_adjtimex(address: u64) -> u64 {
     const ADJ_OFFSET: i32 = 0x0001;
+    const ADJ_STATUS: i32 = 0x0010;
     const ADJ_SETOFFSET: i32 = 0x0100;
     const ADJ_NANO: i32 = 0x2000;
     const ADJ_TICK: i32 = 0x4000;
@@ -266,8 +269,16 @@ pub(super) fn linux_adjtimex(address: u64) -> u64 {
     let Some((seconds, nanoseconds)) = linux_realtime_time() else {
         return LINUX_ENOSYS;
     };
+    if !singleshot && modes & ADJ_STATUS != 0 {
+        linux_set_ntp_status(
+            u32::from_ne_bytes(timex[40..44].try_into().unwrap()),
+            seconds,
+        );
+    }
+    let (status, state) = linux_ntp_state(seconds);
     let mut output = [0_u8; TIMEX_SIZE];
     output[..4].copy_from_slice(&modes.to_ne_bytes());
+    output[40..44].copy_from_slice(&status.to_ne_bytes());
     output[56..64].copy_from_slice(&1_i64.to_ne_bytes());
     output[64..72].copy_from_slice(&32_768_000_i64.to_ne_bytes());
     output[72..80].copy_from_slice(&(seconds as i64).to_ne_bytes());
@@ -277,7 +288,7 @@ pub(super) fn linux_adjtimex(address: u64) -> u64 {
     if !copy_to_linux_user(address, &output) {
         return LINUX_EFAULT;
     }
-    0
+    state
 }
 
 /// clock_adjtime(2): adjtimex for CLOCK_REALTIME; no other clock here can

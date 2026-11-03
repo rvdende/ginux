@@ -82,6 +82,17 @@ pub(crate) fn lookup(instance: u8, pid: u32) -> Option<Vec<u8>> {
     None
 }
 
+/// Whether a live process of `instance` is executing the program at
+/// absolute `path` (opening it for writing is then ETXTBSY).
+pub(crate) fn executing(instance: u8, path: &[u8]) -> bool {
+    ENTRIES.lock().iter().any(|entry| {
+        entry.instance == instance
+            && entry.path == path
+            && linux_process::live_process_status(entry.pid)
+                .is_some_and(|status| status.state != linux_process::LiveProcessState::Zombie)
+    })
+}
+
 /// Forgets every path recorded for `instance`, when its domain stops.
 pub(crate) fn forget_instance(instance: u8) {
     ENTRIES.lock().retain(|entry| entry.instance != instance);

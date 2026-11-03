@@ -444,6 +444,8 @@ pub(super) const LINUX_EAGAIN: u64 = u64::MAX - 10;
 pub(super) const LINUX_EPIPE: u64 = u64::MAX - 31;
 pub(super) const LINUX_EACCES: u64 = u64::MAX - 12;
 pub(super) const LINUX_EBUSY: u64 = u64::MAX - 15;
+/// A program being run cannot be written, nor a file open for writing run.
+pub(super) const LINUX_ETXTBSY: u64 = u64::MAX - 25;
 pub(super) const LINUX_ECONNREFUSED: u64 = u64::MAX - 110;
 pub(super) const LINUX_F_SETPIPE_SZ: u64 = 1031;
 pub(super) const LINUX_F_GETPIPE_SZ: u64 = 1032;

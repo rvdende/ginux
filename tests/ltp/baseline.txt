@@ -5,17 +5,14 @@
 # (tests/qemu/ltp.sh --update-baseline); LTP_STRICT=1 ignores it.
 # From target/ltp-results.txt (2026-11-03), list=tests/ltp/syscalls.list ltp=20260930 kernel=468a6a67.
 clock_gettime03 TBROK
-leapsec01 TBROK
 clone02 TFAIL
 clone05 TFAIL
 clone08 TBROK
 clone09 TBROK
 clone10 TBROK
 clone301 TBROK
-creat07 TFAIL
 epoll_wait06 TFAIL
 epoll_wait16 TBROK
-execve04 TFAIL
 fsetxattr02 TBROK
 fgetxattr02 TBROK
 getcpu01 TFAIL
@@ -83,7 +80,6 @@ sigaction01 TBROK
 signal06 TBROK
 sigtimedwait01 HANG
 sigwaitinfo01 HANG
-splice06 TBROK
 statmount03 TBROK
 times03 TFAIL
 unshare03 TFAIL

@@ -28846,6 +28846,61 @@ static LINUX_REALTIME_OFFSET_NANOSECONDS: [core::sync::atomic::AtomicI64;
     control_abi::DOMAIN_LIMIT] =
     [const { core::sync::atomic::AtomicI64::new(0) }; control_abi::DOMAIN_LIMIT];
 
+/// Each domain's NTP status word (adjtimex's STA_* bits, as ADJ_STATUS set
+/// them) and, while STA_INS is set, the wall-clock second at which the
+/// leap second it asks for is due (the next midnight UTC when it was set).
+static LINUX_NTP_STATUS: [AtomicU32; control_abi::DOMAIN_LIMIT] =
+    [const { AtomicU32::new(0) }; control_abi::DOMAIN_LIMIT];
+static LINUX_NTP_LEAP_SECOND: [AtomicU64; control_abi::DOMAIN_LIMIT] =
+    [const { AtomicU64::new(0) }; control_abi::DOMAIN_LIMIT];
+
+/// Sets the current domain's NTP status to `status` (its writable bits)
+/// at wall-clock second `now`, scheduling a leap second at the next
+/// midnight when STA_INS or STA_DEL is newly set.
+fn linux_set_ntp_status(status: u32, now: u64) {
+    const STA_INS: u32 = 0x0010;
+    const STA_DEL: u32 = 0x0020;
+    // STA_PPSSIGNAL, PPSJITTER, PPSWANDER, PPSERROR, CLOCKERR, NANO, MODE
+    // and CLK are the kernel's to report, not to set.
+    const READ_ONLY: u32 = 0xff00;
+    let Some(slot) = current_container_slot() else {
+        return;
+    };
+    let old = LINUX_NTP_STATUS[slot].swap(status & !READ_ONLY, Ordering::AcqRel);
+    if status & (STA_INS | STA_DEL) != 0 && old & (STA_INS | STA_DEL) == 0 {
+        LINUX_NTP_LEAP_SECOND[slot].store(now - now % 86_400 + 86_400, Ordering::Release);
+    }
+}
+
+/// The current domain's NTP status and its clock state at wall-clock second
+/// `now`, as adjtimex returns it: TIME_INS or TIME_DEL until a scheduled
+/// leap second, TIME_WAIT after it while the flag stays set, TIME_ERROR
+/// for an unsynchronized clock, else TIME_OK.
+fn linux_ntp_state(now: u64) -> (u32, u64) {
+    const STA_INS: u32 = 0x0010;
+    const STA_DEL: u32 = 0x0020;
+    const STA_UNSYNC: u32 = 0x0040;
+    let Some(slot) = current_container_slot() else {
+        return (0, 0);
+    };
+    let status = LINUX_NTP_STATUS[slot].load(Ordering::Acquire);
+    let leap = LINUX_NTP_LEAP_SECOND[slot].load(Ordering::Acquire);
+    let state = if status & (STA_INS | STA_DEL) != 0 {
+        if now >= leap {
+            4
+        } else if status & STA_INS != 0 {
+            1
+        } else {
+            2
+        }
+    } else if status & STA_UNSYNC != 0 {
+        5
+    } else {
+        0
+    };
+    (status, state)
+}
+
 /// The current domain's wall-clock offset (`LINUX_REALTIME_OFFSET_NANOSECONDS`).
 fn linux_realtime_offset_nanoseconds() -> i64 {
     current_container_slot().map_or(0, |slot| {
@@ -29010,51 +29065,94 @@ fn linux_pipe_max_size() -> u64 {
 /// A write of /proc/sys/kernel/domainname: the name up to a newline, as
 /// setdomainname sets it, by root.
 fn linux_proc_domainname_write(device: u16, address: u64, count: u64) -> u64 {
-    if device & 3 & LINUX_DESCRIPTOR_OUTPUT == 0 {
-        return LINUX_EBADF;
-    }
-    if current_linux_credentials().is_none_or(|credentials| credentials.user.effective != 0) {
-        return LINUX_EACCES;
-    }
     let mut text = [0_u8; LINUX_UTS_NAME_CAPACITY + 1];
     let length = usize::try_from(count).map_or(text.len(), |count| count.min(text.len()));
-    if !copy_from_linux_user(address, &mut text[..length]) {
+    if device & 3 & LINUX_DESCRIPTOR_OUTPUT != 0
+        && current_linux_credentials().is_some_and(|credentials| credentials.user.effective == 0)
+        && !copy_from_linux_user(address, &mut text[..length])
+    {
         return LINUX_EFAULT;
     }
-    let name = text[..length]
+    linux_proc_domainname_write_bytes(device, &text[..length]).map_or_else(|error| error, |_| count)
+}
+
+/// The domainname write of `text`, from the kernel's own buffer (splice):
+/// the bytes taken, or the error.
+fn linux_proc_domainname_write_bytes(device: u16, text: &[u8]) -> Result<usize, u64> {
+    if device & 3 & LINUX_DESCRIPTOR_OUTPUT == 0 {
+        return Err(LINUX_EBADF);
+    }
+    if current_linux_credentials().is_none_or(|credentials| credentials.user.effective != 0) {
+        return Err(LINUX_EACCES);
+    }
+    let name = text
         .split(|byte| *byte == b'\n' || *byte == 0)
         .next()
         .unwrap_or_default();
     if name.len() > LINUX_UTS_NAME_CAPACITY || !linux_uts_set(LINUX_UTS_DOMAIN, name) {
-        return LINUX_EINVAL;
+        return Err(LINUX_EINVAL);
     }
-    count
+    Ok(text.len())
 }
 
 fn linux_proc_sysctl_write(device: u16, index: usize, address: u64, count: u64) -> u64 {
-    if device & 3 & LINUX_DESCRIPTOR_OUTPUT == 0 {
-        return LINUX_EBADF;
-    }
-    if current_linux_credentials().is_none_or(|credentials| credentials.user.effective != 0) {
-        return LINUX_EACCES;
-    }
-    let Some(slot) = current_container_slot() else {
-        return LINUX_EIO;
-    };
     let mut text = [0_u8; 24];
     let length = usize::try_from(count).map_or(text.len(), |count| count.min(text.len()));
-    if !copy_from_linux_user(address, &mut text[..length]) {
+    if device & 3 & LINUX_DESCRIPTOR_OUTPUT != 0
+        && current_linux_credentials().is_some_and(|credentials| credentials.user.effective == 0)
+        && !copy_from_linux_user(address, &mut text[..length])
+    {
         return LINUX_EFAULT;
     }
-    let text = text[..length]
+    linux_proc_sysctl_write_bytes(device, index, &text[..length])
+        .map_or_else(|error| error, |_| count)
+}
+
+/// The /proc/sys write of `text` to value `index`, from the kernel's own
+/// buffer (splice): the bytes taken, or the error.
+fn linux_proc_sysctl_write_bytes(device: u16, index: usize, text: &[u8]) -> Result<usize, u64> {
+    if device & 3 & LINUX_DESCRIPTOR_OUTPUT == 0 {
+        return Err(LINUX_EBADF);
+    }
+    if current_linux_credentials().is_none_or(|credentials| credentials.user.effective != 0) {
+        return Err(LINUX_EACCES);
+    }
+    let Some(slot) = current_container_slot() else {
+        return Err(LINUX_EIO);
+    };
+    let value = text
         .split(|byte| *byte == 0)
         .next()
-        .unwrap_or_default();
-    let Some(value) = linux_parse_kernel_integer(text.trim_ascii()) else {
-        return LINUX_EINVAL;
-    };
+        .and_then(|text| linux_parse_kernel_integer(text.trim_ascii()))
+        .ok_or(LINUX_EINVAL)?;
     LINUX_SYSCTL_OVERRIDES[slot][index].store(value, Ordering::Release);
-    count
+    Ok(text.len())
+}
+
+/// The text of the /proc/sys value a descriptor state names, as a read
+/// shows it: the domain's name for kernel/domainname, a number the domain
+/// wrote, else the built-in value; with its length.
+fn linux_proc_sysctl_text(state: u16) -> Option<([u8; LINUX_UTS_NAME_CAPACITY + 1], usize)> {
+    let index = linux_proc_sysctl_index(state)?;
+    let mut text = [0_u8; LINUX_UTS_NAME_CAPACITY + 1];
+    if LINUX_PROC_SYSCTLS[index].1 == b"sys/kernel/domainname" {
+        let mut name = [0_u8; LINUX_UTS_NAME_CAPACITY];
+        let length = linux_uts_name(LINUX_UTS_DOMAIN, &mut name);
+        text[..length].copy_from_slice(&name[..length]);
+        text[length] = b'\n';
+        return Some((text, length + 1));
+    }
+    if let Some(value) = linux_proc_sysctl_override(index) {
+        let mut used = 0;
+        let generated = (value >= 0 || append_linux_bytes(&mut text, &mut used, b"-"))
+            && append_linux_decimal(&mut text, &mut used, value.unsigned_abs())
+            && append_linux_bytes(&mut text, &mut used, b"\n");
+        return generated.then_some((text, used));
+    }
+    let built_in = LINUX_PROC_SYSCTLS[index].2;
+    let length = built_in.len().min(text.len());
+    text[..length].copy_from_slice(&built_in[..length]);
+    Some((text, length))
 }
 
 fn linux_proc_root_file_kind(name: &[u8]) -> Option<u16> {
@@ -30403,6 +30501,15 @@ fn linux_rootfs_execve_source(
         if let Err(error) = linux_check_access(exec_file, ginux_credentials::access::EXECUTE, false)
         {
             return error;
+        }
+        // A file some process has open for writing cannot be executed
+        // (execve04).
+        if crate::linux_overlay::lookup(path.strip_prefix(b"/").unwrap_or(path)).is_some_and(
+            |metadata| {
+                linux_overlay_file_open_for_write(crate::linux_overlay::generation(metadata.handle))
+            },
+        ) {
+            return LINUX_ETXTBSY;
         }
         match linux_overlay_exec_image(path) {
             Ok(image) => overlay_image = image,
@@ -32266,6 +32373,70 @@ fn linux_rootfs_handle_hidden(handle: u16) -> bool {
         .is_some_and(|length| crate::linux_overlay::hidden(&path[..length]))
 }
 
+/// Whether `path` (from `directory`) names the program a live process of
+/// the domain is executing.
+fn linux_path_executing(directory: u64, path: &[u8]) -> bool {
+    let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY + 1];
+    let Ok(length) = linux_canonical_path_at(
+        directory,
+        path,
+        (&mut canonical[1..]).try_into().expect("path capacity"),
+    ) else {
+        return false;
+    };
+    canonical[0] = b'/';
+    crate::linux_exe::executing(
+        X86_RUNTIME.LINUX_EXECUTION_INSTANCE.load(Ordering::SeqCst),
+        &canonical[..length + 1],
+    )
+}
+
+/// Whether a process of the domain has the overlay file of `generation`
+/// open for writing: the current process from its descriptor tables, the
+/// others from their saved records.
+fn linux_overlay_file_open_for_write(generation: u32) -> bool {
+    let writer = |state: u16, file: u32| {
+        state & !3 == LINUX_FILE_TMP_SCRATCH && state & 2 != 0 && file == generation
+    };
+    let current = (0..3).any(|index| {
+        writer(
+            X86_RUNTIME.ELF_PROBE_STDIO_DEVICE_DESCRIPTORS[index].load(Ordering::SeqCst),
+            X86_RUNTIME.ELF_PROBE_STDIO_TMP_FILE_GENERATIONS[index].load(Ordering::SeqCst),
+        )
+    }) || (0..LINUX_DEVICE_DESCRIPTOR_COUNT).any(|index| {
+        X86_RUNTIME
+            .ELF_PROBE_DEVICE_DESCRIPTORS
+            .get(index)
+            .zip(X86_RUNTIME.ELF_PROBE_TMP_FILE_GENERATIONS.get(index))
+            .is_some_and(|(state, file)| {
+                writer(state.load(Ordering::SeqCst), file.load(Ordering::SeqCst))
+            })
+    });
+    if current {
+        return true;
+    }
+    let me = current_linux_process_pid();
+    (0..linux_process::PROCESS_LIMIT)
+        .filter_map(linux_process::live_process_pid_at)
+        .filter(|pid| *pid != me)
+        .any(|pid| {
+            linux_process_runtime_state(pid).is_some_and(|state| {
+                let descriptors = &state.descriptors;
+                state.valid
+                    && (descriptors
+                        .stdio_devices
+                        .iter()
+                        .zip(&descriptors.stdio_tmp_generations)
+                        .any(|(state, file)| writer(*state, *file))
+                        || descriptors
+                            .devices
+                            .iter()
+                            .zip(&descriptors.tmp_generations)
+                            .any(|(state, file)| writer(*state, *file)))
+            })
+        })
+}
+
 fn linux_overlay_descriptor_handle(descriptor: u64) -> Option<crate::linux_overlay::Handle> {
     let generation = if let Some(generation) = usize::try_from(descriptor)
         .ok()
@@ -33068,6 +33239,11 @@ fn linux_openat_path(
     let path = &path[..path_length];
     if temporary {
         return linux_open_temporary(directory, path, flags, mode);
+    }
+    // A program a process of the domain is executing cannot be opened for
+    // writing (creat07).
+    if access != 0 && linux_path_executing(directory, path) {
+        return LINUX_ETXTBSY;
     }
     let tmp_path = path == b"/tmp/ginux-ready";
     let proc_fdinfo_target = linux_proc_fdinfo_target(path);
@@ -39795,6 +39971,13 @@ fn linux_regular_file_read_kernel(
     if !matches!(state & 3, LINUX_DESCRIPTOR_INPUT | 3) {
         return Err(LINUX_EBADF);
     }
+    // A /proc/sys value spliced into a pipe (splice06).
+    if let Some((text, length)) = linux_proc_sysctl_text(state) {
+        let text = text.get(offset..length).unwrap_or_default();
+        let copied = text.len().min(output.len());
+        output[..copied].copy_from_slice(&text[..copied]);
+        return Ok(copied);
+    }
     if let Some(handle) = linux_overlay_descriptor_handle(descriptor) {
         let metadata = crate::linux_overlay::metadata(handle).ok_or(LINUX_EBADF)?;
         if metadata.kind != crate::linux_overlay::NodeKind::File {
@@ -39852,6 +40035,14 @@ fn linux_regular_file_write_kernel(
     }
     if !matches!(state & 3, LINUX_DESCRIPTOR_OUTPUT | 3) {
         return Err(LINUX_EBADF);
+    }
+    // A /proc/sys value written from a pipe (splice06).
+    if let Some(index) = linux_proc_sysctl_index(state) {
+        return if LINUX_PROC_SYSCTLS[index].1 == b"sys/kernel/domainname" {
+            linux_proc_domainname_write_bytes(state, input)
+        } else {
+            linux_proc_sysctl_write_bytes(state, index, input)
+        };
     }
     let length = linux_file_write_limit(offset, input.len())?;
     let input = &input[..length];
@@ -42468,6 +42659,7 @@ impl LinuxSpliceEnd {
             None if linux_overlay_descriptor_handle(descriptor).is_some()
                 || linux_rootfs_descriptor(descriptor) != 0
                 || linux_tmp_descriptor_handle(descriptor, state).is_some()
+                || linux_proc_sysctl_index(state).is_some()
                 || state & LINUX_DEVICE_ZERO != 0 && state & LINUX_DEVICE_DIRECTORY == 0 =>
             {
                 Self::File
