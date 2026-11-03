@@ -156,7 +156,6 @@ realpath01 TBROK
 reboot01 TFAIL
 reboot02 TFAIL
 recvfrom01 TFAIL
-recvmsg01 TFAIL
 recvmmsg01 TBROK
 remap_file_pages01 TBROK
 rt_sigaction01 TBROK
@@ -166,13 +165,11 @@ sched_setattr01 TFAIL
 sched_setattr02 TFAIL
 sched_getattr01 TBROK
 select01 TFAIL
-send01 TFAIL
 send02 TBROK
 sendmsg01 TBROK
 sendto01 TFAIL
 setns02 TWARN
 setrlimit06 TFAIL
-setsockopt01 TFAIL
 setxattr02 TBROK
 setxattr03 TBROK
 shmget02 TBROK
@@ -180,8 +177,6 @@ sigaction01 TBROK
 signal06 TBROK
 sigtimedwait01 HANG
 sigwaitinfo01 HANG
-socketpair01 TFAIL
-sockioctl01 TBROK
 splice06 TBROK
 splice09 TFAIL
 statmount03 TBROK

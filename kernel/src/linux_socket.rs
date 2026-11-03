@@ -2206,6 +2206,60 @@ pub(crate) fn open_unix(socket_type: u8) -> Result<SlotId, Error> {
     SOCKETS.lock().open_unix(socket_type)
 }
 
+/// A network interface as the socket ioctls (SIOCGIF*) describe it.
+#[derive(Clone, Copy)]
+pub(crate) struct InterfaceInfo {
+    pub(crate) name: &'static [u8],
+    pub(crate) index: i32,
+    /// IPv4 address and prefix length.
+    pub(crate) ipv4: u32,
+    pub(crate) prefix: u8,
+    pub(crate) flags: u16,
+    pub(crate) mtu: i32,
+    /// ARPHRD type and hardware address.
+    pub(crate) hardware: (u16, [u8; 6]),
+}
+
+/// The domain's interfaces: the loopback, and eth0 once the network is
+/// configured.
+pub(crate) fn interfaces() -> [Option<InterfaceInfo>; 2] {
+    const IFF_UP: u16 = 0x1;
+    const IFF_BROADCAST: u16 = 0x2;
+    const IFF_LOOPBACK: u16 = 0x8;
+    const IFF_RUNNING: u16 = 0x40;
+    const IFF_MULTICAST: u16 = 0x1000;
+    const ARPHRD_ETHER: u16 = 1;
+    const ARPHRD_LOOPBACK: u16 = 772;
+    let loopback = InterfaceInfo {
+        name: b"lo",
+        index: 1,
+        ipv4: 0x7f00_0001,
+        prefix: 8,
+        flags: IFF_UP | IFF_LOOPBACK | IFF_RUNNING,
+        mtu: 65_536,
+        hardware: (ARPHRD_LOOPBACK, [0; 6]),
+    };
+    let configuration = network::ipv4_configuration();
+    let ipv4 = configuration as u32;
+    let mac = SOCKETS
+        .lock()
+        .platform
+        .map(|platform| platform.initialization.mac);
+    let ethernet = (ipv4 != 0)
+        .then_some(mac)
+        .flatten()
+        .map(|mac| InterfaceInfo {
+            name: b"eth0",
+            index: 2,
+            ipv4,
+            prefix: (configuration >> 32) as u8,
+            flags: IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST,
+            mtu: 1_500,
+            hardware: (ARPHRD_ETHER, mac),
+        });
+    [Some(loopback), ethernet]
+}
+
 /// The most messages a netlink socket queues for its reader; past it the
 /// kernel's message is dropped, as Linux drops it (ENOBUFS for the reader).
 const NETLINK_QUEUE_LIMIT: usize = 64;

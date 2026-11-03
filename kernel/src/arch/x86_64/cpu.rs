@@ -13321,7 +13321,154 @@ fn linux_controller_pipe_write(descriptor: u64, address: u64, count: u64) -> u64
 
 /// Handles the ioctls Linux applies to every descriptor before asking the
 /// file's own driver, by way of the equivalent fcntl calls.
+/// The socket ioctls of Linux's sock_ioctl and inet: SIOCATMARK on TCP
+/// (no urgent data is ever pending), and the interface queries SIOCGIF*
+/// over the domain's loopback and eth0 (`linux_socket::interfaces`).
+/// None for a request this is not, or a descriptor that is no socket.
+fn linux_socket_ioctl(descriptor: u64, request: u64, argument: u64) -> Option<u64> {
+    const SIOCATMARK: u64 = 0x8905;
+    const SIOCGIFNAME: u64 = 0x8910;
+    const SIOCGIFCONF: u64 = 0x8912;
+    const SIOCGIFFLAGS: u64 = 0x8913;
+    const SIOCSIFFLAGS: u64 = 0x8914;
+    const SIOCGIFADDR: u64 = 0x8915;
+    const SIOCGIFNETMASK: u64 = 0x891b;
+    const SIOCGIFMTU: u64 = 0x8921;
+    const SIOCGIFHWADDR: u64 = 0x8927;
+    const SIOCGIFINDEX: u64 = 0x8933;
+    const IFREQ_SIZE: usize = 40;
+    let request = u64::from(request as u32);
+    if !matches!(
+        request,
+        SIOCATMARK
+            | SIOCGIFNAME
+            | SIOCGIFCONF
+            | SIOCGIFFLAGS
+            | SIOCSIFFLAGS
+            | SIOCGIFADDR
+            | SIOCGIFNETMASK
+            | SIOCGIFMTU
+            | SIOCGIFHWADDR
+            | SIOCGIFINDEX
+    ) {
+        return None;
+    }
+    let descriptor = u64::from(descriptor as u32);
+    let slot = linux_socket_slot(descriptor).filter(|_| !linux_pipe_descriptor(descriptor))?;
+    let kind = crate::linux_socket::kind(slot);
+    if request == SIOCATMARK {
+        if kind != Some(crate::linux_socket::Kind::Tcp) {
+            return Some(LINUX_ENOTTY);
+        }
+        return Some(if copy_to_linux_user(argument, &0_i32.to_ne_bytes()) {
+            0
+        } else {
+            LINUX_EFAULT
+        });
+    }
+    let interfaces = crate::linux_socket::interfaces();
+    let sockaddr_in = |address: u32| {
+        let mut sockaddr = [0_u8; 16];
+        sockaddr[..2].copy_from_slice(&2_u16.to_ne_bytes());
+        sockaddr[4..8].copy_from_slice(&address.to_be_bytes());
+        sockaddr
+    };
+    if request == SIOCGIFCONF {
+        // struct ifconf: the buffer's length, then the buffer: one ifreq
+        // (name and address) per interface, or the length needed when the
+        // buffer is null.
+        let mut ifconf = [0_u8; 16];
+        if !copy_from_linux_user(argument, &mut ifconf) {
+            return Some(LINUX_EFAULT);
+        }
+        let capacity = i32::from_ne_bytes(ifconf[..4].try_into().unwrap()).max(0) as usize;
+        let buffer = u64::from_ne_bytes(ifconf[8..16].try_into().unwrap());
+        let mut written = 0_usize;
+        for interface in interfaces.iter().flatten() {
+            if buffer != 0 {
+                if written + IFREQ_SIZE > capacity {
+                    break;
+                }
+                let mut entry = [0_u8; IFREQ_SIZE];
+                entry[..interface.name.len()].copy_from_slice(interface.name);
+                entry[16..32].copy_from_slice(&sockaddr_in(interface.ipv4));
+                if !copy_to_linux_user(buffer + written as u64, &entry) {
+                    return Some(LINUX_EFAULT);
+                }
+            }
+            written += IFREQ_SIZE;
+        }
+        return Some(
+            if copy_to_linux_user(argument, &(written as i32).to_ne_bytes()) {
+                0
+            } else {
+                LINUX_EFAULT
+            },
+        );
+    }
+    let mut ifreq = [0_u8; IFREQ_SIZE];
+    if !copy_from_linux_user(argument, &mut ifreq) {
+        return Some(LINUX_EFAULT);
+    }
+    let interface = if request == SIOCGIFNAME {
+        let index = i32::from_ne_bytes(ifreq[16..20].try_into().unwrap());
+        interfaces
+            .iter()
+            .flatten()
+            .find(|interface| interface.index == index)
+    } else {
+        let name_length = ifreq[..16].iter().position(|byte| *byte == 0).unwrap_or(16);
+        interfaces
+            .iter()
+            .flatten()
+            .find(|interface| interface.name == &ifreq[..name_length])
+    };
+    let Some(interface) = interface else {
+        return Some(LINUX_ENODEV);
+    };
+    match request {
+        SIOCGIFNAME => {
+            ifreq[..16].fill(0);
+            ifreq[..interface.name.len()].copy_from_slice(interface.name);
+        }
+        SIOCGIFFLAGS => ifreq[16..18].copy_from_slice(&interface.flags.to_ne_bytes()),
+        // Changing an interface takes CAP_NET_ADMIN; Ginux keeps them up.
+        SIOCSIFFLAGS => {
+            return Some(
+                if current_linux_credentials().is_some_and(|credentials| {
+                    credentials.has(ginux_credentials::capability::NET_ADMIN)
+                }) {
+                    0
+                } else {
+                    LINUX_EPERM
+                },
+            );
+        }
+        SIOCGIFADDR => ifreq[16..32].copy_from_slice(&sockaddr_in(interface.ipv4)),
+        SIOCGIFNETMASK => {
+            let mask = u32::MAX
+                .checked_shl(32 - u32::from(interface.prefix))
+                .unwrap_or(0);
+            ifreq[16..32].copy_from_slice(&sockaddr_in(mask));
+        }
+        SIOCGIFMTU => ifreq[16..20].copy_from_slice(&interface.mtu.to_ne_bytes()),
+        SIOCGIFHWADDR => {
+            ifreq[16..18].copy_from_slice(&interface.hardware.0.to_ne_bytes());
+            ifreq[18..24].copy_from_slice(&interface.hardware.1);
+        }
+        _ => ifreq[16..20].copy_from_slice(&interface.index.to_ne_bytes()),
+    }
+    Some(if copy_to_linux_user(argument, &ifreq) {
+        0
+    } else {
+        LINUX_EFAULT
+    })
+}
+
 fn linux_generic_ioctl(descriptor: u64, request: u64, argument: u64) -> Option<u64> {
+    if let Some(result) = linux_socket_ioctl(descriptor, request, argument) {
+        return Some(result);
+    }
     match u64::from(request as u32) {
         LINUX_FIOCLEX => Some(linux_descriptor_fcntl(
             descriptor,
@@ -35696,13 +35843,34 @@ fn linux_socket_pair(family: u64, socket_type: u64, protocol: u64, output: u64) 
     const SOCK_SEQPACKET: u64 = 5;
     const SOCK_NONBLOCK: u64 = 0x800;
     const SOCK_CLOEXEC: u64 = 0x8_0000;
+    const AF_INET: u64 = 2;
+    const SOCK_RAW: u64 = 3;
     let family = u64::from(family as u32);
     let socket_type = u64::from(socket_type as u32);
     let protocol = u64::from(protocol as u32);
+    let base = socket_type & 0xf;
+    // An inet socket is made first, as Linux makes it (a bad type EINVAL,
+    // a protocol the type lacks EPROTONOSUPPORT), and then has no pairs
+    // (EOPNOTSUPP: socketpair01).
+    if family == AF_INET {
+        if socket_type & !(0xf | SOCK_NONBLOCK | SOCK_CLOEXEC) != 0
+            || !matches!(base, SOCK_STREAM | SOCK_DGRAM | SOCK_RAW)
+        {
+            return LINUX_EINVAL;
+        }
+        let made = matches!(
+            (base, protocol),
+            (SOCK_STREAM, 0 | 6) | (SOCK_DGRAM, 0 | 1 | 17) | (SOCK_RAW, 1)
+        );
+        return if made {
+            LINUX_EOPNOTSUPP
+        } else {
+            LINUX_EPROTONOSUPPORT
+        };
+    }
     if family != AF_UNIX {
         return LINUX_EAFNOSUPPORT;
     }
-    let base = socket_type & 0xf;
     if !matches!(base, SOCK_STREAM | SOCK_DGRAM | SOCK_SEQPACKET)
         || socket_type & !(0xf | SOCK_NONBLOCK | SOCK_CLOEXEC) != 0
         || protocol != 0
@@ -36099,16 +36267,41 @@ fn linux_socket_sendto(
     destination: u64,
     destination_length: u64,
 ) -> u64 {
-    const SUPPORTED_FLAGS: u64 = 0x40 | 0x4000;
+    const MSG_OOB: u64 = 1;
+    const SUPPORTED_FLAGS: u64 = MSG_OOB | 0x40 | 0x4000;
+    // The largest UDP payload over IPv4.
+    const UDP_PAYLOAD_LIMIT: u64 = 65_507;
     let flags = u64::from(flags as u32);
+    // Pipes are socket pairs inside, and write(2) on one comes here too.
     let Some(slot) = linux_socket_slot(descriptor) else {
         return linux_not_socket_error(descriptor);
     };
     if flags & !SUPPORTED_FLAGS != 0 {
         return LINUX_EINVAL;
     }
-    let netlink = crate::linux_socket::kind(slot) == Some(crate::linux_socket::Kind::Netlink);
-    let remote = if destination == 0 || netlink {
+    let kind = crate::linux_socket::kind(slot);
+    let tcp = kind == Some(crate::linux_socket::Kind::Tcp);
+    // Only TCP has urgent data (MSG_OOB is EOPNOTSUPP elsewhere; sent as
+    // ordinary data here).
+    if flags & MSG_OOB != 0 && !tcp {
+        return LINUX_EOPNOTSUPP;
+    }
+    // The address is read before anything else, as Linux copies it in: a
+    // length past sockaddr_storage is EINVAL, an unreadable one EFAULT.
+    if destination != 0 && (destination_length as u32 as i32) < 0
+        || destination != 0 && u64::from(destination_length as u32) > 128
+    {
+        return LINUX_EINVAL;
+    }
+    if tcp && destination != 0 && !copy_from_linux_user(destination, &mut [0_u8; 16]) {
+        return LINUX_EFAULT;
+    }
+    if kind == Some(crate::linux_socket::Kind::Udp) && count > UDP_PAYLOAD_LIMIT {
+        return LINUX_EMSGSIZE;
+    }
+    let netlink = kind == Some(crate::linux_socket::Kind::Netlink);
+    // A TCP socket sends to its peer, whatever address it is given.
+    let remote = if destination == 0 || netlink || tcp {
         None
     } else {
         match linux_socket_address(destination, destination_length) {
@@ -36170,6 +36363,9 @@ fn linux_socket_sendto(
             }
             written as u64
         }
+        // A TCP socket never connected cannot send: EPIPE, as Linux's
+        // stream send answers (with SIGPIPE).
+        Err(crate::linux_socket::Error::NotConnected) if tcp => LINUX_EPIPE,
         Err(error) => linux_socket_error(error),
     }
 }
@@ -36254,6 +36450,20 @@ fn linux_socket_recvfrom(
         if !copy_to_linux_user(source, &sockaddr[..output_length])
             || !copy_to_linux_user(source_length, &(sockaddr.len() as u32).to_ne_bytes())
         {
+            return LINUX_EFAULT;
+        }
+    } else if source != 0 && endpoint.is_none() {
+        // A connected stream names no sender: the length reads back 0 and
+        // the address is left alone (recvfrom01's bad address); a negative
+        // length is still EINVAL.
+        let mut supplied = [0_u8; 4];
+        if !copy_from_linux_user(source_length, &mut supplied) {
+            return LINUX_EFAULT;
+        }
+        if i32::from_ne_bytes(supplied) < 0 {
+            return LINUX_EINVAL;
+        }
+        if !copy_to_linux_user(source_length, &0_u32.to_ne_bytes()) {
             return LINUX_EFAULT;
         }
     } else if source != 0 {
@@ -36592,11 +36802,11 @@ fn linux_socket_recvmsg(
     let Some(slot) = linux_socket_slot(descriptor) else {
         return linux_not_socket_error(descriptor);
     };
-    // Ginux keeps no socket error queues, so reading one finds it empty.
-    if flags & LINUX_MSG_ERRQUEUE != 0 {
-        return LINUX_EAGAIN;
-    }
-    if flags & !SUPPORTED_FLAGS != 0 {
+    // Linux's order: MSG_CMSG_COMPAT is EINVAL, then the header is read
+    // (EFAULT) and checked (a negative name length EINVAL, more vectors
+    // than UIO_MAXIOV EMSGSIZE), then the flags (recvmsg01).
+    const MSG_CMSG_COMPAT: u64 = 0x8000_0000;
+    if flags & MSG_CMSG_COMPAT != 0 {
         return LINUX_EINVAL;
     }
     let mut header = [0_u8; 56];
@@ -36609,7 +36819,17 @@ fn linux_socket_recvmsg(
         .unwrap_or(usize::MAX);
     let control = u64::from_ne_bytes(header[32..40].try_into().unwrap());
     let control_capacity = u64::from_ne_bytes(header[40..48].try_into().unwrap());
+    if i32::from_ne_bytes(header[8..12].try_into().unwrap()) < 0 {
+        return LINUX_EINVAL;
+    }
     if iov_count > LINUX_IOV_LIMIT {
+        return LINUX_EMSGSIZE;
+    }
+    // Ginux keeps no socket error queues, so reading one finds it empty.
+    if flags & LINUX_MSG_ERRQUEUE != 0 {
+        return LINUX_EAGAIN;
+    }
+    if flags & !SUPPORTED_FLAGS != 0 {
         return LINUX_EINVAL;
     }
     let right_count = crate::linux_socket::unix_right_count(slot);
@@ -37140,6 +37360,19 @@ fn linux_socket_setsockopt(
     let Some(slot) = linux_socket_slot(descriptor) else {
         return linux_not_socket_error(descriptor);
     };
+    // SO_OOBINLINE: an int, read and checked as Linux does (a short length
+    // EINVAL, an unreadable value EFAULT); urgent data is not kept apart.
+    if level == 1 && option == 10 {
+        if length < 4 {
+            return LINUX_EINVAL;
+        }
+        let mut supplied = [0_u8; 4];
+        return if copy_from_linux_user(value, &mut supplied) {
+            0
+        } else {
+            LINUX_EFAULT
+        };
+    }
     if level == 1 && matches!(option, 20 | 21) {
         if length < 16 {
             return LINUX_EINVAL;
