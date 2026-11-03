@@ -28887,6 +28887,7 @@ fn linux_proc_root_file_kind(name: &[u8]) -> Option<u16> {
         b"uptime" => Some(LINUX_FILE_PROC_UPTIME),
         b"loadavg" => Some(LINUX_FILE_PROC_LOADAVG),
         b"filesystems" => Some(LINUX_FILE_PROC_FILESYSTEMS),
+        b"config.gz" => Some(LINUX_FILE_PROC_CONFIG),
         b"cmdline" => Some(LINUX_FILE_PROC_CMDLINE),
         b"sysrq-trigger" => Some(LINUX_FILE_PROC_SYSRQ_TRIGGER),
         b"sysvipc/msg" => Some(LINUX_FILE_PROC_SYSVIPC_MSG),
@@ -46317,6 +46318,7 @@ fn linux_proc_file(state: u16) -> bool {
             | LINUX_FILE_PROC_UPTIME
             | LINUX_FILE_PROC_LOADAVG
             | LINUX_FILE_PROC_FILESYSTEMS
+            | LINUX_FILE_PROC_CONFIG
             | LINUX_FILE_PROC_CMDLINE
             | LINUX_FILE_PROC_PID1_STAT
             | LINUX_FILE_PROC_PID1_STATM
@@ -46519,6 +46521,7 @@ fn linux_regular_file(state: u16) -> Option<&'static [u8]> {
         LINUX_FILE_PROC_UPTIME => return Some(linux_proc_uptime()),
         LINUX_FILE_PROC_LOADAVG => return Some(LINUX_PROC_LOADAVG),
         LINUX_FILE_PROC_FILESYSTEMS => return Some(LINUX_PROC_FILESYSTEMS),
+        LINUX_FILE_PROC_CONFIG => return Some(&LINUX_PROC_CONFIG_GZ),
         LINUX_FILE_PROC_CMDLINE => return Some(LINUX_PROC_CMDLINE),
         LINUX_FILE_PROC_CGROUP => return Some(LINUX_PROC_CGROUP),
         LINUX_FILE_PROC_PROCESS_CMDLINE => return Some(LINUX_PROC_PROCESS_CMDLINE),
@@ -46602,6 +46605,7 @@ fn linux_regular_file_inode(state: u16) -> Option<u64> {
         LINUX_FILE_PROC_UPTIME => return Some(28),
         LINUX_FILE_PROC_LOADAVG => return Some(29),
         LINUX_FILE_PROC_FILESYSTEMS => return Some(30),
+        LINUX_FILE_PROC_CONFIG => return Some(97),
         LINUX_FILE_PROC_CMDLINE => return Some(31),
         LINUX_FILE_PROC_PID1_STAT => return Some(32),
         LINUX_FILE_PROC_PID1_STATM => return Some(33),

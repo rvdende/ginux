@@ -787,6 +787,70 @@ pub(super) const LINUX_PROC_LOADAVG_NODE: u16 = 0xf400;
 pub(super) const LINUX_FILE_PROC_LOADAVG: u16 = LINUX_FILE_MASK | LINUX_PROC_LOADAVG_NODE;
 pub(super) const LINUX_PROC_FILESYSTEMS_NODE: u16 = 0xf300;
 pub(super) const LINUX_FILE_PROC_FILESYSTEMS: u16 = LINUX_FILE_MASK | LINUX_PROC_FILESYSTEMS_NODE;
+/// /proc/config.gz: Ginux's kernel configuration (`kernel_config`).
+pub(super) const LINUX_PROC_CONFIG_NODE: u16 = 0xa900;
+pub(super) const LINUX_FILE_PROC_CONFIG: u16 = LINUX_FILE_MASK | LINUX_PROC_CONFIG_NODE;
+
+/// The kernel configuration as Linux's .config lists it: only what Ginux
+/// implements for Linux programs, so a test that needs a missing feature
+/// (CONFIG_BLK_DEV_LOOP, CONFIG_TIME_NS, ...) skips itself.
+const LINUX_KERNEL_CONFIG: &[u8] = include_bytes!("kernel_config");
+const LINUX_KERNEL_CONFIG_GZIP_SIZE: usize = 10 + 5 + LINUX_KERNEL_CONFIG.len() + 8;
+
+/// `LINUX_KERNEL_CONFIG` as /proc/config.gz serves it: a gzip member
+/// holding one stored (uncompressed) deflate block, built at compile time.
+pub(super) const LINUX_PROC_CONFIG_GZ: [u8; LINUX_KERNEL_CONFIG_GZIP_SIZE] = {
+    const fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = !0_u32;
+        let mut index = 0;
+        while index < bytes.len() {
+            crc ^= bytes[index] as u32;
+            let mut bit = 0;
+            while bit < 8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xedb8_8320
+                } else {
+                    crc >> 1
+                };
+                bit += 1;
+            }
+            index += 1;
+        }
+        !crc
+    }
+    let data = LINUX_KERNEL_CONFIG;
+    assert!(data.len() <= 0xffff);
+    let mut output = [0_u8; LINUX_KERNEL_CONFIG_GZIP_SIZE];
+    // Magic, deflate, no flags, no time, no extra flags, Unix.
+    let header = [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3];
+    let mut index = 0;
+    while index < header.len() {
+        output[index] = header[index];
+        index += 1;
+    }
+    // The final stored block: its length and the length's complement.
+    let length = data.len() as u16;
+    output[10] = 1;
+    output[11] = length as u8;
+    output[12] = (length >> 8) as u8;
+    output[13] = !length as u8;
+    output[14] = (!length >> 8) as u8;
+    let mut offset = 0;
+    while offset < data.len() {
+        output[15 + offset] = data[offset];
+        offset += 1;
+    }
+    let trailer_start = 15 + data.len();
+    let crc = crc32(data).to_le_bytes();
+    let size = (data.len() as u32).to_le_bytes();
+    let mut byte = 0;
+    while byte < 4 {
+        output[trailer_start + byte] = crc[byte];
+        output[trailer_start + 4 + byte] = size[byte];
+        byte += 1;
+    }
+    output
+};
 pub(super) const LINUX_PROC_CMDLINE_NODE: u16 = 0xf200;
 pub(super) const LINUX_FILE_PROC_CMDLINE: u16 = LINUX_FILE_MASK | LINUX_PROC_CMDLINE_NODE;
 pub(super) const LINUX_PROC_PID1_STAT_NODE: u16 = 0xf100;
@@ -1041,7 +1105,7 @@ use super::PAGE_SIZE;
 /// The fixed file nodes and the `/proc/sys` nodes are distinct and clear of
 /// the `/dev/input/eventN` range, so no file is taken for another.
 const _: () = {
-    const NODES: [u16; 44] = [
+    const NODES: [u16; 45] = [
         LINUX_PROC_TASK_DIRECTORY_NODE,
         LINUX_PROC_TASK_COMM_NODE,
         LINUX_PROC_TASK_STAT_NODE,
@@ -1059,6 +1123,7 @@ const _: () = {
         LINUX_PROC_UPTIME_NODE,
         LINUX_PROC_LOADAVG_NODE,
         LINUX_PROC_FILESYSTEMS_NODE,
+        LINUX_PROC_CONFIG_NODE,
         LINUX_PROC_CMDLINE_NODE,
         LINUX_PROC_PID1_STAT_NODE,
         LINUX_PROC_PID1_STATM_NODE,

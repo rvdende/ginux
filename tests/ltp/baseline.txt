@@ -6,7 +6,6 @@
 # From target/ltp-results.txt (2026-11-03), list=tests/ltp/syscalls.list ltp=20260930 kernel=97c546ab.
 abort01 TFAIL
 accept02 TBROK
-acct02 TBROK
 arch_prctl01 TFAIL
 bind02 TFAIL
 bind05 TBROK
@@ -67,7 +66,6 @@ fanotify07 TBROK
 fanotify11 TBROK
 fanotify12 TBROK
 fanotify25 TBROK
-keyctl02 TBROK
 keyctl05 TBROK
 keyctl09 TFAIL
 keyctl23 TBROK
