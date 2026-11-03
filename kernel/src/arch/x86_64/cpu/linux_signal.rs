@@ -1786,7 +1786,13 @@ pub(super) fn linux_kill_current(
     let flags = X86_RUNTIME.ELF_PROBE_SIGNAL_FLAGS[index].load(Ordering::SeqCst);
     let restorer = X86_RUNTIME.ELF_PROBE_SIGNAL_RESTORERS[index].load(Ordering::SeqCst);
     if !linux_signal_action_deliverable(handler, flags, restorer) {
-        return LINUX_ENOSYS;
+        // A handler whose frame cannot be made (no executable restorer: LTP
+        // under musl reads one back from a libc sigaction, which musl does
+        // not fill in) kills the process with SIGSEGV, as Linux's
+        // force_sigsegv does, instead of leaving the signal pending for
+        // every tick to retry (rt_sigsuspend01 ended in SIGILL at the
+        // preemption entry's ud2 that way).
+        return linux_terminate_by_default_signal(LINUX_SIGSEGV);
     }
     let old_alt_stack_flags = X86_RUNTIME.ELF_PROBE_ALT_STACK_FLAGS.load(Ordering::SeqCst);
     let use_alt_stack = flags & LINUX_SA_ONSTACK != 0

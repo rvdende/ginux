@@ -1105,6 +1105,27 @@ fn find_semaphore_set(
     None
 }
 
+/// SEMMNI (the last value of /proc/sys/kernel/sem): semaphore sets per
+/// domain, a frame each.
+pub(crate) const SEMAPHORE_SET_LIMIT: usize = 1024;
+
+fn count_semaphore_sets(instance: usize) -> usize {
+    let mut current = root(
+        &SYSV_IPC_RUNTIME.semaphore_root_addresses,
+        &SYSV_IPC_RUNTIME.semaphore_root_generations,
+        instance,
+    );
+    let mut count = 0;
+    for _ in 0..WALK_LIMIT {
+        let Some(page) = current.and_then(semaphore_page) else {
+            break;
+        };
+        count += 1;
+        current = (page.next_set != memory::FrameLease::EMPTY).then_some(page.next_set);
+    }
+    count
+}
+
 fn find_semaphore_key(instance: usize, key: i32) -> Option<memory::FrameLease> {
     let mut current = root(
         &SYSV_IPC_RUNTIME.semaphore_root_addresses,
@@ -1182,6 +1203,10 @@ pub(crate) fn semaphore_get_or_create(
     let count = usize::try_from(count).map_err(|_| Error::Invalid)?;
     if count == 0 {
         return Err(Error::Invalid);
+    }
+    // SEMMNI (/proc/sys/kernel/sem): no more sets than that (semget05).
+    if count_semaphore_sets(guard.instance) >= SEMAPHORE_SET_LIMIT {
+        return Err(Error::NoSpace);
     }
     let first = allocate_zeroed().ok_or(Error::NoMemory)?;
     let id = SYSV_IPC_RUNTIME.next_semaphore_ids[guard.instance].fetch_add(1, Ordering::AcqRel);

@@ -29,6 +29,7 @@ QEMU, and reports one machine-parseable line per test plus failure clusters.
 | `ab38f442` | /dev nodes, /proc/self/fd magic links, device files open the device, O_TRUNC ignored on devices (baseline 416) | 1362 | 724 | 237 | 162 | 222 | 14 | 0 | 3 |
 | `0a817fe3` | timed waits park again instead of halting, record-lock waits hand off to threads, /dev/urandom, random, full (baseline 413) | 1362 | 727 | 237 | 159 | 222 | 14 | 0 | 3 |
 | ICMP sockets | ping and raw ICMP sockets, blocking socket calls with SO_RCVTIMEO/SO_SNDTIMEO let other processes run (baseline 412) | 1362 | 728 | 236 | 159 | 222 | 14 | 0 | 3 |
+| `18b5a49f` | POSIX timers per process, stop and continue, lone-thread sigtimedwait and sigsuspend, blocked signals kept when ignored, mlock limits, scheduling policies, pwrite and truncate fixes, a settable wall clock, `/proc/PID/task`, `/proc/sysvipc`, writable sysctls; the harness's full test list (1552) on a 4-CPU domain (`LTP_DOMAIN_CPUS=4`, baseline 363) | 1552 | 789 | 206 | 125 | 216 | 14 | 1 | 11 |
 
 \* Counted with the exit status alone, which overstated passes (below).
 The later rows are rescored from each run's saved console logs with LTP's

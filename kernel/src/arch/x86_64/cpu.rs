@@ -14569,6 +14569,10 @@ fn linux_wait4(pid: u64, status_address: u64, options: u64, rusage: u64) -> u64 
     }
     let pid = pid as u32 as i32;
     let options = u64::from(options as u32);
+    // __WNOTHREAD, __WALL and __WCLONE are accepted: every child here ends
+    // with SIGCHLD and belongs to the calling thread (clone301).
+    const WAIT_SCOPE_FLAGS: u64 = 0x2000_0000 | 0x4000_0000 | 0x8000_0000;
+    let options = options & !WAIT_SCOPE_FLAGS;
     if options & !(LINUX_WNOHANG | LINUX_WUNTRACED | LINUX_WCONTINUED) != 0 {
         return LINUX_EINVAL;
     }
@@ -33330,10 +33334,14 @@ fn linux_faccessat(directory: u64, path_address: u64, mode: u64, flags: u64) -> 
         return if denied { LINUX_EACCES } else { 0 };
     }
     if let Some(kind) = linux_virtual_mount_path_at(directory, path) {
+        // A /proc file the domain may write (sysctls and the like) is
+        // writable by root, as its 0644 mode says (shmget02's save of
+        // /proc/sys/kernel/shmmax).
+        let root = current_linux_credentials().is_some_and(|credentials| credentials.privileged());
         let denied = if kind & LINUX_DEVICE_DIRECTORY != 0 {
             mode & 2 != 0
         } else {
-            mode & 3 != 0
+            mode & 1 != 0 || mode & 2 != 0 && !(root && linux_writable_proc_file(kind))
         };
         return if denied { LINUX_EACCES } else { 0 };
     }
@@ -42902,6 +42910,24 @@ fn linux_proc_uptime() -> &'static [u8] {
     &buffer[..length]
 }
 
+/// The frames the current domain counts as its memory (total, free): the
+/// machine's, bounded by the domain's memory budget (CONTAINER_MEMORY_MIB)
+/// less what is in use, so a program checking for space before writing a
+/// large file into the domain's ramfs stops at the budget instead of
+/// running the domain out of memory (sendfile09's 5 GB file).
+fn linux_domain_frame_counts() -> (u64, u64) {
+    let (total, free) = memory::frame_counts().unwrap_or((0, 0));
+    let Some(budget) = current_container_slot()
+        .map(|slot| X86_RUNTIME.CONTAINER_MEMORY_MIB[slot].load(Ordering::Acquire))
+        .filter(|mib| *mib != 0)
+        .map(|mib| mib * (1 << 20) / PAGE_SIZE as u64)
+    else {
+        return (total, free);
+    };
+    let used = total.saturating_sub(free);
+    (total.min(budget), free.min(budget.saturating_sub(used)))
+}
+
 fn linux_proc_meminfo() -> &'static [u8] {
     struct Buffer {
         bytes: [u8; 1024],
@@ -42922,7 +42948,7 @@ fn linux_proc_meminfo() -> &'static [u8] {
         bytes: [0; 1024],
         length: 0,
     };
-    let (total, free) = memory::frame_counts().unwrap_or((0, 0));
+    let (total, free) = linux_domain_frame_counts();
     let (total, free) = (total * 4, free * 4);
     let used = total - free;
     // SAFETY: the kernel is single-processor and readers copy the bytes
@@ -44218,6 +44244,19 @@ fn linux_descriptor_fcntl(descriptor: u64, command: u64, argument: u64) -> u64 {
     let descriptor = u64::from(descriptor as u32);
     let command = u64::from(command as u32);
     let state = linux_device_descriptor(descriptor);
+    // A lock command reads and checks its flock first, whatever the
+    // descriptor (EFAULT, then EINVAL, before EBADF: fcntl13).
+    if matches!(
+        command,
+        LINUX_F_GETLK
+            | LINUX_F_OFD_GETLK
+            | LINUX_F_SETLK
+            | LINUX_F_SETLKW
+            | LINUX_F_OFD_SETLK
+            | LINUX_F_OFD_SETLKW
+    ) {
+        return linux_fcntl_lock(descriptor, command, argument);
+    }
     if descriptor == 2 && X86_RUNTIME.ELF_PROBE_STDERR_OPEN.load(Ordering::SeqCst) {
         return match command {
             LINUX_F_DUPFD => linux_console_dup_at_least(descriptor, argument, false),
@@ -45382,9 +45421,11 @@ fn linux_set_process_resource_limit(pid: u32, resource: u64, requested: [u64; 2]
     if requested[0] > requested[1] {
         return LINUX_EINVAL;
     }
-    // Raising a hard limit takes CAP_SYS_RESOURCE: root here.
+    // Raising a hard limit takes CAP_SYS_RESOURCE: root here. No one
+    // raises RLIMIT_NOFILE past nr_open (setrlimit03).
     if requested[1] > current[1]
         && !current_linux_credentials().is_some_and(|credentials| credentials.privileged())
+        || resource == LINUX_RLIMIT_NOFILE && requested[1] > LINUX_NR_OPEN
     {
         return LINUX_EPERM;
     }
@@ -46285,6 +46326,20 @@ fn linux_sched_setaffinity(pid: u64, length: u64, address: u64) -> u64 {
         Ok(pid) => pid,
         Err(error) => return error,
     };
+    // Another process is the caller's to change with the same effective
+    // or real user, or as root (sched_setaffinity01).
+    if pid != current_linux_process_pid() {
+        let Some(caller) = current_linux_credentials() else {
+            return LINUX_EPERM;
+        };
+        let same_owner = linux_process::live_process_credentials(pid).is_some_and(|target| {
+            target.user.effective == caller.user.effective
+                || target.user.real == caller.user.effective
+        });
+        if !same_owner && !caller.privileged() {
+            return LINUX_EPERM;
+        }
+    }
     let mask = u64::from_ne_bytes(mask) & linux_available_cpu_mask();
     if linux_process::set_live_process_cpu_affinity(pid, mask) {
         0
@@ -46425,6 +46480,30 @@ fn linux_mlockall(flags: u64) -> u64 {
     if flags == 0 || flags & !(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) != 0 || flags == MCL_ONFAULT
     {
         return LINUX_EINVAL;
+    }
+    // An unprivileged caller (no CAP_IPC_LOCK) is bound by RLIMIT_MEMLOCK: a
+    // zero limit forbids locking (EPERM), and MCL_CURRENT refuses when what
+    // is mapped exceeds it (ENOMEM) (mlockall02, mlockall03).
+    if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
+        && current_linux_credentials().is_none_or(|credentials| !credentials.privileged())
+    {
+        let limit = linux_resource_limit_values(LINUX_RLIMIT_MEMLOCK, true)
+            .map_or(u64::MAX, |values| values[0]);
+        if limit == 0 {
+            return LINUX_EPERM;
+        }
+        if flags & MCL_CURRENT != 0 {
+            let mapped = crate::linux_areas::snapshot(
+                linux_execution_instance(),
+                current_linux_process_pid(),
+            )
+            .map_or(0, |areas| {
+                areas.iter().map(|area| area.end - area.start).sum::<u64>()
+            });
+            if mapped > limit {
+                return LINUX_ENOMEM;
+            }
+        }
     }
     // Every present and future Ginux userspace mapping is resident because the
     // kernel has no swap or page-reclaim path.
@@ -47228,7 +47307,7 @@ fn linux_statfs_data(kind: LinuxFilesystemKind) -> [u8; 120] {
     stat[0..8].copy_from_slice(&magic.to_ne_bytes());
     stat[8..16].copy_from_slice(&(PAGE_SIZE as u64).to_ne_bytes());
     if kind == LinuxFilesystemKind::Root {
-        let (total_frames, free_frames) = memory::frame_counts().unwrap_or((0, 0));
+        let (total_frames, free_frames) = linux_domain_frame_counts();
         stat[16..24].copy_from_slice(&total_frames.to_ne_bytes());
         stat[24..32].copy_from_slice(&free_frames.to_ne_bytes());
         stat[32..40].copy_from_slice(&free_frames.to_ne_bytes());

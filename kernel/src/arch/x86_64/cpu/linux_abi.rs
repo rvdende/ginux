@@ -503,6 +503,8 @@ pub(super) const LINUX_RLIMIT_STACK: u64 = 3;
 pub(super) const LINUX_RLIMIT_NPROC: u64 = 6;
 pub(super) const LINUX_RLIMIT_NOFILE: u64 = 7;
 pub(super) const LINUX_RLIMIT_MEMLOCK: u64 = 8;
+/// /proc/sys/fs/nr_open: the most RLIMIT_NOFILE may be raised to.
+pub(super) const LINUX_NR_OPEN: u64 = 1_048_576;
 pub(super) const LINUX_RLIMIT_AS: u64 = 9;
 pub(super) const LINUX_RLIMIT_MSGQUEUE: u64 = 12;
 pub(super) const LINUX_RLIMIT_NLIMITS: u64 = 16;
@@ -727,7 +729,9 @@ pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 25] = [
     (
         0xb500,
         b"sys/kernel/sem",
-        b"32000\t1024000000\t500\t32000\n",
+        // SEMMSL, SEMMNS, SEMOPM, SEMMNI: sets are a frame each here, so
+        // the count is bounded at 1024 (linux_sysv_ipc::SEMAPHORE_SET_LIMIT).
+        b"32000\t1024000000\t500\t1024\n",
     ),
     // uname's fields, as /proc/sys/kernel shows them (linux_time::linux_uname).
     (0xc800, b"sys/kernel/ostype", b"Linux\n"),
