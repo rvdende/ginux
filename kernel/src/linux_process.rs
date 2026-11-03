@@ -562,6 +562,9 @@ struct Process {
     waiting: bool,
     /// CPU time used, in timestamp-counter cycles.
     cpu_cycles: u64,
+    /// When the process was created, in nanoseconds since boot (process
+    /// accounting's start time and elapsed time).
+    started_nanoseconds: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1766,6 +1769,7 @@ impl ProcessTable {
             shares_parent_vm: false,
             waiting: false,
             cpu_cycles: 0,
+            started_nanoseconds: crate::arch::x86_64::cpu::linux_uptime_nanoseconds(),
             posix_timers: [None; POSIX_TIMER_LIMIT],
             itimers: [None; 2],
             maxrss_kib: 0,
@@ -3193,6 +3197,16 @@ pub(crate) fn start_live_process_cpu(now: u64) {
 
 /// The CPU time `pid` has used, in timestamp-counter cycles, at `now`; for
 /// the running process this includes its current interval.
+/// When `pid` was created, in nanoseconds since boot.
+pub(crate) fn live_process_started_nanoseconds(pid: u32) -> Option<u64> {
+    let table = live_process_table_mut()?;
+    Some(
+        table
+            .process(table.handle_by_pid(pid)?)?
+            .started_nanoseconds,
+    )
+}
+
 pub(crate) fn live_process_cpu_cycles(pid: u32, running: bool, now: u64) -> Option<u64> {
     let table = live_process_table_mut()?;
     let cycles = table.process(table.handle_by_pid(pid)?)?.cpu_cycles;

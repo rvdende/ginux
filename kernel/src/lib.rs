@@ -18,6 +18,7 @@ mod image_store;
 mod initramfs;
 mod ipc;
 mod kernel_log;
+mod linux_accounting;
 mod linux_aio;
 mod linux_areas;
 mod linux_drm;

@@ -14100,6 +14100,111 @@ fn linux_reboot(magic: u64, magic2: u64, command: u64, argument: u64) -> u64 {
     }
 }
 
+/// Nanoseconds since boot.
+pub(crate) fn linux_uptime_nanoseconds() -> u64 {
+    linux_time::linux_elapsed_nanoseconds().unwrap_or(0)
+}
+
+/// acct(2), in a domain set `privileged=true`: names the file a record is
+/// appended to as each process of the domain exits, or turns accounting
+/// off. The file is opened as Linux opens it (write-only, append), so
+/// the same errors come back, and must be a regular file.
+fn linux_acct(path_address: u64) -> u64 {
+    const O_WRONLY: u64 = 1;
+    const O_APPEND: u64 = 0o2000;
+    if !linux_privileged_operation_allowed(linux_user::PrivilegedOperation::ProcessAccounting)
+        || !linux_has_capability(ginux_credentials::capability::SYS_PACCT)
+    {
+        return LINUX_EPERM;
+    }
+    let instance = linux_execution_instance();
+    if path_address == 0 {
+        crate::linux_accounting::set_file(instance, 0);
+        return 0;
+    }
+    let descriptor = linux_openat(
+        u64::from(LINUX_AT_FDCWD),
+        path_address,
+        O_WRONLY | O_APPEND,
+        0,
+    );
+    if descriptor > u64::MAX - 4096 {
+        return descriptor;
+    }
+    let handle = linux_overlay_descriptor_handle(descriptor).filter(|handle| {
+        crate::linux_overlay::metadata(*handle)
+            .is_some_and(|metadata| metadata.kind == crate::linux_overlay::NodeKind::File)
+    });
+    let _ = linux_descriptor_close(descriptor);
+    let Some(handle) = handle else {
+        return LINUX_EACCES;
+    };
+    crate::linux_accounting::set_file(
+        instance,
+        u64::from(crate::linux_overlay::generation(handle)),
+    );
+    0
+}
+
+/// Linux's comp_t: a 13-bit mantissa with a 3-bit base-8 exponent.
+fn linux_comp_t(mut value: u64) -> u16 {
+    let mut exponent = 0;
+    while value > 0x1fff {
+        value = (value + 4) >> 3;
+        exponent += 1;
+    }
+    if exponent > 7 {
+        return u16::MAX;
+    }
+    (exponent << 13 | value) as u16
+}
+
+/// Appends the accounting record (Linux's version 2 `struct acct`) of the
+/// current process, exiting with wait status `status`, to its domain's
+/// accounting file, if accounting is on.
+fn linux_account_exit(status: u32) {
+    const AHZ: u64 = 100;
+    let Some(generation) = crate::linux_accounting::file(linux_execution_instance()) else {
+        return;
+    };
+    let Some(handle) = crate::linux_overlay::from_generation(generation as u32) else {
+        return;
+    };
+    let Some(size) = crate::linux_overlay::metadata(handle).map(|metadata| metadata.size) else {
+        return;
+    };
+    let pid = current_linux_process_pid();
+    let credentials = current_linux_credentials();
+    let (uid, gid) = credentials.map_or((0, 0), |credentials| {
+        (credentials.user.real, credentials.group.real)
+    });
+    let now = linux_uptime_nanoseconds();
+    let elapsed =
+        now.saturating_sub(linux_process::live_process_started_nanoseconds(pid).unwrap_or(now));
+    let started = linux_time::linux_realtime_time().map_or(0, |(seconds, _)| {
+        seconds.saturating_sub(elapsed / 1_000_000_000)
+    });
+    let elapsed_ticks = elapsed / (1_000_000_000 / AHZ);
+    let cpu_ticks = linux_time::linux_process_cpu_ticks(pid);
+    let mut name = [0_u8; 16];
+    let name = linux_process_name(pid, &mut name);
+    let mut record = [0_u8; 64];
+    record[1] = 2; // version
+    record[2..4].copy_from_slice(&(uid.min(0xffff) as u16).to_ne_bytes());
+    record[4..6].copy_from_slice(&(gid.min(0xffff) as u16).to_ne_bytes());
+    record[8..12].copy_from_slice(&(started as u32).to_ne_bytes());
+    record[12..14].copy_from_slice(&linux_comp_t(cpu_ticks).to_ne_bytes());
+    record[16..18].copy_from_slice(&linux_comp_t(elapsed_ticks).to_ne_bytes());
+    record[32..36].copy_from_slice(&status.to_ne_bytes());
+    let name_length = name.len().min(16);
+    record[36..36 + name_length].copy_from_slice(&name[..name_length]);
+    record[53] = (elapsed_ticks >> 16) as u8;
+    record[54..56].copy_from_slice(&(elapsed_ticks as u16).to_ne_bytes());
+    record[56..60].copy_from_slice(&uid.to_ne_bytes());
+    record[60..64].copy_from_slice(&gid.to_ne_bytes());
+    let _ = crate::linux_overlay::write(handle, size, &record);
+}
+
 /// ioperm(2): checks the range as Linux does, then refuses to open I/O
 /// ports in every domain, privileged ones too, since port access would
 /// reach around the drivers' isolation. Closing ports is a no-op.
@@ -21237,6 +21342,9 @@ fn linux_statmount(request_address: u64, output_address: u64, capacity: u64, fla
     } else {
         return LINUX_ENOENT;
     };
+    if !linux_mounts_visible() {
+        return LINUX_EPERM;
+    }
     let mut output = [0_u8; FIXED_SIZE + 96];
     output[8..16].copy_from_slice(&requested.to_ne_bytes());
     if requested & SB_BASIC != 0 {
@@ -21324,6 +21432,9 @@ fn linux_listmount(request_address: u64, output_address: u64, count: u64, flags:
     };
     if !matches!(parent, LSMT_ROOT) && parent != root && parent != proc_mount {
         return LINUX_ENOENT;
+    }
+    if !matches!(parent, LSMT_ROOT) && !linux_mounts_visible() {
+        return LINUX_EPERM;
     }
     let candidates = if flags & LISTMOUNT_REVERSE != 0 {
         [proc_mount, root]
@@ -32597,11 +32708,20 @@ fn linux_openat_path(
     /// __O_TMPFILE: an unnamed file in the directory opened.
     const LINUX_O_TMPFILE_BIT: u64 = 0x40_0000;
     let directory = u64::from(directory as u32);
-    let flags = u64::from(flags as u32);
+    let mut flags = u64::from(flags as u32);
     let mode = u64::from(mode as u32);
     let access = flags & 3;
     if access == 3 || flags & LINUX_O_EXCL != 0 && flags & LINUX_O_CREAT == 0 {
         return LINUX_EINVAL;
+    }
+    // A trailing slash names a directory: creating through one is EISDIR,
+    // and otherwise it opens as O_DIRECTORY would, so a file is ENOTDIR.
+    let named = &path[..path_length];
+    if named.len() > 1 && named.ends_with(b"/") && named.iter().any(|byte| *byte != b'/') {
+        if flags & LINUX_O_CREAT != 0 {
+            return LINUX_EISDIR;
+        }
+        flags |= LINUX_O_DIRECTORY;
     }
     // O_TMPFILE is __O_TMPFILE with O_DIRECTORY, without O_CREAT, and
     // needs write access (all EINVAL otherwise, as in Linux).
@@ -36166,6 +36286,49 @@ fn linux_statx_from_stat(stat: &[u8; LINUX_STAT_SIZE]) -> [u8; 256] {
     statx[128..132].copy_from_slice(&((device >> 8) as u32 & 0xfff).to_ne_bytes());
     statx[132..136].copy_from_slice(&(device as u32 & 0xff).to_ne_bytes());
     statx
+}
+
+/// statx(2), reporting the mount's unique id (listmount's and
+/// statmount's) instead of the old one when STATX_MNT_ID_UNIQUE is asked.
+fn linux_statx_unique_mount(
+    directory: u64,
+    path_address: u64,
+    flags: u64,
+    mask: u64,
+    stat_address: u64,
+) -> u64 {
+    const STATX_MNT_ID_UNIQUE: u32 = 0x4000;
+    let result = linux_statx(directory, path_address, flags, mask, stat_address);
+    if result != 0 || mask as u32 & STATX_MNT_ID_UNIQUE == 0 {
+        return result;
+    }
+    let mut stat = [0_u8; 256];
+    if !copy_from_linux_user(stat_address, &mut stat) {
+        return result;
+    }
+    let reported = u32::from_ne_bytes(stat[..4].try_into().unwrap_or([0; 4]));
+    let mount = u64::from_ne_bytes(stat[144..152].try_into().unwrap_or([0; 8]));
+    let Some(unique) = (reported & LINUX_STATX_MNT_ID != 0)
+        .then(|| linux_mount::current_unique_mount_id(mount))
+        .flatten()
+    else {
+        return result;
+    };
+    stat[..4]
+        .copy_from_slice(&(reported & !LINUX_STATX_MNT_ID | STATX_MNT_ID_UNIQUE).to_ne_bytes());
+    stat[144..152].copy_from_slice(&unique.to_ne_bytes());
+    if copy_to_linux_user(stat_address, &stat) {
+        0
+    } else {
+        LINUX_EFAULT
+    }
+}
+
+/// Whether the caller may see the domain's mounts (its root and /proc):
+/// from a chroot below them neither is reachable, and seeing them then
+/// needs CAP_SYS_ADMIN, as Linux's listmount and statmount require.
+fn linux_mounts_visible() -> bool {
+    !linux_chrooted() || linux_has_capability(ginux_credentials::capability::SYS_ADMIN)
 }
 
 fn linux_statx_set_mount(stat: &mut [u8; 256], filesystem: LinuxFilesystemKind) {

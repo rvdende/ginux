@@ -422,6 +422,19 @@ fn linux_syscall_dispatch(
             current_linux_process_pid(),
             linux_current_resident_kib(),
         );
+        // Process accounting records the exit (acct(2)); a process that
+        // only replaces its image goes on.
+        if matches!(number, LINUX_EXIT_GROUP_SYSCALL)
+            || number == LINUX_EXIT_SYSCALL
+                && X86_RUNTIME
+                    .LINUX_THREAD_STATES
+                    .iter()
+                    .filter(|state| state.load(Ordering::SeqCst) != LINUX_THREAD_FREE)
+                    .count()
+                    <= 1
+        {
+            linux_account_exit((first_argument as u32 & 0xff) << 8);
+        }
     }
     // An O_PATH descriptor names a file without opening it: calls that
     // need an open file are EBADF on it, as in Linux (open13).
@@ -1826,7 +1839,9 @@ fn linux_syscall_dispatch(
         LINUX_UTIMES_SYSCALL => linux_utimes(u64::from(LINUX_AT_FDCWD), first_argument, buffer),
         LINUX_FUTIMESAT_SYSCALL => linux_utimes(first_argument, buffer, count),
         LINUX_FCHMODAT2_SYSCALL => linux_fchmodat(first_argument, buffer, count, register(0)),
-        LINUX_STATX_SYSCALL => linux_statx(first_argument, buffer, count, register(0), register(2)),
+        LINUX_STATX_SYSCALL => {
+            linux_statx_unique_mount(first_argument, buffer, count, register(0), register(2))
+        }
         LINUX_CLOSE_RANGE_SYSCALL => linux_close_range(first_argument, buffer, count),
         LINUX_SYNCFS_SYSCALL => linux_syncfs(first_argument),
         LINUX_SYNC_FILE_RANGE_SYSCALL => {
@@ -2061,6 +2076,7 @@ fn linux_syscall_dispatch(
         LINUX_UNSHARE_SYSCALL => linux_unshare(first_argument),
         LINUX_REBOOT_SYSCALL => linux_reboot(first_argument, buffer, count, register(0)),
         LINUX_CHROOT_SYSCALL => linux_chroot(first_argument),
+        LINUX_ACCT_SYSCALL => linux_acct(first_argument),
         LINUX_VHANGUP_SYSCALL => linux_vhangup(),
         LINUX_IOPERM_SYSCALL => linux_ioperm(first_argument, buffer, count),
         LINUX_IOPL_SYSCALL => linux_iopl(first_argument),
