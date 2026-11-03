@@ -127,6 +127,19 @@ pub(crate) fn flags_at(instance: usize, path: &[u8]) -> u32 {
         .map_or(0, |mount| mount.flags)
 }
 
+/// The id of the mount canonical `path` lies on: the deepest mount point
+/// at or above it (0 for the root's own files). Two paths on different
+/// mounts cannot be linked or renamed into one another (EXDEV).
+pub(crate) fn mount_id_at(instance: usize, path: &[u8]) -> u32 {
+    let table = MOUNTS.lock();
+    table
+        .mounts
+        .iter()
+        .filter(|mount| mount.instance == instance && covers(&mount.path, path))
+        .max_by_key(|mount| (mount.path.len(), mount.id))
+        .map_or(0, |mount| mount.id)
+}
+
 /// `path` is the mount point `point` or lies below it.
 fn covers(point: &[u8], path: &[u8]) -> bool {
     point.is_empty()

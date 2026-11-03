@@ -6695,6 +6695,29 @@ pub(crate) fn prune_current_linux_page_tables(start: u64, end: u64) -> bool {
     true
 }
 
+/// Reserves `address` as a page of a file mapping past the end of its file
+/// (a file reservation without a frame): touching it is SIGBUS, and the
+/// kernel's own accesses fail (EFAULT). It keeps `protection` for mprotect
+/// and /proc, but is never filled on demand.
+pub(crate) fn reserve_current_linux_past_eof_page(
+    address: u64,
+    protection: u8,
+    replace: bool,
+) -> Option<Option<memory::FrameLease>> {
+    reserve_current_linux_runtime_page(address, protection, true, replace)
+}
+
+/// Whether `address` is a page `reserve_current_linux_past_eof_page`
+/// reserved: only such a file reservation has no frame.
+pub(crate) fn current_linux_page_past_eof(address: u64) -> bool {
+    current_linux_leaf(address).is_some_and(|entry| {
+        let value = entry.read();
+        value & (PRESENT | LINUX_RUNTIME_RESERVED | LINUX_RUNTIME_FILE)
+            == LINUX_RUNTIME_RESERVED | LINUX_RUNTIME_FILE
+            && value & ADDRESS_MASK == 0
+    })
+}
+
 pub(crate) fn protect_current_linux_runtime_page(address: u64, protection: u8) -> bool {
     if !matches!(protection, 0 | 1 | 3 | 5) {
         return false;

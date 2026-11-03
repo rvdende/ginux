@@ -21,6 +21,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -185,10 +186,13 @@ pub enum Error {
     NoMemory,
 }
 
-/// A process's areas, sorted by address and never overlapping.
+/// A process's areas, sorted by address and never overlapping. A deque, so
+/// a process mapping or unmapping areas in address order, at either end of
+/// tens of thousands (munmap04 fills vm.max_map_count), moves none of the
+/// others.
 #[derive(Clone, Debug, Default)]
 pub struct Areas {
-    areas: Vec<Area>,
+    areas: VecDeque<Area>,
     /// mlockall(MCL_FUTURE): areas mapped from now on are locked.
     lock_future: bool,
 }
@@ -204,7 +208,7 @@ fn valid_range(start: u64, end: u64) -> Result<(), Error> {
 impl Areas {
     pub const fn new() -> Self {
         Self {
-            areas: Vec::new(),
+            areas: VecDeque::new(),
             lock_future: false,
         }
     }
@@ -241,7 +245,7 @@ impl Areas {
 
     /// A copy of this set, as a forked child gets.
     pub fn try_clone(&self) -> Result<Self, Error> {
-        let mut areas = Vec::new();
+        let mut areas = VecDeque::new();
         areas
             .try_reserve_exact(self.areas.len())
             .map_err(|_| Error::NoMemory)?;
@@ -320,6 +324,18 @@ impl Areas {
             .filter(|area| area.locked)
             .map(Area::len)
             .sum()
+    }
+
+    /// Whether some area overlaps `[start, end)`.
+    pub fn overlaps(&self, start: u64, end: u64) -> bool {
+        self.overlapping(start, end).next().is_some()
+    }
+
+    /// Whether unmapping `[start, end)` would split an area in two (an
+    /// area starts before it and ends after it).
+    pub fn splits(&self, start: u64, end: u64) -> bool {
+        self.find(start)
+            .is_some_and(|area| area.start < start && end < area.end)
     }
 
     /// Whether some area overlapping `[start, end)` is locked.
@@ -415,7 +431,7 @@ impl Areas {
                     return;
                 }
                 (None, None) => {
-                    self.areas.remove(index);
+                    let _ = self.areas.remove(index);
                 }
             }
         }
@@ -424,19 +440,21 @@ impl Areas {
     /// Joins the area at `index` with neighbours it continues.
     fn merge_around(&mut self, index: usize) {
         if index + 1 < self.areas.len() && self.areas[index].merges_with(&self.areas[index + 1]) {
-            let next = self.areas.remove(index + 1);
-            self.areas[index].end = next.end;
+            if let Some(next) = self.areas.remove(index + 1) {
+                self.areas[index].end = next.end;
+            }
         }
         if index > 0 && self.areas[index - 1].merges_with(&self.areas[index]) {
-            let area = self.areas.remove(index);
-            self.areas[index - 1].end = area.end;
+            if let Some(area) = self.areas.remove(index) {
+                self.areas[index - 1].end = area.end;
+            }
         }
     }
 
     fn overlapping(&self, start: u64, end: u64) -> impl Iterator<Item = &Area> {
         let first = self.areas.partition_point(|area| area.end <= start);
-        self.areas[first..]
-            .iter()
+        self.areas
+            .range(first..)
             .take_while(move |area| area.start < end)
     }
 }
@@ -523,6 +541,39 @@ mod tests {
         assert_eq!(ranges(&areas), [(0, 4, 3), (6, 8, 3), (25, 30, 1)]);
         areas.unmap(100 * PAGE_SIZE, 101 * PAGE_SIZE).unwrap();
         assert_eq!(areas.len(), 3);
+    }
+
+    #[test]
+    fn overlaps_and_splits() {
+        let mut areas = Areas::new();
+        areas.map(anonymous(0, 10, RW)).unwrap();
+        areas.map(anonymous(20, 30, R)).unwrap();
+        assert!(areas.overlaps(9 * PAGE_SIZE, 11 * PAGE_SIZE));
+        assert!(!areas.overlaps(10 * PAGE_SIZE, 20 * PAGE_SIZE));
+        assert!(areas.splits(PAGE_SIZE, 2 * PAGE_SIZE));
+        assert!(!areas.splits(0, 2 * PAGE_SIZE));
+        assert!(!areas.splits(8 * PAGE_SIZE, 10 * PAGE_SIZE));
+        assert!(!areas.splits(12 * PAGE_SIZE, 13 * PAGE_SIZE));
+    }
+
+    #[test]
+    fn unmapping_in_order_from_either_end() {
+        let mut areas = Areas::new();
+        for index in 0..100 {
+            areas.map(anonymous(index * 3, index * 3 + 1, RW)).unwrap();
+        }
+        assert_eq!(areas.len(), 100);
+        for index in 0..50 {
+            areas
+                .unmap(index * 3 * PAGE_SIZE, (index * 3 + 1) * PAGE_SIZE)
+                .unwrap();
+        }
+        for index in (50..100).rev() {
+            areas
+                .unmap(index * 3 * PAGE_SIZE, (index * 3 + 1) * PAGE_SIZE)
+                .unwrap();
+        }
+        assert!(areas.is_empty());
     }
 
     #[test]

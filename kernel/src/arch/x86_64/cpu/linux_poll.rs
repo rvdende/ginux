@@ -887,14 +887,26 @@ pub(super) fn linux_poll_wait_live_return(
         // deadline, instead of leaking the scheduler's lack of a target as
         // ENOSYS to userspace.
         if matches!(wait_kind, LINUX_THREAD_WAIT_POLL | LINUX_THREAD_WAIT_PPOLL) {
-            match linux_poll_run_others_live_return(
+            // ppoll waits under its temporary mask as sigsuspend does: a
+            // signal it unblocks, pending already or arriving, ends the
+            // wait (ppoll01's race case), and a handler's frame restores
+            // the caller's mask.
+            let slot = usize::from(current.slot);
+            let prior = temporary_signal_mask
+                .filter(|_| X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst))
+                .map(|mask| begin_linux_lone_masked_wait(slot, LINUX_THREAD_WAIT_SIGSUSPEND, mask));
+            let waited = linux_poll_run_others_live_return(
                 output,
                 caller,
                 address,
                 active,
                 duration,
                 poll_syscall,
-            ) {
+            );
+            if let Some(prior) = prior {
+                end_linux_lone_masked_wait(slot, prior);
+            }
+            match waited {
                 Ok(result) => return result,
                 Err((target, deadline)) => {
                     continued_deadline = Some(deadline.unwrap_or(0));

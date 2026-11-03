@@ -262,7 +262,8 @@ struct Slot {
     /// Connections waiting for accept on a listening socket.
     pending: VecDeque<SlotId>,
     /// The other end of a local stream: itself for a loopback socket, the
-    /// listener for a local TCP connection not yet accepted.
+    /// listener's end (waiting in its queue) for a local TCP connection not
+    /// yet accepted.
     peer: Option<SlotId>,
     /// A local stream's peer closed: it reads end-of-file, where a socket
     /// that never had a peer cannot read at all (EINVAL).
@@ -292,6 +293,9 @@ struct Slot {
     icmp_filter: u32,
     /// The TTL of the datagram an ICMP socket received last.
     received_ttl: u8,
+    /// The IPv4 multicast groups the socket joined (MCAST_JOIN_GROUP,
+    /// IP_ADD_MEMBERSHIP); an accepted socket starts with none.
+    groups: Vec<u32>,
     /// A netlink socket's protocol, its port id (0 until bound), and the
     /// messages queued for its reader, one datagram each.
     netlink_protocol: u8,
@@ -327,6 +331,7 @@ impl Slot {
             icmp_raw: false,
             icmp_filter: 0,
             received_ttl: 0,
+            groups: Vec::new(),
             netlink_protocol: 0,
             netlink_port: 0,
             netlink_messages: VecDeque::new(),
@@ -1011,6 +1016,16 @@ impl Sockets {
             }
             return true;
         }
+        // A TCP listener's connections nobody accepted close with it, and
+        // their clients see the peer gone.
+        if state.kind == Kind::Tcp && state.listening {
+            for connection in core::mem::take(&mut state.pending) {
+                let _ = self.close(connection);
+            }
+        }
+        let Some(state) = slot_in(&self.slots, id) else {
+            return false;
+        };
         let Some(runtime) = self.runtime.as_mut() else {
             return false;
         };
@@ -1164,6 +1179,29 @@ impl Sockets {
         })
     }
 
+    /// Joins (`join`) or leaves IPv4 multicast `group`: joining one twice
+    /// is EADDRINUSE, leaving one not joined EADDRNOTAVAIL.
+    fn change_group(&mut self, id: SlotId, group: u32, join: bool) -> Result<(), Error> {
+        let state = self
+            .slot_mut(id)
+            .filter(|state| matches!(state.kind, Kind::Tcp | Kind::Udp | Kind::Icmp))
+            .ok_or(Error::Invalid)?;
+        let joined = state.groups.iter().position(|joined| *joined == group);
+        match (join, joined) {
+            (true, Some(_)) => Err(Error::AddressInUse),
+            (true, None) => {
+                state.groups.try_reserve(1).map_err(|_| Error::Exhausted)?;
+                state.groups.push(group);
+                Ok(())
+            }
+            (false, Some(index)) => {
+                state.groups.swap_remove(index);
+                Ok(())
+            }
+            (false, None) => Err(Error::AddressNotAvailable),
+        }
+    }
+
     fn set_timeout_option(
         &mut self,
         id: SlotId,
@@ -1295,29 +1333,17 @@ impl Sockets {
                 listener.pending.pop_front();
             }
         }
-        if let Some(client) = self
+        if let Some(accepted) = self
             .slot(id)
             .and_then(|state| state.pending.front().copied())
         {
-            if kind == Kind::Unix {
-                // connect_unix made the listener's end already.
-                if let Some(listener) = self.slot_mut(id) {
-                    listener.pending.pop_front();
-                }
-                return Ok((client, endpoint(local_address, 0)));
-            }
-            // A TCP connection from one of the interface's own addresses:
+            // connect_unix, or connect for a TCP connection from one of the
+            // interface's own addresses, made the listener's end already;
             // the two ends exchange bytes through local queues.
-            let client_port = self.slot(client).ok_or(Error::Invalid)?.local_port;
-            let listener = self.slot(id).ok_or(Error::Invalid)?;
-            let remote = endpoint(local_address, client_port);
-            let mut accepted = Slot::new(Kind::Tcp, listener.owner);
-            accepted.remote = Some(remote);
-            accepted.local_port = listener.local_port;
-            accepted.peer = Some(client);
-            accepted.options = listener.options;
-            let accepted = self.insert(accepted)?;
-            self.slot_mut(client).ok_or(Error::Invalid)?.peer = Some(accepted);
+            let remote = self
+                .slot(accepted)
+                .and_then(|state| state.remote)
+                .unwrap_or(endpoint(local_address, 0));
             if let Some(listener) = self.slot_mut(id) {
                 listener.pending.pop_front();
             }
@@ -1422,14 +1448,33 @@ impl Sockets {
                 })
             });
             if let Some(listener) = listener {
+                // The listener's end is made now and waits in its queue
+                // for accept, as Linux's connection does in the accept
+                // queue: what the client sends before then is kept there
+                // (sendto01 sends at once).
                 let listener = listener as SlotId;
-                let queue = &mut slot_in_mut(slots, listener).ok_or(Error::Invalid)?.pending;
-                queue.try_reserve(1).map_err(|_| Error::Exhausted)?;
-                queue.push_back(id);
+                let listener_state = slot_in(slots, listener).ok_or(Error::Invalid)?;
+                let mut accepted = Slot::new(Kind::Tcp, listener_state.owner);
+                accepted.remote = Some(endpoint(runtime.local_address, local_port));
+                accepted.local_port = listener_state.local_port;
+                accepted.peer = Some(id);
+                accepted.options = listener_state.options;
+                slot_in_mut(slots, listener)
+                    .ok_or(Error::Invalid)?
+                    .pending
+                    .try_reserve(1)
+                    .map_err(|_| Error::Exhausted)?;
+                let accepted_index = vacant(slots)?;
+                slots[accepted_index] = Some(accepted);
+                let accepted = accepted_index as SlotId;
+                slot_in_mut(slots, listener)
+                    .ok_or(Error::Invalid)?
+                    .pending
+                    .push_back(accepted);
                 let state = slot_in_mut(slots, id).ok_or(Error::Invalid)?;
                 state.local_port = local_port;
                 state.remote = Some(remote);
-                state.peer = Some(listener);
+                state.peer = Some(accepted);
                 return Ok(());
             }
             // Nothing listens on that local port: a reset, as the host
@@ -2630,6 +2675,11 @@ pub(crate) fn set_boolean_option(
 
 pub(crate) fn boolean_option(id: SlotId, option: BooleanOption) -> Result<bool, Error> {
     SOCKETS.lock().boolean_option(id, option)
+}
+
+/// Joins or leaves IPv4 multicast `group` (`Sockets::change_group`).
+pub(crate) fn change_group(id: SlotId, group: u32, join: bool) -> Result<(), Error> {
+    SOCKETS.lock().change_group(id, group, join)
 }
 
 pub(crate) fn set_timeout_option(

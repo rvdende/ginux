@@ -727,7 +727,11 @@ pub(super) const LINUX_FILE_PROC_TASK_STAT: u16 = LINUX_FILE_MASK | LINUX_PROC_T
 /// file exists but cannot be written, and runs it when the file is absent.
 /// `/proc/sys/fs/aio-max-nr`: the most events one io_setup context may hold.
 pub(super) const LINUX_AIO_MAX_NR: u64 = 65_536;
-pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 36] = [
+/// `/proc/sys/vm/max_map_count`: the most memory areas a process may have.
+pub(super) const LINUX_MAX_MAP_COUNT: usize = 65_530;
+pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 37] = [
+    // The most memory areas a process may have (LINUX_MAX_MAP_COUNT).
+    (0xa000, b"sys/vm/max_map_count", b"65530\n"),
     // The random pool is always full, as Linux reports it since 5.18.
     (0xac00, b"sys/kernel/random/entropy_avail", b"256\n"),
     (0xad00, b"sys/kernel/random/poolsize", b"256\n"),
@@ -1087,6 +1091,8 @@ pub(super) const LINUX_SI_TKILL: i32 = -6;
 pub(super) const LINUX_SI_KERNEL: i32 = 0x80;
 pub(super) const LINUX_SEGV_MAPERR: i32 = 1;
 pub(super) const LINUX_SEGV_ACCERR: i32 = 2;
+/// SIGBUS's si_code for an access past the end of a mapped file.
+pub(super) const LINUX_BUS_ADRERR: i32 = 2;
 pub(super) const LINUX_SA_NOCLDSTOP: u64 = 0x0000_0001;
 pub(super) const LINUX_SA_NOCLDWAIT: u64 = 0x0000_0002;
 pub(super) const LINUX_SA_SIGINFO: u64 = 0x0000_0004;

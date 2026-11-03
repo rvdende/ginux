@@ -77,6 +77,22 @@ const LINUX_RUNTIME_DYNAMIC_MMAP_BASE: u64 = 1 << 39;
 /// above the program image and heap and below 2 GiB.
 const LINUX_LOW_MMAP_BASE: u64 = 0x4000_0000;
 const LINUX_LOW_MMAP_LIMIT: u64 = 0x8000_0000;
+/// The lowest address a program may map at with MAP_FIXED (or unmap and
+/// protect) below the mmap area, up to it: above the kernel's own
+/// placements (heap, stack, vDSO and the program image near 4 MiB), so only
+/// the program's own mappings are there (munmap04 maps from 256 MiB up).
+/// Ranges the kernel's own mappings hold (the low identity map) cannot get
+/// page tables of the process's and are EEXIST. munmap, mprotect and
+/// madvise from here up take the runtime's paths.
+const LINUX_FIXED_LOW_BASE: u64 = 0x1000_0000;
+
+/// Whether `[address, end)` lies in the fixed-mapping window below the mmap
+/// area (`LINUX_FIXED_LOW_BASE`) and holds no page of the program image.
+fn linux_in_fixed_low_window(address: u64, end: u64) -> bool {
+    address >= LINUX_FIXED_LOW_BASE
+        && end <= LINUX_RUNTIME_DYNAMIC_MMAP_BASE
+        && !linux_range_holds_image_page(address, end)
+}
 pub(crate) const LINUX_RUNTIME_STACK_PAGES: usize = 1;
 pub(crate) const LINUX_RUNTIME_HEAP_PAGES: usize = 16;
 const EXCEPTION_STACK_SIZE: usize = 4 * 1024 * 1024;
@@ -19072,7 +19088,7 @@ fn linux_runtime_mmap_end() -> Option<u64> {
 
 fn linux_runtime_mapping_range(address: u64, length: u64) -> Option<(u64, usize)> {
     let end = linux_runtime_mmap_end()?;
-    let in_low_window = (LINUX_LOW_MMAP_BASE..LINUX_LOW_MMAP_LIMIT).contains(&address);
+    let in_low_window = (LINUX_FIXED_LOW_BASE..LINUX_RUNTIME_DYNAMIC_MMAP_BASE).contains(&address);
     if length == 0
         || !address.is_multiple_of(PAGE_SIZE as u64)
         || address < LINUX_RUNTIME_DYNAMIC_MMAP_BASE
@@ -19087,12 +19103,28 @@ fn linux_runtime_mapping_range(address: u64, length: u64) -> Option<(u64, usize)
     // the mmap area; their pages are managed the same way. MAP_32BIT
     // mappings lie in the second gigabyte.
     let in_high_image = address >= LINUX_EXEC_HIGH_LOAD_BASE && mapped_end <= LINUX_EXEC_HIGH_LIMIT;
-    let in_low_window = in_low_window && mapped_end <= LINUX_LOW_MMAP_LIMIT;
+    let in_low_window = in_low_window && linux_in_fixed_low_window(address, mapped_end);
     // The heap up to the break may be protected and unmapped too (brk02).
     let in_heap =
         linux_runtime_heap_contains(address) && linux_runtime_heap_contains(mapped_end - 1);
     (pages != 0 && (mapped_end <= end || in_high_image || in_low_window || in_heap))
         .then_some((mapped_end, pages))
+}
+
+/// Whether a page of the program image the kernel keeps for the process
+/// (its active image mappings) lies in `[start, end)`: those are the
+/// kernel's to place and release, never a mapping call's.
+fn linux_range_holds_image_page(start: u64, end: u64) -> bool {
+    let count = usize::from(
+        X86_RUNTIME
+            .ELF_PROBE_ACTIVE_IMAGE_COUNT
+            .load(Ordering::SeqCst),
+    )
+    .min(LINUX_ACTIVE_IMAGE_MAPPING_LIMIT);
+    (0..count).any(|index| {
+        (start..end)
+            .contains(&X86_RUNTIME.ELF_PROBE_ACTIVE_IMAGE_ADDRESSES[index].load(Ordering::SeqCst))
+    })
 }
 
 fn linux_page_ceil(address: u64) -> Option<u64> {
@@ -19267,12 +19299,11 @@ fn linux_runtime_select_mapping(address: u64, pages: usize, fixed: bool, low: bo
         return None;
     }
     if fixed {
-        return (address >= base
-            && address.is_multiple_of(PAGE_SIZE as u64)
-            && address
-                .checked_add(size)
-                .is_some_and(|mapped_end| mapped_end <= end))
-        .then_some(address);
+        let mapped_end = address.checked_add(size)?;
+        let in_low_window = linux_in_fixed_low_window(address, mapped_end);
+        return (address.is_multiple_of(PAGE_SIZE as u64)
+            && (address >= base && mapped_end <= end || in_low_window))
+            .then_some(address);
     }
     if address >= base
         && address.is_multiple_of(PAGE_SIZE as u64)
@@ -25630,6 +25661,9 @@ fn linux_runtime_mmap(
     let mut overlay_file = None;
     let mut immutable_rootfs_file = None;
     let mut secret = false;
+    // A file mapping's pages past the file's last page are SIGBUS to touch
+    // (mmap13), not zero-filled.
+    let mut file_size = None;
     let file = if anonymous {
         None
     } else {
@@ -25668,9 +25702,9 @@ fn linux_runtime_mmap(
             let Ok(start) = usize::try_from(offset) else {
                 return LINUX_EINVAL;
             };
-            if start >= metadata.size {
-                return LINUX_EINVAL;
-            }
+            // A mapping may start past the end of the file (mprotect05 maps
+            // an empty one); its pages are then all past it.
+            file_size = Some(metadata.size);
             overlay_file = Some((handle, start));
             None
         } else {
@@ -25705,6 +25739,7 @@ fn linux_runtime_mmap(
                 return LINUX_EINVAL;
             }
             immutable_rootfs_file = rootfs_entry.map(|entry| entry.data);
+            file_size = Some(file.len());
             Some((file, start))
         }
     };
@@ -25722,7 +25757,15 @@ fn linux_runtime_mmap(
         // a file moved to paged storage on its first shared mapping.
         sharing == LINUX_MAP_SHARED && !secret && crate::linux_overlay::make_paged(*handle)
     }) {
-        return linux_map_shared_memfd(mapping, pages, handle, start, protection as u8, replace);
+        return linux_map_shared_memfd(
+            mapping,
+            pages,
+            handle,
+            start,
+            protection as u8,
+            replace,
+            file_size,
+        );
     }
     if replace {
         for page in 0..pages {
@@ -25735,7 +25778,19 @@ fn linux_runtime_mmap(
     }
     for (installed, page) in (0..pages).enumerate() {
         let page_address = mapping + (page * PAGE_SIZE) as u64;
-        let old_frame = if anonymous {
+        let past_eof = file_size.is_some_and(|size: usize| {
+            usize::try_from(offset)
+                .ok()
+                .and_then(|offset| offset.checked_add(page * PAGE_SIZE))
+                .is_none_or(|page_offset| page_offset >= size.next_multiple_of(PAGE_SIZE))
+        });
+        let old_frame = if past_eof {
+            address_space::reserve_current_linux_past_eof_page(
+                page_address,
+                protection as u8,
+                replace,
+            )
+        } else if anonymous {
             let install_started =
                 cfg!(feature = "linux-boot-profile").then(timer::timestamp_counter);
             let reserved = address_space::reserve_current_linux_runtime_page(
@@ -25853,6 +25908,9 @@ fn linux_runtime_mmap(
         for page in 0..pages {
             let address = mapping + (page * PAGE_SIZE) as u64;
             let offset = start.saturating_add(page * PAGE_SIZE);
+            if file_size.is_some_and(|size| offset >= size.next_multiple_of(PAGE_SIZE)) {
+                continue;
+            }
             if !crate::linux_overlay::register_shared_mapping(pid, address, handle, offset) {
                 for rollback in 0..page {
                     let _ = crate::linux_overlay::remove_shared_mapping(
@@ -25884,6 +25942,9 @@ fn linux_runtime_mmap(
 // Maps a memfd's own frames, so every process that maps the file shares
 // its pages with the others and with read(2)/write(2) on the file, as
 // Wayland shared-memory buffers require.
+/// `size`, for a file's mapping, is the file's size: its pages past the
+/// file's last page are reserved past its end (SIGBUS to touch); anonymous
+/// shared memory (None) has every page.
 fn linux_map_shared_memfd(
     mapping: u64,
     pages: usize,
@@ -25891,6 +25952,7 @@ fn linux_map_shared_memfd(
     start: usize,
     protection: u8,
     replace: bool,
+    size: Option<usize>,
 ) -> u64 {
     let pid = current_linux_process_pid();
     for page in 0..pages {
@@ -25904,6 +25966,15 @@ fn linux_map_shared_memfd(
                 let _ = rollback_linux_runtime_mapping(mapping, page);
                 return LINUX_ENOMEM;
             }
+        }
+        if size.is_some_and(|size| start + page * PAGE_SIZE >= size.next_multiple_of(PAGE_SIZE)) {
+            if address_space::reserve_current_linux_past_eof_page(address, protection, false)
+                .is_none()
+            {
+                let _ = rollback_linux_runtime_mapping(mapping, page);
+                return LINUX_ENOMEM;
+            }
+            continue;
         }
         // A PROT_NONE page is installed readable, then made inaccessible.
         let installed = crate::linux_overlay::memfd_frame(handle, start / PAGE_SIZE + page)
@@ -25936,7 +26007,7 @@ fn linux_map_shared_anonymous(mapping: u64, pages: usize, protection: u8, replac
     let Some(handle) = crate::linux_overlay::create_shmem() else {
         return LINUX_ENOMEM;
     };
-    let mapped = linux_map_shared_memfd(mapping, pages, handle, 0, protection, replace);
+    let mapped = linux_map_shared_memfd(mapping, pages, handle, 0, protection, replace, None);
     if mapped != mapping {
         crate::linux_overlay::release_unmapped_shmem();
         return mapped;
@@ -27353,7 +27424,7 @@ fn linux_mprotect(address: u64, length: u64, protection: u64) -> u64 {
         return LINUX_EINVAL;
     }
     if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
-        && (address >= LINUX_RUNTIME_DYNAMIC_MMAP_BASE || linux_runtime_heap_contains(address))
+        && (address >= LINUX_FIXED_LOW_BASE || linux_runtime_heap_contains(address))
     {
         return linux_runtime_mprotect(address, length, protection);
     }
@@ -27418,9 +27489,7 @@ fn linux_mseal(address: u64, length: u64, flags: u64) -> u64 {
     if rounded == 0 || address.checked_add(rounded).is_none() {
         return LINUX_EINVAL;
     }
-    if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
-        && address >= LINUX_RUNTIME_DYNAMIC_MMAP_BASE
-    {
+    if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) && address >= LINUX_FIXED_LOW_BASE {
         let Some((_, pages)) = linux_runtime_mapping_range(address, rounded) else {
             return LINUX_ENOMEM;
         };
@@ -27470,9 +27539,7 @@ const fn linux_pkey_free(key: u64) -> u64 {
 }
 
 fn linux_mprotect_mmap(address: u64, length: u64, protection: u64) -> u64 {
-    if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
-        && address >= LINUX_RUNTIME_DYNAMIC_MMAP_BASE
-    {
+    if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) && address >= LINUX_FIXED_LOW_BASE {
         return linux_runtime_mprotect(address, length, protection);
     }
     if protection != 0
@@ -28094,9 +28161,7 @@ fn linux_mmap_fixed_file(
 }
 
 fn linux_munmap(address: u64, length: u64) -> u64 {
-    if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
-        && address >= LINUX_RUNTIME_DYNAMIC_MMAP_BASE
-    {
+    if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) && address >= LINUX_FIXED_LOW_BASE {
         return linux_runtime_munmap(address, length);
     }
     let Some((start_slot, range_pages)) = linux_mmap_range_slots(address, length) else {
@@ -28184,9 +28249,7 @@ fn linux_madvise(address: u64, length: u64, advice: u64) -> u64 {
     {
         return linux_madvise_reclaim_hint(address, length);
     }
-    if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
-        && address >= LINUX_RUNTIME_DYNAMIC_MMAP_BASE
-    {
+    if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) && address >= LINUX_FIXED_LOW_BASE {
         return linux_runtime_madvise(address, length, advice);
     }
     let Some((start_slot, range_pages)) = linux_mmap_range_slots(address, length) else {
@@ -28917,6 +28980,14 @@ fn linux_proc_sysctl_set(path: &[u8], value: i64) {
         return;
     };
     LINUX_SYSCTL_OVERRIDES[slot][index].store(value, Ordering::Release);
+}
+
+/// The most memory areas a process of the current domain may have:
+/// `/proc/sys/vm/max_map_count` as written, else the built-in.
+fn linux_max_map_count() -> usize {
+    linux_proc_sysctl_value(b"sys/vm/max_map_count")
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(LINUX_MAX_MAP_COUNT)
 }
 
 /// The largest pipe an unprivileged process of the current domain may ask
@@ -33672,7 +33743,8 @@ fn linux_resolve_restricted(
                 continue;
             }
             if restrictions & LINUX_RESOLVE_NO_XDEV != 0
-                && crate::linux_mounts::is_mount_point(instance, &output[..length])
+                && (crate::linux_mounts::is_mount_point(instance, &output[..length])
+                    || linux_kernel_mount_point(&output[..length]))
             {
                 return Err(LINUX_EXDEV);
             }
@@ -33693,8 +33765,11 @@ fn linux_resolve_restricted(
             .ok_or(LINUX_ENAMETOOLONG)?;
         output[length..end].copy_from_slice(component);
         length = end;
+        // The kernel's own mounts (/proc, cgroup) are crossed too
+        // (openat202 opens /proc/version).
         if restrictions & LINUX_RESOLVE_NO_XDEV != 0
-            && crate::linux_mounts::is_mount_point(instance, &output[..length])
+            && (crate::linux_mounts::is_mount_point(instance, &output[..length])
+                || linux_kernel_mount_point(&output[..length]))
         {
             return Err(LINUX_EXDEV);
         }
@@ -34789,7 +34864,9 @@ fn linux_linkat(
     if ["proc", "sys", "dev"].iter().any(|mount| {
         old == mount.as_bytes()
             || old.starts_with(mount.as_bytes()) && old.get(mount.len()) == Some(&b'/')
-    }) {
+    }) || crate::linux_mounts::mount_id_at(linux_execution_instance(), old)
+        != crate::linux_mounts::mount_id_at(linux_execution_instance(), destination)
+    {
         return LINUX_EXDEV;
     }
     // A file only the image has is copied up first, so both names share the
@@ -37457,9 +37534,11 @@ fn linux_socket_sendmsg(descriptor: u64, message: u64, flags: u64) -> u64 {
     if iov_count > LINUX_IOV_LIMIT {
         return LINUX_EINVAL;
     }
-    let remote = if name == 0
-        || crate::linux_socket::kind(slot) == Some(crate::linux_socket::Kind::Netlink)
-    {
+    let kind = crate::linux_socket::kind(slot);
+    let tcp = kind == Some(crate::linux_socket::Kind::Tcp);
+    // A TCP socket sends to its peer, whatever address it is given, as
+    // sendto does (sendmsg01).
+    let remote = if name == 0 || tcp || kind == Some(crate::linux_socket::Kind::Netlink) {
         None
     } else {
         match linux_socket_address(name, name_length) {
@@ -37467,6 +37546,25 @@ fn linux_socket_sendmsg(descriptor: u64, message: u64, flags: u64) -> u64 {
             Err(error) => return error,
         }
     };
+    // A UDP datagram past the largest IPv4 payload is EMSGSIZE, however
+    // its parts are laid out.
+    if kind == Some(crate::linux_socket::Kind::Udp) {
+        const UDP_PAYLOAD_LIMIT: u64 = 65_507;
+        let mut total = 0_u64;
+        for index in 0..iov_count {
+            let mut iov = [0_u8; 16];
+            if !iov_address
+                .checked_add((index * 16) as u64)
+                .is_some_and(|entry| copy_from_linux_user(entry, &mut iov))
+            {
+                return LINUX_EFAULT;
+            }
+            total = total.saturating_add(u64::from_ne_bytes(iov[8..].try_into().unwrap()));
+        }
+        if total > UDP_PAYLOAD_LIMIT {
+            return LINUX_EMSGSIZE;
+        }
+    }
     let mut passed_rights = [(0, 0_u32); crate::linux_socket::PASSED_RIGHT_LIMIT];
     let mut passed_files = [None; crate::linux_socket::PASSED_RIGHT_LIMIT];
     let mut passed_right_count = 0_usize;
@@ -37647,6 +37745,10 @@ fn linux_socket_sendmsg(descriptor: u64, message: u64, flags: u64) -> u64 {
         Err(error) => {
             for (passed_slot, _) in passed_rights.iter().copied().take(passed_right_count) {
                 let _ = crate::linux_socket::close(passed_slot);
+            }
+            // A TCP socket never connected cannot send: EPIPE, as sendto.
+            if tcp && error == crate::linux_socket::Error::NotConnected {
+                return LINUX_EPIPE;
             }
             linux_socket_error(error)
         }
@@ -38338,6 +38440,34 @@ fn linux_socket_setsockopt(
             crate::linux_socket::TimeoutOption::Send
         };
         return crate::linux_socket::set_timeout_option(slot, timeout_option, timeout)
+            .map_or_else(linux_socket_error, |()| 0);
+    }
+    // Multicast membership: MCAST_JOIN_GROUP and MCAST_LEAVE_GROUP take a
+    // group_req (interface, then a sockaddr_in at offset 8),
+    // IP_ADD_MEMBERSHIP and IP_DROP_MEMBERSHIP an ip_mreq (group first).
+    // Each socket keeps its own groups; an accepted one has none (accept02).
+    if level == 0 && matches!(option, 35 | 36 | 42 | 45) {
+        let group_request = matches!(option, 42 | 45);
+        let minimum = if group_request { 136 } else { 8 };
+        if length < minimum {
+            return LINUX_EINVAL;
+        }
+        let mut supplied = [0_u8; 136];
+        if !copy_from_linux_user(value, &mut supplied[..minimum as usize]) {
+            return LINUX_EFAULT;
+        }
+        let group = if group_request {
+            if u16::from_ne_bytes([supplied[8], supplied[9]]) != 2 {
+                return LINUX_EINVAL;
+            }
+            u32::from_be_bytes(supplied[12..16].try_into().unwrap())
+        } else {
+            u32::from_be_bytes(supplied[..4].try_into().unwrap())
+        };
+        if group >> 28 != 0xe {
+            return LINUX_EINVAL;
+        }
+        return crate::linux_socket::change_group(slot, group, matches!(option, 35 | 42))
             .map_or_else(linux_socket_error, |()| 0);
     }
     if matches!((level, option), (0, 2) | (255, 1)) {
@@ -52878,7 +53008,7 @@ fn materialize_linux_runtime_user_range(address: u64, length: usize, writable: b
             continue;
         }
         if page.frame.is_none()
-            && ((page_address >= LINUX_RUNTIME_DYNAMIC_MMAP_BASE
+            && ((page_address >= LINUX_FIXED_LOW_BASE
                 && page_address < linux_runtime_mmap_end().unwrap_or(0))
                 || linux_runtime_heap_contains(page_address)
                 || linux_runtime_primary_stack_contains(page_address))
@@ -57520,10 +57650,14 @@ fn handle_user_fault(frame: *mut UserFaultFrame) -> u64 {
             return fault_linux_light_thread(
                 frame,
                 fault_metadata,
-                linux_fault_signal(fault_metadata.vector),
+                linux_user_fault_signal(fault_metadata),
             );
         }
-        if deliver_linux_sigsegv(frame, fault_metadata) {
+        if deliver_linux_fault_signal(
+            frame,
+            fault_metadata,
+            linux_user_fault_signal(fault_metadata),
+        ) {
             return 0;
         }
         if terminate_linux_process_for_fault(fault_metadata) {
@@ -57828,7 +57962,7 @@ fn materialize_linux_runtime_mapping(fault: domain::FaultMetadata) -> bool {
     if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
         || fault.vector != 14
         || fault.error & 1 != 0
-        || !((fault.address >= LINUX_RUNTIME_DYNAMIC_MMAP_BASE
+        || !((fault.address >= LINUX_FIXED_LOW_BASE
             && fault.address < linux_runtime_mmap_end().unwrap_or(0))
             || linux_runtime_heap_contains(fault.address))
     {

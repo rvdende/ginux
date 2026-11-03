@@ -748,6 +748,16 @@ fn linux_syscall_dispatch(
                 register(2),
                 register(1),
             ];
+            // A process past vm.max_map_count areas maps no more, as
+            // Linux refuses (munmap04 maps until this fails).
+            if runtime_mode
+                && crate::linux_areas::count(
+                    linux_execution_instance(),
+                    current_linux_process_pid(),
+                ) > linux_max_map_count()
+            {
+                return LINUX_ENOMEM;
+            }
             let mapped = linux_mmap(
                 arguments[0],
                 arguments[1],
@@ -767,6 +777,24 @@ fn linux_syscall_dispatch(
             mapped
         }
         LINUX_MUNMAP_SYSCALL => {
+            // Unmapping the middle of an area makes two of it: at the
+            // vm.max_map_count limit that is ENOMEM (munmap04).
+            if runtime_mode
+                && first_argument.is_multiple_of(PAGE_SIZE as u64)
+                && buffer != 0
+                && crate::linux_areas::count(
+                    linux_execution_instance(),
+                    current_linux_process_pid(),
+                ) >= linux_max_map_count()
+                && crate::linux_areas::unmap_splits(
+                    linux_execution_instance(),
+                    current_linux_process_pid(),
+                    first_argument,
+                    buffer,
+                )
+            {
+                return LINUX_ENOMEM;
+            }
             let result = linux_munmap(first_argument, buffer);
             if result == 0 && runtime_mode {
                 crate::linux_areas::unmap(

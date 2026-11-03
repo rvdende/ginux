@@ -573,12 +573,38 @@ pub(super) fn linux_futex_wait_live_return(
     };
     let Some(target) = ready_linux_thread_handle() else {
         // Another process may be the one to change the futex word.
-        return match run_other_linux_processes(output, caller, number) {
-            Some(LinuxBlockedWait::Return(result)) => result,
-            // Callers recheck their condition after any wakeup, spurious ones
-            // included.
-            Some(LinuxBlockedWait::Recheck) | None => 0,
-        };
+        if deadline == 0 {
+            return match run_other_linux_processes(output, caller, number) {
+                Some(LinuxBlockedWait::Return(result)) => result,
+                // Callers recheck their condition after any wakeup, spurious
+                // ones included.
+                Some(LinuxBlockedWait::Recheck) | None => 0,
+            };
+        }
+        // A timed wait goes on until its deadline (ETIMEDOUT, which
+        // futex_waitv01 waits for), a signal, or the word changing.
+        loop {
+            let now = linux_elapsed_nanoseconds().unwrap_or(deadline);
+            if now >= deadline {
+                return LINUX_ETIMEDOUT;
+            }
+            if !copy_from_linux_user(address, &mut bytes)
+                || u32::from_ne_bytes(bytes) != value as u32
+            {
+                return 0;
+            }
+            let turn = linux_timed_wait_run_others(output, caller, number, Some(deadline));
+            if let LinuxWaitTurn::Done(result) = turn {
+                return result;
+            }
+            if ready_linux_thread_handle().is_some() {
+                return 0;
+            }
+            if let LinuxWaitTurn::Idle = turn {
+                timer::request_linux_tick_within(deadline.saturating_sub(now));
+                linux_wait_for_interrupt();
+            }
+        }
     };
     let Some(tls) = linux_thread_context(current) else {
         return LINUX_ESRCH;

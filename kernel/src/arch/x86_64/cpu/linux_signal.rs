@@ -2913,6 +2913,20 @@ pub(super) const fn linux_fault_signal(vector: u64) -> u64 {
     }
 }
 
+/// The signal for user fault `fault`: SIGBUS for a page of a file
+/// mapping past the end of its file (`address_space::current_linux_page_past_eof`),
+/// else the one for its vector.
+pub(super) fn linux_user_fault_signal(fault: domain::FaultMetadata) -> u64 {
+    if fault.vector == 14
+        && X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
+        && address_space::current_linux_page_past_eof(fault.address & !(PAGE_SIZE as u64 - 1))
+    {
+        LINUX_SIGBUS
+    } else {
+        linux_fault_signal(fault.vector)
+    }
+}
+
 /// Kills the faulting process, not its domain, when a user fault in a
 /// process other than init cannot be delivered to a handler: Linux's
 /// default action for a forced fault signal.
@@ -2921,7 +2935,7 @@ pub(super) fn terminate_linux_process_for_fault(fault: domain::FaultMetadata) ->
         return false;
     }
     abort_linux_signal();
-    linux_terminate_by_signal(linux_fault_signal(fault.vector), false) == LINUX_RETURN_TO_KERNEL
+    linux_terminate_by_signal(linux_user_fault_signal(fault), false) == LINUX_RETURN_TO_KERNEL
 }
 
 /// Kills the faulting process with SIGKILL when a page it may touch could
@@ -2942,9 +2956,12 @@ pub(super) fn terminate_linux_process_out_of_memory() -> bool {
     linux_terminate_by_default_signal(LINUX_SIGKILL) == LINUX_RETURN_TO_KERNEL
 }
 
-pub(super) fn deliver_linux_sigsegv(
+/// Delivers `signal` (SIGSEGV, or SIGBUS for a page past the end of its
+/// file) for a user page fault to the process's handler.
+pub(super) fn deliver_linux_fault_signal(
     frame: &mut UserFaultFrame,
     fault: domain::FaultMetadata,
+    signal: u64,
 ) -> bool {
     if !frame.is_page_fault()
         || current_linux_thread_handle().is_none()
@@ -2952,12 +2969,12 @@ pub(super) fn deliver_linux_sigsegv(
     {
         return false;
     }
-    let signal_bit = 1 << (LINUX_SIGSEGV - 1);
+    let signal_bit = 1 << (signal - 1);
     let old_mask = X86_RUNTIME.ELF_PROBE_SIGNAL_MASK.load(Ordering::SeqCst);
     if old_mask & signal_bit != 0 {
         return false;
     }
-    let index = LINUX_SIGSEGV as usize - 1;
+    let index = signal as usize - 1;
     let handler = X86_RUNTIME.ELF_PROBE_SIGNAL_HANDLERS[index].load(Ordering::SeqCst);
     let flags = X86_RUNTIME.ELF_PROBE_SIGNAL_FLAGS[index].load(Ordering::SeqCst);
     let restorer = linux_effective_signal_restorer(
@@ -2999,8 +3016,10 @@ pub(super) fn deliver_linux_sigsegv(
         context,
         flags,
         LinuxSignalInformation::fault(
-            LINUX_SIGSEGV,
-            if fault.error & 1 == 0 {
+            signal,
+            if signal == LINUX_SIGBUS {
+                LINUX_BUS_ADRERR
+            } else if fault.error & 1 == 0 {
                 LINUX_SEGV_MAPERR
             } else {
                 LINUX_SEGV_ACCERR
@@ -3017,7 +3036,7 @@ pub(super) fn deliver_linux_sigsegv(
     if !frame.enter_signal_handler(
         handler,
         signal_stack,
-        LINUX_SIGSEGV,
+        signal,
         (
             signal_stack + LINUX_SIGNAL_FRAME_INFO_OFFSET,
             signal_stack + LINUX_SIGNAL_FRAME_CONTEXT_OFFSET,

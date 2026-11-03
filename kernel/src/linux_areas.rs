@@ -173,12 +173,30 @@ pub(crate) fn overlaps(instance: usize, pid: u32, start: u64, length: u64) -> bo
         .lock()
         .iter()
         .find(|process| process.instance == instance && process.pid == pid)
-        .is_some_and(|process| {
-            process
-                .areas
-                .iter()
-                .any(|area| area.start < end && start < area.end)
-        })
+        .is_some_and(|process| process.areas.overlaps(start, end))
+}
+
+/// How many areas `pid` has (Linux's map_count, which vm.max_map_count
+/// bounds).
+pub(crate) fn count(instance: usize, pid: u32) -> usize {
+    PROCESSES
+        .lock()
+        .iter()
+        .find(|process| process.instance == instance && process.pid == pid)
+        .map_or(0, |process| process.areas.len())
+}
+
+/// Whether unmapping `length` bytes at `start` of `pid` would split one
+/// of its areas in two.
+pub(crate) fn unmap_splits(instance: usize, pid: u32, start: u64, length: u64) -> bool {
+    let Some(end) = page_end(start, length) else {
+        return false;
+    };
+    PROCESSES
+        .lock()
+        .iter()
+        .find(|process| process.instance == instance && process.pid == pid)
+        .is_some_and(|process| process.areas.splits(start, end))
 }
 
 /// Whether part of `length` bytes at `start` of `pid` may not be made
