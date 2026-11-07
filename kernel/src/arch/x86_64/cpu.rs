@@ -58634,11 +58634,11 @@ fn linux_mount_new(
         Err(error) if filesystem == b"tmpfs" => return error,
         Err(_) => None,
     };
-    // A tmpfs or ramfs is a filesystem of its own, empty, stored below its
-    // storage root; its root is the mounter's, mode 1777, as in Linux. The
-    // kernel's own filesystems (devtmpfs's device files among them) are
-    // found by their paths.
-    let superblock = if matches!(filesystem, b"tmpfs" | b"ramfs") {
+    // A tmpfs, ramfs or hugetlbfs is a filesystem of its own, empty, stored
+    // below its storage root; its root is the mounter's, mode 1777, as in
+    // Linux. The kernel's own filesystems (devtmpfs's device files among
+    // them) are found by their paths.
+    let superblock = if matches!(filesystem, b"tmpfs" | b"ramfs" | b"hugetlbfs") {
         let superblock = crate::linux_mounts::new_superblock();
         let storage = crate::linux_mount_paths::storage_root(superblock);
         let Some(root) = crate::linux_overlay::create_directory_stored(&storage, 0o1777) else {
