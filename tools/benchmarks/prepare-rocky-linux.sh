@@ -18,7 +18,9 @@ cloud_image="$benchmark_asset_dir/$ROCKY_CLOUD_IMAGE_NAME"
 prepared_image="$benchmark_asset_dir/rocky-linux-prepared-v2.qcow2"
 preparation_log="$benchmark_asset_dir/rocky-linux-prepare-v2.log"
 seed_dir="$benchmark_asset_dir/nocloud-v2"
-http_port="${GINUX_BENCHMARK_HTTP_PORT:-18080}"
+# A free port the host picks, unless one is given: runs in parallel would
+# otherwise collide on a fixed one.
+http_port="${GINUX_BENCHMARK_HTTP_PORT:-$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')}"
 http_pid=""
 qemu_pid=""
 

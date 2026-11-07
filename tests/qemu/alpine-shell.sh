@@ -5,7 +5,10 @@ repo_root=$(cd "$(dirname "$0")/../.." && pwd)
 output_file=$(mktemp "${TMPDIR:-/tmp}/ginux-alpine-shell.XXXXXX")
 volume_image=$(mktemp "${TMPDIR:-/tmp}/ginux-alpine-shell-volume.XXXXXX")
 qemu_pid_file=$(mktemp "${TMPDIR:-/tmp}/ginux-alpine-shell-pid.XXXXXX")
-host_socket_port=18080
+# The host port forwarded to the guest's listener: a free one the host
+# picks, unless one is given, so runs in parallel (other worktrees, other
+# suites) do not collide on a fixed one.
+host_socket_port="${GINUX_ALPINE_SOCKET_PORT:-$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')}"
 qemu_pid=""
 
 stop_qemu() {
@@ -55,6 +58,14 @@ wait_for_line() {
     done
     tail -n 120 "$output_file" >&2
     echo "Alpine shell test failed while waiting for line '$marker'." >&2
+    stop_qemu
+    return 1
+}
+
+# The guest's listener serves `uname`: the Linux personality's sysname.
+check_socket_response() {
+    [[ "$1" == "Linux" ]] && return 0
+    echo "Alpine shell test failed: the guest's socket answered '$1', not 'Linux'." >&2
     stop_qemu
     return 1
 }
@@ -151,7 +162,7 @@ dd if=/dev/zero of="$volume_image" bs=1048576 count=1 2>/dev/null
     wait_for_line 'PIPE_LESS_EXIT_OK'
     wait_for_line 'SERVER_SOCKET_READY_1'
     socket_response=$(nc -w 5 127.0.0.1 "$host_socket_port")
-    [[ "$socket_response" == "Ginux" ]]
+    check_socket_response "$socket_response"
     wait_for_line 'SERVER_SOCKET_ACCEPTED_1'
     printf '%s\n' \
         "printf 'SERVER_SOCKET_RESPONSE_1_OK\\n'" \
@@ -161,7 +172,7 @@ dd if=/dev/zero of="$volume_image" bs=1048576 count=1 2>/dev/null
     wait_for_line 'SERVER_SOCKET_RESPONSE_1_OK'
     wait_for_line 'SERVER_SOCKET_READY_2'
     socket_response=$(nc -w 5 127.0.0.1 "$host_socket_port")
-    [[ "$socket_response" == "Ginux" ]]
+    check_socket_response "$socket_response"
     wait_for_line 'SERVER_SOCKET_ACCEPTED_2'
     printf '%s\n' "printf 'SERVER_SOCKET_RESPONSE_2_OK\\n'"
     wait_for_line 'SERVER_SOCKET_RESPONSE_2_OK'
