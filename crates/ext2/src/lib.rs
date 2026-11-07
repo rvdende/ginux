@@ -39,7 +39,7 @@ mod layout;
 mod xattr;
 
 pub use directory::Entry;
-pub use filesystem::{Change, Filesystem, Options, RenameMode, Statfs};
+pub use filesystem::{Change, Extent, Filesystem, Options, RenameMode, Statfs};
 pub use inode::{Kind, Stat};
 pub use xattr::XattrMode;
 

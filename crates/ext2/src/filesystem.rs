@@ -53,6 +53,14 @@ pub struct Statfs {
     pub id: [u32; 2],
 }
 
+/// A run of a file's data on the disk, in bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Extent {
+    pub logical: u64,
+    pub physical: u64,
+    pub length: u64,
+}
+
 /// Changes to an inode's attributes ([`Filesystem::change`]); each field
 /// left `None` stays.
 #[derive(Clone, Copy, Debug, Default)]
@@ -849,6 +857,43 @@ impl<D: BlockDevice> Filesystem<D> {
             self.superblock_dirty = true;
         }
         self.write_inode(number, &inode)
+    }
+
+    /// Where inode `number`'s data from byte `start` for `length` bytes lies
+    /// on the disk (FS_IOC_FIEMAP): runs of blocks contiguous in the file
+    /// and on the disk, holes left out.
+    pub fn extents(&mut self, number: u32, start: u64, length: u64) -> Result<Vec<Extent>> {
+        let mut inode = self.live_inode(number)?;
+        if inode.kind() != Some(Kind::File) {
+            return Err(Error::Invalid);
+        }
+        let block_size = u64::from(self.block_size);
+        let end = start.saturating_add(length).min(inode.size());
+        let mut extents: Vec<Extent> = Vec::new();
+        for index in start / block_size..end.div_ceil(block_size) {
+            let Some((block, _)) = self.map_block(&mut inode, index, None)? else {
+                continue;
+            };
+            let logical = index * block_size;
+            let physical = u64::from(block) * block_size;
+            match extents.last_mut() {
+                Some(last)
+                    if last.logical + last.length == logical
+                        && last.physical + last.length == physical =>
+                {
+                    last.length += block_size;
+                }
+                _ => {
+                    extents.try_reserve(1).map_err(|_| Error::NoMemory)?;
+                    extents.push(Extent {
+                        logical,
+                        physical,
+                        length: block_size,
+                    });
+                }
+            }
+        }
+        Ok(extents)
     }
 
     /// A symlink's target, into `buffer`; returns its length.

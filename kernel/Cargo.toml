@@ -19,6 +19,7 @@ ginux-keyrings = { path = "../crates/keyrings" }
 ginux-tty = { path = "../crates/tty" }
 ginux-image-store = { path = "../crates/image-store" }
 ginux-memory-areas = { path = "../crates/memory-areas" }
+ginux-ext2 = { path = "../crates/ext2" }
 ginux-seccomp = { path = "../crates/seccomp" }
 ginux-oci = { path = "../crates/oci" }
 ginux-oci-cache = { path = "../crates/oci-cache" }

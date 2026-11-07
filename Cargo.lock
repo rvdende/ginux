@@ -482,6 +482,7 @@ dependencies = [
  "font8x8",
  "ginux-credentials",
  "ginux-drm",
+ "ginux-ext2",
  "ginux-image-store",
  "ginux-keyrings",
  "ginux-memory-areas",

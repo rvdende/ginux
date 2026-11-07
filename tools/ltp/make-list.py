@@ -6,7 +6,7 @@
 Run after tools/ltp/build.sh (it reads build/ltp and the LTP sources in
 target/ltp-build). Every runtest/syscalls entry becomes one line, in LTP's
 order. Generated notes start with "auto:": tests whose binary did not build
-or that need loop devices or kernel modules (SKIP_RULES) are marked skipped,
+or that need kernel modules (SKIP_RULES) are marked skipped,
 and tests whose LTP timeout or runtime exceed the harness's default budget
 get a larger budget. Lines with any other note are
 curated by hand and are kept unchanged when the list is regenerated.
@@ -26,18 +26,10 @@ LTP_DEFAULT_TIMEOUT = 30
 RUNTIME_MUL = 0.1
 SLACK = 15
 
-# Tests skipped from their LTP metadata, with the reason recorded. Ginux
-# offers no loop block devices (LTP builds a filesystem image on one) and
+# Tests skipped from their LTP metadata, with the reason recorded: Ginux
 # loads no kernel modules (LTP's test modules are not built). Delete a rule
 # to run those tests again.
 SKIP_RULES = (
-    (
-        re.compile(
-            r"\.(needs_device|mount_device|format_device|all_filesystems)\s*=\s*1\b"
-            r"|\btst_acquire_device\s*\("
-        ),
-        "needs a loop block device (mkfs and mount)",
-    ),
     (
         re.compile(r"\.needs_drivers\s*=|\btst_module_(load|exists)\s*\("),
         "needs loadable kernel modules",
@@ -55,9 +47,8 @@ HEADER = """\
 #
 # Regenerate with tools/ltp/make-list.py after changing the LTP version.
 # Notes starting with "auto:" are generated (budgets from LTP's timeout and
-# runtime, skips for tests that did not build or need loop devices or kernel
-# modules); lines with any other note are curated by hand and survive
-# regeneration.
+# runtime, skips for tests that did not build or need kernel modules);
+# lines with any other note are curated by hand and survive regeneration.
 """
 
 

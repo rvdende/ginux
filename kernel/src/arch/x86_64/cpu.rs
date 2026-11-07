@@ -16282,6 +16282,15 @@ fn current_linux_credentials() -> Option<linux_user::Credentials> {
     linux_process::live_process_credentials(current_linux_process_pid())
 }
 
+/// The mode a new file (not a directory) at canonical `path` is made with:
+/// `mode` without set-group-ID where the creator may not have it (see
+/// [`linux_new_file_identity`]), judged before the umask, then the umask,
+/// as Linux's `vfs_prepare_mode` orders them.
+fn linux_file_creation_mode(path: &[u8], mode: u32) -> u32 {
+    let (_, _, mode) = linux_new_file_identity(path, false, mode);
+    mode & !(X86_RUNTIME.ELF_PROBE_UMASK.load(Ordering::SeqCst) as u32)
+}
+
 /// The owner, group and mode of a file the current process creates at
 /// canonical `path`: its filesystem ids (root outside a process). In a
 /// set-group-ID directory the file takes the directory's group, a new
@@ -22795,6 +22804,7 @@ fn linux_domain_mount_by_unique_id(unique: u64) -> Option<u32> {
 /// The superblock magic statfs and statmount report for `filesystem`.
 fn linux_filesystem_magic(filesystem: &[u8]) -> u64 {
     match filesystem {
+        b"ext2" => u64::from(ginux_ext2::MAGIC),
         b"tmpfs" | b"devtmpfs" => 0x0102_1994,
         b"ramfs" => 0x8584_58f6,
         b"proc" => 0x9fa0,
@@ -23008,10 +23018,13 @@ fn linux_statmount_domain(
     use crate::linux_mounts::{NO_ATIME, NO_DEVICES, NO_EXEC, NO_SUID, READ_ONLY};
     let unique = |local: u32| linux_mount::current_unique_mount_id(u64::from(local)).unwrap_or(0);
     if requested & SB_BASIC != 0 {
-        output[16..20].copy_from_slice(&0_u32.to_ne_bytes());
-        output[20..24].copy_from_slice(&mount.device.to_ne_bytes());
+        let (major, minor) = linux_device_numbers(mount.device);
+        output[16..20].copy_from_slice(&major.to_ne_bytes());
+        output[20..24].copy_from_slice(&minor.to_ne_bytes());
         output[24..32].copy_from_slice(&linux_filesystem_magic(&mount.filesystem).to_ne_bytes());
-        output[32..36].copy_from_slice(&0_u32.to_ne_bytes());
+        // The superblock's SB_RDONLY, which a read-only mount sets.
+        let superblock_flags = u32::from(mount.flags & READ_ONLY != 0);
+        output[32..36].copy_from_slice(&superblock_flags.to_ne_bytes());
     }
     let sharing = mount.sharing;
     if requested & MNT_BASIC != 0 {
@@ -34080,6 +34093,9 @@ fn linux_apply_exec_credentials(file: Option<ginux_credentials::FileAccess>) {
         return;
     };
     let id_count = linux_user::identity_authority(namespace, &credentials).id_count;
+    // With no_new_privs an exec grants nothing: the set-ID bits do not
+    // count (PR_SET_NO_NEW_PRIVS).
+    let file = file.filter(|_| !X86_RUNTIME.ELF_PROBE_NO_NEW_PRIVS.load(Ordering::SeqCst));
     let set_id = |bits: u32, id: fn(&ginux_credentials::FileAccess) -> u32| {
         file.filter(|file| file.mode & bits == bits)
             .map(|file| id(&file))
@@ -36105,12 +36121,14 @@ fn linux_overlay_stat(metadata: crate::linux_overlay::Metadata) -> [u8; LINUX_ST
         crate::linux_overlay::NodeKind::BlockDevice => 0o060000,
     };
     let mut stat = linux_stat(kind | metadata.mode, metadata.handle.inode());
+    stat[0..8].copy_from_slice(&u64::from(metadata.filesystem).to_ne_bytes());
+    stat[56..64].copy_from_slice(&u64::from(metadata.block_size).to_ne_bytes());
     stat[40..48].copy_from_slice(&u64::from(metadata.device).to_ne_bytes());
     stat[16..24].copy_from_slice(&u64::from(metadata.links).to_ne_bytes());
     stat[28..32].copy_from_slice(&metadata.owner.to_ne_bytes());
     stat[32..36].copy_from_slice(&metadata.group.to_ne_bytes());
     stat[48..56].copy_from_slice(&(metadata.size as u64).to_ne_bytes());
-    stat[64..72].copy_from_slice(&(metadata.size as u64).div_ceil(512).to_ne_bytes());
+    stat[64..72].copy_from_slice(&metadata.sectors.to_ne_bytes());
     stat[72..80].copy_from_slice(&metadata.atime.0.to_ne_bytes());
     stat[80..88].copy_from_slice(&metadata.atime.1.to_ne_bytes());
     stat[88..96].copy_from_slice(&metadata.mtime.0.to_ne_bytes());
@@ -36143,7 +36161,9 @@ fn linux_openat_path(
     let mut flags = u64::from(flags as u32);
     let mode = u64::from(mode as u32);
     let access = flags & 3;
-    if access == 3 || flags & LINUX_O_EXCL != 0 && flags & LINUX_O_CREAT == 0 {
+    // O_EXCL without O_CREAT means something only for a block device
+    // (an exclusive open); elsewhere Linux ignores it.
+    if access == 3 {
         return LINUX_EINVAL;
     }
     // A trailing slash names a directory: creating through one is EISDIR,
@@ -36584,7 +36604,7 @@ fn linux_openat_path(
             )
         });
         let permissions = image_file.map_or_else(
-            || (mode as u32) & !(X86_RUNTIME.ELF_PROBE_UMASK.load(Ordering::SeqCst) as u32),
+            || linux_file_creation_mode(&canonical[..length], mode as u32),
             |entry| linux_rootfs_mode(entry) & 0o7777,
         );
         let Some(handle) = crate::linux_overlay::create_file(
@@ -36615,7 +36635,7 @@ fn linux_openat_path(
         }
         let Some(handle) = crate::linux_overlay::create_file(
             &canonical[..length],
-            (mode as u32) & !(X86_RUNTIME.ELF_PROBE_UMASK.load(Ordering::SeqCst) as u32),
+            linux_file_creation_mode(&canonical[..length], mode as u32),
             &[],
         ) else {
             return LINUX_ENOSPC;
@@ -36815,14 +36835,9 @@ fn linux_openat_path(
     }
     set_linux_descriptor_close_on_exec(descriptor, flags & LINUX_O_CLOEXEC != 0);
     reset_linux_descriptor_flags(descriptor, created);
-    let initial_offset = if flags & LINUX_O_APPEND != 0 {
-        overlay_handle
-            .and_then(crate::linux_overlay::metadata)
-            .map_or(0, |metadata| metadata.size as u64)
-    } else {
-        0
-    };
-    linux_descriptor_offset(descriptor).store(initial_offset, Ordering::SeqCst);
+    // A new open starts at offset 0, O_APPEND or not: each write of an
+    // O_APPEND file moves to its end first (open12).
+    linux_descriptor_offset(descriptor).store(0, Ordering::SeqCst);
     descriptor
 }
 
@@ -37218,10 +37233,15 @@ fn linux_open_temporary(directory: u64, path: &[u8], flags: u64, mode: u64) -> u
     else {
         return LINUX_EMFILE;
     };
-    let umask = X86_RUNTIME.ELF_PROBE_UMASK.load(Ordering::SeqCst) as u32;
+    let mut probe = Vec::new();
+    if probe.try_reserve_exact(parent.len() + 2).is_err() {
+        return LINUX_ENOMEM;
+    }
+    probe.extend_from_slice(parent);
+    probe.extend_from_slice(b"/x");
     let Some(handle) = crate::linux_overlay::create_temporary(
         parent,
-        (mode as u32) & 0o7777 & !umask,
+        linux_file_creation_mode(&probe, mode as u32 & 0o7777),
         flags & LINUX_O_EXCL == 0,
     ) else {
         return LINUX_ENOSPC;
@@ -38086,8 +38106,7 @@ fn linux_mknodat(directory: u64, path_address: u64, mode: u64, device: u64) -> u
     if let Err(error) = linux_check_entry_change(path, false) {
         return error;
     }
-    let permissions =
-        (mode as u32) & 0o7777 & !(X86_RUNTIME.ELF_PROBE_UMASK.load(Ordering::SeqCst) as u32);
+    let permissions = linux_file_creation_mode(path, mode as u32 & 0o7777);
     let created = match kind {
         S_IFIFO => crate::linux_overlay::create_fifo(path, permissions),
         S_IFSOCK => crate::linux_overlay::create_socket(path, permissions),
@@ -38603,6 +38622,11 @@ fn linux_fallocate(descriptor: u64, mode: u64, offset: u64, length: u64) -> u64 
     if metadata.kind != crate::linux_overlay::NodeKind::File {
         return LINUX_EISDIR;
     }
+    // ext2's block maps cannot hold preallocated, unwritten blocks: Linux
+    // allocates only for extent-mapped files.
+    if crate::linux_blockfs::owns(handle) {
+        return LINUX_EOPNOTSUPP;
+    }
     // Allocating changes no data, so only F_SEAL_GROW stops it (and only
     // when the size grows); the write seals stop a hole punch.
     if let Some(seals) = crate::linux_overlay::file_seals(handle) {
@@ -38884,7 +38908,11 @@ fn linux_fchownat(directory: u64, path_address: u64, uid: u64, gid: u64, flags: 
 }
 
 fn linux_xattr_name(address: u64, output: &mut [u8; 256]) -> Result<usize, u64> {
-    let length = copy_linux_c_string(address, output)?;
+    // A name longer than XATTR_NAME_MAX is out of range, not too long.
+    let length = match copy_linux_c_string(address, output) {
+        Err(LINUX_ENAMETOOLONG) => return Err(LINUX_ERANGE),
+        result => result?,
+    };
     if length == 0 || length > 255 {
         Err(LINUX_ERANGE)
     } else {
@@ -38901,6 +38929,10 @@ const LINUX_FS_APPEND_FL: u32 = 0x20;
 /// The attributes a file keeps, as tmpfs does: immutable, append-only,
 /// no-dump and no-atime.
 const LINUX_FS_MODIFIABLE_FLAGS: u32 = LINUX_FS_IMMUTABLE_FL | LINUX_FS_APPEND_FL | 0x40 | 0x80;
+/// The attributes an ext2 file keeps: those, and secure deletion,
+/// undeletion, compression, synchronous updates, no-tail-merging,
+/// directory sync and top of a directory hierarchy.
+const LINUX_EXT2_MODIFIABLE_FLAGS: u32 = 0x0003_80ff;
 
 /// An overlay file's FS_*_FL attributes.
 fn linux_overlay_attributes(handle: crate::linux_overlay::Handle) -> u32 {
@@ -38957,7 +38989,14 @@ fn linux_file_attributes_ioctl(descriptor: u64, request: u64, argument: u64) -> 
     {
         return Some(LINUX_EPERM);
     }
-    if attributes & !LINUX_FS_MODIFIABLE_FLAGS != 0 {
+    // ext2 keeps the flags its inodes have room for (EXT2_FL_USER_MODIFIABLE),
+    // tmpfs only a few.
+    let modifiable = if crate::linux_blockfs::owns(handle) {
+        LINUX_EXT2_MODIFIABLE_FLAGS
+    } else {
+        LINUX_FS_MODIFIABLE_FLAGS
+    };
+    if attributes & !modifiable != 0 {
         return Some(LINUX_EOPNOTSUPP);
     }
     if let Err(error) = linux_check_writable_handle(handle) {
@@ -38965,6 +39004,93 @@ fn linux_file_attributes_ioctl(descriptor: u64, request: u64, argument: u64) -> 
     }
     let _ = crate::linux_overlay::set_attributes(handle, attributes);
     Some(0)
+}
+
+/// FS_IOC_FIEMAP on a file of a mounted volume: where its data lies on the
+/// disk; the overlay's files have no disk (EOPNOTSUPP, as tmpfs). FICLONE,
+/// FICLONERANGE and FIDEDUPERANGE need shared extents, which neither has
+/// (EOPNOTSUPP). None for other requests and descriptors.
+fn linux_fiemap_ioctl(descriptor: u64, request: u64, argument: u64) -> Option<u64> {
+    const FS_IOC_FIEMAP: u32 = 0xc020_660b;
+    const FICLONE: u32 = 0x4004_9409;
+    const FICLONERANGE: u32 = 0x4020_940d;
+    const FIDEDUPERANGE: u32 = 0xc018_9436;
+    const FIEMAP_FLAG_SYNC: u32 = 1;
+    const FIEMAP_FLAG_XATTR: u32 = 2;
+    const FIEMAP_EXTENT_LAST: u32 = 0x1;
+    const FIEMAP_EXTENT_MERGED: u32 = 0x1000;
+    const HEADER: usize = 32;
+    const EXTENT: usize = 56;
+    const LINUX_EBADR: u64 = u64::MAX - 52;
+    let request = request as u32;
+    if !matches!(
+        request,
+        FS_IOC_FIEMAP | FICLONE | FICLONERANGE | FIDEDUPERANGE
+    ) {
+        return None;
+    }
+    let handle = linux_overlay_descriptor_handle(descriptor);
+    if handle.is_none() && linux_rootfs_entry(descriptor).is_none() {
+        return None;
+    }
+    let Some(handle) =
+        handle.filter(|handle| request == FS_IOC_FIEMAP && crate::linux_blockfs::owns(*handle))
+    else {
+        return Some(LINUX_EOPNOTSUPP);
+    };
+    let mut header = [0_u8; HEADER];
+    if !copy_from_linux_user(argument, &mut header) {
+        return Some(LINUX_EFAULT);
+    }
+    let word = |at: usize| u64::from_ne_bytes(header[at..at + 8].try_into().unwrap_or_default());
+    let half = |at: usize| u32::from_ne_bytes(header[at..at + 4].try_into().unwrap_or_default());
+    let (start, length, flags, capacity) = (word(0), word(8), half(16), half(24));
+    let unsupported = flags & !(FIEMAP_FLAG_SYNC | FIEMAP_FLAG_XATTR);
+    if unsupported != 0 {
+        // The flags the filesystem lacks go back in fm_flags.
+        return Some(
+            if copy_to_linux_user(argument + 16, &unsupported.to_ne_bytes()) {
+                LINUX_EBADR
+            } else {
+                LINUX_EFAULT
+            },
+        );
+    }
+    if length == 0 {
+        return Some(LINUX_EINVAL);
+    }
+    let Some(extents) = crate::linux_blockfs::extents(handle, start, length) else {
+        return Some(LINUX_EBADF);
+    };
+    let mapped = if capacity == 0 {
+        // A count of zero asks only how many there are.
+        extents.len()
+    } else {
+        extents.len().min(capacity as usize)
+    };
+    for (index, extent) in extents.iter().take(capacity as usize).enumerate() {
+        let mut record = [0_u8; EXTENT];
+        record[0..8].copy_from_slice(&extent.logical.to_ne_bytes());
+        record[8..16].copy_from_slice(&extent.physical.to_ne_bytes());
+        record[16..24].copy_from_slice(&extent.length.to_ne_bytes());
+        let last = if index + 1 == extents.len() {
+            FIEMAP_EXTENT_LAST
+        } else {
+            0
+        };
+        record[40..44].copy_from_slice(&(FIEMAP_EXTENT_MERGED | last).to_ne_bytes());
+        let at = argument + (HEADER + index * EXTENT) as u64;
+        if !copy_to_linux_user(at, &record) {
+            return Some(LINUX_EFAULT);
+        }
+    }
+    Some(
+        if copy_to_linux_user(argument + 20, &(mapped as u32).to_ne_bytes()) {
+            0
+        } else {
+            LINUX_EFAULT
+        },
+    )
 }
 
 fn linux_xattr_path_handle(
@@ -39400,6 +39526,7 @@ fn linux_utimensat(directory: u64, path_address: u64, times_address: u64, flags:
         .unwrap_or((0, 0));
     let mut times = [now, now];
     let mut only_now = true;
+    let mut omitted = 0;
     if times_address != 0 {
         let mut input = [0_u8; 32];
         if !copy_from_linux_user(times_address, &mut input) {
@@ -39411,6 +39538,7 @@ fn linux_utimensat(directory: u64, path_address: u64, times_address: u64, flags:
             let nanoseconds =
                 i64::from_ne_bytes(input[offset + 8..offset + 16].try_into().unwrap());
             only_now &= nanoseconds == LINUX_UTIME_NOW;
+            omitted += usize::from(nanoseconds == LINUX_UTIME_OMIT);
             *time = match nanoseconds {
                 LINUX_UTIME_NOW => now,
                 LINUX_UTIME_OMIT if index == 0 => metadata.atime,
@@ -39419,6 +39547,17 @@ fn linux_utimensat(directory: u64, path_address: u64, times_address: u64, flags:
                 _ => return LINUX_EINVAL,
             };
         }
+    }
+    // Leaving both times as they are changes nothing and checks nothing.
+    if omitted == 2 {
+        return 0;
+    }
+    // An immutable file's times do not change, nor an append-only file's
+    // to anything but now.
+    if metadata.attributes & LINUX_FS_IMMUTABLE_FL != 0
+        || metadata.attributes & LINUX_FS_APPEND_FL != 0 && !only_now
+    {
+        return LINUX_EPERM;
     }
     if let Err(error) = linux_check_set_times(metadata, only_now) {
         return error;
@@ -39582,6 +39721,49 @@ fn linux_renameat(
         return error;
     }
     let target = crate::linux_overlay::lookup(&new_canonical[..new_length]);
+    let (old, new) = (&old_canonical[..old_length], &new_canonical[..new_length]);
+    let space = linux_mount_space();
+    if crate::linux_mounts::mount_id_at(space, old) != crate::linux_mounts::mount_id_at(space, new)
+    {
+        return LINUX_EXDEV;
+    }
+    // A directory cannot move below itself, nor a name onto a directory
+    // above it (which holds it, so is not empty).
+    let below = |above: &[u8], path: &[u8]| {
+        path.strip_prefix(above)
+            .is_some_and(|rest| rest.starts_with(b"/"))
+    };
+    if below(old, new) {
+        return LINUX_EINVAL;
+    }
+    if below(new, old) {
+        return LINUX_ENOTEMPTY;
+    }
+    if flags != RENAME_EXCHANGE {
+        if let Some(target) = target.filter(|target| target.handle != source.handle) {
+            let directory = crate::linux_overlay::NodeKind::Directory;
+            match (source.kind == directory, target.kind == directory) {
+                (true, false) => return LINUX_ENOTDIR,
+                (false, true) => return LINUX_EISDIR,
+                _ => {}
+            }
+        }
+    }
+    // A volume renames in one step, replacing the target as it goes.
+    if crate::linux_blockfs::owns(source.handle) {
+        let mode = match flags {
+            RENAME_EXCHANGE => ginux_ext2::RenameMode::Exchange,
+            RENAME_NOREPLACE => ginux_ext2::RenameMode::NoReplace,
+            _ => ginux_ext2::RenameMode::Replace,
+        };
+        let result = crate::linux_blockfs::rename_with(old, new, mode);
+        linux_reclaim_unlinked_files();
+        return match result {
+            Some(Ok(())) => 0,
+            Some(Err(errno)) => errno.wrapping_neg(),
+            None => LINUX_EXDEV,
+        };
+    }
     if flags == RENAME_EXCHANGE {
         return linux_rename_exchange(&old_canonical[..old_length], &new_canonical[..new_length]);
     }
@@ -39911,29 +40093,7 @@ fn linux_statx(directory: u64, path_address: u64, flags: u64, mask: u64, stat_ad
             Err(error) => return error,
         };
         if let Some(metadata) = found {
-            let mode = match metadata.kind {
-                crate::linux_overlay::NodeKind::File => 0o100000,
-                crate::linux_overlay::NodeKind::Directory => 0o040000,
-                crate::linux_overlay::NodeKind::Symlink => 0o120000,
-                crate::linux_overlay::NodeKind::Fifo => 0o010000,
-                crate::linux_overlay::NodeKind::Socket => 0o140000,
-                crate::linux_overlay::NodeKind::CharacterDevice => 0o020000,
-                crate::linux_overlay::NodeKind::BlockDevice => 0o060000,
-            } | metadata.mode;
-            let size = metadata.size as u64;
-            let mut stat = [0_u8; 256];
-            linux_statx_set_mount(&mut stat, LinuxFilesystemKind::Root);
-            stat[4..8].copy_from_slice(&(PAGE_SIZE as u32).to_ne_bytes());
-            stat[16..20].copy_from_slice(&metadata.links.to_ne_bytes());
-            stat[20..24].copy_from_slice(&metadata.owner.to_ne_bytes());
-            stat[24..28].copy_from_slice(&metadata.group.to_ne_bytes());
-            stat[28..30].copy_from_slice(&(mode as u16).to_ne_bytes());
-            stat[32..40].copy_from_slice(&metadata.handle.inode().to_ne_bytes());
-            let (major, minor) = linux_device_numbers(metadata.device);
-            stat[128..132].copy_from_slice(&major.to_ne_bytes());
-            stat[132..136].copy_from_slice(&minor.to_ne_bytes());
-            stat[40..48].copy_from_slice(&size.to_ne_bytes());
-            stat[48..56].copy_from_slice(&size.div_ceil(512).to_ne_bytes());
+            let stat = linux_statx_from_metadata(metadata);
             return if copy_to_linux_user(stat_address, &stat) {
                 0
             } else {
@@ -40050,9 +40210,36 @@ fn linux_statx_from_stat(stat: &[u8; LINUX_STAT_SIZE]) -> [u8; 256] {
         statx[to..to + 8].copy_from_slice(&word(from).to_ne_bytes());
         statx[to + 8..to + 12].copy_from_slice(&(word(from + 8) as u32).to_ne_bytes());
     }
-    let device = word(40);
-    statx[128..132].copy_from_slice(&((device >> 8) as u32 & 0xfff).to_ne_bytes());
-    statx[132..136].copy_from_slice(&(device as u32 & 0xff).to_ne_bytes());
+    let (major, minor) = linux_device_numbers(word(40) as u32);
+    statx[128..132].copy_from_slice(&major.to_ne_bytes());
+    statx[132..136].copy_from_slice(&minor.to_ne_bytes());
+    // A file on a block device's filesystem names that device.
+    let filesystem = word(0) as u32;
+    if filesystem != 0 {
+        let (major, minor) = linux_device_numbers(filesystem);
+        statx[136..140].copy_from_slice(&major.to_ne_bytes());
+        statx[140..144].copy_from_slice(&minor.to_ne_bytes());
+    }
+    statx
+}
+
+/// statx(2) of an overlay or volume file: its stat, and the inode flags
+/// statx shows as attributes (those tmpfs shows, and on ext2 also
+/// compression).
+fn linux_statx_from_metadata(metadata: crate::linux_overlay::Metadata) -> [u8; 256] {
+    const STATX_ATTR_COMPRESSED: u64 = 0x4;
+    const STATX_ATTR_IMMUTABLE: u64 = 0x10;
+    const STATX_ATTR_APPEND: u64 = 0x20;
+    const STATX_ATTR_NODUMP: u64 = 0x40;
+    let mut statx = linux_statx_from_stat(&linux_overlay_stat(metadata));
+    let mut supported = STATX_ATTR_IMMUTABLE | STATX_ATTR_APPEND | STATX_ATTR_NODUMP;
+    if crate::linux_blockfs::owns(metadata.handle) {
+        supported |= STATX_ATTR_COMPRESSED;
+    }
+    // The FS_*_FL bits of these attributes have the same values.
+    let attributes = u64::from(metadata.attributes) & supported;
+    statx[8..16].copy_from_slice(&attributes.to_ne_bytes());
+    statx[56..64].copy_from_slice(&supported.to_ne_bytes());
     statx
 }
 
@@ -45770,6 +45957,13 @@ fn linux_open_kernel_log(flags: u64) -> u64 {
 /// Opens block device `major`:`minor`: a loop device (/dev/loopN) or a RAM
 /// disk (/dev/ramN).
 fn linux_open_block_device(major: u32, minor: u32, flags: u64) -> u64 {
+    // An exclusive open of a disk a filesystem is mounted from is EBUSY
+    // (mkfs refuses a mounted device this way).
+    if flags & (LINUX_O_EXCL | LINUX_O_CREAT) == LINUX_O_EXCL
+        && crate::linux_blockfs::device_mounted(linux_device_number(major, minor))
+    {
+        return LINUX_EBUSY;
+    }
     let access = flags & 3;
     let (readable, writable) = (access != 1, access != 0);
     let (class, opened) = if major == crate::linux_ramdisk::MAJOR {
@@ -46030,7 +46224,9 @@ fn linux_block_transfer(
                 crate::linux_loop::read_at(id, at, &mut buffer[..chunk])
             };
             read.and_then(|length| {
-                if copy_to_linux_user(address.wrapping_add(total), &buffer[..length]) {
+                // Nothing read (the end of the device) copies nothing.
+                if length == 0 || copy_to_linux_user(address.wrapping_add(total), &buffer[..length])
+                {
                     Ok(length)
                 } else {
                     Err(crate::linux_loop::Error::Fault)
@@ -51976,8 +52172,18 @@ fn linux_proc_mount_table(mountinfo: bool) -> Option<Vec<u8>> {
             append_linux_decimal(&mut line, &mut used, u64::from(mount.id))
                 && append_linux_bytes(&mut line, &mut used, b" ")
                 && append_linux_decimal(&mut line, &mut used, u64::from(mount.parent))
-                && append_linux_bytes(&mut line, &mut used, b" 0:")
-                && append_linux_decimal(&mut line, &mut used, u64::from(mount.device))
+                && append_linux_bytes(&mut line, &mut used, b" ")
+                && append_linux_decimal(
+                    &mut line,
+                    &mut used,
+                    u64::from(linux_device_numbers(mount.device).0),
+                )
+                && append_linux_bytes(&mut line, &mut used, b":")
+                && append_linux_decimal(
+                    &mut line,
+                    &mut used,
+                    u64::from(linux_device_numbers(mount.device).1),
+                )
                 && append_linux_bytes(&mut line, &mut used, b" /")
                 && escaped(&mount.root, &mut line, &mut used)
                 && append_linux_bytes(&mut line, &mut used, b" ")
@@ -52348,20 +52554,34 @@ fn linux_regular_file_inode(state: u16) -> Option<u64> {
 }
 
 fn linux_regular_file_seek(descriptor: u64, state: u16, offset: u64, whence: u64) -> u64 {
+    const SEEK_DATA: u64 = 3;
+    const SEEK_HOLE: u64 = 4;
+    let size = || {
+        linux_overlay_descriptor_handle(descriptor)
+            .and_then(crate::linux_overlay::metadata)
+            .map_or_else(
+                || {
+                    linux_rootfs_entry(descriptor)
+                        .map_or_else(|| linux_file_size(state), |entry| entry.data.len() as u64)
+                },
+                |metadata| metadata.size as u64,
+            )
+    };
     let base = match whence {
         0 => 0_i128,
         1 => i128::from(linux_descriptor_offset(descriptor).load(Ordering::SeqCst)),
-        2 => i128::from(
-            linux_overlay_descriptor_handle(descriptor)
-                .and_then(crate::linux_overlay::metadata)
-                .map_or_else(
-                    || {
-                        linux_rootfs_entry(descriptor)
-                            .map_or_else(|| linux_file_size(state), |entry| entry.data.len() as u64)
-                    },
-                    |metadata| metadata.size as u64,
-                ),
-        ),
+        2 => i128::from(size()),
+        // Holes are not tracked: the whole file is data, with the implicit
+        // hole at its end, as Linux's generic llseek has it.
+        SEEK_DATA | SEEK_HOLE => {
+            let size = size();
+            if (offset as i64) < 0 || offset >= size {
+                return LINUX_ENXIO;
+            }
+            let next = if whence == SEEK_DATA { offset } else { size };
+            linux_descriptor_offset(descriptor).store(next, Ordering::SeqCst);
+            return next;
+        }
         _ => return LINUX_EINVAL,
     };
     let next = base + i128::from(offset as i64);
@@ -53015,6 +53235,7 @@ fn linux_descriptor_close_with_wake(descriptor: u64, wake_waiters: bool) -> u64 
             cell.store(0, Ordering::SeqCst);
         }
         linux_legacy_descriptor_offset(descriptor).store(0, Ordering::SeqCst);
+        linux_reclaim_unlinked_files();
     }
     result
 }
@@ -54418,9 +54639,18 @@ fn linux_getdents64(descriptor: u64, address: u64, count: u64) -> u64 {
 
 fn linux_getdents(descriptor: u64, address: u64, count: u64, legacy: bool) -> u64 {
     let descriptor = u64::from(descriptor as u32);
+    if !linux_descriptor_open(descriptor) {
+        return LINUX_EBADF;
+    }
     let state = linux_device_descriptor(descriptor);
     if state & LINUX_DEVICE_DIRECTORY == 0 {
         return LINUX_ENOTDIR;
+    }
+    // A removed directory lists nothing more (Linux's dead directory).
+    if linux_overlay_descriptor_handle(descriptor)
+        .is_some_and(|handle| !crate::linux_overlay::linked(handle))
+    {
+        return LINUX_ENOENT;
     }
     let offset = linux_descriptor_offset(descriptor).load(Ordering::SeqCst);
     let Ok(capacity) = usize::try_from(count) else {
@@ -56330,6 +56560,7 @@ fn linux_munlockall() -> u64 {
 fn linux_syncfs(descriptor: u64) -> u64 {
     let descriptor = u64::from(descriptor as u32);
     if linux_descriptor_open(descriptor) {
+        crate::linux_blockfs::sync_all();
         0
     } else {
         LINUX_EBADF
@@ -57269,6 +57500,20 @@ fn linux_statfs(path_address: u64, stat_address: u64) -> u64 {
             linux_missing_path_error(&canonical[..length])
         });
     }
+    if let Some(statfs) = overlay
+        .map(|metadata| metadata.handle)
+        .and_then(crate::linux_blockfs::statfs_of)
+    {
+        let length = canonical_length.unwrap_or(0);
+        return if copy_to_linux_user(
+            stat_address,
+            &linux_volume_statfs_data(statfs, &canonical[..length]),
+        ) {
+            0
+        } else {
+            LINUX_EFAULT
+        };
+    }
     let kind = if virtual_path.is_some() || canonical_is_proc {
         LinuxFilesystemKind::Proc
     } else if canonical_is_cgroup {
@@ -57356,6 +57601,11 @@ fn linux_mount_filesystem(
     if flags & !VALID_FLAGS != 0 {
         return LINUX_EINVAL;
     }
+    // Mandatory locking is not built in (Linux without
+    // CONFIG_MANDATORY_FILE_LOCKING refuses the option).
+    if flags & MS_MANDLOCK != 0 {
+        return LINUX_EPERM;
+    }
 
     let mut target = [0_u8; LINUX_PATH_MAX];
     let mut target_length = match copy_linux_c_string(target_address, &mut target) {
@@ -57442,6 +57692,21 @@ fn linux_mount_filesystem(
     if flags & MS_REMOUNT != 0 && propagation == 0 {
         // Remounting changes a domain mount's options; the root and the
         // kernel's own mounts keep theirs.
+        // A volume with a file open for writing cannot become read-only.
+        if flags & MS_RDONLY != 0
+            && crate::linux_blockfs::generations_at(canonical_target).is_some_and(|generations| {
+                generations
+                    .into_iter()
+                    .any(linux_overlay_file_open_for_write)
+            })
+        {
+            return LINUX_EBUSY;
+        }
+        if let Some(Err(error)) =
+            crate::linux_blockfs::remount(canonical_target, flags & MS_RDONLY != 0)
+        {
+            return error.wrapping_neg();
+        }
         return match crate::linux_mounts::remount(space, canonical_target, mount_flags) {
             Ok(()) => 0,
             Err(_) if flags & MS_BIND != 0 || linux_kernel_mount_point(canonical_target) => 0,
@@ -57494,6 +57759,9 @@ fn linux_mount_filesystem(
         Err(error) => return error,
     };
     let filesystem = &filesystem[..filesystem_length];
+    if filesystem == b"ext2" {
+        return linux_mount_volume(source_address, canonical_target, mount_flags);
+    }
     if !matches!(
         filesystem,
         b"tmpfs"
@@ -57559,6 +57827,239 @@ fn linux_mount_filesystem(
         }
         Err(_) => LINUX_ENOMEM,
     }
+}
+
+/// mount(2) of the ext2 filesystem on the block device at `source_address`
+/// on canonical `target`, a directory, with the domain mount options
+/// `options` (`linux_mounts`).
+fn linux_mount_volume(source_address: u64, target: &[u8], options: u32) -> u64 {
+    if source_address == 0 {
+        return LINUX_EINVAL;
+    }
+    let mut source = [0_u8; LINUX_PATH_MAX];
+    let source_length = match copy_linux_c_string(source_address, &mut source) {
+        Ok(0) => return LINUX_ENOENT,
+        Ok(length) => length,
+        Err(error) => return error,
+    };
+    let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    let length = match linux_canonical_path_at(
+        u64::from(LINUX_AT_FDCWD),
+        &source[..source_length],
+        &mut canonical,
+    ) {
+        Ok(length) => length,
+        Err(error) => return error,
+    };
+    // /proc/mounts names the device by its canonical path.
+    let mut source_name = [0_u8; crate::linux_overlay::PATH_CAPACITY + 1];
+    source_name[0] = b'/';
+    source_name[1..=length].copy_from_slice(&canonical[..length]);
+    let source_name_length = length + 1;
+    let device = match linux_overlay_lookup_following(&mut canonical, length, true) {
+        Ok((_, _, Some(metadata)))
+            if metadata.kind == crate::linux_overlay::NodeKind::BlockDevice =>
+        {
+            metadata.device
+        }
+        // Anything else that exists is no block device (ENOTBLK), which is
+        // how LTP tells a filesystem the kernel has from one it lacks.
+        Ok((_, _, Some(_))) => return LINUX_ENOTBLK,
+        Ok((length, _, None)) => {
+            return if linux_rootfs_path_at(u64::from(LINUX_AT_FDCWD), &source[..source_length])
+                .is_some()
+                || LinuxCharacterDevice::from_path(&source[..source_length]).is_some()
+            {
+                LINUX_ENOTBLK
+            } else {
+                linux_missing_path_error(&canonical[..length])
+            };
+        }
+        Err(error) => return error,
+    };
+    if crate::linux_blockfs::device_mounted(device) {
+        return LINUX_EBUSY;
+    }
+    let read_only = options & crate::linux_mounts::READ_ONLY != 0;
+    let (major, minor) = linux_device_numbers(device);
+    let source = match major {
+        crate::linux_loop::MAJOR => {
+            let open = match crate::linux_loop::open(minor, true, !read_only) {
+                Ok(open) => open,
+                Err(error) => return linux_loop_errno(error),
+            };
+            match crate::linux_loop::backing(open) {
+                // A volume's own file cannot carry another volume here.
+                Ok((backing, _, _, _)) if crate::linux_blockfs::owns(backing) => {
+                    crate::linux_loop::release(crate::linux_loop::CLASS_DEVICE, open);
+                    return LINUX_EINVAL;
+                }
+                Ok((_, _, _, true)) if !read_only => {
+                    crate::linux_loop::release(crate::linux_loop::CLASS_DEVICE, open);
+                    return LINUX_EACCES;
+                }
+                Ok((backing, offset, size, _)) => crate::linux_blockfs::Source::Loop {
+                    minor,
+                    open,
+                    backing,
+                    offset,
+                    size,
+                },
+                Err(_) => {
+                    crate::linux_loop::release(crate::linux_loop::CLASS_DEVICE, open);
+                    return LINUX_EINVAL;
+                }
+            }
+        }
+        crate::linux_ramdisk::MAJOR => match crate::linux_ramdisk::open(minor, true, !read_only) {
+            Ok(open) => crate::linux_blockfs::Source::Ram {
+                minor,
+                open,
+                size: crate::linux_ramdisk::DISK_SIZE,
+            },
+            Err(error) => return linux_loop_errno(error),
+        },
+        _ => return LINUX_ENXIO,
+    };
+    let io = match source {
+        crate::linux_blockfs::Source::Loop { open, .. } => crate::linux_loop::io_counters(open),
+        crate::linux_blockfs::Source::Ram { .. } => None,
+    };
+    if let Err(error) = crate::linux_blockfs::mount(target, source, io, read_only) {
+        linux_release_volume_device(source);
+        return error.wrapping_neg();
+    }
+    let named = &source_name[..source_name_length];
+    let space = linux_mount_space();
+    let Ok(id) = crate::linux_mounts::mount(space, target, named, b"ext2", options, None) else {
+        if let Some(Ok(source)) = crate::linux_blockfs::unmount(target) {
+            linux_release_volume_device(source);
+        }
+        return LINUX_ENOMEM;
+    };
+    // The mount shows the disk it is on, not an anonymous device.
+    crate::linux_mounts::set_device(space, id, device);
+    0
+}
+
+/// Closes the device a volume was mounted from.
+fn linux_release_volume_device(source: crate::linux_blockfs::Source) {
+    match source {
+        crate::linux_blockfs::Source::Loop { open, .. } => {
+            crate::linux_loop::release(crate::linux_loop::CLASS_DEVICE, open)
+        }
+        crate::linux_blockfs::Source::Ram { open, .. } => {
+            crate::linux_ramdisk::release(crate::linux_ramdisk::CLASS_DISK, open)
+        }
+    }
+}
+
+/// Whether a file of generation `generation` is in use by any process of
+/// the domain: open as a descriptor, or a working directory. A process
+/// live on some CPU is read from its bank, any other from its saved record.
+pub(crate) fn linux_generation_in_use(generation: u32) -> bool {
+    let in_bank = |bank: usize| {
+        let stdio = X86_RUNTIME
+            .ELF_PROBE_STDIO_TMP_FILE_GENERATIONS
+            .at_bank(bank);
+        (0..3).any(|index| {
+            stdio[index].load(Ordering::SeqCst) == generation
+                && X86_RUNTIME.ELF_PROBE_STDIO_DEVICE_DESCRIPTORS[index]
+                    .at_bank(bank)
+                    .load(Ordering::SeqCst)
+                    != 0
+        }) || X86_RUNTIME
+            .ELF_PROBE_DEVICE_DESCRIPTORS
+            .at_bank(bank)
+            .iter()
+            .zip(X86_RUNTIME.ELF_PROBE_TMP_FILE_GENERATIONS.at_bank(bank))
+            .any(|(state, file)| {
+                state.load(Ordering::SeqCst) != 0 && file.load(Ordering::SeqCst) == generation
+            })
+            || X86_RUNTIME
+                .ELF_PROBE_OVERLAY_CWD
+                .at_bank(bank)
+                .load(Ordering::SeqCst)
+                == generation
+    };
+    if in_bank(linux_cpu_bank()) {
+        return true;
+    }
+    let me = current_linux_process_pid();
+    let instance = linux_execution_instance();
+    (0..linux_process::PROCESS_LIMIT)
+        .filter_map(linux_process::live_process_pid_at)
+        .filter(|pid| *pid != me)
+        .any(|pid| {
+            if let Some(bank) = linux_live_process_bank(pid, instance) {
+                return in_bank(bank);
+            }
+            linux_process_runtime_state(pid).is_some_and(|state| {
+                let descriptors = &state.descriptors;
+                state.valid
+                    && (state.overlay_cwd == generation
+                        || descriptors
+                            .stdio_devices
+                            .iter()
+                            .zip(&descriptors.stdio_tmp_generations)
+                            .any(|(state, file)| *state != 0 && *file == generation)
+                        || descriptors
+                            .devices
+                            .iter()
+                            .zip(&descriptors.tmp_generations)
+                            .any(|(state, file)| *state != 0 && *file == generation))
+            })
+        })
+}
+
+/// Frees the files, on the overlay or a volume, that lost their last name
+/// once nothing has them open (after a close or an unlink).
+pub(crate) fn linux_reclaim_unlinked_files() {
+    crate::linux_overlay::reclaim_unlinked(|handle| {
+        linux_generation_in_use(crate::linux_overlay::generation(handle))
+            || crate::linux_loop::backs(handle)
+    });
+    if crate::linux_blockfs::has_orphans() {
+        for source in crate::linux_blockfs::reclaim(linux_generation_in_use) {
+            linux_release_volume_device(source);
+        }
+    }
+}
+
+/// statfs(2)'s answer for a volume: ext2's counts, and the options of the
+/// mount at canonical `path`.
+fn linux_volume_statfs_data(statfs: ginux_ext2::Statfs, path: &[u8]) -> [u8; 120] {
+    const ST_RDONLY: u64 = 1;
+    const ST_NOSUID: u64 = 2;
+    const ST_NODEV: u64 = 4;
+    const ST_NOEXEC: u64 = 8;
+    const ST_VALID: u64 = 32;
+    const ST_RELATIME: u64 = 4096;
+    let options = crate::linux_mounts::flags_at(linux_mount_space(), path);
+    let flags = [
+        (crate::linux_mounts::READ_ONLY, ST_RDONLY),
+        (crate::linux_mounts::NO_SUID, ST_NOSUID),
+        (crate::linux_mounts::NO_DEVICES, ST_NODEV),
+        (crate::linux_mounts::NO_EXEC, ST_NOEXEC),
+    ]
+    .into_iter()
+    .filter(|(option, _)| options & option != 0)
+    .fold(ST_VALID | ST_RELATIME, |flags, (_, flag)| flags | flag);
+    let mut stat = [0_u8; 120];
+    let block_size = u64::from(statfs.block_size);
+    stat[0..8].copy_from_slice(&u64::from(ginux_ext2::MAGIC).to_ne_bytes());
+    stat[8..16].copy_from_slice(&block_size.to_ne_bytes());
+    stat[16..24].copy_from_slice(&statfs.blocks.to_ne_bytes());
+    stat[24..32].copy_from_slice(&statfs.free_blocks.to_ne_bytes());
+    stat[32..40].copy_from_slice(&statfs.available_blocks.to_ne_bytes());
+    stat[40..48].copy_from_slice(&statfs.inodes.to_ne_bytes());
+    stat[48..56].copy_from_slice(&statfs.free_inodes.to_ne_bytes());
+    stat[56..60].copy_from_slice(&statfs.id[0].to_ne_bytes());
+    stat[60..64].copy_from_slice(&statfs.id[1].to_ne_bytes());
+    stat[64..72].copy_from_slice(&u64::from(statfs.name_max).to_ne_bytes());
+    stat[72..80].copy_from_slice(&block_size.to_ne_bytes());
+    stat[80..88].copy_from_slice(&flags.to_ne_bytes());
+    stat
 }
 
 /// The root and the mounts the kernel makes itself (/proc, cgroup2).
@@ -57673,6 +58174,23 @@ fn linux_umount(target_address: u64, flags: u64) -> u64 {
         && !linux_api_directory(canonical)
     {
         return linux_missing_path_error(canonical);
+    }
+    if let Some(generations) = crate::linux_blockfs::generations_at(canonical) {
+        // A file of the volume still open, or a working directory on it,
+        // keeps it mounted (EBUSY), unless the unmount is lazy (MNT_DETACH):
+        // then it leaves the namespace and goes with its last close.
+        if generations.into_iter().any(linux_generation_in_use) {
+            if flags & MNT_DETACH == 0 {
+                return LINUX_EBUSY;
+            }
+            crate::linux_blockfs::detach(canonical);
+        } else {
+            match crate::linux_blockfs::unmount(canonical) {
+                Some(Ok(source)) => linux_release_volume_device(source),
+                Some(Err(error)) => return error.wrapping_neg(),
+                None => {}
+            }
+        }
     }
     match crate::linux_mounts::unmount(linux_mount_space(), canonical) {
         Ok(gone) => {
@@ -58106,6 +58624,20 @@ fn linux_fstatfs(descriptor: u64, stat_address: u64) -> u64 {
     let descriptor = u64::from(descriptor as u32);
     if !linux_descriptor_open(descriptor) {
         return LINUX_EBADF;
+    }
+    if let Some(handle) = linux_overlay_descriptor_handle(descriptor) {
+        if let Some(statfs) = crate::linux_blockfs::statfs_of(handle) {
+            let mut path = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+            let length = crate::linux_overlay::copy_path(handle, &mut path).unwrap_or(0);
+            return if copy_to_linux_user(
+                stat_address,
+                &linux_volume_statfs_data(statfs, &path[..length]),
+            ) {
+                0
+            } else {
+                LINUX_EFAULT
+            };
+        }
     }
     if copy_to_linux_user(
         stat_address,

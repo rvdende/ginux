@@ -1031,6 +1031,9 @@ fn linux_syscall_dispatch(
             if let Some(result) = linux_file_attributes_ioctl(first_argument, buffer, count) {
                 return result;
             }
+            if let Some(result) = linux_fiemap_ioctl(first_argument, buffer, count) {
+                return result;
+            }
             if linux_namespace_descriptor(first_argument) {
                 return linux_namespace_ioctl(first_argument, buffer, count);
             }
@@ -1876,7 +1879,10 @@ fn linux_syscall_dispatch(
             copy_to_linux_user,
         ),
         LINUX_SETRLIMIT_SYSCALL => linux_setrlimit(first_argument, buffer),
-        LINUX_SYNC_SYSCALL => 0,
+        LINUX_SYNC_SYSCALL => {
+            crate::linux_blockfs::sync_all();
+            0
+        }
         LINUX_GETRUSAGE_SYSCALL => linux_getrusage(first_argument, buffer),
         LINUX_SYSINFO_SYSCALL => linux_sysinfo(first_argument),
         LINUX_TIMES_SYSCALL => linux_times(first_argument),

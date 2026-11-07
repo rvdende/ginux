@@ -148,11 +148,20 @@ feature rather than a fix:
   the `/lib/modules/RELEASE/modules.builtin` that `tests/ltp/setup.sh`
   writes, as a Linux kernel package would install it.
 - **Loop devices** (`kernel/src/linux_loop.rs`: /dev/loop-control,
-  /dev/loopN backed by overlay files, /sys/block/loopN) and RAM disks
-  (`linux_ramdisk.rs`, /dev/ramN) pass ioctl_loop01-04, 06 and 07.
-  ioctl_loop05 needs TMPDIR on a block-backed filesystem (Ginux's root is
-  a RAM filesystem, device 0), and the device tests below need a
-  filesystem made on a loop device and mounted.
+  /dev/loopN backed by overlay files, /sys/block/loopN with its stat
+  counters) and RAM disks (`linux_ramdisk.rs`, /dev/ramN) pass
+  ioctl_loop01-07.
+- **Block-device filesystems**: ext2 (`crates/ext2`, mounted through
+  `kernel/src/linux_blockfs.rs`) on a loop device or RAM disk, so the
+  tests that format and mount a device (`.needs_device`,
+  `.mount_device`, `.all_filesystems`) run, on ext2 and tmpfs.
+  `tests/ltp/setup.sh` unpacks e2fsprogs (mkfs.ext2,
+  `tools/ltp/fetch-e2fsprogs.sh`, pinned Alpine packages) into the
+  domain; mkfs.ext3/ext4 exist too, but the kernel answers ENODEV for
+  those types, so LTP skips them. ioctl_loop05 runs through
+  `/opt/ltp/disk-tmpdir.sh`, which gives it a TMPDIR on an ext2 volume of
+  its own (the domain's /tmp is the overlay, device 0). The device tests
+  still skipped in `syscalls.list` say what they lack.
 - **Memory details**: mmap, madvise, mremap, msync, mlock and mseal
   corner cases, `/proc/self/smaps`, `/proc/PID/pagemap`. A Linux
   process's first 4 GiB hold only the kernel's own 2 MiB regions (its
@@ -521,14 +530,10 @@ TAG COMMAND [ARG...]  # budget=N      run, allowing N seconds
 `tools/ltp/make-list.py` regenerates it from the build. Notes starting with
 `auto:` are generated: a budget of LTP's timeout (30 s plus the test's
 `.timeout`) plus a tenth of its `.runtime` plus 15 s, rounded up to 30 s,
-when that exceeds 60 s; and skips for tests that did not build, that need a
-loop block device (`.needs_device`, `.mount_device`, `.format_device`,
-`.all_filesystems`, or `tst_acquire_device()` in old-API tests: LTP makes and
-mounts a filesystem image), or that need loadable kernel modules. Lines with
-any other note are curated by hand and survive regeneration, so to skip a
-test permanently write `!TAG COMMAND  # reason`. To run the device tests
-again (Ginux has loop devices; mounting a filesystem made on one is what
-is missing), delete the rule from `SKIP_RULES` in `tools/ltp/make-list.py`.
+when that exceeds 60 s; and skips for tests that did not build or that need
+loadable kernel modules. Lines with any other note are curated by hand and
+survive regeneration, so to skip a test permanently write
+`!TAG COMMAND  # reason`.
 
 Tests of Policy-denied operations (setting the clock, loading modules; see
 [LINUX-COMPATIBILITY.md](LINUX-COMPATIBILITY.md)) are deliberately not

@@ -20,7 +20,7 @@ pub(crate) const CLASS_DISK: u8 = 6;
 /// The block device major number of RAM disks.
 pub(crate) const MAJOR: u32 = 1;
 const DISK_COUNT: u32 = 16;
-const DISK_SIZE: u64 = 4 << 20;
+pub(crate) const DISK_SIZE: u64 = 4 << 20;
 const PAGE_SIZE: u64 = 4096;
 const SECTOR_SIZE: u32 = 512;
 
@@ -84,7 +84,7 @@ impl RamDisks {
 }
 
 static RAM_DISKS: SpinLock<RamDisks> = SpinLock::new(
-    LockRank::LOOP,
+    LockRank::RAM_DISKS,
     RamDisks {
         domains: Vec::new(),
         opens: Vec::new(),

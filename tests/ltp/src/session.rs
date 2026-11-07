@@ -143,7 +143,8 @@ pub fn git_rev(repo: &Path) -> String {
 }
 
 /// Sets up the files the guest downloads (in `work/serve`: the LTP tree,
-/// the runner, setup.sh and the run list of `runnable`) and serves them.
+/// the runner, e2fsprogs, setup.sh and the run list of `runnable`) and
+/// serves them.
 /// Returns the base URL the guest uses.
 pub fn serve_guest_files(config: &Config, runnable: &[&Test]) -> io::Result<String> {
     let serve = config.work().join("serve");
@@ -152,6 +153,11 @@ pub fn serve_guest_files(config: &Config, runnable: &[&Test]) -> io::Result<Stri
     let ltp_dir = config.ltp_dir();
     symlink(ltp_dir.join("ltp.tar.xz"), serve.join("ltp.tar.xz"))?;
     symlink(ltp_dir.join("ltp-runner"), serve.join("ltp-runner"))?;
+    // mkfs.ext2 and friends (tools/ltp/fetch-e2fsprogs.sh), if fetched.
+    let e2fsprogs = config.repo.join("build/e2fsprogs/e2fsprogs.tar.gz");
+    if e2fsprogs.exists() {
+        symlink(e2fsprogs, serve.join("e2fsprogs.tar.gz"))?;
+    }
     symlink(
         config.repo.join("tests/ltp/setup.sh"),
         serve.join("setup.sh"),

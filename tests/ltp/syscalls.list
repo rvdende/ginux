@@ -8,9 +8,8 @@
 #
 # Regenerate with tools/ltp/make-list.py after changing the LTP version.
 # Notes starting with "auto:" are generated (budgets from LTP's timeout and
-# runtime, skips for tests that did not build or need loop devices or kernel
-# modules); lines with any other note are curated by hand and survive
-# regeneration.
+# runtime, skips for tests that did not build or need kernel modules);
+# lines with any other note are curated by hand and survive regeneration.
 
 # Generated from LTP 20260930 runtest/syscalls.
 
@@ -62,11 +61,11 @@ capset02 capset02
 capset03 capset03
 capset04 capset04
 cacheflush01 cacheflush01
-!cachestat01 cachestat01  # auto: needs a loop block device (mkfs and mount)
+cachestat01 cachestat01
 cachestat02 cachestat02
 cachestat03 cachestat03
-!cachestat04 cachestat04  # auto: needs a loop block device (mkfs and mount)
-!chdir01 chdir01  # auto: needs a loop block device (mkfs and mount)
+cachestat04 cachestat04
+chdir01 chdir01
 chdir02 chdir02
 chdir04 chdir04
 chmod01 chmod01
@@ -75,7 +74,7 @@ chmod05 chmod05
 chmod06 chmod06
 chmod07 chmod07
 chmod08 chmod08
-!chmod09 chmod09  # auto: needs a loop block device (mkfs and mount)
+!chmod09 chmod09  # chmod through an O_PATH symlink's /proc/self/fd link is not EOPNOTSUPP
 chown01 chown01
 chown01_16 chown01_16
 chown02 chown02
@@ -123,7 +122,7 @@ clone303 clone303
 clone304 clone304
 close01 close01
 close02 close02
-!close_range01 close_range01  # auto: needs a loop block device (mkfs and mount)
+close_range01 close_range01
 close_range02 close_range02
 confstr01 confstr01
 connect01 connect01
@@ -136,7 +135,7 @@ creat05 creat05
 creat06 creat06
 creat07 creat07
 creat08 creat08
-!creat09 creat09  # auto: needs a loop block device (mkfs and mount)
+creat09 creat09
 !delete_module01 delete_module01  # auto: needs loadable kernel modules
 delete_module02 delete_module02
 !delete_module03 delete_module03  # auto: needs loadable kernel modules
@@ -212,7 +211,7 @@ execve06 execve06
 execvp01 execvp01
 execveat01 execveat01
 execveat02 execveat02
-!execveat03 execveat03  # auto: needs a loop block device (mkfs and mount)
+execveat03 execveat03
 exit01 exit01
 exit02 exit02
 exit_group01 exit_group01
@@ -220,19 +219,19 @@ faccessat01 faccessat01
 faccessat02 faccessat02
 faccessat201 faccessat201
 faccessat202 faccessat202
-!fallocate01 fallocate01  # auto: needs a loop block device (mkfs and mount)
+fallocate01 fallocate01
 fallocate02 fallocate02
 fallocate03 fallocate03
-!fallocate04 fallocate04  # auto: needs a loop block device (mkfs and mount)
-!fallocate05 fallocate05  # auto: needs a loop block device (mkfs and mount)
-!fallocate06 fallocate06  # auto: needs a loop block device (mkfs and mount)
-!fsetxattr01 fsetxattr01  # auto: needs a loop block device (mkfs and mount)
+!fallocate04 fallocate04  # holes punched in a tmpfs file are not tracked (SEEK_HOLE finds none)
+!fallocate05 fallocate05  # tmpfs ignores size=: filling it exhausts the domain's memory
+!fallocate06 fallocate06  # tmpfs ignores size=: filling it exhausts the domain's memory
+fsetxattr01 fsetxattr01
 fsetxattr02 fsetxattr02
-!file_attr01 file_attr01  # auto: needs a loop block device (mkfs and mount)
-!file_attr02 file_attr02  # auto: needs a loop block device (mkfs and mount)
-!file_attr03 file_attr03  # auto: needs a loop block device (mkfs and mount)
+file_attr01 file_attr01
+file_attr02 file_attr02
+file_attr03 file_attr03
 file_attr04 file_attr04
-!file_attr05 file_attr05  # auto: needs a loop block device (mkfs and mount)
+file_attr05 file_attr05
 posix_fadvise01 posix_fadvise01
 posix_fadvise01_64 posix_fadvise01_64
 posix_fadvise02 posix_fadvise02
@@ -252,7 +251,7 @@ fchmod05 fchmod05
 fchmod06 fchmod06
 fchmodat01 fchmodat01
 fchmodat02 fchmodat02
-!fchmodat2_01 fchmodat2_01  # auto: needs a loop block device (mkfs and mount)
+fchmodat2_01 fchmodat2_01
 fchmodat2_02 fchmodat2_02
 fchown01 fchown01
 fchown01_16 fchown01_16
@@ -345,8 +344,8 @@ fcntl40 fcntl40
 fcntl40_64 fcntl40_64
 fdatasync01 fdatasync01
 fdatasync02 fdatasync02
-!fdatasync03 fdatasync03  # auto: needs a loop block device (mkfs and mount)
-!fgetxattr01 fgetxattr01  # auto: needs a loop block device (mkfs and mount)
+fdatasync03 fdatasync03
+fgetxattr01 fgetxattr01
 fgetxattr02 fgetxattr02
 fgetxattr03 fgetxattr03
 !finit_module01 finit_module01  # auto: needs loadable kernel modules
@@ -374,36 +373,36 @@ fork11 fork_procs -n 100
 fork13 fork13  # auto: budget=120
 fork14 fork14
 fpathconf01 fpathconf01
-!fremovexattr01 fremovexattr01  # auto: needs a loop block device (mkfs and mount)
-!fremovexattr02 fremovexattr02  # auto: needs a loop block device (mkfs and mount)
-!fsconfig01 fsconfig01  # auto: needs a loop block device (mkfs and mount)
-!fsconfig02 fsconfig02  # auto: needs a loop block device (mkfs and mount)
-!fsconfig03 fsconfig03  # auto: needs a loop block device (mkfs and mount)
-!fsmount01 fsmount01  # auto: needs a loop block device (mkfs and mount)
-!fsmount02 fsmount02  # auto: needs a loop block device (mkfs and mount)
-!fsopen01 fsopen01  # auto: needs a loop block device (mkfs and mount)
-!fsopen02 fsopen02  # auto: needs a loop block device (mkfs and mount)
-!fspick01 fspick01  # auto: needs a loop block device (mkfs and mount)
-!fspick02 fspick02  # auto: needs a loop block device (mkfs and mount)
+fremovexattr01 fremovexattr01
+fremovexattr02 fremovexattr02
+fsconfig01 fsconfig01
+fsconfig02 fsconfig02
+fsconfig03 fsconfig03
+fsmount01 fsmount01
+fsmount02 fsmount02
+fsopen01 fsopen01
+fsopen02 fsopen02
+fspick01 fspick01
+fspick02 fspick02
 fstat02 fstat02
 fstat02_64 fstat02_64
 fstat03 fstat03
 fstat03_64 fstat03_64
 fstatat01 fstatat01
-!fstatfs01 fstatfs01  # auto: needs a loop block device (mkfs and mount)
-!fstatfs01_64 fstatfs01_64  # auto: needs a loop block device (mkfs and mount)
+fstatfs01 fstatfs01
+fstatfs01_64 fstatfs01_64
 fstatfs02 fstatfs02
 fstatfs02_64 fstatfs02_64
-!fsync01 fsync01  # auto: needs a loop block device (mkfs and mount)
+fsync01 fsync01
 fsync02 fsync02  # auto: budget=360
 fsync03 fsync03
-!fsync04 fsync04  # auto: needs a loop block device (mkfs and mount)
+fsync04 fsync04  # auto: budget=90
 ftruncate01 ftruncate01
 ftruncate01_64 ftruncate01_64
 ftruncate03 ftruncate03
 ftruncate03_64 ftruncate03_64
-!ftruncate04 ftruncate04  # auto: needs a loop block device (mkfs and mount)
-!ftruncate04_64 ftruncate04_64  # auto: needs a loop block device (mkfs and mount)
+ftruncate04 ftruncate04
+ftruncate04_64 ftruncate04_64
 futimesat01 futimesat01
 getcontext01 getcontext01
 getcpu01 getcpu01
@@ -412,8 +411,8 @@ getcwd01 getcwd01
 getcwd02 getcwd02
 getcwd03 getcwd03
 getcwd04 getcwd04
-!getdents01 getdents01  # auto: needs a loop block device (mkfs and mount)
-!getdents02 getdents02  # auto: needs a loop block device (mkfs and mount)
+getdents01 getdents01
+getdents02 getdents02
 getdomainname01 getdomainname01
 getegid01 getegid01
 getegid01_16 getegid01_16
@@ -488,27 +487,27 @@ getuid01_16 getuid01_16
 getuid03 getuid03
 getuid03_16 getuid03_16
 getxattr01 getxattr01
-!getxattr02 getxattr02  # auto: needs a loop block device (mkfs and mount)
-!getxattr03 getxattr03  # auto: needs a loop block device (mkfs and mount)
-!getxattr04 getxattr04  # auto: needs a loop block device (mkfs and mount)
+getxattr02 getxattr02
+getxattr03 getxattr03
+getxattr04 getxattr04
 getxattr05 getxattr05
 !init_module01 init_module01  # auto: needs loadable kernel modules
 !init_module02 init_module02  # auto: needs loadable kernel modules
 ioctl01 ioctl01
 ioctl02 test_ioctl
 ioctl03 ioctl03
-!ioctl04 ioctl04  # auto: needs a loop block device (mkfs and mount)
-!ioctl05 ioctl05  # auto: needs a loop block device (mkfs and mount)
-!ioctl06 ioctl06  # auto: needs a loop block device (mkfs and mount)
+ioctl04 ioctl04
+ioctl05 ioctl05
+ioctl06 ioctl06
 ioctl07 ioctl07
-!ioctl08 ioctl08  # auto: needs a loop block device (mkfs and mount)
+ioctl08 ioctl08
 ioctl09 ioctl09
 ioctl10 ioctl10
 ioctl_loop01 ioctl_loop01
 ioctl_loop02 ioctl_loop02
 ioctl_loop03 ioctl_loop03
 ioctl_loop04 ioctl_loop04
-ioctl_loop05 ioctl_loop05
+ioctl_loop05 /opt/ltp/disk-tmpdir.sh ioctl_loop05  # TMPDIR on an ext2 volume: the backing file must be on a block device
 ioctl_loop06 ioctl_loop06
 ioctl_loop07 ioctl_loop07
 ioctl_ns01 ioctl_ns01
@@ -519,13 +518,13 @@ ioctl_ns05 ioctl_ns05
 ioctl_ns06 ioctl_ns06
 ioctl_ns07 ioctl_ns07
 ioctl_sg01 ioctl_sg01  # auto: budget=3660
-!ioctl_ficlone01 ioctl_ficlone01  # auto: needs a loop block device (mkfs and mount)
-!ioctl_ficlone02 ioctl_ficlone02  # auto: needs a loop block device (mkfs and mount)
-!ioctl_ficlone03 ioctl_ficlone03  # auto: needs a loop block device (mkfs and mount)
-!ioctl_ficlonerange01 ioctl_ficlonerange01  # auto: needs a loop block device (mkfs and mount)
-!ioctl_ficlonerange02 ioctl_ficlonerange02  # auto: needs a loop block device (mkfs and mount)
-!ioctl_fiemap01 ioctl_fiemap01  # auto: needs a loop block device (mkfs and mount)
-!ioctl_getlbmd01 ioctl_getlbmd01  # auto: needs a loop block device (mkfs and mount)
+ioctl_ficlone01 ioctl_ficlone01
+ioctl_ficlone02 ioctl_ficlone02
+ioctl_ficlone03 ioctl_ficlone03
+ioctl_ficlonerange01 ioctl_ficlonerange01
+ioctl_ficlonerange02 ioctl_ficlonerange02
+ioctl_fiemap01 ioctl_fiemap01
+ioctl_getlbmd01 ioctl_getlbmd01
 ioctl_pidfd01 ioctl_pidfd01
 ioctl_pidfd02 ioctl_pidfd02
 ioctl_pidfd03 ioctl_pidfd03
@@ -536,40 +535,40 @@ inotify_init1_01 inotify_init1_01
 inotify_init1_02 inotify_init1_02
 inotify01 inotify01
 inotify02 inotify02
-!inotify03 inotify03  # auto: needs a loop block device (mkfs and mount)
+!inotify03 inotify03  # unmounting a watched filesystem sends no IN_UNMOUNT or IN_IGNORED
 inotify04 inotify04
 inotify05 inotify05
 inotify06 inotify06  # auto: budget=120
-!inotify07 inotify07  # auto: needs a loop block device (mkfs and mount)
-!inotify08 inotify08  # auto: needs a loop block device (mkfs and mount)
+inotify07 inotify07
+inotify08 inotify08
 inotify09 inotify09
 inotify10 inotify10
 inotify11 inotify11
 inotify12 inotify12
-!fanotify01 fanotify01  # auto: needs a loop block device (mkfs and mount)
+fanotify01 fanotify01
 fanotify02 fanotify02
-!fanotify03 fanotify03  # auto: needs a loop block device (mkfs and mount)
+!fanotify03 fanotify03  # permission events (FAN_OPEN_PERM) on a mount mark are not generated
 fanotify04 fanotify04
-!fanotify05 fanotify05  # auto: needs a loop block device (mkfs and mount)
-!fanotify06 fanotify06  # auto: needs a loop block device (mkfs and mount)
+!fanotify05 fanotify05  # hangs: fanotify's queue overflow (FAN_Q_OVERFLOW) is not reported
+fanotify06 fanotify06
 fanotify07 fanotify07
 fanotify08 fanotify08
-!fanotify09 fanotify09  # auto: needs a loop block device (mkfs and mount)
-!fanotify10 fanotify10  # auto: needs a loop block device (mkfs and mount)
+!fanotify09 fanotify09  # ignore masks on mount and filesystem marks do not survive a modify event
+fanotify10 fanotify10
 fanotify11 fanotify11
 fanotify12 fanotify12
-!fanotify13 fanotify13  # auto: needs a loop block device (mkfs and mount)
-!fanotify14 fanotify14  # auto: needs a loop block device (mkfs and mount)
-!fanotify15 fanotify15  # auto: needs a loop block device (mkfs and mount)
-!fanotify16 fanotify16  # auto: needs a loop block device (mkfs and mount)
-!fanotify17 fanotify17  # auto: needs a loop block device (mkfs and mount)
-!fanotify18 fanotify18  # auto: needs a loop block device (mkfs and mount)
-!fanotify19 fanotify19  # auto: needs a loop block device (mkfs and mount)
-!fanotify20 fanotify20  # auto: needs a loop block device (mkfs and mount)
-!fanotify21 fanotify21  # auto: needs a loop block device (mkfs and mount)
-!fanotify22 fanotify22  # auto: needs a loop block device (mkfs and mount)
-!fanotify23 fanotify23  # auto: needs a loop block device (mkfs and mount)
-!fanotify24 fanotify24  # auto: needs a loop block device (mkfs and mount)
+fanotify13 fanotify13
+fanotify14 fanotify14
+fanotify15 fanotify15
+fanotify16 fanotify16
+fanotify17 fanotify17
+fanotify18 fanotify18
+fanotify19 fanotify19
+fanotify20 fanotify20
+fanotify21 fanotify21
+fanotify22 fanotify22
+fanotify23 fanotify23
+fanotify24 fanotify24
 fanotify25 fanotify25
 !ioperm01 ioperm01  # raw I/O ports stay refused in every domain (driver isolation)
 ioperm02 ioperm02
@@ -638,9 +637,9 @@ kill13 kill13
 landlock01 landlock01
 landlock02 landlock02
 landlock03 landlock03
-!landlock04 landlock04  # auto: needs a loop block device (mkfs and mount)
-!landlock05 landlock05  # auto: needs a loop block device (mkfs and mount)
-!landlock06 landlock06  # auto: needs a loop block device (mkfs and mount)
+landlock04 landlock04  # auto: budget=420
+landlock05 landlock05
+landlock06 landlock06
 landlock07 landlock07
 landlock08 landlock08
 landlock09 landlock09
@@ -656,10 +655,10 @@ link04 link04
 link05 link05
 link08 link08
 linkat01 linkat01
-!linkat02 linkat02  # auto: needs a loop block device (mkfs and mount)
+linkat02 linkat02
 listen01 listen01
-!listmount01 listmount01  # auto: needs a loop block device (mkfs and mount)
-!listmount02 listmount02  # auto: needs a loop block device (mkfs and mount)
+!listmount01 listmount01  # listmount does not list the test's mounts below the root as Linux does
+!listmount02 listmount02  # listmount does not list the test's mounts below the root as Linux does
 listmount03 listmount03
 listmount04 listmount04
 listxattr01 listxattr01
@@ -672,7 +671,7 @@ llistxattr03 llistxattr03
 llseek01 llseek01
 llseek02 llseek02
 llseek03 llseek03
-!lremovexattr01 lremovexattr01  # auto: needs a loop block device (mkfs and mount)
+lremovexattr01 lremovexattr01
 lseek01 lseek01
 lseek02 lseek02
 lseek07 lseek07
@@ -687,8 +686,8 @@ lstat01 lstat01
 lstat01_64 lstat01_64
 lstat02 lstat02
 lstat02_64 lstat02_64
-!lstat03 lstat03  # auto: needs a loop block device (mkfs and mount)
-!lstat03_64 lstat03_64  # auto: needs a loop block device (mkfs and mount)
+lstat03 lstat03
+lstat03_64 lstat03_64
 mallinfo02 mallinfo02
 mallinfo2_01 mallinfo2_01
 mallopt01 mallopt01
@@ -709,7 +708,7 @@ mkdir02 mkdir02
 mkdir03 mkdir03
 mkdir04 mkdir04
 mkdir05 mkdir05
-!mkdir09 mkdir09  # auto: needs a loop block device (mkfs and mount)
+mkdir09 mkdir09
 mkdirat01 mkdirat01
 mkdirat02 mkdirat02
 mknod01 mknod01
@@ -722,7 +721,7 @@ mknod07 mknod07
 mknod08 mknod08
 mknod09 mknod09
 mknodat01 mknodat01
-!mknodat02 mknodat02  # auto: needs a loop block device (mkfs and mount)
+mknodat02 mknodat02
 mlock01 mlock01
 mlock02 mlock02
 mlock03 mlock03 -i 20
@@ -743,7 +742,7 @@ mmap12 mmap12
 mmap13 mmap13
 mmap14 mmap14
 mmap15 mmap15
-!mmap16 mmap16  # auto: needs a loop block device (mkfs and mount)
+mmap16 mmap16
 mmap17 mmap17
 mmap18 mmap18
 mmap19 mmap19
@@ -755,18 +754,18 @@ mmap23 mmap23
 mmap24 mmap24
 modify_ldt01 modify_ldt01
 modify_ldt02 modify_ldt02
-!mount01 mount01  # auto: needs a loop block device (mkfs and mount)
-!mount02 mount02  # auto: needs a loop block device (mkfs and mount)
-!mount03 mount03  # auto: needs a loop block device (mkfs and mount)
-!mount04 mount04  # auto: needs a loop block device (mkfs and mount)
-!mount05 mount05  # auto: needs a loop block device (mkfs and mount)
-!mount06 mount06  # auto: needs a loop block device (mkfs and mount)
-!mount07 mount07  # auto: needs a loop block device (mkfs and mount)
+mount01 mount01
+mount02 mount02
+!mount03 mount03  # mount options beyond ro, nosuid, nodev, noexec and noatime are not kept
+mount04 mount04
+!mount05 mount05  # a bind mount does not show its source's files
+!mount06 mount06  # MS_MOVE does not move a mount
+!mount07 mount07  # MS_NOSYMFOLLOW is not kept
 mount08 mount08
-!mount_setattr01 mount_setattr01  # auto: needs a loop block device (mkfs and mount)
+mount_setattr01 mount_setattr01
 mount_setattr02 mount_setattr02
-!move_mount01 move_mount01  # auto: needs a loop block device (mkfs and mount)
-!move_mount02 move_mount02  # auto: needs a loop block device (mkfs and mount)
+move_mount01 move_mount01
+move_mount02 move_mount02
 move_mount03 move_mount03
 move_pages01 move_pages01
 move_pages02 move_pages02
@@ -830,7 +829,7 @@ msgsnd06 msgsnd06
 msync01 msync01
 msync02 msync02
 msync03 msync03
-!msync04 msync04  # auto: needs a loop block device (mkfs and mount)
+!msync04 msync04  # a shared mapping of an ext2 file is a copy, written back at msync and munmap
 munlock01 munlock01
 munlock02 munlock02
 munlockall01 munlockall01
@@ -860,21 +859,21 @@ open08 open08
 open09 open09
 open10 open10
 open11 open11
-!open12 open12  # auto: needs a loop block device (mkfs and mount)
+open12 open12
 !open13 open13  # musl: fchmod() and fchown() retry an EBADF through /proc/self/fd/N, which an O_PATH descriptor allows
-!open14 open14  # auto: needs a loop block device (mkfs and mount)
+open14 open14
 open15 open15
 openat01 openat01
-!openat02 openat02  # auto: needs a loop block device (mkfs and mount)
+openat02 openat02
 openat03 openat03
-!openat04 openat04  # auto: needs a loop block device (mkfs and mount)
+openat04 openat04
 openat201 openat201
 openat202 openat202
 openat203 openat203
 open_by_handle_at01 open_by_handle_at01
 open_by_handle_at02 open_by_handle_at02
-!open_tree01 open_tree01  # auto: needs a loop block device (mkfs and mount)
-!open_tree02 open_tree02  # auto: needs a loop block device (mkfs and mount)
+open_tree01 open_tree01
+open_tree02 open_tree02
 mincore01 mincore01
 mincore02 mincore02
 mincore03 mincore03
@@ -942,7 +941,7 @@ prctl01 prctl01
 prctl02 prctl02
 prctl03 prctl03
 prctl05 prctl05
-!prctl06 prctl06  # auto: needs a loop block device (mkfs and mount)
+prctl06 prctl06
 prctl07 prctl07
 prctl08 prctl08
 prctl09 prctl09
@@ -955,14 +954,14 @@ preadv01 preadv01
 preadv01_64 preadv01_64
 preadv02 preadv02
 preadv02_64 preadv02_64
-!preadv03 preadv03  # auto: needs a loop block device (mkfs and mount)
-!preadv03_64 preadv03_64  # auto: needs a loop block device (mkfs and mount)
+preadv03 preadv03
+preadv03_64 preadv03_64
 preadv201 preadv201
 preadv201_64 preadv201_64
 preadv202 preadv202
 preadv202_64 preadv202_64
-!preadv203 preadv203  # auto: needs a loop block device (mkfs and mount)
-!preadv203_64 preadv203_64  # auto: needs a loop block device (mkfs and mount)
+!preadv203 preadv203  # /proc/sys/vm/drop_caches is missing
+!preadv203_64 preadv203_64  # /proc/sys/vm/drop_caches is missing
 profil01 profil01
 process_vm_readv01 process_vm01 -r
 process_vm_readv02 process_vm_readv02
@@ -1003,29 +1002,29 @@ pwritev01 pwritev01
 pwritev01_64 pwritev01_64
 pwritev02 pwritev02
 pwritev02_64 pwritev02_64
-!pwritev03 pwritev03  # auto: needs a loop block device (mkfs and mount)
-!pwritev03_64 pwritev03_64  # auto: needs a loop block device (mkfs and mount)
+pwritev03 pwritev03
+pwritev03_64 pwritev03_64
 pwritev201 pwritev201
 pwritev201_64 pwritev201_64
 pwritev202 pwritev202
 pwritev202_64 pwritev202_64
-!quotactl01 quotactl01  # auto: needs a loop block device (mkfs and mount)
-!quotactl02 quotactl02  # auto: needs a loop block device (mkfs and mount)
-!quotactl03 quotactl03  # auto: needs a loop block device (mkfs and mount)
-!quotactl04 quotactl04  # auto: needs a loop block device (mkfs and mount)
-!quotactl05 quotactl05  # auto: needs a loop block device (mkfs and mount)
-!quotactl06 quotactl06  # auto: needs a loop block device (mkfs and mount)
-!quotactl07 quotactl07  # auto: needs a loop block device (mkfs and mount)
-!quotactl08 quotactl08  # auto: needs a loop block device (mkfs and mount)
-!quotactl09 quotactl09  # auto: needs a loop block device (mkfs and mount)
+quotactl01 quotactl01
+quotactl02 quotactl02
+quotactl03 quotactl03
+quotactl04 quotactl04
+quotactl05 quotactl05
+quotactl06 quotactl06
+quotactl07 quotactl07
+quotactl08 quotactl08
+quotactl09 quotactl09
 read01 read01
 read02 read02
 read03 read03
 read04 read04
 readahead01 readahead01
-!readahead02 readahead02  # auto: needs a loop block device (mkfs and mount)
-!readdir01 readdir01  # auto: needs a loop block device (mkfs and mount)
-!readdir21 readdir21  # auto: needs a loop block device (mkfs and mount)
+readahead02 readahead02  # auto: budget=120
+readdir01 readdir01
+readdir21 readdir21
 readlink01 readlink01
 !readlink03 readlink03  # musl: readlink() with a zero size passes a one-byte buffer instead, so the EINVAL case cannot fail
 readlinkat01 readlinkat01
@@ -1045,21 +1044,21 @@ remap_file_pages01 remap_file_pages01
 remap_file_pages02 remap_file_pages02
 removexattr01 removexattr01
 removexattr02 removexattr02
-!rename01 rename01  # auto: needs a loop block device (mkfs and mount)
-!rename03 rename03  # auto: needs a loop block device (mkfs and mount)
-!rename04 rename04  # auto: needs a loop block device (mkfs and mount)
-!rename05 rename05  # auto: needs a loop block device (mkfs and mount)
-!rename06 rename06  # auto: needs a loop block device (mkfs and mount)
-!rename07 rename07  # auto: needs a loop block device (mkfs and mount)
-!rename08 rename08  # auto: needs a loop block device (mkfs and mount)
+rename01 rename01
+rename03 rename03
+rename04 rename04
+rename05 rename05
+rename06 rename06
+rename07 rename07
+rename08 rename08
 rename09 rename09
-!rename10 rename10  # auto: needs a loop block device (mkfs and mount)
-!rename11 rename11  # auto: needs a loop block device (mkfs and mount)
-!rename12 rename12  # auto: needs a loop block device (mkfs and mount)
-!rename13 rename13  # auto: needs a loop block device (mkfs and mount)
+rename10 rename10
+rename11 rename11
+rename12 rename12
+rename13 rename13
 rename14 rename14
-!rename15 rename15  # auto: needs a loop block device (mkfs and mount)
-!renameat01 renameat01  # auto: needs a loop block device (mkfs and mount)
+rename15 rename15
+renameat01 renameat01
 renameat201 renameat201
 renameat202 renameat202 -i 10
 request_key01 request_key01
@@ -1161,8 +1160,8 @@ sendto02 sendto02
 sendto03 sendto03
 set_mempolicy01 set_mempolicy01  # auto: budget=660
 set_mempolicy02 set_mempolicy02
-!set_mempolicy03 set_mempolicy03  # auto: needs a loop block device (mkfs and mount)
-!set_mempolicy04 set_mempolicy04  # auto: needs a loop block device (mkfs and mount)
+set_mempolicy03 set_mempolicy03
+set_mempolicy04 set_mempolicy04
 set_robust_list01 set_robust_list01
 set_thread_area01 set_thread_area01
 set_thread_area02 set_thread_area02
@@ -1279,7 +1278,7 @@ setuid03 setuid03
 setuid03_16 setuid03_16
 setuid04 setuid04
 setuid04_16 setuid04_16
-!setxattr01 setxattr01  # auto: needs a loop block device (mkfs and mount)
+setxattr01 setxattr01
 setxattr02 setxattr02
 setxattr03 setxattr03
 shmat01 shmat01
@@ -1352,43 +1351,43 @@ stat02 stat02
 stat02_64 stat02_64
 stat03 stat03
 stat03_64 stat03_64
-!stat04 stat04  # auto: needs a loop block device (mkfs and mount)
-!stat04_64 stat04_64  # auto: needs a loop block device (mkfs and mount)
-!statmount01 statmount01  # auto: needs a loop block device (mkfs and mount)
-!statmount02 statmount02  # auto: needs a loop block device (mkfs and mount)
+stat04 stat04
+stat04_64 stat04_64
+statmount01 statmount01
+!statmount02 statmount02  # a tmpfs mount's statmount device differs from its files' st_dev
 statmount03 statmount03
-!statmount04 statmount04  # auto: needs a loop block device (mkfs and mount)
-!statmount05 statmount05  # auto: needs a loop block device (mkfs and mount)
-!statmount06 statmount06  # auto: needs a loop block device (mkfs and mount)
-!statmount07 statmount07  # auto: needs a loop block device (mkfs and mount)
+!statmount04 statmount04  # mount propagation does not copy mounts to peers
+statmount05 statmount05
+statmount06 statmount06
+!statmount07 statmount07  # statmount's mask checks are not Linux's (EOVERFLOW)
 statmount08 statmount08
-!statmount09 statmount09  # auto: needs a loop block device (mkfs and mount)
-!statfs01 statfs01  # auto: needs a loop block device (mkfs and mount)
-!statfs01_64 statfs01_64  # auto: needs a loop block device (mkfs and mount)
+!statmount09 statmount09  # the NS_GET_MNTNS_ID ioctl is missing
+statfs01 statfs01
+statfs01_64 statfs01_64
 statfs02 statfs02
 statfs02_64 statfs02_64
 statfs03 statfs03
 statfs03_64 statfs03_64
-!statvfs01 statvfs01  # auto: needs a loop block device (mkfs and mount)
+statvfs01 statvfs01
 statvfs02 statvfs02
 stime01 stime01
 stime02 stime02
 string01 string01
-!swapoff01 swapoff01  # auto: needs a loop block device (mkfs and mount)
-!swapoff02 swapoff02  # auto: needs a loop block device (mkfs and mount)
-!swapon01 swapon01  # auto: needs a loop block device (mkfs and mount)
-!swapon02 swapon02  # auto: needs a loop block device (mkfs and mount)
-!swapon03 swapon03  # auto: needs a loop block device (mkfs and mount)
-!swapon04 swapon04  # auto: needs a loop block device (mkfs and mount)
+!swapoff01 swapoff01  # swap files are not supported
+!swapoff02 swapoff02  # swap files are not supported
+swapon01 swapon01  # auto: budget=120
+!swapon02 swapon02  # swap files are not supported
+swapon03 swapon03
+swapon04 swapon04
 switch01 endian_switch01
 symlink02 symlink02
 symlink03 symlink03
 symlink04 symlink04
 symlinkat01 symlinkat01
-!sync01 sync01  # auto: needs a loop block device (mkfs and mount)
-!syncfs01 syncfs01  # auto: needs a loop block device (mkfs and mount)
+sync01 sync01
+syncfs01 syncfs01
 sync_file_range01 sync_file_range01
-!sync_file_range02 sync_file_range02  # auto: needs a loop block device (mkfs and mount)
+sync_file_range02 sync_file_range02
 syscall01 syscall01
 syscall02 syscall02
 sysconf01 sysconf01
@@ -1442,7 +1441,7 @@ uname04 uname04
 unlink05 unlink05
 unlink07 unlink07
 unlink08 unlink08
-!unlink09 unlink09  # auto: needs a loop block device (mkfs and mount)
+unlink09 unlink09
 unlink10 unlink10
 unlinkat01 unlinkat01
 unshare01 unshare01
@@ -1450,11 +1449,11 @@ unshare02 unshare02
 unshare03 unshare03
 unshare04 unshare04
 unshare05 unshare05
-!umount01 umount01  # auto: needs a loop block device (mkfs and mount)
-!umount02 umount02  # auto: needs a loop block device (mkfs and mount)
-!umount03 umount03  # auto: needs a loop block device (mkfs and mount)
-!umount2_01 umount2_01  # auto: needs a loop block device (mkfs and mount)
-!umount2_02 umount2_02  # auto: needs a loop block device (mkfs and mount)
+umount01 umount01
+umount02 umount02
+umount03 umount03
+umount2_01 umount2_01
+!umount2_02 umount2_02  # MNT_EXPIRE is not supported
 userfaultfd01 userfaultfd01
 userfaultfd02 userfaultfd02
 userfaultfd03 userfaultfd03
@@ -1464,15 +1463,15 @@ userfaultfd06 userfaultfd06
 userfaultfd07 userfaultfd07
 ustat01 ustat01
 ustat02 ustat02
-!utime01 utime01  # auto: needs a loop block device (mkfs and mount)
-!utime02 utime02  # auto: needs a loop block device (mkfs and mount)
-!utime03 utime03  # auto: needs a loop block device (mkfs and mount)
-!utime04 utime04  # auto: needs a loop block device (mkfs and mount)
-!utime05 utime05  # auto: needs a loop block device (mkfs and mount)
+utime01 utime01
+utime02 utime02
+utime03 utime03
+utime04 utime04
+utime05 utime05
 utime06 utime06
 utime07 utime07
 utimes01 utimes01
-!utimensat01 utimensat01  # auto: needs a loop block device (mkfs and mount)
+utimensat01 utimensat01
 vfork01 vfork01
 vfork02 vfork02
 vhangup01 vhangup01
@@ -1516,7 +1515,7 @@ write05 write05
 write06 write06
 writev01 writev01
 writev02 writev02
-!writev03 writev03  # auto: needs a loop block device (mkfs and mount)
+writev03 writev03
 writev05 writev05
 writev06 writev06
 writev07 writev07
@@ -1545,21 +1544,21 @@ memfd_create01 memfd_create01
 memfd_create02 memfd_create02
 memfd_create03 memfd_create03
 memfd_create04 memfd_create04
-!copy_file_range01 copy_file_range01  # auto: needs a loop block device (mkfs and mount)
-!copy_file_range02 copy_file_range02  # auto: needs a loop block device (mkfs and mount)
+copy_file_range01 copy_file_range01
+!copy_file_range02 copy_file_range02  # copy_file_range's pipe, EOVERFLOW and EFBIG cases differ, and the test exhausts the domain's memory
 copy_file_range03 copy_file_range03
 statx01 statx01
 statx02 statx02
 statx03 statx03
-!statx04 statx04  # auto: needs a loop block device (mkfs and mount)
-!statx05 statx05  # auto: needs a loop block device (mkfs and mount)
-!statx06 statx06  # auto: needs a loop block device (mkfs and mount)
+statx04 statx04
+statx05 statx05
+statx06 statx06
 statx07 statx07
-!statx08 statx08  # auto: needs a loop block device (mkfs and mount)
-!statx09 statx09  # auto: needs a loop block device (mkfs and mount)
-!statx10 statx10  # auto: needs a loop block device (mkfs and mount)
-!statx11 statx11  # auto: needs a loop block device (mkfs and mount)
-!statx12 statx12  # auto: needs a loop block device (mkfs and mount)
+statx08 statx08
+statx09 statx09
+statx10 statx10
+statx11 statx11
+statx12 statx12
 membarrier01 membarrier01
 io_uring01 io_uring01
 io_uring02 io_uring02

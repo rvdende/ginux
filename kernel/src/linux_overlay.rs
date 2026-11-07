@@ -1,7 +1,8 @@
 use crate::{
     arch::x86_64::cpu,
-    control_abi,
+    control_abi, linux_blockfs as blockfs,
     memory::{self, FrameLease, FrameOwner},
+    sync::{LockRank, SpinLock},
 };
 use alloc::{collections::BTreeMap, vec::Vec};
 use core::cell::UnsafeCell;
@@ -44,6 +45,11 @@ impl Handle {
     pub(crate) const fn inode(self) -> u64 {
         self.inode
     }
+
+    /// The handle of a file on a mounted volume ([`crate::linux_blockfs`]).
+    pub(crate) const fn volume(generation: u32, inode: u64) -> Self {
+        Self { generation, inode }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -63,6 +69,13 @@ pub(crate) struct Metadata {
     pub(crate) atime: (i64, i64),
     pub(crate) mtime: (i64, i64),
     pub(crate) ctime: (i64, i64),
+    /// The device of the filesystem the file is on (stat's st_dev): 0 for
+    /// the overlay's own files.
+    pub(crate) filesystem: u32,
+    /// Space used, in 512-byte sectors (stat's st_blocks).
+    pub(crate) sectors: u64,
+    /// The preferred I/O size (stat's st_blksize): the filesystem's block.
+    pub(crate) block_size: u32,
 }
 
 pub(crate) struct Child {
@@ -73,6 +86,18 @@ pub(crate) struct Child {
 }
 
 impl Child {
+    pub(crate) fn new(next_cursor: usize, metadata: Metadata, name: &[u8]) -> Self {
+        let name_length = name.len().min(NAME_MAX);
+        let mut stored = [0; NAME_MAX];
+        stored[..name_length].copy_from_slice(&name[..name_length]);
+        Self {
+            next_cursor,
+            metadata,
+            name_length,
+            name: stored,
+        }
+    }
+
     pub(crate) fn name(&self) -> &[u8] {
         &self.name[..self.name_length]
     }
@@ -266,6 +291,9 @@ impl Node {
             atime: self.atime,
             mtime: self.mtime,
             ctime: self.ctime,
+            filesystem: 0,
+            sectors: (self.size as u64).div_ceil(512),
+            block_size: PAGE_SIZE as u32,
         }
     }
 }
@@ -305,7 +333,7 @@ impl Overlay {
 
 /// The overlay has a symlink a path walk may need to follow.
 pub(crate) fn has_symlinks() -> bool {
-    live().is_some_and(|overlay| overlay.symlinks != 0)
+    live().is_some_and(|overlay| overlay.symlinks != 0) || blockfs::any_mounted()
 }
 
 pub(crate) fn register_shared_mapping(
@@ -500,6 +528,9 @@ static OVERLAY_RUNTIME: OverlayRuntimeOwner =
     OverlayRuntimeOwner(UnsafeCell::new([Overlay::EMPTY; INSTANCE_LIMIT]));
 
 pub(crate) fn lookup(path: &[u8]) -> Option<Metadata> {
+    if let Some(found) = blockfs::lookup(path) {
+        return found;
+    }
     valid_path(path)?;
     let named = linked_node(path, false)?;
     match named.alias_of {
@@ -537,6 +568,10 @@ fn linked_node(path: &[u8], whiteouts: bool) -> Option<&'static mut Node> {
 }
 
 pub(crate) fn hidden(path: &[u8]) -> bool {
+    // A volume's files are its own: nothing of the image shows through.
+    if blockfs::covers(path) {
+        return false;
+    }
     // Only a path or ancestor some node was ever given can be hidden.
     let hints = path_hints();
     let named = (0..=path.len())
@@ -558,6 +593,9 @@ pub(crate) fn hidden(path: &[u8]) -> bool {
 }
 
 pub(crate) fn from_generation(generation: u32) -> Option<Handle> {
+    if blockfs::owns(Handle::volume(generation, 0)) {
+        return blockfs::from_generation(generation);
+    }
     let overlay = live()?;
     for_each_node(overlay, |node| {
         (node.handle.generation == generation).then_some(node.handle)
@@ -569,6 +607,9 @@ pub(crate) fn generation(handle: Handle) -> u32 {
 }
 
 pub(crate) fn metadata(handle: Handle) -> Option<Metadata> {
+    if blockfs::owns(handle) {
+        return blockfs::metadata(handle);
+    }
     node(handle).map(Node::metadata)
 }
 
@@ -605,6 +646,14 @@ const TEMPORARY_NAME: &[u8] = b".ginux-o-tmpfile";
 /// `directory` (owner, group and set-group-ID inheritance from it), that
 /// linkat(2) may later name unless `linkable` is false (O_EXCL).
 pub(crate) fn create_temporary(directory: &[u8], mode: u32, linkable: bool) -> Option<Handle> {
+    if blockfs::covers(directory) {
+        let mut probe = Vec::new();
+        probe.try_reserve_exact(directory.len() + 2).ok()?;
+        probe.extend_from_slice(directory);
+        probe.extend_from_slice(b"/x");
+        let (owner, group, mode) = cpu::linux_new_file_identity(&probe, false, mode);
+        return blockfs::create_temporary(directory, mode, owner, group, linkable).flatten();
+    }
     let mut path = [0_u8; PATH_CAPACITY];
     let separator = usize::from(!directory.is_empty());
     let length = directory.len() + separator + TEMPORARY_NAME.len();
@@ -640,6 +689,15 @@ pub(crate) enum LinkError {
 /// linkat(2) of an O_TMPFILE file. A named file gets a hard link from
 /// [`create_link`] instead.
 pub(crate) fn link_unnamed(path: &[u8], handle: Handle) -> Result<(), LinkError> {
+    if blockfs::owns(handle) {
+        if lookup(path).is_some() {
+            return Err(LinkError::Exists);
+        }
+        return blockfs::link_unnamed(path, handle).unwrap_or(Err(LinkError::Gone));
+    }
+    if blockfs::covers(path) {
+        return Err(LinkError::CrossDevice);
+    }
     valid_path(path).ok_or(LinkError::Failed)?;
     if lookup(path).is_some() {
         return Err(LinkError::Exists);
@@ -670,6 +728,9 @@ pub(crate) fn link_unnamed(path: &[u8], handle: Handle) -> Result<(), LinkError>
 
 /// Whether the file `handle` still has a name.
 pub(crate) fn linked(handle: Handle) -> bool {
+    if blockfs::owns(handle) {
+        return blockfs::linked(handle);
+    }
     node(handle).is_some_and(|node| node.linked)
 }
 
@@ -891,6 +952,9 @@ pub(crate) fn add_file_seals(handle: Handle, seals: u32) -> Option<bool> {
 }
 
 pub(crate) fn copy_path(handle: Handle, output: &mut [u8]) -> Option<usize> {
+    if blockfs::owns(handle) {
+        return blockfs::copy_path(handle, output);
+    }
     let overlay = live()?;
     for_each_node(overlay, |node| {
         if node.handle != handle {
@@ -908,6 +972,9 @@ pub(crate) fn copy_path(handle: Handle, output: &mut [u8]) -> Option<usize> {
 /// has a node for the directory itself: files created in a directory of the
 /// image are overlay nodes below the image's directory.
 pub(crate) fn next_child_at(directory: &[u8], cursor: usize) -> Option<Option<Child>> {
+    if let Some(next) = blockfs::next_child_at(directory, cursor) {
+        return next;
+    }
     // A child's path is the directory's, a slash (none below the root),
     // then its name.
     let name_below = |path: &'static [u8]| {
@@ -988,17 +1055,26 @@ pub(crate) fn create_device(path: &[u8], kind: NodeKind, mode: u32, device: u32)
     if !matches!(kind, NodeKind::CharacterDevice | NodeKind::BlockDevice) {
         return None;
     }
+    if blockfs::covers(path) {
+        return create_on_volume(path, blockfs::New::Device(kind, device), mode);
+    }
     let handle = create(path, kind, mode, &[])?;
     node_mut(handle)?.device = device;
     Some(handle)
 }
 
 pub(crate) fn fifo_socket(handle: Handle) -> Option<crate::linux_socket::SlotId> {
+    if blockfs::owns(handle) {
+        return blockfs::fifo_socket(handle).flatten();
+    }
     let node = node(handle)?;
     (node.kind == NodeKind::Fifo && node.fifo_socket != 0).then_some(node.fifo_socket - 1)
 }
 
 pub(crate) fn set_fifo_socket(handle: Handle, slot: crate::linux_socket::SlotId) -> bool {
+    if blockfs::owns(handle) {
+        return blockfs::set_fifo_socket(handle, slot).unwrap_or(false);
+    }
     let Some(node) = node_mut(handle).filter(|node| node.kind == NodeKind::Fifo) else {
         return false;
     };
@@ -1009,7 +1085,26 @@ pub(crate) fn set_fifo_socket(handle: Handle, slot: crate::linux_socket::SlotId)
     true
 }
 
+/// Creates `new` at `path` on the volume it lies on, owned as the overlay's
+/// files are.
+fn create_on_volume(path: &[u8], new: blockfs::New, mode: u32) -> Option<Handle> {
+    let directory = matches!(new, blockfs::New::Directory);
+    let (owner, group, mode) = cpu::linux_new_file_identity(path, directory, mode);
+    blockfs::create(path, new, mode, owner, group).flatten()
+}
+
 fn create(path: &[u8], kind: NodeKind, mode: u32, initial: &[u8]) -> Option<Handle> {
+    if blockfs::covers(path) {
+        let new = match kind {
+            NodeKind::File => blockfs::New::File(initial),
+            NodeKind::Directory => blockfs::New::Directory,
+            NodeKind::Symlink => blockfs::New::Symlink(initial),
+            NodeKind::Fifo => blockfs::New::Fifo,
+            NodeKind::Socket => blockfs::New::Socket,
+            NodeKind::CharacterDevice | NodeKind::BlockDevice => blockfs::New::Device(kind, 0),
+        };
+        return create_on_volume(path, new, mode);
+    }
     // A new file's times are when it was made.
     let created = crate::arch::x86_64::cpu::linux_realtime_now();
     valid_path(path)?;
@@ -1074,7 +1169,7 @@ fn create(path: &[u8], kind: NodeKind, mode: u32, initial: &[u8]) -> Option<Hand
 }
 
 pub(crate) fn whiteout(path: &[u8]) -> bool {
-    if valid_path(path).is_none() {
+    if valid_path(path).is_none() || blockfs::covers(path) {
         return false;
     }
     let has_node = lookup(path).is_some() || hidden(path);
@@ -1146,6 +1241,9 @@ pub(crate) fn whiteout(path: &[u8]) -> bool {
 }
 
 pub(crate) fn read(handle: Handle, offset: usize, output: &mut [u8]) -> Option<usize> {
+    if blockfs::owns(handle) {
+        return blockfs::read(handle, offset, output);
+    }
     let node = node_mut(handle)?;
     if matches!(
         node.kind,
@@ -1212,6 +1310,9 @@ fn read_node(node: &mut Node, offset: usize, output: &mut [u8]) -> Option<usize>
 /// Writes `input` at `offset` of the file at `handle`, which marks it
 /// modified now (its mtime and ctime), as a Linux write does.
 pub(crate) fn write(handle: Handle, offset: usize, input: &[u8]) -> Option<usize> {
+    if blockfs::owns(handle) {
+        return blockfs::write(handle, offset, input);
+    }
     let written = write_data(handle, offset, input)?;
     if written != 0 {
         let _ = touch_modified(handle, crate::arch::x86_64::cpu::linux_realtime_now());
@@ -1279,6 +1380,9 @@ fn write_data(handle: Handle, offset: usize, input: &[u8]) -> Option<usize> {
 }
 
 pub(crate) fn truncate(handle: Handle, size: usize) -> bool {
+    if blockfs::owns(handle) {
+        return blockfs::truncate(handle, size).unwrap_or(false);
+    }
     let Some(node) = node_mut(handle) else {
         return false;
     };
@@ -1345,6 +1449,9 @@ pub(crate) fn truncate(handle: Handle, size: usize) -> bool {
 }
 
 pub(crate) fn set_mode(handle: Handle, mode: u32) -> bool {
+    if blockfs::owns(handle) {
+        return blockfs::set_mode(handle, mode).unwrap_or(false);
+    }
     let Some(node) = node_mut(handle) else {
         return false;
     };
@@ -1355,6 +1462,9 @@ pub(crate) fn set_mode(handle: Handle, mode: u32) -> bool {
 /// Sets a file's attributes (FS_IOC_SETFLAGS): FS_*_FL bits, of which
 /// the file keeps those that fit a byte.
 pub(crate) fn set_attributes(handle: Handle, attributes: u32) -> bool {
+    if blockfs::owns(handle) {
+        return blockfs::set_attributes(handle, attributes).unwrap_or(false);
+    }
     let Some(node) = node_mut(handle) else {
         return false;
     };
@@ -1363,6 +1473,9 @@ pub(crate) fn set_attributes(handle: Handle, attributes: u32) -> bool {
 }
 
 pub(crate) fn set_owner(handle: Handle, owner: u32, group: u32) -> bool {
+    if blockfs::owns(handle) {
+        return blockfs::set_owner(handle, owner, group).unwrap_or(false);
+    }
     let Some(node) = node_mut(handle) else {
         return false;
     };
@@ -1373,6 +1486,9 @@ pub(crate) fn set_owner(handle: Handle, owner: u32, group: u32) -> bool {
 
 /// Marks the file at `handle` modified at `time` (its mtime and ctime).
 pub(crate) fn touch_modified(handle: Handle, time: (i64, i64)) -> bool {
+    if blockfs::owns(handle) {
+        return blockfs::touch_modified(handle, time).unwrap_or(false);
+    }
     let Some(node) = node_mut(handle) else {
         return false;
     };
@@ -1382,6 +1498,9 @@ pub(crate) fn touch_modified(handle: Handle, time: (i64, i64)) -> bool {
 }
 
 pub(crate) fn set_times(handle: Handle, atime: (i64, i64), mtime: (i64, i64)) -> bool {
+    if blockfs::owns(handle) {
+        return blockfs::set_times(handle, atime, mtime).unwrap_or(false);
+    }
     let Some(node) = node_mut(handle) else {
         return false;
     };
@@ -1402,6 +1521,10 @@ pub(crate) fn set_xattr_from<F>(
 where
     F: FnMut(usize, &mut [u8]) -> bool,
 {
+    if blockfs::owns(handle) {
+        return blockfs::set_xattr_from(handle, name, value_size, create_only, replace_only, fill)
+            .unwrap_or(false);
+    }
     if name.is_empty()
         || name.len() > XATTR_NAME_CAPACITY
         || name.contains(&0)
@@ -1431,6 +1554,9 @@ pub(crate) fn get_xattr_chunk(
     offset: usize,
     output: &mut [u8],
 ) -> Option<(usize, usize)> {
+    if blockfs::owns(handle) {
+        return blockfs::get_xattr_chunk(handle, name, offset, output).flatten();
+    }
     let (page, removed) = xattr_metadata(handle, name)?;
     if removed {
         return None;
@@ -1466,6 +1592,9 @@ pub(crate) fn list_xattrs_chunk(
     offset: usize,
     output: &mut [u8],
 ) -> Option<(usize, usize)> {
+    if blockfs::owns(handle) {
+        return blockfs::list_xattrs_chunk(handle, offset, output).flatten();
+    }
     let node = node(handle)?;
     let mut current = node.xattr_first;
     let mut used: usize = 0;
@@ -1495,6 +1624,9 @@ pub(crate) fn list_xattrs_chunk(
 }
 
 pub(crate) fn remove_xattr(handle: Handle, name: &[u8]) -> bool {
+    if blockfs::owns(handle) {
+        return blockfs::remove_xattr(handle, name).unwrap_or(false);
+    }
     if !xattr_metadata(handle, name).is_some_and(|(_, removed)| !removed) {
         return false;
     }
@@ -1502,6 +1634,14 @@ pub(crate) fn remove_xattr(handle: Handle, name: &[u8]) -> bool {
 }
 
 pub(crate) fn rename(handle: Handle, path: &[u8]) -> bool {
+    if blockfs::owns(handle) {
+        let done = blockfs::rename(handle, path).unwrap_or(false);
+        cpu::linux_reclaim_unlinked_files();
+        return done;
+    }
+    if blockfs::covers(path) {
+        return false;
+    }
     if valid_path(path).is_none() || lookup(path).is_some() {
         return false;
     }
@@ -1579,6 +1719,12 @@ fn renamed_suffix<'a>(
 /// Gives the file `target` (not a directory) another name, `path`: a hard
 /// link. Both names then reach the same data, owner and mode.
 pub(crate) fn create_link(path: &[u8], target: Handle) -> bool {
+    if blockfs::owns(target) {
+        return blockfs::create_link(path, target).unwrap_or(false);
+    }
+    if blockfs::covers(path) {
+        return false;
+    }
     if valid_path(path).is_none() || lookup(path).is_some() {
         return false;
     }
@@ -1630,6 +1776,10 @@ pub(crate) fn create_link(path: &[u8], target: Handle) -> bool {
 /// own node moves one alias's name onto it. Directories and files with one
 /// name go as `unlink` does.
 pub(crate) fn unlink_path(path: &[u8]) -> bool {
+    if let Some(removed) = blockfs::unlink_path(path) {
+        cpu::linux_reclaim_unlinked_files();
+        return removed;
+    }
     let Some(overlay) = live() else {
         return false;
     };
@@ -1688,6 +1838,13 @@ fn drop_alias(alias: Handle, file: Handle) -> bool {
 /// Renames the name `from` to `to`: an alias moves alone; a file's own node
 /// (or a directory, with everything under it) as `rename` does.
 pub(crate) fn rename_path(from: &[u8], to: &[u8]) -> bool {
+    if let Some(renamed) = blockfs::rename_path(from, to) {
+        cpu::linux_reclaim_unlinked_files();
+        return renamed;
+    }
+    if blockfs::covers(to) {
+        return false;
+    }
     if valid_path(to).is_none() || lookup(to).is_some() {
         return false;
     }
@@ -1739,6 +1896,7 @@ pub(crate) fn unlink_below(path: &[u8]) {
                     symlinks_removed += 1;
                 }
                 node.linked = false;
+                note_unlinked(node.handle);
             }
         }
         page = nodes.next;
@@ -1748,6 +1906,11 @@ pub(crate) fn unlink_below(path: &[u8]) {
 }
 
 pub(crate) fn unlink(handle: Handle) -> bool {
+    if blockfs::owns(handle) {
+        let done = blockfs::unlink(handle).unwrap_or(false);
+        cpu::linux_reclaim_unlinked_files();
+        return done;
+    }
     let Some(metadata) = metadata(handle) else {
         return false;
     };
@@ -1776,12 +1939,90 @@ pub(crate) fn unlink(handle: Handle) -> bool {
         let overlay = live_mut();
         overlay.symlinks = overlay.symlinks.saturating_sub(1);
     }
+    note_unlinked(handle);
     true
+}
+
+/// Files that lost their last name, whose data [`reclaim_unlinked`] frees
+/// once nothing has them open: per domain instance.
+static UNLINKED: SpinLock<Vec<(usize, Handle)>> =
+    SpinLock::new(LockRank::UNLINKED_FILES, Vec::new());
+
+fn note_unlinked(handle: Handle) {
+    let mut unlinked = UNLINKED.lock();
+    if unlinked.try_reserve(1).is_ok() {
+        unlinked.push((current_instance(), handle));
+    }
+}
+
+/// Frees the files of this domain that lost their last name and that
+/// nothing has open any more, as Linux frees an inode at its last close:
+/// `in_use` says whether a descriptor, a working directory or a loop device
+/// still holds one. Files with paged data (mapped shared) are left alone.
+pub(crate) fn reclaim_unlinked(in_use: impl Fn(Handle) -> bool) {
+    let instance = current_instance();
+    let candidates: Vec<Handle> = UNLINKED
+        .lock()
+        .iter()
+        .filter(|(owner, _)| *owner == instance)
+        .map(|(_, handle)| *handle)
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    let mut settled = Vec::new();
+    for handle in candidates {
+        let Some(node) = node_mut(handle) else {
+            // Gone already (the overlay was torn down).
+            settled.push(handle);
+            continue;
+        };
+        if node.linked {
+            // Named again (linkat of an O_TMPFILE file).
+            settled.push(handle);
+            continue;
+        }
+        let reclaimable = node.active
+            && !node.whiteout
+            && node.alias_of.is_none()
+            && matches!(node.origin, Origin::Named | Origin::Temporary { .. })
+            && matches!(
+                node.kind,
+                NodeKind::File | NodeKind::Directory | NodeKind::Symlink
+            );
+        if !reclaimable {
+            settled.push(handle);
+            continue;
+        }
+        // A paged file's frames may be mapped (shared, or copy-on-write
+        // into private mappings) where no registration says so; such a
+        // file stays until the overlay goes, as before.
+        if node.paged() {
+            settled.push(handle);
+            continue;
+        }
+        if in_use(handle) {
+            continue;
+        }
+        let Some(node) = node_mut(handle) else {
+            continue;
+        };
+        if release_node_data(node) && release_xattr_pages(node.xattr_first) {
+            *node = Node::EMPTY;
+            settled.push(handle);
+        }
+    }
+    UNLINKED
+        .lock()
+        .retain(|(owner, handle)| *owner != instance || !settled.contains(handle));
 }
 
 pub(crate) fn teardown() -> bool {
     // The domain's loop devices are backed by its files, and its RAM disks
     // go with them.
+    blockfs::forget_instance();
+    let instance = current_instance();
+    UNLINKED.lock().retain(|(owner, _)| *owner != instance);
     crate::linux_loop::forget_domain();
     crate::linux_ramdisk::forget_domain();
     let overlay = live_mut();

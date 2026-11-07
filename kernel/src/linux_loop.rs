@@ -18,8 +18,8 @@
 //! but no `loopNpM` devices appear. A loop device cannot back another one
 //! (EINVAL).
 
-use alloc::{format, vec::Vec};
-use core::sync::atomic::{AtomicBool, Ordering};
+use alloc::{format, sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::arch::x86_64::cpu;
 use crate::linux_overlay::{self, Handle, NodeKind};
@@ -74,6 +74,10 @@ const LOOP_CTL_GET_FREE: u32 = 0x4c82;
 
 // The block layer's own ioctls, which every block device answers.
 const BLKROSET: u32 = 0x125d;
+const BLKRASET: u32 = 0x1262;
+const BLKRAGET: u32 = 0x1263;
+/// The readahead a device starts with, in sectors (Linux's 128 KiB).
+const DEFAULT_READAHEAD: u64 = 256;
 const BLKROGET: u32 = 0x125e;
 const BLKRRPART: u32 = 0x125f;
 const BLKGETSIZE: u32 = 0x1260;
@@ -171,6 +175,38 @@ pub(crate) trait Caller {
     fn administrator(&self) -> bool;
 }
 
+/// The I/O a device has done, which `/sys/block/loopN/stat` shows: its
+/// own reads and writes and those of a filesystem mounted from it.
+#[derive(Default)]
+pub(crate) struct IoCounters {
+    reads: AtomicU64,
+    read_sectors: AtomicU64,
+    writes: AtomicU64,
+    write_sectors: AtomicU64,
+}
+
+impl IoCounters {
+    /// Counts one read or write of `bytes`.
+    pub(crate) fn count(&self, write: bool, bytes: usize) {
+        let (requests, sectors) = if write {
+            (&self.writes, &self.write_sectors)
+        } else {
+            (&self.reads, &self.read_sectors)
+        };
+        requests.fetch_add(1, Ordering::Relaxed);
+        sectors.fetch_add((bytes as u64).div_ceil(SECTOR_SIZE), Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> [u64; 4] {
+        [
+            self.reads.load(Ordering::Relaxed),
+            self.read_sectors.load(Ordering::Relaxed),
+            self.writes.load(Ordering::Relaxed),
+            self.write_sectors.load(Ordering::Relaxed),
+        ]
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum State {
     Unbound,
@@ -196,6 +232,13 @@ struct Device {
     openers: u32,
     /// The device file and attributes need rewriting.
     stale: bool,
+    /// Write-protected by BLKROSET, whatever its binding says.
+    protected: bool,
+    /// The readahead BLKRASET set, in 512-byte sectors (whole pages).
+    readahead: u64,
+    /// What I/O the device has done, and what its stat file last showed.
+    io: Option<Arc<IoCounters>>,
+    shown_io: [u64; 4],
 }
 
 impl Device {
@@ -211,6 +254,10 @@ impl Device {
             file_name: [0; NAME_SIZE],
             openers: 0,
             stale: true,
+            protected: false,
+            readahead: DEFAULT_READAHEAD,
+            io: None,
+            shown_io: [0; 4],
         }
     }
 
@@ -223,6 +270,11 @@ impl Device {
 
     fn read_only(&self) -> bool {
         self.state != State::Unbound && self.flags & FLAG_READ_ONLY != 0
+    }
+
+    /// Whether writes are refused: a read-only binding, or BLKROSET.
+    fn write_protected(&self) -> bool {
+        self.read_only() || self.protected
     }
 
     fn size(&self) -> u64 {
@@ -244,6 +296,10 @@ impl Device {
     fn clear(&mut self) {
         *self = Self {
             openers: self.openers,
+            protected: self.protected,
+            readahead: self.readahead,
+            io: self.io.take(),
+            shown_io: self.shown_io,
             ..Self::new()
         };
     }
@@ -283,7 +339,10 @@ impl Domain {
         if self.devices[index].is_some() {
             return false;
         }
-        self.devices[index] = Some(Device::new());
+        self.devices[index] = Some(Device {
+            io: Some(Arc::new(IoCounters::default())),
+            ..Device::new()
+        });
         self.removed.retain(|removed| *removed != minor);
         true
     }
@@ -432,6 +491,41 @@ pub(crate) fn forget_domain() {
     }
 }
 
+/// What a filesystem mounted from the device open `id` reads: the backing
+/// file, the device's offset into it and its size, and whether the device
+/// is read-only. ENXIO for a device bound to nothing. The binding stays
+/// while the open does: detaching it then only marks it to go at the last
+/// close.
+pub(crate) fn backing(id: u64) -> Result<(Handle, u64, u64, bool), Error> {
+    let mut loops = LOOPS.lock();
+    let device = loops.device_of(id)?;
+    let handle = device.bound()?;
+    Ok((
+        handle,
+        device.offset,
+        device.size(),
+        device.write_protected(),
+    ))
+}
+
+/// Whether some loop device of any domain is bound to `backing` (or was,
+/// and is still open).
+pub(crate) fn backs(backing: Handle) -> bool {
+    LOOPS.lock().domains.iter().any(|domain| {
+        domain
+            .devices
+            .iter()
+            .flatten()
+            .any(|device| device.state != State::Unbound && device.backing == Some(backing))
+    })
+}
+
+/// The I/O counters of the device open `id` refers to, for a filesystem
+/// mounted from it to count its own I/O in.
+pub(crate) fn io_counters(id: u64) -> Option<Arc<IoCounters>> {
+    LOOPS.lock().device_of(id).ok()?.io.clone()
+}
+
 /// The minor number of the device open `id` refers to.
 pub(crate) fn minor(id: u64) -> Option<u32> {
     LOOPS.lock().open(id).ok().map(|open| open.minor)
@@ -509,7 +603,7 @@ fn span(
         return Err(Error::BadDescriptor);
     }
     let device = loops.device_of(id)?;
-    if write && device.read_only() {
+    if write && device.write_protected() {
         return Err(Error::Permission);
     }
     if length == 0 {
@@ -521,6 +615,9 @@ fn span(
     }
     let length = (length as u64).min(size - position) as usize;
     let backing = device.backing.ok_or(Error::Io)?;
+    if let Some(io) = &device.io {
+        io.count(write, length);
+    }
     Ok(Some((backing, device.offset + position, length)))
 }
 
@@ -734,6 +831,10 @@ fn configure(id: u64, config: &[u8; CONFIG_SIZE], caller: &mut impl Caller) -> R
     configured.backing = Some(handle);
     configured.state = State::Bound;
     configured.openers = device.openers;
+    configured.protected = device.protected;
+    configured.readahead = device.readahead;
+    configured.io = device.io.take();
+    configured.shown_io = device.shown_io;
     *device = configured;
     Ok(0)
 }
@@ -842,7 +943,7 @@ fn geometry(id: u64) -> Result<Geometry, Error> {
     Ok(Geometry {
         size: device.size(),
         block_size: device.block_size,
-        read_only: device.read_only(),
+        read_only: device.write_protected(),
         partscan: device.flags & FLAG_PARTSCAN != 0,
     })
 }
@@ -888,6 +989,37 @@ pub(crate) fn ioctl(
     argument: u64,
     caller: &mut impl Caller,
 ) -> Result<u64, Error> {
+    if request == BLKROSET && caller.administrator() {
+        // The block layer's own write protection of the device.
+        let mut value = [0; 4];
+        if !caller.copy_in(argument, &mut value) {
+            return Err(Error::Fault);
+        }
+        let mut loops = LOOPS.lock();
+        let device = loops.device_of(id)?;
+        device.protected = i32::from_ne_bytes(value) != 0;
+        device.stale = true;
+        return Ok(0);
+    }
+    match request {
+        // The readahead is kept in whole pages, as Linux keeps it.
+        BLKRASET if !caller.administrator() => return Err(Error::Access),
+        BLKRASET => {
+            let mut loops = LOOPS.lock();
+            loops.device_of(id)?.readahead =
+                argument / (PAGE_SIZE / SECTOR_SIZE) * (PAGE_SIZE / SECTOR_SIZE);
+            return Ok(0);
+        }
+        BLKRAGET => {
+            let readahead = LOOPS.lock().device_of(id)?.readahead;
+            return if caller.copy_out(argument, &readahead.to_ne_bytes()) {
+                Ok(0)
+            } else {
+                Err(Error::Fault)
+            };
+        }
+        _ => {}
+    }
     if let Some(result) = block_ioctl(&geometry(id)?, request, argument, caller) {
         return result;
     }
@@ -1015,9 +1147,24 @@ fn free_minor(devices: &Domain) -> Result<u32, Error> {
         .ok_or(Error::NoSpace)
 }
 
+/// `/sys/block/loopN/stat`: Linux's 17 counters, of which the requests
+/// and sectors are kept; the I/O ticks count requests, as if each took a
+/// millisecond.
+fn stat_line([reads, read_sectors, writes, write_sectors]: [u64; 4]) -> alloc::string::String {
+    let ticks = reads + writes;
+    format!(
+        "{reads:>8} {zero:>8} {read_sectors:>8} {reads:>8} {writes:>8} {zero:>8} \
+         {write_sectors:>8} {writes:>8} {zero:>8} {ticks:>8} {ticks:>8} {zero:>8} {zero:>8} \
+         {zero:>8} {zero:>8} {zero:>8} {zero:>8}\n",
+        zero = 0
+    )
+}
+
 /// What a device's sysfs attributes show.
 struct Attributes {
     minor: u32,
+    /// Reads, sectors read, writes and sectors written.
+    io: [u64; 4],
     sectors: u64,
     read_only: bool,
     block_size: u32,
@@ -1055,10 +1202,15 @@ pub(crate) fn ensure_nodes() {
         let removed = core::mem::take(&mut devices.removed);
         let mut changed = Vec::new();
         for (minor, device) in devices.devices.iter_mut().enumerate() {
-            let Some(device) = device.as_mut().filter(|device| fresh || device.stale) else {
+            let Some(device) = device.as_mut() else {
                 continue;
             };
+            let io = device.io.as_ref().map_or([0; 4], |io| io.snapshot());
+            if !fresh && !device.stale && io == device.shown_io {
+                continue;
+            }
             device.stale = false;
+            device.shown_io = io;
             let bound = device
                 .backing
                 .filter(|_| device.state != State::Unbound)
@@ -1072,8 +1224,9 @@ pub(crate) fn ensure_nodes() {
                 });
             changed.push(Attributes {
                 minor: minor as u32,
+                io,
                 sectors: device.sectors,
-                read_only: device.read_only(),
+                read_only: device.write_protected(),
                 block_size: device.block_size,
                 bound,
             });
@@ -1173,6 +1326,7 @@ fn make_device(attributes: &Attributes) {
             format!("MAJOR={MAJOR}\nMINOR={minor}\nDEVNAME=loop{minor}\nDEVTYPE=disk\n"),
         ),
         ("size", format!("{}\n", attributes.sectors)),
+        ("stat", stat_line(attributes.io)),
         ("ro", format!("{}\n", u8::from(attributes.read_only))),
         ("removable", "0\n".into()),
         ("queue/logical_block_size", block_size.clone()),

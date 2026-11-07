@@ -73,6 +73,17 @@ impl LockRank {
     /// heap so the list may grow while held.
     pub(crate) const MEMORY_FAILURE: Self = Self(175);
     pub(crate) const FUTEX_COORDINATION: Self = Self(180);
+    /// The mounted volumes (filesystems on block devices): every path walk
+    /// looks at them, so they rank above the device and file tables whose
+    /// holders make and remove files (loop devices, pseudo-terminals), and
+    /// below the RAM disks and the heap, which volume I/O uses.
+    pub(crate) const VOLUMES: Self = Self(186);
+    /// Each domain's RAM disks and their opens; ranks below the heap so the
+    /// disks may grow while held.
+    pub(crate) const RAM_DISKS: Self = Self(187);
+    /// Overlay files that lost their last name, waiting for their last
+    /// close; ranks above the tables under which files are unlinked.
+    pub(crate) const UNLINKED_FILES: Self = Self(188);
     /// The kernel heap refills from the frame allocator while holding its
     /// lock, so it ranks just below it.
     pub(crate) const KERNEL_HEAP: Self = Self(190);

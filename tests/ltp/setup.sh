@@ -44,6 +44,31 @@ if [ -d "$overlay" ] && ! command -v useradd >/dev/null 2>&1; then
         mkdir -p "/${file%/*}" && cp -a "$overlay/$file" "/$file" || fail "shadow tools: $file"
     done
 fi
+# e2fsprogs, for the tests that format a device (mkfs.ext2); without it
+# they report mkfs missing.
+if [ ! -x /sbin/mke2fs ]; then
+    wget -q -O - "$base/e2fsprogs.tar.gz" 2>/dev/null | tar -xzf - -C / 2>/dev/null
+fi
+# disk-tmpdir.sh TEST [ARG...]: runs a test with its TMPDIR on an ext2
+# filesystem of its own, for the tests whose files must live on a block
+# device (the domain's /tmp is the overlay, which has none).
+cat > /opt/ltp/disk-tmpdir.sh <<'EOF' || fail "disk-tmpdir.sh"
+#!/bin/sh
+image=/tmp/ltp/disk-tmpdir.img
+mount=/tmp/ltp/disk-tmpdir
+dd if=/dev/zero of="$image" bs=1M count=64 2>/dev/null &&
+    device=$(losetup -f) && losetup "$device" "$image" &&
+    mkfs.ext2 -q -F "$device" && mkdir -p "$mount" &&
+    mount -t ext2 "$device" "$mount" && chmod 1777 "$mount" ||
+    { echo "disk-tmpdir.sh: TBROK: cannot make an ext2 TMPDIR"; exit 2; }
+TMPDIR=$mount "$@"
+status=$?
+umount "$mount"
+losetup -d "$device"
+rm -rf "$image" "$mount"
+exit $status
+EOF
+chmod +x /opt/ltp/disk-tmpdir.sh || fail chmod
 wget -q -O /opt/ltp/ltp-runner "$base/ltp-runner" || fail "runner download"
 chmod +x /opt/ltp/ltp-runner || fail chmod
 wget -q -O /opt/ltp/runlist.txt "$base/runlist.txt" || fail "run list download"

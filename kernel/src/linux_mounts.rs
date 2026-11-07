@@ -87,7 +87,8 @@ pub(crate) struct Mount {
     /// The mode, owner and group the mount point directory had before the
     /// mount's root took its place, to give back when the filesystem goes.
     pub(crate) covered: Option<Attributes>,
-    /// The minor of the anonymous device (0:N) the filesystem is on.
+    /// The device the filesystem is on, as stat(2) encodes it: an
+    /// anonymous 0:N, or the disk of a filesystem mounted from one.
     pub(crate) device: u32,
     /// A bind mount: it shows a filesystem another mount made.
     pub(crate) bind: bool,
@@ -283,6 +284,19 @@ pub(crate) fn mount(
         mount.device = id;
     }
     Ok(id)
+}
+
+/// Records that mount `id` of `space` is on block device `device` (a
+/// filesystem mounted from a disk), instead of an anonymous device.
+pub(crate) fn set_device(space: Space, id: u32, device: u32) {
+    let mut table = MOUNTS.lock();
+    if let Some(mount) = table
+        .mounts
+        .iter_mut()
+        .find(|mount| mount.space == space && mount.id == id)
+    {
+        mount.device = device;
+    }
 }
 
 /// Bind mounts canonical `source` at canonical `target` in `space`

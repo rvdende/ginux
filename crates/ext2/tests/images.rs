@@ -194,6 +194,16 @@ fn file_data_survives_every_level_of_the_block_map() {
     assert!(hole.iter().all(|byte| *byte == 0));
     let stat = filesystem.stat(file).unwrap();
     assert_eq!(stat.size, (70 << 20) + 5000);
+    // The written runs, and nothing for the holes between them.
+    let extents = filesystem.extents(file, 0, u64::MAX).unwrap();
+    assert_eq!(extents.first().unwrap().logical, 0);
+    assert_eq!(
+        extents.last().unwrap().logical + extents.last().unwrap().length,
+        (70 << 20) + 5 * 1024
+    );
+    assert!(extents
+        .iter()
+        .all(|extent| extent.logical < 1 << 20 || extent.logical >= 70 << 20));
     image.store(filesystem);
     let listing = image.debugfs("stat /data");
     assert!(
