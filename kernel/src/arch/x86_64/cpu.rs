@@ -40704,11 +40704,15 @@ fn linux_socket_create(family: u64, socket_type: u64, protocol: u64) -> u64 {
     const SOCK_CLOEXEC: u64 = 0x8_0000;
     const IPPROTO_ICMP: u64 = 1;
     const AF_NETLINK: u64 = 16;
+    const AF_PACKET: u64 = 17;
     let family = u64::from(family as u32);
     let socket_type = u64::from(socket_type as u32);
     let protocol = u64::from(protocol as u32);
     if family == AF_NETLINK {
         return linux_netlink_socket_create(socket_type, protocol);
+    }
+    if family == AF_PACKET {
+        return linux_packet_socket_create(socket_type, protocol);
     }
     if !matches!(family, AF_UNIX | AF_INET) {
         return LINUX_EAFNOSUPPORT;
@@ -40770,6 +40774,44 @@ fn linux_socket_create(family: u64, socket_type: u64, protocol: u64) -> u64 {
             }
             return result;
         }
+    };
+    let index = (descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
+    X86_RUNTIME.ELF_PROBE_SOCKET_SLOTS[index].store(slot + 1, Ordering::SeqCst);
+    X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index]
+        .store((socket_type & SOCK_NONBLOCK) as u32, Ordering::SeqCst);
+    X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index]
+        .store(LINUX_DEVICE_SOCKET | 3, Ordering::SeqCst);
+    set_linux_descriptor_close_on_exec(descriptor, socket_type & SOCK_CLOEXEC != 0);
+    descriptor
+}
+
+/// socket(AF_PACKET, ...): a packet socket of base type SOCK_RAW or
+/// SOCK_DGRAM, which needs CAP_NET_RAW in the domain's user namespace. The
+/// socket lives in the caller's network namespace; it carries the TPACKET
+/// options its setsockopt validates but delivers no frames.
+fn linux_packet_socket_create(socket_type: u64, protocol: u64) -> u64 {
+    const SOCK_DGRAM: u64 = 2;
+    const SOCK_RAW: u64 = 3;
+    const SOCK_NONBLOCK: u64 = 0x800;
+    const SOCK_CLOEXEC: u64 = 0x8_0000;
+    let base = socket_type & 0xf;
+    if socket_type & !(0xf | SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
+        return LINUX_EINVAL;
+    }
+    if !matches!(base, SOCK_DGRAM | SOCK_RAW) {
+        return LINUX_ESOCKTNOSUPPORT;
+    }
+    if !linux_has_capability(ginux_credentials::capability::NET_RAW) {
+        return LINUX_EPERM;
+    }
+    let Some(descriptor) = (LINUX_AUX_DESCRIPTOR_FIRST..LINUX_AUX_DESCRIPTOR_LIMIT)
+        .find(|descriptor| linux_aux_descriptor_free(*descriptor))
+    else {
+        return LINUX_EMFILE;
+    };
+    let slot = match crate::linux_socket::open_packet(base as u8, protocol as u16) {
+        Ok(slot) => slot,
+        Err(error) => return linux_socket_error(error),
     };
     let index = (descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
     X86_RUNTIME.ELF_PROBE_SOCKET_SLOTS[index].store(slot + 1, Ordering::SeqCst);
@@ -41004,6 +41046,37 @@ fn linux_socket_bind(descriptor: u64, address: u64, length: u64) -> u64 {
         return match crate::linux_socket::bind_netlink(slot, port, current_linux_process_pid()) {
             Ok(_) => 0,
             Err(error) => linux_socket_error(error),
+        };
+    }
+    if crate::linux_socket::kind(slot) == Some(crate::linux_socket::Kind::Packet) {
+        // struct sockaddr_ll: family, protocol, ifindex, hatype, pkttype,
+        // halen, addr[8]. bind takes the family, the interface to bind to
+        // (ifindex 0 unbinds) and the protocol; a frame ring is never mapped.
+        let mut sockaddr = [0_u8; 20];
+        if length < sockaddr.len() as u64 {
+            return LINUX_EINVAL;
+        }
+        if !copy_from_linux_user(address, &mut sockaddr) {
+            return LINUX_EFAULT;
+        }
+        if u16::from_ne_bytes([sockaddr[0], sockaddr[1]]) != 17 {
+            return LINUX_EINVAL;
+        }
+        let protocol = u16::from_be_bytes([sockaddr[2], sockaddr[3]]);
+        let ifindex = i32::from_ne_bytes(sockaddr[4..8].try_into().unwrap());
+        // A non-zero index must name an interface of this network namespace.
+        if ifindex != 0
+            && !linux_network_interfaces()
+                .iter()
+                .flatten()
+                .any(|interface| interface.index == ifindex)
+        {
+            return LINUX_ENODEV;
+        }
+        return if crate::linux_socket::set_packet_bind(slot, ifindex, protocol) {
+            0
+        } else {
+            linux_not_socket_error(descriptor)
         };
     }
     if crate::linux_socket::kind(slot) == Some(crate::linux_socket::Kind::Unix) {
@@ -42568,6 +42641,206 @@ fn linux_socket_name(descriptor: u64, address: u64, length: u64, peer: bool) -> 
     }
 }
 
+/// The TPACKET header length (bytes) for version `version` (0: V1, 1: V2,
+/// 2: V3): the aligned per-frame header plus the sockaddr_ll a frame carries,
+/// as Linux's TPACKET_HDRLEN macros compute. Used to reject a ring whose
+/// frame is too small to hold a packet's header.
+fn linux_tpacket_hdrlen(version: u8) -> u64 {
+    match version {
+        // TPACKET_ALIGN(sizeof(tpacket_hdr)) + sizeof(sockaddr_ll) = 32 + 20,
+        // and the V2 header aligns to the same 32.
+        0 | 1 => 52,
+        // TPACKET_ALIGN(sizeof(tpacket3_hdr)) + sizeof(sockaddr_ll) = 48 + 20.
+        _ => 68,
+    }
+}
+
+/// `setsockopt(SOL_PACKET)` on AF_PACKET socket `slot`, validating options in
+/// Linux's order and errno (the packet-ring CVE regression tests). No ring is
+/// mapped: the geometry is validated and remembered, not allocated.
+fn linux_packet_setsockopt(slot: u16, option: u64, value: u64, length: u64) -> u64 {
+    const PACKET_RX_RING: u64 = 5;
+    const PACKET_VERSION: u64 = 10;
+    const PACKET_RESERVE: u64 = 12;
+    const PACKET_TX_RING: u64 = 13;
+    const PACKET_VNET_HDR: u64 = 15;
+    const TPACKET_ALIGNMENT: u64 = 16;
+    let Some(info) = crate::linux_socket::packet_info(slot) else {
+        return LINUX_ENOTSOCK;
+    };
+    let read_int = || -> Result<u32, u64> {
+        if length < 4 {
+            return Err(LINUX_EINVAL);
+        }
+        let mut supplied = [0_u8; 4];
+        if copy_from_linux_user(value, &mut supplied) {
+            Ok(u32::from_ne_bytes(supplied))
+        } else {
+            Err(LINUX_EFAULT)
+        }
+    };
+    match option {
+        PACKET_VERSION => {
+            // optlen must be exactly an int; the value is V1, V2 or V3.
+            if length != 4 {
+                return LINUX_EINVAL;
+            }
+            let version = match read_int() {
+                Ok(version) => version,
+                Err(error) => return error,
+            };
+            let version = match version {
+                0..=2 => version as u8,
+                _ => return LINUX_EINVAL,
+            };
+            if info.has_ring {
+                return LINUX_EBUSY;
+            }
+            crate::linux_socket::set_packet_version(slot, version);
+            0
+        }
+        PACKET_RESERVE => {
+            if length != 4 {
+                return LINUX_EINVAL;
+            }
+            let reserve = match read_int() {
+                Ok(reserve) => reserve,
+                Err(error) => return error,
+            };
+            // Capped at INT_MAX (CVE-2017-1000111 / bcc5364bdcfe).
+            if reserve > i32::MAX as u32 {
+                return LINUX_EINVAL;
+            }
+            if info.has_ring {
+                return LINUX_EBUSY;
+            }
+            crate::linux_socket::set_packet_reserve(slot, reserve);
+            0
+        }
+        PACKET_VNET_HDR => {
+            // A virtio-net header is a SOCK_RAW option; it may not change
+            // while a ring is set.
+            if info.socket_type != 3 {
+                return LINUX_EINVAL;
+            }
+            if length < 4 {
+                return LINUX_EINVAL;
+            }
+            let enabled = match read_int() {
+                Ok(value) => value != 0,
+                Err(error) => return error,
+            };
+            if info.has_ring {
+                return LINUX_EBUSY;
+            }
+            crate::linux_socket::set_packet_vnet_hdr(slot, enabled);
+            0
+        }
+        PACKET_RX_RING | PACKET_TX_RING => {
+            // struct tpacket_req is four u32s; the V3 request adds
+            // tp_retire_blk_tov, tp_sizeof_priv and tp_feature_req_word.
+            let minimum = if info.version == 2 { 28 } else { 16 };
+            if length < minimum {
+                return LINUX_EINVAL;
+            }
+            let mut request = [0_u8; 28];
+            let wanted = minimum as usize;
+            if !copy_from_linux_user(value, &mut request[..wanted]) {
+                return LINUX_EFAULT;
+            }
+            let field = |index: usize| {
+                u32::from_ne_bytes(request[index * 4..index * 4 + 4].try_into().unwrap())
+            };
+            let block_size = field(0);
+            let block_nr = field(1);
+            let frame_size = field(2);
+            let frame_nr = field(3);
+            // Tearing a ring down: block_nr 0 needs frame_nr 0, then frees it.
+            if block_nr == 0 {
+                if frame_nr != 0 {
+                    return LINUX_EINVAL;
+                }
+                crate::linux_socket::set_packet_ring(slot, false);
+                return 0;
+            }
+            // Creating one while another exists is EBUSY (CVE-2016-8655).
+            if info.has_ring {
+                return LINUX_EBUSY;
+            }
+            // A virtio-net header with a ring is not supported here.
+            if info.vnet_hdr {
+                return LINUX_EINVAL;
+            }
+            // tp_block_size must be a positive, page-aligned size.
+            if block_size == 0
+                || block_size & 0x8000_0000 != 0
+                || !u64::from(block_size).is_multiple_of(PAGE_SIZE as u64)
+            {
+                return LINUX_EINVAL;
+            }
+            let min_frame_size = linux_tpacket_hdrlen(info.version) + u64::from(info.reserve);
+            // V3 keeps per-block private space ahead of the frames: the block
+            // must hold the aligned block descriptor, that space and a frame
+            // (CVE-2017-7308, computed in u64 so a huge tp_sizeof_priv cannot
+            // overflow into an acceptable value).
+            if info.version == 2 {
+                let sizeof_priv = u64::from(field(5));
+                if u64::from(block_size) < 48 + sizeof_priv + min_frame_size {
+                    return LINUX_EINVAL;
+                }
+            }
+            if u64::from(frame_size) < min_frame_size {
+                return LINUX_EINVAL;
+            }
+            if u64::from(frame_size) & (TPACKET_ALIGNMENT - 1) != 0 {
+                return LINUX_EINVAL;
+            }
+            let frames_per_block = block_size / frame_size;
+            if frames_per_block == 0 {
+                return LINUX_EINVAL;
+            }
+            if frames_per_block > u32::MAX / block_nr {
+                return LINUX_EINVAL;
+            }
+            if frames_per_block * block_nr != frame_nr {
+                return LINUX_EINVAL;
+            }
+            crate::linux_socket::set_packet_ring(slot, true);
+            0
+        }
+        _ => LINUX_ENOPROTOOPT,
+    }
+}
+
+/// `getsockopt(SOL_PACKET)` on AF_PACKET socket `slot`: PACKET_VERSION and
+/// PACKET_RESERVE return their stored int; other options are unsupported.
+fn linux_packet_getsockopt(slot: u16, option: u64, value: u64, length: u64) -> u64 {
+    const PACKET_VERSION: u64 = 10;
+    const PACKET_RESERVE: u64 = 12;
+    let Some(info) = crate::linux_socket::packet_info(slot) else {
+        return LINUX_ENOTSOCK;
+    };
+    let result = match option {
+        PACKET_VERSION => u32::from(info.version),
+        PACKET_RESERVE => info.reserve,
+        _ => return LINUX_ENOPROTOOPT,
+    };
+    let mut supplied = [0_u8; 4];
+    if !copy_from_linux_user(length, &mut supplied) {
+        return LINUX_EFAULT;
+    }
+    let Ok(wanted) = usize::try_from(i32::from_ne_bytes(supplied)) else {
+        return LINUX_EINVAL;
+    };
+    let copied = wanted.min(4);
+    if copied != 0 && !copy_to_linux_user(value, &result.to_ne_bytes()[..copied])
+        || !copy_to_linux_user(length, &(copied as u32).to_ne_bytes())
+    {
+        return LINUX_EFAULT;
+    }
+    0
+}
+
 fn linux_socket_setsockopt(
     descriptor: u64,
     level: u64,
@@ -42581,6 +42854,10 @@ fn linux_socket_setsockopt(
     let Some(slot) = linux_socket_call_slot(descriptor) else {
         return linux_not_socket_error(descriptor);
     };
+    // SOL_PACKET options on an AF_PACKET socket.
+    if level == 263 {
+        return linux_packet_setsockopt(slot, option, value, length);
+    }
     // SO_OOBINLINE: an int, read and checked as Linux does (a short length
     // EINVAL, an unreadable value EFAULT); urgent data is not kept apart.
     if level == 1 && option == 10 {
@@ -42729,6 +43006,10 @@ fn linux_socket_getsockopt(
     let Some(slot) = linux_socket_call_slot(descriptor) else {
         return linux_not_socket_error(descriptor);
     };
+    // SOL_PACKET options on an AF_PACKET socket.
+    if level == 263 {
+        return linux_packet_getsockopt(slot, option, value, length);
+    }
     if level == 1 && option == 17 {
         if crate::linux_socket::kind(slot) != Some(crate::linux_socket::Kind::Unix) {
             return LINUX_ENOPROTOOPT;
@@ -42880,6 +43161,8 @@ fn linux_socket_getsockopt(
             Some(crate::linux_socket::Kind::Unix) => 0,
             Some(crate::linux_socket::Kind::Netlink) => crate::linux_socket::netlink_address(slot)
                 .map_or(0, |(protocol, _)| i32::from(protocol)),
+            // SO_PROTOCOL on an AF_PACKET socket: no single IP protocol.
+            Some(crate::linux_socket::Kind::Packet) => 0,
             Some(crate::linux_socket::Kind::Object) => return LINUX_ENOTSOCK,
             None => return LINUX_EBADF,
         },
@@ -42891,6 +43174,7 @@ fn linux_socket_getsockopt(
             ) => 2,
             Some(crate::linux_socket::Kind::Unix) => 1,
             Some(crate::linux_socket::Kind::Netlink) => 16,
+            Some(crate::linux_socket::Kind::Packet) => 17,
             Some(crate::linux_socket::Kind::Object) => return LINUX_ENOTSOCK,
             None => return LINUX_EBADF,
         },

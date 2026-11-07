@@ -108,6 +108,12 @@ pub(crate) enum Kind {
     /// answered with an NLMSG_ERROR of EOPNOTSUPP, since no netlink family
     /// is served yet.
     Netlink,
+    /// An AF_PACKET socket: SOCK_RAW or SOCK_DGRAM, bound to an interface of
+    /// its network namespace. It carries the TPACKET version, reserve and
+    /// ring geometry that `setsockopt(SOL_PACKET)` validates (the packet
+    /// CVE regression tests), but delivers no frames: no ring is mapped and
+    /// nothing is read, so a bound socket only records its interface.
+    Packet,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -376,6 +382,17 @@ struct Slot {
     /// The input event an EPOLLEXCLUSIVE watch claimed last: each event
     /// wakes one exclusive watcher, not all of them.
     exclusive_claim: Option<u32>,
+    /// An AF_PACKET socket's base type (2 datagram, 3 raw), TPACKET version
+    /// (0: V1, 1: V2, 2: V3), reserve, bound interface index (0: unbound),
+    /// protocol, whether PACKET_VNET_HDR is set and whether a ring buffer
+    /// (PACKET_RX_RING or PACKET_TX_RING) is configured.
+    packet_type: u8,
+    packet_version: u8,
+    packet_reserve: u32,
+    packet_ifindex: i32,
+    packet_protocol: u16,
+    packet_vnet_hdr: bool,
+    packet_has_ring: bool,
 }
 
 impl Slot {
@@ -417,6 +434,13 @@ impl Slot {
             input_events: 0,
             output_events: 0,
             exclusive_claim: None,
+            packet_type: 0,
+            packet_version: 0,
+            packet_reserve: 0,
+            packet_ifindex: 0,
+            packet_protocol: 0,
+            packet_vnet_hdr: false,
+            packet_has_ring: false,
         }
     }
 
@@ -937,7 +961,7 @@ impl Sockets {
     fn open(&mut self, kind: Kind) -> Result<SlotId, Error> {
         let handle = match kind {
             Kind::Unix => return self.open_unix(1),
-            Kind::Object | Kind::Netlink => return Err(Error::Invalid),
+            Kind::Object | Kind::Netlink | Kind::Packet => return Err(Error::Invalid),
             Kind::Tcp => add_tcp_socket(self.runtime()?)?,
             Kind::Udp => add_udp_socket(self.runtime()?)?,
             Kind::Icmp => add_icmp_socket(self.runtime()?)?,
@@ -978,6 +1002,7 @@ impl Sockets {
             Kind::Icmp => Some(if state.icmp_raw { 3 } else { 2 }),
             Kind::Unix => Some(state.unix_type),
             Kind::Netlink => Some(3),
+            Kind::Packet => Some(state.packet_type),
             Kind::Object => None,
         }
     }
@@ -1693,7 +1718,7 @@ impl Sockets {
                 state.remote = Some(remote);
                 Ok(())
             }
-            Kind::Unix | Kind::Object | Kind::Netlink => Err(Error::Invalid),
+            Kind::Unix | Kind::Object | Kind::Netlink | Kind::Packet => Err(Error::Invalid),
         }
     }
 
@@ -1812,7 +1837,9 @@ impl Sockets {
                 }
                 sent
             }
-            Kind::Icmp | Kind::Unix | Kind::Object | Kind::Netlink => Err(Error::Invalid),
+            Kind::Icmp | Kind::Unix | Kind::Object | Kind::Netlink | Kind::Packet => {
+                Err(Error::Invalid)
+            }
         }
     }
 
@@ -2038,7 +2065,9 @@ impl Sockets {
                 .recv_slice(output)
                 .map(|(size, metadata)| (size, Some(metadata.endpoint)))
                 .map_err(|_| Error::WouldBlock),
-            Kind::Icmp | Kind::Unix | Kind::Object | Kind::Netlink => Err(Error::Invalid),
+            Kind::Icmp | Kind::Unix | Kind::Object | Kind::Netlink | Kind::Packet => {
+                Err(Error::Invalid)
+            }
         }
     }
 
@@ -2172,7 +2201,9 @@ impl Sockets {
                 .peek_slice(output)
                 .map(|(size, metadata)| (size, Some(metadata.endpoint)))
                 .map_err(|_| Error::WouldBlock),
-            Kind::Icmp | Kind::Unix | Kind::Object | Kind::Netlink => Err(Error::Invalid),
+            Kind::Icmp | Kind::Unix | Kind::Object | Kind::Netlink | Kind::Packet => {
+                Err(Error::Invalid)
+            }
         }
     }
 
@@ -2346,7 +2377,7 @@ impl Sockets {
                 let socket = runtime.sockets.get::<udp::Socket>(handle);
                 (socket.can_recv(), socket.can_send(), false)
             }
-            Kind::Icmp | Kind::Unix | Kind::Object | Kind::Netlink => return None,
+            Kind::Icmp | Kind::Unix | Kind::Object | Kind::Netlink | Kind::Packet => return None,
         })
     }
 
@@ -2848,7 +2879,7 @@ pub(crate) fn set_ttl(id: SlotId, ttl: u8) -> Result<(), Error> {
             .sockets
             .get_mut::<udp::Socket>(handle)
             .set_hop_limit(hop_limit),
-        Kind::Icmp | Kind::Unix | Kind::Object | Kind::Netlink => {}
+        Kind::Icmp | Kind::Unix | Kind::Object | Kind::Netlink | Kind::Packet => {}
     }
     Ok(())
 }
@@ -3018,6 +3049,97 @@ pub(crate) fn is_raw(id: SlotId) -> bool {
         .lock()
         .slot(id)
         .is_some_and(|state| state.kind == Kind::Icmp && state.icmp_raw)
+}
+
+/// An AF_PACKET socket's state the `setsockopt(SOL_PACKET)` path reads.
+#[derive(Clone, Copy)]
+pub(crate) struct PacketInfo {
+    /// The base socket type: 2 datagram, 3 raw.
+    pub(crate) socket_type: u8,
+    /// The TPACKET version: 0 (V1), 1 (V2) or 2 (V3).
+    pub(crate) version: u8,
+    pub(crate) reserve: u32,
+    /// Whether PACKET_VNET_HDR is set.
+    pub(crate) vnet_hdr: bool,
+    /// Whether a ring buffer (PACKET_RX_RING or PACKET_TX_RING) is set.
+    pub(crate) has_ring: bool,
+}
+
+/// Opens an AF_PACKET socket of base type `socket_type` (2 datagram, 3 raw)
+/// and `protocol` (the ethertype, in network order as the caller gave it).
+pub(crate) fn open_packet(socket_type: u8, protocol: u16) -> Result<SlotId, Error> {
+    let mut slot = Slot::new(Kind::Packet, current_owner());
+    slot.packet_type = socket_type;
+    slot.packet_protocol = protocol;
+    SOCKETS.lock().insert(slot)
+}
+
+fn packet_slot(sockets: &mut Sockets, id: SlotId) -> Option<&mut Slot> {
+    sockets
+        .slot_mut(id)
+        .filter(|state| state.kind == Kind::Packet)
+}
+
+/// AF_PACKET socket `id`'s state, or None when it is not a packet socket.
+pub(crate) fn packet_info(id: SlotId) -> Option<PacketInfo> {
+    SOCKETS
+        .lock()
+        .slot(id)
+        .filter(|state| state.kind == Kind::Packet)
+        .map(|state| PacketInfo {
+            socket_type: state.packet_type,
+            version: state.packet_version,
+            reserve: state.packet_reserve,
+            vnet_hdr: state.packet_vnet_hdr,
+            has_ring: state.packet_has_ring,
+        })
+}
+
+/// Binds AF_PACKET socket `id` to interface index `ifindex` (0: unbound)
+/// and `protocol`.
+pub(crate) fn set_packet_bind(id: SlotId, ifindex: i32, protocol: u16) -> bool {
+    let mut sockets = SOCKETS.lock();
+    packet_slot(&mut sockets, id).is_some_and(|state| {
+        state.packet_ifindex = ifindex;
+        state.packet_protocol = protocol;
+        true
+    })
+}
+
+/// Sets AF_PACKET socket `id`'s TPACKET version.
+pub(crate) fn set_packet_version(id: SlotId, version: u8) -> bool {
+    let mut sockets = SOCKETS.lock();
+    packet_slot(&mut sockets, id).is_some_and(|state| {
+        state.packet_version = version;
+        true
+    })
+}
+
+/// Sets AF_PACKET socket `id`'s PACKET_RESERVE.
+pub(crate) fn set_packet_reserve(id: SlotId, reserve: u32) -> bool {
+    let mut sockets = SOCKETS.lock();
+    packet_slot(&mut sockets, id).is_some_and(|state| {
+        state.packet_reserve = reserve;
+        true
+    })
+}
+
+/// Sets AF_PACKET socket `id`'s PACKET_VNET_HDR flag.
+pub(crate) fn set_packet_vnet_hdr(id: SlotId, enabled: bool) -> bool {
+    let mut sockets = SOCKETS.lock();
+    packet_slot(&mut sockets, id).is_some_and(|state| {
+        state.packet_vnet_hdr = enabled;
+        true
+    })
+}
+
+/// Records whether AF_PACKET socket `id` has a ring buffer configured.
+pub(crate) fn set_packet_ring(id: SlotId, present: bool) -> bool {
+    let mut sockets = SOCKETS.lock();
+    packet_slot(&mut sockets, id).is_some_and(|state| {
+        state.packet_has_ring = present;
+        true
+    })
 }
 
 /// Opens an object slot for `class` and `id`, with one reference.
@@ -3376,7 +3498,7 @@ pub(crate) fn event_counts(id: SlotId) -> Option<(u32, u32)> {
     let counted = match state.kind {
         Kind::Unix | Kind::Netlink => true,
         Kind::Tcp => state.is_local(),
-        Kind::Udp | Kind::Icmp | Kind::Object => false,
+        Kind::Udp | Kind::Icmp | Kind::Object | Kind::Packet => false,
     };
     counted.then_some((state.input_events, state.output_events))
 }

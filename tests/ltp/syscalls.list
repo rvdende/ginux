@@ -43,7 +43,7 @@ bind02 bind02
 bind03 bind03
 bind04 bind04
 bind05 bind05
-bind06 bind06
+bind06 bind06  # budget=330 fzsync race may use all of LTP's 300 s runtime
 bpf_map01 bpf_map01
 bpf_prog01 bpf_prog01
 bpf_prog02 bpf_prog02
@@ -1264,8 +1264,8 @@ setsockopt02 setsockopt02
 setsockopt03 setsockopt03
 setsockopt04 setsockopt04
 setsockopt05 setsockopt05
-setsockopt06 setsockopt06
-setsockopt07 setsockopt07
+setsockopt06 setsockopt06  # budget=300 fzsync race may use all of LTP's 270 s runtime
+setsockopt07 setsockopt07  # budget=180 fzsync race may use all of LTP's 150 s runtime
 setsockopt08 setsockopt08
 setsockopt09 setsockopt09
 setsockopt10 setsockopt10
