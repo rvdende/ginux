@@ -156,6 +156,14 @@ pub(crate) enum BooleanOption {
     /// SO_NO_CHECK: UDP may send without a checksum; smoltcp always sums,
     /// which receivers accept either way.
     NoCheck,
+    /// SO_BROADCAST: a datagram socket may send to a broadcast address.
+    /// Kept for getsockopt; sends are not refused without it here.
+    Broadcast,
+    /// IPV6_RECVHOPLIMIT: received datagrams carry their hop limit (an
+    /// IPV6_HOPLIMIT message).
+    ReceiveHopLimit,
+    /// IPV6_2292HOPLIMIT: the same, as RFC 2292 numbers the message.
+    ReceiveHopLimit2292,
 }
 
 #[derive(Clone, Copy)]
@@ -176,6 +184,9 @@ struct Options {
     receive_ttl: bool,
     header_included: bool,
     no_check: bool,
+    broadcast: bool,
+    receive_hop_limit: bool,
+    receive_hop_limit_2292: bool,
     /// IP_TTL; 0 for DEFAULT_TTL.
     ttl: u8,
     receive_timeout_us: u64,
@@ -367,6 +378,14 @@ struct Slot {
     icmp_raw: bool,
     /// ICMP_FILTER of a raw ICMP socket: types (bit numbers) it drops.
     icmp_filter: u32,
+    /// ICMPV6_FILTER of a raw ICMPv6 socket, as struct icmp6_filter lays
+    /// it out: eight native-endian words, bit `type % 32` of word
+    /// `type / 32` set for each of the 256 types it drops.
+    icmpv6_filter: [u8; 32],
+    /// IPV6_CHECKSUM of a raw ICMPv6 socket: where in each message it
+    /// sends the checksum goes (2, ICMPv6's own, unless set), or -1 for
+    /// none.
+    icmpv6_checksum: i32,
     /// The TTL of the datagram an ICMP socket received last.
     received_ttl: u8,
     /// What MSG_MORE sends held back: they go out with the next send
@@ -441,6 +460,8 @@ impl Slot {
             object: (0, 0),
             icmp_raw: false,
             icmp_filter: 0,
+            icmpv6_filter: [0; 32],
+            icmpv6_checksum: 2,
             received_ttl: 0,
             groups: Vec::new(),
             corked: Vec::new(),
@@ -492,6 +513,21 @@ impl Slot {
     /// or a TCP socket connected to one of the interface's own addresses.
     fn is_local(&self) -> bool {
         self.kind == Kind::Unix || self.peer.is_some() && !self.listening
+    }
+
+    /// Whether this datagram socket takes a datagram sent to `destination`,
+    /// as Linux matches one: an IPv4 socket only IPv4, an IPV6_V6ONLY one
+    /// only IPv6, and a socket bound to an address only that address (an
+    /// AF_INET6 socket bound to an IPv4-mapped one keeps it as IPv4).
+    fn takes_datagram_to(&self, destination: Option<IpAddress>) -> bool {
+        let Some(destination) = destination else {
+            return true;
+        };
+        let family = match destination {
+            IpAddress::Ipv4(_) => !self.ipv6 || !self.v6only,
+            IpAddress::Ipv6(_) => self.ipv6,
+        };
+        family && self.bound.is_none_or(|bound| bound == destination)
     }
 }
 
@@ -667,6 +703,25 @@ fn add_icmp_socket(runtime: &mut Runtime) -> Result<SocketHandle, Error> {
     )))
 }
 
+/// A smoltcp raw socket that receives every ICMPv6 packet of the
+/// interface and sends the IPv6 packets an ICMPv6 socket builds.
+fn add_icmpv6_socket(runtime: &mut Runtime) -> Result<SocketHandle, Error> {
+    let rx = raw::PacketBuffer::new(
+        filled(ICMP_PACKET_COUNT, raw::PacketMetadata::EMPTY)?,
+        filled(ICMP_BUFFER_SIZE, 0_u8)?,
+    );
+    let tx = raw::PacketBuffer::new(
+        filled(ICMP_PACKET_COUNT, raw::PacketMetadata::EMPTY)?,
+        filled(ICMP_BUFFER_SIZE, 0_u8)?,
+    );
+    Ok(runtime.sockets.add(raw::Socket::new(
+        Some(IpVersion::Ipv6),
+        Some(IpProtocol::Icmpv6),
+        rx,
+        tx,
+    )))
+}
+
 /// The Internet checksum (RFC 1071) of `bytes`.
 fn internet_checksum(bytes: &[u8]) -> u16 {
     let (words, rest) = bytes.as_chunks::<2>();
@@ -681,32 +736,90 @@ fn internet_checksum(bytes: &[u8]) -> u16 {
     !(sum as u16)
 }
 
-/// An ICMP packet received by a raw socket: its IPv4 header's length,
-/// source and TTL, and the ICMP message's type and identifier.
+/// An ICMP or ICMPv6 packet received by a raw socket: its IP header's
+/// length, source and TTL (hop limit), and the message's type and
+/// identifier.
 struct IcmpPacket {
     header_length: usize,
-    source: u32,
+    source: IpAddress,
     ttl: u8,
     icmp_type: u8,
     identifier: u16,
 }
 
 impl IcmpPacket {
+    /// The IPv6 header's length: smoltcp hands a raw socket the packet as
+    /// it came, and none sent here carries extension headers.
+    const IPV6_HEADER: usize = 40;
+
     fn parse(packet: &[u8]) -> Option<Self> {
-        let header_length = usize::from(packet.first()? & 0xf) * 4;
+        let ipv6 = packet.first()? >> 4 == 6;
+        let header_length = if ipv6 {
+            Self::IPV6_HEADER
+        } else {
+            usize::from(packet[0] & 0xf) * 4
+        };
         let message = packet
             .get(header_length..)
             .filter(|_| header_length >= 20)?;
+        let source = if ipv6 {
+            let octets: [u8; 16] = packet.get(8..24)?.try_into().ok()?;
+            IpAddress::Ipv6(Ipv6Address::from_octets(octets))
+        } else {
+            let octets: [u8; 4] = packet.get(12..16)?.try_into().ok()?;
+            IpAddress::Ipv4(Ipv4Address::from_octets(octets))
+        };
         Some(Self {
             header_length,
-            source: u32::from_be_bytes(packet[12..16].try_into().ok()?),
-            ttl: packet[8],
+            source,
+            ttl: if ipv6 { packet[7] } else { packet[8] },
             icmp_type: *message.first()?,
             identifier: message
                 .get(4..6)
                 .map_or(0, |bytes| u16::from_be_bytes([bytes[0], bytes[1]])),
         })
     }
+}
+
+/// The IPv6 packet that carries `message` (an ICMPv6 message) from `source`
+/// to `destination`, with the checksum, which covers the IPv6
+/// pseudo-header, filled in at byte `checksum` of the message (ICMPv6's 2
+/// unless IPV6_CHECKSUM moved it; none for None). A message too short to
+/// hold it is EINVAL.
+fn icmpv6_packet(
+    source: Ipv6Address,
+    destination: Ipv6Address,
+    hop_limit: u8,
+    message: &[u8],
+    checksum: Option<usize>,
+) -> Result<Vec<u8>, Error> {
+    const HEADER: usize = IcmpPacket::IPV6_HEADER;
+    let payload_length = u16::try_from(message.len()).map_err(|_| Error::Invalid)?;
+    if checksum.is_some_and(|offset| offset + 2 > message.len()) {
+        return Err(Error::Invalid);
+    }
+    let mut packet = filled(HEADER + message.len(), 0_u8)?;
+    packet[0] = 0x60;
+    packet[4..6].copy_from_slice(&payload_length.to_be_bytes());
+    packet[6] = u8::from(IpProtocol::Icmpv6);
+    packet[7] = hop_limit;
+    packet[8..24].copy_from_slice(&source.octets());
+    packet[24..40].copy_from_slice(&destination.octets());
+    packet[HEADER..].copy_from_slice(message);
+    let Some(offset) = checksum.map(|offset| HEADER + offset) else {
+        return Ok(packet);
+    };
+    packet[offset..offset + 2].fill(0);
+    // The pseudo-header: both addresses, the upper-layer length (32 bits)
+    // and the next header (32 bits, zero-padded).
+    let mut pseudo = filled(40 + message.len(), 0_u8)?;
+    pseudo[..32].copy_from_slice(&packet[8..40]);
+    pseudo[32..36].copy_from_slice(&u32::from(payload_length).to_be_bytes());
+    pseudo[39] = u8::from(IpProtocol::Icmpv6);
+    pseudo[40..].copy_from_slice(&packet[HEADER..]);
+    let sum = internet_checksum(&pseudo);
+    packet[offset..offset + 2].copy_from_slice(&sum.to_be_bytes());
+    Ok(packet)
 }
 
 /// The IPv4 packet that carries `message` (an ICMP message) from `source`
@@ -1003,6 +1116,25 @@ impl Sockets {
                 }
             }
         }
+        // smoltcp delivers a datagram by port alone; a socket drops those
+        // sent to an address it does not take (see `Slot::takes_datagram_to`).
+        for state in self
+            .slots
+            .iter()
+            .flatten()
+            .filter(|state| state.kind == Kind::Udp)
+        {
+            let Some(handle) = state.handle else {
+                continue;
+            };
+            let socket = runtime.sockets.get_mut::<udp::Socket>(handle);
+            while let Ok((_, metadata)) = socket.peek() {
+                if state.takes_datagram_to(metadata.local_address) {
+                    break;
+                }
+                let _ = socket.recv();
+            }
+        }
     }
 
     fn teardown(&mut self) -> bool {
@@ -1040,6 +1172,22 @@ impl Sockets {
             state.icmp_raw = raw;
         }
         Ok(id)
+    }
+
+    /// An ICMPv6 socket: raw (SOCK_RAW) or a ping socket.
+    fn open_icmpv6(&mut self, raw: bool) -> Result<SlotId, Error> {
+        let handle = add_icmpv6_socket(self.runtime()?)?;
+        let mut slot = Slot::new(Kind::Icmp, current_owner());
+        slot.handle = Some(handle);
+        slot.icmp_raw = raw;
+        slot.ipv6 = true;
+        let id = self.insert(slot);
+        if id.is_err() {
+            if let Some(runtime) = self.runtime.as_mut() {
+                runtime.sockets.remove(handle);
+            }
+        }
+        id
     }
 
     fn open_unix(&mut self, socket_type: u8) -> Result<SlotId, Error> {
@@ -1393,6 +1541,9 @@ impl Sockets {
             BooleanOption::ReceiveTtl => options.receive_ttl = enabled,
             BooleanOption::HeaderIncluded => options.header_included = enabled,
             BooleanOption::NoCheck => options.no_check = enabled,
+            BooleanOption::Broadcast => options.broadcast = enabled,
+            BooleanOption::ReceiveHopLimit => options.receive_hop_limit = enabled,
+            BooleanOption::ReceiveHopLimit2292 => options.receive_hop_limit_2292 = enabled,
         }
         if state.kind == Kind::Tcp {
             if let Some(handle) = state.handle {
@@ -1409,7 +1560,10 @@ impl Sockets {
                     | BooleanOption::Timestamp
                     | BooleanOption::ReceiveTtl
                     | BooleanOption::HeaderIncluded
-                    | BooleanOption::NoCheck => {}
+                    | BooleanOption::NoCheck
+                    | BooleanOption::Broadcast
+                    | BooleanOption::ReceiveHopLimit
+                    | BooleanOption::ReceiveHopLimit2292 => {}
                 }
             }
         }
@@ -1428,6 +1582,9 @@ impl Sockets {
             BooleanOption::ReceiveTtl => options.receive_ttl,
             BooleanOption::HeaderIncluded => options.header_included,
             BooleanOption::NoCheck => options.no_check,
+            BooleanOption::Broadcast => options.broadcast,
+            BooleanOption::ReceiveHopLimit => options.receive_hop_limit,
+            BooleanOption::ReceiveHopLimit2292 => options.receive_hop_limit_2292,
         })
     }
 
@@ -1978,6 +2135,9 @@ impl Sockets {
     /// (its port, chosen now if it has none) and the checksum filled in, as
     /// Linux; a raw socket sends the message as it is.
     fn send_icmp(&mut self, id: SlotId, input: &[u8], remote: IpEndpoint) -> Result<usize, Error> {
+        if self.slot(id).is_some_and(|state| state.ipv6) {
+            return self.send_icmpv6(id, input, remote);
+        }
         let IpAddress::Ipv4(_) = remote.addr else {
             return Err(Error::Unavailable);
         };
@@ -2034,19 +2194,88 @@ impl Sockets {
             .map_err(|_| Error::WouldBlock)
     }
 
+    /// Sends `input`, an ICMPv6 message, to `remote`'s address (IPv6
+    /// loopback: the only IPv6 address here; the unspecified address means
+    /// it too). A ping socket sends only echo requests (EINVAL otherwise,
+    /// and for an IPv4 address), with its identifier; every message gets
+    /// its checksum.
+    fn send_icmpv6(
+        &mut self,
+        id: SlotId,
+        input: &[u8],
+        remote: IpEndpoint,
+    ) -> Result<usize, Error> {
+        const ECHO_REQUEST: u8 = 128;
+        let IpAddress::Ipv6(destination) = remote.addr else {
+            return Err(Error::Invalid);
+        };
+        let destination = if destination.is_unspecified() {
+            Ipv6Address::LOCALHOST
+        } else {
+            destination
+        };
+        if !destination.is_loopback() {
+            return Err(Error::Unavailable);
+        }
+        let index = usize::from(id);
+        self.start_runtime()?;
+        let Self { runtime, slots, .. } = self;
+        let runtime = runtime.as_mut().ok_or(Error::Unavailable)?;
+        let state = slot_in(slots, id).ok_or(Error::Invalid)?;
+        let (raw, handle, ttl) = (state.icmp_raw, state.handle, state.options.ttl);
+        // A ping socket's checksum is always ICMPv6's.
+        let checksum = if raw {
+            usize::try_from(state.icmpv6_checksum).ok()
+        } else {
+            Some(2)
+        };
+        let mut message = filled(input.len(), 0_u8)?;
+        message.copy_from_slice(input);
+        if !raw {
+            if message.len() < 8 || message[0] != ECHO_REQUEST || message[1] != 0 {
+                return Err(Error::Invalid);
+            }
+            let identifier = match state.local_port {
+                0 => allocate_ephemeral_port(&mut runtime.next_port, slots, Kind::Icmp, index)
+                    .ok_or(Error::Exhausted)?,
+                port => port,
+            };
+            slot_in_mut(slots, id).ok_or(Error::Invalid)?.local_port = identifier;
+            message[4..6].copy_from_slice(&identifier.to_be_bytes());
+        }
+        let hop_limit = if ttl == 0 { DEFAULT_TTL } else { ttl };
+        let packet = icmpv6_packet(
+            Ipv6Address::LOCALHOST,
+            destination,
+            hop_limit,
+            &message,
+            checksum,
+        )?;
+        runtime
+            .sockets
+            .get_mut::<raw::Socket>(handle.ok_or(Error::Invalid)?)
+            .send_slice(&packet)
+            .map(|()| input.len())
+            .map_err(|_| Error::WouldBlock)
+    }
+
     /// Drops the packets at the front of ICMP socket `id`'s queue that are
     /// not for it, and says whether one that is waits there: an echo reply
     /// with its identifier for a ping socket, a type its filter passes for
     /// a raw one.
     fn icmp_ready(&mut self, id: SlotId) -> bool {
+        const ECHO_REPLY: u8 = 0;
+        const ECHOV6_REPLY: u8 = 129;
         let Some(state) = self.slot(id) else {
             return false;
         };
-        let (raw, filter, identifier, handle) = (
+        let (raw, filter, filter_v6, identifier, handle, ipv6) = (
             state.icmp_raw,
             state.icmp_filter,
+            state.icmpv6_filter,
             state.local_port,
             state.handle,
+            state.ipv6,
         );
         let (Some(runtime), Some(handle)) = (self.runtime.as_mut(), handle) else {
             return false;
@@ -2055,10 +2284,21 @@ impl Sockets {
         loop {
             let wanted = match socket.peek() {
                 Ok(packet) => IcmpPacket::parse(packet).is_some_and(|packet| {
-                    if raw {
-                        packet.icmp_type >= 32 || filter >> packet.icmp_type & 1 == 0
-                    } else {
-                        packet.icmp_type == 0 && packet.identifier == identifier
+                    let kind = packet.icmp_type;
+                    match (raw, ipv6) {
+                        (true, false) => kind >= 32 || filter >> kind & 1 == 0,
+                        (true, true) => {
+                            let word = usize::from(kind >> 5) * 4;
+                            let word = u32::from_ne_bytes([
+                                filter_v6[word],
+                                filter_v6[word + 1],
+                                filter_v6[word + 2],
+                                filter_v6[word + 3],
+                            ]);
+                            word >> (kind & 31) & 1 == 0
+                        }
+                        (false, false) => kind == ECHO_REPLY && packet.identifier == identifier,
+                        (false, true) => kind == ECHOV6_REPLY && packet.identifier == identifier,
                     }
                 }),
                 Err(_) => return false,
@@ -2092,7 +2332,9 @@ impl Sockets {
         }
         .map_err(|_| Error::WouldBlock)?;
         let header = IcmpPacket::parse(packet).ok_or(Error::WouldBlock)?;
-        let datagram = if raw {
+        // An IPv4 raw socket receives the whole packet; a ping socket, and
+        // any ICMPv6 one, the message alone.
+        let datagram = if raw && !matches!(header.source, IpAddress::Ipv6(_)) {
             packet
         } else {
             &packet[header.header_length..]
@@ -2101,7 +2343,7 @@ impl Sockets {
         output[..copied].copy_from_slice(&datagram[..copied]);
         let length = datagram.len();
         self.slot_mut(id).ok_or(Error::Invalid)?.received_ttl = header.ttl;
-        Ok((copied, length, Some(endpoint(header.source, 0))))
+        Ok((copied, length, Some(IpEndpoint::new(header.source, 0))))
     }
 
     /// What a local stream with nothing queued returns: EAGAIN while its
@@ -2514,7 +2756,9 @@ impl Sockets {
                     None => IpAddress::Ipv6(Ipv6Address::UNSPECIFIED),
                 })
         } else {
-            own
+            // An IPv4 socket bound to an address is named by it (a
+            // datagram socket takes only what is sent there).
+            state.bound.unwrap_or(own)
         };
         Some((IpEndpoint::new(local, state.local_port), state.remote))
     }
@@ -3098,6 +3342,60 @@ pub(crate) fn open_icmp(raw: bool) -> Result<SlotId, Error> {
     SOCKETS.lock().open_icmp(raw)
 }
 
+/// Opens an ICMPv6 socket: a raw one (SOCK_RAW) or a ping socket.
+pub(crate) fn open_icmpv6(raw: bool) -> Result<SlotId, Error> {
+    SOCKETS.lock().open_icmpv6(raw)
+}
+
+/// Sets ICMPV6_FILTER of raw ICMPv6 socket `id` from the first bytes of
+/// a struct icmp6_filter (as many as were given, as Linux copies).
+pub(crate) fn set_icmpv6_filter(id: SlotId, bytes: &[u8]) -> Result<(), Error> {
+    let mut sockets = SOCKETS.lock();
+    let state = sockets
+        .slot_mut(id)
+        .filter(|state| state.kind == Kind::Icmp && state.icmp_raw && state.ipv6)
+        .ok_or(Error::Invalid)?;
+    let length = bytes.len().min(state.icmpv6_filter.len());
+    state.icmpv6_filter[..length].copy_from_slice(&bytes[..length]);
+    Ok(())
+}
+
+/// Sets IPV6_CHECKSUM (SOL_RAW) of raw ICMPv6 socket `id`: the checksum's
+/// offset in the messages it sends, or -1 for none. An odd offset is
+/// EINVAL, as Linux takes the field to be 16-bit aligned.
+pub(crate) fn set_icmpv6_checksum(id: SlotId, offset: i32) -> Result<(), Error> {
+    if offset > 0 && offset % 2 != 0 {
+        return Err(Error::Invalid);
+    }
+    let mut sockets = SOCKETS.lock();
+    let state = sockets
+        .slot_mut(id)
+        .filter(|state| state.kind == Kind::Icmp && state.icmp_raw && state.ipv6)
+        .ok_or(Error::Invalid)?;
+    state.icmpv6_checksum = offset.max(-1);
+    Ok(())
+}
+
+/// IPV6_CHECKSUM of raw ICMPv6 socket `id`.
+pub(crate) fn icmpv6_checksum(id: SlotId) -> Result<i32, Error> {
+    SOCKETS
+        .lock()
+        .slot(id)
+        .filter(|state| state.kind == Kind::Icmp && state.icmp_raw && state.ipv6)
+        .map(|state| state.icmpv6_checksum)
+        .ok_or(Error::Invalid)
+}
+
+/// ICMPV6_FILTER of raw ICMPv6 socket `id`, as a struct icmp6_filter.
+pub(crate) fn icmpv6_filter(id: SlotId) -> Result<[u8; 32], Error> {
+    SOCKETS
+        .lock()
+        .slot(id)
+        .filter(|state| state.kind == Kind::Icmp && state.icmp_raw && state.ipv6)
+        .map(|state| state.icmpv6_filter)
+        .ok_or(Error::Invalid)
+}
+
 /// The TTL of the datagram ICMP socket `id` received last.
 pub(crate) fn received_ttl(id: SlotId) -> Option<u8> {
     SOCKETS
@@ -3152,7 +3450,7 @@ pub(crate) fn set_icmp_filter(id: SlotId, filter: u32) -> Result<(), Error> {
     let mut sockets = SOCKETS.lock();
     let state = sockets
         .slot_mut(id)
-        .filter(|state| state.kind == Kind::Icmp && state.icmp_raw)
+        .filter(|state| state.kind == Kind::Icmp && state.icmp_raw && !state.ipv6)
         .ok_or(Error::Invalid)?;
     state.icmp_filter = filter;
     Ok(())
@@ -3163,7 +3461,7 @@ pub(crate) fn icmp_filter(id: SlotId) -> Result<u32, Error> {
     SOCKETS
         .lock()
         .slot(id)
-        .filter(|state| state.kind == Kind::Icmp && state.icmp_raw)
+        .filter(|state| state.kind == Kind::Icmp && state.icmp_raw && !state.ipv6)
         .map(|state| state.icmp_filter)
         .ok_or(Error::Invalid)
 }

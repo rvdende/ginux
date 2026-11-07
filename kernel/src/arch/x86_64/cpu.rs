@@ -41005,6 +41005,7 @@ fn linux_socket_create(family: u64, socket_type: u64, protocol: u64) -> u64 {
     const SOCK_NONBLOCK: u64 = 0x800;
     const SOCK_CLOEXEC: u64 = 0x8_0000;
     const IPPROTO_ICMP: u64 = 1;
+    const IPPROTO_ICMPV6: u64 = 58;
     const AF_NETLINK: u64 = 16;
     const AF_PACKET: u64 = 17;
     let family = u64::from(family as u32);
@@ -41038,13 +41039,21 @@ fn linux_socket_create(family: u64, socket_type: u64, protocol: u64) -> u64 {
             crate::linux_socket::Kind::Icmp
         }
         (AF_INET, SOCK_STREAM | SOCK_DGRAM | SOCK_RAW) => return LINUX_EPROTONOSUPPORT,
-        // AF_INET6 TCP and UDP; ICMPv6 and raw IPv6 sockets are not made
-        // here.
+        // AF_INET6 TCP and UDP, and ICMPv6 ping and raw sockets; raw
+        // sockets of other IPv6 protocols are not made here.
         (AF_INET6, SOCK_STREAM) if matches!(protocol, 0 | 6) => crate::linux_socket::Kind::Tcp,
         (AF_INET6, SOCK_DGRAM) if matches!(protocol, 0 | 17) => crate::linux_socket::Kind::Udp,
+        (AF_INET6, SOCK_DGRAM | SOCK_RAW) if protocol == IPPROTO_ICMPV6 => {
+            crate::linux_socket::Kind::Icmp
+        }
         (AF_INET6, SOCK_STREAM | SOCK_DGRAM | SOCK_RAW) => return LINUX_EPROTONOSUPPORT,
         _ => return LINUX_EINVAL,
     };
+    // A raw socket needs CAP_NET_RAW, checked once the protocol is known,
+    // as Linux's inet_create and inet6_create do.
+    if base == SOCK_RAW && !linux_has_capability(ginux_credentials::capability::NET_RAW) {
+        return LINUX_EPERM;
+    }
     let Some(descriptor) = (LINUX_AUX_DESCRIPTOR_FIRST..LINUX_AUX_DESCRIPTOR_LIMIT)
         .find(|descriptor| linux_aux_descriptor_free(*descriptor))
     else {
@@ -41052,6 +41061,8 @@ fn linux_socket_create(family: u64, socket_type: u64, protocol: u64) -> u64 {
     };
     let slot = match if kind == crate::linux_socket::Kind::Unix {
         crate::linux_socket::open_unix(base as u8)
+    } else if kind == crate::linux_socket::Kind::Icmp && family == AF_INET6 {
+        crate::linux_socket::open_icmpv6(base == SOCK_RAW)
     } else if kind == crate::linux_socket::Kind::Icmp {
         crate::linux_socket::open_icmp(base == SOCK_RAW)
     } else if family == AF_INET6 {
@@ -41157,7 +41168,10 @@ fn linux_socket_pair(family: u64, socket_type: u64, protocol: u64, output: u64) 
         }
         let made = matches!(
             (family, base, protocol),
-            (_, SOCK_STREAM, 0 | 6) | (_, SOCK_DGRAM, 0 | 17) | (AF_INET, SOCK_DGRAM | SOCK_RAW, 1)
+            (_, SOCK_STREAM, 0 | 6)
+                | (_, SOCK_DGRAM, 0 | 17)
+                | (AF_INET, SOCK_DGRAM | SOCK_RAW, 1)
+                | (AF_INET6, SOCK_DGRAM | SOCK_RAW, 58)
         );
         return if made {
             LINUX_EOPNOTSUPP
@@ -41271,7 +41285,7 @@ fn linux_inet_address(
 }
 
 /// A destination for socket `slot` (connect, sendto, sendmsg): port 0 is
-/// EINVAL; an AF_INET6 socket reaches an IPv4-mapped address over IPv4,
+/// EINVAL, except for ICMP sockets, which have none; an AF_INET6 socket reaches an IPv4-mapped address over IPv4,
 /// which an IPV6_V6ONLY one cannot (ENETUNREACH). The unspecified address
 /// stays: the socket table takes it as the local host, as Linux does.
 fn linux_socket_address(
@@ -41280,7 +41294,7 @@ fn linux_socket_address(
     length: u64,
 ) -> Result<smoltcp::wire::IpEndpoint, u64> {
     let (ip, port) = linux_inet_address(slot, address, length)?;
-    if port == 0 {
+    if port == 0 && crate::linux_socket::kind(slot) != Some(crate::linux_socket::Kind::Icmp) {
         return Err(LINUX_EINVAL);
     }
     let ip = match crate::linux_socket::ipv4_of(ip) {
@@ -42607,6 +42621,35 @@ fn linux_socket_recvmsg(
             control_length += 24;
         }
     }
+    // IPV6_RECVHOPLIMIT and IPV6_2292HOPLIMIT: the hop limit an ICMPv6
+    // datagram arrived with (SOL_IPV6, IPV6_HOPLIMIT, or the RFC 2292 type).
+    for (option, kind) in [
+        (crate::linux_socket::BooleanOption::ReceiveHopLimit, 52_i32),
+        (
+            crate::linux_socket::BooleanOption::ReceiveHopLimit2292,
+            8_i32,
+        ),
+    ] {
+        let Some(hop_limit) = crate::linux_socket::received_ttl(slot).filter(|_| {
+            crate::linux_socket::is_ipv6(slot)
+                && crate::linux_socket::boolean_option(slot, option).unwrap_or(false)
+        }) else {
+            continue;
+        };
+        if control_capacity.saturating_sub(control_length) < 24 {
+            output_flags |= MSG_CTRUNC;
+            continue;
+        }
+        let mut ancillary = [0_u8; 24];
+        ancillary[..8].copy_from_slice(&20_u64.to_ne_bytes());
+        ancillary[8..12].copy_from_slice(&41_i32.to_ne_bytes());
+        ancillary[12..16].copy_from_slice(&kind.to_ne_bytes());
+        ancillary[16..20].copy_from_slice(&i32::from(hop_limit).to_ne_bytes());
+        if !copy_to_linux_user(control + control_length, &ancillary) {
+            return LINUX_EFAULT;
+        }
+        control_length += 24;
+    }
     header[40..48].copy_from_slice(&control_length.to_ne_bytes());
     header[48..52].copy_from_slice(&output_flags.to_ne_bytes());
     if !copy_to_linux_user(message, &header) {
@@ -43288,6 +43331,9 @@ fn linux_socket_setsockopt(
     if level == 41 {
         return linux_ipv6_setsockopt(slot, option, value, length);
     }
+    if level == LINUX_SOL_ICMPV6 && crate::linux_socket::is_ipv6(slot) {
+        return linux_icmpv6_setsockopt(slot, option, value, length);
+    }
     // SO_OOBINLINE: an int, read and checked as Linux does (a short length
     // EINVAL, an unreadable value EFAULT); urgent data is not kept apart.
     if level == 1 && option == 10 {
@@ -43356,6 +43402,21 @@ fn linux_socket_setsockopt(
         return crate::linux_socket::change_group(slot, group, matches!(option, 35 | 42))
             .map_or_else(linux_socket_error, |()| 0);
     }
+    // SOL_RAW IPV6_CHECKSUM of a raw ICMPv6 socket: an int offset.
+    if (level, option) == (255, 7) && crate::linux_socket::is_ipv6(slot) {
+        if !crate::linux_socket::is_raw(slot) {
+            return LINUX_ENOPROTOOPT;
+        }
+        if length < 4 {
+            return LINUX_EINVAL;
+        }
+        let mut supplied = [0_u8; 4];
+        if !copy_from_linux_user(value, &mut supplied) {
+            return LINUX_EFAULT;
+        }
+        return crate::linux_socket::set_icmpv6_checksum(slot, i32::from_ne_bytes(supplied))
+            .map_or_else(linux_socket_error, |()| 0);
+    }
     if matches!((level, option), (0, 2) | (255, 1)) {
         if length < 4 {
             return LINUX_EINVAL;
@@ -43390,6 +43451,7 @@ fn linux_socket_setsockopt(
             Some(crate::linux_socket::BooleanOption::HeaderIncluded)
         }
         (1, 2) => Some(crate::linux_socket::BooleanOption::ReuseAddress),
+        (1, 6) => Some(crate::linux_socket::BooleanOption::Broadcast),
         (1, 9) => Some(crate::linux_socket::BooleanOption::KeepAlive),
         (1, 11) => Some(crate::linux_socket::BooleanOption::NoCheck),
         (1, 16) => Some(crate::linux_socket::BooleanOption::PassCredentials),
@@ -43422,6 +43484,69 @@ fn linux_socket_setsockopt(
         crate::linux_socket::set_boolean_option(slot, option, enabled)
             .map_or_else(linux_socket_error, |()| 0)
     })
+}
+
+/// SOL_ICMPV6 (IPPROTO_ICMPV6), the level of ICMPV6_FILTER.
+const LINUX_SOL_ICMPV6: u64 = 58;
+/// ICMPV6_FILTER: a raw ICMPv6 socket's struct icmp6_filter.
+const LINUX_ICMPV6_FILTER: u64 = 1;
+
+/// setsockopt(SOL_ICMPV6, ...) on AF_INET6 socket `slot`: ICMPV6_FILTER
+/// on a raw ICMPv6 socket, as many bytes of the filter as are given (up to
+/// its 32). Other sockets lack the level (ENOPROTOOPT, as ipv6_setsockopt
+/// answers a ping, TCP or UDP socket).
+fn linux_icmpv6_setsockopt(
+    slot: crate::linux_socket::SlotId,
+    option: u64,
+    value: u64,
+    length: u64,
+) -> u64 {
+    if !crate::linux_socket::is_raw(slot) {
+        return LINUX_ENOPROTOOPT;
+    }
+    if option != LINUX_ICMPV6_FILTER {
+        return LINUX_ENOPROTOOPT;
+    }
+    let mut filter = [0_u8; 32];
+    let length = usize::try_from(length)
+        .unwrap_or(usize::MAX)
+        .min(filter.len());
+    if !copy_from_linux_user(value, &mut filter[..length]) {
+        return LINUX_EFAULT;
+    }
+    crate::linux_socket::set_icmpv6_filter(slot, &filter[..length])
+        .map_or_else(linux_socket_error, |()| 0)
+}
+
+/// getsockopt(SOL_ICMPV6, ICMPV6_FILTER) on a raw ICMPv6 socket: as much
+/// of the filter as the length has room for (a negative one EINVAL).
+fn linux_icmpv6_getsockopt(
+    slot: crate::linux_socket::SlotId,
+    option: u64,
+    value: u64,
+    length: u64,
+) -> u64 {
+    if !crate::linux_socket::is_raw(slot) || option != LINUX_ICMPV6_FILTER {
+        return LINUX_ENOPROTOOPT;
+    }
+    let mut supplied = [0_u8; 4];
+    if !copy_from_linux_user(length, &mut supplied) {
+        return LINUX_EFAULT;
+    }
+    let Ok(supplied) = usize::try_from(i32::from_ne_bytes(supplied)) else {
+        return LINUX_EINVAL;
+    };
+    let filter = match crate::linux_socket::icmpv6_filter(slot) {
+        Ok(filter) => filter,
+        Err(error) => return linux_socket_error(error),
+    };
+    let copied = supplied.min(filter.len());
+    if !copy_to_linux_user(length, &(copied as u32).to_ne_bytes())
+        || copied != 0 && !copy_to_linux_user(value, &filter[..copied])
+    {
+        return LINUX_EFAULT;
+    }
+    0
 }
 
 /// IPV6_V6ONLY (an int).
@@ -43475,6 +43600,21 @@ fn linux_ipv6_setsockopt(
             Ok(_) => LINUX_EINVAL,
             Err(error) => error,
         },
+        // IPV6_RECVHOPLIMIT and IPV6_2292HOPLIMIT: an int, nonzero to
+        // receive each datagram's hop limit.
+        51 | 8 => match read_int() {
+            Ok(enabled) => crate::linux_socket::set_boolean_option(
+                slot,
+                if option == 51 {
+                    crate::linux_socket::BooleanOption::ReceiveHopLimit
+                } else {
+                    crate::linux_socket::BooleanOption::ReceiveHopLimit2292
+                },
+                enabled != 0,
+            )
+            .map_or_else(linux_socket_error, |()| 0),
+            Err(error) => error,
+        },
         // IPV6_RTHDR: routing headers are not sent here, so none is taken
         // (EINVAL, as Linux answers a type it does not build).
         57 => {
@@ -43507,6 +43647,17 @@ fn linux_ipv6_getsockopt(
     };
     let result = match option {
         LINUX_IPV6_V6ONLY => i32::from(crate::linux_socket::v6only(slot).unwrap_or(false)),
+        51 | 8 => i32::from(
+            crate::linux_socket::boolean_option(
+                slot,
+                if option == 51 {
+                    crate::linux_socket::BooleanOption::ReceiveHopLimit
+                } else {
+                    crate::linux_socket::BooleanOption::ReceiveHopLimit2292
+                },
+            )
+            .unwrap_or(false),
+        ),
         // A connected socket's route MTU: loopback's 65536, eth0's 1500;
         // ENOTCONN with no route yet, as in Linux.
         LINUX_IPV6_MTU => match crate::linux_socket::names(slot).and_then(|(_, remote)| remote) {
@@ -43550,6 +43701,9 @@ fn linux_socket_getsockopt(
     }
     if level == 41 {
         return linux_ipv6_getsockopt(slot, option, value, length);
+    }
+    if level == LINUX_SOL_ICMPV6 && crate::linux_socket::is_ipv6(slot) {
+        return linux_icmpv6_getsockopt(slot, option, value, length);
     }
     if level == 1 && option == 17 {
         if crate::linux_socket::kind(slot) != Some(crate::linux_socket::Kind::Unix) {
@@ -43666,6 +43820,16 @@ fn linux_socket_getsockopt(
             Ok(value) => value,
             Err(error) => return error,
         },
+        (1, 6) => match read_boolean(crate::linux_socket::BooleanOption::Broadcast) {
+            Ok(value) => value,
+            Err(error) => return error,
+        },
+        (255, 7) if crate::linux_socket::is_ipv6(slot) => {
+            match crate::linux_socket::icmpv6_checksum(slot) {
+                Ok(offset) => offset,
+                Err(_) => return LINUX_ENOPROTOOPT,
+            }
+        }
         (1, 11) => match read_boolean(crate::linux_socket::BooleanOption::NoCheck) {
             Ok(value) => value,
             Err(error) => return error,
@@ -43698,6 +43862,7 @@ fn linux_socket_getsockopt(
         (1, 38) => match crate::linux_socket::kind(slot) {
             Some(crate::linux_socket::Kind::Tcp) => 6,
             Some(crate::linux_socket::Kind::Udp) => 17,
+            Some(crate::linux_socket::Kind::Icmp) if crate::linux_socket::is_ipv6(slot) => 58,
             Some(crate::linux_socket::Kind::Icmp) => 1,
             Some(crate::linux_socket::Kind::Unix) => 0,
             Some(crate::linux_socket::Kind::Netlink) => crate::linux_socket::netlink_address(slot)
@@ -43708,11 +43873,11 @@ fn linux_socket_getsockopt(
             None => return LINUX_EBADF,
         },
         (1, 39) => match crate::linux_socket::kind(slot) {
-            Some(crate::linux_socket::Kind::Tcp | crate::linux_socket::Kind::Udp)
-                if crate::linux_socket::is_ipv6(slot) =>
-            {
-                10
-            }
+            Some(
+                crate::linux_socket::Kind::Tcp
+                | crate::linux_socket::Kind::Udp
+                | crate::linux_socket::Kind::Icmp,
+            ) if crate::linux_socket::is_ipv6(slot) => 10,
             Some(
                 crate::linux_socket::Kind::Tcp
                 | crate::linux_socket::Kind::Udp
