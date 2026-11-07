@@ -98,9 +98,24 @@ feature rather than a fix:
   it is made when first touched. Placement also avoids recorded areas.
   Smaller mappings still reserve each page; moving them to areas too is
   the roadmap's next memory step.
-- **Shared-resource clones** (clone02, clone05, clone08, clone10,
-  clone301, kcmp03): CLONE_VM, CLONE_FILES, CLONE_FS or CLONE_SIGHAND
-  without CLONE_THREAD, and CLONE_PARENT. Ginux keeps these per process.
+- **Shared-resource clones** (clone02, clone05, kcmp03 pass): a process
+  clone may share its parent's memory, descriptor table, filesystem
+  context and signal handlers (CLONE_VM, CLONE_FILES, CLONE_FS,
+  CLONE_SIGHAND), take another parent (CLONE_PARENT), exit signal,
+  thread pointer and tid words. Each process names what it shares by an
+  id in the registry (`linux_process::SharedResource`; kcmp compares
+  them). A CLONE_VM child maps its parent's pages, which are made the
+  parent's own first so writes are seen both ways; mappings made after
+  the clone are not shared. Shared runtime state lives in each sharer's
+  record and is brought into the bank as a call starts and written back
+  to every sharer as it ends (`pull/push_linux_shared_runtime_state`);
+  the group holds one table's open files, released by the last to go,
+  and exec unshares descriptors and handlers. A vfork parent waits until
+  its child executes or exits (`linux_vfork_wait_live`). Still failing:
+  clone301's CLONE_NEWPID case (no PID namespaces) and clone09 (no
+  network namespaces or /proc/sys/net); clone08 and clone10 are skipped
+  because musl's clone() refuses CLONE_THREAD, CLONE_SETTLS and
+  CLONE_CHILD_CLEARTID.
 - **Privileged operations** now run in a domain set `privileged=true`
   (the LTP domain is): root there holds machine-level authority, so
   reboot resets the machine and syslog reads the machine's kernel log
@@ -282,7 +297,7 @@ Smaller ones: setting the clock is Policy-denied (`clock_settime01..04`,
 reading stale data, guarded-buffer corruption in `chmod01`, `renameat2`
 flags (`EINVAL`), `removexattr` returning `ENODATA` for `ENOENT`,
 `open(O_DIRECTORY)` succeeding on a FIFO (`fcntl07`: LTP's cleanup then
-fails with `ENOTDIR`), and `clone` with `CLONE_PARENT` (`EINVAL`). TCONF is
+fails with `ENOTDIR`). TCONF is
 mostly expected: no libnuma in the static build (20), `ramfs` lacks leases,
 no hugetlbfs, 32-bit-only syscalls.
 

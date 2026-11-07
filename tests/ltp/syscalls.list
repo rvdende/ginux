@@ -113,9 +113,9 @@ clone04 clone04
 clone05 clone05
 clone06 clone06
 clone07 clone07
-clone08 clone08
+!clone08 clone08  # musl: clone() refuses CLONE_CHILD_CLEARTID with EINVAL before the system call, so the CLONE_THREAD case cannot run (the CLONE_PARENT and tid cases pass)
 clone09 clone09
-clone10 clone10
+!clone10 clone10  # musl: clone() refuses CLONE_THREAD, CLONE_SETTLS and CLONE_CHILD_CLEARTID with EINVAL before the system call
 clone11 clone11
 clone301 clone301
 clone302 clone302

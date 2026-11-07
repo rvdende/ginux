@@ -1628,6 +1628,7 @@ pub(super) fn linux_reap_ignored_children() {
         exited: true,
         stopped: false,
         continued: false,
+        scope: linux_process::ChildScope::All,
     };
     while let Some(linux_process::ChildWaitState::Exited { pid, .. }) =
         linux_process::live_child_wait_state(parent, None, exited)

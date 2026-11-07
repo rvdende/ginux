@@ -232,12 +232,31 @@ fn linux_syscall_dispatch(
         return linux_clock_gettime(saved_registers.rdi, saved_registers.rsi);
     }
     let _kernel_entry = crate::sync::kernel_entry_lock();
+    // Dropped before the lock: what the call changed of state shared with
+    // other processes reaches them while it still holds it.
+    let _shared_state = LinuxSharedStateCall::enter();
     // Before the usual context checks: the timer, not the program, chose
     // this call and saved the context it stands for.
     if number == LINUX_PREEMPT_SYSCALL {
         if let Some(result) = linux_complete_timer_preemption(registers, user_rip) {
             return result;
         }
+    }
+    // A vfork parent resumed into its wait for the child, which is not one
+    // of the program's own calls (no seccomp filter or trace sees it).
+    if number == LINUX_VFORK_WAIT_SYSCALL
+        && linux_light_thread_here().is_none()
+        && linux_process::live_process_vfork_child(current_linux_process_pid()).is_some()
+    {
+        let caller = LinuxUserContext {
+            registers: saved_registers,
+            rip: user_rip,
+            rsp: user_stack,
+            rflags: user_rflags,
+            rax: 0,
+            fs_base: active_fs_base(),
+        };
+        return linux_vfork_wait_live(registers, caller);
     }
     // A thread on the light path: it leaves the CPU when its process ends,
     // and calls the light path does not run go to the process's owner.
@@ -1317,47 +1336,33 @@ fn linux_syscall_dispatch(
                 result
             }
         }
-        LINUX_CLONE_SYSCALL
-            if runtime_mode
-                && saved_registers.rdi & LINUX_CLONE_THREAD == 0
-                && saved_registers.rdi & 0xff == LINUX_SIGCHLD =>
-        {
-            // musl's posix_spawn creates its child with
-            // clone(CLONE_VM | CLONE_VFORK | SIGCHLD, stack), the process
-            // form that clone3 already routes to the fork machinery. It is
-            // not run as a CLONE_VM child: the child still maps its parent's
-            // pages (it has its own stack), but the parent's registry is
-            // refreshed in full first, and the child keeps running after
-            // exec until it exits or blocks instead of the parent resuming
-            // inside the fork.
-            // A plain clone(SIGCHLD, stack), as LTP's ltp_clone makes, is a
-            // fork whose child starts on that stack: the same request, with
-            // the child's pages its own copy as a fork's.
+        LINUX_CLONE_SYSCALL if runtime_mode && saved_registers.rdi & LINUX_CLONE_THREAD == 0 => {
+            // A process: clone(flags | signal, stack, parent_tid, child_tid,
+            // tls). musl's posix_spawn makes one with
+            // clone(CLONE_VM | CLONE_VFORK | SIGCHLD, stack), LTP's ltp_clone
+            // plain forks on a stack and the sharing forms.
             let flags = saved_registers.rdi;
-            let child_stack = saved_registers.rsi;
-            if flags & !(0xff | LINUX_CLONE_VM | LINUX_CLONE_VFORK | LINUX_CLONE_PROCESS_NAMESPACES)
-                != 0
-                || (flags & LINUX_CLONE_VM != 0 && flags & LINUX_CLONE_VFORK == 0)
-                || child_stack == 0
-            {
+            if flags & LINUX_CLONE_PIDFD != 0 && flags & LINUX_CLONE_PARENT_SETTID != 0 {
+                // clone's pidfd goes where the parent's tid would.
                 LINUX_EINVAL
-            } else if !materialize_linux_runtime_user_range(
-                (child_stack - 1) & !(PAGE_SIZE as u64 - 1),
-                PAGE_SIZE,
-                true,
-            ) {
-                LINUX_EFAULT
             } else {
-                linux_request_process_fork(
-                    true,
+                linux_clone_process(
+                    LinuxProcessClone {
+                        flags: flags & !0xff,
+                        exit_signal: flags & 0xff,
+                        stack: saved_registers.rsi,
+                        parent_tid: saved_registers.rdx,
+                        child_tid: saved_registers.r10,
+                        tls: saved_registers.r8,
+                        pidfd: if flags & LINUX_CLONE_PIDFD != 0 {
+                            saved_registers.rdx
+                        } else {
+                            0
+                        },
+                        cgroup_generation: 0,
+                    },
                     syscall_return,
-                    flags & LINUX_CLONE_PROCESS_NAMESPACES,
-                    child_stack,
-                    false,
-                    0,
-                    0,
-                    false,
-                    flags & LINUX_CLONE_VM == 0,
+                    true,
                 )
             }
         }
@@ -1417,7 +1422,25 @@ fn linux_syscall_dispatch(
             false,
         ),
         LINUX_VFORK_SYSCALL => {
-            linux_request_process_fork(runtime_mode, syscall_return, 0, 0, true, 0, 0, false, false)
+            let result = linux_request_process_fork(
+                runtime_mode,
+                syscall_return,
+                0,
+                0,
+                true,
+                0,
+                0,
+                false,
+                false,
+            );
+            // The parent is suspended until the child executes or exits.
+            if result == LINUX_RETURN_TO_KERNEL {
+                X86_RUNTIME.LINUX_FORK_CLONE_FLAGS.store(
+                    LINUX_FORK_CLONE_REQUESTED | LINUX_CLONE_VM | LINUX_CLONE_VFORK | LINUX_SIGCHLD,
+                    Ordering::SeqCst,
+                );
+            }
+            result
         }
         LINUX_EXECVE_SYSCALL => {
             if runtime_mode && !refresh_live_linux_process_registry(syscall_return) {
@@ -2035,6 +2058,19 @@ fn linux_syscall_dispatch(
             linux_exit_child_to_parent(registers, syscall_return)
         }
         LINUX_EXIT_SYSCALL | LINUX_EXIT_GROUP_SYSCALL if current_linux_process_pid() != 1 => {
+            // Memory others still use sees the exit: the tid word
+            // (CLONE_CHILD_CLEARTID, set_tid_address) is cleared and woken,
+            // as Linux does while the memory has other users.
+            let clear_child_tid = current_linux_clear_child_tid().unwrap_or(0);
+            if clear_child_tid != 0
+                && linux_process::live_process_resource_shared(
+                    current_linux_process_pid(),
+                    linux_process::SharedResource::Memory,
+                )
+                && copy_to_linux_user(clear_child_tid, &0_u32.to_ne_bytes())
+            {
+                let _ = wake_linux_futex(clear_child_tid, 1);
+            }
             if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
                 && !refresh_live_linux_process_registry(syscall_return)
             {

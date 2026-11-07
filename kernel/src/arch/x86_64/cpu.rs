@@ -457,6 +457,13 @@ struct X86RuntimeOwner {
     /// (clone(SIGCHLD, stack), clone3 with a stack), not shared as
     /// posix_spawn's CLONE_VM form shares them.
     LINUX_FORK_OWN_PAGES: RuntimeRef<CpuBankedAtomicBool>,
+    /// The clone flags of a process clone that the fork transaction acts
+    /// on (`LinuxProcessClone`), the exit signal in the low byte.
+    LINUX_FORK_CLONE_FLAGS: RuntimeRef<CpuBankedAtomicU64>,
+    /// CLONE_SETTLS: the child's thread pointer.
+    LINUX_FORK_TLS: RuntimeRef<CpuBankedAtomicU64>,
+    /// CLONE_CHILD_CLEARTID: the word the child's exit clears and wakes.
+    LINUX_FORK_CLEAR_TID_ADDRESS: RuntimeRef<CpuBankedAtomicU64>,
     LINUX_FORK_NEW_MOUNT_NAMESPACE: RuntimeRef<CpuBankedAtomicBool>,
     LINUX_FORK_NEW_USER_NAMESPACE: RuntimeRef<CpuBankedAtomicBool>,
     LINUX_FORK_PIDFD_ADDRESS: RuntimeRef<CpuBankedAtomicU64>,
@@ -972,6 +979,9 @@ static X86_RUNTIME: X86RuntimeOwner = X86RuntimeOwner {
     LINUX_FORK_PARENT_TID_ADDRESS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_FORK_PARENT_TID_ADDRESS),
     LINUX_FORK_CLEAR_SIGHAND: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_FORK_CLEAR_SIGHAND),
     LINUX_FORK_OWN_PAGES: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_FORK_OWN_PAGES),
+    LINUX_FORK_CLONE_FLAGS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_FORK_CLONE_FLAGS),
+    LINUX_FORK_TLS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_FORK_TLS),
+    LINUX_FORK_CLEAR_TID_ADDRESS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_FORK_CLEAR_TID_ADDRESS),
     LINUX_FORK_NEW_MOUNT_NAMESPACE: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_FORK_NEW_MOUNT_NAMESPACE),
     LINUX_FORK_NEW_USER_NAMESPACE: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_FORK_NEW_USER_NAMESPACE),
     LINUX_FORK_PIDFD_ADDRESS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_FORK_PIDFD_ADDRESS),
@@ -1366,6 +1376,9 @@ fn copy_linux_bank_transients(from: usize, to: usize) {
         LINUX_FORK_PIDFD_ADDRESS,
         LINUX_FORK_CLEAR_SIGHAND,
         LINUX_FORK_OWN_PAGES,
+        LINUX_FORK_CLONE_FLAGS,
+        LINUX_FORK_TLS,
+        LINUX_FORK_CLEAR_TID_ADDRESS,
     );
 }
 
@@ -2979,14 +2992,8 @@ fn settle_linux_process_exit(pid: u32, status: u8) -> bool {
     let parent = linux_process::live_process_parent_pid(pid);
     let signals_cleared = process_slot
         .is_some_and(|slot| clear_linux_signal_queues_for_process(linux_signal_instance(), slot));
-    let child_signal_queued = parent.is_some_and(|parent| {
-        linux_queue_process_signal(
-            parent,
-            LINUX_SIGCHLD,
-            LINUX_CLD_EXITED,
-            Some(u64::from(status)),
-        ) == 0
-    });
+    let child_signal_queued =
+        parent.is_some_and(|parent| linux_signal_child_exit(parent, pid, status));
     let exited = signals_cleared
         && child_signal_queued
         && linux_process::complete_live_process_exit_detached(pid, status);
@@ -2994,7 +3001,7 @@ fn settle_linux_process_exit(pid: u32, status: u8) -> bool {
     linux_release_process_cgroup(pid);
     release_linux_process_shared_mappings(pid);
     if let Some(state) = linux_process_runtime_state(pid) {
-        release_linux_descriptor_runtime_state(&state.descriptors);
+        release_linux_process_descriptors(pid, state);
         *state = LinuxProcessRuntimeState::EMPTY;
     }
     if let Some(namespace) = mount_namespace {
@@ -3196,6 +3203,10 @@ static X86_RUNTIME_BACKING_LINUX_FORK_CLEAR_SIGHAND: CpuBankedAtomicBool =
     CpuBankedAtomicBool::new(false);
 static X86_RUNTIME_BACKING_LINUX_FORK_OWN_PAGES: CpuBankedAtomicBool =
     CpuBankedAtomicBool::new(false);
+static X86_RUNTIME_BACKING_LINUX_FORK_CLONE_FLAGS: CpuBankedAtomicU64 = CpuBankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_LINUX_FORK_TLS: CpuBankedAtomicU64 = CpuBankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_LINUX_FORK_CLEAR_TID_ADDRESS: CpuBankedAtomicU64 =
+    CpuBankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_LINUX_PROCESS_CHILD_EXITED: CpuBankedAtomicBool =
     CpuBankedAtomicBool::new(false);
 static X86_RUNTIME_BACKING_LINUX_PROCESS_CHILD_EXECUTED: CpuBankedAtomicBool =
@@ -6650,13 +6661,23 @@ fn execute_deferred_live_fork() -> bool {
         .LINUX_FORK_NEW_USER_NAMESPACE
         .swap(false, Ordering::SeqCst);
     let parent_pid = current_linux_process_pid();
+    // A clone's own requests (`linux_clone_process`): 0 for a plain fork.
+    let clone_flags = X86_RUNTIME.LINUX_FORK_CLONE_FLAGS.swap(0, Ordering::SeqCst);
+    let clone_tls = X86_RUNTIME.LINUX_FORK_TLS.swap(0, Ordering::SeqCst);
+    let clear_tid_address = X86_RUNTIME
+        .LINUX_FORK_CLEAR_TID_ADDRESS
+        .swap(0, Ordering::SeqCst);
+    let shares_descriptors = clone_flags & LINUX_CLONE_FILES != 0;
+    let vfork = clone_flags & LINUX_CLONE_VFORK != 0;
     // The transaction switches back to the parent: no other CPU takes it.
     let _pin = LinuxProcessPin::new(parent_pid);
-    let Some(parent_runtime) = stage_linux_fork_parent_runtime_state(parent_pid) else {
+    let Some(parent_runtime) =
+        stage_linux_fork_parent_runtime_state(parent_pid, shares_descriptors)
+    else {
         return false;
     };
     if !save_linux_process_extended_state(parent_pid) {
-        release_staged_linux_fork_descriptors(parent_pid);
+        release_staged_linux_fork_descriptors(parent_pid, shares_descriptors);
         return false;
     }
     let child_stack = X86_RUNTIME.LINUX_FORK_CHILD_STACK.swap(0, Ordering::SeqCst);
@@ -6689,14 +6710,14 @@ fn execute_deferred_live_fork() -> bool {
     let own_pages = X86_RUNTIME
         .LINUX_FORK_OWN_PAGES
         .swap(false, Ordering::SeqCst);
-    let Some(child) = linux_process::begin_live_fork(
+    let Some(mut child) = linux_process::begin_live_fork(
         parent_pid,
         false,
         share_vm || child_stack != 0 && !own_pages,
         (child_stack != 0).then_some(child_stack),
         !parent_first,
     ) else {
-        release_staged_linux_fork_descriptors(parent_pid);
+        release_staged_linux_fork_descriptors(parent_pid, shares_descriptors);
         X86_RUNTIME
             .LINUX_FORK_CHILD_TID_ADDRESS
             .store(0, Ordering::SeqCst);
@@ -6724,6 +6745,15 @@ fn execute_deferred_live_fork() -> bool {
         return false;
     };
     if !clone_linux_process_extended_state(parent_pid, child.pid) {
+        return false;
+    }
+    if clone_flags & LINUX_FORK_CLONE_REQUESTED != 0
+        && !(linux_clone_shared_resources(clone_flags).all(|resource| {
+            linux_process::share_live_process_resource(child.pid, resource, Some(parent_pid))
+        }) && linux_process::set_live_process_exit_signal(child.pid, clone_flags as u8)
+            && (clone_flags & LINUX_CLONE_PARENT == 0
+                || linux_process::adopt_live_process_by_grandparent(child.pid)))
+    {
         return false;
     }
     // The child's number in the parent's PID namespace, which fork returns
@@ -6849,6 +6879,18 @@ fn execute_deferred_live_fork() -> bool {
     {
         return false;
     }
+    // CLONE_CHILD_CLEARTID: the child's exit clears and wakes the word;
+    // CLONE_SETTLS: it starts with its own thread pointer.
+    if clear_tid_address != 0 && !set_current_linux_clear_child_tid(clear_tid_address) {
+        return false;
+    }
+    if clone_flags & LINUX_CLONE_SETTLS != 0 {
+        let Some(slot) = current_linux_thread_slot() else {
+            return false;
+        };
+        X86_RUNTIME.LINUX_THREAD_POINTERS[slot].store(clone_tls, Ordering::SeqCst);
+        child.fs_base = clone_tls;
+    }
     if clear_sighand {
         X86_RUNTIME
             .ELF_PROBE_SIGNAL_HANDLERS
@@ -6868,10 +6910,11 @@ fn execute_deferred_live_fork() -> bool {
             .for_each(|mask| mask.store(0, Ordering::SeqCst));
     }
     if child_stack != 0 {
-        // A child with pages of its own may use its whole stack buffer; one
-        // sharing the parent's memory (posix_spawn) exec's from the top
-        // page, which is all that is registered for it, as before.
-        let (base, size) = if own_pages {
+        // A child with pages of its own or sharing its parent's memory for
+        // good (CLONE_VM without CLONE_VFORK) may use its whole stack
+        // buffer; a vfork child (posix_spawn) exec's from the top page,
+        // which is all that is registered for it, as before.
+        let (base, size) = if own_pages || clone_flags & LINUX_CLONE_VM != 0 && !vfork {
             linux_clone_stack_extent(parent_pid, child_stack)
         } else {
             (
@@ -7031,9 +7074,19 @@ fn execute_deferred_live_fork() -> bool {
     }
     linux_boot_profile_lifecycle_phase(2, profile_state_started);
     if (child_executed || child_yielded) && !child_exited {
-        let Some(parent) = linux_process::resume_live_parent_after_child_exec(child.pid) else {
+        let Some(mut parent) = linux_process::resume_live_parent_after_child_exec(child.pid) else {
             return false;
         };
+        // A vfork parent stays suspended until its child executes or exits,
+        // waiting in its vfork as the call it re-issues in place of
+        // returning from it (`linux_vfork_wait_live`).
+        if vfork && !child_executed {
+            if !linux_process::set_live_process_vfork_child(parent_pid, child.pid) {
+                return false;
+            }
+            parent.rip = parent.rip.wrapping_sub(LINUX_SYSCALL_INSTRUCTION_SIZE);
+            parent.general[0] = LINUX_VFORK_WAIT_SYSCALL;
+        }
         // The child runs on its own now; the parent resumes here, inside
         // this transaction, and its own exec or exit goes to the outer one.
         exec_flag_guard.resume_parent();
@@ -7066,12 +7119,12 @@ fn execute_deferred_live_fork() -> bool {
         cfg!(feature = "linux-boot-profile").then(timer::timestamp_counter);
     let parent = (child_resumed && child_exited)
         .then(|| {
-            (linux_queue_process_signal(
-                parent_pid,
-                LINUX_SIGCHLD,
-                LINUX_CLD_EXITED,
-                Some(u64::from(child_status)),
-            ) == 0)
+            // Its parent, which a CLONE_PARENT child does not share with
+            // the transaction.
+            let parent = linux_process::live_process_parent_pid(child.pid)
+                .filter(|parent| *parent != 0)
+                .unwrap_or(parent_pid);
+            linux_signal_child_exit(parent, child.pid, child_status)
                 .then(|| linux_process::complete_live_child_exit(child.pid, child_status))
                 .flatten()
         })
@@ -7103,7 +7156,7 @@ fn execute_deferred_live_fork() -> bool {
     release_linux_process_shared_mappings(child.pid);
     let mut left_namespace = None;
     if let Some(child_state_slot) = linux_process_runtime_state(child.pid) {
-        release_linux_descriptor_runtime_state(&child_state_slot.descriptors);
+        release_linux_process_descriptors(child.pid, child_state_slot);
         left_namespace = child_state_slot.mount_namespace;
         *child_state_slot = LinuxProcessRuntimeState::EMPTY;
     }
@@ -8251,7 +8304,12 @@ fn construct_linux_clone_context(
     X86_RUNTIME.LINUX_THREAD_RAXS[slot].store(child.rax, Ordering::SeqCst);
     X86_RUNTIME.LINUX_THREAD_RCXS[slot].store(child.rip, Ordering::SeqCst);
     X86_RUNTIME.LINUX_THREAD_R11S[slot].store(child.rflags, Ordering::SeqCst);
-    X86_RUNTIME.LINUX_THREAD_CLEAR_CHILD_TIDS[slot].store(request.child_tid, Ordering::SeqCst);
+    let clear_child_tid = if request.flags & LINUX_CLONE_CHILD_CLEARTID != 0 {
+        request.child_tid
+    } else {
+        0
+    };
+    X86_RUNTIME.LINUX_THREAD_CLEAR_CHILD_TIDS[slot].store(clear_child_tid, Ordering::SeqCst);
     Some(LinuxCloneResult {
         parent_rax: u64::from(handle.tid),
         child,
@@ -14633,14 +14691,36 @@ fn linux_unshare(flags: u64) -> u64 {
         return LINUX_EINVAL;
     }
     let pid = current_linux_process_pid();
-    // Copying a table shared with another process fails when it holds a
-    // descriptor at or above nr_open (Linux's dup_fd); a table the process
-    // has alone stays as it is.
-    if flags & LINUX_CLONE_FILES != 0 && linux_process::live_process_shares_descriptors(pid) {
+    // A descriptor table shared with another process (clone's CLONE_FILES)
+    // becomes the caller's own copy, which fails when it holds a descriptor
+    // at or above nr_open (Linux's dup_fd); a table the process has alone
+    // stays as it is. So does a shared filesystem context (CLONE_FS), and a
+    // new mount namespace needs one of its own too.
+    if flags & LINUX_CLONE_FILES != 0
+        && linux_process::live_process_resource_shared(
+            pid,
+            linux_process::SharedResource::Descriptors,
+        )
+    {
         if (linux_nr_open()..LINUX_AUX_DESCRIPTOR_LIMIT).any(linux_descriptor_open) {
             return LINUX_EMFILE;
         }
-        let _ = linux_process::set_live_process_shares_descriptors(pid, false);
+        if !unshare_linux_descriptors(pid) {
+            return LINUX_ENOMEM;
+        }
+    }
+    if flags & (LINUX_CLONE_FS | LINUX_CLONE_NEWNS) != 0
+        && linux_process::live_process_resource_shared(
+            pid,
+            linux_process::SharedResource::Filesystem,
+        )
+        && !linux_process::share_live_process_resource(
+            pid,
+            linux_process::SharedResource::Filesystem,
+            None,
+        )
+    {
+        return LINUX_ENOMEM;
     }
     let mut owner = namespace;
     if flags & LINUX_CLONE_NEWUSER != 0 {
@@ -15051,13 +15131,6 @@ fn linux_request_process_fork(
     clear_sighand: bool,
     own_pages: bool,
 ) -> u64 {
-    // A CLONE_FILES child counts as sharing its parent's descriptor table.
-    if !linux_process::set_live_process_child_shares_descriptors(
-        current_linux_process_pid(),
-        clone_flags & LINUX_CLONE_FILES != 0,
-    ) {
-        return LINUX_ESRCH;
-    }
     // The child's new UTS, IPC, PID and time namespaces are made now, in
     // the caller, so a failure is the call's; the fork takes them.
     if clone_flags & LINUX_CLONE_NEW_KEPT != 0 {
@@ -15190,6 +15263,190 @@ fn linux_request_process_fork(
     }
 }
 
+/// A clone that makes a process rather than a thread: clone or clone3
+/// without CLONE_THREAD.
+#[derive(Clone, Copy)]
+struct LinuxProcessClone {
+    flags: u64,
+    /// The signal the parent gets when the child ends (0 for none).
+    exit_signal: u64,
+    /// The top of the child's stack, or 0 for the parent's.
+    stack: u64,
+    parent_tid: u64,
+    child_tid: u64,
+    tls: u64,
+    /// Where the parent gets a pidfd of the child (CLONE_PIDFD), or 0.
+    pidfd: u64,
+    /// CLONE_INTO_CGROUP's cgroup, by generation, or 0.
+    cgroup_generation: u32,
+}
+
+const LINUX_CLONE_PTRACE: u64 = 0x0000_2000;
+const LINUX_CLONE_PARENT: u64 = 0x0000_8000;
+const LINUX_CLONE_UNTRACED: u64 = 0x0080_0000;
+const LINUX_CLONE_IO: u64 = 0x8000_0000;
+
+/// What a process clone may ask for: the namespaces this kernel has, what
+/// it shares with its parent, where it starts and which tid words it sets.
+/// CLONE_PTRACE and CLONE_UNTRACED only matter to a tracer, which a clone
+/// here never has.
+const LINUX_PROCESS_CLONE_FLAGS: u64 = LINUX_CLONE_VM
+    | LINUX_CLONE_FS
+    | LINUX_CLONE_FILES
+    | LINUX_CLONE_SIGHAND
+    | LINUX_CLONE_PIDFD
+    | LINUX_CLONE_PTRACE
+    | LINUX_CLONE_VFORK
+    | LINUX_CLONE_PARENT
+    | LINUX_CLONE_NEWNS
+    | LINUX_CLONE_SYSVSEM
+    | LINUX_CLONE_SETTLS
+    | LINUX_CLONE_PARENT_SETTID
+    | LINUX_CLONE_CHILD_CLEARTID
+    | LINUX_CLONE_DETACHED
+    | LINUX_CLONE_UNTRACED
+    | LINUX_CLONE_CHILD_SETTID
+    | LINUX_CLONE_NEWUSER
+    | LINUX_CLONE_NEW_KEPT
+    | LINUX_CLONE_IO
+    | LINUX_CLONE_CLEAR_SIGHAND
+    | LINUX_CLONE_INTO_CGROUP;
+
+/// Marks `LINUX_FORK_CLONE_FLAGS` as set by a clone (a plain fork leaves
+/// it 0), so an exit signal of 0 means none rather than SIGCHLD.
+const LINUX_FORK_CLONE_REQUESTED: u64 = 1 << 63;
+
+/// Starts process clone `clone` from the calling thread (`caller`): checks
+/// it as Linux does, then asks the fork transaction for the child. From
+/// clone(2) (`legacy`), CLONE_VM | CLONE_VFORK on a stack is musl's
+/// posix_spawn, whose child maps its parent's pages and whose exec does not
+/// let the parent go (see `execute_deferred_live_fork`).
+#[inline(never)]
+fn linux_clone_process(clone: LinuxProcessClone, caller: LinuxUserContext, legacy: bool) -> u64 {
+    let flags = clone.flags;
+    if flags & LINUX_CLONE_FS != 0 && flags & (LINUX_CLONE_NEWNS | LINUX_CLONE_NEWUSER) != 0
+        || flags & LINUX_CLONE_SIGHAND != 0 && flags & LINUX_CLONE_VM == 0
+        || flags & LINUX_CLONE_SIGHAND != 0 && flags & LINUX_CLONE_CLEAR_SIGHAND != 0
+        // init has no parent to give its child (Linux: an unkillable init).
+        || flags & LINUX_CLONE_PARENT != 0 && current_linux_process_pid() == 1
+        || flags & LINUX_CLONE_PIDFD != 0 && flags & LINUX_CLONE_DETACHED != 0
+        || clone.exit_signal > LINUX_SIGNAL_COUNT as u64
+        || flags & !LINUX_PROCESS_CLONE_FLAGS != 0
+    {
+        return LINUX_EINVAL;
+    }
+    if flags & LINUX_CLONE_PIDFD != 0 && !linux_writable_user_range_contains(clone.pidfd, 4)
+        || flags & LINUX_CLONE_PARENT_SETTID != 0
+            && !linux_writable_user_range_contains(clone.parent_tid, 4)
+        || flags & LINUX_CLONE_CHILD_SETTID != 0
+            && !linux_writable_user_range_contains(clone.child_tid, 4)
+    {
+        return LINUX_EFAULT;
+    }
+    if clone.stack != 0
+        && !materialize_linux_runtime_user_range(
+            (clone.stack - 1) & !(PAGE_SIZE as u64 - 1),
+            PAGE_SIZE,
+            true,
+        )
+    {
+        return LINUX_EFAULT;
+    }
+    let share_vm = flags & LINUX_CLONE_VM != 0;
+    let vfork = flags & LINUX_CLONE_VFORK != 0;
+    // A child sharing its parent's memory maps the parent's pages. Pages
+    // the parent shares copy-on-write with others (what an earlier fork
+    // left) are made the parent's own first, so that what either writes
+    // the other sees. A vfork child only runs until it executes or exits
+    // while its parent waits, and goes without.
+    // The registry's mapping list is brought up to date first: a wait
+    // leaves it stale, and the copies are recorded in it.
+    if share_vm && !vfork {
+        if !refresh_live_linux_process_registry(caller) {
+            return LINUX_EAGAIN;
+        }
+        if !linux_own_copy_on_write_pages() {
+            return LINUX_ENOMEM;
+        }
+    }
+    let result = linux_request_process_fork(
+        true,
+        caller,
+        flags,
+        clone.stack,
+        share_vm && !(legacy && vfork && clone.stack != 0),
+        clone.pidfd,
+        clone.cgroup_generation,
+        flags & LINUX_CLONE_CLEAR_SIGHAND != 0,
+        !share_vm,
+    );
+    if result == LINUX_RETURN_TO_KERNEL {
+        // The rest is done once the child exists: the tid words written
+        // (the child's in it, the parent's in the parent), and what it
+        // shares, its parent, exit signal and thread pointer set.
+        let address_if = |flag: u64, address: u64| if flags & flag != 0 { address } else { 0 };
+        X86_RUNTIME.LINUX_FORK_CHILD_TID_ADDRESS.store(
+            address_if(LINUX_CLONE_CHILD_SETTID, clone.child_tid),
+            Ordering::SeqCst,
+        );
+        X86_RUNTIME.LINUX_FORK_PARENT_TID_ADDRESS.store(
+            address_if(LINUX_CLONE_PARENT_SETTID, clone.parent_tid),
+            Ordering::SeqCst,
+        );
+        X86_RUNTIME.LINUX_FORK_CLEAR_TID_ADDRESS.store(
+            address_if(LINUX_CLONE_CHILD_CLEARTID, clone.child_tid),
+            Ordering::SeqCst,
+        );
+        X86_RUNTIME
+            .LINUX_FORK_TLS
+            .store(address_if(LINUX_CLONE_SETTLS, clone.tls), Ordering::SeqCst);
+        X86_RUNTIME.LINUX_FORK_CLONE_FLAGS.store(
+            LINUX_FORK_CLONE_REQUESTED | flags & !0xff | clone.exit_signal,
+            Ordering::SeqCst,
+        );
+    }
+    result
+}
+
+/// Makes every page the current process maps copy-on-write (shared with
+/// another address space since a fork) a page of its own, as a write to
+/// each would; false when memory runs out.
+#[inline(never)]
+fn linux_own_copy_on_write_pages() -> bool {
+    let mut pages = Vec::new();
+    if !address_space::current_linux_cow_addresses(&mut pages) {
+        return false;
+    }
+    pages.into_iter().all(materialize_linux_cow_address)
+}
+
+/// The resources a process clone with `flags` shares with its parent.
+fn linux_clone_shared_resources(flags: u64) -> impl Iterator<Item = linux_process::SharedResource> {
+    use linux_process::SharedResource;
+    [
+        (LINUX_CLONE_VM, SharedResource::Memory),
+        (LINUX_CLONE_FILES, SharedResource::Descriptors),
+        (LINUX_CLONE_FS, SharedResource::Filesystem),
+        (LINUX_CLONE_SIGHAND, SharedResource::SignalHandlers),
+        (LINUX_CLONE_IO, SharedResource::Io),
+        (LINUX_CLONE_SYSVSEM, SharedResource::SemaphoreUndo),
+    ]
+    .into_iter()
+    .filter(move |(flag, _)| flags & flag != 0)
+    .map(|(_, resource)| resource)
+}
+
+/// Tells process `child`'s parent that the child ended with `status`: its
+/// exit signal (SIGCHLD unless clone named another; none for 0). Only a
+/// SIGCHLD that cannot be queued fails.
+fn linux_signal_child_exit(parent: u32, child: u32, status: u8) -> bool {
+    let signal = linux_process::live_process_exit_signal(child).map_or(LINUX_SIGCHLD, u64::from);
+    let queued = signal == 0
+        || linux_queue_process_signal(parent, signal, LINUX_CLD_EXITED, Some(u64::from(status)))
+            == 0;
+    queued || signal != LINUX_SIGCHLD
+}
+
 fn linux_clone3(
     arguments: u64,
     size: u64,
@@ -15286,43 +15543,9 @@ fn linux_clone3(
     {
         return LINUX_EINVAL;
     }
-    // A process (not a thread) ending with SIGCHLD: a fork, on `stack` if
-    // given. CLONE_FS, CLONE_FILES, CLONE_SYSVSEM and CLONE_IO are taken
-    // as fork's copies: nothing here shares those between processes yet
-    // (unshare03 forks with CLONE_FILES and unshares the table again).
-    const CLONE_IO: u64 = 0x8000_0000;
-    const PROCESS_CLONE_FLAGS: u64 = LINUX_CLONE_VM
-        | LINUX_CLONE_PIDFD
-        | LINUX_CLONE_VFORK
-        | LINUX_CLONE_NEWNS
-        | LINUX_CLONE_NEWUSER
-        | LINUX_CLONE_NEW_KEPT
-        | LINUX_CLONE_CLEAR_SIGHAND
-        | LINUX_CLONE_INTO_CGROUP
-        | LINUX_CLONE_FS
-        | LINUX_CLONE_FILES
-        | LINUX_CLONE_SYSVSEM
-        | CLONE_IO
-        | LINUX_CLONE_PARENT_SETTID
-        | LINUX_CLONE_CHILD_SETTID
-        | LINUX_CLONE_CHILD_CLEARTID;
-    if flags & LINUX_CLONE_THREAD == 0 && exit_signal == LINUX_SIGCHLD {
-        if flags & !PROCESS_CLONE_FLAGS != 0
-            || flags & LINUX_CLONE_VM != 0 && flags & LINUX_CLONE_VFORK == 0
-        {
+    if flags & LINUX_CLONE_THREAD == 0 {
+        if flags & LINUX_CLONE_DETACHED != 0 {
             return LINUX_EINVAL;
-        }
-        if flags & LINUX_CLONE_PIDFD != 0 && !linux_writable_user_range_contains(_pidfd, 4)
-            || flags & LINUX_CLONE_PARENT_SETTID != 0
-                && !linux_writable_user_range_contains(parent_tid, 4)
-        {
-            return LINUX_EFAULT;
-        }
-        if stack != 0 {
-            let stack_page = (child_stack - 1) & !(PAGE_SIZE as u64 - 1);
-            if !materialize_linux_runtime_user_range(stack_page, PAGE_SIZE, true) {
-                return LINUX_EFAULT;
-            }
         }
         let cgroup_generation = if flags & LINUX_CLONE_INTO_CGROUP != 0 {
             let Some(handle) = linux_overlay_descriptor_handle(cgroup) else {
@@ -15344,42 +15567,24 @@ fn linux_clone3(
         } else {
             0
         };
-        let result = linux_request_process_fork(
-            true,
-            caller,
-            flags,
-            child_stack,
-            flags & LINUX_CLONE_VM != 0,
-            if flags & LINUX_CLONE_PIDFD != 0 {
-                _pidfd
-            } else {
-                0
+        return linux_clone_process(
+            LinuxProcessClone {
+                flags,
+                exit_signal,
+                stack: child_stack,
+                parent_tid,
+                child_tid,
+                tls,
+                pidfd: if flags & LINUX_CLONE_PIDFD != 0 {
+                    _pidfd
+                } else {
+                    0
+                },
+                cgroup_generation,
             },
-            cgroup_generation,
-            flags & LINUX_CLONE_CLEAR_SIGHAND != 0,
-            flags & LINUX_CLONE_VM == 0,
+            caller,
+            false,
         );
-        if result == LINUX_RETURN_TO_KERNEL {
-            // The tid words are written once the child exists: the
-            // child's in it (CHILD_SETTID), the parent's in the parent.
-            X86_RUNTIME.LINUX_FORK_CHILD_TID_ADDRESS.store(
-                if flags & LINUX_CLONE_CHILD_SETTID != 0 {
-                    child_tid
-                } else {
-                    0
-                },
-                Ordering::SeqCst,
-            );
-            X86_RUNTIME.LINUX_FORK_PARENT_TID_ADDRESS.store(
-                if flags & LINUX_CLONE_PARENT_SETTID != 0 {
-                    parent_tid
-                } else {
-                    0
-                },
-                Ordering::SeqCst,
-            );
-        }
-        return result;
     }
     // Linux permits unused clone3 output fields to alias the thread-id word.
     // Their values only carry meaning when the corresponding flag is set.
@@ -15419,7 +15624,7 @@ fn linux_clone_thread(registers: LinuxSyscallFrame, user_rip: u64, user_rflags: 
 }
 
 fn linux_clone_thread_request(
-    request: LinuxCloneRequest,
+    mut request: LinuxCloneRequest,
     parent_registers: LinuxSyscallFrame,
     user_rip: u64,
     user_rflags: u64,
@@ -15444,6 +15649,17 @@ fn linux_clone_thread_request(
     let sibling_stack = X86_RUNTIME.ELF_PROBE_SIBLING_STACK.load(Ordering::SeqCst);
     let tls_size = X86_RUNTIME.ELF_PROBE_TLS_SIZE.load(Ordering::SeqCst);
     let (sibling_context, stack_base, stack_size) = if runtime {
+        // Without CLONE_SETTLS the thread starts with its creator's thread
+        // pointer; tid words no flag asks for are not looked at.
+        if request.flags & LINUX_CLONE_SETTLS == 0 {
+            request.tls = active_fs_base();
+        }
+        if request.flags & LINUX_CLONE_PARENT_SETTID == 0 {
+            request.parent_tid = 0;
+        }
+        if request.flags & (LINUX_CLONE_CHILD_SETTID | LINUX_CLONE_CHILD_CLEARTID) == 0 {
+            request.child_tid = 0;
+        }
         let Ok(thread_pointer) = usize::try_from(request.tls) else {
             return LINUX_EINVAL;
         };
@@ -15700,7 +15916,7 @@ fn linux_init_exit_kill_others_live_return(
 fn retire_linux_process_record(pid: u32) {
     if let Some(state) = linux_process_runtime_state(pid) {
         if state.valid {
-            release_linux_descriptor_runtime_state(&state.descriptors);
+            release_linux_process_descriptors(pid, state);
         }
         *state = LinuxProcessRuntimeState::EMPTY;
     }
@@ -16149,6 +16365,25 @@ fn linux_child_wait_state(
     }
 }
 
+/// __WNOTHREAD, __WALL and __WCLONE: which children a wait looks at.
+/// __WNOTHREAD changes nothing here: every thread waits for its process's
+/// children.
+const LINUX_WAIT_SCOPE_FLAGS: u64 = 0x2000_0000 | 0x4000_0000 | 0x8000_0000;
+
+/// The children a wait with `options` reports: __WALL all of them, __WCLONE
+/// those ending with a signal other than SIGCHLD, otherwise the others.
+fn linux_wait_child_scope(options: u64) -> linux_process::ChildScope {
+    const WALL: u64 = 0x4000_0000;
+    const WCLONE: u64 = 0x8000_0000;
+    if options & WALL != 0 {
+        linux_process::ChildScope::All
+    } else if options & WCLONE != 0 {
+        linux_process::ChildScope::Clone
+    } else {
+        linux_process::ChildScope::Plain
+    }
+}
+
 fn linux_wait4(pid: u64, status_address: u64, options: u64, rusage: u64) -> u64 {
     let parent_pid = current_linux_process_pid();
     // Any thread may wait for the children of its process.
@@ -16159,10 +16394,8 @@ fn linux_wait4(pid: u64, status_address: u64, options: u64, rusage: u64) -> u64 
     }
     let pid = pid as u32 as i32;
     let options = u64::from(options as u32);
-    // __WNOTHREAD, __WALL and __WCLONE are accepted: every child here ends
-    // with SIGCHLD and belongs to the calling thread (clone301).
-    const WAIT_SCOPE_FLAGS: u64 = 0x2000_0000 | 0x4000_0000 | 0x8000_0000;
-    let options = options & !WAIT_SCOPE_FLAGS;
+    let scope = linux_wait_child_scope(options);
+    let options = options & !LINUX_WAIT_SCOPE_FLAGS;
     if options & !(LINUX_WNOHANG | LINUX_WUNTRACED | LINUX_WCONTINUED) != 0 {
         return LINUX_EINVAL;
     }
@@ -16192,6 +16425,7 @@ fn linux_wait4(pid: u64, status_address: u64, options: u64, rusage: u64) -> u64 
             exited: true,
             stopped: options & LINUX_WUNTRACED != 0,
             continued: options & LINUX_WCONTINUED != 0,
+            scope,
         },
     ) else {
         return LINUX_ECHILD;
@@ -16259,8 +16493,14 @@ fn linux_waitid(id_type: u64, id: u64, information: u64, options: u64, rusage: u
     let id_type = u64::from(id_type as u32);
     let id = u64::from(id as u32);
     let options = u64::from(options as u32);
+    let scope = linux_wait_child_scope(options);
     if options
-        & !(LINUX_WEXITED | LINUX_WUNTRACED | LINUX_WCONTINUED | LINUX_WNOHANG | LINUX_WNOWAIT)
+        & !(LINUX_WEXITED
+            | LINUX_WUNTRACED
+            | LINUX_WCONTINUED
+            | LINUX_WNOHANG
+            | LINUX_WNOWAIT
+            | LINUX_WAIT_SCOPE_FLAGS)
         != 0
         || options & (LINUX_WEXITED | LINUX_WUNTRACED | LINUX_WCONTINUED) == 0
     {
@@ -16318,6 +16558,7 @@ fn linux_waitid(id_type: u64, id: u64, information: u64, options: u64, rusage: u
             exited: options & LINUX_WEXITED != 0,
             stopped: options & LINUX_WUNTRACED != 0,
             continued: options & LINUX_WCONTINUED != 0,
+            scope,
         },
     ) else {
         return LINUX_ECHILD;
@@ -16617,6 +16858,13 @@ fn run_other_linux_processes_deferring(
                 LINUX_SIGKILL,
             )));
         }
+        // A wait for children looks for them before a signal interrupts it,
+        // as Linux's does: the exit signal of the child it waits for must not
+        // end it with EINTR (clone301). A signal still pending when nothing
+        // turns up interrupts the next round.
+        if matches!(number, LINUX_WAIT4_SYSCALL | LINUX_WAITID_SYSCALL) {
+            return Some(LinuxBlockedWait::Recheck);
+        }
         let mut interrupted = caller;
         interrupted.rax = LINUX_EINTR;
         let delivered = linux_deliver_pending_signal_restarting(
@@ -16709,9 +16957,13 @@ fn linux_activation_owner(pid: u32) -> u64 {
 fn park_linux_process(pid: u32) -> bool {
     let fs_base = active_fs_base();
     let root = address_space::current_root_address();
+    // Others sharing its state run while it waits, and it sees what they
+    // changed when it wakes.
+    push_linux_shared_runtime_state();
     if !activation::park(linux_activation_owner(pid)) {
         return false;
     }
+    pull_linux_shared_runtime_state();
     // SAFETY: both are this process's, saved on its own stack before it
     // parked; the process is current again.
     unsafe {
@@ -16903,6 +17155,41 @@ fn write_linux_live_return(output: *mut LinuxSyscallFrame, context: LinuxUserCon
 /// The Ginux-internal system call the vDSO's preemption entry makes; above
 /// every Linux system call number.
 const LINUX_PREEMPT_SYSCALL: u64 = 0x4750;
+/// The Ginux-internal system call a vfork parent is resumed into while its
+/// child runs, in place of its vfork's return: it waits there for the
+/// child to execute or exit, then returns the child's pid as the vfork.
+const LINUX_VFORK_WAIT_SYSCALL: u64 = 0x4751;
+
+/// A vfork parent's wait for its child (`LINUX_VFORK_WAIT_SYSCALL`). Only
+/// SIGKILL and stop signals reach it meanwhile, as Linux's vfork wait is
+/// killable only; the others wait until the vfork returns.
+#[inline(never)]
+fn linux_vfork_wait_live(output: *mut LinuxSyscallFrame, caller: LinuxUserContext) -> u64 {
+    const SIGSTOP: u64 = 19;
+    const UNBLOCKABLE: u64 = (1 << (LINUX_SIGKILL - 1)) | (1 << (SIGSTOP - 1));
+    let pid = current_linux_process_pid();
+    let mask = X86_RUNTIME.ELF_PROBE_SIGNAL_MASK.load(Ordering::SeqCst);
+    store_current_linux_signal_mask(!UNBLOCKABLE);
+    let result = loop {
+        let Some((child, pending)) = linux_process::live_process_vfork_child(pid) else {
+            break LINUX_ENOSYS;
+        };
+        if !pending {
+            break u64::from(linux_pid_seen_by(pid, child));
+        }
+        match run_other_linux_processes(output, caller, LINUX_VFORK_WAIT_SYSCALL) {
+            Some(LinuxBlockedWait::Recheck) => {}
+            Some(LinuxBlockedWait::Return(result)) => break result,
+            // Nothing else can run here: the parent goes on as it did.
+            None => break u64::from(linux_pid_seen_by(pid, child)),
+        }
+    };
+    store_current_linux_signal_mask(mask);
+    if result != LINUX_RETURN_TO_KERNEL {
+        let _ = linux_process::set_live_process_vfork_child(pid, 0);
+    }
+    result
+}
 /// Timer ticks a thread of nice 0 runs before it is preempted so that
 /// others get the CPU; a thread's own slice scales with its nice as Linux's
 /// load weights do (`linux_thread_slice_ticks`).
@@ -18781,14 +19068,19 @@ impl LinuxForkExecFlagGuard {
 // function into the recursive fork executor retains roughly 50 KiB for every
 // live child and can exhaust the kernel stack during a systemd boot.
 #[inline(never)]
-fn stage_linux_fork_parent_runtime_state(parent_pid: u32) -> Option<LinuxForkParentRuntime> {
+fn stage_linux_fork_parent_runtime_state(
+    parent_pid: u32,
+    share_descriptors: bool,
+) -> Option<LinuxForkParentRuntime> {
     assign_linux_open_file_ids();
     let mut state = capture_linux_process_runtime_state()?;
     state.active = true;
     state.completed = false;
     state.exit_status = 0;
     state.termination_signal = 0;
-    if !retain_linux_descriptor_runtime_state(&state.descriptors) {
+    // The child's copy holds the open files again, unless the two share
+    // the one table (CLONE_FILES), whose files the group holds once.
+    if !share_descriptors && !retain_linux_descriptor_runtime_state(&state.descriptors) {
         return None;
     }
     let parent_stack = current_linux_thread_slot().map(|slot| {
@@ -18807,7 +19099,10 @@ fn stage_linux_fork_parent_runtime_state(parent_pid: u32) -> Option<LinuxForkPar
     })
 }
 
-fn release_staged_linux_fork_descriptors(parent_pid: u32) {
+fn release_staged_linux_fork_descriptors(parent_pid: u32, shared: bool) {
+    if shared {
+        return;
+    }
     if let Some(state) = linux_process_runtime_state(parent_pid).filter(|state| state.valid) {
         release_linux_descriptor_runtime_state(&state.descriptors);
     }
@@ -19435,6 +19730,227 @@ fn restore_linux_process_runtime_state(state: &LinuxProcessRuntimeState) {
     X86_RUNTIME
         .LINUX_NEXT_TID
         .store(state.next_tid, Ordering::SeqCst);
+}
+
+/// The parts of a process's runtime state clone can share with other
+/// processes: the descriptor table (CLONE_FILES), the filesystem context,
+/// cwd and umask (CLONE_FS), and the signal handlers (CLONE_SIGHAND).
+#[derive(Clone, Copy)]
+struct LinuxSharedRuntimeParts {
+    descriptors: bool,
+    filesystem: bool,
+    signal_handlers: bool,
+}
+
+impl LinuxSharedRuntimeParts {
+    /// What process `pid` shares with another live process now.
+    fn of(pid: u32) -> Self {
+        use linux_process::SharedResource;
+        let shared = |resource| linux_process::live_process_resource_shared(pid, resource);
+        Self {
+            descriptors: shared(SharedResource::Descriptors),
+            filesystem: shared(SharedResource::Filesystem),
+            signal_handlers: shared(SharedResource::SignalHandlers),
+        }
+    }
+
+    fn any(self) -> bool {
+        self.descriptors || self.filesystem || self.signal_handlers
+    }
+}
+
+/// Processes that share runtime state each keep a copy of it, in their
+/// bank while they run and in their record otherwise: the record is the
+/// state, and a running process's bank is brought up to date from it as a
+/// system call starts (or a parked one resumes), then written back to the
+/// records of everyone sharing it when the call ends (or parks). System
+/// calls run one at a time under the kernel-entry lock, so each one sees
+/// what the last one left. One table's open files are held once, by the
+/// group: only the last process to end releases them.
+#[inline(never)]
+fn pull_linux_shared_runtime_state() {
+    if !linux_processes_may_share_state() {
+        return;
+    }
+    let pid = current_linux_process_pid();
+    let parts = LinuxSharedRuntimeParts::of(pid);
+    if !parts.any() || !linux_bank_holds(linux_cpu_bank(), pid, linux_execution_instance()) {
+        return;
+    }
+    let Some(state) = linux_process_runtime_state(pid).filter(|state| state.valid) else {
+        return;
+    };
+    if parts.descriptors {
+        install_linux_descriptor_runtime_state(&state.descriptors);
+    }
+    if parts.filesystem {
+        X86_RUNTIME.ELF_PROBE_CWD.store(state.cwd, Ordering::SeqCst);
+        X86_RUNTIME
+            .ELF_PROBE_ROOTFS_CWD
+            .store(state.rootfs_cwd, Ordering::SeqCst);
+        X86_RUNTIME
+            .ELF_PROBE_OVERLAY_CWD
+            .store(state.overlay_cwd, Ordering::SeqCst);
+        X86_RUNTIME
+            .ELF_PROBE_UMASK
+            .store(state.umask, Ordering::SeqCst);
+    }
+    if parts.signal_handlers {
+        for signal in 0..LINUX_SIGNAL_COUNT {
+            X86_RUNTIME.ELF_PROBE_SIGNAL_HANDLERS[signal]
+                .store(state.signal_handlers[signal], Ordering::SeqCst);
+            X86_RUNTIME.ELF_PROBE_SIGNAL_FLAGS[signal]
+                .store(state.signal_flags[signal], Ordering::SeqCst);
+            X86_RUNTIME.ELF_PROBE_SIGNAL_RESTORERS[signal]
+                .store(state.signal_restorers[signal], Ordering::SeqCst);
+            X86_RUNTIME.ELF_PROBE_SIGNAL_ACTION_MASKS[signal]
+                .store(state.signal_action_masks[signal], Ordering::SeqCst);
+        }
+    }
+}
+
+/// Writes what the current process shares with others from its bank to
+/// its record and theirs (see `pull_linux_shared_runtime_state`).
+#[inline(never)]
+fn push_linux_shared_runtime_state() {
+    use linux_process::SharedResource;
+    if !linux_processes_may_share_state() {
+        return;
+    }
+    let pid = current_linux_process_pid();
+    let parts = LinuxSharedRuntimeParts::of(pid);
+    if !parts.any() || !linux_bank_holds(linux_cpu_bank(), pid, linux_execution_instance()) {
+        return;
+    }
+    let Some(state) = linux_process_runtime_state(pid).filter(|state| state.valid) else {
+        return;
+    };
+    if parts.descriptors {
+        assign_linux_open_file_ids();
+        state.descriptors = capture_linux_descriptor_runtime_state();
+    }
+    if parts.filesystem {
+        state.cwd = X86_RUNTIME.ELF_PROBE_CWD.load(Ordering::SeqCst);
+        state.rootfs_cwd = X86_RUNTIME.ELF_PROBE_ROOTFS_CWD.load(Ordering::SeqCst);
+        state.overlay_cwd = X86_RUNTIME.ELF_PROBE_OVERLAY_CWD.load(Ordering::SeqCst);
+        state.umask = X86_RUNTIME.ELF_PROBE_UMASK.load(Ordering::SeqCst);
+    }
+    if parts.signal_handlers {
+        for signal in 0..LINUX_SIGNAL_COUNT {
+            state.signal_handlers[signal] =
+                X86_RUNTIME.ELF_PROBE_SIGNAL_HANDLERS[signal].load(Ordering::SeqCst);
+            state.signal_flags[signal] =
+                X86_RUNTIME.ELF_PROBE_SIGNAL_FLAGS[signal].load(Ordering::SeqCst);
+            state.signal_restorers[signal] =
+                X86_RUNTIME.ELF_PROBE_SIGNAL_RESTORERS[signal].load(Ordering::SeqCst);
+            state.signal_action_masks[signal] =
+                X86_RUNTIME.ELF_PROBE_SIGNAL_ACTION_MASKS[signal].load(Ordering::SeqCst);
+        }
+    }
+    let source: *const LinuxProcessRuntimeState = state;
+    let copy_to_sharers = |resource, copy: &dyn Fn(&mut LinuxProcessRuntimeState)| {
+        let (sharers, count) = linux_process::live_processes_sharing(pid, resource);
+        for peer in sharers[..count].iter().copied() {
+            if let Some(destination) = linux_process_runtime_state(peer).filter(|state| state.valid)
+            {
+                copy(destination);
+            }
+        }
+    };
+    // SAFETY: `source` is this process's record, which no copy below
+    // writes: each destination is another process's.
+    let source = unsafe { &*source };
+    if parts.descriptors {
+        copy_to_sharers(SharedResource::Descriptors, &|destination| {
+            destination.descriptors = source.descriptors;
+        });
+    }
+    if parts.filesystem {
+        copy_to_sharers(SharedResource::Filesystem, &|destination| {
+            destination.cwd = source.cwd;
+            destination.rootfs_cwd = source.rootfs_cwd;
+            destination.overlay_cwd = source.overlay_cwd;
+            destination.umask = source.umask;
+        });
+    }
+    if parts.signal_handlers {
+        copy_to_sharers(SharedResource::SignalHandlers, &|destination| {
+            destination.signal_handlers = source.signal_handlers;
+            destination.signal_flags = source.signal_flags;
+            destination.signal_restorers = source.signal_restorers;
+            destination.signal_action_masks = source.signal_action_masks;
+        });
+    }
+}
+
+/// Whether any process of the running domain may share runtime state
+/// with another: only then does a system call look for sharers.
+fn linux_processes_may_share_state() -> bool {
+    X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::Relaxed)
+        && linux_process::live_processes_share_state()
+}
+
+/// Keeps the current process's shared runtime state in step around one
+/// system call: brought up to date as it is made, written back as it
+/// leaves (see `pull_linux_shared_runtime_state`).
+struct LinuxSharedStateCall;
+
+impl LinuxSharedStateCall {
+    fn enter() -> Self {
+        pull_linux_shared_runtime_state();
+        Self
+    }
+}
+
+impl Drop for LinuxSharedStateCall {
+    fn drop(&mut self) {
+        push_linux_shared_runtime_state();
+    }
+}
+
+/// Releases the open files of process `pid`'s saved descriptor table,
+/// which it no longer uses, unless another live process still shares that
+/// table (CLONE_FILES): the last one to go releases them.
+#[inline(never)]
+fn release_linux_process_descriptors(pid: u32, state: &LinuxProcessRuntimeState) {
+    if !linux_process::live_process_resource_shared(pid, linux_process::SharedResource::Descriptors)
+    {
+        release_linux_descriptor_runtime_state(&state.descriptors);
+    }
+}
+
+/// Gives process `pid`, the current one, a descriptor table of its own when
+/// it shares one (unshare's CLONE_FILES, CLOSE_RANGE_UNSHARE, exec): a copy
+/// of the shared table, whose open files it holds now as well. False when
+/// they cannot be held.
+#[inline(never)]
+fn unshare_linux_descriptors(pid: u32) -> bool {
+    use linux_process::SharedResource;
+    if !linux_process::live_process_resource_shared(pid, SharedResource::Descriptors) {
+        return true;
+    }
+    // The bank is the group's table as this call found it.
+    assign_linux_open_file_ids();
+    let table = capture_linux_descriptor_runtime_state();
+    retain_linux_descriptor_runtime_state(&table)
+        && linux_process::share_live_process_resource(pid, SharedResource::Descriptors, None)
+}
+
+/// An exec leaves what the process shared with others behind, as Linux's
+/// does (unshare_files, unshare_sighand): a descriptor table of its own,
+/// whose open files it holds now as well, and signal handlers of its own,
+/// which the new program resets. The filesystem context stays shared.
+#[inline(never)]
+fn unshare_linux_state_for_exec(pid: u32) {
+    use linux_process::SharedResource;
+    if !linux_processes_may_share_state() {
+        return;
+    }
+    let _ = unshare_linux_descriptors(pid);
+    if linux_process::live_process_resource_shared(pid, SharedResource::SignalHandlers) {
+        let _ =
+            linux_process::share_live_process_resource(pid, SharedResource::SignalHandlers, None);
+    }
 }
 
 /// Gives every open descriptor its open-file id before the table is copied
@@ -28825,10 +29341,29 @@ fn linux_kcmp(first_pid: u64, second_pid: u64, kind: u64, first: u64, second: u6
         return LINUX_EPERM;
     }
     if (1..=KCMP_SYSVSEM).contains(&kind) {
-        // Every process fork currently receives a distinct VM, descriptor
-        // table, filesystem context, signal table, I/O context, and SysV undo
-        // context. A process compared with itself shares each resource.
-        return u64::from(first_pid != second_pid);
+        use linux_process::SharedResource;
+        // KCMP_VM, KCMP_FILES, KCMP_FS, KCMP_SIGHAND, KCMP_IO, KCMP_SYSVSEM:
+        // the same object, or an order between the two (Linux orders them
+        // by an obfuscated address; any consistent order will do).
+        let resource = [
+            SharedResource::Memory,
+            SharedResource::Descriptors,
+            SharedResource::Filesystem,
+            SharedResource::SignalHandlers,
+            SharedResource::Io,
+            SharedResource::SemaphoreUndo,
+        ][kind as usize - 1];
+        let (Some(first), Some(second)) = (
+            linux_process::live_process_shared_id(first_pid, resource),
+            linux_process::live_process_shared_id(second_pid, resource),
+        ) else {
+            return LINUX_ESRCH;
+        };
+        return match first.cmp(&second) {
+            core::cmp::Ordering::Equal => 0,
+            core::cmp::Ordering::Less => 1,
+            core::cmp::Ordering::Greater => 2,
+        };
     }
     if kind != KCMP_FILE {
         return LINUX_EINVAL;
@@ -33177,6 +33712,7 @@ fn linux_rootfs_execve_source(
         (loader_code.page_count * PAGE_SIZE) as u64,
         Ordering::SeqCst,
     );
+    unshare_linux_state_for_exec(current_linux_process_pid());
     for descriptor in 0..LINUX_AUX_DESCRIPTOR_LIMIT {
         if linux_descriptor_close_on_exec(descriptor) {
             let _ = linux_descriptor_close(descriptor);
@@ -34361,6 +34897,7 @@ fn linux_execve_at(
             .ELF_PROBE_READ_ONLY_DATA_PAGE
             .store(0, Ordering::SeqCst);
     }
+    unshare_linux_state_for_exec(current_linux_process_pid());
     for descriptor in 0..LINUX_AUX_DESCRIPTOR_LIMIT {
         if linux_descriptor_close_on_exec(descriptor) {
             let _ = linux_descriptor_close(descriptor);
@@ -52192,6 +52729,13 @@ fn linux_close_range(first: u64, last: u64, flags: u64) -> u64 {
     if first > last || flags & !(LINUX_CLOSE_RANGE_CLOEXEC | LINUX_CLOSE_RANGE_UNSHARE) != 0 {
         return LINUX_EINVAL;
     }
+    // CLOSE_RANGE_UNSHARE: the caller gets a table of its own first, so
+    // what it closes stays open for those it shared the table with.
+    if flags & LINUX_CLOSE_RANGE_UNSHARE != 0
+        && !unshare_linux_descriptors(current_linux_process_pid())
+    {
+        return LINUX_ENOMEM;
+    }
     let end = last.min(LINUX_DESCRIPTOR_TABLE_LIMIT - 1);
     if first > end {
         return 0;
@@ -54512,6 +55056,7 @@ fn verify_linux_cross_process_prlimit(pid: u32) -> bool {
                 exited: true,
                 stopped: false,
                 continued: false,
+                scope: linux_process::ChildScope::All,
             },
         ) == Some(linux_process::ChildWaitState::Exited {
             pid,

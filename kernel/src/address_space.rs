@@ -5619,6 +5619,36 @@ pub(crate) fn current_linux_cow_page(address: u64) -> Option<memory::FrameLease>
     linux_cow_page_in_root(root, address)
 }
 
+/// Adds the address of every page the current address space maps
+/// copy-on-write to `pages`; false when the list cannot grow.
+pub(crate) fn current_linux_cow_addresses(pages: &mut Vec<u64>) -> bool {
+    fn walk(table_address: u64, level: usize, base: u64, pages: &mut Vec<u64>) -> bool {
+        let Some(table) = mapped_frame::<u64>(table_address) else {
+            return false;
+        };
+        let end = if level == 0 { 256 } else { ENTRY_COUNT };
+        let span = 1_u64 << (12 + 9 * (3 - level));
+        (0..end).all(|index| {
+            let value = unsafe { table.add(index).read() };
+            let address = base + index as u64 * span;
+            if level < 3 {
+                value & (PRESENT | USER | LARGE_PAGE) != PRESENT | USER
+                    || walk(value & ADDRESS_MASK, level + 1, address, pages)
+            } else if value & (PRESENT | USER | WRITABLE | LINUX_RUNTIME_COW)
+                == PRESENT | USER | LINUX_RUNTIME_COW
+            {
+                pages.try_reserve(1).is_ok() && {
+                    pages.push(address);
+                    true
+                }
+            } else {
+                true
+            }
+        })
+    }
+    walk(current_root(), 0, 0, pages)
+}
+
 pub(crate) fn linux_cow_page_in_root(
     root: memory::FrameLease,
     address: u64,

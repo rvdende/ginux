@@ -101,10 +101,29 @@ pub(super) const LINUX_BOUNDED_THREAD_CLONE_FLAGS: u64 = LINUX_CLONE_VM
     | LINUX_CLONE_CHILD_CLEARTID
     | LINUX_CLONE_CHILD_SETTID;
 
+/// Whether a thread clone with `flags` is one this kernel makes: a thread
+/// shares its process's memory and signal handlers (CLONE_THREAD needs
+/// CLONE_SIGHAND, which needs CLONE_VM), may set its thread pointer and tid
+/// words, and ignores the exit signal in the low byte as Linux does. Its
+/// descriptor table and filesystem context are its process's whether or not
+/// CLONE_FILES and CLONE_FS are asked for: threads here have none of their
+/// own.
 pub(super) fn linux_thread_clone_flags_supported(flags: u64) -> bool {
-    let flags = flags & !LINUX_CLONE_DETACHED;
-    flags == LINUX_BOUNDED_THREAD_CLONE_FLAGS
-        || flags == LINUX_BOUNDED_THREAD_CLONE_FLAGS & !LINUX_CLONE_CHILD_SETTID
+    const REQUIRED: u64 = LINUX_CLONE_THREAD | LINUX_CLONE_SIGHAND | LINUX_CLONE_VM;
+    const OPTIONAL: u64 = 0xff
+        | LINUX_CLONE_FS
+        | LINUX_CLONE_FILES
+        | LINUX_CLONE_SYSVSEM
+        | LINUX_CLONE_SETTLS
+        | LINUX_CLONE_PARENT_SETTID
+        | LINUX_CLONE_CHILD_CLEARTID
+        | LINUX_CLONE_CHILD_SETTID
+        | LINUX_CLONE_DETACHED
+        // CLONE_PTRACE, CLONE_UNTRACED, CLONE_IO
+        | 0x2000
+        | 0x0080_0000
+        | 0x8000_0000;
+    flags & REQUIRED == REQUIRED && flags & !(REQUIRED | OPTIONAL) == 0
 }
 pub(super) const LINUX_EXIT_SYSCALL: u64 = 60;
 pub(super) const LINUX_UNAME_SYSCALL: u64 = 63;

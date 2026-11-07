@@ -514,11 +514,6 @@ struct Process {
     /// The namespaces a clone it asked for made for its next child (clone
     /// with CLONE_NEWPID and the like), taken when that child is made.
     child_namespaces: Option<linux_namespace::Set>,
-    /// Made by clone with CLONE_FILES: its descriptor table counts as its
-    /// parent's (copied here) until it unshares one or execs.
-    shares_descriptors: bool,
-    /// Its next child is made with CLONE_FILES.
-    child_shares_descriptors: bool,
     /// Its user and group ids: inherited across fork, kept across exec.
     credentials: linux_user::Credentials,
     runtime_slot: Option<u8>,
@@ -579,6 +574,20 @@ struct Process {
     /// with its own stack) that has not executed yet: every page it maps is
     /// its parent's.
     shares_parent_vm: bool,
+    /// The objects clone can share between processes, by id: processes
+    /// holding the same id share that object (see `SharedResource`).
+    shared: [u32; SHARED_RESOURCE_COUNT],
+    /// The signal its parent gets when it ends (clone's exit signal): 0 for
+    /// none. A child whose signal is not SIGCHLD is a "clone" child, which
+    /// only a wait with __WCLONE or __WALL reports.
+    exit_signal: u8,
+    /// The process that cloned this one when that is not its parent
+    /// (CLONE_PARENT): the fork transaction that runs it first resumes that
+    /// one, not the parent.
+    cloned_by: Option<ProcessHandle>,
+    /// The child of a vfork (CLONE_VFORK) this process is suspended for
+    /// until that child executes or exits, or 0.
+    vfork_child: u32,
     /// Gave up the CPU in a blocking system call and has not been dispatched
     /// since: Linux's interruptible sleep ('S').
     waiting: bool,
@@ -594,6 +603,27 @@ struct Process {
     /// accounting's start time and elapsed time).
     started_nanoseconds: u64,
 }
+
+/// What clone can share between processes rather than copy (CLONE_VM,
+/// CLONE_FILES, CLONE_FS, CLONE_SIGHAND, CLONE_IO, CLONE_SYSVSEM). Each
+/// process names each of these by an id; processes that share one hold the
+/// same id, and an id is never handed out twice in a domain, so kcmp(2)
+/// compares them and the runtime keeps the shared state of processes with
+/// the same id in step.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SharedResource {
+    Memory,
+    Descriptors,
+    Filesystem,
+    SignalHandlers,
+    Io,
+    SemaphoreUndo,
+}
+
+const SHARED_RESOURCE_COUNT: usize = 6;
+
+/// The signal a child's end sends its parent unless clone named another.
+const DEFAULT_EXIT_SIGNAL: u8 = 17;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProcessWaitEvent {
@@ -686,6 +716,11 @@ struct ProcessTable {
     /// names its newest. One no process reaches is reused (`install`).
     seccomp_filters: Vec<Option<SeccompFilter>>,
     next_pid: u32,
+    /// The next id of a shared object (`Process::shared`).
+    next_shared_id: u32,
+    /// Some process was cloned sharing runtime state with another (see
+    /// `live_processes_share_state`).
+    sharing: bool,
     init: Option<ProcessHandle>,
 }
 
@@ -712,8 +747,17 @@ impl ProcessTable {
             roots: Vec::new(),
             seccomp_filters: Vec::new(),
             next_pid: 1,
+            next_shared_id: 1,
+            sharing: false,
             init: None,
         }
+    }
+
+    /// A shared-object id no process holds yet.
+    fn new_shared_id(&mut self) -> u32 {
+        let id = self.next_shared_id;
+        self.next_shared_id = id.wrapping_add(1).max(1);
+        id
     }
 
     fn create_init(
@@ -1398,9 +1442,12 @@ impl ProcessTable {
         }) else {
             return;
         };
+        // An adopted child ends with SIGCHLD to init, whatever its clone
+        // asked of its first parent, as in Linux.
         for process in self.processes.iter_mut().flatten() {
             if process.parent == Some(handle) {
                 process.parent = Some(init);
+                process.exit_signal = DEFAULT_EXIT_SIGNAL;
             }
         }
     }
@@ -1810,17 +1857,13 @@ impl ProcessTable {
         let seccomp_filter = parent
             .and_then(|parent| self.process(parent))
             .map_or(0, |parent| parent.seccomp_filter);
-        let (namespaces, shares_descriptors) =
-            match parent.and_then(|parent| self.process_mut(parent)) {
-                Some(parent) => (
-                    parent
-                        .child_namespaces
-                        .take()
-                        .unwrap_or_else(|| parent.namespaces.for_child()),
-                    core::mem::take(&mut parent.child_shares_descriptors),
-                ),
-                None => (linux_namespace::Set::default(), false),
-            };
+        let namespaces = match parent.and_then(|parent| self.process_mut(parent)) {
+            Some(parent) => parent
+                .child_namespaces
+                .take()
+                .unwrap_or_else(|| parent.namespaces.for_child()),
+            None => linux_namespace::Set::default(),
+        };
         // A child born into a PID namespace gets its numbers there, and the
         // time namespace it enters keeps its offsets from now on.
         let instance = cpu::current_linux_execution_instance();
@@ -1847,6 +1890,7 @@ impl ProcessTable {
         }
         self.roots[slot] = root;
         self.generations[slot] = generation;
+        let shared = core::array::from_fn(|_| self.new_shared_id());
         self.processes[slot] = Some(Process {
             handle,
             parent,
@@ -1856,8 +1900,6 @@ impl ProcessTable {
             user_namespace,
             namespaces,
             child_namespaces: None,
-            shares_descriptors,
-            child_shares_descriptors: false,
             credentials,
             runtime_slot: address_space.map(|space| space.storage_slot),
             address_space,
@@ -1878,6 +1920,10 @@ impl ProcessTable {
             state,
             wait_event: None,
             shares_parent_vm: false,
+            shared,
+            exit_signal: DEFAULT_EXIT_SIGNAL,
+            cloned_by: None,
+            vfork_child: 0,
             waiting: false,
             cpu_cycles: 0,
             user_cycles: 0,
@@ -2001,8 +2047,6 @@ impl ProcessTable {
             return false;
         };
         process.executed = true;
-        // exec gives the process a descriptor table of its own.
-        process.shares_descriptors = false;
         process.posix_timers = [None; POSIX_TIMER_LIMIT];
         process.debug_registers = DebugRegisters::RESET;
         true
@@ -2034,11 +2078,13 @@ impl ProcessTable {
         }
         process.context = Some(context);
         process.executed = true;
-        // exec gives the process a descriptor table of its own.
-        process.shares_descriptors = false;
         process.posix_timers = [None; POSIX_TIMER_LIMIT];
         process.debug_registers = DebugRegisters::RESET;
         process.shares_parent_vm = false;
+        let memory = self.new_shared_id();
+        if let Some(process) = self.process_mut(handle) {
+            process.shared[SharedResource::Memory as usize] = memory;
+        }
         true
     }
 
@@ -3270,43 +3316,6 @@ pub(crate) fn set_live_process_groups(pid: u32, groups: Vec<u32>) -> bool {
     true
 }
 
-/// Whether process `pid` was made sharing its parent's descriptor table
-/// and has not unshared it since.
-pub(crate) fn live_process_shares_descriptors(pid: u32) -> bool {
-    live_process_table_mut()
-        .and_then(|table| Some(table.process(table.handle_by_pid(pid)?)?.shares_descriptors))
-        .unwrap_or(false)
-}
-
-/// Whether process `pid`'s next child is made with CLONE_FILES.
-pub(crate) fn set_live_process_child_shares_descriptors(pid: u32, shares: bool) -> bool {
-    let Some(table) = live_process_table_mut() else {
-        return false;
-    };
-    let Some(process) = table
-        .handle_by_pid(pid)
-        .and_then(|handle| table.process_mut(handle))
-    else {
-        return false;
-    };
-    process.child_shares_descriptors = shares;
-    true
-}
-
-pub(crate) fn set_live_process_shares_descriptors(pid: u32, shares: bool) -> bool {
-    let Some(table) = live_process_table_mut() else {
-        return false;
-    };
-    let Some(process) = table
-        .handle_by_pid(pid)
-        .and_then(|handle| table.process_mut(handle))
-    else {
-        return false;
-    };
-    process.shares_descriptors = shares;
-    true
-}
-
 /// Sets the namespaces process `pid`'s next child is made in (`None`:
 /// its own, as a fork's child has).
 pub(crate) fn set_live_process_child_namespaces(
@@ -4468,6 +4477,186 @@ pub(crate) fn live_process_shares_parent_vm(pid: u32) -> bool {
     })
 }
 
+/// The id of the `resource` process `pid` uses (`SharedResource`).
+pub(crate) fn live_process_shared_id(pid: u32, resource: SharedResource) -> Option<u32> {
+    let table = live_process_table_mut()?;
+    let process = table.process(table.handle_by_pid(pid)?)?;
+    Some(process.shared[resource as usize])
+}
+
+/// Makes process `pid` use `resource` of process `owner` (a clone that
+/// shares it), or one of its own when `owner` is None (unshare, exec).
+pub(crate) fn share_live_process_resource(
+    pid: u32,
+    resource: SharedResource,
+    owner: Option<u32>,
+) -> bool {
+    let Some(table) = live_process_table_mut() else {
+        return false;
+    };
+    let id = match owner {
+        Some(owner) => {
+            let Some(owner) = table
+                .handle_by_pid(owner)
+                .and_then(|handle| table.process(handle))
+            else {
+                return false;
+            };
+            owner.shared[resource as usize]
+        }
+        None => table.new_shared_id(),
+    };
+    table.sharing |= owner.is_some()
+        && matches!(
+            resource,
+            SharedResource::Descriptors
+                | SharedResource::Filesystem
+                | SharedResource::SignalHandlers
+        );
+    let Some(process) = table
+        .handle_by_pid(pid)
+        .and_then(|handle| table.process_mut(handle))
+    else {
+        return false;
+    };
+    process.shared[resource as usize] = id;
+    true
+}
+
+/// The other processes that share `resource` with process `pid` and have
+/// not ended (a zombie holds nothing any more): their pids and how many.
+pub(crate) fn live_processes_sharing(
+    pid: u32,
+    resource: SharedResource,
+) -> ([u32; PROCESS_LIMIT], usize) {
+    let mut sharing = ([0; PROCESS_LIMIT], 0);
+    let Some(table) = live_process_table_mut() else {
+        return sharing;
+    };
+    let Some(id) = table
+        .handle_by_pid(pid)
+        .and_then(|handle| table.process(handle))
+        .map(|process| process.shared[resource as usize])
+    else {
+        return sharing;
+    };
+    for process in table.processes.iter().flatten() {
+        if process.handle.pid != pid
+            && process.shared[resource as usize] == id
+            && matches!(
+                process.state,
+                ProcessState::Running | ProcessState::Stopped { .. }
+            )
+            && sharing.1 < PROCESS_LIMIT
+        {
+            sharing.0[sharing.1] = process.handle.pid;
+            sharing.1 += 1;
+        }
+    }
+    sharing
+}
+
+/// Whether process `pid` shares `resource` with another that has not ended.
+pub(crate) fn live_process_resource_shared(pid: u32, resource: SharedResource) -> bool {
+    let tracked = matches!(
+        resource,
+        SharedResource::Memory | SharedResource::Io | SharedResource::SemaphoreUndo
+    ) || live_processes_share_state();
+    tracked && live_processes_sharing(pid, resource).1 != 0
+}
+
+/// Whether any process of the domain was ever cloned to share runtime
+/// state (descriptors, filesystem context, signal handlers) with another:
+/// until then no system call needs to keep any in step.
+pub(crate) fn live_processes_share_state() -> bool {
+    live_process_table_mut().is_some_and(|table| table.sharing)
+}
+
+/// The signal process `pid`'s end sends its parent (clone's exit signal).
+pub(crate) fn live_process_exit_signal(pid: u32) -> Option<u8> {
+    let table = live_process_table_mut()?;
+    let process = table.process(table.handle_by_pid(pid)?)?;
+    Some(process.exit_signal)
+}
+
+pub(crate) fn set_live_process_exit_signal(pid: u32, signal: u8) -> bool {
+    let Some(table) = live_process_table_mut() else {
+        return false;
+    };
+    let Some(process) = table
+        .handle_by_pid(pid)
+        .and_then(|handle| table.process_mut(handle))
+    else {
+        return false;
+    };
+    process.exit_signal = signal;
+    true
+}
+
+/// Makes process `pid`, a child just cloned, the child of its parent's
+/// parent instead (CLONE_PARENT): that process waits for it and gets its
+/// exit signal.
+pub(crate) fn adopt_live_process_by_grandparent(pid: u32) -> bool {
+    let Some(table) = live_process_table_mut() else {
+        return false;
+    };
+    let Some(grandparent) = table
+        .handle_by_pid(pid)
+        .and_then(|handle| table.process(handle))
+        .and_then(|process| process.parent)
+        .and_then(|parent| table.process(parent))
+        .and_then(|parent| parent.parent)
+    else {
+        return false;
+    };
+    let Some(process) = table
+        .handle_by_pid(pid)
+        .and_then(|handle| table.process_mut(handle))
+    else {
+        return false;
+    };
+    process.cloned_by = process.parent;
+    process.parent = Some(grandparent);
+    true
+}
+
+/// Records that process `parent` is suspended in a vfork until `child`
+/// executes or exits (0: no longer).
+pub(crate) fn set_live_process_vfork_child(parent: u32, child: u32) -> bool {
+    let Some(table) = live_process_table_mut() else {
+        return false;
+    };
+    let Some(process) = table
+        .handle_by_pid(parent)
+        .and_then(|handle| table.process_mut(handle))
+    else {
+        return false;
+    };
+    process.vfork_child = child;
+    true
+}
+
+/// The vfork child process `parent` is suspended for, and whether it still
+/// is: true until the child has executed or ended.
+pub(crate) fn live_process_vfork_child(parent: u32) -> Option<(u32, bool)> {
+    let table = live_process_table_mut()?;
+    let child = table.process(table.handle_by_pid(parent)?)?.vfork_child;
+    if child == 0 {
+        return None;
+    }
+    let pending = table
+        .handle_by_pid(child)
+        .and_then(|handle| table.process(handle))
+        .is_some_and(|process| {
+            !process.executed
+                && matches!(
+                    process.state,
+                    ProcessState::Running | ProcessState::Stopped { .. } | ProcessState::Preparing
+                )
+        });
+    Some((child, pending))
+}
+
 pub(crate) fn replace_live_process_mapping(
     pid: u32,
     address: usize,
@@ -5312,9 +5501,9 @@ pub(crate) fn complete_live_child_exit(pid: u32, status: u8) -> Option<LiveProce
         .store(151, Ordering::Release);
     let child_handle = table.handle_by_pid(pid)?;
     let child = table.process(child_handle)?;
-    let parent_handle = child.parent?;
+    let parent_handle = child.cloned_by.or(child.parent)?;
     let parent = table.process(parent_handle)?;
-    if child.parent != Some(parent_handle) || child.state != ProcessState::Running {
+    if child.state != ProcessState::Running {
         return None;
     }
     let parent_space = parent.address_space.as_ref()?;
@@ -5390,7 +5579,7 @@ pub(crate) fn resume_live_parent_after_child_exec(pid: u32) -> Option<LiveProces
     let table = live_process_table_mut()?;
     let child_handle = table.handle_by_pid(pid)?;
     let child = table.process(child_handle)?;
-    let parent_handle = child.parent?;
+    let parent_handle = child.cloned_by.or(child.parent)?;
     let parent = table.process(parent_handle)?;
     let child_space = child.address_space.as_ref()?;
     let parent_space = parent.address_space.as_ref()?;
@@ -5628,7 +5817,9 @@ pub(crate) fn live_child_wait_state(
     let parent = table.handle_by_pid(parent_pid)?;
     table.child_wait_state_matching(
         parent,
-        |process| child_pid.is_none_or(|pid| process.handle.pid == pid),
+        |process| {
+            child_pid.is_none_or(|pid| process.handle.pid == pid) && events.scope.includes(process)
+        },
         events.exited,
         events.stopped,
         events.continued,
@@ -5644,7 +5835,7 @@ pub(crate) fn live_child_group_wait_state(
     let parent = table.handle_by_pid(parent_pid)?;
     table.child_wait_state_matching(
         parent,
-        |process| process.process_group == process_group,
+        |process| process.process_group == process_group && events.scope.includes(process),
         events.exited,
         events.stopped,
         events.continued,
@@ -5658,6 +5849,27 @@ pub(crate) struct ChildWaitEvents {
     pub(crate) exited: bool,
     pub(crate) stopped: bool,
     pub(crate) continued: bool,
+    pub(crate) scope: ChildScope,
+}
+
+/// Which children a wait looks at, by the signal they end with: those
+/// ending with SIGCHLD (the default), the others ("clone" children,
+/// __WCLONE) or all of them (__WALL).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ChildScope {
+    Plain,
+    Clone,
+    All,
+}
+
+impl ChildScope {
+    fn includes(self, process: &Process) -> bool {
+        match self {
+            Self::Plain => process.exit_signal == DEFAULT_EXIT_SIGNAL,
+            Self::Clone => process.exit_signal != DEFAULT_EXIT_SIGNAL,
+            Self::All => true,
+        }
+    }
 }
 
 pub(crate) fn consume_live_child_wait_event(parent_pid: u32, child_pid: u32) -> bool {
