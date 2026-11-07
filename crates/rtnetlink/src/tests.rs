@@ -15,8 +15,8 @@ fn links() -> [Link<'static>; 2] {
             mtu: 65_536,
             min_mtu: 0,
             max_mtu: 0,
-            address: [0; 6],
-            broadcast: [0; 6],
+            address: Some([0; 6]),
+            broadcast: Some([0; 6]),
             txqlen: 1000,
             qdisc: b"noqueue",
         },
@@ -28,8 +28,8 @@ fn links() -> [Link<'static>; 2] {
             mtu: 1500,
             min_mtu: 68,
             max_mtu: 65_535,
-            address: ETHERNET_MAC,
-            broadcast: [0xff; 6],
+            address: Some(ETHERNET_MAC),
+            broadcast: Some([0xff; 6]),
             txqlen: 1000,
             qdisc: b"pfifo_fast",
         },
@@ -107,6 +107,9 @@ struct Kernel {
     administrator: bool,
     changes: Vec<LinkChange>,
     result: Result<(), i32>,
+    /// The addresses added (true) and removed (false).
+    addresses: Vec<(bool, i32, Ip, u8)>,
+    address_result: Result<(), i32>,
 }
 
 impl Kernel {
@@ -115,6 +118,8 @@ impl Kernel {
             administrator: true,
             changes: Vec::new(),
             result: Ok(()),
+            addresses: Vec::new(),
+            address_result: Err(EOPNOTSUPP),
         }
     }
 }
@@ -127,6 +132,16 @@ impl Network for Kernel {
     fn change_link(&mut self, change: LinkChange) -> Result<(), i32> {
         self.changes.push(change);
         self.result
+    }
+
+    fn add_address(&mut self, index: i32, address: Ip, prefix: u8) -> Result<(), i32> {
+        self.addresses.push((true, index, address, prefix));
+        self.address_result
+    }
+
+    fn remove_address(&mut self, index: i32, address: Ip, prefix: u8) -> Result<(), i32> {
+        self.addresses.push((false, index, address, prefix));
+        self.address_result
     }
 }
 
@@ -646,4 +661,77 @@ fn prefixes_match_by_bits() {
     assert!(Ip::V4([10, 0, 3, 1]).matches(Ip::V4([10, 0, 2, 0]), 23));
     assert!(Ip::V4([1, 2, 3, 4]).matches(Ip::V4([0; 4]), 0));
     assert!(!Ip::V4([1, 2, 3, 4]).matches(Ip::V6([0; 16]), 0));
+}
+
+#[test]
+fn the_kernel_adds_and_removes_addresses() {
+    let lo = [AF_INET, 8, 0, 0, 1, 0, 0, 0];
+    let add = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
+    let mut kernel = Kernel::new();
+    kernel.address_result = Ok(());
+    let found = run(
+        &mut kernel,
+        &request(RTM_NEWADDR, add, 1, &lo, &[(IFA_LOCAL, &[127, 0, 0, 2])]),
+    );
+    assert_eq!(error_of(&found[0]), 0);
+    let found = run(
+        &mut kernel,
+        &request(
+            RTM_DELADDR,
+            NLM_F_REQUEST | NLM_F_ACK,
+            2,
+            &lo,
+            &[(IFA_LOCAL, &[127, 0, 0, 1])],
+        ),
+    );
+    assert_eq!(error_of(&found[0]), 0);
+    assert_eq!(
+        kernel.addresses,
+        [
+            (true, 1, Ip::V4([127, 0, 0, 2]), 8),
+            (false, 1, Ip::V4([127, 0, 0, 1]), 8),
+        ]
+    );
+    // Linux's own answers come first: the kernel is not asked.
+    let mut kernel = Kernel::new();
+    run(
+        &mut kernel,
+        &request(RTM_NEWADDR, add, 3, &lo, &[(IFA_LOCAL, &[127, 0, 0, 1])]),
+    );
+    run(
+        &mut kernel,
+        &request(
+            RTM_DELADDR,
+            NLM_F_REQUEST,
+            4,
+            &lo,
+            &[(IFA_LOCAL, &[127, 0, 0, 9])],
+        ),
+    );
+    assert!(kernel.addresses.is_empty());
+}
+
+#[test]
+fn links_without_an_address_have_none() {
+    let tun = Link {
+        index: 3,
+        name: b"tun0",
+        kind: 65_534,
+        address: None,
+        broadcast: None,
+        ..links()[1]
+    };
+    let view = View {
+        links: &[tun],
+        addresses: &[],
+        routes: &[],
+    };
+    let found = messages(&answer(
+        &view,
+        &mut Kernel::new(),
+        &request(RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, 1, &[0], &[]),
+        5,
+    ));
+    assert_eq!(attribute(&found[0].4, 16, IFLA_ADDRESS), None);
+    assert_eq!(attribute(&found[0].4, 16, IFLA_IFNAME).unwrap(), b"tun0\0");
 }

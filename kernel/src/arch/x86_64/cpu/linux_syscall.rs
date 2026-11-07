@@ -562,6 +562,14 @@ fn linux_syscall_dispatch(
                         LINUX_EAGAIN
                     }
                 }
+                // A blocking read of /dev/net/tun waits for a packet.
+                LINUX_EAGAIN if linux_tun_file(first_argument).is_some() => {
+                    if number == LINUX_READ_SYSCALL && !linux_socket_nonblocking(first_argument) {
+                        linux_retry_later_live_return(registers, syscall_return, number)
+                    } else {
+                        LINUX_EAGAIN
+                    }
+                }
                 // An ioctl that waits for the GPU: let the rest of the
                 // domain run, then issue it again.
                 LINUX_EAGAIN if number == LINUX_IOCTL_SYSCALL => {

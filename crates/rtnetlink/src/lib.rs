@@ -160,8 +160,10 @@ pub struct Link<'a> {
     pub mtu: u32,
     pub min_mtu: u32,
     pub max_mtu: u32,
-    pub address: [u8; 6],
-    pub broadcast: [u8; 6],
+    /// The link-layer address and broadcast address; none for a link
+    /// without one (a TUN device).
+    pub address: Option<[u8; 6]>,
+    pub broadcast: Option<[u8; 6]>,
     pub txqlen: u32,
     /// The queueing discipline's name.
     pub qdisc: &'a [u8],
@@ -294,6 +296,13 @@ pub trait Network {
 
     /// Applies `change`, or says why not (an errno).
     fn change_link(&mut self, change: LinkChange) -> Result<(), i32>;
+
+    /// Gives link `index` an address it has not got (RTM_NEWADDR), or
+    /// says why not.
+    fn add_address(&mut self, index: i32, address: Ip, prefix: u8) -> Result<(), i32>;
+
+    /// Takes an address from link `index` (RTM_DELADDR).
+    fn remove_address(&mut self, index: i32, address: Ip, prefix: u8) -> Result<(), i32>;
 }
 
 /// The datagrams that answer `input`, one or more netlink messages a
@@ -393,7 +402,7 @@ fn request(
         }
         // IPv4 has no single-address GETADDR; Linux answers EOPNOTSUPP.
         RTM_GETADDR => Err(EOPNOTSUPP),
-        RTM_NEWADDR | RTM_DELADDR => change_address(view, header, body),
+        RTM_NEWADDR | RTM_DELADDR => change_address(view, network, header, body),
         RTM_GETROUTE if dump => {
             for route in view
                 .routes
@@ -492,8 +501,13 @@ fn change_link(
 
 /// RTM_NEWADDR and RTM_DELADDR: an address the link already has is
 /// EEXIST to add (unless NLM_F_REPLACE), one it lacks EADDRNOTAVAIL to
-/// delete; the kernel adds and removes none (EOPNOTSUPP).
-fn change_address(view: &View, header: &Header, body: &[u8]) -> Result<(), i32> {
+/// delete; the kernel adds or removes the others, or says why not.
+fn change_address(
+    view: &View,
+    network: &mut dyn Network,
+    header: &Header,
+    body: &[u8],
+) -> Result<(), i32> {
     const IFADDRMSG: usize = 8;
     if body.len() < IFADDRMSG {
         return Err(EINVAL);
@@ -517,8 +531,9 @@ fn change_address(view: &View, header: &Header, body: &[u8]) -> Result<(), i32> 
     match (header.kind, existing) {
         (RTM_NEWADDR, true) if header.flags & NLM_F_REPLACE == 0 => Err(EEXIST),
         (RTM_NEWADDR, true) => Ok(()),
+        (RTM_NEWADDR, false) => network.add_address(index, address, prefix),
         (RTM_DELADDR, false) => Err(EADDRNOTAVAIL),
-        _ => Err(EOPNOTSUPP),
+        _ => network.remove_address(index, address, prefix),
     }
 }
 
@@ -770,8 +785,12 @@ fn link_message(link: &Link, reply: Reply, flags: u16) -> Vec<u8> {
     message.u32(IFLA_NUM_RX_QUEUES, 1);
     message.u8(IFLA_CARRIER, u8::from(link.flags & IFF_RUNNING != 0));
     message.string(IFLA_QDISC, link.qdisc);
-    message.attribute(IFLA_ADDRESS, &link.address);
-    message.attribute(IFLA_BROADCAST, &link.broadcast);
+    if let Some(address) = link.address {
+        message.attribute(IFLA_ADDRESS, &address);
+    }
+    if let Some(broadcast) = link.broadcast {
+        message.attribute(IFLA_BROADCAST, &broadcast);
+    }
     message.finish()
 }
 

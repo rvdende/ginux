@@ -30,6 +30,7 @@ mod linux_signal;
 mod linux_swapon;
 mod linux_syscall;
 mod linux_time;
+mod linux_tun;
 mod linux_userfaultfd;
 pub(crate) use architecture::{
     clear_interrupt_gate, current_cpu_index, current_cpu_index_checked, double_fault_guard_page,
@@ -70,6 +71,7 @@ pub(crate) use linux_signal::{
 use linux_swapon::*;
 use linux_syscall::linux_syscall_handler;
 use linux_time::*;
+use linux_tun::*;
 use linux_userfaultfd::*;
 
 use crate::{
@@ -13636,13 +13638,14 @@ fn linux_socket_ioctl(descriptor: u64, request: u64, argument: u64) -> Option<u6
         let capacity = i32::from_ne_bytes(ifconf[..4].try_into().unwrap()).max(0) as usize;
         let buffer = u64::from_ne_bytes(ifconf[8..16].try_into().unwrap());
         let mut written = 0_usize;
-        for interface in interfaces.iter().flatten() {
+        for interface in &interfaces {
             if buffer != 0 {
                 if written + IFREQ_SIZE > capacity {
                     break;
                 }
                 let mut entry = [0_u8; IFREQ_SIZE];
-                entry[..interface.name.len()].copy_from_slice(interface.name);
+                let name = interface.name.as_bytes();
+                entry[..name.len()].copy_from_slice(name);
                 entry[16..32].copy_from_slice(&sockaddr_in(interface.ipv4));
                 if !copy_to_linux_user(buffer + written as u64, &entry) {
                     return Some(LINUX_EFAULT);
@@ -13664,16 +13667,12 @@ fn linux_socket_ioctl(descriptor: u64, request: u64, argument: u64) -> Option<u6
     }
     let interface = if request == SIOCGIFNAME {
         let index = i32::from_ne_bytes(ifreq[16..20].try_into().unwrap());
-        interfaces
-            .iter()
-            .flatten()
-            .find(|interface| interface.index == index)
+        interfaces.iter().find(|interface| interface.index == index)
     } else {
         let name_length = ifreq[..16].iter().position(|byte| *byte == 0).unwrap_or(16);
         interfaces
             .iter()
-            .flatten()
-            .find(|interface| interface.name == &ifreq[..name_length])
+            .find(|interface| interface.name.as_bytes() == &ifreq[..name_length])
     };
     let Some(interface) = interface else {
         return Some(LINUX_ENODEV);
@@ -13681,13 +13680,14 @@ fn linux_socket_ioctl(descriptor: u64, request: u64, argument: u64) -> Option<u6
     match request {
         SIOCGIFNAME => {
             ifreq[..16].fill(0);
-            ifreq[..interface.name.len()].copy_from_slice(interface.name);
+            let name = interface.name.as_bytes();
+            ifreq[..name.len()].copy_from_slice(name);
         }
         SIOCGIFFLAGS => ifreq[16..18].copy_from_slice(&interface.flags.to_ne_bytes()),
         // Changing an interface takes CAP_NET_ADMIN. The domain's own stay
         // as the kernel set them up (EOPNOTSUPP for a change; setting what
-        // they have is a success); a network namespace's loopback goes up
-        // and down and takes another MTU.
+        // they have is a success); a TUN or TAP device, and a network
+        // namespace's loopback, go up and down and take another MTU.
         SIOCSIFFLAGS | SIOCSIFMTU => {
             if !current_linux_credentials().is_some_and(|credentials| {
                 credentials.has(ginux_credentials::capability::NET_ADMIN)
@@ -13705,6 +13705,22 @@ fn linux_socket_ioctl(descriptor: u64, request: u64, argument: u64) -> Option<u6
             } else {
                 (flags ^ interface.flags) & LINUX_IFF_UP == 0
             };
+            if interface.tun {
+                let result = if request == SIOCSIFMTU {
+                    crate::linux_socket::tun_set_link(
+                        interface.index,
+                        None,
+                        u32::try_from(mtu).ok(),
+                    )
+                } else {
+                    crate::linux_socket::tun_set_link(
+                        interface.index,
+                        Some(flags & LINUX_IFF_UP != 0),
+                        None,
+                    )
+                };
+                return Some(result.map_or_else(|errno| (-i64::from(errno)) as u64, |()| 0));
+            }
             if network == 0 && !unchanged {
                 return Some(LINUX_EOPNOTSUPP);
             }
@@ -13734,9 +13750,12 @@ fn linux_socket_ioctl(descriptor: u64, request: u64, argument: u64) -> Option<u6
             ifreq[16..32].copy_from_slice(&sockaddr_in(mask));
         }
         SIOCGIFMTU => ifreq[16..20].copy_from_slice(&interface.mtu.to_ne_bytes()),
-        // ifr_qlen: every interface's transmit queue holds 1000, as
-        // Linux's default.
-        SIOCGIFTXQLEN => ifreq[16..20].copy_from_slice(&1000_i32.to_ne_bytes()),
+        // ifr_qlen: Linux's defaults, 500 for a TUN or TAP device's queue
+        // and 1000 for the others.
+        SIOCGIFTXQLEN => {
+            let length: i32 = if interface.tun { 500 } else { 1000 };
+            ifreq[16..20].copy_from_slice(&length.to_ne_bytes());
+        }
         SIOCGIFHWADDR => {
             ifreq[16..18].copy_from_slice(&interface.hardware.0.to_ne_bytes());
             ifreq[18..24].copy_from_slice(&interface.hardware.1);
@@ -13774,7 +13793,7 @@ const LINUX_IFF_UP: u16 = 0x1;
 /// The interfaces the current process's network namespace has: the
 /// domain's (loopback and eth0), or a namespace's own loopback alone,
 /// with 127.0.0.1 only while it is up.
-fn linux_network_interfaces() -> [Option<crate::linux_socket::InterfaceInfo>; 2] {
+fn linux_network_interfaces() -> Vec<crate::linux_socket::InterfaceInfo> {
     const IFF_LOOPBACK: u16 = 0x8;
     const IFF_RUNNING: u16 = 0x40;
     const ARPHRD_LOOPBACK: u16 = 772;
@@ -13784,10 +13803,12 @@ fn linux_network_interfaces() -> [Option<crate::linux_socket::InterfaceInfo>; 2]
     }
     let loopback = linux_namespace::loopback(linux_execution_instance(), network).map(|loopback| {
         crate::linux_socket::InterfaceInfo {
-            name: b"lo",
+            name: ginux_tun::Name::new(b"lo").unwrap_or_else(|| unreachable!("a valid name")),
             index: 1,
             ipv4: if loopback.up { 0x7f00_0001 } else { 0 },
             prefix: if loopback.up { 8 } else { 0 },
+            more_ipv4: Vec::new(),
+            tun: false,
             flags: IFF_LOOPBACK
                 | if loopback.up {
                     LINUX_IFF_UP | IFF_RUNNING
@@ -13798,7 +13819,7 @@ fn linux_network_interfaces() -> [Option<crate::linux_socket::InterfaceInfo>; 2]
             hardware: (ARPHRD_LOOPBACK, [0; 6]),
         }
     });
-    [loopback, None]
+    loopback.into_iter().collect()
 }
 
 /// Whether the current process's network namespace reaches IPv4 address
@@ -37902,6 +37923,7 @@ fn linux_open_file_at(
                 Ok(LinuxDeviceNode::PtyMaster) => return linux_open_pty_master(flags),
                 Ok(LinuxDeviceNode::PtySlave(index)) => return linux_open_pty_slave(index, flags),
                 Ok(LinuxDeviceNode::Userfaultfd) => return linux_open_userfaultfd_device(flags),
+                Ok(LinuxDeviceNode::Tun) => return linux_open_tun(flags),
                 Err(error) => return error,
             },
             None => return LINUX_ENOENT,
@@ -39029,6 +39051,9 @@ fn linux_ensure_dev_nodes() {
     if !image_has(b"dev/shm") && crate::linux_overlay::lookup(b"dev/shm").is_none() {
         root_owned(crate::linux_overlay::create_directory(b"dev/shm", 0o1777));
     }
+    if !image_has(b"dev/net") && crate::linux_overlay::lookup(b"dev/net").is_none() {
+        root_owned(crate::linux_overlay::create_directory(b"dev/net", 0o755));
+    }
     for device in LinuxCharacterDevice::ALL {
         let mut path = [0_u8; 16];
         let name = device.name();
@@ -39060,6 +39085,7 @@ fn linux_ensure_dev_nodes() {
     for (name, device, permissions) in [
         (&b"dev/ptmx"[..], crate::linux_pty::MASTER_DEVICE, 0o666),
         (b"dev/userfaultfd", LINUX_USERFAULTFD_DEVICE, 0o600),
+        (b"dev/net/tun", LINUX_TUN_DEVICE, 0o666),
     ] {
         if crate::linux_overlay::lookup(name).is_none() {
             root_owned(crate::linux_overlay::create_device(
@@ -39109,6 +39135,8 @@ enum LinuxDeviceNode {
     PtySlave(u64),
     /// /dev/userfaultfd (10:126).
     Userfaultfd,
+    /// /dev/net/tun (10:200).
+    Tun,
 }
 
 /// What opening the device file `handle` opens: the kernel's null, zero and
@@ -39136,6 +39164,9 @@ fn linux_device_node_kind(
     }
     if character && device == LINUX_USERFAULTFD_DEVICE {
         return Ok(LinuxDeviceNode::Userfaultfd);
+    }
+    if character && device == LINUX_TUN_DEVICE {
+        return Ok(LinuxDeviceNode::Tun);
     }
     if let Some(index) = crate::linux_pty::slave_index(device).filter(|_| character) {
         return Ok(LinuxDeviceNode::PtySlave(index));
@@ -42188,7 +42219,6 @@ fn linux_socket_bind(descriptor: u64, address: u64, length: u64) -> u64 {
         if ifindex != 0
             && !linux_network_interfaces()
                 .iter()
-                .flatten()
                 .any(|interface| interface.index == ifindex)
         {
             return LINUX_ENODEV;
@@ -48126,6 +48156,7 @@ pub(crate) fn linux_release_objects() {
         crate::linux_fscontext::release(class, id);
         linux_userfaultfd_release(class, id);
         crate::linux_landlock::release(class, id);
+        linux_tun_release(class, id);
     }
 }
 
@@ -48547,6 +48578,9 @@ fn linux_object_syscall(number: u64, descriptor: u64, buffer: u64, count: u64) -
         (LINUX_READ_SYSCALL, crate::linux_userfaultfd::CLASS_CONTEXT) => {
             linux_userfaultfd_read(descriptor, buffer, count)
         }
+        (LINUX_IOCTL_SYSCALL, LINUX_TUN_CLASS) => linux_tun_ioctl(id, buffer as u32, count),
+        (LINUX_READ_SYSCALL, LINUX_TUN_CLASS) => linux_tun_read(id, buffer, count),
+        (LINUX_WRITE_SYSCALL, LINUX_TUN_CLASS) => linux_tun_write(id, buffer, count),
         // Host memory is coherent: there is nothing to flush.
         (LINUX_IOCTL_SYSCALL, crate::linux_drm::CLASS_DMABUF)
             if buffer & 0xffff_ffff == DMA_BUF_IOCTL_SYNC =>
@@ -52176,6 +52210,9 @@ fn linux_descriptor_poll_events(descriptor: i32, requested: u16) -> u16 {
     if let Some((crate::linux_userfaultfd::CLASS_CONTEXT, id)) = linux_object_descriptor(descriptor)
     {
         return linux_userfaultfd_poll_events(descriptor, id, requested);
+    }
+    if let Some(id) = linux_tun_file(descriptor) {
+        return linux_tun_poll_events(id, requested);
     }
     if let Some(slot) = linux_socket_slot(descriptor) {
         if let Some((class, id)) = crate::linux_socket::object(slot) {
@@ -59696,6 +59733,11 @@ fn linux_descriptor_stat(descriptor: u64) -> Option<[u8; LINUX_STAT_SIZE]> {
         if class == LINUX_USERFAULTFD_DEVICE_CLASS {
             let mut stat = linux_stat(0o020_600, 0x2000 + u64::from(LINUX_USERFAULTFD_DEVICE));
             stat[40..48].copy_from_slice(&u64::from(LINUX_USERFAULTFD_DEVICE).to_ne_bytes());
+            return Some(stat);
+        }
+        if class == LINUX_TUN_CLASS {
+            let mut stat = linux_stat(0o020_666, 0x2000 + u64::from(LINUX_TUN_DEVICE));
+            stat[40..48].copy_from_slice(&u64::from(LINUX_TUN_DEVICE).to_ne_bytes());
             return Some(stat);
         }
         if class == crate::linux_kmsg::CLASS_READER {

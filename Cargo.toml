@@ -20,6 +20,7 @@ members = [
     "crates/runtime-memory",
     "crates/seccomp",
     "crates/tty",
+    "crates/tun",
     "crates/udplite",
     "crates/usb-audio",
     "crates/usb-hid",

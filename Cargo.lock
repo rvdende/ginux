@@ -503,6 +503,7 @@ dependencies = [
  "ginux-rtnetlink",
  "ginux-seccomp",
  "ginux-tty",
+ "ginux-tun",
  "ginux-udplite",
  "ginux-usb-audio",
  "ginux-usb-hid",
@@ -600,6 +601,10 @@ version = "0.1.0"
 
 [[package]]
 name = "ginux-tty"
+version = "0.1.0"
+
+[[package]]
+name = "ginux-tun"
 version = "0.1.0"
 
 [[package]]

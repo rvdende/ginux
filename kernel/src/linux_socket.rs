@@ -1073,8 +1073,17 @@ fn own_address(runtime: &Runtime, network: u32) -> u32 {
     }
 }
 
+/// Whether IPv4 `address` (host order) is the interface's own: loopback,
+/// eth0's, or one a TUN or TAP device was given.
 fn is_local_address(runtime: &Runtime, address: u32) -> bool {
-    address >> 24 == 127 || address == runtime.local_address
+    let ipv4 = Ipv4Address::from_octets(address.to_be_bytes());
+    address >> 24 == 127
+        || address == runtime.local_address
+        || runtime
+            .interface
+            .ip_addrs()
+            .iter()
+            .any(|cidr| cidr.address() == IpAddress::Ipv4(ipv4))
 }
 
 fn port_in_use(slots: &[Option<Slot>], kind: Kind, port: u16, except: usize) -> bool {
@@ -3517,22 +3526,31 @@ pub(crate) fn open_unix(socket_type: u8) -> Result<SlotId, Error> {
 }
 
 /// A network interface as the socket ioctls (SIOCGIF*) describe it.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct InterfaceInfo {
-    pub(crate) name: &'static [u8],
+    pub(crate) name: ginux_tun::Name,
     pub(crate) index: i32,
-    /// IPv4 address and prefix length.
+    /// IPv4 address and prefix length (0 for none), and a TUN or TAP
+    /// device's others.
     pub(crate) ipv4: u32,
     pub(crate) prefix: u8,
+    pub(crate) more_ipv4: Vec<(u32, u8)>,
     pub(crate) flags: u16,
     pub(crate) mtu: i32,
     /// ARPHRD type and hardware address.
     pub(crate) hardware: (u16, [u8; 6]),
+    /// A TUN or TAP device, whose state SIOCSIF* and rtnetlink change.
+    pub(crate) tun: bool,
 }
 
-/// The domain's interfaces: the loopback, and eth0 once the network is
-/// configured.
-pub(crate) fn interfaces() -> [Option<InterfaceInfo>; 2] {
+/// An interface name the kernel gives (lo, eth0).
+fn interface_name(name: &[u8]) -> ginux_tun::Name {
+    ginux_tun::Name::new(name).unwrap_or_else(|| unreachable!("a built-in interface name"))
+}
+
+/// The domain's interfaces: the loopback, eth0 once the network is
+/// configured, and the TUN and TAP devices.
+pub(crate) fn interfaces() -> Vec<InterfaceInfo> {
     const IFF_UP: u16 = 0x1;
     const IFF_BROADCAST: u16 = 0x2;
     const IFF_LOOPBACK: u16 = 0x8;
@@ -3540,34 +3558,247 @@ pub(crate) fn interfaces() -> [Option<InterfaceInfo>; 2] {
     const IFF_MULTICAST: u16 = 0x1000;
     const ARPHRD_ETHER: u16 = 1;
     const ARPHRD_LOOPBACK: u16 = 772;
-    let loopback = InterfaceInfo {
-        name: b"lo",
+    /// ARPHRD_NONE: a TUN device's link has no hardware.
+    const ARPHRD_NONE: u16 = 65_534;
+    let mut interfaces = Vec::new();
+    interfaces.push(InterfaceInfo {
+        name: interface_name(b"lo"),
         index: 1,
         ipv4: 0x7f00_0001,
         prefix: 8,
+        more_ipv4: Vec::new(),
         flags: IFF_UP | IFF_LOOPBACK | IFF_RUNNING,
         mtu: 65_536,
         hardware: (ARPHRD_LOOPBACK, [0; 6]),
-    };
+        tun: false,
+    });
     let configuration = network::ipv4_configuration();
     let ipv4 = configuration as u32;
-    let mac = SOCKETS
-        .lock()
-        .platform
-        .map(|platform| platform.initialization.mac);
-    let ethernet = (ipv4 != 0)
-        .then_some(mac)
-        .flatten()
-        .map(|mac| InterfaceInfo {
-            name: b"eth0",
+    let sockets = SOCKETS.lock();
+    let mac = sockets.platform.map(|platform| platform.initialization.mac);
+    if let (true, Some(mac)) = (ipv4 != 0, mac) {
+        interfaces.push(InterfaceInfo {
+            name: interface_name(b"eth0"),
             index: 2,
             ipv4,
             prefix: (configuration >> 32) as u8,
+            more_ipv4: Vec::new(),
             flags: IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST,
             mtu: 1_500,
             hardware: (ARPHRD_ETHER, mac),
+            tun: false,
         });
-    [Some(loopback), ethernet]
+    }
+    if let Some(runtime) = sockets.runtime.as_ref() {
+        for device in runtime.device.tun.borrow().devices() {
+            let mut addresses = device
+                .addresses
+                .iter()
+                .map(|address| (u32::from_be_bytes(address.address), address.prefix));
+            let (ipv4, prefix) = addresses.next().unwrap_or((0, 0));
+            interfaces.push(InterfaceInfo {
+                name: device.name,
+                index: device.index,
+                ipv4,
+                prefix,
+                more_ipv4: addresses.collect(),
+                flags: device.interface_flags() as u16,
+                mtu: device.mtu as i32,
+                hardware: if device.tap {
+                    (ARPHRD_ETHER, device.mac)
+                } else {
+                    (ARPHRD_NONE, [0; 6])
+                },
+                tun: true,
+            });
+        }
+    }
+    interfaces
+}
+
+/// Runs `call` on the network runtime's TUN and TAP table, starting the
+/// runtime (the devices are a part of its interface's traffic): ENODEV
+/// without a network device.
+fn with_tun<R>(call: impl FnOnce(&mut Sockets) -> Result<R, i32>) -> Result<R, i32> {
+    let mut sockets = SOCKETS.lock();
+    sockets.start_runtime().map_err(|_| TUN_ENODEV)?;
+    call(&mut sockets)
+}
+
+/// ENODEV, for a domain without a network device to carry TUN traffic.
+const TUN_ENODEV: i32 = 19;
+
+impl Sockets {
+    fn tun(&self) -> Result<core::cell::RefMut<'_, ginux_tun::Tun>, i32> {
+        self.runtime
+            .as_ref()
+            .map(|runtime| runtime.device.tun.borrow_mut())
+            .ok_or(TUN_ENODEV)
+    }
+
+    /// The interface's MAC address, which the stack's frames carry.
+    fn interface_mac(&self) -> [u8; 6] {
+        self.platform
+            .map_or([0; 6], |platform| platform.initialization.mac)
+    }
+
+    /// Adds or removes TUN device addresses among the interface's own, so
+    /// the stack takes their traffic (EADDRNOTAVAIL-like ENOSPC when the
+    /// interface holds no more).
+    fn tun_interface_address(&mut self, address: ginux_tun::Address, add: bool) -> Result<(), i32> {
+        const ENOSPC: i32 = 28;
+        let runtime = self.runtime.as_mut().ok_or(TUN_ENODEV)?;
+        let cidr = IpCidr::new(
+            IpAddress::Ipv4(Ipv4Address::from_octets(address.address)),
+            address.prefix,
+        );
+        let mut added = true;
+        runtime.interface.update_ip_addrs(|addresses| {
+            if add {
+                added = addresses.push(cidr).is_ok();
+            } else {
+                addresses.retain(|own| *own != cidr);
+            }
+        });
+        if added {
+            Ok(())
+        } else {
+            Err(ENOSPC)
+        }
+    }
+}
+
+/// A new /dev/net/tun file's id.
+pub(crate) fn tun_open() -> Result<u64, i32> {
+    with_tun(|sockets| sockets.tun()?.open())
+}
+
+/// Closes /dev/net/tun file `id`; its device goes with its last queue
+/// unless it persists, and with it its addresses.
+pub(crate) fn tun_close(id: u64) {
+    let mut sockets = SOCKETS.lock();
+    let closed = match sockets.tun() {
+        Ok(mut tun) => tun.close(id),
+        Err(_) => return,
+    };
+    if let ginux_tun::Closed::Removed { addresses, .. } = closed {
+        for address in addresses {
+            let _ = sockets.tun_interface_address(address, false);
+        }
+    }
+}
+
+/// TUNSETIFF on file `id` (see `ginux_tun::Tun::set_iff`): a new device
+/// gets the lowest interface index from 3 that no device has.
+pub(crate) fn tun_set_iff(
+    id: u64,
+    name: &[u8],
+    flags: u16,
+    caller: &ginux_tun::Caller,
+) -> Result<(ginux_tun::Name, u16), i32> {
+    with_tun(|sockets| {
+        let mut tun = sockets.tun()?;
+        let index = (3..)
+            .find(|index| !tun.devices().iter().any(|device| device.index == *index))
+            .unwrap_or(3);
+        // A locally administered unicast address per device.
+        let mac = [0x02, 0x00, 0x5e, 0x10, (index >> 8) as u8, index as u8];
+        let taken = |name: &[u8]| name == b"lo" || name == b"eth0";
+        tun.set_iff(
+            id,
+            name,
+            flags,
+            caller,
+            &taken,
+            ginux_tun::Identity { index, mac },
+        )
+    })
+}
+
+/// TUNGETIFF.
+pub(crate) fn tun_get_iff(id: u64) -> Result<(ginux_tun::Name, u16), i32> {
+    with_tun(|sockets| sockets.tun()?.get_iff(id))
+}
+
+/// TUNSETPERSIST, TUNSETOWNER, TUNSETGROUP and TUNSETQUEUE.
+pub(crate) enum TunSetting<'a> {
+    Persist(bool),
+    Owner(u32),
+    Group(u32),
+    Queue(u16, &'a ginux_tun::Caller<'a>),
+}
+
+pub(crate) fn tun_set(id: u64, setting: TunSetting) -> Result<(), i32> {
+    with_tun(|sockets| {
+        let mut tun = sockets.tun()?;
+        match setting {
+            TunSetting::Persist(persist) => tun.set_persist(id, persist),
+            TunSetting::Owner(owner) => tun.set_owner(id, owner),
+            TunSetting::Group(group) => tun.set_group(id, group),
+            TunSetting::Queue(flags, caller) => tun.set_queue(id, flags, caller),
+        }
+    })
+}
+
+/// Reads file `id`'s next packet into `output` (EAGAIN with none yet),
+/// after the stack has sent what it has.
+pub(crate) fn tun_read(id: u64, output: &mut [u8]) -> Result<usize, i32> {
+    with_tun(|sockets| {
+        sockets.poll();
+        sockets.tun()?.read(id, output)
+    })
+}
+
+/// Whether file `id` has a packet to read.
+pub(crate) fn tun_readable(id: u64) -> Option<bool> {
+    with_tun(|sockets| {
+        sockets.poll();
+        Ok(sockets.tun()?.readable(id))
+    })
+    .ok()
+    .flatten()
+}
+
+/// Writes `input` on file `id`: the stack receives it at once.
+pub(crate) fn tun_write(id: u64, input: &[u8]) -> Result<usize, i32> {
+    with_tun(|sockets| {
+        let interface = sockets.interface_mac();
+        let frame = sockets.tun()?.write(id, input, interface)?;
+        if let Some(runtime) = sockets.runtime.as_ref() {
+            runtime.device.loop_back(&frame);
+        }
+        sockets.poll();
+        Ok(input.len())
+    })
+}
+
+/// Brings TUN or TAP device `index` up or down and sets its MTU.
+pub(crate) fn tun_set_link(index: i32, up: Option<bool>, mtu: Option<u32>) -> Result<(), i32> {
+    with_tun(|sockets| sockets.tun()?.set_link(index, up, mtu))
+}
+
+/// Adds or removes an IPv4 address of TUN or TAP device `index`, among the
+/// interface's addresses too.
+pub(crate) fn tun_change_address(
+    index: i32,
+    address: [u8; 4],
+    prefix: u8,
+    add: bool,
+) -> Result<(), i32> {
+    with_tun(|sockets| {
+        let address = ginux_tun::Address { address, prefix };
+        if add {
+            sockets.tun()?.add_address(index, address)?;
+            if let Err(error) = sockets.tun_interface_address(address, true) {
+                let _ = sockets.tun()?.remove_address(index, address);
+                return Err(error);
+            }
+        } else {
+            sockets.tun()?.remove_address(index, address)?;
+            sockets.tun_interface_address(address, false)?;
+        }
+        Ok(())
+    })
 }
 
 /// The most messages a netlink socket queues for its reader; past it the

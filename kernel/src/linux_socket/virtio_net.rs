@@ -57,6 +57,10 @@ pub(super) struct VirtioNet {
     tx_avail: Cell<u16>,
     tx_used: Cell<u16>,
     loopback: RefCell<VecDeque<Vec<u8>>>,
+    /// The TUN and TAP devices, whose traffic is a part of the interface's
+    /// (`ginux_tun`): what the stack sends them waits for their readers
+    /// instead of going to the wire.
+    pub(super) tun: RefCell<ginux_tun::Tun>,
 }
 
 impl VirtioNet {
@@ -109,6 +113,7 @@ impl VirtioNet {
             tx_avail: Cell::new(0),
             tx_used: Cell::new(0),
             loopback: RefCell::new(VecDeque::new()),
+            tun: RefCell::new(ginux_tun::Tun::new()),
         };
         device.post_receive();
         Some(device)
@@ -165,8 +170,10 @@ impl VirtioNet {
         unsafe { write_volatile(self.tx_notify as *mut u16, 1) };
     }
 
-    /// Queues a copy of a frame for the interface itself.
-    fn loop_back(&self, frame: &[u8]) {
+    /// Queues `frame` to be received on the next pass (a frame to the
+    /// interface's own addresses, or one a TUN or TAP device's reader
+    /// wrote); a full queue drops it.
+    pub(super) fn loop_back(&self, frame: &[u8]) {
         let mut queue = self.loopback.borrow_mut();
         if queue.len() == LOOPBACK_FRAME_COUNT
             || frame.len() > FRAME_SIZE
@@ -338,12 +345,23 @@ impl TxToken for TransmitToken<'_> {
         let (header, frame) = buffer.split_at_mut(VIRTIO_HEADER_LENGTH);
         header.fill(0);
         let result = callback(frame);
-        if let Some(advert) = loopback_neighbor_advert(frame) {
-            device.loop_back(&advert);
-        } else if frame_loops_back(frame, device.local_address) {
-            device.loop_back(frame);
-        } else {
-            device.post_transmit(length);
+        // A TUN or TAP device's traffic stays here: queued for its reader,
+        // or received again (its own addresses, the answer for a TUN peer).
+        let interface = <[u8; 6]>::try_from(&frame[6..12]).unwrap_or([0; 6]);
+        let egress = device.tun.borrow_mut().egress(frame, interface);
+        match egress {
+            ginux_tun::Egress::Taken => {}
+            ginux_tun::Egress::Local => device.loop_back(frame),
+            ginux_tun::Egress::Answer(answer) => device.loop_back(&answer),
+            ginux_tun::Egress::Pass => {
+                if let Some(advert) = loopback_neighbor_advert(frame) {
+                    device.loop_back(&advert);
+                } else if frame_loops_back(frame, device.local_address) {
+                    device.loop_back(frame);
+                } else {
+                    device.post_transmit(length);
+                }
+            }
         }
         result
     }
