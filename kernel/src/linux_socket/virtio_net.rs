@@ -13,8 +13,14 @@ use core::cell::{Cell, RefCell};
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{compiler_fence, Ordering};
 
-use smoltcp::phy::{Device, DeviceCapabilities, Medium, PacketMeta, RxToken, TxToken};
+use smoltcp::phy::{
+    ChecksumCapabilities, Device, DeviceCapabilities, Medium, PacketMeta, RxToken, TxToken,
+};
 use smoltcp::time::Instant;
+use smoltcp::wire::{
+    Icmpv6Packet, Icmpv6Repr, IpProtocol, Ipv6Address, Ipv6Packet, Ipv6Repr, NdiscNeighborFlags,
+    NdiscRepr, RawHardwareAddress,
+};
 
 use super::Platform;
 use crate::arch::x86_64::{iommu::DeviceTranslation, pci};
@@ -216,8 +222,12 @@ impl VirtioNet {
 }
 
 /// Whether an Ethernet frame is addressed to one of the interface's own
-/// IPv4 addresses: an IPv4 packet's destination or an ARP request's target.
+/// addresses: an IPv4 packet's destination or an ARP request's target, or
+/// an IPv6 packet to loopback (::1).
 fn frame_loops_back(frame: &[u8], local_address: u32) -> bool {
+    if frame.get(12..14) == Some(&[0x86, 0xdd]) {
+        return frame.get(38..54) == Some(&Ipv6Address::LOCALHOST.octets()[..]);
+    }
     let target = match frame.get(12..14) {
         Some([0x08, 0x00]) => frame.get(30..34),
         Some([0x08, 0x06]) => frame.get(38..42),
@@ -226,6 +236,55 @@ fn frame_loops_back(frame: &[u8], local_address: u32) -> bool {
     target
         .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
         .is_some_and(|octets| octets[0] == 127 || u32::from_be_bytes(octets) == local_address)
+}
+
+/// The answer to a neighbour solicitation for IPv6 loopback (::1): smoltcp
+/// asks for ::1's link address as for any other, on a multicast group it
+/// does not take for loopback, and a loopback link has no neighbours to
+/// answer (Linux's lo does no neighbour discovery). The answer, a neighbour
+/// advertisement of the interface's own address from ::1, is received in
+/// the solicitation's place.
+fn loopback_neighbor_advert(frame: &[u8]) -> Option<Vec<u8>> {
+    const ETHERNET_HEADER: usize = 14;
+    const IPV6_HEADER: usize = 40;
+    const NEIGHBOR_SOLICITATION: u8 = 135;
+    let loopback = Ipv6Address::LOCALHOST;
+    let solicitation = frame.get(12..14) == Some(&[0x86, 0xdd])
+        && frame.get(20) == Some(&u8::from(IpProtocol::Icmpv6))
+        && frame.get(ETHERNET_HEADER + IPV6_HEADER) == Some(&NEIGHBOR_SOLICITATION)
+        && frame.get(62..78) == Some(&loopback.octets()[..]);
+    if !solicitation {
+        return None;
+    }
+    let own = frame.get(6..12)?;
+    let advert = Icmpv6Repr::Ndisc(NdiscRepr::NeighborAdvert {
+        flags: NdiscNeighborFlags::SOLICITED | NdiscNeighborFlags::OVERRIDE,
+        target_addr: loopback,
+        lladdr: Some(RawHardwareAddress::from_bytes(own)),
+    });
+    let header = Ipv6Repr {
+        src_addr: loopback,
+        dst_addr: loopback,
+        next_header: IpProtocol::Icmpv6,
+        payload_len: advert.buffer_len(),
+        hop_limit: 255,
+    };
+    let length = ETHERNET_HEADER + IPV6_HEADER + advert.buffer_len();
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(length).ok()?;
+    bytes.resize(length, 0);
+    bytes[..6].copy_from_slice(own);
+    bytes[6..12].copy_from_slice(own);
+    bytes[12..14].copy_from_slice(&[0x86, 0xdd]);
+    let (ip, message) = bytes[ETHERNET_HEADER..].split_at_mut(IPV6_HEADER);
+    header.emit(&mut Ipv6Packet::new_unchecked(ip));
+    advert.emit(
+        &loopback,
+        &loopback,
+        &mut Icmpv6Packet::new_unchecked(message),
+        &ChecksumCapabilities::default(),
+    );
+    Some(bytes)
 }
 
 /// A received frame: in the receive buffer (its length), or the first
@@ -279,7 +338,9 @@ impl TxToken for TransmitToken<'_> {
         let (header, frame) = buffer.split_at_mut(VIRTIO_HEADER_LENGTH);
         header.fill(0);
         let result = callback(frame);
-        if frame_loops_back(frame, device.local_address) {
+        if let Some(advert) = loopback_neighbor_advert(frame) {
+            device.loop_back(&advert);
+        } else if frame_loops_back(frame, device.local_address) {
             device.loop_back(frame);
         } else {
             device.post_transmit(length);

@@ -7,6 +7,8 @@ use core::cell::UnsafeCell;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
+use smoltcp::wire::IpAddress;
+
 use super::{paging, timer};
 
 mod activation;
@@ -13726,8 +13728,11 @@ fn linux_endpoint_reachable(endpoint: smoltcp::wire::IpEndpoint) -> bool {
         smoltcp::wire::IpAddress::Ipv4(address) => {
             linux_network_reaches(u32::from_be_bytes(address.octets()))
         }
-        #[allow(unreachable_patterns)]
-        _ => current_linux_namespaces().net == 0,
+        // IPv6 has loopback alone: no address or route on eth0.
+        smoltcp::wire::IpAddress::Ipv6(address) => {
+            (address.is_loopback() || address.is_unspecified())
+                && linux_network_reaches(0x7f00_0001)
+        }
     }
 }
 
@@ -41060,6 +41065,7 @@ fn linux_netlink_socket_create(socket_type: u64, protocol: u64) -> u64 {
 fn linux_socket_create(family: u64, socket_type: u64, protocol: u64) -> u64 {
     const AF_UNIX: u64 = 1;
     const AF_INET: u64 = 2;
+    const AF_INET6: u64 = 10;
     const SOCK_STREAM: u64 = 1;
     const SOCK_DGRAM: u64 = 2;
     const SOCK_RAW: u64 = 3;
@@ -41078,7 +41084,7 @@ fn linux_socket_create(family: u64, socket_type: u64, protocol: u64) -> u64 {
     if family == AF_PACKET {
         return linux_packet_socket_create(socket_type, protocol);
     }
-    if !matches!(family, AF_UNIX | AF_INET) {
+    if !matches!(family, AF_UNIX | AF_INET | AF_INET6) {
         return LINUX_EAFNOSUPPORT;
     }
     let base = socket_type & 0xf;
@@ -41100,6 +41106,11 @@ fn linux_socket_create(family: u64, socket_type: u64, protocol: u64) -> u64 {
             crate::linux_socket::Kind::Icmp
         }
         (AF_INET, SOCK_STREAM | SOCK_DGRAM | SOCK_RAW) => return LINUX_EPROTONOSUPPORT,
+        // AF_INET6 TCP and UDP; ICMPv6 and raw IPv6 sockets are not made
+        // here.
+        (AF_INET6, SOCK_STREAM) if matches!(protocol, 0 | 6) => crate::linux_socket::Kind::Tcp,
+        (AF_INET6, SOCK_DGRAM) if matches!(protocol, 0 | 17) => crate::linux_socket::Kind::Udp,
+        (AF_INET6, SOCK_STREAM | SOCK_DGRAM | SOCK_RAW) => return LINUX_EPROTONOSUPPORT,
         _ => return LINUX_EINVAL,
     };
     let Some(descriptor) = (LINUX_AUX_DESCRIPTOR_FIRST..LINUX_AUX_DESCRIPTOR_LIMIT)
@@ -41111,6 +41122,8 @@ fn linux_socket_create(family: u64, socket_type: u64, protocol: u64) -> u64 {
         crate::linux_socket::open_unix(base as u8)
     } else if kind == crate::linux_socket::Kind::Icmp {
         crate::linux_socket::open_icmp(base == SOCK_RAW)
+    } else if family == AF_INET6 {
+        crate::linux_socket::open_ipv6(kind)
     } else {
         crate::linux_socket::open(kind)
     } {
@@ -41195,6 +41208,7 @@ fn linux_socket_pair(family: u64, socket_type: u64, protocol: u64, output: u64) 
     const SOCK_NONBLOCK: u64 = 0x800;
     const SOCK_CLOEXEC: u64 = 0x8_0000;
     const AF_INET: u64 = 2;
+    const AF_INET6: u64 = 10;
     const SOCK_RAW: u64 = 3;
     let family = u64::from(family as u32);
     let socket_type = u64::from(socket_type as u32);
@@ -41203,15 +41217,15 @@ fn linux_socket_pair(family: u64, socket_type: u64, protocol: u64, output: u64) 
     // An inet socket is made first, as Linux makes it (a bad type EINVAL,
     // a protocol the type lacks EPROTONOSUPPORT), and then has no pairs
     // (EOPNOTSUPP: socketpair01).
-    if family == AF_INET {
+    if matches!(family, AF_INET | AF_INET6) {
         if socket_type & !(0xf | SOCK_NONBLOCK | SOCK_CLOEXEC) != 0
             || !matches!(base, SOCK_STREAM | SOCK_DGRAM | SOCK_RAW)
         {
             return LINUX_EINVAL;
         }
         let made = matches!(
-            (base, protocol),
-            (SOCK_STREAM, 0 | 6) | (SOCK_DGRAM, 0 | 1 | 17) | (SOCK_RAW, 1)
+            (family, base, protocol),
+            (_, SOCK_STREAM, 0 | 6) | (_, SOCK_DGRAM, 0 | 17) | (AF_INET, SOCK_DGRAM | SOCK_RAW, 1)
         );
         return if made {
             LINUX_EOPNOTSUPP
@@ -41284,44 +41298,82 @@ fn linux_socket_pair(family: u64, socket_type: u64, protocol: u64, output: u64) 
     0
 }
 
-fn linux_socket_address(address: u64, length: u64) -> Result<smoltcp::wire::IpEndpoint, u64> {
+/// The internet address user memory holds for socket `slot`: a
+/// sockaddr_in, or for an AF_INET6 socket a sockaddr_in6 (at least the 24
+/// bytes of RFC 2133's, without the scope id, as Linux takes). A shorter
+/// one is EINVAL, another family EAFNOSUPPORT.
+fn linux_inet_address(
+    slot: crate::linux_socket::SlotId,
+    address: u64,
+    length: u64,
+) -> Result<(IpAddress, u16), u64> {
+    const AF_INET: u16 = 2;
+    const AF_INET6: u16 = 10;
+    let ipv6 = crate::linux_socket::is_ipv6(slot);
     let length = u64::from(length as u32);
-    if length < 16 {
+    let size = if ipv6 { 24 } else { 16 };
+    if length < size as u64 {
         return Err(LINUX_EINVAL);
     }
-    let mut sockaddr = [0_u8; 16];
-    if !copy_from_linux_user(address, &mut sockaddr) {
+    let mut sockaddr = [0_u8; 24];
+    if !copy_from_linux_user(address, &mut sockaddr[..size]) {
         return Err(LINUX_EFAULT);
     }
-    if u16::from_ne_bytes(sockaddr[..2].try_into().unwrap()) != 2 {
+    let family = u16::from_ne_bytes([sockaddr[0], sockaddr[1]]);
+    if family != if ipv6 { AF_INET6 } else { AF_INET } {
         return Err(LINUX_EAFNOSUPPORT);
     }
-    let port = u16::from_be_bytes(sockaddr[2..4].try_into().unwrap());
-    let ipv4 = u32::from_be_bytes(sockaddr[4..8].try_into().unwrap());
-    // INADDR_ANY as a destination reaches the local host (the socket table
-    // maps it to loopback), as in Linux.
+    let port = u16::from_be_bytes([sockaddr[2], sockaddr[3]]);
+    let ip = if ipv6 {
+        let octets: [u8; 16] = sockaddr[8..24].try_into().unwrap_or([0; 16]);
+        IpAddress::Ipv6(smoltcp::wire::Ipv6Address::from_octets(octets))
+    } else {
+        IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(
+            sockaddr[4],
+            sockaddr[5],
+            sockaddr[6],
+            sockaddr[7],
+        ))
+    };
+    Ok((ip, port))
+}
+
+/// A destination for socket `slot` (connect, sendto, sendmsg): port 0 is
+/// EINVAL; an AF_INET6 socket reaches an IPv4-mapped address over IPv4,
+/// which an IPV6_V6ONLY one cannot (ENETUNREACH). The unspecified address
+/// stays: the socket table takes it as the local host, as Linux does.
+fn linux_socket_address(
+    slot: crate::linux_socket::SlotId,
+    address: u64,
+    length: u64,
+) -> Result<smoltcp::wire::IpEndpoint, u64> {
+    let (ip, port) = linux_inet_address(slot, address, length)?;
     if port == 0 {
         return Err(LINUX_EINVAL);
     }
-    Ok(crate::linux_socket::endpoint(ipv4, port))
+    let ip = match crate::linux_socket::ipv4_of(ip) {
+        Some(ipv4) if matches!(ip, IpAddress::Ipv6(_)) => {
+            if crate::linux_socket::v6only(slot) == Some(true) {
+                return Err(LINUX_ENETUNREACH);
+            }
+            IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from_octets(ipv4.to_be_bytes()))
+        }
+        _ => ip,
+    };
+    Ok(smoltcp::wire::IpEndpoint::new(ip, port))
 }
 
-fn linux_socket_bind_address(address: u64, length: u64) -> Result<(u32, u16), u64> {
-    let length = u64::from(length as u32);
-    if length < 16 {
+/// Whether user memory holds an AF_UNSPEC address (connect's
+/// disconnect): the family alone, as Linux reads it.
+fn linux_socket_unspecified_address(address: u64, length: u64) -> Result<bool, u64> {
+    if u64::from(length as u32) < 2 {
         return Err(LINUX_EINVAL);
     }
-    let mut sockaddr = [0_u8; 16];
-    if !copy_from_linux_user(address, &mut sockaddr) {
+    let mut family = [0_u8; 2];
+    if !copy_from_linux_user(address, &mut family) {
         return Err(LINUX_EFAULT);
     }
-    if u16::from_ne_bytes(sockaddr[..2].try_into().unwrap()) != 2 {
-        return Err(LINUX_EAFNOSUPPORT);
-    }
-    Ok((
-        u32::from_be_bytes(sockaddr[4..8].try_into().unwrap()),
-        u16::from_be_bytes(sockaddr[2..4].try_into().unwrap()),
-    ))
+    Ok(u16::from_ne_bytes(family) == 0)
 }
 
 /// The canonical path of the file Unix socket pathname `path` leads to,
@@ -41484,7 +41536,7 @@ fn linux_socket_bind(descriptor: u64, address: u64, length: u64) -> u64 {
         }
         return 0;
     }
-    let (address, port) = match linux_socket_bind_address(address, length) {
+    let (address, port) = match linux_inet_address(slot, address, length) {
         Ok(endpoint) => endpoint,
         Err(error) => return error,
     };
@@ -41499,8 +41551,14 @@ fn linux_socket_bind(descriptor: u64, address: u64, length: u64) -> u64 {
     {
         return LINUX_EACCES;
     }
-    // A network namespace's sockets bind only to its own addresses.
-    if address != 0 && !linux_network_reaches(address) {
+    // A network namespace's sockets bind only to its own addresses (IPv6
+    // loopback as its IPv4 loopback).
+    let reaches = match address {
+        _ if address.is_unspecified() => true,
+        IpAddress::Ipv6(ipv6) if ipv6.is_loopback() => linux_network_reaches(0x7f00_0001),
+        _ => crate::linux_socket::ipv4_of(address).is_none_or(linux_network_reaches),
+    };
+    if !reaches {
         return LINUX_EADDRNOTAVAIL;
     }
     crate::linux_socket::bind(slot, address, port).map_or_else(linux_socket_error, |_| 0)
@@ -41523,7 +41581,7 @@ fn linux_socket_listen(descriptor: u64, backlog: u64) -> u64 {
     crate::linux_socket::listen(slot, backlog).map_or_else(linux_socket_error, |()| 0)
 }
 
-fn linux_socket_accept_address_valid(address: u64, length: u64) -> bool {
+fn linux_socket_accept_address_valid(address: u64, length: u64, size: u32) -> bool {
     if address == 0 {
         return true;
     }
@@ -41531,7 +41589,7 @@ fn linux_socket_accept_address_valid(address: u64, length: u64) -> bool {
     if length == 0 || !copy_from_linux_user(length, &mut supplied) {
         return false;
     }
-    let address_length = usize::try_from(u32::from_ne_bytes(supplied).min(16)).unwrap_or(16);
+    let address_length = usize::try_from(u32::from_ne_bytes(supplied).min(size)).unwrap_or(16);
     linux_writable_user_range_contains(length, 4)
         && linux_writable_user_range_contains(address, address_length)
 }
@@ -41567,7 +41625,8 @@ fn linux_socket_accept(descriptor: u64, address: u64, length: u64, flags: u64) -
     else {
         return LINUX_EMFILE;
     };
-    if !linux_socket_accept_address_valid(address, length) {
+    let ipv6 = crate::linux_socket::is_ipv6(listener_slot);
+    if !linux_socket_accept_address_valid(address, length, linux_inet_address_size(ipv6)) {
         return LINUX_EFAULT;
     }
     let accepted = if linux_socket_nonblocking(descriptor)
@@ -41587,7 +41646,7 @@ fn linux_socket_accept(descriptor: u64, address: u64, length: u64, flags: u64) -
         if crate::linux_socket::kind(listener_slot) == Some(crate::linux_socket::Kind::Unix) {
             linux_write_unnamed_unix_address(address, length)
         } else {
-            linux_write_socket_address(address, length, remote)
+            linux_write_socket_address(address, length, remote, ipv6)
         };
     if address != 0 && !written {
         let _ = crate::linux_socket::close(accepted_slot);
@@ -41701,7 +41760,21 @@ fn linux_socket_connect(descriptor: u64, address: u64, length: u64) -> u64 {
             Err(error) => linux_socket_error(error),
         };
     }
-    let endpoint = match linux_socket_address(address, length) {
+    // AF_UNSPEC ends a TCP connection or forgets a UDP socket's peer.
+    if matches!(
+        crate::linux_socket::kind(slot),
+        Some(crate::linux_socket::Kind::Tcp | crate::linux_socket::Kind::Udp)
+    ) {
+        match linux_socket_unspecified_address(address, length) {
+            Ok(true) => {
+                return crate::linux_socket::disconnect(slot)
+                    .map_or_else(linux_socket_error, |()| 0)
+            }
+            Ok(false) => {}
+            Err(error) => return error,
+        }
+    }
+    let endpoint = match linux_socket_address(slot, address, length) {
         Ok(endpoint) => endpoint,
         Err(error) => return error,
     };
@@ -41777,7 +41850,7 @@ fn linux_socket_sendto(
     let remote = if destination == 0 || netlink || tcp || unix {
         None
     } else {
-        match linux_socket_address(destination, destination_length) {
+        match linux_socket_address(slot, destination, destination_length) {
             Ok(endpoint) => Some(endpoint),
             Err(error) => return error,
         }
@@ -41959,7 +42032,12 @@ fn linux_socket_recvfrom(
         let Some(endpoint) = endpoint else {
             return LINUX_EINVAL;
         };
-        if !linux_write_socket_address(source, source_length, endpoint) {
+        if !linux_write_socket_address(
+            source,
+            source_length,
+            endpoint,
+            crate::linux_socket::is_ipv6(slot),
+        ) {
             return LINUX_EFAULT;
         }
     }
@@ -42031,7 +42109,7 @@ fn linux_socket_sendmsg(descriptor: u64, message: u64, flags: u64) -> u64 {
     let remote = if name == 0 || tcp || unix || kind == Some(crate::linux_socket::Kind::Netlink) {
         None
     } else {
-        match linux_socket_address(name, name_length) {
+        match linux_socket_address(slot, name, name_length) {
             Ok(endpoint) => Some(endpoint),
             Err(error) => return error,
         }
@@ -42455,10 +42533,11 @@ fn linux_socket_recvmsg(
     if name != 0 {
         if let Some(endpoint) = endpoint {
             let name_length_address = message + 8;
-            if !linux_write_socket_address(name, name_length_address, endpoint) {
+            let ipv6 = crate::linux_socket::is_ipv6(slot);
+            if !linux_write_socket_address(name, name_length_address, endpoint, ipv6) {
                 return LINUX_EFAULT;
             }
-            header[8..12].copy_from_slice(&16_u32.to_ne_bytes());
+            header[8..12].copy_from_slice(&linux_inet_address_size(ipv6).to_ne_bytes());
         } else if crate::linux_socket::unix_type(slot) == Some(2) {
             // A Unix datagram's sender, as recvfrom gives it.
             let name_length_address = message + 8;
@@ -42910,23 +42989,51 @@ fn linux_write_unix_address(address: u64, length_address: u64, name: &[u8]) -> b
         && copy_to_linux_user(length_address, &(actual as u32).to_ne_bytes())
 }
 
+/// The size of an internet socket's address: sockaddr_in6 for an AF_INET6
+/// socket, else sockaddr_in.
+fn linux_inet_address_size(ipv6: bool) -> u32 {
+    if ipv6 {
+        28
+    } else {
+        16
+    }
+}
+
+/// Writes `endpoint` as a socket's address: a sockaddr_in, or for an
+/// AF_INET6 socket (`ipv6`) a sockaddr_in6 with an IPv4 address mapped
+/// (::ffff:a.b.c.d), as much as the length at `length_address` has room
+/// for, and the full length there.
 fn linux_write_socket_address(
     address: u64,
     length_address: u64,
     endpoint: smoltcp::wire::IpEndpoint,
+    ipv6: bool,
 ) -> bool {
     let mut supplied = [0_u8; 4];
     if !copy_from_linux_user(length_address, &mut supplied) {
         return false;
     }
-    let length = u32::from_ne_bytes(supplied).min(16);
-    let mut sockaddr = [0_u8; 16];
-    sockaddr[..2].copy_from_slice(&2_u16.to_ne_bytes());
+    let size = linux_inet_address_size(ipv6);
+    let length = u32::from_ne_bytes(supplied).min(size);
+    let mut sockaddr = [0_u8; 28];
     sockaddr[2..4].copy_from_slice(&endpoint.port.to_be_bytes());
-    let smoltcp::wire::IpAddress::Ipv4(ipv4) = endpoint.addr;
-    sockaddr[4..8].copy_from_slice(&ipv4.octets());
+    match endpoint.addr {
+        IpAddress::Ipv6(address) => {
+            sockaddr[..2].copy_from_slice(&10_u16.to_ne_bytes());
+            sockaddr[8..24].copy_from_slice(&address.octets());
+        }
+        IpAddress::Ipv4(address) if ipv6 => {
+            sockaddr[..2].copy_from_slice(&10_u16.to_ne_bytes());
+            sockaddr[18..20].copy_from_slice(&[0xff, 0xff]);
+            sockaddr[20..24].copy_from_slice(&address.octets());
+        }
+        IpAddress::Ipv4(address) => {
+            sockaddr[..2].copy_from_slice(&2_u16.to_ne_bytes());
+            sockaddr[4..8].copy_from_slice(&address.octets());
+        }
+    }
     copy_to_linux_user(address, &sockaddr[..length as usize])
-        && copy_to_linux_user(length_address, &16_u32.to_ne_bytes())
+        && copy_to_linux_user(length_address, &size.to_ne_bytes())
 }
 
 fn linux_socket_shutdown(descriptor: u64, how: u64) -> u64 {
@@ -43017,7 +43124,12 @@ fn linux_socket_name(descriptor: u64, address: u64, length: u64, peer: bool) -> 
     } else {
         local
     };
-    if linux_write_socket_address(address, length, endpoint) {
+    if linux_write_socket_address(
+        address,
+        length,
+        endpoint,
+        crate::linux_socket::is_ipv6(slot),
+    ) {
         0
     } else {
         LINUX_EFAULT
@@ -43241,6 +43353,9 @@ fn linux_socket_setsockopt(
     if level == 263 {
         return linux_packet_setsockopt(slot, option, value, length);
     }
+    if level == 41 {
+        return linux_ipv6_setsockopt(slot, option, value, length);
+    }
     // SO_OOBINLINE: an int, read and checked as Linux does (a short length
     // EINVAL, an unreadable value EFAULT); urgent data is not kept apart.
     if level == 1 && option == 10 {
@@ -43377,6 +43492,114 @@ fn linux_socket_setsockopt(
     })
 }
 
+/// IPV6_V6ONLY (an int).
+const LINUX_IPV6_V6ONLY: u64 = 26;
+/// IPV6_ADDRFORM: an int, the family to turn an AF_INET6 socket into.
+const LINUX_IPV6_ADDRFORM: u64 = 1;
+/// IPV6_MTU: the path MTU a socket sends with (an int, 0 for the route's).
+const LINUX_IPV6_MTU: u64 = 24;
+
+/// setsockopt(IPPROTO_IPV6, ...) on socket `slot`, which must be an AF_INET6
+/// one (ENOPROTOOPT otherwise, as IPv4 sockets lack the level).
+fn linux_ipv6_setsockopt(
+    slot: crate::linux_socket::SlotId,
+    option: u64,
+    value: u64,
+    length: u64,
+) -> u64 {
+    if !crate::linux_socket::is_ipv6(slot) {
+        return LINUX_ENOPROTOOPT;
+    }
+    // Every option here is an int; Linux reads it before acting.
+    let read_int = || -> Result<i32, u64> {
+        if length < 4 {
+            return Err(LINUX_EINVAL);
+        }
+        let mut supplied = [0_u8; 4];
+        if !copy_from_linux_user(value, &mut supplied) {
+            return Err(LINUX_EFAULT);
+        }
+        Ok(i32::from_ne_bytes(supplied))
+    };
+    match option {
+        LINUX_IPV6_V6ONLY => match read_int() {
+            Ok(enabled) => crate::linux_socket::set_v6only(slot, enabled != 0)
+                .map_or_else(linux_socket_error, |()| 0),
+            Err(error) => error,
+        },
+        // Only AF_INET is a family to turn into.
+        LINUX_IPV6_ADDRFORM => match read_int() {
+            Ok(2) => {
+                crate::linux_socket::address_form_ipv4(slot).map_or_else(linux_socket_error, |()| 0)
+            }
+            Ok(_) => LINUX_EINVAL,
+            Err(error) => error,
+        },
+        // The largest fragment to send: 0 (the route's) or at least IPv6's
+        // minimum link MTU, 1280. Datagrams here are not fragmented, so the
+        // size is only checked.
+        LINUX_IPV6_MTU => match read_int() {
+            Ok(mtu) if mtu == 0 || mtu >= 1280 => 0,
+            Ok(_) => LINUX_EINVAL,
+            Err(error) => error,
+        },
+        // IPV6_RTHDR: routing headers are not sent here, so none is taken
+        // (EINVAL, as Linux answers a type it does not build).
+        57 => {
+            if length == 0 {
+                0
+            } else {
+                LINUX_EINVAL
+            }
+        }
+        _ => LINUX_ENOPROTOOPT,
+    }
+}
+
+/// getsockopt(IPPROTO_IPV6, ...) on AF_INET6 socket `slot`.
+fn linux_ipv6_getsockopt(
+    slot: crate::linux_socket::SlotId,
+    option: u64,
+    value: u64,
+    length: u64,
+) -> u64 {
+    if !crate::linux_socket::is_ipv6(slot) {
+        return LINUX_EOPNOTSUPP;
+    }
+    let mut supplied = [0_u8; 4];
+    if !copy_from_linux_user(length, &mut supplied) {
+        return LINUX_EFAULT;
+    }
+    let Ok(supplied) = usize::try_from(i32::from_ne_bytes(supplied)) else {
+        return LINUX_EINVAL;
+    };
+    let result = match option {
+        LINUX_IPV6_V6ONLY => i32::from(crate::linux_socket::v6only(slot).unwrap_or(false)),
+        // A connected socket's route MTU: loopback's 65536, eth0's 1500;
+        // ENOTCONN with no route yet, as in Linux.
+        LINUX_IPV6_MTU => match crate::linux_socket::names(slot).and_then(|(_, remote)| remote) {
+            Some(remote)
+                if match remote.addr {
+                    IpAddress::Ipv4(address) => address.is_loopback(),
+                    IpAddress::Ipv6(address) => address.is_loopback(),
+                } =>
+            {
+                65_536
+            }
+            Some(_) => 1500,
+            None => return LINUX_ENOTCONN,
+        },
+        _ => return LINUX_ENOPROTOOPT,
+    };
+    let copied = supplied.min(4);
+    if copied != 0 && !copy_to_linux_user(value, &result.to_ne_bytes()[..copied])
+        || !copy_to_linux_user(length, &(copied as u32).to_ne_bytes())
+    {
+        return LINUX_EFAULT;
+    }
+    0
+}
+
 fn linux_socket_getsockopt(
     descriptor: u64,
     level: u64,
@@ -43392,6 +43615,9 @@ fn linux_socket_getsockopt(
     // SOL_PACKET options on an AF_PACKET socket.
     if level == 263 {
         return linux_packet_getsockopt(slot, option, value, length);
+    }
+    if level == 41 {
+        return linux_ipv6_getsockopt(slot, option, value, length);
     }
     if level == 1 && option == 17 {
         if crate::linux_socket::kind(slot) != Some(crate::linux_socket::Kind::Unix) {
@@ -43550,6 +43776,11 @@ fn linux_socket_getsockopt(
             None => return LINUX_EBADF,
         },
         (1, 39) => match crate::linux_socket::kind(slot) {
+            Some(crate::linux_socket::Kind::Tcp | crate::linux_socket::Kind::Udp)
+                if crate::linux_socket::is_ipv6(slot) =>
+            {
+                10
+            }
             Some(
                 crate::linux_socket::Kind::Tcp
                 | crate::linux_socket::Kind::Udp

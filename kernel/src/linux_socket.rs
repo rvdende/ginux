@@ -26,7 +26,10 @@ use smoltcp::{
     iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet},
     socket::{raw, tcp, udp},
     time::{Duration, Instant},
-    wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, IpProtocol, IpVersion, Ipv4Address},
+    wire::{
+        EthernetAddress, IpAddress, IpCidr, IpEndpoint, IpProtocol, IpVersion, Ipv4Address,
+        Ipv6Address,
+    },
 };
 
 use crate::{
@@ -315,6 +318,17 @@ struct Slot {
     network: u32,
     references: u16,
     kind: Kind,
+    /// An AF_INET6 socket: its names are IPv6 addresses, IPv4 ones mapped
+    /// (::ffff:a.b.c.d) as Linux's dual-stack sockets show them.
+    ipv6: bool,
+    /// IPV6_V6ONLY: an AF_INET6 socket that takes no IPv4 traffic.
+    v6only: bool,
+    /// bind chose its port (Linux's SOCK_BINDPORT_LOCK): a disconnect keeps
+    /// it.
+    port_locked: bool,
+    /// The address an internet socket was bound to (IPv4 for an IPv4-mapped
+    /// one), or None for the unspecified address.
+    bound: Option<IpAddress>,
     /// The smoltcp socket of a TCP or UDP socket.
     handle: Option<SocketHandle>,
     remote: Option<IpEndpoint>,
@@ -402,6 +416,10 @@ impl Slot {
             network: current_network(),
             references: 1,
             kind,
+            ipv6: false,
+            v6only: false,
+            port_locked: false,
+            bound: None,
             handle: None,
             remote: None,
             local_port: 0,
@@ -760,18 +778,23 @@ fn is_local_address(runtime: &Runtime, address: u32) -> bool {
 
 fn port_in_use(slots: &[Option<Slot>], kind: Kind, port: u16, except: usize) -> bool {
     // TCP ports are each network namespace's own; UDP ones are shared, as
-    // smoltcp's one interface delivers by port alone.
-    let network = slots
+    // smoltcp's one interface delivers by port alone. An IPV6_V6ONLY TCP
+    // socket and an IPv4 one may hold the same port, as in Linux.
+    let (network, ipv6, v6only) = slots
         .get(except)
         .and_then(Option::as_ref)
-        .map_or(0, |slot| slot.network);
+        .map_or((0, false, false), |slot| {
+            (slot.network, slot.ipv6, slot.v6only)
+        });
     port != 0
         && slots.iter().enumerate().any(|(index, slot)| {
             index != except
                 && slot.as_ref().is_some_and(|slot| {
                     slot.kind == kind
                         && slot.local_port == port
-                        && (kind != Kind::Tcp || slot.network == network)
+                        && (kind != Kind::Tcp
+                            || slot.network == network
+                                && (slot.ipv6 == ipv6 || !slot.v6only && !v6only))
                 })
         })
 }
@@ -815,6 +838,39 @@ fn slot_in_mut(slots: &mut [Option<Slot>], id: SlotId) -> Option<&mut Slot> {
 
 fn unix_in_mut(slots: &mut [Option<Slot>], id: SlotId) -> Option<&mut Slot> {
     slot_in_mut(slots, id).filter(|state| state.kind == Kind::Unix)
+}
+
+/// The IPv4 address `address` is or maps (::ffff:a.b.c.d), host order.
+pub(crate) fn ipv4_of(address: IpAddress) -> Option<u32> {
+    match address {
+        IpAddress::Ipv4(address) => Some(u32::from_be_bytes(address.octets())),
+        IpAddress::Ipv6(address) => {
+            let octets = address.octets();
+            (octets[..10] == [0; 10] && octets[10..12] == [0xff, 0xff])
+                .then(|| u32::from_be_bytes(octets[12..].try_into().unwrap_or([0; 4])))
+        }
+    }
+}
+
+/// What an address an AF_INET6 socket was given means: an IPv4-mapped one
+/// is that IPv4 address (an error for an IPV6_V6ONLY socket).
+fn unmapped(address: IpAddress, v6only: bool) -> Result<IpAddress, Error> {
+    match (address, ipv4_of(address)) {
+        (IpAddress::Ipv6(_), Some(_)) if v6only => Err(Error::Invalid),
+        (IpAddress::Ipv6(_), Some(ipv4)) => Ok(IpAddress::Ipv4(Ipv4Address::from_octets(
+            ipv4.to_be_bytes(),
+        ))),
+        _ => Ok(address),
+    }
+}
+
+/// Whether `address` is one of the interface's own: IPv4 as
+/// `is_local_address` says, or IPv6 loopback.
+fn is_local_ip(runtime: &Runtime, address: IpAddress) -> bool {
+    match address {
+        IpAddress::Ipv4(_) => ipv4_of(address).is_some_and(|ipv4| is_local_address(runtime, ipv4)),
+        IpAddress::Ipv6(address) => address.is_loopback(),
+    }
 }
 
 pub(crate) fn endpoint(address: u32, port: u16) -> IpEndpoint {
@@ -880,6 +936,7 @@ impl Sockets {
                 IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)),
                 8,
             ));
+            let _ = addresses.push(IpCidr::new(IpAddress::Ipv6(Ipv6Address::LOCALHOST), 128));
         });
         if interface
             .routes_mut()
@@ -1419,7 +1476,7 @@ impl Sockets {
         })
     }
 
-    fn bind(&mut self, id: SlotId, address: u32, requested_port: u16) -> Result<u16, Error> {
+    fn bind(&mut self, id: SlotId, address: IpAddress, requested_port: u16) -> Result<u16, Error> {
         self.poll();
         self.start_runtime()?;
         let index = usize::from(id);
@@ -1430,7 +1487,14 @@ impl Sockets {
             return Err(Error::Invalid);
         }
         let (kind, handle) = (state.kind, state.handle);
-        if address != 0 && !is_local_address(runtime, address) {
+        // An AF_INET6 socket bound to an IPv4-mapped address is bound to that
+        // IPv4 address (EINVAL for an IPV6_V6ONLY one).
+        let address = if state.ipv6 {
+            unmapped(address, state.v6only)?
+        } else {
+            address
+        };
+        if !address.is_unspecified() && !is_local_ip(runtime, address) {
             return Err(Error::AddressNotAvailable);
         }
         // A raw socket has no port: it receives every packet of its protocol.
@@ -1453,7 +1517,10 @@ impl Sockets {
                 .bind(port)
                 .map_err(|_| Error::AddressInUse)?;
         }
-        slot_in_mut(slots, id).ok_or(Error::Invalid)?.local_port = port;
+        let state = slot_in_mut(slots, id).ok_or(Error::Invalid)?;
+        state.local_port = port;
+        state.port_locked = requested_port != 0;
+        state.bound = (!address.is_unspecified()).then_some(address);
         Ok(port)
     }
 
@@ -1598,17 +1665,30 @@ impl Sockets {
     fn connect(&mut self, id: SlotId, remote: IpEndpoint) -> Result<(), Error> {
         self.poll();
         self.start_runtime()?;
-        // Connecting to INADDR_ANY reaches the local host, as in Linux.
-        let remote = match remote.addr {
-            IpAddress::Ipv4(address) if address.is_unspecified() => {
-                IpEndpoint::new(IpAddress::v4(127, 0, 0, 1), remote.port)
-            }
-            _ => remote,
-        };
         let index = usize::from(id);
         let Self { runtime, slots, .. } = self;
         let runtime = runtime.as_mut().ok_or(Error::Unavailable)?;
         let state = slot_in(slots, id).ok_or(Error::Invalid)?;
+        // An AF_INET6 socket reaches an IPv4-mapped address over IPv4
+        // (ENETUNREACH for an IPV6_V6ONLY one); connecting to the
+        // unspecified address reaches the local host, as in Linux.
+        let remote = if state.ipv6 {
+            IpEndpoint::new(
+                unmapped(remote.addr, state.v6only).map_err(|_| Error::Unavailable)?,
+                remote.port,
+            )
+        } else {
+            remote
+        };
+        let remote = match remote.addr {
+            IpAddress::Ipv4(address) if address.is_unspecified() => {
+                IpEndpoint::new(IpAddress::v4(127, 0, 0, 1), remote.port)
+            }
+            IpAddress::Ipv6(address) if address.is_unspecified() => {
+                IpEndpoint::new(IpAddress::Ipv6(Ipv6Address::LOCALHOST), remote.port)
+            }
+            _ => remote,
+        };
         let handle = state.handle.ok_or(Error::Invalid)?;
         if state.listening {
             return Err(Error::Invalid);
@@ -1639,11 +1719,11 @@ impl Sockets {
         };
         // A network namespace made in a domain reaches only its own
         // loopback: its TCP connections are all local ones.
-        if kind == Kind::Tcp
-            && (network != 0
-                || matches!(remote.addr, IpAddress::Ipv4(address)
-                    if is_local_address(runtime, u32::from_be_bytes(address.octets()))))
-        {
+        if kind == Kind::Tcp && (network != 0 || is_local_ip(runtime, remote.addr)) {
+            // An IPv6 connection reaches AF_INET6 listeners; an IPv4 one
+            // IPv4 listeners and the AF_INET6 ones that take IPv4 too (not
+            // IPV6_V6ONLY, not bound to an IPv6 address).
+            let ipv6_client = matches!(remote.addr, IpAddress::Ipv6(_));
             let listener = slots.iter().position(|candidate| {
                 candidate.as_ref().is_some_and(|candidate| {
                     candidate.kind == Kind::Tcp
@@ -1652,6 +1732,13 @@ impl Sockets {
                         && candidate.listening
                         && candidate.local_port == remote.port
                         && candidate.pending.len() <= candidate.backlog
+                        && if ipv6_client {
+                            candidate.ipv6 && !matches!(candidate.bound, Some(IpAddress::Ipv4(_)))
+                        } else {
+                            !candidate.ipv6
+                                || !candidate.v6only
+                                    && !matches!(candidate.bound, Some(IpAddress::Ipv6(_)))
+                        }
                 })
             });
             if let Some(listener) = listener {
@@ -1662,7 +1749,16 @@ impl Sockets {
                 let listener = listener as SlotId;
                 let listener_state = slot_in(slots, listener).ok_or(Error::Invalid)?;
                 let mut accepted = Slot::new(Kind::Tcp, listener_state.owner);
-                accepted.remote = Some(endpoint(own_address(runtime, network), local_port));
+                accepted.ipv6 = listener_state.ipv6;
+                accepted.v6only = listener_state.v6only;
+                accepted.port_locked = listener_state.port_locked;
+                // Its name is the address the client reached.
+                accepted.bound = Some(remote.addr);
+                accepted.remote = Some(if ipv6_client {
+                    IpEndpoint::new(IpAddress::Ipv6(Ipv6Address::LOCALHOST), local_port)
+                } else {
+                    endpoint(own_address(runtime, network), local_port)
+                });
                 accepted.local_port = listener_state.local_port;
                 accepted.peer = Some(id);
                 accepted.options = listener_state.options;
@@ -1882,8 +1978,10 @@ impl Sockets {
     /// (its port, chosen now if it has none) and the checksum filled in, as
     /// Linux; a raw socket sends the message as it is.
     fn send_icmp(&mut self, id: SlotId, input: &[u8], remote: IpEndpoint) -> Result<usize, Error> {
-        let IpAddress::Ipv4(destination) = remote.addr;
-        let destination = u32::from_be_bytes(destination.octets());
+        let IpAddress::Ipv4(_) = remote.addr else {
+            return Err(Error::Unavailable);
+        };
+        let destination = ipv4_of(remote.addr).ok_or(Error::Unavailable)?;
         let index = usize::from(id);
         self.start_runtime()?;
         let Self { runtime, slots, .. } = self;
@@ -2401,10 +2499,88 @@ impl Sockets {
     fn names(&self, id: SlotId) -> Option<(IpEndpoint, Option<IpEndpoint>)> {
         let state = self.slot(id).filter(|state| state.kind != Kind::Unix)?;
         let runtime = self.runtime.as_ref()?;
-        Some((
-            endpoint(own_address(runtime, state.network), state.local_port),
-            state.remote,
-        ))
+        let own = IpAddress::Ipv4(Ipv4Address::from_octets(
+            own_address(runtime, state.network).to_be_bytes(),
+        ));
+        // An AF_INET6 socket is named by the address it was bound to, or the
+        // one it reaches its peer from (IPv6 loopback, or the interface's
+        // IPv4 address), or else the unspecified address.
+        let local = if state.ipv6 {
+            state
+                .bound
+                .unwrap_or(match state.remote.map(|remote| remote.addr) {
+                    Some(IpAddress::Ipv6(_)) => IpAddress::Ipv6(Ipv6Address::LOCALHOST),
+                    Some(IpAddress::Ipv4(_)) => own,
+                    None => IpAddress::Ipv6(Ipv6Address::UNSPECIFIED),
+                })
+        } else {
+            own
+        };
+        Some((IpEndpoint::new(local, state.local_port), state.remote))
+    }
+
+    /// connect with AF_UNSPEC: a TCP socket's connection ends (its peer
+    /// sees it reset) and its port is given up unless bind chose it; a UDP
+    /// socket forgets its peer.
+    fn disconnect(&mut self, id: SlotId) -> Result<(), Error> {
+        self.poll();
+        let state = self.slot(id).ok_or(Error::Invalid)?;
+        let (kind, peer, handle, listening, port_locked) = (
+            state.kind,
+            state.peer,
+            state.handle,
+            state.listening,
+            state.port_locked,
+        );
+        match kind {
+            Kind::Udp | Kind::Icmp => {
+                self.slot_mut(id).ok_or(Error::Invalid)?.remote = None;
+                Ok(())
+            }
+            Kind::Tcp => {
+                if let Some(peer) = peer.filter(|peer| *peer != id) {
+                    if let Some(other) = self.slot_mut(peer) {
+                        other.peer = None;
+                        other.peer_closed = true;
+                        other.note_change();
+                    }
+                }
+                if !listening && peer.is_none() {
+                    if let (Some(runtime), Some(handle)) = (self.runtime.as_mut(), handle) {
+                        runtime.sockets.get_mut::<tcp::Socket>(handle).abort();
+                    }
+                }
+                let pending = {
+                    let state = self.slot_mut(id).ok_or(Error::Invalid)?;
+                    state.peer = None;
+                    state.peer_closed = false;
+                    state.remote = None;
+                    state.listening = false;
+                    state.read_shutdown = false;
+                    state.write_shutdown = false;
+                    state.local = LocalQueue::default();
+                    if !port_locked {
+                        state.local_port = 0;
+                        state.bound = None;
+                    }
+                    state.note_change();
+                    core::mem::take(&mut state.pending)
+                };
+                for connection in pending {
+                    let _ = self.close(connection);
+                }
+                // A connection accepted on the local queues had no smoltcp
+                // socket; the closed socket may listen or connect again.
+                if handle.is_none() {
+                    let handle = add_tcp_socket(self.runtime()?)?;
+                    if let Some(state) = self.slot_mut(id) {
+                        state.handle = Some(handle);
+                    }
+                }
+                Ok(())
+            }
+            Kind::Unix | Kind::Object | Kind::Netlink | Kind::Packet => Err(Error::Invalid),
+        }
     }
 
     fn set_unix_pair_credentials(
@@ -2653,6 +2829,72 @@ pub(crate) fn configure(
         notification,
         iommu,
     })
+}
+
+/// An AF_INET6 socket of `kind` (TCP or UDP).
+pub(crate) fn open_ipv6(kind: Kind) -> Result<SlotId, Error> {
+    let mut sockets = SOCKETS.lock();
+    let id = sockets.open(kind)?;
+    if let Some(state) = sockets.slot_mut(id) {
+        state.ipv6 = true;
+    }
+    Ok(id)
+}
+
+/// Whether socket `id` is an AF_INET6 one.
+pub(crate) fn is_ipv6(id: SlotId) -> bool {
+    SOCKETS.lock().slot(id).is_some_and(|state| state.ipv6)
+}
+
+/// IPV6_V6ONLY of AF_INET6 socket `id`.
+pub(crate) fn v6only(id: SlotId) -> Option<bool> {
+    SOCKETS
+        .lock()
+        .slot(id)
+        .filter(|state| state.ipv6)
+        .map(|state| state.v6only)
+}
+
+/// Sets IPV6_V6ONLY, which a bound or connected socket may no longer change
+/// (EINVAL).
+pub(crate) fn set_v6only(id: SlotId, enabled: bool) -> Result<(), Error> {
+    let mut sockets = SOCKETS.lock();
+    let state = sockets
+        .slot_mut(id)
+        .filter(|state| state.ipv6)
+        .ok_or(Error::Invalid)?;
+    if state.local_port != 0 || state.remote.is_some() {
+        return Err(Error::Invalid);
+    }
+    state.v6only = enabled;
+    Ok(())
+}
+
+/// IPV6_ADDRFORM to AF_INET: an AF_INET6 TCP socket connected over IPv4,
+/// or a UDP one, becomes an AF_INET socket; EINVAL otherwise.
+pub(crate) fn address_form_ipv4(id: SlotId) -> Result<(), Error> {
+    let mut sockets = SOCKETS.lock();
+    let state = sockets
+        .slot_mut(id)
+        .filter(|state| state.ipv6)
+        .ok_or(Error::Invalid)?;
+    let over_ipv4 = matches!(state.remote, Some(remote) if matches!(remote.addr, IpAddress::Ipv4(_)))
+        && !matches!(state.bound, Some(IpAddress::Ipv6(_)));
+    let allowed = match state.kind {
+        Kind::Tcp => over_ipv4 && !state.listening,
+        Kind::Udp => state.remote.is_none() || over_ipv4,
+        _ => false,
+    };
+    if !allowed {
+        return Err(Error::Invalid);
+    }
+    state.ipv6 = false;
+    Ok(())
+}
+
+/// connect(2) with AF_UNSPEC (`Sockets::disconnect`).
+pub(crate) fn disconnect(id: SlotId) -> Result<(), Error> {
+    SOCKETS.lock().disconnect(id)
 }
 
 pub(crate) fn open(kind: Kind) -> Result<SlotId, Error> {
@@ -3251,7 +3493,7 @@ fn clock_microseconds() -> Option<u64> {
     u64::try_from(ticks * 1_000_000 / u128::from(frequency)).ok()
 }
 
-pub(crate) fn bind(id: SlotId, address: u32, requested_port: u16) -> Result<u16, Error> {
+pub(crate) fn bind(id: SlotId, address: IpAddress, requested_port: u16) -> Result<u16, Error> {
     SOCKETS.lock().bind(id, address, requested_port)
 }
 
