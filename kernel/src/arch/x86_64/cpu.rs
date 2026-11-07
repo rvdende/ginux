@@ -37242,12 +37242,18 @@ fn linux_rootfs_mode(entry: crate::published_rootfs::Entry<'_>) -> u32 {
     kind | entry.mode & 0o7777
 }
 
+/// The root filesystem's device, 0:1, as /proc/self/mountinfo and
+/// statmount name the root mount's (`linux_kernel_filesystem`): stat's
+/// st_dev for the image's and the overlay's files.
+const LINUX_ROOT_FILESYSTEM_DEVICE: u32 = 1;
+
 fn linux_rootfs_stat(
     handle: u16,
     entry: Option<crate::published_rootfs::Entry<'_>>,
 ) -> [u8; LINUX_STAT_SIZE] {
     let mode = entry.map_or(LINUX_STAT_DIRECTORY_MODE, linux_rootfs_mode);
     let mut stat = linux_stat(mode, linux_rootfs_inode(handle));
+    stat[0..8].copy_from_slice(&u64::from(LINUX_ROOT_FILESYSTEM_DEVICE).to_ne_bytes());
     let (owner, group) = entry.map_or((0, 0), |entry| (entry.owner, entry.group));
     stat[28..32].copy_from_slice(&owner.to_ne_bytes());
     stat[32..36].copy_from_slice(&group.to_ne_bytes());
@@ -37268,7 +37274,12 @@ fn linux_overlay_stat(metadata: crate::linux_overlay::Metadata) -> [u8; LINUX_ST
         crate::linux_overlay::NodeKind::BlockDevice => 0o060000,
     };
     let mut stat = linux_stat(kind | metadata.mode, metadata.handle.inode());
-    stat[0..8].copy_from_slice(&u64::from(metadata.filesystem).to_ne_bytes());
+    // The overlay's own files (filesystem 0) are the root filesystem's.
+    let device = match metadata.filesystem {
+        0 => LINUX_ROOT_FILESYSTEM_DEVICE,
+        filesystem => filesystem,
+    };
+    stat[0..8].copy_from_slice(&u64::from(device).to_ne_bytes());
     stat[56..64].copy_from_slice(&u64::from(metadata.block_size).to_ne_bytes());
     stat[40..48].copy_from_slice(&u64::from(metadata.device).to_ne_bytes());
     stat[16..24].copy_from_slice(&u64::from(metadata.links).to_ne_bytes());
@@ -61137,7 +61148,7 @@ fn linux_kernel_filesystem(path: &[u8]) -> crate::linux_mounts::KernelFilesystem
     } else if below(b"sys/fs/cgroup") {
         (b"cgroup2", b"cgroup2", 3)
     } else {
-        (b"ginux-root", b"rootfs", 1)
+        (b"ginux-root", b"rootfs", LINUX_ROOT_FILESYSTEM_DEVICE)
     };
     crate::linux_mounts::KernelFilesystem {
         filesystem,
