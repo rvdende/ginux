@@ -33664,6 +33664,19 @@ fn linux_rootfs_execve_source(
         }
         _ => path,
     };
+    // The process is named for the path as given (`exe` for
+    // /proc/self/exe), as Linux names it from the file name.
+    let named_path = path;
+    // /proc/PID/exe runs the program that process runs.
+    let linked;
+    let path = match linux_proc_exe_link(path) {
+        Some(Ok(target)) if domain_exec_slot.is_none() => {
+            linked = target;
+            &linked[..]
+        }
+        Some(Err(error)) if domain_exec_slot.is_none() => return error,
+        _ => path,
+    };
     // A symlink written at runtime (dpkg installs clang-21 -> clang) leads
     // to the file that runs, in the overlay or the image.
     let mut followed = [0_u8; crate::linux_overlay::PATH_CAPACITY + 1];
@@ -34072,7 +34085,10 @@ fn linux_rootfs_execve_source(
             Ordering::SeqCst,
         );
     }
-    let process_name = path.rsplit(|byte| *byte == b'/').next().unwrap_or(path);
+    let process_name = named_path
+        .rsplit(|byte| *byte == b'/')
+        .next()
+        .unwrap_or(named_path);
     if process_name.is_empty() {
         return LINUX_ENOEXEC;
     }
@@ -58189,6 +58205,44 @@ fn linux_descriptor_stat(descriptor: u64) -> Option<[u8; LINUX_STAT_SIZE]> {
             LinuxCharacterDevice::from_kind(device).stat()
         }
     })
+}
+
+/// The program the link at absolute `path` names, when it is
+/// /proc/self/exe, /proc/thread-self/exe or /proc/PID/exe: the file that
+/// process executed (Linux's proc_exe_link). ENOENT for no such process or
+/// one with no program recorded, EACCES for a process the caller may not
+/// look into (ptrace_may_access). None for any other path.
+fn linux_proc_exe_link(path: &[u8]) -> Option<Result<Vec<u8>, u64>> {
+    let process = path.strip_prefix(b"/proc/")?.strip_suffix(b"/exe")?;
+    let caller = current_linux_process_pid();
+    let pid = match process {
+        b"self" | b"thread-self" => caller,
+        digits if !digits.is_empty() && digits.iter().all(u8::is_ascii_digit) => {
+            match core::str::from_utf8(digits)
+                .ok()
+                .and_then(|digits| digits.parse::<u32>().ok())
+            {
+                Some(pid) => pid,
+                None => return Some(Err(LINUX_ENOENT)),
+            }
+        }
+        _ => return None,
+    };
+    if pid != caller {
+        if linux_process::live_process_status(pid).is_none() {
+            return Some(Err(LINUX_ENOENT));
+        }
+        if !linux_ptrace_access_permitted(pid) {
+            return Some(Err(LINUX_EACCES));
+        }
+    }
+    Some(
+        crate::linux_exe::lookup(
+            X86_RUNTIME.LINUX_EXECUTION_INSTANCE.load(Ordering::SeqCst),
+            pid,
+        )
+        .ok_or(LINUX_ENOENT),
+    )
 }
 
 /// The path of the program the calling process runs, when `path` (from
