@@ -839,6 +839,60 @@ pub(crate) fn read(handle: Handle, offset: usize, output: &mut [u8]) -> Option<u
     }
 }
 
+/// Whether page `index` of `handle`'s file has disk blocks for all of it
+/// that lies within the file: a write through a shared mapping of it then
+/// needs nothing allocated, so the page may be mapped writable at once.
+pub(crate) fn page_backed(handle: Handle, index: usize) -> bool {
+    let mut table = VOLUMES.lock();
+    let Some((volume, inode)) = table.of(handle) else {
+        return true;
+    };
+    let Ok(size) = volume.filesystem.stat(inode).map(|stat| stat.size) else {
+        return true;
+    };
+    let start = (index * PAGE) as u64;
+    if start >= size {
+        return true;
+    }
+    let length = (start + PAGE as u64).min(size) - start;
+    volume
+        .filesystem
+        .blocks_allocated(inode, start, length)
+        .unwrap_or(false)
+}
+
+/// page_mkwrite: before a shared mapping may write page `index` of
+/// `handle`'s file, the part of the page within the file gets disk blocks
+/// (the cached page is written to them); Err (ENOSPC, EDQUOT) when the
+/// disk or the quota has none left, which the writer gets as SIGBUS.
+pub(crate) fn page_mkwrite(handle: Handle, index: usize) -> Result<(), Errno> {
+    let mut table = VOLUMES.lock();
+    let Some((volume, inode)) = table.of(handle) else {
+        return Ok(());
+    };
+    let size = volume.filesystem.stat(inode).map_err(errno)?.size;
+    let start = (index * PAGE) as u64;
+    if start >= size {
+        return Ok(());
+    }
+    let length = ((start + PAGE as u64).min(size) - start) as usize;
+    if volume
+        .filesystem
+        .blocks_allocated(inode, start, length as u64)
+        .map_err(errno)?
+    {
+        return Ok(());
+    }
+    let Some(page) = volume.page(inode, index, true) else {
+        return Ok(());
+    };
+    match volume.filesystem.write(inode, start, &page[..length]) {
+        Ok(written) if written == length => Ok(()),
+        Ok(_) => Err(Error::NoSpace.errno()),
+        Err(error) => Err(errno(error)),
+    }
+}
+
 /// The frame holding page `index` of `handle`'s file in the page cache
 /// (cached first if `load`): what a shared mapping of the page maps.
 pub(crate) fn cached_frame(handle: Handle, index: usize, load: bool) -> Option<memory::FrameLease> {

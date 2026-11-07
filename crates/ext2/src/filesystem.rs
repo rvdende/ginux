@@ -1640,6 +1640,27 @@ impl<D: BlockDevice> Filesystem<D> {
         Ok(extents)
     }
 
+    /// Whether every block of inode `number`'s data from `offset` for
+    /// `length` bytes has a place on the disk (a write there allocates
+    /// nothing): written, or preallocated.
+    pub fn blocks_allocated(&mut self, number: u32, offset: u64, length: u64) -> Result<bool> {
+        let mut inode = self.live_inode(number)?;
+        let block_size = u64::from(self.block_size);
+        let end = offset.saturating_add(length);
+        for index in offset / block_size..end.div_ceil(block_size) {
+            let present = if inode.uses_extents() {
+                let index = u32::try_from(index).map_err(|_| Error::FileTooBig)?;
+                self.find_run(&inode, index)?.is_some()
+            } else {
+                self.map_block(&mut inode, index, None)?.is_some()
+            };
+            if !present {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// A symlink's target, into `buffer`; returns its length.
     pub fn read_link(&mut self, number: u32, buffer: &mut [u8]) -> Result<usize> {
         let mut inode = self.live_inode(number)?;

@@ -28440,7 +28440,12 @@ fn linux_map_shared_memfd(
         // A PROT_NONE page is installed readable, then made inaccessible.
         let installed = crate::linux_overlay::memfd_frame(handle, start / PAGE_SIZE + page)
             .is_some_and(|frame| {
-                address_space::install_current_linux_shared_page(address, frame, protection.max(1))
+                address_space::install_current_linux_shared_page(
+                    address,
+                    frame,
+                    linux_shared_page_protection(handle, start + page * PAGE_SIZE, protection)
+                        .max(1),
+                )
             })
             && (protection != 0 || address_space::protect_current_linux_runtime_page(address, 0));
         if !installed {
@@ -28511,8 +28516,99 @@ fn linux_map_shared_file_page(
     }
     // A PROT_NONE page is installed readable, then made inaccessible.
     crate::linux_overlay::memfd_frame(handle, offset / PAGE_SIZE).is_some_and(|frame| {
-        address_space::install_current_linux_shared_page(address, frame, protection.max(1))
+        address_space::install_current_linux_shared_page(
+            address,
+            frame,
+            linux_shared_page_protection(handle, offset, protection).max(1),
+        )
     }) && (protection != 0 || address_space::protect_current_linux_runtime_page(address, 0))
+}
+
+/// The protection a page of a shared mapping of file `handle` at `offset`
+/// is installed with: a volume's page whose blocks are not all allocated
+/// yet is read-only first, so that the first write faults and allocates
+/// them (`linux_volume_page_mkwrite`), as Linux's page_mkwrite does.
+fn linux_shared_page_protection(
+    handle: crate::linux_overlay::Handle,
+    offset: usize,
+    protection: u8,
+) -> u8 {
+    if protection & LINUX_PROT_WRITE as u8 != 0
+        && crate::linux_blockfs::owns(handle)
+        && !crate::linux_blockfs::page_backed(handle, offset / PAGE_SIZE)
+    {
+        protection & !(LINUX_PROT_WRITE as u8)
+    } else {
+        protection
+    }
+}
+
+/// The first write to a page of a shared mapping of a volume's file that
+/// was installed read-only for want of disk blocks: the blocks are
+/// allocated and the page made writable. When the disk (or the quota) has
+/// none, the page is noted so that the fault raises SIGBUS.
+fn linux_volume_page_mkwrite(fault: domain::FaultMetadata) -> bool {
+    // The note is this fault's alone: every fault that gets this far
+    // without being resolved clears what an earlier one left.
+    LINUX_MKWRITE_FAILED_PAGE.store(0, Ordering::SeqCst);
+    if fault.vector != 14 || fault.error & 3 != 3 || fault.address >= 1 << 47 {
+        return false;
+    }
+    linux_volume_page_mkwrite_at(fault.address & !(PAGE_SIZE as u64 - 1))
+}
+
+/// `linux_volume_page_mkwrite` for page `address`, as a fault or the
+/// kernel writing into the page would need it.
+fn linux_volume_page_mkwrite_at(address: u64) -> bool {
+    let page = address_space::current_linux_runtime_page(address);
+    if !page.occupied
+        || !page.shared
+        || page.frame.is_none()
+        || page.protection != LINUX_PROT_READ as u8
+    {
+        return false;
+    }
+    let Some(area) = crate::linux_areas::area_at(
+        linux_execution_instance(),
+        current_linux_process_pid(),
+        address,
+    ) else {
+        return false;
+    };
+    if !area.shared || !area.protection.writable() || area.protection.executable() {
+        return false;
+    }
+    let Some((handle, offset)) = linux_shared_file_page(address) else {
+        return false;
+    };
+    if !crate::linux_blockfs::owns(handle) {
+        return false;
+    }
+    match crate::linux_blockfs::page_mkwrite(handle, offset / PAGE_SIZE) {
+        Ok(()) => address_space::protect_current_linux_runtime_page(
+            address,
+            (LINUX_PROT_READ | LINUX_PROT_WRITE) as u8,
+        ),
+        Err(_) => {
+            LINUX_MKWRITE_FAILED_PAGE.store(linux_mkwrite_note(address), Ordering::SeqCst);
+            false
+        }
+    }
+}
+
+/// The page (with its process) whose page_mkwrite failed in the fault
+/// being handled, so that the fault is SIGBUS, as Linux's VM_FAULT_SIGBUS.
+static LINUX_MKWRITE_FAILED_PAGE: AtomicU64 = AtomicU64::new(0);
+
+/// The note for page `address` of the current process: the page, bit 0,
+/// and the pid above the address bits.
+fn linux_mkwrite_note(address: u64) -> u64 {
+    (address & !(PAGE_SIZE as u64 - 1)) | 1 | u64::from(current_linux_process_pid()) << 48
+}
+
+/// Whether user fault `fault` is the one whose page_mkwrite failed.
+pub(super) fn linux_mkwrite_failed(fault: domain::FaultMetadata) -> bool {
+    LINUX_MKWRITE_FAILED_PAGE.load(Ordering::SeqCst) == linux_mkwrite_note(fault.address)
 }
 
 /// Gives a page of a shared file mapping that was past the file's end
@@ -28535,6 +28631,46 @@ fn linux_refill_shared_file_page(address: u64) -> bool {
         )
 }
 
+/// After volume file `handle` grew from `old_size`, the current process's
+/// shared mappings of the page that held the old end become read-only
+/// again: the rest of that page now lies in the file and needs blocks
+/// before a write through the mapping (Linux's pagecache_isize_extended).
+fn linux_protect_grown_volume_page(handle: crate::linux_overlay::Handle, old_size: usize) {
+    if old_size.is_multiple_of(PAGE_SIZE) || !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
+    {
+        return;
+    }
+    let Some((device, inode)) = linux_overlay_file_identity(handle) else {
+        return;
+    };
+    let page_offset = (old_size - old_size % PAGE_SIZE) as u64;
+    for area in crate::linux_areas::shared_file_areas(
+        linux_execution_instance(),
+        current_linux_process_pid(),
+        device,
+        inode,
+    ) {
+        let crate::linux_areas::Backing::File { offset, .. } = area.backing else {
+            continue;
+        };
+        let Some(address) = page_offset
+            .checked_sub(offset)
+            .map(|delta| area.start + delta)
+            .filter(|address| *address < area.end)
+        else {
+            continue;
+        };
+        let page = address_space::current_linux_runtime_page(address);
+        if page.shared
+            && page.frame.is_some()
+            && page.protection == (LINUX_PROT_READ | LINUX_PROT_WRITE) as u8
+        {
+            let _ =
+                address_space::protect_current_linux_runtime_page(address, LINUX_PROT_READ as u8);
+        }
+    }
+}
+
 /// Truncates overlay file `handle` to `size`. The pages of the current
 /// process's shared mappings of it that end up wholly past the new end
 /// become SIGBUS to touch (and EFAULT to the kernel), as Linux unmaps
@@ -28543,6 +28679,9 @@ fn linux_truncate_overlay_file(handle: crate::linux_overlay::Handle, size: usize
     let old_size = crate::linux_overlay::metadata(handle).map_or(0, |metadata| metadata.size);
     if !crate::linux_overlay::truncate(handle, size) {
         return false;
+    }
+    if size > old_size && crate::linux_blockfs::owns(handle) {
+        linux_protect_grown_volume_page(handle, old_size);
     }
     let end = size.next_multiple_of(PAGE_SIZE) as u64;
     if old_size as u64 <= end || !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
@@ -60681,6 +60820,11 @@ fn materialize_linux_runtime_user_range(address: u64, length: usize, writable: b
         {
             page = address_space::current_linux_runtime_page(page_address);
         }
+        // The kernel writing into a volume's page that waits for its
+        // blocks allocates them, as a user write would.
+        if writable && page.occupied && linux_volume_page_mkwrite_at(page_address) {
+            page = address_space::current_linux_runtime_page(page_address);
+        }
         if !page.occupied || page.protection & required == 0 {
             return false;
         }
@@ -65344,7 +65488,8 @@ fn handle_user_fault(frame: *mut UserFaultFrame) -> u64 {
             || materialize_linux_runtime_stack_page(fault_metadata)
             || grow_linux_runtime_stack(fault_metadata)
             || grow_linux_growsdown_area(fault_metadata)
-            || linux_flip_write_execute_page(fault_metadata))
+            || linux_flip_write_execute_page(fault_metadata)
+            || linux_volume_page_mkwrite(fault_metadata))
     {
         return 0;
     }

@@ -3026,7 +3026,8 @@ pub(super) const fn linux_fault_signal(vector: u64) -> u64 {
 pub(super) fn linux_user_fault_signal(fault: domain::FaultMetadata) -> u64 {
     if fault.vector == 14
         && X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
-        && address_space::current_linux_page_past_eof(fault.address & !(PAGE_SIZE as u64 - 1))
+        && (address_space::current_linux_page_past_eof(fault.address & !(PAGE_SIZE as u64 - 1))
+            || linux_mkwrite_failed(fault))
     {
         LINUX_SIGBUS
     } else {

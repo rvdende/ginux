@@ -742,7 +742,7 @@ mmap12 mmap12
 mmap13 mmap13
 mmap14 mmap14
 mmap15 mmap15
-!mmap16 mmap16  # a write through a shared mapping to file blocks a full ext4 cannot allocate is not refused with SIGBUS (no page_mkwrite: blocks are allocated at write-back)
+mmap16 mmap16
 mmap17 mmap17
 mmap18 mmap18
 mmap19 mmap19
