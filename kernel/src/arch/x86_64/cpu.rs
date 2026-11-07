@@ -15695,6 +15695,11 @@ fn linux_clone_shared_resources(flags: u64) -> impl Iterator<Item = linux_proces
 /// exit signal (SIGCHLD unless clone named another; none for 0). Only a
 /// SIGCHLD that cannot be queued fails.
 fn linux_signal_child_exit(parent: u32, child: u32, status: u8) -> bool {
+    // A parent ignoring SIGCHLD now reaps this child; one that ended
+    // before stays its zombie.
+    if linux_parent_reaps_automatically(parent) {
+        linux_process::set_live_process_reaped_by_parent(child);
+    }
     let signal = linux_process::live_process_exit_signal(child).map_or(LINUX_SIGCHLD, u64::from);
     let queued = signal == 0
         || linux_queue_process_signal(parent, signal, LINUX_CLD_EXITED, Some(u64::from(status)))
@@ -32164,6 +32169,13 @@ fn linux_proc_sysctl_write_bytes(device: u16, index: usize, text: &[u8]) -> Resu
             };
         }
     }
+    if let Some(set) = linux_fanotify_set_limit(LINUX_PROC_SYSCTLS[index].1, value) {
+        return if set {
+            Ok(text.len())
+        } else {
+            Err(LINUX_EINVAL)
+        };
+    }
     if LINUX_PROC_SYSCTLS[index].1 == b"sys/vm/drop_caches" && value & 1 != 0 {
         crate::linux_blockfs::drop_caches();
     }
@@ -32196,7 +32208,9 @@ fn linux_proc_sysctl_text(state: u16) -> Option<([u8; LINUX_UTS_NAME_CAPACITY + 
         text[length] = b'\n';
         return Some((text, length + 1));
     }
-    if let Some(value) = linux_proc_sysctl_override(index) {
+    let value = linux_fanotify_limit_value(LINUX_PROC_SYSCTLS[index].1)
+        .or_else(|| linux_proc_sysctl_override(index));
+    if let Some(value) = value {
         let mut used = 0;
         let generated = (value >= 0 || append_linux_bytes(&mut text, &mut used, b"-"))
             && append_linux_decimal(&mut text, &mut used, value.unsigned_abs())
@@ -39416,6 +39430,18 @@ fn linux_fchmodat(directory: u64, path_address: u64, mode: u64, flags: u64) -> u
     };
     if path_length == 0 && flags & LINUX_AT_EMPTY_PATH != 0 {
         return linux_fchmod(directory, mode);
+    }
+    // A /proc/self/fd/N link names what its descriptor has open: a
+    // symlink itself for an O_PATH | O_NOFOLLOW descriptor of one, whose
+    // mode cannot change (EOPNOTSUPP since Linux 6.6, chmod09).
+    if let Some(descriptor) = linux_descriptor_link_at(directory, &path[..path_length], true) {
+        let mut resolved = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+        let mut target = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+        if let Some(length) = linux_descriptor_path(descriptor, &mut resolved) {
+            if linux_exact_symlink(&resolved[1..length], &mut target).is_some() {
+                return LINUX_EOPNOTSUPP;
+            }
+        }
     }
     let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
     let length = match linux_canonical_path_at(directory, &path[..path_length], &mut canonical) {
@@ -49997,11 +50023,12 @@ fn linux_inotify_instance(descriptor: u64) -> Option<usize> {
     if !linux_inotify_descriptor(descriptor) {
         return None;
     }
+    // The instance is the descriptor's open file description id, which
+    // only grows: a long-running domain's go past 16 bits.
     let instance = linux_descriptor_offset(descriptor).load(Ordering::SeqCst);
     instance
         .checked_sub(1)
         .and_then(|index| usize::try_from(index).ok())
-        .filter(|index| *index < usize::from(u16::MAX))
 }
 
 /// The inotify instance a descriptor stands for: its domain and id.
@@ -50287,10 +50314,19 @@ pub(super) fn linux_inotify_before(number: u64, arguments: [u64; 6]) -> Option<L
         }
         LINUX_CLOSE_SYSCALL => {
             let path = linux_inotify_descriptor_path(arguments[0]);
-            let directory = path.as_deref().is_some_and(linux_inotify_is_directory);
+            let directory = crate::linux_inotify::active()
+                && path.as_deref().is_some_and(linux_inotify_is_directory);
             let writer = linux_device_descriptor(u64::from(arguments[0] as u32))
                 & LINUX_DESCRIPTOR_OUTPUT
                 != 0;
+            // What fanotify reports of the close, from the descriptor
+            // while it is still open.
+            let node = path
+                .as_deref()
+                .filter(|_| crate::linux_fanotify::active())
+                .and_then(|path| {
+                    linux_fanotify_descriptor_node(u64::from(arguments[0] as u32), path)
+                });
             return Some(LinuxInotifyCall {
                 number,
                 arguments,
@@ -50298,7 +50334,7 @@ pub(super) fn linux_inotify_before(number: u64, arguments: [u64; 6]) -> Option<L
                 second: None,
                 directory,
                 writer,
-                nodes: [None, None],
+                nodes: [node, None],
             });
         }
         _ => (None, None, false),
@@ -50332,8 +50368,11 @@ pub(super) fn linux_inotify_after(call: LinuxInotifyCall, result: u64) {
     let domain = linux_execution_instance();
     let arguments = call.arguments;
     let at = u64::from(LINUX_AT_FDCWD);
+    // Looking a path up costs a directory walk: inotify's part only when
+    // it has watches.
+    let inotify = crate::linux_inotify::active();
     let object = |path: Option<LinuxInotifyPath>, mask: u32| {
-        if let Some(path) = path {
+        if let Some(path) = path.filter(|_| inotify) {
             let path = &path[..];
             let directory = linux_inotify_is_directory(path);
             crate::linux_inotify::notify(
@@ -50366,9 +50405,11 @@ pub(super) fn linux_inotify_after(call: LinuxInotifyCall, result: u64) {
         }
         path
     };
-    let fanotify = |path: &Option<LinuxInotifyPath>, mask: u32| {
+    // Events through an open file: fanotify describes it by its
+    // descriptor.
+    let fanotify = |descriptor: u64, path: &Option<LinuxInotifyPath>, mask: u32| {
         if let Some(path) = path {
-            linux_fanotify_event(path, mask);
+            linux_fanotify_descriptor_event(u64::from(descriptor as u32), path, mask);
         }
     };
     match call.number {
@@ -50377,7 +50418,7 @@ pub(super) fn linux_inotify_after(call: LinuxInotifyCall, result: u64) {
             if linux_descriptor_flag(&X86_RUNTIME.ELF_PROBE_DESCRIPTOR_CREATED, result) {
                 created(&path, false);
             }
-            fanotify(&path, FAN_OPEN);
+            fanotify(result, &path, FAN_OPEN);
             object(path, IN_OPEN);
         }
         LINUX_READ_SYSCALL
@@ -50388,7 +50429,7 @@ pub(super) fn linux_inotify_after(call: LinuxInotifyCall, result: u64) {
             if result != 0 =>
         {
             let path = linux_inotify_descriptor_path(arguments[0]);
-            fanotify(&path, FAN_ACCESS);
+            fanotify(arguments[0], &path, FAN_ACCESS);
             object(path, IN_ACCESS);
         }
         LINUX_WRITE_SYSCALL
@@ -50399,12 +50440,12 @@ pub(super) fn linux_inotify_after(call: LinuxInotifyCall, result: u64) {
             if result != 0 =>
         {
             let path = linux_inotify_descriptor_path(arguments[0]);
-            fanotify(&path, FAN_MODIFY);
+            fanotify(arguments[0], &path, FAN_MODIFY);
             object(path, IN_MODIFY);
         }
         LINUX_FALLOCATE_SYSCALL => {
             let path = linux_inotify_descriptor_path(arguments[0]);
-            fanotify(&path, FAN_MODIFY);
+            fanotify(arguments[0], &path, FAN_MODIFY);
             object(path, IN_MODIFY);
         }
         // A truncate changes the file's size by name, as Linux's
@@ -50494,8 +50535,11 @@ pub(super) fn linux_inotify_after(call: LinuxInotifyCall, result: u64) {
             } else {
                 FAN_CLOSE_NOWRITE
             };
-            fanotify(&call.first, closed);
-            if let Some(path) = call.first {
+            let [node, _] = call.nodes;
+            if let Some(node) = node {
+                linux_fanotify_node_event(node, closed);
+            }
+            if let Some(path) = call.first.filter(|_| inotify) {
                 let mask = if call.writer {
                     IN_CLOSE_WRITE
                 } else {
@@ -59180,8 +59224,17 @@ fn linux_umount(target_address: u64, flags: u64) -> u64 {
     }
     match crate::linux_mounts::unmount(space, canonical) {
         Ok(gone) => {
+            // A filesystem that goes with its last mount (not a bind mount
+            // of one that stays): the watches on its files end.
+            let filesystem_gone = gone.is_some();
             if let Some(gone) = gone {
                 linux_filesystem_gone(gone);
+            }
+            if filesystem_gone {
+                let domain = linux_execution_instance();
+                crate::linux_inotify::unmounted(domain, canonical);
+                crate::linux_fanotify::removed(domain, canonical);
+                wake_linux_descriptor_waits();
             }
             0
         }

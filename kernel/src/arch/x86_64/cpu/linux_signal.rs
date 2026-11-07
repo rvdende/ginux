@@ -1652,15 +1652,9 @@ pub(super) fn linux_reap_ignored_children() {
     if !linux_parent_reaps_automatically(parent) {
         return;
     }
-    let exited = linux_process::ChildWaitEvents {
-        exited: true,
-        stopped: false,
-        continued: false,
-        scope: linux_process::ChildScope::All,
-    };
-    while let Some(linux_process::ChildWaitState::Exited { pid, .. }) =
-        linux_process::live_child_wait_state(parent, None, exited)
-    {
+    // Only the children that ended while it did; a zombie from before it
+    // ignored SIGCHLD is waited for as any other (fanotify03).
+    while let Some(pid) = linux_process::live_child_reaped_by_parent(parent) {
         if linux_reap_child(parent, pid).is_none() {
             break;
         }

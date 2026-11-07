@@ -591,6 +591,10 @@ struct Process {
     /// none. A child whose signal is not SIGCHLD is a "clone" child, which
     /// only a wait with __WCLONE or __WALL reports.
     exit_signal: u8,
+    /// It ended while its parent ignored SIGCHLD (or set SA_NOCLDWAIT): its
+    /// parent reaps it at once, leaving no zombie to wait for. A child that
+    /// ended before its parent did so stays a zombie, as in Linux.
+    reaped_by_parent: bool,
     /// The cgroup it was placed in (CLONE_INTO_CGROUP), by the cgroup
     /// directory's generation, or 0 for the domain's root.
     cgroup_generation: u32,
@@ -1994,6 +1998,7 @@ impl ProcessTable {
             shares_parent_vm: false,
             shared,
             exit_signal: DEFAULT_EXIT_SIGNAL,
+            reaped_by_parent: false,
             cgroup_generation: 0,
             cloned_by: None,
             vfork_child: 0,
@@ -4760,6 +4765,18 @@ pub(crate) fn live_process_exit_signal(pid: u32) -> Option<u8> {
     Some(process.exit_signal)
 }
 
+/// Process `pid` ended while its parent reaped its children automatically.
+pub(crate) fn set_live_process_reaped_by_parent(pid: u32) {
+    if let Some(table) = live_process_table_mut() {
+        if let Some(process) = table
+            .handle_by_pid(pid)
+            .and_then(|handle| table.process_mut(handle))
+        {
+            process.reaped_by_parent = true;
+        }
+    }
+}
+
 pub(crate) fn set_live_process_exit_signal(pid: u32, signal: u8) -> bool {
     let Some(table) = live_process_table_mut() else {
         return false;
@@ -6020,6 +6037,23 @@ pub(crate) fn live_child_wait_state(
         events.stopped,
         events.continued,
     )
+}
+
+/// An exited child of `parent_pid` that ended while it reaped its
+/// children automatically.
+pub(crate) fn live_child_reaped_by_parent(parent_pid: u32) -> Option<u32> {
+    let table = live_process_table_mut()?;
+    let parent = table.handle_by_pid(parent_pid)?;
+    match table.child_wait_state_matching(
+        parent,
+        |process| process.reaped_by_parent,
+        true,
+        false,
+        false,
+    )? {
+        ChildWaitState::Exited { pid, .. } => Some(pid),
+        _ => None,
+    }
 }
 
 pub(crate) fn live_child_group_wait_state(

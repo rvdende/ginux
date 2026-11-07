@@ -74,7 +74,7 @@ chmod05 chmod05
 chmod06 chmod06
 chmod07 chmod07
 chmod08 chmod08
-!chmod09 chmod09  # chmod through an O_PATH symlink's /proc/self/fd link is not EOPNOTSUPP
+chmod09 chmod09
 chown01 chown01
 chown01_16 chown01_16
 chown02 chown02
@@ -535,7 +535,7 @@ inotify_init1_01 inotify_init1_01
 inotify_init1_02 inotify_init1_02
 inotify01 inotify01
 inotify02 inotify02
-!inotify03 inotify03  # unmounting a watched filesystem sends no IN_UNMOUNT or IN_IGNORED
+inotify03 inotify03
 inotify04 inotify04
 inotify05 inotify05
 inotify06 inotify06  # auto: budget=120
@@ -547,13 +547,13 @@ inotify11 inotify11
 inotify12 inotify12
 fanotify01 fanotify01
 fanotify02 fanotify02
-!fanotify03 fanotify03  # permission events (FAN_OPEN_PERM) on a mount mark are not generated
+fanotify03 fanotify03
 fanotify04 fanotify04
-!fanotify05 fanotify05  # hangs: fanotify's queue overflow (FAN_Q_OVERFLOW) is not reported
+fanotify05 fanotify05  # budget=120 makes and opens 32770 files on ext2
 fanotify06 fanotify06
 fanotify07 fanotify07
 fanotify08 fanotify08
-!fanotify09 fanotify09  # ignore masks on mount and filesystem marks do not survive a modify event
+fanotify09 fanotify09
 fanotify10 fanotify10
 fanotify11 fanotify11
 fanotify12 fanotify12

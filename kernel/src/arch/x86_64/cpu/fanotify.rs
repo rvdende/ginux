@@ -21,11 +21,86 @@ fn linux_fanotify_key(descriptor: u64) -> Option<(usize, u64)> {
     linux_descriptor_open_file_id(descriptor).map(|id| (linux_execution_instance(), id))
 }
 
-/// Whether the caller has CAP_SYS_ADMIN (the kernel outside a process is
-/// root).
+/// Whether the caller has CAP_SYS_ADMIN in the domain's initial user
+/// namespace, as Linux's capable() asks (the kernel outside a process is
+/// root): root of a namespace made in the domain does not.
 fn linux_fanotify_admin() -> bool {
     current_linux_credentials()
         .is_none_or(|credentials| credentials.has(ginux_credentials::capability::SYS_ADMIN))
+        && current_linux_user_namespace()
+            .is_none_or(|namespace| linux_user::parent(namespace).is_none())
+}
+
+/// Who the caller's groups count against: its user in its user namespace
+/// and those above it.
+fn linux_fanotify_owner() -> Option<fanotify::Owner> {
+    let uid = current_linux_credentials().map_or(0, |credentials| credentials.user.effective);
+    let mut namespaces = Vec::new();
+    let mut namespace = current_linux_user_namespace();
+    while let Some(handle) = namespace {
+        namespaces.try_reserve(1).ok()?;
+        namespaces.push(handle.to_word());
+        namespace = linux_user::parent(handle);
+    }
+    if namespaces.is_empty() {
+        namespaces.try_reserve(1).ok()?;
+        namespaces.push(0);
+    }
+    Some(fanotify::Owner { uid, namespaces })
+}
+
+/// The /proc/sys values of fanotify's per-user limits: the caller's user
+/// namespace's (user/max_fanotify_groups and max_fanotify_marks), or the
+/// domain's initial namespace's (fs/fanotify/max_user_groups and
+/// max_user_marks); None for other paths.
+fn linux_fanotify_limit_at(path: &[u8]) -> Option<(fanotify::Limit, Option<u64>)> {
+    let (limit, own) = match path {
+        b"sys/user/max_fanotify_groups" => (fanotify::Limit::Groups, true),
+        b"sys/user/max_fanotify_marks" => (fanotify::Limit::Marks, true),
+        b"sys/fs/fanotify/max_user_groups" => (fanotify::Limit::Groups, false),
+        b"sys/fs/fanotify/max_user_marks" => (fanotify::Limit::Marks, false),
+        _ => return None,
+    };
+    let namespace = current_linux_user_namespace();
+    let namespace = if own { namespace } else { None };
+    Some((
+        limit,
+        namespace
+            .filter(|namespace| linux_user::parent(*namespace).is_some())
+            .map(linux_user::UserNamespaceHandle::to_word),
+    ))
+}
+
+/// The number a fanotify limit's /proc/sys file shows.
+pub(super) fn linux_fanotify_limit_value(path: &[u8]) -> Option<i64> {
+    let (limit, namespace) = linux_fanotify_limit_at(path)?;
+    let initial = linux_fanotify_initial_namespace();
+    Some(i64::from(fanotify::user_limit(
+        linux_execution_instance(),
+        namespace.unwrap_or(initial),
+        namespace.is_none(),
+        limit,
+    )))
+}
+
+/// Writes a fanotify limit's /proc/sys file: Some(false) for a value out
+/// of range.
+pub(super) fn linux_fanotify_set_limit(path: &[u8], value: i64) -> Option<bool> {
+    let (limit, namespace) = linux_fanotify_limit_at(path)?;
+    let Ok(value) = u32::try_from(value).map(|value| value.min(i32::MAX as u32)) else {
+        return Some(false);
+    };
+    let namespace = namespace.unwrap_or_else(linux_fanotify_initial_namespace);
+    Some(fanotify::set_user_limit(linux_execution_instance(), namespace, limit, value).is_ok())
+}
+
+/// The domain's initial user namespace, as fanotify's limits name it.
+fn linux_fanotify_initial_namespace() -> u64 {
+    let mut namespace = current_linux_user_namespace();
+    while let Some(parent) = namespace.and_then(linux_user::parent) {
+        namespace = Some(parent);
+    }
+    namespace.map_or(0, linux_user::UserNamespaceHandle::to_word)
 }
 
 /// fanotify_init(2), with Linux's checks in Linux's order.
@@ -101,12 +176,16 @@ pub(super) fn linux_fanotify_init(flags: u64, event_flags: u64) -> u64 {
         },
         Ordering::SeqCst,
     );
-    let created = match linux_descriptor_open_file_id(descriptor) {
-        Some(id) => fanotify::create(
+    let queue_limit = linux_proc_sysctl_value(b"sys/fs/fanotify/max_queued_events")
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(fanotify::DEFAULT_QUEUE_LIMIT);
+    let created = match linux_descriptor_open_file_id(descriptor).zip(linux_fanotify_owner()) {
+        Some((id, owner)) => fanotify::create(
             linux_execution_instance(),
             id,
-            current_linux_process_pid(),
+            (current_linux_process_pid(), owner),
             (flags | internal, event_flags | LINUX_O_LARGEFILE as u32),
+            queue_limit,
         ),
         None => Err(fanotify::Error::NoMemory),
     };
@@ -126,13 +205,20 @@ pub(super) fn linux_fanotify_init(flags: u64, event_flags: u64) -> u64 {
 /// mount's id, a volume's id, /proc's and cgroup2's numbers, or the
 /// root's, as `linux_statfs` reports them.
 fn linux_fanotify_fsid(path: &[u8]) -> [u8; 8] {
+    linux_fanotify_fsid_of(
+        path,
+        crate::linux_overlay::lookup(path).map(|metadata| metadata.handle),
+    )
+}
+
+/// `linux_fanotify_fsid` for the object at `path` whose overlay node, if
+/// it has one, is `handle` (so a caller that looked it up already does not
+/// walk the path again).
+fn linux_fanotify_fsid_of(path: &[u8], handle: Option<crate::linux_overlay::Handle>) -> [u8; 8] {
     if let Some(fsid) = linux_tmpfs_fsid(path) {
         return fsid;
     }
-    if let Some(statfs) = crate::linux_overlay::lookup(path)
-        .map(|metadata| metadata.handle)
-        .and_then(crate::linux_blockfs::statfs_of)
-    {
+    if let Some(statfs) = handle.and_then(crate::linux_blockfs::statfs_of) {
         let mut fsid = [0_u8; 8];
         fsid[..4].copy_from_slice(&statfs.id[0].to_ne_bytes());
         fsid[4..].copy_from_slice(&statfs.id[1].to_ne_bytes());
@@ -159,6 +245,8 @@ pub(super) struct LinuxFanotifyNode {
     handle: Option<[u8; 8]>,
     /// Its hard links, for whether removing a name deletes it.
     links: u32,
+    /// Its overlay node, when it has one.
+    overlay: Option<crate::linux_overlay::Handle>,
 }
 
 impl LinuxFanotifyNode {
@@ -189,40 +277,55 @@ pub(super) fn linux_fanotify_node(path: &[u8]) -> Option<LinuxFanotifyNode> {
     use crate::published_rootfs::EntryKind;
     // As name_to_handle_at encodes it: the overlay's node by generation,
     // else the image's entry by handle.
-    let (directory, openable, handle, links) =
-        if let Some(metadata) = crate::linux_overlay::lookup(path) {
-            let handle = u64::from(1_u32) << 32
-                | u64::from(crate::linux_overlay::generation(metadata.handle));
-            (
-                metadata.kind == NodeKind::Directory,
-                matches!(metadata.kind, NodeKind::File | NodeKind::Directory),
-                handle,
-                metadata.links,
-            )
-        } else {
-            if crate::linux_overlay::hidden(path) {
-                return None;
-            }
-            let (rootfs, entry) =
-                crate::published_rootfs::lookup_at(crate::published_rootfs::ROOT_HANDLE, path)
-                    .filter(|(handle, _)| !linux_rootfs_handle_hidden(*handle))?;
-            let kind = entry.map(|entry| entry.kind);
-            let directory = matches!(kind, None | Some(EntryKind::Directory));
-            let handle = u64::from(2_u32) << 32 | u64::from(rootfs);
-            (
-                directory,
-                !matches!(kind, Some(EntryKind::Symlink)),
-                handle,
-                1,
-            )
-        };
+    let overlay = crate::linux_overlay::lookup(path);
+    let (directory, openable, handle, links) = if let Some(metadata) = overlay {
+        let handle =
+            u64::from(1_u32) << 32 | u64::from(crate::linux_overlay::generation(metadata.handle));
+        (
+            metadata.kind == NodeKind::Directory,
+            matches!(metadata.kind, NodeKind::File | NodeKind::Directory),
+            handle,
+            metadata.links,
+        )
+    } else {
+        if crate::linux_overlay::hidden(path) {
+            return None;
+        }
+        let (rootfs, entry) =
+            crate::published_rootfs::lookup_at(crate::published_rootfs::ROOT_HANDLE, path)
+                .filter(|(handle, _)| !linux_rootfs_handle_hidden(*handle))?;
+        let kind = entry.map(|entry| entry.kind);
+        let directory = matches!(kind, None | Some(EntryKind::Directory));
+        let handle = u64::from(2_u32) << 32 | u64::from(rootfs);
+        (
+            directory,
+            !matches!(kind, Some(EntryKind::Symlink)),
+            handle,
+            1,
+        )
+    };
     Some(LinuxFanotifyNode {
         path: linux_heap_path(path)?,
         directory,
         openable,
-        fsid: linux_fanotify_fsid(path),
+        fsid: linux_fanotify_fsid_of(path, overlay.map(|metadata| metadata.handle)),
         handle: Some(handle.to_ne_bytes()),
         links,
+        overlay: overlay.map(|metadata| metadata.handle),
+    })
+}
+
+/// A directory as only its path matters to an event (no group reports
+/// identifiers): its marks are found by path.
+fn linux_fanotify_directory_by_path(path: &[u8]) -> Option<LinuxFanotifyNode> {
+    Some(LinuxFanotifyNode {
+        path: linux_heap_path(path)?,
+        directory: true,
+        openable: true,
+        fsid: [0; 8],
+        handle: None,
+        links: 1,
+        overlay: None,
     })
 }
 
@@ -246,15 +349,36 @@ fn linux_fanotify_notify(notice: &Notice) {
 /// reporting descriptors hear), or to it by name (an attribute change, a
 /// truncate).
 fn linux_fanotify_file_event(path: &[u8], mask: u32, opened: bool) {
-    if !fanotify::active() || !opened && !fanotify::identifier_groups() {
+    linux_fanotify_file_event_of(path, mask, opened, || linux_fanotify_node(path));
+}
+
+/// `linux_fanotify_file_event` with the object from `object`, asked only
+/// when some mark may hear the event.
+fn linux_fanotify_file_event_of(
+    path: &[u8],
+    mask: u32,
+    opened: bool,
+    object: impl FnOnce() -> Option<LinuxFanotifyNode>,
+) {
+    if !fanotify::active()
+        || !opened && !fanotify::identifier_groups()
+        || !fanotify::may_hear(linux_execution_instance(), mask)
+    {
         return;
     }
-    let Some(object) = linux_fanotify_node(path) else {
+    let Some(object) = object() else {
         return;
     };
     let (parent_path, name) = fanotify::split(path);
+    // The directory's identifiers matter only to groups reporting them.
     let parent = (!path.is_empty())
-        .then(|| linux_fanotify_node(parent_path))
+        .then(|| {
+            if fanotify::identifier_groups() {
+                linux_fanotify_node(parent_path)
+            } else {
+                linux_fanotify_directory_by_path(parent_path)
+            }
+        })
         .flatten();
     let mount = opened.then(|| {
         if fanotify::mount_marks() {
@@ -272,11 +396,93 @@ fn linux_fanotify_file_event(path: &[u8], mask: u32, opened: bool) {
         moved: None,
         mount,
     });
+    // A file of an overlayfs is a layer's file underneath: that file hears
+    // the event too, by its own identifiers, as Linux reports it on the
+    // real inode (since 6.5). Its directory and mount are the layer's,
+    // which marks do not name here.
+    if let Some(real) = object
+        .overlay
+        .filter(|handle| crate::linux_overlayfs::owns(*handle))
+        .and_then(crate::linux_overlayfs::real)
+        .and_then(linux_fanotify_handle_node)
+    {
+        linux_fanotify_notify(&Notice {
+            kind: Kind::File,
+            mask,
+            object: real.node(),
+            directory: None,
+            name,
+            moved: None,
+            mount: None,
+        });
+    }
+}
+
+/// The object overlay node `handle` is, by its own path (a layer's file).
+fn linux_fanotify_handle_node(handle: crate::linux_overlay::Handle) -> Option<LinuxFanotifyNode> {
+    use crate::linux_overlay::NodeKind;
+    let metadata = crate::linux_overlay::metadata(handle)?;
+    let mut path = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    let length = crate::linux_overlay::copy_path(handle, &mut path)?;
+    let path = &path[..length];
+    let identifier =
+        u64::from(1_u32) << 32 | u64::from(crate::linux_overlay::generation(metadata.handle));
+    Some(LinuxFanotifyNode {
+        path: linux_heap_path(path)?,
+        directory: metadata.kind == NodeKind::Directory,
+        openable: matches!(metadata.kind, NodeKind::File | NodeKind::Directory),
+        fsid: linux_fanotify_fsid_of(path, Some(metadata.handle)),
+        handle: Some(identifier.to_ne_bytes()),
+        links: metadata.links,
+        overlay: Some(metadata.handle),
+    })
 }
 
 /// Events `mask` happened through an open file of canonical `path`.
 pub(super) fn linux_fanotify_event(path: &[u8], mask: u32) {
     linux_fanotify_file_event(path, mask, true);
+}
+
+/// The object open file `descriptor` (of canonical `path`) has open, by
+/// its overlay node, without walking the path again (a large directory's
+/// entries cost a scan each).
+pub(super) fn linux_fanotify_descriptor_node(
+    descriptor: u64,
+    path: &[u8],
+) -> Option<LinuxFanotifyNode> {
+    use crate::linux_overlay::NodeKind;
+    let Some(handle) = linux_overlay_descriptor_handle(descriptor) else {
+        return linux_fanotify_node(path);
+    };
+    let Some(metadata) = crate::linux_overlay::metadata(handle) else {
+        return linux_fanotify_node(path);
+    };
+    let identifier =
+        u64::from(1_u32) << 32 | u64::from(crate::linux_overlay::generation(metadata.handle));
+    Some(LinuxFanotifyNode {
+        path: linux_heap_path(path)?,
+        directory: metadata.kind == NodeKind::Directory,
+        openable: matches!(metadata.kind, NodeKind::File | NodeKind::Directory),
+        fsid: linux_fanotify_fsid_of(path, Some(metadata.handle)),
+        handle: Some(identifier.to_ne_bytes()),
+        links: metadata.links,
+        overlay: Some(handle),
+    })
+}
+
+/// Events `mask` happened through open file `descriptor` of canonical
+/// `path`.
+pub(super) fn linux_fanotify_descriptor_event(descriptor: u64, path: &[u8], mask: u32) {
+    linux_fanotify_file_event_of(path, mask, true, || {
+        linux_fanotify_descriptor_node(descriptor, path)
+    });
+}
+
+/// Events `mask` happened through an open file whose object was `object`
+/// (a closed descriptor's, described before it closed).
+pub(super) fn linux_fanotify_node_event(object: LinuxFanotifyNode, mask: u32) {
+    let path = object.path.clone();
+    linux_fanotify_file_event_of(&path, mask, true, || Some(object));
 }
 
 /// Events `mask` happened to canonical `path` by name (FAN_ATTRIB, a
@@ -468,7 +674,7 @@ pub(super) fn linux_fanotify_permission_check(
     output: *mut LinuxSyscallFrame,
     caller: LinuxUserContext,
 ) -> Option<u64> {
-    use crate::linux_fanotify::{Permission, FAN_ACCESS_PERM, FAN_OPEN_PERM};
+    use crate::linux_fanotify::{Permission, FAN_ACCESS_PERM, FAN_OPEN_EXEC_PERM, FAN_OPEN_PERM};
     let at = u64::from(LINUX_AT_FDCWD);
     let (path, mask) = match number {
         LINUX_READ_SYSCALL
@@ -505,14 +711,33 @@ pub(super) fn linux_fanotify_permission_check(
                 (linux_heap_path(&canonical[..length])?, FAN_OPEN_PERM)
             }
         }
+        // An exec opens its file to run it: FAN_OPEN_EXEC_PERM, then
+        // FAN_OPEN_PERM, as Linux's open_exec asks.
+        LINUX_EXECVE_SYSCALL => {
+            let path = linux_inotify_path_at(at, arguments[0])?;
+            let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+            canonical.get_mut(..path.len())?.copy_from_slice(&path);
+            let length = linux_overlay_lookup_following(&mut canonical, path.len(), true)
+                .ok()?
+                .0;
+            (
+                linux_heap_path(&canonical[..length])?,
+                FAN_OPEN_EXEC_PERM | FAN_OPEN_PERM,
+            )
+        }
         _ => return None,
     };
-    let object =
-        linux_fanotify_object(&path).filter(|object| mask == FAN_OPEN_PERM || !object.directory)?;
-    match fanotify::permission(
+    let object = linux_fanotify_object(&path)
+        .filter(|object| mask & FAN_ACCESS_PERM == 0 || !object.directory)?;
+    let steps: &[u32] = if mask == FAN_OPEN_EXEC_PERM | FAN_OPEN_PERM {
+        &[FAN_OPEN_EXEC_PERM, FAN_OPEN_PERM]
+    } else {
+        core::slice::from_ref(&mask)
+    };
+    match fanotify::permission_steps(
         linux_execution_instance(),
         object,
-        mask,
+        steps,
         linux_fanotify_cause(),
     ) {
         Permission::Allowed => None,
@@ -738,7 +963,8 @@ pub(super) fn linux_fanotify_mark(
     } else {
         Command::Remove
     };
-    match fanotify::mark(domain, group, command, kind, path, change) {
+    let handle = node.as_ref().and_then(|node| node.handle);
+    match fanotify::mark(domain, group, command, (kind, path, handle), change) {
         Ok(()) => 0,
         Err(fanotify::Error::NotFound) => LINUX_ENOENT,
         Err(fanotify::Error::NoMemory) => LINUX_ENOMEM,

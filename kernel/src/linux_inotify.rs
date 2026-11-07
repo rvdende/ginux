@@ -29,6 +29,8 @@ pub(crate) const IN_DELETE_SELF: u32 = 0x0000_0400;
 pub(crate) const IN_MOVE_SELF: u32 = 0x0000_0800;
 pub(crate) const IN_ALL_EVENTS: u32 = 0x0000_0fff;
 pub(crate) const IN_Q_OVERFLOW: u32 = 0x0000_4000;
+/// The watched object's filesystem was unmounted.
+pub(crate) const IN_UNMOUNT: u32 = 0x0000_2000;
 pub(crate) const IN_IGNORED: u32 = 0x0000_8000;
 pub(crate) const IN_ONLYDIR: u32 = 0x0100_0000;
 pub(crate) const IN_DONT_FOLLOW: u32 = 0x0200_0000;
@@ -620,6 +622,44 @@ pub(crate) fn deleted(domain: usize, path: &[u8], directory: bool) {
                 cookie: 0,
                 name: Vec::new(),
             });
+        }
+    }
+}
+
+/// The filesystem mounted at canonical `path` was unmounted: the watches
+/// on its files (at or under `path`) get IN_UNMOUNT and IN_IGNORED, and
+/// end, as Linux ends them.
+pub(crate) fn unmounted(domain: usize, path: &[u8]) {
+    if !active() {
+        return;
+    }
+    let mut instances = INSTANCES.lock();
+    for instance in instances
+        .iter_mut()
+        .filter(|instance| instance.domain == domain)
+    {
+        let mut index = 0;
+        while index < instance.watches.len() {
+            let watched = &instance.watches[index].path;
+            let on = path.is_empty()
+                || watched
+                    .strip_prefix(path)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(b"/"));
+            if !on {
+                index += 1;
+                continue;
+            }
+            let wd = instance.watches[index].wd;
+            instance.watches.remove(index);
+            WATCHES.fetch_sub(1, Ordering::Relaxed);
+            for mask in [IN_UNMOUNT, IN_IGNORED] {
+                instance.queue(Event {
+                    wd,
+                    mask,
+                    cookie: 0,
+                    name: Vec::new(),
+                });
+            }
         }
     }
 }

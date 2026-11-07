@@ -776,7 +776,7 @@ pub(super) const LINUX_AIO_MAX_NR: u64 = 65_536;
 pub(super) const LINUX_MAX_MAP_COUNT: usize = 65_530;
 // threads-max below is linux_process::PROCESS_LIMIT.
 const _: () = assert!(crate::linux_process::PROCESS_LIMIT == 4096);
-pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 48] = [
+pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 53] = [
     // The most memory areas a process may have (LINUX_MAX_MAP_COUNT).
     (0xa000, b"sys/vm/max_map_count", b"65530\n"),
     // Writing 1, 2 or 3 drops the volumes' page caches (linux_blockfs);
@@ -846,6 +846,14 @@ pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 48] = [
     (0xc300, b"sys/fs/inotify/max_queued_events", b"16384\n"),
     (0xc400, b"sys/fs/inotify/max_user_instances", b"128\n"),
     (0xc500, b"sys/fs/inotify/max_user_watches", b"65536\n"),
+    // fanotify's queue length and per-user limits (linux_fanotify): the
+    // user/ ones are each user namespace's, the fs/fanotify/ ones the
+    // domain's initial namespace's (cpu/fanotify.rs computes both).
+    (0x9300, b"sys/fs/fanotify/max_queued_events", b"16384\n"),
+    (0x9400, b"sys/fs/fanotify/max_user_groups", b"128\n"),
+    (0x9500, b"sys/fs/fanotify/max_user_marks", b"8192\n"),
+    (0x9600, b"sys/user/max_fanotify_groups", b"128\n"),
+    (0x9700, b"sys/user/max_fanotify_marks", b"8192\n"),
     (0xc600, b"sys/kernel/keys/root_maxkeys", b"1000000\n"),
     (0xc700, b"sys/kernel/keys/root_maxbytes", b"25000000\n"),
     // The key quotas of users other than root (linux_key_limits).
@@ -883,9 +891,10 @@ pub(super) const LINUX_FILE_PROC_MODULES: u16 = LINUX_FILE_MASK | LINUX_PROC_MOD
 /// node `LINUX_PROC_SYS_DIRECTORY_FIRST_NODE + (index << 8)`, a directory
 /// kind of the /proc/PID role, and inode `LINUX_PROC_SYS_DIRECTORY_INODES +
 /// index`.
-pub(super) const LINUX_PROC_SYS_DIRECTORIES: [&[u8]; 15] = [
+pub(super) const LINUX_PROC_SYS_DIRECTORIES: [&[u8]; 16] = [
     b"proc/sys",
     b"proc/sys/fs",
+    b"proc/sys/fs/fanotify",
     b"proc/sys/fs/inotify",
     b"proc/sys/fs/mqueue",
     b"proc/sys/kernel",
@@ -1336,7 +1345,7 @@ const _: () = {
     // The /proc/sys directory nodes stay below every other node.
     assert!(
         LINUX_PROC_SYS_DIRECTORY_FIRST_NODE as usize + (LINUX_PROC_SYS_DIRECTORIES.len() << 8)
-            <= 0x9800
+            <= 0x9300
     );
     // Every /proc/sys value's directory is listed.
     let mut value = 0;

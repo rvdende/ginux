@@ -102,10 +102,37 @@ const CHILD_EVENTS: u32 = FAN_ACCESS
 pub(crate) const EVENT_METADATA_SIZE: usize = 24;
 /// The default queue limit (/proc/sys/fs/fanotify/max_queued_events).
 pub(crate) const DEFAULT_QUEUE_LIMIT: usize = 16_384;
-/// The most groups a domain may have (max_user_groups).
-pub(crate) const GROUP_LIMIT: usize = 128;
-/// The most marks a domain may have (max_user_marks).
-pub(crate) const MARK_LIMIT: usize = 8_192;
+/// The most groups and marks a user may have in the domain's initial
+/// user namespace (/proc/sys/fs/fanotify/max_user_groups and
+/// max_user_marks, Linux's defaults); a namespace made in it has no limit
+/// of its own until /proc/sys/user/max_fanotify_* sets one.
+pub(crate) const DEFAULT_GROUP_LIMIT: u32 = 128;
+pub(crate) const DEFAULT_MARK_LIMIT: u32 = 8_192;
+
+/// The per-user limits fanotify keeps.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Limit {
+    Groups,
+    Marks,
+}
+
+/// Who a group and its marks count against, as Linux's ucounts charge
+/// them: the user (its kernel uid) in its user namespace and in each
+/// namespace that one was made in, innermost first; the last is the
+/// domain's initial one.
+#[derive(Clone, Debug)]
+pub(crate) struct Owner {
+    pub(crate) uid: u32,
+    pub(crate) namespaces: Vec<u64>,
+}
+
+/// The limits a user namespace set (None: its default).
+struct NamespaceLimits {
+    domain: usize,
+    namespace: u64,
+    groups: Option<u32>,
+    marks: Option<u32>,
+}
 /// How many queued events a new one may merge with (Linux's limit).
 const MERGE_DEPTH: usize = 128;
 
@@ -179,6 +206,9 @@ pub(crate) struct Change {
 struct Mark {
     kind: MarkKind,
     path: Vec<u8>,
+    /// An inode mark's object's file handle when it was marked: the mark
+    /// stays on that object, as Linux's marks are on inodes.
+    handle: Option<[u8; 8]>,
     mask: u32,
     ignore: u32,
     ignore_flags: bool,
@@ -199,7 +229,30 @@ enum Place {
     Filesystem,
 }
 
+/// Whether the object at `path` with `handle` is the one marked at
+/// `marked` with `marked_handle`: the same handle, or else the same path,
+/// unless both are overlay nodes that differ (another file now at the
+/// path: one recreated there, or an overlay mounted over the marked one).
+fn same_object(
+    marked: &[u8],
+    marked_handle: Option<[u8; 8]>,
+    path: &[u8],
+    handle: Option<[u8; 8]>,
+) -> bool {
+    let overlay = |handle: [u8; 8]| u64::from_ne_bytes(handle) >> 32 == 1;
+    match (marked_handle, handle) {
+        (Some(first), Some(second)) if first == second => true,
+        (Some(first), Some(second)) if overlay(first) && overlay(second) => false,
+        _ => marked == path,
+    }
+}
+
 impl Mark {
+    /// Whether this inode mark is on the object at `path` with `handle`.
+    fn on(&self, path: &[u8], handle: Option<[u8; 8]>) -> bool {
+        self.kind == MarkKind::Inode && same_object(&self.path, self.handle, path, handle)
+    }
+
     /// Whether `mask` (a mark's mask or ignore mask with its flags) speaks
     /// for an object that is a directory or not, from `place`.
     fn applicable(mask: u32, directory: bool, place: Place) -> bool {
@@ -428,6 +481,8 @@ struct Group {
     /// The process that made it: a child closing an inherited descriptor
     /// leaves the group to it, as with inotify instances.
     creator: u32,
+    /// Who it and its marks count against.
+    owner: Owner,
     /// fanotify_init's flags, with UNPRIVILEGED.
     flags: u32,
     /// fanotify_init's event_f_flags: how event descriptors are opened.
@@ -510,15 +565,15 @@ impl Group {
             let mut places = [None; 2];
             match mark.kind {
                 MarkKind::Inode => {
-                    if mark.path == slots.own {
+                    if mark.on(slots.own, slots.own_handle) {
                         places[0] = Some(Place::Own);
                     }
-                    if let Some((path, place)) = slots.second {
+                    if let Some((path, handle, place)) = slots.second {
                         // A directory that does not watch its children is
                         // no parent to the event.
                         let watches = place != Place::Parent
                             || (mark.mask | mark.ignore) & FAN_EVENT_ON_CHILD != 0;
-                        if mark.path == path && watches {
+                        if mark.on(path, handle) && watches {
                             places[1] = Some(place);
                         }
                     }
@@ -539,10 +594,14 @@ impl Group {
     }
 }
 
+/// A file handle as name_to_handle_at encodes it.
+type Handle = [u8; 8];
+
 /// The objects whose marks an event reaches (Linux's iteration types).
 struct Slots<'a> {
     own: &'a [u8],
-    second: Option<(&'a [u8], Place)>,
+    own_handle: Option<[u8; 8]>,
+    second: Option<(&'a [u8], Option<Handle>, Place)>,
     mount: Option<u32>,
     fsid: [u8; 8],
 }
@@ -562,8 +621,13 @@ struct Request {
 
 struct State {
     groups: Vec<Group>,
+    limits: Vec<NamespaceLimits>,
     requests: Vec<Request>,
     next_request: u64,
+    /// The steps of a several-event check a thread already passed (an
+    /// exec's FAN_OPEN_EXEC_PERM before its FAN_OPEN_PERM): domain,
+    /// thread, path and event.
+    passed: Vec<(usize, u32, Vec<u8>, u32)>,
 }
 
 impl State {
@@ -583,12 +647,12 @@ impl State {
 
     /// The union of the masks of every group's inode marks on `path`
     /// (Linux's i_fsnotify_mask).
-    fn inode_mask(&self, domain: usize, path: &[u8]) -> u32 {
+    fn inode_mask(&self, domain: usize, path: &[u8], handle: Option<[u8; 8]>) -> u32 {
         self.groups
             .iter()
             .filter(|group| group.domain == domain)
             .flat_map(|group| group.marks.iter())
-            .filter(|mark| mark.kind == MarkKind::Inode && mark.path == path)
+            .filter(|mark| mark.on(path, handle))
             .fold(0, |mask, mark| mask | mark.watching())
     }
 
@@ -603,12 +667,49 @@ impl State {
             .fold(0, |mask, mark| mask | mark.watching())
     }
 
-    fn marks(&self, domain: usize) -> usize {
-        self.groups
+    /// The limit user namespace `namespace` (the domain's initial one when
+    /// `initial`) sets on `limit`.
+    fn limit(&self, domain: usize, namespace: u64, initial: bool, limit: Limit) -> u32 {
+        let set = self
+            .limits
             .iter()
-            .filter(|group| group.domain == domain)
-            .map(|group| group.marks.len())
-            .sum()
+            .find(|limits| limits.domain == domain && limits.namespace == namespace)
+            .and_then(|limits| match limit {
+                Limit::Groups => limits.groups,
+                Limit::Marks => limits.marks,
+            });
+        set.unwrap_or(match (initial, limit) {
+            (true, Limit::Groups) => DEFAULT_GROUP_LIMIT,
+            (true, Limit::Marks) => DEFAULT_MARK_LIMIT,
+            (false, _) => i32::MAX as u32,
+        })
+    }
+
+    /// Whether `owner` may have one more of `limit`: in each of its user
+    /// namespaces, what the user has there stays below that namespace's
+    /// limit (EMFILE for groups, ENOSPC for marks past it).
+    fn below_limits(&self, domain: usize, owner: &Owner, limit: Limit) -> bool {
+        let last = owner.namespaces.len().saturating_sub(1);
+        owner
+            .namespaces
+            .iter()
+            .enumerate()
+            .all(|(level, namespace)| {
+                let charged: usize = self
+                    .groups
+                    .iter()
+                    .filter(|group| {
+                        group.domain == domain
+                            && group.owner.uid == owner.uid
+                            && group.owner.namespaces.contains(namespace)
+                    })
+                    .map(|group| match limit {
+                        Limit::Groups => 1,
+                        Limit::Marks => group.marks.len(),
+                    })
+                    .sum();
+                charged < self.limit(domain, *namespace, level == last, limit) as usize
+            })
     }
 }
 
@@ -616,8 +717,10 @@ static STATE: SpinLock<State> = SpinLock::new(
     LockRank::FANOTIFY,
     State {
         groups: Vec::new(),
+        limits: Vec::new(),
         requests: Vec::new(),
         next_request: 1,
+        passed: Vec::new(),
     },
 );
 /// Marks in all domains, so file operations skip the table when none.
@@ -682,6 +785,19 @@ pub(crate) fn mount_marks() -> bool {
     MOUNT_MARKS.load(Ordering::Relaxed) != 0
 }
 
+/// Whether some mark of `domain` could hear events `mask` (Linux's first
+/// test in fsnotify: the marks' masks, a modification for the ignore masks
+/// it clears): when none can, the kernel need not describe the event.
+pub(crate) fn may_hear(domain: usize, mask: u32) -> bool {
+    STATE
+        .lock()
+        .groups
+        .iter()
+        .filter(|group| group.domain == domain)
+        .flat_map(|group| group.marks.iter())
+        .any(|mark| mark.watching() & mask & ALL_EVENTS != 0)
+}
+
 /// Whether some group reports file identifiers: only such groups hear
 /// directory entry and inode events.
 pub(crate) fn identifier_groups() -> bool {
@@ -689,21 +805,18 @@ pub(crate) fn identifier_groups() -> bool {
 }
 
 /// A new group `id` of `domain` with fanotify_init's `flags` (with
-/// UNPRIVILEGED) and `event_flags`.
+/// UNPRIVILEGED) and `event_flags`, made by process `creator` of `owner`,
+/// queueing up to `queue_limit` events: TooMany past the owner's group
+/// limits.
 pub(crate) fn create(
     domain: usize,
     id: u64,
-    creator: u32,
+    (creator, owner): (u32, Owner),
     (flags, event_flags): (u32, u32),
+    queue_limit: usize,
 ) -> Result<(), Error> {
     let mut state = STATE.lock();
-    if state
-        .groups
-        .iter()
-        .filter(|group| group.domain == domain)
-        .count()
-        >= GROUP_LIMIT
-    {
+    if !state.below_limits(domain, &owner, Limit::Groups) {
         return Err(Error::TooMany);
     }
     state.groups.try_reserve(1).map_err(|_| Error::NoMemory)?;
@@ -711,6 +824,7 @@ pub(crate) fn create(
         domain,
         id,
         creator,
+        owner,
         flags,
         event_flags,
         marks: Vec::new(),
@@ -718,7 +832,7 @@ pub(crate) fn create(
         limit: if flags & FAN_UNLIMITED_QUEUE != 0 {
             usize::MAX
         } else {
-            DEFAULT_QUEUE_LIMIT
+            queue_limit
         },
         awaiting: Vec::new(),
     });
@@ -760,7 +874,47 @@ pub(crate) fn release(domain: usize, id: Option<u64>, closer: u32) {
     }
     if id.is_none() {
         state.requests.retain(|request| request.domain != domain);
+        state.limits.retain(|limits| limits.domain != domain);
     }
+}
+
+/// The limit on `limit` user namespace `namespace` of `domain` (its
+/// initial one when `initial`) has: /proc/sys/user/max_fanotify_*.
+pub(crate) fn user_limit(domain: usize, namespace: u64, initial: bool, limit: Limit) -> u32 {
+    STATE.lock().limit(domain, namespace, initial, limit)
+}
+
+/// Sets user namespace `namespace`'s limit on `limit`.
+pub(crate) fn set_user_limit(
+    domain: usize,
+    namespace: u64,
+    limit: Limit,
+    value: u32,
+) -> Result<(), Error> {
+    let mut state = STATE.lock();
+    let index = match state
+        .limits
+        .iter()
+        .position(|limits| limits.domain == domain && limits.namespace == namespace)
+    {
+        Some(index) => index,
+        None => {
+            state.limits.try_reserve(1).map_err(|_| Error::NoMemory)?;
+            state.limits.push(NamespaceLimits {
+                domain,
+                namespace,
+                groups: None,
+                marks: None,
+            });
+            state.limits.len() - 1
+        }
+    };
+    let limits = &mut state.limits[index];
+    match limit {
+        Limit::Groups => limits.groups = Some(value),
+        Limit::Marks => limits.marks = Some(value),
+    }
+    Ok(())
 }
 
 /// Process `pid` of `domain` ended: the groups it made go, their
@@ -812,18 +966,26 @@ pub(crate) fn mark(
     domain: usize,
     id: u64,
     command: Command,
-    kind: MarkKind,
-    path: &[u8],
+    (kind, path, handle): (MarkKind, &[u8], Option<[u8; 8]>),
     change: Change,
 ) -> Result<(), Error> {
     let mut state = STATE.lock();
-    let full = state.marks(domain) >= MARK_LIMIT;
-    let group = state.group(domain, id).ok_or(Error::Invalid)?;
-    let path: &[u8] = if kind == MarkKind::Inode { path } else { &[] };
-    let index = group
-        .marks
+    let full = state
+        .groups
         .iter()
-        .position(|mark| mark.kind == kind && mark.path == path);
+        .find(|group| group.domain == domain && group.id == id)
+        .is_some_and(|group| !state.below_limits(domain, &group.owner, Limit::Marks));
+    let group = state.group(domain, id).ok_or(Error::Invalid)?;
+    let (path, handle): (&[u8], _) = if kind == MarkKind::Inode {
+        (path, handle)
+    } else {
+        (&[], None)
+    };
+    let index = group.marks.iter().position(|mark| {
+        mark.kind == kind
+            && (kind != MarkKind::Inode || mark.on(path, handle))
+            && (kind == MarkKind::Inode || mark.path == path)
+    });
     match (command, index) {
         (Command::Add, Some(index)) => {
             let mark = &mut group.marks[index];
@@ -850,6 +1012,7 @@ pub(crate) fn mark(
             let mark = Mark {
                 kind,
                 path: copy(path)?,
+                handle,
                 mask,
                 ignore,
                 ignore_flags: change.ignore && change.ignore_flags,
@@ -980,7 +1143,7 @@ fn prepare<'a>(state: &State, domain: usize, notice: &Notice<'a>) -> Prepared<'a
     match notice.kind {
         Kind::File => {
             if let Some(parent) = notice.directory {
-                let parent_mask = state.inode_mask(domain, parent.path);
+                let parent_mask = state.inode_mask(domain, parent.path, parent.handle);
                 let watched = parent_mask & FAN_EVENT_ON_CHILD != 0;
                 // A mark asks for the directory and name with
                 // FAN_EVENT_ON_CHILD in its mask (Linux's
@@ -996,7 +1159,7 @@ fn prepare<'a>(state: &State, domain: usize, notice: &Notice<'a>) -> Prepared<'a
                     let mount = notice.mount.map_or(0, |id| {
                         needed_mask(state.kind_mask(domain, MarkKind::Mount(id)))
                     });
-                    let marks = needed_mask(state.inode_mask(domain, own))
+                    let marks = needed_mask(state.inode_mask(domain, own, notice.object.handle))
                         | needed_mask(
                             state.kind_mask(domain, MarkKind::Filesystem(notice.object.fsid)),
                         )
@@ -1009,7 +1172,7 @@ fn prepare<'a>(state: &State, domain: usize, notice: &Notice<'a>) -> Prepared<'a
                         name = Some(notice.name);
                         if interested {
                             mask |= FAN_EVENT_ON_CHILD;
-                            second = Some((parent.path, Place::Parent));
+                            second = Some((parent.path, parent.handle, Place::Parent));
                         }
                     }
                     directory = Some(parent);
@@ -1020,7 +1183,7 @@ fn prepare<'a>(state: &State, domain: usize, notice: &Notice<'a>) -> Prepared<'a
             directory = notice.directory;
             name = Some(notice.name);
             if let Some((moved, _)) = notice.moved.filter(|_| mask & FAN_RENAME != 0) {
-                second = Some((moved.path, Place::Second));
+                second = Some((moved.path, moved.handle, Place::Second));
             }
         }
         Kind::Inode => {}
@@ -1034,6 +1197,11 @@ fn prepare<'a>(state: &State, domain: usize, notice: &Notice<'a>) -> Prepared<'a
                 notice.directory.map_or(own, |directory| directory.path)
             } else {
                 own
+            },
+            own_handle: if notice.kind == Kind::Entry {
+                notice.directory.and_then(|directory| directory.handle)
+            } else {
+                notice.object.handle
             },
             second,
             mount: notice.mount,
@@ -1243,15 +1411,67 @@ pub(crate) enum Permission {
     Asked,
 }
 
-/// Whether the thread of `cause` may go on with permission event `mask`
-/// on `object`. The first time, the groups of `domain` that hear the event
-/// queue it and the thread waits; once they all answered, the thread's
-/// next check gets their verdict.
-pub(crate) fn permission(domain: usize, object: Object, mask: u32, cause: Cause) -> Permission {
+/// Permission events `masks` on `object`, one after the other (an exec
+/// opens its file with FAN_OPEN_EXEC_PERM and then FAN_OPEN_PERM): each
+/// waits for its answers before the next is asked, and the first denied
+/// decides.
+pub(crate) fn permission_steps(
+    domain: usize,
+    object: Object,
+    masks: &[u32],
+    cause: Cause,
+) -> Permission {
     if !permission_active() {
         return Permission::Allowed;
     }
     let mut state = STATE.lock();
+    for (step, mask) in masks.iter().enumerate() {
+        let done = state
+            .passed
+            .iter()
+            .any(|(passed_domain, tid, path, passed)| {
+                *passed_domain == domain
+                    && *tid == cause.tid
+                    && path == object.path
+                    && passed == mask
+            });
+        if done {
+            continue;
+        }
+        match permission_in(&mut state, domain, object, *mask, cause) {
+            Permission::Allowed if step + 1 < masks.len() => {
+                if let (Ok(path), Ok(())) = (copy(object.path), state.passed.try_reserve(1)) {
+                    state.passed.push((domain, cause.tid, path, *mask));
+                }
+            }
+            Permission::Allowed => {}
+            other => {
+                if other == Permission::Denied {
+                    state.passed.retain(|(passed_domain, tid, ..)| {
+                        *passed_domain != domain || *tid != cause.tid
+                    });
+                }
+                return other;
+            }
+        }
+    }
+    state
+        .passed
+        .retain(|(passed_domain, tid, ..)| *passed_domain != domain || *tid != cause.tid);
+    Permission::Allowed
+}
+
+/// Whether the thread of `cause` may go on with permission event `mask`
+/// on `object`. The first time, the groups of `domain` that hear the event
+/// queue it and the thread waits; once they all answered, the thread's
+/// next check gets their verdict.
+fn permission_in(
+    state: &mut State,
+    domain: usize,
+    object: Object,
+    mask: u32,
+    cause: Cause,
+) -> Permission {
     if let Some(index) = state
         .requests
         .iter()
