@@ -2810,6 +2810,9 @@ ginux_linux_system_init:
     call .Lrequire_zero
     cmp dword ptr [rip + .Lnuma_status], 0
     jne .Lfailure
+    # set_mempolicy_home_node on a range none of whose mappings has a
+    # policy of its own (the mbind above set MPOL_DEFAULT) is ENOENT, as
+    # in Linux.
     lea rdi, [rip + .Lstatus]
     and rdi, -4096
     mov esi, 4096
@@ -2817,7 +2820,8 @@ ginux_linux_system_init:
     xor r10d, r10d
     mov eax, 450
     syscall
-    call .Lrequire_zero
+    cmp rax, -2
+    jne .Lfailure
 
     lea rax, [rip + .Lsignal_handler]
     mov qword ptr [rip + .Lsignal_action], rax

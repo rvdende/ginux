@@ -10,9 +10,11 @@ set -eu
 fix_owner() { chown -R "$HOST_UID:$HOST_GID" /work /out 2>/dev/null || true; }
 trap fix_owner EXIT
 
+# numactl-dev: libnuma (with libnuma.a) for the NUMA tests (set_mempolicy,
+# mbind, move_pages, migrate_pages, ...), which configure finds.
 apk add --no-cache --quiet \
     build-base linux-headers autoconf automake bash perl pkgconf \
-    tar gzip xz findutils libaio-dev libcap-dev libcap-static shadow
+    tar gzip xz findutils libaio-dev libcap-dev libcap-static shadow numactl-dev
 
 # The guest-side runner that tests/qemu/ltp.sh starts in the domain.
 gcc -static-pie -fPIE -O2 -Wall -Wextra -Werror -o /out/ltp-runner.new /scripts/ltp-runner.c
@@ -42,7 +44,9 @@ case "${VARIANT:-}" in
         ;;
     *) echo "unknown variant $VARIANT" >&2; exit 2 ;;
 esac
-configure_args="--prefix=/opt/ltp CFLAGS=$cflags LDFLAGS=$ldflags"
+# The libraries configure finds are part of the stamp, so a tree configured
+# before libnuma was installed is configured again.
+configure_args="--prefix=/opt/ltp CFLAGS=$cflags LDFLAGS=$ldflags libs=numa"
 stamp="$src/.ginux-configured"
 
 if [ ! -f "$stamp" ] || [ "$(cat "$stamp")" != "$configure_args" ]; then

@@ -11,7 +11,9 @@
 
 use alloc::vec::Vec;
 
-pub(crate) use ginux_memory_areas::{Area, Areas, Backing, Protection, HUGE_PAGE_SIZE, PAGE_SIZE};
+pub(crate) use ginux_memory_areas::{
+    Area, Areas, Backing, Policy, Protection, HUGE_PAGE_SIZE, PAGE_SIZE,
+};
 
 use crate::sync::{LockRank, SpinLock};
 
@@ -351,6 +353,7 @@ pub(crate) fn remap(
             grows_down: area.grows_down,
             huge: area.huge,
             huge_reserved: area.huge_reserved,
+            policy: area.policy,
             backing,
         });
     });
@@ -391,6 +394,45 @@ pub(crate) fn huge_reserved_pages(instance: usize) -> u64 {
         .map(|process| process.areas.huge_reserved_bytes())
         .sum::<u64>()
         .div_ceil(ginux_memory_areas::HUGE_PAGE_SIZE)
+}
+
+/// Gives the areas of `pid` in `[start, end)` memory policy `policy`
+/// (mbind); ranges without an area are left alone.
+pub(crate) fn set_policy(instance: usize, pid: u32, start: u64, end: u64, policy: Policy) {
+    update(instance, pid, |areas| {
+        let _ = areas.set_policy(start, end, policy);
+    });
+}
+
+/// The parts of `pid`'s areas within `[start, end)`, with their memory
+/// policies, in address order.
+pub(crate) fn policies_in(
+    instance: usize,
+    pid: u32,
+    start: u64,
+    end: u64,
+) -> Vec<(u64, u64, Policy)> {
+    let processes = PROCESSES.lock();
+    let Some(process) = processes
+        .iter()
+        .find(|process| process.instance == instance && process.pid == pid)
+    else {
+        return Vec::new();
+    };
+    let overlapping = || {
+        process
+            .areas
+            .iter()
+            .skip_while(|area| area.end <= start)
+            .take_while(|area| area.start < end)
+            .map(|area| (area.start.max(start), area.end.min(end), area.policy))
+    };
+    let mut pieces = Vec::new();
+    if pieces.try_reserve_exact(overlapping().count()).is_err() {
+        return Vec::new();
+    }
+    pieces.extend(overlapping());
+    pieces
 }
 
 /// Gives a forked `child` a copy of its parent's areas.

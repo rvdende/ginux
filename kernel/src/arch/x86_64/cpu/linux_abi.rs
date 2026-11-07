@@ -771,6 +771,53 @@ pub(super) const LINUX_FILE_PROC_TASK_COMM: u16 = LINUX_FILE_MASK | LINUX_PROC_T
 /// own state (its descriptor keeps the thread id).
 pub(super) const LINUX_PROC_TASK_STAT_NODE: u16 = 0xb800;
 pub(super) const LINUX_FILE_PROC_TASK_STAT: u16 = LINUX_FILE_MASK | LINUX_PROC_TASK_STAT_NODE;
+/// `/proc/sys` values are numbered from their place in
+/// `LINUX_PROC_SYSCTLS`, in a node range of their own below the /proc/sys
+/// directories' (`LINUX_PROC_SYSCTL_FIRST_NODE` up to
+/// `LINUX_PROC_SYS_DIRECTORY_FIRST_NODE`): the table grows to 111 values
+/// without taking another /proc file's node or picking numbers by hand.
+pub(super) const LINUX_PROC_SYSCTL_FIRST_NODE: u16 = 0x0100;
+
+/// `values` (path under `/proc`, contents) with the nodes their places give.
+const fn linux_numbered_sysctls<const N: usize>(
+    values: [(&'static [u8], &'static [u8]); N],
+) -> [(u16, &'static [u8], &'static [u8]); N] {
+    assert!(
+        LINUX_PROC_SYSCTL_FIRST_NODE as usize + (N << 8)
+            <= LINUX_PROC_SYS_DIRECTORY_FIRST_NODE as usize
+    );
+    let mut numbered: [(u16, &'static [u8], &'static [u8]); N] = [(0, &[], &[]); N];
+    let mut index = 0;
+    while index < N {
+        numbered[index] = (
+            LINUX_PROC_SYSCTL_FIRST_NODE + ((index as u16) << 8),
+            values[index].0,
+            values[index].1,
+        );
+        index += 1;
+    }
+    numbered
+}
+
+/// The node of the `/proc/sys` value at `path` (under `/proc`).
+const fn linux_proc_sysctl_node_named(path: &[u8]) -> u16 {
+    let mut index = 0;
+    while index < LINUX_PROC_SYSCTLS.len() {
+        let (node, name, _) = LINUX_PROC_SYSCTLS[index];
+        if name.len() == path.len() {
+            let mut byte = 0;
+            while byte < path.len() && name[byte] == path[byte] {
+                byte += 1;
+            }
+            if byte == path.len() {
+                return node;
+            }
+        }
+        index += 1;
+    }
+    panic!("no such /proc/sys value")
+}
+
 /// `/proc/sys` values: node, path under `/proc`, contents. Values match
 /// what Ginux implements (four user namespaces); root may write them, and
 /// the kernel acts on those it reads back (`linux_proc_sysctl_value`).
@@ -780,98 +827,107 @@ pub(super) const LINUX_AIO_MAX_NR: u64 = 65_536;
 pub(super) const LINUX_MAX_MAP_COUNT: usize = 65_530;
 // threads-max below is linux_process::PROCESS_LIMIT.
 const _: () = assert!(crate::linux_process::PROCESS_LIMIT == 4096);
-pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 53] = [
+pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 57] = linux_numbered_sysctls([
     // The most memory areas a process may have (LINUX_MAX_MAP_COUNT).
-    (0xa000, b"sys/vm/max_map_count", b"65530\n"),
+    (b"sys/vm/max_map_count", b"65530\n"),
     // Writing 1, 2 or 3 drops the volumes' page caches (linux_blockfs);
     // it reads as the last value written.
-    (0x9800, b"sys/vm/drop_caches", b"0\n"),
+    (b"sys/vm/drop_caches", b"0\n"),
+    // The huge page pool (`linux_hugetlb`): its persistent pages, which a
+    // write sets as far as free memory goes, the surplus pages it may lend
+    // beyond them, and the group whose members may make SHM_HUGETLB
+    // segments.
+    (b"sys/vm/nr_hugepages", b"0\n"),
+    (b"sys/vm/nr_overcommit_hugepages", b"0\n"),
+    (b"sys/vm/hugetlb_shm_group", b"0\n"),
+    // How hard the kernel reclaims the dentry and inode caches; Ginux keeps
+    // the value (tests save and restore it).
+    (b"sys/vm/vfs_cache_pressure", b"100\n"),
     // The random pool is always full, as Linux reports it since 5.18.
-    (0xac00, b"sys/kernel/random/entropy_avail", b"256\n"),
-    (0xad00, b"sys/kernel/random/poolsize", b"256\n"),
+    (b"sys/kernel/random/entropy_avail", b"256\n"),
+    (b"sys/kernel/random/poolsize", b"256\n"),
     // Core files are "core" in the dumping process's directory.
-    (0xaa00, b"sys/kernel/core_pattern", b"core\n"),
-    (0xab00, b"sys/kernel/core_uses_pid", b"0\n"),
+    (b"sys/kernel/core_pattern", b"core\n"),
+    (b"sys/kernel/core_uses_pid", b"0\n"),
     // Console log levels (syslog's CONSOLE_LEVEL; syslog11 saves them).
-    (0xa600, b"sys/kernel/printk", b"7\t4\t1\t7\n"),
+    (b"sys/kernel/printk", b"7\t4\t1\t7\n"),
     // System V IPC limits, Linux's defaults; tests read them to size runs.
-    (0xb000, b"sys/kernel/shmmni", b"4096\n"),
-    (0xb100, b"sys/kernel/shmmax", b"18446744073692774399\n"),
-    (0xb200, b"sys/kernel/shmall", b"18446744073692774399\n"),
-    (0xb300, b"sys/kernel/msgmax", b"8192\n"),
-    (0xb400, b"sys/kernel/msgmnb", b"16384\n"),
+    (b"sys/kernel/shmmni", b"4096\n"),
+    (b"sys/kernel/shmmax", b"18446744073692774399\n"),
+    (b"sys/kernel/shmall", b"18446744073692774399\n"),
+    (b"sys/kernel/msgmax", b"8192\n"),
+    (b"sys/kernel/msgmnb", b"16384\n"),
     (
-        0xb500,
         b"sys/kernel/sem",
         // SEMMSL, SEMMNS, SEMOPM, SEMMNI: sets are a frame each here, so
         // the count is bounded at 1024 (linux_sysv_ipc::SEMAPHORE_SET_LIMIT).
         b"32000\t1024000000\t500\t1024\n",
     ),
     // uname's fields, as /proc/sys/kernel shows them (linux_time::linux_uname).
-    (0xc800, b"sys/kernel/ostype", b"Linux\n"),
-    (0xc900, b"sys/kernel/version", b"#1\n"),
-    (0xca00, b"sys/kernel/domainname", b"localdomain\n"),
+    (b"sys/kernel/ostype", b"Linux\n"),
+    (b"sys/kernel/version", b"#1\n"),
+    (b"sys/kernel/domainname", b"localdomain\n"),
     // The id the next created queue or segment gets once written (-1: the
     // next free one); the kernel resets it to -1 when it uses it.
-    (0xcb00, b"sys/kernel/msg_next_id", b"-1\n"),
-    (0xcc00, b"sys/kernel/shm_next_id", b"-1\n"),
-    (0xd700, b"sys/kernel/pid_max", b"4194304\n"),
+    (b"sys/kernel/msg_next_id", b"-1\n"),
+    (b"sys/kernel/shm_next_id", b"-1\n"),
+    (b"sys/kernel/pid_max", b"4194304\n"),
     // Who may make io_uring rings: 0 everyone, 1 CAP_SYS_ADMIN, 2 nobody.
-    (0xb900, b"sys/kernel/io_uring_disabled", b"0\n"),
-    (0xd600, b"sys/kernel/tainted", b"0\n"),
-    (0xd500, b"sys/user/max_user_namespaces", b"3\n"),
-    (0xd400, b"sys/fs/pipe-max-size", b"1048576\n"),
-    (0xd200, b"sys/fs/aio-max-nr", b"65536\n"),
+    (b"sys/kernel/io_uring_disabled", b"0\n"),
+    (b"sys/kernel/tainted", b"0\n"),
+    (b"sys/user/max_user_namespaces", b"3\n"),
+    (b"sys/fs/pipe-max-size", b"1048576\n"),
+    (b"sys/fs/aio-max-nr", b"65536\n"),
     // The most descriptors a process may have (LINUX_NR_OPEN); unsharing a
     // descriptor table holding one above it fails (unshare03).
-    (LINUX_PROC_NR_OPEN_NODE, b"sys/fs/nr_open", b"1048576\n"),
+    (b"sys/fs/nr_open", b"1048576\n"),
     // IPv4 interface tags (devconf "tag"), which each network namespace
     // has its own of (clone09): every interface's, new ones', the loopback's.
-    (0xbd00, b"sys/net/ipv4/conf/all/tag", b"0\n"),
-    (0xbe00, b"sys/net/ipv4/conf/default/tag", b"0\n"),
-    (0xbf00, b"sys/net/ipv4/conf/lo/tag", b"0\n"),
-    (0xd000, b"sys/fs/pipe-user-pages-soft", b"16384\n"),
+    (b"sys/net/ipv4/conf/all/tag", b"0\n"),
+    (b"sys/net/ipv4/conf/default/tag", b"0\n"),
+    (b"sys/net/ipv4/conf/lo/tag", b"0\n"),
+    (b"sys/fs/pipe-user-pages-soft", b"16384\n"),
     // Seconds a lease holder has to give up its lease (fcntl33 saves it).
-    (0xa500, b"sys/fs/lease-break-time", b"45\n"),
+    (b"sys/fs/lease-break-time", b"45\n"),
     // POSIX message queue limits (mq_open): the queues a domain may hold,
     // the largest attributes an unprivileged process may ask for, and what
     // a queue gets without attributes.
-    (0xa200, b"sys/fs/mqueue/queues_max", b"256\n"),
-    (0xa300, b"sys/fs/mqueue/msg_max", b"10\n"),
-    (0xa400, b"sys/fs/mqueue/msgsize_max", b"8192\n"),
-    (0xa100, b"sys/fs/mqueue/msg_default", b"10\n"),
-    (0xa800, b"sys/fs/mqueue/msgsize_default", b"8192\n"),
-    // Values tests read to size themselves (nodes below the input range).
-    (0xc000, b"sys/kernel/osrelease", b"6.12.0-ginux.0.1\n"),
-    (0xc100, b"sys/kernel/msgmni", b"32000\n"),
+    (b"sys/fs/mqueue/queues_max", b"256\n"),
+    (b"sys/fs/mqueue/msg_max", b"10\n"),
+    (b"sys/fs/mqueue/msgsize_max", b"8192\n"),
+    (b"sys/fs/mqueue/msg_default", b"10\n"),
+    (b"sys/fs/mqueue/msgsize_default", b"8192\n"),
+    // Values tests read to size themselves.
+    (b"sys/kernel/osrelease", b"6.12.0-ginux.0.1\n"),
+    (b"sys/kernel/msgmni", b"32000\n"),
     // As many tasks as a domain may have processes (linux_process::
     // PROCESS_LIMIT): what tests size their forks by.
-    (0xc200, b"sys/kernel/threads-max", b"4096\n"),
-    (0xc300, b"sys/fs/inotify/max_queued_events", b"16384\n"),
-    (0xc400, b"sys/fs/inotify/max_user_instances", b"128\n"),
-    (0xc500, b"sys/fs/inotify/max_user_watches", b"65536\n"),
+    (b"sys/kernel/threads-max", b"4096\n"),
+    (b"sys/fs/inotify/max_queued_events", b"16384\n"),
+    (b"sys/fs/inotify/max_user_instances", b"128\n"),
+    (b"sys/fs/inotify/max_user_watches", b"65536\n"),
     // fanotify's queue length and per-user limits (linux_fanotify): the
     // user/ ones are each user namespace's, the fs/fanotify/ ones the
     // domain's initial namespace's (cpu/fanotify.rs computes both).
-    (0x9300, b"sys/fs/fanotify/max_queued_events", b"16384\n"),
-    (0x9400, b"sys/fs/fanotify/max_user_groups", b"128\n"),
-    (0x9500, b"sys/fs/fanotify/max_user_marks", b"8192\n"),
-    (0x9600, b"sys/user/max_fanotify_groups", b"128\n"),
-    (0x9700, b"sys/user/max_fanotify_marks", b"8192\n"),
-    (0xc600, b"sys/kernel/keys/root_maxkeys", b"1000000\n"),
-    (0xc700, b"sys/kernel/keys/root_maxbytes", b"25000000\n"),
+    (b"sys/fs/fanotify/max_queued_events", b"16384\n"),
+    (b"sys/fs/fanotify/max_user_groups", b"128\n"),
+    (b"sys/fs/fanotify/max_user_marks", b"8192\n"),
+    (b"sys/user/max_fanotify_groups", b"128\n"),
+    (b"sys/user/max_fanotify_marks", b"8192\n"),
+    (b"sys/kernel/keys/root_maxkeys", b"1000000\n"),
+    (b"sys/kernel/keys/root_maxbytes", b"25000000\n"),
     // The key quotas of users other than root (linux_key_limits).
-    (0x9a00, b"sys/kernel/keys/maxkeys", b"200\n"),
-    (0x9b00, b"sys/kernel/keys/maxbytes", b"20000\n"),
+    (b"sys/kernel/keys/maxkeys", b"200\n"),
+    (b"sys/kernel/keys/maxbytes", b"20000\n"),
     // Seconds a revoked or expired key stays linked before the garbage
     // collector drops it (linux_with_keys).
-    (0x9900, b"sys/kernel/keys/gc_delay", b"300\n"),
+    (b"sys/kernel/keys/gc_delay", b"300\n"),
     // Link restrictions in sticky, world-writable directories (off, as
     // Linux boots; distributions turn them on): linux_check_hardlink_source
     // and linux_check_follow_link.
-    (0x9c00, b"sys/fs/protected_hardlinks", b"0\n"),
-    (0x9d00, b"sys/fs/protected_symlinks", b"0\n"),
-];
+    (b"sys/fs/protected_hardlinks", b"0\n"),
+    (b"sys/fs/protected_symlinks", b"0\n"),
+]);
 pub(super) const LINUX_PROC_CPUINFO_NODE: u16 = 0xf800;
 pub(super) const LINUX_FILE_PROC_CPUINFO: u16 = LINUX_FILE_MASK | LINUX_PROC_CPUINFO_NODE;
 pub(super) const LINUX_PROC_MEMINFO_NODE: u16 = 0xf700;
@@ -1016,7 +1072,7 @@ pub(super) const LINUX_FILE_PROC_PROCESS_ENVIRON: u16 =
     LINUX_FILE_MASK | LINUX_PROC_PROCESS_ENVIRON_NODE;
 pub(super) const LINUX_PROC_FILE_MAX_NODE: u16 = 0xe800;
 pub(super) const LINUX_FILE_PROC_FILE_MAX: u16 = LINUX_FILE_MASK | LINUX_PROC_FILE_MAX_NODE;
-pub(super) const LINUX_PROC_NR_OPEN_NODE: u16 = 0xe700;
+pub(super) const LINUX_PROC_NR_OPEN_NODE: u16 = linux_proc_sysctl_node_named(b"sys/fs/nr_open");
 pub(super) const LINUX_FILE_PROC_NR_OPEN: u16 = LINUX_FILE_MASK | LINUX_PROC_NR_OPEN_NODE;
 pub(super) const LINUX_PROC_OOM_SCORE_ADJ_NODE: u16 = 0xe600;
 /// `/proc/PID/timens_offsets`: the offsets of the time namespace PID's
@@ -1346,10 +1402,15 @@ const _: () = {
         }
     }
     let input_end = LINUX_INPUT_NODE_FIRST + ((crate::linux_input::DEVICE_LIMIT as u16) << 8);
-    // The /proc/sys directory nodes stay below every other node.
+    // The /proc/sys values' nodes come first, then the directories', then
+    // every other node (from 0x9800).
+    assert!(
+        LINUX_PROC_SYSCTL_FIRST_NODE as usize + (LINUX_PROC_SYSCTLS.len() << 8)
+            <= LINUX_PROC_SYS_DIRECTORY_FIRST_NODE as usize
+    );
     assert!(
         LINUX_PROC_SYS_DIRECTORY_FIRST_NODE as usize + (LINUX_PROC_SYS_DIRECTORIES.len() << 8)
-            <= 0x9300
+            <= 0x9800
     );
     // Every /proc/sys value's directory is listed.
     let mut value = 0;

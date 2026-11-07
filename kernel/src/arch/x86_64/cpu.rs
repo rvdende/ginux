@@ -20,6 +20,7 @@ mod linux_cgroupfs;
 mod linux_fsmount;
 mod linux_futex;
 mod linux_hugetlb;
+mod linux_numa;
 mod linux_poll;
 mod linux_pty;
 mod linux_quota;
@@ -53,6 +54,7 @@ pub(crate) use linux_cgroupfs::{charge_linux_user_pages, reclaim_linux_user_page
 use linux_fsmount::*;
 use linux_futex::*;
 use linux_hugetlb::*;
+use linux_numa::*;
 use linux_poll::*;
 use linux_pty::*;
 use linux_quota::*;
@@ -13924,6 +13926,7 @@ pub(crate) fn linux_runtime_diagnostics() -> (Option<u8>, Option<u64>) {
 fn prepare_configured_linux_system_domain() -> bool {
     linux_prepare_securityfs();
     linux_prepare_hugetlbfs();
+    linux_prepare_numa_sysfs();
     if !prepare_linux_package_platform() {
         return false;
     }
@@ -23583,6 +23586,7 @@ fn verify_linux_sysv_shared_memory_syscalls() -> bool {
     let userfaultfd = verify_linux_userfaultfd_syscall();
     let fanotify = verify_linux_fanotify_syscalls();
     let landlock = verify_linux_landlock_syscalls();
+    let numa = verify_linux_numa_syscalls();
     let io_uring = verify_linux_io_uring_syscalls();
     let scheduler_priorities = verify_linux_scheduler_priority_ranges();
     let process_priorities = verify_linux_process_priorities();
@@ -23666,6 +23670,7 @@ fn verify_linux_sysv_shared_memory_syscalls() -> bool {
         address_space_limit,
         fadvise,
         runtime_boot_contracts,
+        numa,
         mappings_released,
     ]
     .into_iter()
@@ -23706,6 +23711,7 @@ fn verify_linux_sysv_shared_memory_syscalls() -> bool {
         && userfaultfd
         && fanotify
         && landlock
+        && numa
         && io_uring
         && scheduler_priorities
         && process_priorities
@@ -28647,6 +28653,7 @@ fn linux_record_exec_image(
                 grows_down: false,
                 huge: false,
                 huge_reserved: false,
+                policy: crate::linux_areas::Policy::DEFAULT,
                 backing: Backing::File {
                     device: 0,
                     inode: 0,
@@ -28676,6 +28683,7 @@ fn linux_record_exec_image(
                 grows_down: false,
                 huge: false,
                 huge_reserved: false,
+                policy: crate::linux_areas::Policy::DEFAULT,
                 backing: Backing::Stack,
             },
         );
@@ -28706,6 +28714,7 @@ fn linux_record_heap(program_break: u64) {
                 grows_down: false,
                 huge: false,
                 huge_reserved: false,
+                policy: crate::linux_areas::Policy::DEFAULT,
                 backing: Backing::Heap,
             },
         );
@@ -28786,6 +28795,7 @@ fn linux_record_mapping(
             grows_down: flags & LINUX_MAP_GROWSDOWN != 0,
             huge: false,
             huge_reserved: false,
+            policy: crate::linux_areas::Policy::DEFAULT,
             backing,
         },
     );
@@ -29548,192 +29558,6 @@ fn linux_process_vm_vectors(
         }
     }
     Ok(ranges)
-}
-
-fn linux_node_zero_mask(address: u64, maximum_node: u64) -> Result<bool, u64> {
-    if address == 0 {
-        return Ok(false);
-    }
-    let byte_count = maximum_node.checked_add(7).ok_or(LINUX_EINVAL)? / 8;
-    if byte_count == 0 || byte_count > PAGE_SIZE as u64 {
-        return Err(LINUX_EINVAL);
-    }
-    let mut offset = 0_u64;
-    let mut chunk = [0_u8; 64];
-    let mut node_zero = false;
-    while offset < byte_count {
-        let length = usize::try_from((byte_count - offset).min(chunk.len() as u64)).unwrap();
-        let source = address.checked_add(offset).ok_or(LINUX_EFAULT)?;
-        if !copy_from_linux_user(source, &mut chunk[..length]) {
-            return Err(LINUX_EFAULT);
-        }
-        for (index, byte) in chunk[..length].iter().copied().enumerate() {
-            if offset == 0 && index == 0 {
-                node_zero = byte & 1 != 0;
-                if byte & !1 != 0 {
-                    return Ok(false);
-                }
-            } else if byte != 0 {
-                return Ok(false);
-            }
-        }
-        offset += length as u64;
-    }
-    Ok(node_zero)
-}
-
-fn linux_set_mempolicy(mode: u64, nodes: u64, maximum_node: u64) -> u64 {
-    if mode != 0 || nodes != 0 {
-        return LINUX_EINVAL;
-    }
-    let _ = maximum_node;
-    0
-}
-
-fn linux_get_mempolicy(
-    mode_address: u64,
-    nodes: u64,
-    maximum_node: u64,
-    address: u64,
-    flags: u64,
-) -> u64 {
-    const MPOL_F_MEMS_ALLOWED: u64 = 4;
-    if !matches!(flags, 0 | MPOL_F_MEMS_ALLOWED) || flags == MPOL_F_MEMS_ALLOWED && address != 0 {
-        return LINUX_EINVAL;
-    }
-    if mode_address != 0 && !copy_to_linux_user(mode_address, &0_i32.to_ne_bytes()) {
-        return LINUX_EFAULT;
-    }
-    if nodes == 0 {
-        return 0;
-    }
-    let byte_count = match maximum_node.checked_add(7) {
-        Some(bits) if maximum_node != 0 && bits / 8 <= PAGE_SIZE as u64 => bits / 8,
-        _ => return LINUX_EINVAL,
-    };
-    let mut offset = 0_u64;
-    let mut zeros = [0_u8; 64];
-    if flags == MPOL_F_MEMS_ALLOWED {
-        zeros[0] = 1;
-    }
-    while offset < byte_count {
-        let length = usize::try_from((byte_count - offset).min(zeros.len() as u64)).unwrap();
-        let Some(target) = nodes.checked_add(offset) else {
-            return LINUX_EFAULT;
-        };
-        if !copy_to_linux_user(target, &zeros[..length]) {
-            return LINUX_EFAULT;
-        }
-        zeros[0] = 0;
-        offset += length as u64;
-    }
-    0
-}
-
-fn linux_mbind(
-    address: u64,
-    length: u64,
-    mode: u64,
-    nodes: u64,
-    maximum_node: u64,
-    flags: u64,
-) -> u64 {
-    if mode != 0
-        || nodes != 0
-        || flags != 0
-        || length == 0
-        || !address.is_multiple_of(PAGE_SIZE as u64)
-    {
-        return LINUX_EINVAL;
-    }
-    let Ok(length) = usize::try_from(length) else {
-        return LINUX_ENOMEM;
-    };
-    let _ = maximum_node;
-    if address_space::current_linux_range_mapped(address, length, false) {
-        0
-    } else {
-        LINUX_ENOMEM
-    }
-}
-
-fn linux_migrate_pages(pid: u64, maximum_node: u64, old_nodes: u64, new_nodes: u64) -> u64 {
-    let pid = pid as i32;
-    if pid < 0 || pid != 0 && pid as u32 != current_linux_process_pid() {
-        return LINUX_ESRCH;
-    }
-    match (
-        linux_node_zero_mask(old_nodes, maximum_node),
-        linux_node_zero_mask(new_nodes, maximum_node),
-    ) {
-        (Ok(true), Ok(true)) => 0,
-        (Err(error), _) | (_, Err(error)) => error,
-        _ => LINUX_EINVAL,
-    }
-}
-
-fn linux_move_pages(pid: u64, count: u64, pages: u64, nodes: u64, status: u64, flags: u64) -> u64 {
-    let pid = pid as i32;
-    let flags = u64::from(flags as u32);
-    if pid < 0 || pid != 0 && pid as u32 != current_linux_process_pid() {
-        return LINUX_ESRCH;
-    }
-    if flags != 0 {
-        return LINUX_EINVAL;
-    }
-    let Ok(count) = usize::try_from(count) else {
-        return LINUX_EINVAL;
-    };
-    let Some(page_bytes) = count.checked_mul(size_of::<u64>()) else {
-        return LINUX_EINVAL;
-    };
-    let Some(status_bytes) = count.checked_mul(size_of::<i32>()) else {
-        return LINUX_EINVAL;
-    };
-    if count != 0
-        && (!linux_readable_user_range_contains(pages, page_bytes)
-            || !linux_writable_user_range_contains(status, status_bytes)
-            || nodes != 0 && !linux_readable_user_range_contains(nodes, status_bytes))
-    {
-        return LINUX_EFAULT;
-    }
-    for index in 0..count {
-        let mut page = [0_u8; 8];
-        if !copy_from_linux_user(pages + (index * 8) as u64, &mut page) {
-            return LINUX_EFAULT;
-        }
-        let page = u64::from_ne_bytes(page) & !(PAGE_SIZE as u64 - 1);
-        if !address_space::current_linux_range_mapped(page, PAGE_SIZE, false) {
-            return LINUX_EFAULT;
-        }
-        if nodes != 0 {
-            let mut node = [0_u8; 4];
-            if !copy_from_linux_user(nodes + (index * 4) as u64, &mut node) {
-                return LINUX_EFAULT;
-            }
-            if i32::from_ne_bytes(node) != 0 {
-                return LINUX_ENODEV;
-            }
-        }
-        if !copy_to_linux_user(status + (index * 4) as u64, &0_i32.to_ne_bytes()) {
-            return LINUX_EFAULT;
-        }
-    }
-    0
-}
-
-fn linux_set_mempolicy_home_node(address: u64, length: u64, home_node: u64, flags: u64) -> u64 {
-    if home_node != 0 || flags != 0 || length == 0 || !address.is_multiple_of(PAGE_SIZE as u64) {
-        return LINUX_EINVAL;
-    }
-    let Ok(length) = usize::try_from(length) else {
-        return LINUX_ENOMEM;
-    };
-    if address_space::current_linux_range_mapped(address, length, false) {
-        0
-    } else {
-        LINUX_ENOMEM
-    }
 }
 
 fn linux_kcmp(first_pid: u64, second_pid: u64, kind: u64, first: u64, second: u64) -> u64 {
@@ -32225,6 +32049,10 @@ fn linux_proc_sysctl_write_bytes(device: u16, index: usize, text: &[u8]) -> Resu
         b"sys/kernel/io_uring_disabled" => Some(0..=2),
         b"sys/fs/protected_hardlinks" | b"sys/fs/protected_symlinks" => Some(0..=1),
         b"sys/vm/drop_caches" => Some(1..=4),
+        b"sys/vm/nr_hugepages"
+        | b"sys/vm/nr_overcommit_hugepages"
+        | b"sys/vm/vfs_cache_pressure" => Some(0..=i64::from(i32::MAX)),
+        b"sys/vm/hugetlb_shm_group" => Some(0..=i64::from(u32::MAX)),
         b"sys/kernel/keys/maxkeys"
         | b"sys/kernel/keys/maxbytes"
         | b"sys/kernel/keys/root_maxkeys"
@@ -32260,6 +32088,12 @@ fn linux_proc_sysctl_write_bytes(device: u16, index: usize, text: &[u8]) -> Resu
     if LINUX_PROC_SYSCTLS[index].1 == b"sys/vm/drop_caches" && value & 1 != 0 {
         crate::linux_blockfs::drop_caches();
     }
+    // The pool gets as many huge pages as memory allows, which reads back.
+    let value = if LINUX_PROC_SYSCTLS[index].1 == b"sys/vm/nr_hugepages" {
+        linux_huge_pool_size_for(value)
+    } else {
+        value
+    };
     LINUX_SYSCTL_OVERRIDES[slot][index].store(value, Ordering::Release);
     Ok(text.len())
 }
@@ -36144,12 +35978,14 @@ fn linux_canonical_path_at(
     if length == 0 {
         return Err(LINUX_EISDIR);
     }
-    let length = linux_hugepages_proc_alias(output, length);
     if output[..length].starts_with(b"sys/fs/cgroup/") {
         linux_cgroup_ensure_root();
     }
     if output[..length].starts_with(b"sys/kernel/mm") {
         linux_refresh_hugepages_sysfs();
+    }
+    if output[..length].starts_with(b"sys/devices/system/node") {
+        linux_refresh_numa_sysfs();
     }
     if output[..length].starts_with(b"dev/dri") || output[..length].starts_with(b"sys/dev") {
         crate::linux_drm::ensure_nodes();
@@ -44336,7 +44172,7 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
             linux_process::LiveProcessState::Stopped => b'T',
             linux_process::LiveProcessState::Zombie => b'Z',
         };
-        let mut file = [0_u8; 256];
+        let mut file = [0_u8; 512];
         let mut used = 0_usize;
         let mut name = [0_u8; 16];
         let generated = match state & !3 {
@@ -44371,6 +44207,14 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
                             / 1024,
                     )
                     && append_linux_bytes(&mut file, &mut used, b" kB\nVmSwap:\t0 kB\n")
+                    && append_linux_bytes(
+                        &mut file,
+                        &mut used,
+                        &linux_allowed_status(
+                            linux_process::live_process_cpu_affinity(pid)
+                                .map_or(0, |mask| mask & linux_available_cpu_mask()),
+                        ),
+                    )
             }
             LINUX_FILE_PROC_DYNAMIC_STAT => {
                 append_linux_decimal(&mut file, &mut used, u64::from(status.pid))

@@ -5,8 +5,8 @@
 //! segments. A huge mapping is 2 MiB aligned and a multiple of 2 MiB long,
 //! and is only split at a huge page boundary.
 //!
-//! The pool's size is what its sysfs files hold (`/proc/sys/vm/nr_hugepages`
-//! is the same file). The pool is an account: what a mapping reserves comes out of it when it
+//! The pool's size is vm.nr_hugepages (its sysfs file writes it too). The
+//! pool is an account: what a mapping reserves comes out of it when it
 //! is made (ENOMEM once it is used up, unless MAP_NORESERVE), and is
 //! backed by 512 ordinary pages each, mapped as small pages. What is in use
 //! is counted from the things that hold pages (`linux_huge_pages_in_use`),
@@ -45,37 +45,20 @@ fn linux_huge_size_supported(flags: u64) -> bool {
     )
 }
 
-/// The number one of the pool's sysfs files holds, 0 without one.
-fn linux_hugepages_sysfs_value(name: &[u8]) -> u64 {
-    let mut path = [0_u8; 96];
-    let Some(length) = linux_hugepages_sysfs_path(name, &mut path) else {
-        return 0;
-    };
-    let Some(metadata) = crate::linux_overlay::lookup(&path[..length]) else {
-        return 0;
-    };
-    let mut text = [0_u8; 24];
-    let read = crate::linux_overlay::read(metadata.handle, 0, &mut text).unwrap_or(0);
-    linux_parse_kernel_integer(text[..read].trim_ascii())
+/// The persistent huge pages of the pool (vm.nr_hugepages).
+fn linux_huge_pool_size() -> u64 {
+    linux_proc_sysctl_value(b"sys/vm/nr_hugepages")
         .and_then(|value| u64::try_from(value).ok())
         .unwrap_or(0)
 }
 
-/// The persistent huge pages of the pool (nr_hugepages): the number its
-/// sysfs file holds, which /proc/sys/vm/nr_hugepages also is.
-fn linux_huge_pool_size() -> u64 {
-    linux_hugepages_sysfs_value(b"nr_hugepages")
-}
-
 /// The surplus pages the pool may lend beyond its own
-/// (nr_overcommit_hugepages).
+/// (vm.nr_overcommit_hugepages).
 fn linux_huge_pool_overcommit() -> u64 {
-    linux_hugepages_sysfs_value(b"nr_overcommit_hugepages")
+    linux_proc_sysctl_value(b"sys/vm/nr_overcommit_hugepages")
+        .and_then(|value| u64::try_from(value).ok())
+        .unwrap_or(0)
 }
-
-/// The group whose members may make SHM_HUGETLB segments
-/// (vm.hugetlb_shm_group): root's, as Linux boots.
-const LINUX_HUGETLB_SHM_GROUP: u32 = 0;
 
 /// The huge pages in use in the current domain: those its processes'
 /// private huge mappings reserve, those files of huge pages hold for their
@@ -130,11 +113,11 @@ fn linux_huge_pages_available(pages: u64) -> bool {
 /// The pool size a write of `requested` to nr_hugepages gets: no more than
 /// free memory can back beyond the pages in use, as Linux's allocation of
 /// the pages may fall short.
-fn linux_huge_pool_size_for(requested: u64) -> u64 {
+pub(super) fn linux_huge_pool_size_for(requested: i64) -> i64 {
     let (_, free_frames) = linux_domain_frame_counts();
     let backed =
         free_frames / (LINUX_HUGE_PAGE_SIZE / PAGE_SIZE as u64) + linux_huge_pages_in_use();
-    requested.min(backed)
+    requested.min(i64::try_from(backed).unwrap_or(i64::MAX))
 }
 
 /// Whether overlay file `handle` is made of huge pages: an MFD_HUGETLB
@@ -319,7 +302,9 @@ pub(super) fn linux_shm_huge_allowed(size: u64, flags: u64) -> Result<(), u64> {
         .checked_next_multiple_of(LINUX_HUGE_PAGE_SIZE)
         .ok_or(LINUX_ENOMEM)?;
     let credentials = current_linux_credentials().ok_or(LINUX_EPERM)?;
-    let group = LINUX_HUGETLB_SHM_GROUP;
+    let group = linux_proc_sysctl_value(b"sys/vm/hugetlb_shm_group")
+        .and_then(|group| u32::try_from(group).ok())
+        .unwrap_or(0);
     let in_group = linux_process::with_live_process_groups(current_linux_process_pid(), |groups| {
         credentials.in_group(groups, group) || credentials.group.effective == group
     })
@@ -387,19 +372,20 @@ pub(super) fn linux_prepare_hugetlbfs() {
     linux_refresh_hugepages_sysfs();
 }
 
-/// Rewrites the pool's derived sysfs files (free, reserved, surplus pages,
-/// and nr_hugepages_mempolicy, which is nr_hugepages without NUMA) with
-/// what it holds now; a walk to a path under `/sys/kernel/mm` does this, so
-/// they read as current.
+/// Rewrites the pool's sysfs files with what it holds now (the
+/// /proc/sys/vm values and the counts); a walk to a path under
+/// `/sys/kernel/mm` does this, so they read as current.
 pub(super) fn linux_refresh_hugepages_sysfs() {
     let counts = linux_huge_page_counts();
     let mut path = [0_u8; 96];
-    for (name, value) in [
-        (&b"nr_hugepages_mempolicy"[..], counts.persistent),
-        (b"free_hugepages", counts.free),
-        (b"resv_hugepages", counts.reserved),
-        (b"surplus_hugepages", counts.surplus),
-    ] {
+    for (name, _) in LINUX_HUGEPAGES_SYSFS_FILES {
+        let value = match name {
+            b"free_hugepages" => counts.free,
+            b"resv_hugepages" => counts.reserved,
+            b"surplus_hugepages" => counts.surplus,
+            b"nr_overcommit_hugepages" => counts.overcommit,
+            _ => counts.persistent,
+        };
         let Some(length) = linux_hugepages_sysfs_path(name, &mut path) else {
             continue;
         };
@@ -421,27 +407,6 @@ fn linux_write_hugepages_value(handle: crate::linux_overlay::Handle, value: u64)
     }
 }
 
-/// `/proc/sys/vm/nr_hugepages` and `nr_overcommit_hugepages`, canonical in
-/// `output[..length]`, are the pool's sysfs files: the path becomes
-/// theirs. The new length.
-pub(super) fn linux_hugepages_proc_alias(
-    output: &mut [u8; crate::linux_overlay::PATH_CAPACITY],
-    length: usize,
-) -> usize {
-    let Some(name) = output[..length].strip_prefix(b"proc/sys/vm/") else {
-        return length;
-    };
-    if !matches!(name, b"nr_hugepages" | b"nr_overcommit_hugepages") {
-        return length;
-    }
-    let mut path = [0_u8; 96];
-    let Some(alias) = linux_hugepages_sysfs_path(name, &mut path) else {
-        return length;
-    };
-    output[..alias].copy_from_slice(&path[..alias]);
-    alias
-}
-
 /// After a write to overlay file `handle`: one of the pool's writable sysfs
 /// files sets the pool as the matching /proc/sys/vm value does, and the
 /// files then show what it got.
@@ -456,28 +421,22 @@ pub(super) fn linux_hugepages_sysfs_written(handle: crate::linux_overlay::Handle
     else {
         return;
     };
-    if !matches!(
-        name,
-        b"nr_hugepages" | b"nr_hugepages_mempolicy" | b"nr_overcommit_hugepages"
-    ) {
-        return;
-    }
+    let sysctl: &[u8] = match name {
+        b"nr_hugepages" | b"nr_hugepages_mempolicy" => b"sys/vm/nr_hugepages",
+        b"nr_overcommit_hugepages" => b"sys/vm/nr_overcommit_hugepages",
+        _ => return,
+    };
     let mut text = [0_u8; 24];
     let read = crate::linux_overlay::read(handle, 0, &mut text).unwrap_or(0);
-    let value = linux_parse_kernel_integer(text[..read].trim_ascii())
-        .and_then(|value| u64::try_from(value).ok())
-        .unwrap_or(0);
-    if name == b"nr_overcommit_hugepages" {
-        linux_write_hugepages_value(handle, value);
-    } else {
-        // The pool gets as many pages as memory can back, which reads back
-        // (tst_hugepage compares).
-        let mut path = [0_u8; 96];
-        if let Some(metadata) = linux_hugepages_sysfs_path(b"nr_hugepages", &mut path)
-            .and_then(|length| crate::linux_overlay::lookup(&path[..length]))
-        {
-            linux_write_hugepages_value(metadata.handle, linux_huge_pool_size_for(value));
-        }
+    if let Some(value) =
+        linux_parse_kernel_integer(text[..read].trim_ascii()).filter(|value| *value >= 0)
+    {
+        let value = if sysctl == b"sys/vm/nr_hugepages" {
+            linux_huge_pool_size_for(value)
+        } else {
+            value
+        };
+        linux_proc_sysctl_set(sysctl, value);
     }
     linux_refresh_hugepages_sysfs();
 }

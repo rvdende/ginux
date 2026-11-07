@@ -124,6 +124,38 @@ impl Backing {
     }
 }
 
+/// A memory policy (Linux's `struct mempolicy`): what mbind gives an area
+/// and set_mempolicy a process. `mode` and `flags` hold Linux's `MPOL_*`
+/// values (mode 0, MPOL_DEFAULT, is no policy of its own), `nodes` the
+/// nodes it allocates from and `user_nodes` the set the caller passed, which
+/// MPOL_F_STATIC_NODES and MPOL_F_RELATIVE_NODES report back: one bit per
+/// node, of the 64 a Linux built with NODES_SHIFT 6 has. `home_node` is
+/// set_mempolicy_home_node's node.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Policy {
+    pub mode: u8,
+    pub flags: u16,
+    pub nodes: u64,
+    pub user_nodes: u64,
+    pub home_node: Option<u8>,
+}
+
+impl Policy {
+    /// No policy of its own: the area follows its process's, the process
+    /// the system default (local allocation).
+    pub const DEFAULT: Self = Self {
+        mode: 0,
+        flags: 0,
+        nodes: 0,
+        user_nodes: 0,
+        home_node: None,
+    };
+
+    pub const fn is_default(&self) -> bool {
+        self.mode == 0
+    }
+}
+
 /// One mapped range: `[start, end)`, page-aligned and not empty.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Area {
@@ -148,6 +180,8 @@ pub struct Area {
     /// pool for it (Linux's HPAGE_RESV_OWNER): the mapper's, not the copy a
     /// forked child gets.
     pub huge_reserved: bool,
+    /// Its memory policy (mbind; Linux's `vm_policy`).
+    pub policy: Policy,
     pub backing: Backing,
 }
 
@@ -180,6 +214,7 @@ impl Area {
             grows_down: self.grows_down,
             huge: self.huge,
             huge_reserved: self.huge_reserved,
+            policy: self.policy,
             backing: self.backing.advanced(start - self.start),
         }
     }
@@ -194,6 +229,7 @@ impl Area {
             && self.grows_down == next.grows_down
             && self.huge == next.huge
             && self.huge_reserved == next.huge_reserved
+            && self.policy == next.policy
             && self.backing.continues_into(self.len(), &next.backing)
     }
 }
@@ -405,6 +441,25 @@ impl Areas {
         })
     }
 
+    /// Gives the mapped parts of `[start, end)` `policy` (mbind, which
+    /// leaves holes alone), splitting and merging areas around them.
+    pub fn set_policy(&mut self, start: u64, end: u64, policy: Policy) -> Result<(), Error> {
+        valid_range(start, end)?;
+        let pieces = || {
+            self.overlapping(start, end)
+                .map(|area| (area.start.max(start), area.end.min(end)))
+        };
+        let mut changed = Vec::new();
+        changed
+            .try_reserve_exact(pieces().count())
+            .map_err(|_| Error::NoMemory)?;
+        changed.extend(pieces());
+        for (piece_start, piece_end) in changed {
+            self.change(piece_start, piece_end, |area| area.policy = policy)?;
+        }
+        Ok(())
+    }
+
     /// The bytes of huge areas holding a huge page reservation.
     pub fn huge_reserved_bytes(&self) -> u64 {
         self.areas
@@ -554,6 +609,7 @@ mod tests {
             grows_down: false,
             huge: false,
             huge_reserved: false,
+            policy: Policy::DEFAULT,
             backing: Backing::Anonymous,
         }
     }
@@ -569,6 +625,7 @@ mod tests {
             grows_down: false,
             huge: false,
             huge_reserved: false,
+            policy: Policy::DEFAULT,
             backing: Backing::File {
                 device: 1,
                 inode: 7,
@@ -793,6 +850,37 @@ mod tests {
             })
             .unwrap();
         assert_eq!(ranges(&areas), [(0, 2, 3), (9, 12, 3)]);
+    }
+
+    #[test]
+    fn policies_split_areas_and_skip_holes() {
+        let mut areas = Areas::new();
+        areas.map(anonymous(0, 4, RW)).unwrap();
+        areas.map(anonymous(6, 8, RW)).unwrap();
+        let bind = Policy {
+            mode: 2,
+            nodes: 1,
+            ..Policy::DEFAULT
+        };
+        areas.set_policy(PAGE_SIZE, 7 * PAGE_SIZE, bind).unwrap();
+        let policies: vec::Vec<(u64, u64, u8)> = areas
+            .iter()
+            .map(|area| {
+                (
+                    area.start / PAGE_SIZE,
+                    area.end / PAGE_SIZE,
+                    area.policy.mode,
+                )
+            })
+            .collect();
+        assert_eq!(policies, [(0, 1, 0), (1, 4, 2), (6, 7, 2), (7, 8, 0)]);
+        // A fork keeps them; back to the default, the pieces merge again.
+        assert_eq!(
+            areas.forked().unwrap().find(PAGE_SIZE).unwrap().policy,
+            bind
+        );
+        areas.set_policy(0, 8 * PAGE_SIZE, Policy::DEFAULT).unwrap();
+        assert_eq!(ranges(&areas), [(0, 4, 3), (6, 8, 3)]);
     }
 
     #[test]

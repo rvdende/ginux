@@ -331,8 +331,9 @@ reading stale data, guarded-buffer corruption in `chmod01`, `renameat2`
 flags (`EINVAL`), `removexattr` returning `ENODATA` for `ENOENT`,
 `open(O_DIRECTORY)` succeeding on a FIFO (`fcntl07`: LTP's cleanup then
 fails with `ENOTDIR`). TCONF is
-mostly expected: no libnuma in the static build (20), `ramfs` lacks leases,
-no hugetlbfs, 32-bit-only syscalls.
+mostly expected: NUMA tests that need two nodes (Ginux has one, node 0,
+as a one-node Linux machine does; the builder links libnuma from Alpine's
+numactl-dev), `ramfs` lacks leases, 32-bit-only syscalls.
 
 `target/ltp-report.txt` lists every cluster with its tests;
 `tests/ltp/report.py --variant no-oom-protection` does the same for the

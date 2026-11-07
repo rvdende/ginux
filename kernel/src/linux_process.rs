@@ -563,6 +563,10 @@ struct Process {
     deadline_parameters: [u64; 3],
     /// `/proc/PID/oom_score_adj`: inherited across fork, kept across exec.
     oom_score_adj: i16,
+    /// Its memory policy (set_mempolicy): inherited across fork, kept
+    /// across exec, as Linux's task policy is. Linux keeps one per thread;
+    /// here the process's threads share it.
+    memory_policy: crate::linux_areas::Policy,
     /// The signal whose default action terminated the process, or 0.
     killed_by_signal: u8,
     /// Chosen by a memory cgroup's OOM killer: dying for its memory, so no
@@ -1944,6 +1948,11 @@ impl ProcessTable {
         let (cgroup_generation, memcg) = parent
             .and_then(|parent| self.process(parent))
             .map_or((0, 0), |parent| (parent.cgroup_generation, parent.memcg));
+        let memory_policy = parent
+            .and_then(|parent| self.process(parent))
+            .map_or(crate::linux_areas::Policy::DEFAULT, |parent| {
+                parent.memory_policy
+            });
         let namespaces = match parent.and_then(|parent| self.process_mut(parent)) {
             Some(parent) => parent
                 .child_namespaces
@@ -1998,6 +2007,7 @@ impl ProcessTable {
             timer_slack,
             stopped_in_call: false,
             oom_score_adj,
+            memory_policy,
             killed_by_signal: 0,
             oom_victim: false,
             seccomp_filter,
@@ -4167,6 +4177,28 @@ pub(crate) fn live_process_oom_score_adj(pid: u32) -> Option<i16> {
         ProcessState::Running | ProcessState::Stopped { .. } | ProcessState::Zombie { .. }
     )
     .then_some(process.oom_score_adj)
+}
+
+/// The memory policy of `pid` (set_mempolicy).
+pub(crate) fn live_process_memory_policy(pid: u32) -> Option<crate::linux_areas::Policy> {
+    let table = live_process_table_mut()?;
+    let process = table.process(table.handle_by_pid(pid)?)?;
+    Some(process.memory_policy)
+}
+
+/// Sets the memory policy of `pid` (set_mempolicy).
+pub(crate) fn set_live_process_memory_policy(pid: u32, policy: crate::linux_areas::Policy) -> bool {
+    let Some(table) = live_process_table_mut() else {
+        return false;
+    };
+    let Some(process) = table
+        .handle_by_pid(pid)
+        .and_then(|handle| table.process_mut(handle))
+    else {
+        return false;
+    };
+    process.memory_policy = policy;
+    true
 }
 
 /// Records that a signal's default action is terminating `pid`, so its
