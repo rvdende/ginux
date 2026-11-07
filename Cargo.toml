@@ -20,6 +20,7 @@ members = [
     "crates/rtnetlink",
     "crates/runtime-memory",
     "crates/seccomp",
+    "crates/slab",
     "crates/tty",
     "crates/tun",
     "crates/udplite",

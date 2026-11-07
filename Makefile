@@ -369,6 +369,8 @@ check: manifest architecture-check linux-compat-check
 	@cargo test --package ginux-memory-areas
 	@cargo clippy --package ginux-deadline-heap --all-targets -- -D warnings
 	@cargo test --package ginux-deadline-heap
+	@cargo clippy --package ginux-slab --all-targets -- -D warnings
+	@cargo test --package ginux-slab
 	@cargo clippy --package ginux-cgroup --all-targets -- -D warnings
 	@cargo test --package ginux-cgroup
 	@cargo clippy --package ginux-keyrings --all-targets -- -D warnings

@@ -55310,6 +55310,7 @@ fn linux_proc_meminfo() -> &'static [u8] {
     let used = total - free;
     let huge = linux_huge_page_counts();
     let kernel_stack = activation::kernel_stack_bytes() / 1024;
+    let slab = crate::heap::slab_bytes() / 1024;
     let (swap_total, swap_free) = crate::linux_swap::totals(linux_execution_instance());
     let swap_cached = crate::linux_swap::cached_pages(linux_execution_instance()) * 4;
     // SAFETY: the kernel is single-processor and readers copy the bytes
@@ -55324,7 +55325,8 @@ fn linux_proc_meminfo() -> &'static [u8] {
              Cached:         {zero:>10} kB\nSwapCached:     {swap_cached:>10} kB\n\
              Active:         {used:>10} kB\nInactive:       {zero:>10} kB\n\
              SwapTotal:      {swap_total:>10} kB\nSwapFree:       {swap_free:>10} kB\n\
-             KernelStack:    {kernel_stack:>10} kB\n\
+             Slab:           {slab:>10} kB\nSReclaimable:   {zero:>10} kB\n\
+             SUnreclaim:     {slab:>10} kB\nKernelStack:    {kernel_stack:>10} kB\n\
              CommitLimit:    {total:>10} kB\nCommitted_AS:   {used:>10} kB\n\
              VmallocTotal:   13743895347199 kB\n\
              HugePages_Total:   {huge_total:>5}\nHugePages_Free:    {huge_free:>5}\n\

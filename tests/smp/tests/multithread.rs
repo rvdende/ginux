@@ -18,7 +18,8 @@
 //!    Steps 6 and 7 run `EXIT_ROUNDS` times.
 //! 8. `ginux-memtest returns` (userland/memtest): memory comes back after
 //!    bursts of processes, fork-and-exec children and shared mappings of
-//!    removed files.
+//!    removed files; `ginux-memtest slab`: the kernel heap's slabs come
+//!    back after thousands of files with long paths are made and removed.
 //!
 //! Every wait fails at once on a kernel failure line, a wrong status, or a
 //! step that does not finish within its budget.
@@ -133,6 +134,10 @@ fn multithread() {
     }
     let returns = shell.expect("RETURNS", "ginux-memtest returns", 0, Some("RETURNS OK"));
     for line in returns.lines().filter(|line| line.starts_with("RETURNS ")) {
+        eprintln!("multithread: {line}");
+    }
+    let slab = shell.expect("SLAB", "ginux-memtest slab", 0, Some("SLAB OK"));
+    for line in slab.lines().filter(|line| line.starts_with("SLAB ")) {
         eprintln!("multithread: {line}");
     }
     // The shell still works after all that.

@@ -15,6 +15,10 @@
 //!   kernel stacks (/proc/meminfo's KernelStack) must have gone back but
 //!   for the spare ones, and the rounds after the first must give back
 //!   all but a little of MemFree. Prints `RETURNS OK`.
+//! - `ginux-memtest slab` makes and removes thousands of files with long
+//!   paths, whose names the kernel keeps on its heap: /proc/meminfo's Slab
+//!   must grow with them and come back once they are gone. Prints
+//!   `SLAB OK`.
 
 use rustix::mm::{mmap, mmap_anonymous, munmap, MapFlags, ProtFlags};
 use rustix::process::{wait, WaitOptions};
@@ -233,6 +237,69 @@ fn returns_round(program: &std::path::Path) -> std::io::Result<(u64, u64)> {
     Ok((during, after))
 }
 
+/// Files `slab` makes at once.
+const SLAB_FILES: usize = 4000;
+
+/// What `slab` needs the files to have taken from the heap's slabs.
+const SLAB_GROWTH_KIB: u64 = 2048;
+
+/// What `slab` lets the heap keep of it once the files are gone: the
+/// spare slabs and the kernel's path hints.
+const SLAB_KEPT_KIB: u64 = 1024;
+
+/// Makes `SLAB_FILES` files below `directory` and removes them; returns
+/// the Slab KiB while they existed.
+fn slab_burst(directory: &std::path::Path) -> std::io::Result<u64> {
+    std::fs::create_dir_all(directory)?;
+    for index in 0..SLAB_FILES {
+        std::fs::File::create(directory.join(format!("{index:0>200}")))?;
+    }
+    let during = meminfo_kib("Slab").unwrap_or(0);
+    for index in 0..SLAB_FILES {
+        std::fs::remove_file(directory.join(format!("{index:0>200}")))?;
+    }
+    Ok(during)
+}
+
+fn slab() -> ExitCode {
+    // Paths of about a kilobyte: three directories of 200-character names.
+    let root = std::path::Path::new("/tmp/memtest-slab");
+    let directory = root
+        .join("d".repeat(200))
+        .join("e".repeat(200))
+        .join("f".repeat(200));
+    let Some(before) = meminfo_kib("Slab") else {
+        eprintln!("memtest: no Slab in /proc/meminfo");
+        return ExitCode::FAILURE;
+    };
+    let during = match slab_burst(&directory) {
+        Ok(during) => during,
+        Err(error) => {
+            eprintln!("memtest: slab: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let _ = std::fs::remove_dir_all(root);
+    let after = meminfo_kib("Slab").unwrap_or(u64::MAX);
+    println!("SLAB kib before={before} during={during} after={after}");
+    if during < before + SLAB_GROWTH_KIB {
+        eprintln!(
+            "memtest: {SLAB_FILES} files took {} KiB of slabs",
+            during.saturating_sub(before)
+        );
+        return ExitCode::FAILURE;
+    }
+    if after > before + SLAB_KEPT_KIB {
+        eprintln!(
+            "memtest: slabs kept {} KiB once the files went (limit {SLAB_KEPT_KIB})",
+            after - before
+        );
+        return ExitCode::FAILURE;
+    }
+    println!("SLAB OK");
+    ExitCode::SUCCESS
+}
+
 fn returns() -> ExitCode {
     const ROUNDS: usize = 4;
     let program = match std::env::current_exe() {
@@ -300,6 +367,7 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
         Some("returns") => returns(),
+        Some("slab") => slab(),
         Some("idle") => {
             std::thread::sleep(Duration::from_millis(500));
             ExitCode::SUCCESS

@@ -503,6 +503,7 @@ dependencies = [
  "ginux-oci-cache",
  "ginux-rtnetlink",
  "ginux-seccomp",
+ "ginux-slab",
  "ginux-tty",
  "ginux-tun",
  "ginux-udplite",
@@ -605,6 +606,10 @@ version = "0.1.0"
 
 [[package]]
 name = "ginux-seccomp"
+version = "0.1.0"
+
+[[package]]
+name = "ginux-slab"
 version = "0.1.0"
 
 [[package]]

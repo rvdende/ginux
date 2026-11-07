@@ -25,6 +25,7 @@ ginux-tty = { path = "../crates/tty" }
 ginux-image-store = { path = "../crates/image-store" }
 ginux-memory-areas = { path = "../crates/memory-areas" }
 ginux-deadline-heap = { path = "../crates/deadline-heap" }
+ginux-slab = { path = "../crates/slab" }
 ginux-cgroup = { path = "../crates/cgroup" }
 ginux-ext2 = { path = "../crates/ext2" }
 ginux-seccomp = { path = "../crates/seccomp" }
