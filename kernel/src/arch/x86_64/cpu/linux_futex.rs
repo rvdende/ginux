@@ -24,7 +24,21 @@ pub(super) struct LinuxProcessFutexWait {
     /// Elapsed nanoseconds when the wait times out, or 0.
     deadline: u64,
     woken: bool,
+    /// One word of a futex_waitv wait, which has a record per word: the
+    /// call returns the index of the first one woken.
+    vector: bool,
+    index: u8,
+    /// The waiting thread's slot when a vector wait blocked it as a thread
+    /// wait of its process (`LINUX_FUTEX_VECTOR_KEY`): wakes from that
+    /// process find it by address and make the thread ready. None for a
+    /// wait at the process level, which wakes from any process find by key.
+    thread_slot: Option<u8>,
 }
+
+/// The wait key of a thread blocked in a futex_waitv wait: its tid under a
+/// tag no futex address has, so a classic wake never matches it and a
+/// vector record names its thread's current wait.
+const LINUX_FUTEX_VECTOR_KEY: u64 = 1 << 62;
 
 /// Identifies a futex word across processes by the page it is on, so
 /// processes sharing the page (MAP_SHARED, or not yet copied after fork)
@@ -46,8 +60,69 @@ fn take_linux_process_futex_wait(
 ) -> Option<LinuxProcessFutexWait> {
     let index = waits
         .iter()
-        .position(|wait| wait.pid == pid && wait.tid == tid)?;
+        .position(|wait| !wait.vector && wait.pid == pid && wait.tid == tid)?;
     Some(waits.swap_remove(index))
+}
+
+/// Whether thread-level vector record `wait` still names its thread's
+/// wait: the thread is blocked in it, not since woken, timed out or
+/// interrupted (which leave the records for its next wait to drop).
+fn linux_futex_vector_thread_waiting(wait: &LinuxProcessFutexWait) -> bool {
+    let Some(slot) = wait.thread_slot.map(usize::from) else {
+        return false;
+    };
+    wait.pid == current_linux_process_pid()
+        && slot < LINUX_THREAD_LIMIT
+        && X86_RUNTIME.LINUX_THREAD_TIDS[slot].load(Ordering::SeqCst) == wait.tid
+        && X86_RUNTIME.LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) == LINUX_THREAD_BLOCKED
+        && X86_RUNTIME.LINUX_THREAD_WAIT_KINDS[slot].load(Ordering::SeqCst)
+            == LINUX_THREAD_WAIT_FUTEX
+        && X86_RUNTIME.LINUX_THREAD_WAIT_KEYS[slot].load(Ordering::SeqCst)
+            == LINUX_FUTEX_VECTOR_KEY | u64::from(wait.tid)
+}
+
+/// Wakes up to `limit` threads of this process blocked in futex_waitv
+/// waits on the word at `address`: each returns the index of the word
+/// that woke it, and its records go.
+pub(super) fn wake_linux_futex_vector_threads(
+    waits: &mut Vec<LinuxProcessFutexWait>,
+    address: u64,
+    mask: u32,
+    limit: u32,
+) -> u32 {
+    // Records of this process's threads that left their vector waits
+    // another way (timed out, interrupted, exited) go here; a thread puts
+    // its records and blocks under the same lock, so none is half made.
+    let pid = current_linux_process_pid();
+    waits.retain(|wait| {
+        wait.thread_slot.is_none() || wait.pid != pid || linux_futex_vector_thread_waiting(wait)
+    });
+    let mut woken = 0;
+    while woken < limit {
+        let Some(wait) = waits
+            .iter()
+            .find(|wait| {
+                wait.thread_slot.is_some()
+                    && wait.address == address
+                    && wait.mask & mask != 0
+                    && linux_futex_vector_thread_waiting(wait)
+            })
+            .copied()
+        else {
+            break;
+        };
+        let slot = usize::from(wait.thread_slot.unwrap_or(0));
+        X86_RUNTIME.LINUX_THREAD_RAXS[slot].store(u64::from(wait.index), Ordering::SeqCst);
+        X86_RUNTIME.LINUX_THREAD_WAIT_KINDS[slot].store(LINUX_THREAD_WAIT_NONE, Ordering::SeqCst);
+        X86_RUNTIME.LINUX_THREAD_WAIT_KEYS[slot].store(0, Ordering::SeqCst);
+        X86_RUNTIME.LINUX_THREAD_WAIT_OUTPUTS[slot].store(0, Ordering::SeqCst);
+        X86_RUNTIME.LINUX_THREAD_WAIT_DEADLINES[slot].store(0, Ordering::SeqCst);
+        X86_RUNTIME.LINUX_THREAD_STATES[slot].store(LINUX_THREAD_READY, Ordering::SeqCst);
+        waits.retain(|other| !(other.vector && other.pid == wait.pid && other.tid == wait.tid));
+        linux_trace_futex(8, address, slot as u64);
+        woken += 1;
+    }
+    woken
 }
 
 /// Marks up to `limit` processes waiting on `key` woken, dropping records of
@@ -58,10 +133,9 @@ pub(super) fn wake_linux_process_futex_waits(key: u64, mask: u32, limit: u32) ->
         linux_process::live_process_status(wait.pid).is_some_and(|status| status.state.is_running())
     });
     let mut woken = 0;
-    for wait in waits
-        .iter_mut()
-        .filter(|wait| !wait.woken && wait.key == key && wait.mask & mask != 0)
-    {
+    for wait in waits.iter_mut().filter(|wait| {
+        !wait.woken && wait.thread_slot.is_none() && wait.key == key && wait.mask & mask != 0
+    }) {
         if woken == limit {
             break;
         }
@@ -122,9 +196,23 @@ fn requeue_linux_futex_waits(source: u64, target: u64, wake: u32, requeue: u32) 
         linux_process::live_process_status(wait.pid).is_some_and(|status| status.state.is_running())
     });
     let mut moved = 0;
+    // A thread blocked in a vector wait was woken above if it was due; one
+    // left waits on the target word from here. Linux requeues a waitv
+    // waiter's word the same way.
+    let current_pid = current_linux_process_pid();
+    for wait in waits.iter_mut().filter(|wait| {
+        wait.thread_slot.is_some() && wait.pid == current_pid && wait.address == source
+    }) {
+        if moved == requeue {
+            break;
+        }
+        wait.address = target;
+        wait.key = target_key;
+        moved += 1;
+    }
     for wait in waits
         .iter_mut()
-        .filter(|wait| !wait.woken && wait.key == source_key)
+        .filter(|wait| !wait.woken && wait.thread_slot.is_none() && wait.key == source_key)
     {
         if woken < wake {
             wait.woken = true;
@@ -357,6 +445,9 @@ pub(super) fn linux_futex_live_return(
                 mask: wait_mask as u32,
                 deadline,
                 woken: false,
+                vector: false,
+                index: 0,
+                thread_slot: None,
             });
         }
         linux_trace_futex(1, address, key);
@@ -458,49 +549,7 @@ pub(super) fn linux_futex_live_return(
             .fetch_add(1, Ordering::SeqCst);
         return LINUX_RETURN_TO_KERNEL;
     };
-    let mut target_registers = LinuxSyscallFrame::ZERO;
-    let mut target_rip = 0;
-    let mut target_rsp = 0;
-    let mut target_rflags = 0;
-    let mut target_rax = 0;
-    if !install_linux_thread_return(
-        target,
-        &mut target_registers,
-        &mut target_rip,
-        &mut target_rsp,
-        &mut target_rflags,
-        &mut target_rax,
-    ) {
-        let slot = usize::from(current.slot);
-        X86_RUNTIME.LINUX_THREAD_WAIT_KINDS[slot].store(LINUX_THREAD_WAIT_NONE, Ordering::SeqCst);
-        X86_RUNTIME.LINUX_THREAD_WAIT_KEYS[slot].store(0, Ordering::SeqCst);
-        X86_RUNTIME.LINUX_THREAD_WAIT_OUTPUTS[slot].store(0, Ordering::SeqCst);
-        X86_RUNTIME.LINUX_THREAD_WAIT_DEADLINES[slot].store(0, Ordering::SeqCst);
-        X86_RUNTIME.LINUX_THREAD_STATES[slot].store(LINUX_THREAD_RUNNING, Ordering::SeqCst);
-        X86_RUNTIME
-            .LINUX_CURRENT_THREAD_SLOT
-            .store(current.slot, Ordering::SeqCst);
-        let _ = install_linux_tls_context(tls);
-        return LINUX_EINVAL;
-    }
-    let selected = LinuxUserContext {
-        registers: target_registers,
-        rip: target_rip,
-        rsp: target_rsp,
-        rflags: target_rflags,
-        rax: target_rax,
-        fs_base: active_fs_base(),
-    };
-    if !write_linux_thread_live_return(output, target, selected) {
-        return LINUX_EINVAL;
-    }
-    X86_RUNTIME
-        .LINUX_LIVE_RETURN_VALIDATED
-        .store(true, Ordering::SeqCst);
-    X86_RUNTIME
-        .LINUX_FUTEX_WAIT_BLOCK_COUNT
-        .fetch_add(1, Ordering::SeqCst);
-    LINUX_RETURN_FROM_IRET
+    switch_from_blocked_linux_futex_waiter(output, current, tls, target)
 }
 
 pub(super) fn linux_futex2_flags_valid(flags: u64) -> bool {
@@ -648,51 +697,52 @@ pub(super) fn linux_futex_wait_live_return(
         return LINUX_EINVAL;
     }
     drop(coordination);
-    let mut target_registers = LinuxSyscallFrame::ZERO;
-    let mut target_rip = 0;
-    let mut target_rsp = 0;
-    let mut target_rflags = 0;
-    let mut target_rax = 0;
-    if !install_linux_thread_return(
-        target,
-        &mut target_registers,
-        &mut target_rip,
-        &mut target_rsp,
-        &mut target_rflags,
-        &mut target_rax,
-    ) {
-        let slot = usize::from(current.slot);
-        X86_RUNTIME.LINUX_THREAD_WAIT_KINDS[slot].store(LINUX_THREAD_WAIT_NONE, Ordering::SeqCst);
-        X86_RUNTIME.LINUX_THREAD_WAIT_KEYS[slot].store(0, Ordering::SeqCst);
-        X86_RUNTIME.LINUX_THREAD_WAIT_OUTPUTS[slot].store(0, Ordering::SeqCst);
-        X86_RUNTIME.LINUX_THREAD_WAIT_DEADLINES[slot].store(0, Ordering::SeqCst);
-        X86_RUNTIME.LINUX_THREAD_STATES[slot].store(LINUX_THREAD_RUNNING, Ordering::SeqCst);
-        X86_RUNTIME
-            .LINUX_CURRENT_THREAD_SLOT
-            .store(current.slot, Ordering::SeqCst);
-        let _ = install_linux_tls_context(tls);
-        return LINUX_EINVAL;
-    }
-    let selected = LinuxUserContext {
-        registers: target_registers,
-        rip: target_rip,
-        rsp: target_rsp,
-        rflags: target_rflags,
-        rax: target_rax,
-        fs_base: active_fs_base(),
-    };
-    if !write_linux_thread_live_return(output, target, selected) {
-        return LINUX_EINVAL;
-    }
-    X86_RUNTIME
-        .LINUX_LIVE_RETURN_VALIDATED
-        .store(true, Ordering::SeqCst);
-    X86_RUNTIME
-        .LINUX_FUTEX_WAIT_BLOCK_COUNT
-        .fetch_add(1, Ordering::SeqCst);
-    LINUX_RETURN_FROM_IRET
+    switch_from_blocked_linux_futex_waiter(output, current, tls, target)
 }
 
+/// futex_waitv's absolute `timeout` on `clock` (0 realtime, 1 monotonic)
+/// as an elapsed-nanoseconds deadline, 0 without one; Err(errno) as
+/// Linux's futex2_setup_timeout. A deadline already past is returned as
+/// is: the words are compared first, as in Linux.
+fn linux_futex_waitv_deadline(timeout: u64, clock: u64) -> Result<u64, u64> {
+    if timeout == 0 {
+        return Ok(0);
+    }
+    if !matches!(clock, LINUX_CLOCK_REALTIME | LINUX_CLOCK_MONOTONIC) {
+        return Err(LINUX_EINVAL);
+    }
+    let mut timeout_bytes = [0_u8; 16];
+    if !copy_from_linux_user(timeout, &mut timeout_bytes) {
+        return Err(LINUX_EFAULT);
+    }
+    let requested = linux_timespec_nanoseconds(&timeout_bytes).ok_or(LINUX_EINVAL)?;
+    let monotonic_now = linux_elapsed_nanoseconds().ok_or(LINUX_ENOSYS)?;
+    if clock == LINUX_CLOCK_MONOTONIC {
+        return Ok(requested.max(1));
+    }
+    let (seconds, nanoseconds) = linux_realtime_time().ok_or(LINUX_ENOSYS)?;
+    let realtime_now = seconds
+        .checked_mul(NANOSECONDS_PER_SECOND)
+        .and_then(|seconds| seconds.checked_add(nanoseconds))
+        .ok_or(LINUX_EINVAL)?;
+    Ok(if requested <= realtime_now {
+        monotonic_now.max(1)
+    } else {
+        monotonic_now.saturating_add(requested - realtime_now)
+    })
+}
+
+/// One futex_waitv waiter: the word's address and the value it must hold.
+#[derive(Clone, Copy)]
+struct LinuxFutexVectorWord {
+    address: u64,
+    value: u32,
+}
+
+/// futex_waitv(2): waits on up to 128 futex words at once until one is
+/// woken (the call returns its index), the absolute timeout passes or a
+/// signal arrives, as Linux's futex_wait_multiple. Every word is checked
+/// first: the first whose value differs ends the call with EAGAIN.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn linux_futex_waitv_live_return(
     output: *mut LinuxSyscallFrame,
@@ -703,35 +753,265 @@ pub(super) fn linux_futex_waitv_live_return(
     timeout: u64,
     clock: u64,
 ) -> u64 {
+    const FUTEX2_VALID_MASK: u32 = 0x3 | 0x80 | 0x4 | 0x8;
     // No waiter array is EINVAL before anything is read, as in Linux.
     if flags != 0 || count == 0 || count > 128 || waiters == 0 {
         return LINUX_EINVAL;
     }
-    if count != 1 {
-        return LINUX_ENOSYS;
+    let deadline = match linux_futex_waitv_deadline(timeout, clock) {
+        Ok(deadline) => deadline,
+        Err(error) => return error,
+    };
+    // futex_parse_waitv: each entry's flags, reserved word and value.
+    let mut words = [LinuxFutexVectorWord {
+        address: 0,
+        value: 0,
+    }; 128];
+    let words = &mut words[..count as usize];
+    for (index, word) in words.iter_mut().enumerate() {
+        let mut entry = [0_u8; 24];
+        if !copy_from_linux_user(waiters + index as u64 * 24, &mut entry) {
+            return LINUX_EFAULT;
+        }
+        let value = u64::from_ne_bytes(entry[..8].try_into().unwrap());
+        let address = u64::from_ne_bytes(entry[8..16].try_into().unwrap());
+        let entry_flags = u32::from_ne_bytes(entry[16..20].try_into().unwrap());
+        let reserved = u32::from_ne_bytes(entry[20..24].try_into().unwrap());
+        if entry_flags & !FUTEX2_VALID_MASK != 0
+            || reserved != 0
+            || !linux_futex2_flags_valid(u64::from(entry_flags))
+            || value > u64::from(u32::MAX)
+        {
+            return LINUX_EINVAL;
+        }
+        *word = LinuxFutexVectorWord {
+            address,
+            value: value as u32,
+        };
     }
-    let mut waiter = [0_u8; 24];
-    if !copy_from_linux_user(waiters, &mut waiter) {
-        return LINUX_EFAULT;
-    }
-    let value = u64::from_ne_bytes(waiter[..8].try_into().unwrap());
-    let address = u64::from_ne_bytes(waiter[8..16].try_into().unwrap());
-    let waiter_flags = u32::from_ne_bytes(waiter[16..20].try_into().unwrap());
-    let reserved = u32::from_ne_bytes(waiter[20..24].try_into().unwrap());
-    if reserved != 0 {
+    // get_futex_key for each, then each word's value in order.
+    if words
+        .iter()
+        .any(|word| !word.address.is_multiple_of(size_of::<u32>() as u64))
+    {
         return LINUX_EINVAL;
     }
-    linux_futex_wait_live_return(
-        output,
-        caller,
-        LINUX_FUTEX_WAITV_SYSCALL,
-        address,
-        value,
-        u64::from(u32::MAX),
-        u64::from(waiter_flags),
-        timeout,
-        clock,
-    )
+    let compare = |words: &[LinuxFutexVectorWord], locked: bool| {
+        for word in words {
+            let mut bytes = [0_u8; size_of::<u32>()];
+            if !copy_from_linux_user(word.address, &mut bytes) {
+                // A word on a page not mapped in yet (a SysV segment just
+                // attached) is mapped by the owner's path.
+                if !locked && linux_light_thread_here().is_some() {
+                    return Some(migrate_current_linux_thread_to_owner(
+                        caller,
+                        LINUX_FUTEX_WAITV_SYSCALL,
+                    ));
+                }
+                return Some(LINUX_EFAULT);
+            }
+            if u32::from_ne_bytes(bytes) != word.value {
+                return Some(LINUX_EAGAIN);
+            }
+        }
+        None
+    };
+    let pid = current_linux_process_pid();
+    let tid = current_linux_tid().unwrap_or(0);
+    let Some(current) = current_linux_thread_handle() else {
+        return LINUX_ESRCH;
+    };
+    // A wait this call began before it restarted (it yielded to another
+    // process) is still recorded: it ends if a word was woken, else goes on
+    // to its deadline without comparing the words again.
+    // Only this call can have left process-level records of this thread's
+    // (any other wait removes them as it ends); a requeue may have moved
+    // their words since.
+    let restarted: Option<(Option<u8>, u64)> = {
+        let mut waits = LINUX_FUTEX_COORDINATION.lock();
+        let ours = |wait: &LinuxProcessFutexWait| {
+            wait.vector && wait.thread_slot.is_none() && wait.pid == pid && wait.tid == tid
+        };
+        let recorded = waits.iter().filter(|wait| ours(wait)).count();
+        if recorded == words.len() {
+            let woken = waits
+                .iter()
+                .filter(|wait| ours(wait) && wait.woken)
+                .map(|wait| wait.index)
+                .min();
+            let deadline = waits
+                .iter()
+                .find(|wait| ours(wait))
+                .map_or(0, |wait| wait.deadline);
+            Some((woken, deadline))
+        } else {
+            waits.retain(|wait| !(wait.vector && wait.pid == pid && wait.tid == tid));
+            None
+        }
+    };
+    if let Some((Some(index), _)) = restarted {
+        LINUX_FUTEX_COORDINATION
+            .lock()
+            .retain(|wait| !(wait.vector && wait.pid == pid && wait.tid == tid));
+        return u64::from(index);
+    }
+    let deadline = restarted.map_or(deadline, |(_, deadline)| deadline);
+    if restarted.is_none() {
+        if let Some(result) = compare(words, false) {
+            return result;
+        }
+    }
+    if deadline != 0 && linux_elapsed_nanoseconds().is_some_and(|now| now >= deadline) {
+        LINUX_FUTEX_COORDINATION
+            .lock()
+            .retain(|wait| !(wait.vector && wait.pid == pid && wait.tid == tid));
+        return LINUX_ETIMEDOUT;
+    }
+    let record = |index: usize, word: &LinuxFutexVectorWord, thread_slot: Option<u8>| {
+        LinuxProcessFutexWait {
+            pid,
+            tid,
+            address: word.address,
+            key: linux_futex_key(word.address),
+            mask: u32::MAX,
+            deadline,
+            woken: false,
+            vector: true,
+            index: index as u8,
+            thread_slot,
+        }
+    };
+    let process_woken_index = || {
+        LINUX_FUTEX_COORDINATION
+            .lock()
+            .iter()
+            .filter(|wait| {
+                wait.vector
+                    && wait.thread_slot.is_none()
+                    && wait.pid == pid
+                    && wait.tid == tid
+                    && wait.woken
+            })
+            .map(|wait| wait.index)
+            .min()
+    };
+    let forget = || {
+        LINUX_FUTEX_COORDINATION
+            .lock()
+            .retain(|wait| !(wait.vector && wait.pid == pid && wait.tid == tid));
+    };
+    if ready_linux_thread_handle().is_none() && current_linux_runtime_cpu_index() == 0 {
+        // At the process level: a wake from any process sharing a word
+        // marks its record, and the call looks again each time it runs.
+        if restarted.is_none() {
+            let mut waits = LINUX_FUTEX_COORDINATION.lock();
+            if waits.try_reserve(words.len()).is_err() {
+                return LINUX_ENOMEM;
+            }
+            waits.extend(
+                words
+                    .iter()
+                    .enumerate()
+                    .map(|(index, word)| record(index, word, None)),
+            );
+        }
+        let result = loop {
+            if let Some(index) = process_woken_index() {
+                break Some(u64::from(index));
+            }
+            if deadline != 0 && linux_elapsed_nanoseconds().is_some_and(|now| now >= deadline) {
+                break Some(LINUX_ETIMEDOUT);
+            }
+            let turn = linux_timed_wait_run_others(
+                output,
+                caller,
+                LINUX_FUTEX_WAITV_SYSCALL,
+                (deadline != 0).then_some(deadline),
+            );
+            match turn {
+                // Yielded: the call starts again and finds its records.
+                LinuxWaitTurn::Done(LINUX_RETURN_TO_KERNEL) => return LINUX_RETURN_TO_KERNEL,
+                LinuxWaitTurn::Done(result) => break Some(result),
+                LinuxWaitTurn::Resumed => {}
+                LinuxWaitTurn::Idle => {
+                    // A sibling thread is ready: the wait goes on as a
+                    // thread wait while it runs.
+                    if ready_linux_thread_handle().is_some() {
+                        break None;
+                    }
+                    if let Some(now) = linux_elapsed_nanoseconds().filter(|_| deadline != 0) {
+                        timer::request_linux_tick_within(deadline.saturating_sub(now));
+                    }
+                    linux_wait_for_interrupt();
+                }
+            }
+        };
+        if let Some(result) = result {
+            forget();
+            return result;
+        }
+    }
+    // As a thread wait while a sibling runs (or on a CPU other than the
+    // boot CPU): a wake from this process finds the thread by its records.
+    // The words were compared when the wait began if it began at the
+    // process level, whose records a wake may have marked meanwhile.
+    let compared = restarted.is_some()
+        || LINUX_FUTEX_COORDINATION
+            .lock()
+            .iter()
+            .any(|wait| wait.vector && wait.pid == pid && wait.tid == tid);
+    let target = ready_linux_thread_handle();
+    let Some(tls) = linux_thread_context(current) else {
+        forget();
+        return LINUX_ESRCH;
+    };
+    let slot = current.slot;
+    let mut waits = LINUX_FUTEX_COORDINATION.lock();
+    let ours = |wait: &LinuxProcessFutexWait| wait.vector && wait.pid == pid && wait.tid == tid;
+    if let Some(index) = waits
+        .iter()
+        .filter(|wait| ours(wait) && wait.woken)
+        .map(|wait| wait.index)
+        .min()
+    {
+        waits.retain(|wait| !ours(wait));
+        return u64::from(index);
+    }
+    if !compared {
+        if let Some(result) = compare(words, true) {
+            return result;
+        }
+    }
+    if waits.try_reserve(words.len()).is_err() {
+        waits.retain(|wait| !ours(wait));
+        return LINUX_ENOMEM;
+    }
+    waits.retain(|wait| !ours(wait));
+    waits.extend(
+        words
+            .iter()
+            .enumerate()
+            .map(|(index, word)| record(index, word, Some(slot))),
+    );
+    if !save_linux_thread_return_context(current, caller)
+        || !block_current_linux_thread(
+            LINUX_THREAD_WAIT_FUTEX,
+            LINUX_FUTEX_VECTOR_KEY | u64::from(tid),
+            u64::from(u32::MAX),
+            deadline,
+        )
+    {
+        waits.retain(|wait| !ours(wait));
+        return LINUX_EINVAL;
+    }
+    drop(waits);
+    let Some(target) = target else {
+        X86_RUNTIME
+            .LINUX_FUTEX_WAIT_BLOCK_COUNT
+            .fetch_add(1, Ordering::SeqCst);
+        return LINUX_RETURN_TO_KERNEL;
+    };
+    switch_from_blocked_linux_futex_waiter(output, current, tls, target)
 }
 
 pub(super) fn linux_futex_requeue(
@@ -784,4 +1064,57 @@ pub(super) fn linux_futex_requeue(
         wake_count as u32,
         requeue_count as u32,
     ))
+}
+
+/// Leaves `current`, just blocked in a futex wait, for its ready sibling
+/// `target`, whose context the call returns into.
+fn switch_from_blocked_linux_futex_waiter(
+    output: *mut LinuxSyscallFrame,
+    current: LinuxThreadHandle,
+    tls: LinuxTlsContext,
+    target: LinuxThreadHandle,
+) -> u64 {
+    let mut target_registers = LinuxSyscallFrame::ZERO;
+    let mut target_rip = 0;
+    let mut target_rsp = 0;
+    let mut target_rflags = 0;
+    let mut target_rax = 0;
+    if !install_linux_thread_return(
+        target,
+        &mut target_registers,
+        &mut target_rip,
+        &mut target_rsp,
+        &mut target_rflags,
+        &mut target_rax,
+    ) {
+        let slot = usize::from(current.slot);
+        X86_RUNTIME.LINUX_THREAD_WAIT_KINDS[slot].store(LINUX_THREAD_WAIT_NONE, Ordering::SeqCst);
+        X86_RUNTIME.LINUX_THREAD_WAIT_KEYS[slot].store(0, Ordering::SeqCst);
+        X86_RUNTIME.LINUX_THREAD_WAIT_OUTPUTS[slot].store(0, Ordering::SeqCst);
+        X86_RUNTIME.LINUX_THREAD_WAIT_DEADLINES[slot].store(0, Ordering::SeqCst);
+        X86_RUNTIME.LINUX_THREAD_STATES[slot].store(LINUX_THREAD_RUNNING, Ordering::SeqCst);
+        X86_RUNTIME
+            .LINUX_CURRENT_THREAD_SLOT
+            .store(current.slot, Ordering::SeqCst);
+        let _ = install_linux_tls_context(tls);
+        return LINUX_EINVAL;
+    }
+    let selected = LinuxUserContext {
+        registers: target_registers,
+        rip: target_rip,
+        rsp: target_rsp,
+        rflags: target_rflags,
+        rax: target_rax,
+        fs_base: active_fs_base(),
+    };
+    if !write_linux_thread_live_return(output, target, selected) {
+        return LINUX_EINVAL;
+    }
+    X86_RUNTIME
+        .LINUX_LIVE_RETURN_VALIDATED
+        .store(true, Ordering::SeqCst);
+    X86_RUNTIME
+        .LINUX_FUTEX_WAIT_BLOCK_COUNT
+        .fetch_add(1, Ordering::SeqCst);
+    LINUX_RETURN_FROM_IRET
 }

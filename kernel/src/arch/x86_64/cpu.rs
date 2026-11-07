@@ -9128,8 +9128,9 @@ fn wake_linux_futex(address: u64, limit: u32) -> u32 {
 }
 
 fn wake_linux_futex_masked(address: u64, mask: u32, limit: u32) -> u32 {
-    let _coordination = LINUX_FUTEX_COORDINATION.lock();
-    wake_linux_futex_masked_locked(address, mask, limit)
+    let mut coordination = LINUX_FUTEX_COORDINATION.lock();
+    let woken = wake_linux_futex_masked_locked(address, mask, limit);
+    woken + wake_linux_futex_vector_threads(&mut coordination, address, mask, limit - woken)
 }
 
 fn wake_linux_futex_masked_locked(address: u64, mask: u32, limit: u32) -> u32 {
@@ -28670,10 +28671,11 @@ fn linux_runtime_munmap_pages(address: u64, length: u64) -> u64 {
     }) {
         return LINUX_EPERM;
     }
+    let mut unshared = false;
     for page in 0..pages {
         let page_address = address + (page * PAGE_SIZE) as u64;
         let _ = linux_flush_shared_mapping_page(current_linux_process_pid(), page_address);
-        let _ =
+        unshared |=
             crate::linux_overlay::remove_shared_mapping(current_linux_process_pid(), page_address);
         if !release_linux_runtime_page(address_space::remove_current_linux_runtime_page(
             page_address,
@@ -28681,7 +28683,13 @@ fn linux_runtime_munmap_pages(address: u64, length: u64) -> u64 {
             return LINUX_EINVAL;
         }
     }
-    crate::linux_overlay::release_unmapped_shmem();
+    // Shared memory can only have lost its last mapping here if a shared
+    // mapping went: looking through every overlay node on each munmap made
+    // munmap04's 65,000 unmaps take seconds once a long run had made
+    // thousands of files.
+    if unshared {
+        crate::linux_overlay::release_unmapped_shmem();
+    }
     if !address_space::prune_current_linux_page_tables(
         address,
         address + (pages * PAGE_SIZE) as u64,
