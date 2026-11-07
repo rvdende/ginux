@@ -381,6 +381,8 @@ check: manifest architecture-check linux-compat-check
 	@cargo test --package ginux-udplite
 	@cargo clippy --package ginux-tun --all-targets -- -D warnings
 	@cargo test --package ginux-tun
+	@cargo clippy --package ginux-ktls --all-targets -- -D warnings
+	@cargo test --package ginux-ktls
 	@cargo clippy --package ginux-tty --all-targets -- -D warnings
 	@cargo test --package ginux-tty
 	@cargo clippy --package ginux-drm --all-targets -- -D warnings

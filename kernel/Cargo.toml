@@ -20,6 +20,7 @@ ginux-landlock = { path = "../crates/landlock" }
 ginux-rtnetlink = { path = "../crates/rtnetlink" }
 ginux-udplite = { path = "../crates/udplite" }
 ginux-tun = { path = "../crates/tun" }
+ginux-ktls = { path = "../crates/ktls" }
 ginux-tty = { path = "../crates/tty" }
 ginux-image-store = { path = "../crates/image-store" }
 ginux-memory-areas = { path = "../crates/memory-areas" }
@@ -40,3 +41,7 @@ ginux-volume-format = { path = "../crates/volume-format" }
 ginux-volume-service = { path = "../crates/volume-service" }
 miniz_oxide = { version = "=0.9.1", default-features = false }
 smoltcp = { version = "=0.14.0", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-udp", "socket-tcp", "socket-raw", "auto-icmp-echo-reply", "iface-max-addr-count-8"] }
+
+[lints.rust]
+# Set for the kernel's target in .cargo/config.toml (kernel TLS's ciphers).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(aes_force_soft)", "cfg(polyval_force_soft)"] }

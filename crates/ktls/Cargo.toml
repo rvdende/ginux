@@ -1,0 +1,13 @@
+[package]
+name = "ginux-ktls"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+[dependencies]
+# RustCrypto's AES-GCM, already in the workspace (embedded-tls in the
+# network service). In the kernel it is built with aes_force_soft and
+# polyval_force_soft (.cargo/config.toml): the kernel is soft-float and
+# does not save user SIMD state, so AES-NI and PCLMULQDQ must not run there.
+aes-gcm = { version = "=0.10.3", default-features = false, features = ["aes"] }

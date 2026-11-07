@@ -2,6 +2,12 @@
 
 extern crate alloc;
 
+// RustCrypto's AES and GHASH would use AES-NI and PCLMULQDQ, which run on
+// the SIMD registers user processes own: the kernel neither uses nor saves
+// them (.cargo/config.toml sets these cfgs for the kernel's target).
+#[cfg(not(all(aes_force_soft, polyval_force_soft)))]
+compile_error!("the kernel must be built with --cfg aes_force_soft --cfg polyval_force_soft");
+
 mod address_space;
 mod arch;
 mod bringup;

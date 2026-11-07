@@ -15,9 +15,13 @@
 //! holds sockets and files alike.
 #![deny(unsafe_code)]
 
+mod tls;
 #[allow(unsafe_code)]
 mod virtio_net;
 
+pub(crate) use tls::TlsFlag;
+
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -155,6 +159,8 @@ pub(crate) enum Error {
     IsConnected,
     /// connect on a stream socket whose connection is still in progress.
     Already,
+    /// Another errno, as it is (kernel TLS's EBADMSG, EIO, EOPNOTSUPP).
+    Errno(i32),
 }
 
 #[derive(Clone, Copy)]
@@ -394,6 +400,8 @@ struct Slot {
     icmp_raw: bool,
     /// ICMP_FILTER of a raw ICMP socket: types (bit numbers) it drops.
     icmp_filter: u32,
+    /// A TCP socket's TLS upper layer (TCP_ULP "tls").
+    tls: Option<Box<tls::Tls>>,
     /// UDPLITE_SEND_CSCOV and UDPLITE_RECV_CSCOV of a UDP-Lite socket, once
     /// set: the bytes its checksums cover (0: all), and the least coverage
     /// it takes of a partly covered datagram (0: none such).
@@ -481,6 +489,7 @@ impl Slot {
             object: (0, 0),
             icmp_raw: false,
             icmp_filter: 0,
+            tls: None,
             udplite_send_coverage: None,
             udplite_receive_coverage: None,
             icmpv6_filter: [0; 32],
@@ -1596,6 +1605,11 @@ impl Sockets {
             *references -= 1;
             return true;
         }
+        // Sealed TLS records still go out, as far as the connection takes
+        // them.
+        if self.tls_sends(id) {
+            let _ = self.tls_flush(id, None);
+        }
         let index = usize::from(id);
         let Some(state) = slot_in_mut(&mut self.slots, id) else {
             return false;
@@ -1919,7 +1933,8 @@ impl Sockets {
         self.poll();
         let index = usize::from(id);
         let state = self.slot(id).ok_or(Error::Invalid)?;
-        if state.remote.is_some() {
+        // An upper layer (TLS) cannot be cloned into accepted sockets.
+        if state.remote.is_some() || state.tls.is_some() {
             return Err(Error::Invalid);
         }
         // Linux's accept queue is full only past the backlog
@@ -2231,7 +2246,22 @@ impl Sockets {
         }
     }
 
+    /// Sends `input` on socket `id`: through its TLS records if it has
+    /// TLS_TX (`tls`), else as it is (`send_raw`).
     fn send_queued(
+        &mut self,
+        id: SlotId,
+        input: &[u8],
+        remote: Option<IpEndpoint>,
+        local_capacity: Option<usize>,
+    ) -> Result<usize, Error> {
+        if self.tls_sends(id) {
+            return self.tls_send(id, input, local_capacity);
+        }
+        self.send_raw(id, input, remote, local_capacity)
+    }
+
+    fn send_raw(
         &mut self,
         id: SlotId,
         input: &[u8],
@@ -2694,7 +2724,21 @@ impl Sockets {
         }
     }
 
+    /// Reads from socket `id`: the plaintext of its TLS records if it has
+    /// TLS_RX, else what came (`recv_raw`).
     fn recv(
+        &mut self,
+        id: SlotId,
+        output: &mut [u8],
+    ) -> Result<(usize, Option<IpEndpoint>), Error> {
+        if self.tls_receives(id) {
+            self.poll();
+            return self.tls_recv(id, output, false).map(|read| (read, None));
+        }
+        self.recv_raw(id, output)
+    }
+
+    fn recv_raw(
         &mut self,
         id: SlotId,
         output: &mut [u8],
@@ -2848,6 +2892,18 @@ impl Sockets {
     }
 
     fn peek(
+        &mut self,
+        id: SlotId,
+        output: &mut [u8],
+    ) -> Result<(usize, Option<IpEndpoint>), Error> {
+        if self.tls_receives(id) {
+            self.poll();
+            return self.tls_recv(id, output, true).map(|read| (read, None));
+        }
+        self.peek_raw(id, output)
+    }
+
+    fn peek_raw(
         &mut self,
         id: SlotId,
         output: &mut [u8],
@@ -3034,7 +3090,23 @@ impl Sockets {
         )
     }
 
+    /// Whether socket `id` reads and writes without waiting, and has an
+    /// error: a TLS socket's reads wait for whole records, its writes for
+    /// room among its sealed records.
     fn readiness(&mut self, id: SlotId) -> Option<(bool, bool, bool)> {
+        if self.tls_attached(id) {
+            let _ = self.tls_flush(id, Some(LOCAL_QUEUE_CAPACITY));
+            let (readable, writable, error) = self.readiness_raw(id)?;
+            return Some((
+                self.tls_readable(id).unwrap_or(readable),
+                writable && self.tls_writable(id).unwrap_or(true),
+                error,
+            ));
+        }
+        self.readiness_raw(id)
+    }
+
+    fn readiness_raw(&mut self, id: SlotId) -> Option<(bool, bool, bool)> {
         if let Some(state) = self.slot(id).filter(|state| state.kind == Kind::Netlink) {
             return Some((!state.netlink_messages.is_empty(), true, false));
         }
@@ -3144,6 +3216,11 @@ impl Sockets {
     /// socket forgets its peer.
     fn disconnect(&mut self, id: SlotId) -> Result<(), Error> {
         self.poll();
+        // TLS keeps its state to the connection: Linux 6.12 refuses
+        // (CVE-2023-0461's fix).
+        if self.tls_attached(id) {
+            return Err(Error::Errno(tls::EOPNOTSUPP));
+        }
         let state = self.slot(id).ok_or(Error::Invalid)?;
         let (kind, peer, handle, listening, port_locked) = (
             state.kind,
@@ -3933,6 +4010,60 @@ fn answer_netlink_requests(state: &mut Slot, input: &[u8]) -> Result<(), Error> 
         }
     }
     Ok(())
+}
+
+/// setsockopt(SOL_TCP, TCP_ULP, name) (`Sockets::set_ulp`).
+pub(crate) fn set_ulp(id: SlotId, name: &[u8]) -> Result<(), i32> {
+    SOCKETS.lock().set_ulp(id, name)
+}
+
+/// Whether socket `id` has the TLS upper layer (getsockopt TCP_ULP).
+pub(crate) fn tls_attached(id: SlotId) -> bool {
+    SOCKETS.lock().tls_attached(id)
+}
+
+/// setsockopt(SOL_TLS, TLS_TX or TLS_RX).
+pub(crate) fn set_tls_crypto(id: SlotId, receive: bool, bytes: &[u8]) -> Result<(), i32> {
+    SOCKETS.lock().set_tls_crypto(id, receive, bytes)
+}
+
+/// getsockopt(SOL_TLS, TLS_TX or TLS_RX).
+pub(crate) fn tls_crypto(id: SlotId, receive: bool) -> Result<Vec<u8>, i32> {
+    SOCKETS.lock().tls_crypto(id, receive)
+}
+
+pub(crate) fn set_tls_flag(id: SlotId, flag: TlsFlag, value: bool) -> Result<(), i32> {
+    SOCKETS.lock().set_tls_flag(id, flag, value)
+}
+
+pub(crate) fn tls_flag(id: SlotId, flag: TlsFlag) -> Result<bool, i32> {
+    SOCKETS.lock().tls_flag(id, flag)
+}
+
+/// The record type of socket `id`'s next send (TLS_SET_RECORD_TYPE).
+pub(crate) fn set_tls_record_type(id: SlotId, kind: u8) {
+    SOCKETS.lock().set_tls_record_type(id, kind);
+}
+
+/// Whether socket `id` sends through TLS.
+pub(crate) fn tls_sends(id: SlotId) -> bool {
+    SOCKETS.lock().tls_sends(id)
+}
+
+/// Whether socket `id` receives through TLS.
+pub(crate) fn tls_receives(id: SlotId) -> bool {
+    SOCKETS.lock().tls_receives(id)
+}
+
+/// Whether socket `id`'s coming receive takes control messages (recvmsg
+/// with room for them).
+pub(crate) fn set_tls_control(id: SlotId, control: bool) {
+    SOCKETS.lock().set_tls_control(id, control);
+}
+
+/// The record type socket `id`'s last receive returned.
+pub(crate) fn tls_last_type(id: SlotId) -> Option<u8> {
+    SOCKETS.lock().tls_last_type(id)
 }
 
 /// Which UDP-Lite checksum coverage option: UDPLITE_SEND_CSCOV or

@@ -1,0 +1,7 @@
+# The kernel (x86_64-unknown-uefi) is soft-float and saves no user SIMD
+# state when it is entered, so the RustCrypto ciphers it uses (kernel TLS:
+# crates/ktls) must take their software, constant-time backends there and
+# never AES-NI or PCLMULQDQ. kernel/src/lib.rs refuses to build without
+# these cfgs.
+[target.x86_64-unknown-uefi]
+rustflags = ["--cfg", "aes_force_soft", "--cfg", "polyval_force_soft"]

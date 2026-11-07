@@ -20,6 +20,7 @@ mod linux_cgroupfs;
 mod linux_fsmount;
 mod linux_futex;
 mod linux_hugetlb;
+mod linux_ktls;
 mod linux_numa;
 mod linux_poll;
 mod linux_pty;
@@ -58,6 +59,7 @@ pub(crate) use linux_cgroupfs::{charge_linux_user_pages, reclaim_linux_user_page
 use linux_fsmount::*;
 use linux_futex::*;
 use linux_hugetlb::*;
+use linux_ktls::*;
 use linux_numa::*;
 use linux_poll::*;
 use linux_pty::*;
@@ -41894,6 +41896,7 @@ fn linux_socket_error(error: crate::linux_socket::Error) -> u64 {
         crate::linux_socket::Error::Refused => LINUX_ECONNREFUSED,
         crate::linux_socket::Error::IsConnected => LINUX_EISCONN,
         crate::linux_socket::Error::Already => LINUX_EALREADY,
+        crate::linux_socket::Error::Errno(errno) => (-i64::from(errno)) as u64,
     }
 }
 
@@ -42894,6 +42897,9 @@ fn linux_socket_recvfrom(
     let Some(slot) = linux_socket_slot(descriptor) else {
         return linux_not_socket_error(descriptor);
     };
+    // A TLS record that is not application data needs recvmsg's control
+    // buffer: here it is EIO.
+    linux_tls_receive_control(slot, 0);
     // Ginux keeps no socket error queues, so reading one finds it empty.
     if flags & LINUX_MSG_ERRQUEUE != 0 {
         return LINUX_EAGAIN;
@@ -43104,7 +43110,16 @@ fn linux_socket_sendmsg(descriptor: u64, message: u64, flags: u64) -> u64 {
     let mut passed_files = [None; crate::linux_socket::PASSED_RIGHT_LIMIT];
     let mut passed_right_count = 0_usize;
     let mut passed_credentials = None;
-    if control_length != 0 {
+    // A TLS socket's control messages say what record type it sends.
+    let tls_sends = crate::linux_socket::tls_sends(slot);
+    if control_length != 0 && tls_sends {
+        if let Some(error) =
+            linux_tls_send_control(slot, control, control_length, flags & LINUX_MSG_MORE != 0)
+        {
+            return error;
+        }
+    }
+    if control_length != 0 && !tls_sends {
         if crate::linux_socket::kind(slot) != Some(crate::linux_socket::Kind::Unix) {
             return LINUX_EINVAL;
         }
@@ -43450,6 +43465,7 @@ fn linux_socket_recvmsg(
     let nonblocking = flags & MSG_DONTWAIT != 0 || linux_socket_nonblocking(descriptor);
     let peek_only = flags & MSG_PEEK != 0;
     let wait_all = flags & MSG_WAITALL != 0;
+    linux_tls_receive_control(slot, if control == 0 { 0 } else { control_capacity });
     let result = if nonblocking {
         crate::linux_socket::recv_message(slot, &mut bytes[..capacity], peek_only)
     } else if matches!(
@@ -43634,6 +43650,22 @@ fn linux_socket_recvmsg(
                 return LINUX_EFAULT;
             }
             control_length += 32;
+        }
+    }
+    // TLS_GET_RECORD_TYPE: the type of the TLS records read.
+    if let Some(written) = linux_tls_record_type_message(
+        slot,
+        control + control_length,
+        if control == 0 {
+            0
+        } else {
+            control_capacity.saturating_sub(control_length)
+        },
+    ) {
+        match written {
+            Ok(space) => control_length += space,
+            Err(0) => output_flags |= MSG_CTRUNC,
+            Err(error) => return error,
         }
     }
     // IP_RECVTTL: the datagram's TTL (SOL_IP, IP_TTL), which ping prints.
@@ -44379,6 +44411,9 @@ fn linux_socket_setsockopt(
     if level == LINUX_SOL_ICMPV6 && crate::linux_socket::is_ipv6(slot) {
         return linux_icmpv6_setsockopt(slot, option, value, length);
     }
+    if level == ginux_ktls::SOL_TLS {
+        return linux_tls_setsockopt(slot, option, value, length);
+    }
     if let Some(coverage) = linux_udplite_coverage_option(level, option) {
         if crate::linux_socket::kind(slot) != Some(crate::linux_socket::Kind::UdpLite) {
             return LINUX_ENOPROTOOPT;
@@ -44530,9 +44565,8 @@ fn linux_socket_setsockopt(
             Some(crate::linux_socket::BooleanOption::NoDelay)
         }
         (1, 7 | 8) => None,
-        // TCP_ULP: no upper-layer protocol (TLS) is loadable here, which
-        // Linux reports as ENOENT (setsockopt10 then reports TCONF).
-        (6, 31) => return LINUX_ENOENT,
+        // TCP_ULP: "tls" is the upper layer there is (kernel TLS).
+        (6, LINUX_TCP_ULP) => return linux_set_ulp(slot, value, length),
         _ => return LINUX_ENOPROTOOPT,
     };
     if length < 4 {
@@ -44777,6 +44811,14 @@ fn linux_socket_getsockopt(
     }
     if level == LINUX_SOL_ICMPV6 && crate::linux_socket::is_ipv6(slot) {
         return linux_icmpv6_getsockopt(slot, option, value, length);
+    }
+    if level == ginux_ktls::SOL_TLS {
+        return linux_tls_getsockopt(slot, option, value, length);
+    }
+    if (level, option) == (6, LINUX_TCP_ULP)
+        && crate::linux_socket::kind(slot) == Some(crate::linux_socket::Kind::Tcp)
+    {
+        return linux_get_ulp(slot, value, length);
     }
     if level == 1 && option == 17 {
         if crate::linux_socket::kind(slot) != Some(crate::linux_socket::Kind::Unix) {

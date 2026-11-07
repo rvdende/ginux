@@ -9,6 +9,7 @@ members = [
     "crates/ext2",
     "crates/image-store",
     "crates/keyrings",
+    "crates/ktls",
     "crates/landlock",
     "crates/memory-areas",
     "crates/cgroup",
