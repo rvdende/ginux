@@ -689,3 +689,4 @@ interior-mutable	kernel/src/linux_record_lock.rs	WAITING	process-runtime	allowli
 interior-mutable	kernel/src/linux_async_io.rs	ENTRIES	process-runtime	allowlist	none	ranked-async-io-owners
 interior-mutable	kernel/src/arch/x86_64/cpu/linux_swapon.rs	LINUX_SWAP_CURSOR	domain-runtime	allowlist	none	atomic-swap-scan-cursor
 interior-mutable	kernel/src/arch/x86_64/cpu/linux_swapon.rs	LINUX_USER_FAULT_RECLAIM	process-runtime	allowlist	none	atomic-user-fault-reclaim-tag
+interior-mutable	kernel/src/arch/x86_64/cpu/linux_cgroupfs.rs	LINUX_CACHE_RECLAIM_ROTOR	domain-runtime	allowlist	none	atomic-cache-reclaim-rotor

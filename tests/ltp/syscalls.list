@@ -1570,7 +1570,7 @@ perf_event_open03 perf_event_open03  # auto: budget=90
 ginux_swap01 ginux_swap01  # budget=300 Ginux's own (tools/ltp/tests): a memory cgroup oversubscribed with swap
 ginux_stack01 ginux_stack01  # Ginux's own (tools/ltp/tests): the main stack grows to RLIMIT_STACK
 memcontrol01 memcontrol01  # runtest/controllers: the memory controller
-!memcontrol02 memcontrol02  # runtest/controllers: page cache is not charged to memory cgroups (memory.stat file stays 0)
-!memcontrol03 memcontrol03  # runtest/controllers: page cache is not charged to memory cgroups (memory.stat file stays 0)
-!memcontrol04 memcontrol04  # runtest/controllers: page cache is not charged to memory cgroups (memory.stat file stays 0)
+memcontrol02 memcontrol02  # runtest/controllers: the memory controller
+!memcontrol03 memcontrol03  # runtest/controllers: passes alone, but late in a full run its children's 50 MiB page-cache writes outlast the test's 10 s checkpoint
+!memcontrol04 memcontrol04  # runtest/controllers: passes alone, but late in a full run its children's 50 MiB page-cache writes outlast the test's 10 s checkpoint
 !stack_clash stack_clash  # runtest/cve: maps MAP_FIXED next to the stack and over every gap below it, but MAP_FIXED takes only 256 MiB to 1 TiB

@@ -1096,6 +1096,53 @@ pub(crate) fn write_back_all() {
     }
 }
 
+/// Whether any volume has pages in its page cache, for reclaim to look at.
+pub(crate) fn any_cached() -> bool {
+    VOLUMES
+        .try_lock()
+        .is_some_and(|table| table.volumes.iter().any(|volume| volume.cached_pages != 0))
+}
+
+/// Reclaim under memory pressure: drops up to `budget` clean cached pages,
+/// of files no process maps shared, whose memory cgroup charge `wanted`
+/// takes (`memory::frame_charge`), as Linux reclaims clean page cache
+/// before anonymous memory. The count dropped; none while this CPU holds
+/// a lock the volumes' would rank below.
+pub(crate) fn reclaim_page_cache(budget: u64, wanted: impl Fn(u16) -> bool) -> u64 {
+    if budget == 0 || !crate::sync::rank_available(LockRank::VOLUMES) {
+        return 0;
+    }
+    let mut dropped = 0;
+    let mut table = VOLUMES.lock();
+    for volume in &mut table.volumes {
+        let caches: Vec<(u32, Cache)> = volume
+            .caches
+            .iter()
+            .map(|(inode, cache)| (*inode, *cache))
+            .collect();
+        for (inode, cache) in caches {
+            if dropped >= budget {
+                return dropped;
+            }
+            let file = Handle::volume(
+                volume.inodes.get(&inode).copied().unwrap_or(0),
+                u64::from(inode),
+            );
+            if cache.mapped || crate::linux_overlay::mapped_shared(file) {
+                continue;
+            }
+            let released = crate::linux_overlay::release_charged_cached_pages(
+                cache.pages,
+                budget - dropped,
+                &wanted,
+            );
+            volume.cached_pages = volume.cached_pages.saturating_sub(released as usize);
+            dropped += released;
+        }
+    }
+    dropped
+}
+
 /// /proc/sys/vm/drop_caches: drops the cached pages no shared mapping
 /// maps, as Linux drops clean page cache.
 pub(crate) fn drop_caches() {
@@ -1140,6 +1187,13 @@ pub(crate) fn write(handle: Handle, offset: usize, input: &[u8]) -> Option<usize
     volume.write_back_range(inode, offset, offset.saturating_add(input.len()));
     let written = volume.filesystem.write(inode, offset as u64, input).ok()?;
     volume.refresh_cache(inode, offset, offset + written);
+    // What was written stays in the page cache, as Linux writes through it
+    // (and charges it to the writer's memory cgroup), as far as the cache
+    // has room: a write never empties the other caches to make it.
+    let room = cache_limit().saturating_sub(volume.cached_pages);
+    for index in (offset / PAGE..(offset + written).div_ceil(PAGE)).take(room) {
+        let _ = volume.page(inode, index, true);
+    }
     if written != 0 {
         let _ = volume.filesystem.change(
             inode,

@@ -719,6 +719,17 @@ pub(crate) fn charge_linux_user_pages(pages: u64) -> Option<u16> {
     }
 }
 
+/// The memory cgroup a page-cache or shared-memory page brought in now is
+/// charged to: the current process's, or none outside a domain's process.
+pub(crate) fn linux_cache_charge_slot() -> Option<u16> {
+    if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
+        || current_linux_thread_handle().is_none()
+    {
+        return None;
+    }
+    process_memcg(current_linux_process_pid())
+}
+
 /// Reclaims what the current domain's other processes may give up when
 /// the machine is short of memory: true if anything was.
 pub(crate) fn reclaim_linux_user_pages(pages: u64) -> bool {
@@ -727,7 +738,13 @@ pub(crate) fn reclaim_linux_user_pages(pages: u64) -> bool {
     {
         return false;
     }
-    if !cgroup::reclaimable() && !crate::linux_swap::available(linux_execution_instance()) {
+    // Nothing to take, nothing to scan for: a machine short of frames asks
+    // at every allocation.
+    if !cgroup::reclaimable()
+        && !crate::linux_swap::available(linux_execution_instance())
+        && !(crate::sync::rank_available(crate::sync::LockRank::VOLUMES)
+            && crate::linux_blockfs::any_cached())
+    {
         return false;
     }
     let reclaimed = cgroup::root(linux_execution_instance())
@@ -754,9 +771,6 @@ fn linux_process_quiescent(pid: u32) -> bool {
 /// a user page fault: `linux_own_pages_reclaimable`). The count reclaimed.
 pub(super) fn linux_memcg_reclaim(slot: Slot, pages: u64, except: u32) -> u64 {
     let instance = linux_execution_instance();
-    if !cgroup::reclaimable() && !crate::linux_swap::available(instance) {
-        return 0;
-    }
     let root = cgroup::root(instance).unwrap_or(NO_SLOT);
     let mut members = [0_u32; 64];
     let mut count = 0;
@@ -779,7 +793,8 @@ pub(super) fn linux_memcg_reclaim(slot: Slot, pages: u64, except: u32) -> u64 {
             running_count += 1;
         }
     }
-    let mut reclaimed = 0;
+    // Clean page cache goes first: it costs no I/O to drop.
+    let mut reclaimed = linux_reclaim_page_cache(slot, pages, false);
     for pid in &members[..count] {
         if reclaimed >= pages {
             break;
@@ -808,6 +823,11 @@ pub(super) fn linux_memcg_reclaim(slot: Slot, pages: u64, except: u32) -> u64 {
     {
         reclaimed += linux_reclaim_active_pages(current, pages - reclaimed);
     }
+    // Nothing above the cgroups' memory.low: their page cache goes below
+    // it, each such cgroup counting a low event, as Linux's second pass.
+    if reclaimed == 0 {
+        reclaimed += linux_reclaim_page_cache(slot, pages, true);
+    }
     // Last, the swap cache's copies of pages still in swap.
     if reclaimed < pages {
         reclaimed += crate::linux_swap::shrink_cache(instance, pages - reclaimed, |memcg| {
@@ -818,6 +838,129 @@ pub(super) fn linux_memcg_reclaim(slot: Slot, pages: u64, except: u32) -> u64 {
         cgroup::note_reclaimed(slot, reclaimed);
     }
     reclaimed
+}
+
+/// A cgroup of a reclaim's subtree, with the protection memory.min and
+/// memory.low give it against that reclaim.
+struct LinuxMemcgProtection {
+    slot: Slot,
+    usage: u64,
+    min: u64,
+    low: u64,
+}
+
+/// Each cgroup of `root`'s subtree, root first, with its effective
+/// protection as Linux's mem_cgroup_calculate_protection works it out
+/// (without memory_recursiveprot): a child of the root has its own
+/// memory.min and memory.low; one further down, the part of its usage its
+/// setting covers, scaled down when its siblings' protected usage overruns
+/// what their parent is protected for (effective_protection).
+fn linux_memcg_protection(root: Slot) -> Vec<LinuxMemcgProtection> {
+    fn effective(usage: u64, setting: u64, parent: u64, siblings: u64) -> u64 {
+        let protected = usage.min(setting);
+        if siblings > parent && siblings != 0 {
+            (u128::from(protected) * u128::from(parent) / u128::from(siblings)) as u64
+        } else {
+            protected
+        }
+    }
+    fn visit(node: Slot, root: Slot, min: u64, low: u64, out: &mut Vec<LinuxMemcgProtection>) {
+        let mut children = Vec::new();
+        for child in cgroup::children(node) {
+            if children.try_reserve(1).is_err() {
+                return;
+            }
+            children.push(child);
+        }
+        let protected = |limit: Limit| -> u64 {
+            children
+                .iter()
+                .map(|child| cgroup::usage(*child).min(cgroup::limit(*child, limit)))
+                .sum()
+        };
+        let (min_sum, low_sum) = (protected(Limit::Min), protected(Limit::Low));
+        for child in children {
+            let usage = cgroup::usage(child);
+            let (child_min, child_low) = (
+                cgroup::limit(child, Limit::Min),
+                cgroup::limit(child, Limit::Low),
+            );
+            let (emin, elow) = if node == root {
+                (child_min, child_low)
+            } else {
+                (
+                    effective(usage, child_min, min, min_sum),
+                    effective(usage, child_low, low, low_sum),
+                )
+            };
+            if out.try_reserve(1).is_err() {
+                return;
+            }
+            out.push(LinuxMemcgProtection {
+                slot: child,
+                usage,
+                min: emin,
+                low: elow,
+            });
+            visit(child, root, emin, elow, out);
+        }
+    }
+    let mut out = Vec::new();
+    if out.try_reserve(1).is_ok() {
+        out.push(LinuxMemcgProtection {
+            slot: root,
+            usage: cgroup::usage(root),
+            min: 0,
+            low: 0,
+        });
+        visit(root, root, 0, 0, &mut out);
+    }
+    out
+}
+
+/// Where the next page-cache reclaim starts among a subtree's cgroups, so
+/// successive ones spread over them, as Linux's reclaim walks every memcg.
+static LINUX_CACHE_RECLAIM_ROTOR: AtomicU32 = AtomicU32::new(0);
+
+/// Drops up to `pages` (at least a cluster) of the clean page cache charged
+/// to the cgroups of `slot`'s subtree, none below its effective memory.min,
+/// nor below its memory.low unless `below_low`, when each cgroup reclaimed
+/// below it counts a low event (memory.events). The count dropped.
+fn linux_reclaim_page_cache(slot: Slot, pages: u64, below_low: bool) -> u64 {
+    const CLUSTER: u64 = 32;
+    let budget = pages.max(CLUSTER);
+    let root = cgroup::root(linux_execution_instance()).unwrap_or(NO_SLOT);
+    let cgroups = linux_memcg_protection(slot);
+    if cgroups.is_empty() {
+        return 0;
+    }
+    let start = LINUX_CACHE_RECLAIM_ROTOR.fetch_add(1, Ordering::Relaxed) as usize % cgroups.len();
+    let mut dropped = 0;
+    for index in (start..cgroups.len()).chain(0..start) {
+        if dropped >= budget {
+            break;
+        }
+        let cgroup = &cgroups[index];
+        let protection = if below_low {
+            cgroup.min
+        } else {
+            cgroup.min.max(cgroup.low)
+        };
+        let room = cgroup.usage.saturating_sub(protection);
+        if room == 0 {
+            continue;
+        }
+        let wanted = cgroup.slot;
+        let taken =
+            crate::linux_blockfs::reclaim_page_cache((budget - dropped).min(room), |memcg| {
+                (if memcg == NO_SLOT { root } else { memcg }) == wanted
+            });
+        if taken != 0 && below_low && cgroup.usage <= cgroup.low {
+            cgroup::note_event(cgroup.slot, Event::Low);
+        }
+        dropped += taken;
+    }
+    dropped
 }
 
 /// Reclaims up to `budget` pages of process `pid`, which is not running.

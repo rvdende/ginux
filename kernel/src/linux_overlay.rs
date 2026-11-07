@@ -2606,6 +2606,45 @@ pub(crate) fn release_unmapped_cached_pages(handle: Handle, file: Handle) -> usi
     released
 }
 
+/// Drops up to `budget` frames of page cache `handle` that no mapping maps
+/// and whose memory cgroup charge `wanted` takes; the count dropped. The
+/// caller knows they are clean (no shared mapping of the file).
+pub(crate) fn release_charged_cached_pages(
+    handle: Handle,
+    budget: u64,
+    wanted: &impl Fn(u16) -> bool,
+) -> u64 {
+    let Some(node) = node_mut(handle).filter(|node| node.paged()) else {
+        return 0;
+    };
+    let mut released = 0;
+    let mut page = node.first_page;
+    while page != FrameLease::EMPTY && released < budget {
+        let Some(entries) = frame_index_page_mut(page) else {
+            break;
+        };
+        for entry in &mut entries.frames {
+            if released >= budget {
+                break;
+            }
+            if *entry != FrameLease::EMPTY
+                && swapped_entry(*entry).is_none()
+                && !memory::frame_is_shared(*entry)
+                && wanted(memory::frame_charge(*entry))
+                && memory::scrub_and_release_frames(
+                    FrameOwner::KERNEL,
+                    core::slice::from_ref(entry),
+                )
+            {
+                *entry = FrameLease::EMPTY;
+                released += 1;
+            }
+        }
+        page = entries.next;
+    }
+    released
+}
+
 /// Whether a process maps `handle`'s file shared.
 pub(crate) fn mapped_shared(handle: Handle) -> bool {
     live().is_some_and(|overlay| handle_mapped(overlay, handle))
@@ -2899,13 +2938,18 @@ fn memfd_page(node: &mut Node, index: usize, allocate: bool) -> Option<FrameLeas
         page = entries.next;
     }
     let entry = &mut frame_index_page_mut(page)?.frames[index % FRAME_INDEX_CAPACITY];
+    // A volume's page cache is file memory; tmpfs, memfd and shmem pages
+    // are shared memory (memory.stat).
+    let shmem = !(node.origin == Origin::Pseudo && matches!(node.data, Data::Paged));
     if *entry == FrameLease::EMPTY {
         allocate.then_some(())?;
         *entry = allocate_zeroed_frame()?;
+        memory::charge_cache_frame(*entry, shmem);
     }
     // A page out in swap comes back first, whatever wants it.
     if let Some(swap) = swapped_entry(*entry) {
         let frame = allocate_zeroed_frame()?;
+        memory::charge_cache_frame(frame, shmem);
         if !crate::arch::x86_64::cpu::linux_swap_read_page(swap, frame) {
             let _ = memory::scrub_and_release_frames(FrameOwner::KERNEL, &[frame]);
             return None;
@@ -3183,6 +3227,8 @@ fn release_xattr_pages(mut page: FrameLease) -> bool {
 fn ensure_data_pages(node: &mut Node, required: usize) -> Option<()> {
     while node.page_count < required {
         let next = allocate_data_page()?;
+        // A tmpfs file's data is shared memory, charged to its writer.
+        memory::charge_cache_frame(next, true);
         if node.first_page == FrameLease::EMPTY {
             node.first_page = next;
             node.cached_page = next;

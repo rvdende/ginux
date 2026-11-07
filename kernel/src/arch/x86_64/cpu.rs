@@ -56,7 +56,9 @@ use execution::{
 use fanotify::*;
 pub(crate) use linux_abi::*;
 use linux_cgroupfs::*;
-pub(crate) use linux_cgroupfs::{charge_linux_user_pages, reclaim_linux_user_pages};
+pub(crate) use linux_cgroupfs::{
+    charge_linux_user_pages, linux_cache_charge_slot, reclaim_linux_user_pages,
+};
 use linux_fsmount::*;
 use linux_futex::*;
 use linux_hugetlb::*;

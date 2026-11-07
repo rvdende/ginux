@@ -78,6 +78,10 @@ struct Memcg {
     swap_peak: AtomicU64,
     /// Pages charged to this cgroup itself (not below it).
     local_usage: AtomicU64,
+    /// Of `usage`, page cache (a volume's file pages) and shared memory
+    /// (tmpfs files, memfds, MAP_SHARED anonymous memory).
+    file: AtomicU64,
+    shmem: AtomicU64,
     reclaimed: AtomicU64,
     events: [AtomicU64; EVENT_COUNT],
     local_events: [AtomicU64; EVENT_COUNT],
@@ -105,6 +109,8 @@ impl Memcg {
             swap_usage: AtomicU64::new(0),
             swap_peak: AtomicU64::new(0),
             local_usage: AtomicU64::new(0),
+            file: AtomicU64::new(0),
+            shmem: AtomicU64::new(0),
             reclaimed: AtomicU64::new(0),
             events: [const { AtomicU64::new(0) }; EVENT_COUNT],
             local_events: [const { AtomicU64::new(0) }; EVENT_COUNT],
@@ -125,6 +131,8 @@ impl Memcg {
             &self.swap_usage,
             &self.swap_peak,
             &self.local_usage,
+            &self.file,
+            &self.shmem,
             &self.reclaimed,
         ] {
             counter.store(0, Ordering::Relaxed);
@@ -481,6 +489,49 @@ pub(crate) fn swap_events(slot: Slot) -> [u64; 3] {
     })
 }
 
+/// What a charged page holds, for memory.stat.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum PageKind {
+    Anon,
+    /// Page cache: a volume's file page.
+    File,
+    /// Shared memory: tmpfs, memfd and MAP_SHARED anonymous pages.
+    Shmem,
+}
+
+/// Charges a page of `kind` to `slot` and its ancestors whatever the limits
+/// say (the page cache and shared memory are filled where reclaim cannot
+/// run; the next charge past memory.max reclaims them).
+pub(crate) fn charge_kind(slot: Slot, kind: PageKind) {
+    force_charge(slot, 1);
+    for memcg in lineage(slot) {
+        match kind {
+            PageKind::Anon => {}
+            PageKind::File => {
+                memcg.file.fetch_add(1, Ordering::AcqRel);
+            }
+            PageKind::Shmem => {
+                memcg.shmem.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
+}
+
+/// Gives back a page of `kind` charged to `slot`, as its frame is freed.
+pub(crate) fn uncharge_kind(slot: Slot, kind: PageKind) {
+    for memcg in lineage(slot) {
+        let counter = match kind {
+            PageKind::Anon => continue,
+            PageKind::File => &memcg.file,
+            PageKind::Shmem => &memcg.shmem,
+        };
+        let _ = counter.try_update(Ordering::AcqRel, Ordering::Acquire, |pages| {
+            Some(pages.saturating_sub(1))
+        });
+    }
+    uncharge(slot, 1);
+}
+
 /// Records an event of `slot` in its `memory.events.local` and in the
 /// hierarchical `memory.events` of it and its ancestors.
 pub(crate) fn note_event(slot: Slot, event: Event) {
@@ -577,13 +628,20 @@ pub(crate) fn events(slot: Slot, local: bool) -> MemoryEvents {
     }
 }
 
-/// `memory.stat`: every page Ginux charges is anonymous memory.
+/// `memory.stat`: anonymous memory, page cache and shared memory.
 pub(crate) fn stat(slot: Slot) -> MemoryStat {
     let Some(memcg) = memcg(slot) else {
         return MemoryStat::default();
     };
+    let file = memcg.file.load(Ordering::Acquire);
+    let shmem = memcg.shmem.load(Ordering::Acquire);
     MemoryStat {
-        anon: memcg.usage.load(Ordering::Acquire),
+        anon: memcg
+            .usage
+            .load(Ordering::Acquire)
+            .saturating_sub(file + shmem),
+        file,
+        shmem,
         swapped: memcg.swap_usage.load(Ordering::Acquire),
         reclaimed: memcg.reclaimed.load(Ordering::Relaxed),
         ..MemoryStat::default()

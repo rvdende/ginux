@@ -601,7 +601,8 @@ impl FrameAllocator {
         // The page's memory cgroup is charged until its last mapping goes.
         let charge = self.take_charge(index);
         if charge != 0 {
-            crate::linux_cgroup::uncharge(charge, 1);
+            let (slot, kind) = charge_parts(charge);
+            crate::linux_cgroup::uncharge_kind(slot, kind);
         }
         let metadata = self.metadata(index);
         let slot = (metadata & META_OWNER) as usize;
@@ -952,7 +953,57 @@ pub(crate) fn frame_charge(frame: FrameLease) -> u16 {
         let allocator = storage.assume_init_ref();
         allocator
             .index(frame.address)
-            .map_or(0, |index| allocator.charge(index))
+            .map_or(0, |index| charge_parts(allocator.charge(index)).0)
+    }
+}
+
+/// A frame's charge: the memory cgroup's slot, and in the top bits what the
+/// page holds (memory.stat's anon, file or shmem).
+const CHARGE_FILE: u16 = 1 << 14;
+const CHARGE_SHMEM: u16 = 1 << 15;
+const CHARGE_SLOT: u16 = CHARGE_FILE - 1;
+const _: () = assert!(crate::linux_cgroup::SLOT_LIMIT <= CHARGE_SLOT as usize);
+
+fn charge_parts(charge: u16) -> (u16, crate::linux_cgroup::PageKind) {
+    use crate::linux_cgroup::PageKind;
+    let kind = if charge & CHARGE_FILE != 0 {
+        PageKind::File
+    } else if charge & CHARGE_SHMEM != 0 {
+        PageKind::Shmem
+    } else {
+        PageKind::Anon
+    };
+    (charge & CHARGE_SLOT, kind)
+}
+
+/// Charges a page-cache or shared-memory `frame` the kernel allocated for a
+/// file to the current process's memory cgroup, as Linux charges a page
+/// cache page to the cgroup of the task that brings it in; a frame charged
+/// already keeps its charge.
+pub(crate) fn charge_cache_frame(frame: FrameLease, shmem: bool) {
+    let Some(slot) = crate::arch::x86_64::cpu::linux_cache_charge_slot() else {
+        return;
+    };
+    if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) {
+        return;
+    }
+    let mut storage = PHYSICAL_MEMORY.allocator.lock();
+    // SAFETY: as for allocate_frames.
+    unsafe {
+        let allocator = storage.assume_init_mut();
+        let Some(index) = allocator.index(frame.address) else {
+            return;
+        };
+        if allocator.charge(index) != 0 || !allocator.lease_matches(frame, None) {
+            return;
+        }
+        let (kind, bits) = if shmem {
+            (crate::linux_cgroup::PageKind::Shmem, CHARGE_SHMEM)
+        } else {
+            (crate::linux_cgroup::PageKind::File, CHARGE_FILE)
+        };
+        crate::linux_cgroup::charge_kind(slot, kind);
+        allocator.set_charge(index, slot | bits);
     }
 }
 
