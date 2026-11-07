@@ -8,6 +8,5 @@ clone09 TBROK
 ioctl_loop05 TBROK
 msgstress01 TBROK
 prot_hsymlinks TBROK
-userfaultfd03 TBROK
 futex_cmp_requeue01 TBROK
 add_key05 TBROK

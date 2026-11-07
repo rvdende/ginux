@@ -142,6 +142,15 @@ register bits, including epoll registration and descriptor cleanup.
 `dup`, `dup2`, `dup3` and `fcntl(F_DUPFD[_CLOEXEC])` of an epoll descriptor give
 another descriptor for the same epoll instance, as tokio's I/O driver expects;
 closing the original moves the instance's watches to a remaining duplicate.
+A userfaultfd (`kernel/src/linux_userfaultfd.rs`) registers ranges of its
+process's memory for missing-page, write-protect and minor (shared or overlay
+file page) faults. A user-mode fault there queues a `uffd_msg` for read and
+poll and the faulting thread waits, trying the access again as it is
+rescheduled, until UFFDIO_COPY, ZEROPAGE, MOVE, CONTINUE, POISON,
+WRITEPROTECT or WAKE resolves it. The kernel's own accesses are never
+reported, the fork, remap, remove and unmap events are not offered, and a
+forked child's memory is not registered. Without UFFD_USER_MODE_ONLY the
+system call needs CAP_SYS_PTRACE; `/dev/userfaultfd` needs only its mode.
 An eventfd or timerfd is one open file (`kernel/src/linux_event_files.rs`):
 its counter, timer and `O_NONBLOCK` are shared by every descriptor `dup`,
 `F_DUPFD` and fork make from it, and freed with the last, as on Linux.

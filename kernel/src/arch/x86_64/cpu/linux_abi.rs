@@ -704,7 +704,6 @@ pub(super) const LINUX_DEVICE_RANDOM: u16 = LINUX_DEVICE_ZERO | 1 << 8;
 pub(super) const LINUX_DEVICE_FULL: u16 = LINUX_DEVICE_ZERO | 1 << 9;
 pub(super) const LINUX_DEVICE_CONSOLE: u16 = 1 << 3;
 pub(super) const LINUX_DEVICE_DIRECTORY: u16 = 1 << 4;
-pub(super) const LINUX_DEVICE_USERFAULTFD: u16 = 1 << 8;
 pub(super) const LINUX_DEVICE_FANOTIFY: u16 = 1 << 9;
 pub(super) const LINUX_DEVICE_POSIX_MQ: u16 = 1 << 10;
 pub(super) const LINUX_DEVICE_INOTIFY: u16 = 1 << 11;

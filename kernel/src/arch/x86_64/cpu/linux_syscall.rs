@@ -547,6 +547,15 @@ fn linux_syscall_dispatch(
             if runtime_mode && linux_object_descriptor(first_argument).is_some() =>
         {
             match linux_object_syscall(number, first_argument, buffer, count) {
+                // A userfaultfd's EAGAIN is its own answer, but a blocking
+                // read of it waits for a fault to read.
+                LINUX_EAGAIN if linux_userfaultfd_descriptor(first_argument) => {
+                    if number == LINUX_READ_SYSCALL && !linux_socket_nonblocking(first_argument) {
+                        linux_retry_later_live_return(registers, syscall_return, number)
+                    } else {
+                        LINUX_EAGAIN
+                    }
+                }
                 // An ioctl that waits for the GPU: let the rest of the
                 // domain run, then issue it again.
                 LINUX_EAGAIN if number == LINUX_IOCTL_SYSCALL => {
@@ -852,6 +861,14 @@ fn linux_syscall_dispatch(
             mapped
         }
         LINUX_MUNMAP_SYSCALL => {
+            if runtime_mode {
+                crate::linux_userfaultfd::forget(
+                    linux_execution_instance(),
+                    current_linux_process_pid(),
+                    first_argument,
+                    first_argument.saturating_add(buffer),
+                );
+            }
             // Unmapping the middle of an area makes two of it: at the
             // vm.max_map_count limit that is ENOMEM (munmap04).
             if runtime_mode
@@ -1013,9 +1030,6 @@ fn linux_syscall_dispatch(
             }
             if let Some(result) = linux_file_attributes_ioctl(first_argument, buffer, count) {
                 return result;
-            }
-            if linux_userfaultfd_descriptor(first_argument) {
-                return linux_userfaultfd_ioctl(first_argument, buffer, count);
             }
             if linux_namespace_descriptor(first_argument) {
                 return linux_namespace_ioctl(first_argument, buffer, count);

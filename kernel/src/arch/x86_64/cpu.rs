@@ -19,6 +19,7 @@ mod linux_pty;
 mod linux_signal;
 mod linux_syscall;
 mod linux_time;
+mod linux_userfaultfd;
 pub(crate) use architecture::{
     clear_interrupt_gate, current_cpu_index, current_cpu_index_checked, double_fault_guard_page,
     double_fault_stack_top, install, install_for_cpu, install_interrupt_gate,
@@ -47,6 +48,7 @@ pub(crate) use linux_signal::{
 };
 use linux_syscall::linux_syscall_handler;
 use linux_time::*;
+use linux_userfaultfd::*;
 
 use crate::{
     address_space,
@@ -25438,49 +25440,6 @@ fn verify_linux_fanotify_syscalls() -> bool {
     removed && closed && removed_file && unmapped
 }
 
-fn verify_linux_userfaultfd_syscall() -> bool {
-    const UPPER_REGISTER_BITS: u64 = 1_u64 << 32;
-    let mapping = linux_runtime_mmap(
-        0,
-        PAGE_SIZE as u64,
-        LINUX_PROT_READ | LINUX_PROT_WRITE,
-        LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
-        u64::MAX,
-        0,
-    );
-    if !(LINUX_RUNTIME_DYNAMIC_MMAP_BASE..LINUX_RUNTIME_DYNAMIC_MMAP_BASE + (1 << 39))
-        .contains(&mapping)
-    {
-        return false;
-    }
-    let policy = linux_userfaultfd(0) == LINUX_EPERM && linux_userfaultfd(2) == LINUX_EINVAL;
-    let descriptor = if policy {
-        linux_userfaultfd(UPPER_REGISTER_BITS | 1 | LINUX_O_NONBLOCK | LINUX_O_CLOEXEC)
-    } else {
-        LINUX_EBADF
-    };
-    let opened = descriptor < LINUX_AUX_DESCRIPTOR_LIMIT
-        && linux_descriptor_close_on_exec(descriptor)
-        && linux_descriptor_fcntl(descriptor, LINUX_F_GETFL, 0) == (2 | LINUX_O_NONBLOCK);
-    let mut api = [0_u8; 24];
-    api[..8].copy_from_slice(&0xaa_u64.to_ne_bytes());
-    let negotiated = opened
-        && copy_to_linux_user(mapping, &api)
-        && linux_userfaultfd_ioctl(UPPER_REGISTER_BITS | descriptor, 0xc018_aa3f, mapping) == 0
-        && copy_from_linux_user(mapping, &mut api)
-        && u64::from_ne_bytes(api[..8].try_into().unwrap()) == 0xaa
-        && u64::from_ne_bytes(api[8..16].try_into().unwrap()) == 0
-        && u64::from_ne_bytes(api[16..24].try_into().unwrap()) == 1_u64 << 63;
-    let empty = negotiated
-        && linux_descriptor_read(descriptor, mapping + 64, 32) == LINUX_EAGAIN
-        && linux_userfaultfd_ioctl(descriptor, 0, mapping) == LINUX_ENOTTY;
-    let closed = descriptor < LINUX_AUX_DESCRIPTOR_LIMIT
-        && linux_descriptor_close(descriptor) == 0
-        && linux_descriptor_read(descriptor, mapping, 1) == LINUX_EBADF;
-    let unmapped = linux_runtime_munmap(mapping, PAGE_SIZE as u64) == 0;
-    empty && closed && unmapped
-}
-
 fn verify_linux_keyring_syscalls() -> bool {
     let mapping = linux_runtime_mmap(
         0,
@@ -28212,6 +28171,7 @@ fn release_linux_process_shared_mappings(pid: u32) {
     crate::linux_overlay::remove_process_shared_mappings(pid);
     crate::linux_overlay::release_unmapped_shmem();
     crate::linux_areas::forget(linux_execution_instance(), pid);
+    crate::linux_userfaultfd::forget(linux_execution_instance(), pid, 0, 1 << 47);
 }
 
 /// Records the segments exec mapped for the new program: the executable's
@@ -29595,7 +29555,22 @@ fn linux_runtime_madvise(address: u64, length: u64, advice: u64) -> u64 {
         }
         // A shared mapping's page keeps its contents for the other mappings
         // and is read back unchanged, as Linux rereads it from the object.
+        // One a userfaultfd watches for minor faults is unmapped, so its
+        // next touch maps it again through that fault.
         if state.shared {
+            if linux_userfaultfd_minor_page(page_address) {
+                let removed = address_space::remove_current_linux_runtime_page(page_address);
+                if !release_linux_runtime_page(removed)
+                    || address_space::reserve_current_linux_past_eof_page(
+                        page_address,
+                        state.protection,
+                        false,
+                    )
+                    .is_none()
+                {
+                    return LINUX_EINVAL;
+                }
+            }
             continue;
         }
         if state.frame.is_some() {
@@ -45420,6 +45395,7 @@ pub(crate) fn linux_release_objects() {
         crate::linux_ramdisk::release(class, id);
         crate::linux_kmsg::release(class, id);
         crate::linux_pty::release(class, id);
+        linux_userfaultfd_release(class, id);
     }
 }
 
@@ -45825,6 +45801,12 @@ fn linux_object_syscall(number: u64, descriptor: u64, buffer: u64, count: u64) -
         // opening the device was the permission check.
         (LINUX_IOCTL_SYSCALL, LINUX_USERFAULTFD_DEVICE_CLASS) if buffer & 0xffff_ffff == 0xaa00 => {
             linux_userfaultfd_create(count, true)
+        }
+        (LINUX_IOCTL_SYSCALL, crate::linux_userfaultfd::CLASS_CONTEXT) => {
+            linux_userfaultfd_ioctl(descriptor, buffer, count)
+        }
+        (LINUX_READ_SYSCALL, crate::linux_userfaultfd::CLASS_CONTEXT) => {
+            linux_userfaultfd_read(descriptor, buffer, count)
         }
         // Host memory is coherent: there is nothing to flush.
         (LINUX_IOCTL_SYSCALL, crate::linux_drm::CLASS_DMABUF)
@@ -48414,72 +48396,6 @@ fn linux_inotify_descriptor(descriptor: u64) -> bool {
     linux_device_descriptor(descriptor) & !3 == LINUX_DEVICE_INOTIFY
 }
 
-fn linux_userfaultfd_descriptor(descriptor: u64) -> bool {
-    linux_device_descriptor(descriptor) & !3 == LINUX_DEVICE_USERFAULTFD
-}
-
-fn linux_userfaultfd(flags: u64) -> u64 {
-    linux_userfaultfd_create(flags, false)
-}
-
-/// A userfaultfd with `flags`; `device` when /dev/userfaultfd asks, which
-/// needs no UFFD_USER_MODE_ONLY.
-fn linux_userfaultfd_create(flags: u64, device: bool) -> u64 {
-    const USER_MODE_ONLY: u64 = 1;
-    const VALID_FLAGS: u64 = USER_MODE_ONLY | LINUX_O_NONBLOCK | LINUX_O_CLOEXEC;
-    let flags = u64::from(flags as u32);
-    if flags & !VALID_FLAGS != 0 {
-        return LINUX_EINVAL;
-    }
-    // Domains intentionally lack host ptrace authority. Linux requires either
-    // that authority or UFFD_USER_MODE_ONLY when unprivileged userfaultfd is
-    // disabled.
-    if flags & USER_MODE_ONLY == 0 && !device {
-        return LINUX_EPERM;
-    }
-    let Some(descriptor) = (LINUX_AUX_DESCRIPTOR_FIRST..LINUX_AUX_DESCRIPTOR_LIMIT)
-        .find(|descriptor| linux_aux_descriptor_free(*descriptor))
-    else {
-        return LINUX_EMFILE;
-    };
-    let index = (descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
-    X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index]
-        .store(LINUX_DEVICE_USERFAULTFD | 3, Ordering::SeqCst);
-    X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index]
-        .store((flags & LINUX_O_NONBLOCK) as u32, Ordering::SeqCst);
-    set_linux_descriptor_close_on_exec(descriptor, flags & LINUX_O_CLOEXEC != 0);
-    descriptor
-}
-
-fn linux_userfaultfd_ioctl(descriptor: u64, request: u64, argument: u64) -> u64 {
-    const UFFDIO_API: u64 = 0xc018_aa3f;
-    const API: u64 = 0xaa;
-    let descriptor = u64::from(descriptor as u32);
-    // The request is an unsigned int: libc may pass it sign-extended.
-    let request = u64::from(request as u32);
-    if !linux_userfaultfd_descriptor(descriptor) {
-        return LINUX_EBADF;
-    }
-    if request != UFFDIO_API {
-        return LINUX_ENOTTY;
-    }
-    let mut api = [0_u8; 24];
-    if !copy_from_linux_user(argument, &mut api) {
-        return LINUX_EFAULT;
-    }
-    if u64::from_ne_bytes(api[..8].try_into().unwrap()) != API
-        || u64::from_ne_bytes(api[8..16].try_into().unwrap()) != 0
-    {
-        return LINUX_EINVAL;
-    }
-    api[16..24].copy_from_slice(&(1_u64 << 63).to_ne_bytes());
-    if copy_to_linux_user(argument, &api) {
-        0
-    } else {
-        LINUX_EFAULT
-    }
-}
-
 fn linux_fanotify_descriptor(descriptor: u64) -> bool {
     linux_device_descriptor(descriptor) & !3 == LINUX_DEVICE_FANOTIFY
 }
@@ -49802,6 +49718,10 @@ fn linux_descriptor_poll_events(descriptor: i32, requested: u16) -> u16 {
     }
     if let Some((end, index)) = linux_pty_descriptor(descriptor) {
         return linux_pty_poll_events(end, index, requested);
+    }
+    if let Some((crate::linux_userfaultfd::CLASS_CONTEXT, id)) = linux_object_descriptor(descriptor)
+    {
+        return linux_userfaultfd_poll_events(descriptor, id, requested);
     }
     if let Some(slot) = linux_socket_slot(descriptor) {
         if let Some((class, id)) = crate::linux_socket::object(slot) {
@@ -56958,6 +56878,9 @@ fn linux_statfs_descriptor_kind(descriptor: u64) -> LinuxFilesystemKind {
     if state & LINUX_DEVICE_PIPE != 0 || linux_pipe_descriptor(descriptor) {
         return LinuxFilesystemKind::Pipe;
     }
+    if linux_userfaultfd_descriptor(descriptor) {
+        return LinuxFilesystemKind::Anonymous;
+    }
     if state & LINUX_DEVICE_SOCKET != 0 {
         return LinuxFilesystemKind::Socket;
     }
@@ -56965,8 +56888,7 @@ fn linux_statfs_descriptor_kind(descriptor: u64) -> LinuxFilesystemKind {
         || linux_eventfd_descriptor(descriptor)
         || linux_timerfd_descriptor(descriptor)
         || state
-            & (LINUX_DEVICE_USERFAULTFD
-                | LINUX_DEVICE_FANOTIFY
+            & (LINUX_DEVICE_FANOTIFY
                 | LINUX_DEVICE_POSIX_MQ
                 | LINUX_DEVICE_INOTIFY
                 | LINUX_DEVICE_PIDFD
@@ -57745,7 +57667,9 @@ fn linux_descriptor_link_target(
         crate::linux_ramdisk::CLASS_DISK => crate::linux_ramdisk::minor(id),
         _ => None,
     });
-    let (prefix, numbered): (&[u8], bool) = if linux_pipe_descriptor(descriptor) {
+    let (prefix, numbered): (&[u8], bool) = if linux_userfaultfd_descriptor(descriptor) {
+        (b"anon_inode:[userfaultfd]", false)
+    } else if linux_pipe_descriptor(descriptor) {
         (b"pipe:[", true)
     } else if let Some((class, _)) = block {
         match class {
@@ -57768,8 +57692,6 @@ fn linux_descriptor_link_target(
         (b"anon_inode:inotify", false)
     } else if linux_pidfd_descriptor(descriptor) {
         (b"anon_inode:[pidfd]", false)
-    } else if linux_userfaultfd_descriptor(descriptor) {
-        (b"anon_inode:[userfaultfd]", false)
     } else if linux_fanotify_descriptor(descriptor) {
         (b"anon_inode:[fanotify]", false)
     } else if linux_io_uring_descriptor(descriptor) {
@@ -62774,6 +62696,13 @@ fn handle_user_fault(frame: *mut UserFaultFrame) -> u64 {
     if fault_domain.is_none()
         && X86_RUNTIME.ELF_PROBE_ACTIVE.load(Ordering::SeqCst)
         && refresh_linux_runtime_translation(fault_metadata)
+    {
+        return 0;
+    }
+    // A page a userfaultfd context resolves: the thread waits for it.
+    if fault_domain.is_none()
+        && X86_RUNTIME.ELF_PROBE_ACTIVE.load(Ordering::SeqCst)
+        && linux_userfault(frame, fault_metadata)
     {
         return 0;
     }

@@ -51,6 +51,9 @@ impl LockRank {
     /// while held, and below inotify, which removing a slave's node under it
     /// may reach.
     pub(crate) const PTYS: Self = Self(158);
+    /// userfaultfd contexts; ranks below the heap so their tables may grow
+    /// while held.
+    pub(crate) const USERFAULTFD: Self = Self(159);
     /// The record (fcntl) lock table; ranks below the heap so the table may
     /// grow while held.
     pub(crate) const RECORD_LOCKS: Self = Self(160);

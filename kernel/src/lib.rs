@@ -50,6 +50,7 @@ mod linux_strace;
 mod linux_sysv_ipc;
 mod linux_tmpfs;
 mod linux_user;
+mod linux_userfaultfd;
 mod machine_control;
 mod manifest;
 mod memory;

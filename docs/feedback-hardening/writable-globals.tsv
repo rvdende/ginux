@@ -458,6 +458,8 @@ interior-mutable	kernel/src/linux_loop.rs	LOOPS	domain-runtime	allowlist	none	ra
 interior-mutable	kernel/src/linux_loop.rs	MAKING_NODES	domain-runtime	allowlist	none	atomic-reentrancy-guard
 interior-mutable	kernel/src/linux_ramdisk.rs	RAM_DISKS	domain-runtime	allowlist	none	ranked-ram-disks-and-opens
 interior-mutable	kernel/src/linux_pty.rs	PTYS	domain-runtime	allowlist	none	ranked-pty-pairs-owned-per-domain
+interior-mutable	kernel/src/linux_userfaultfd.rs	CONTEXTS	domain-runtime	allowlist	none	ranked-userfaultfd-contexts-owned-per-process
+interior-mutable	kernel/src/linux_userfaultfd.rs	LIVE	domain-runtime	allowlist	none	atomic-live-context-count
 interior-mutable	kernel/src/drivers/virtio_gpu.rs	THREE_D_CAPSETS	platform-device	allowlist	none	atomic-published-at-activation
 interior-mutable	kernel/src/drivers/virtio_gpu.rs	PCI_ADDRESS	platform-device	allowlist	none	atomic-published-at-activation
 interior-mutable	kernel/src/linux_mount.rs	MOUNT_RUNTIME	domain-runtime	allowlist	none	explicit-domain-mount-runtime-owner-root
