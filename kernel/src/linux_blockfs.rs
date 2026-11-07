@@ -1583,6 +1583,14 @@ pub(crate) fn extents(handle: Handle, start: u64, length: u64) -> Option<Vec<gin
     volume.filesystem.extents(inode, start, length).ok()
 }
 
+/// The volume `handle`'s file is on, and the largest file it holds
+/// (`s_maxbytes`): copy_file_range copies within one filesystem only.
+pub(crate) fn volume_of(handle: Handle) -> Option<(u64, u64)> {
+    let mut table = VOLUMES.lock();
+    let (volume, _) = table.of(handle)?;
+    Some((volume.id, volume.filesystem.max_file_size()))
+}
+
 /// statfs(2) of the volume `handle`'s file is on.
 pub(crate) fn statfs_of(handle: Handle) -> Option<ginux_ext2::Statfs> {
     let mut table = VOLUMES.lock();

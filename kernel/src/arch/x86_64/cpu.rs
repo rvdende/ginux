@@ -44709,6 +44709,44 @@ fn linux_descriptors_same_file(
             .is_some_and(|(first, second)| first == second)
 }
 
+/// One end of a copy_file_range(2): its overlay handle, whether it is a
+/// directory, whether a regular file, and its size.
+struct LinuxCopyEnd {
+    handle: Option<crate::linux_overlay::Handle>,
+    directory: bool,
+    regular: bool,
+    size: u64,
+}
+
+fn linux_copy_end(descriptor: u64, state: u16) -> LinuxCopyEnd {
+    let handle = linux_overlay_descriptor_handle(descriptor);
+    if let Some(metadata) = handle.and_then(crate::linux_overlay::metadata) {
+        return LinuxCopyEnd {
+            handle,
+            directory: metadata.kind == crate::linux_overlay::NodeKind::Directory,
+            regular: metadata.kind == crate::linux_overlay::NodeKind::File,
+            size: metadata.size as u64,
+        };
+    }
+    if let Some(file) = linux_tmp_descriptor_handle(descriptor, state) {
+        return LinuxCopyEnd {
+            handle: None,
+            directory: false,
+            regular: true,
+            size: linux_tmpfs::size(file).unwrap_or(0) as u64,
+        };
+    }
+    let entry = linux_rootfs_entry(descriptor);
+    let directory =
+        entry.is_some_and(|entry| entry.kind == crate::published_rootfs::EntryKind::Directory);
+    LinuxCopyEnd {
+        handle: None,
+        directory,
+        regular: entry.is_some() && !directory,
+        size: entry.map_or(0, |entry| entry.data.len() as u64),
+    }
+}
+
 fn linux_copy_file_range(
     input: u64,
     input_offset_pointer: u64,
@@ -44728,6 +44766,16 @@ fn linux_copy_file_range(
     }
     let input_state = linux_device_descriptor(input);
     let output_state = linux_device_descriptor(output);
+    // generic_file_rw_checks: directories, then whatever is no regular
+    // file, then the open modes.
+    let source = linux_copy_end(input, input_state);
+    let target = linux_copy_end(output, output_state);
+    if source.directory || target.directory {
+        return LINUX_EISDIR;
+    }
+    if !source.regular || !target.regular {
+        return LINUX_EINVAL;
+    }
     if !matches!(input_state & 3, LINUX_DESCRIPTOR_INPUT | 3)
         || !matches!(output_state & 3, LINUX_DESCRIPTOR_OUTPUT | 3)
     {
@@ -44736,20 +44784,26 @@ fn linux_copy_file_range(
     if linux_socket_flags(output).is_some_and(|flags| flags & LINUX_O_APPEND as u32 != 0) {
         return LINUX_EBADF;
     }
-    let input_is_regular = linux_overlay_descriptor_handle(input).is_some()
-        || linux_rootfs_descriptor(input) != 0
-        || linux_tmp_descriptor_handle(input, input_state).is_some();
-    let output_is_regular = linux_overlay_descriptor_handle(output).is_some()
-        || linux_rootfs_descriptor(output) != 0
-        || linux_tmp_descriptor_handle(output, output_state).is_some();
-    if !input_is_regular || !output_is_regular {
-        return LINUX_EINVAL;
-    }
     if input_offset_pointer != 0 && input_offset_pointer == output_offset_pointer {
         return LINUX_EINVAL;
     }
-    if linux_descriptors_same_file(input, output, input_state, output_state) {
-        return LINUX_EINVAL;
+    // generic_copy_file_checks: one filesystem (neither ext4 nor tmpfs
+    // copies across superblocks), an output that may change, offsets
+    // that do not wrap, the input's end and the output's size limits, and
+    // no overlap within one file.
+    let volume = |handle: Option<crate::linux_overlay::Handle>| {
+        handle.and_then(crate::linux_blockfs::volume_of)
+    };
+    let (source_volume, target_volume) = (volume(source.handle), volume(target.handle));
+    if source_volume.map(|(id, _)| id) != target_volume.map(|(id, _)| id) {
+        return LINUX_EXDEV;
+    }
+    if target
+        .handle
+        .and_then(crate::linux_overlay::metadata)
+        .is_some_and(|metadata| metadata.attributes & LINUX_FS_IMMUTABLE_FL != 0)
+    {
+        return LINUX_EPERM;
     }
     let (mut input_offset, explicit_input) =
         match linux_file_range_offset(input_offset_pointer, input) {
@@ -44761,12 +44815,30 @@ fn linux_copy_file_range(
             Ok(offset) => offset,
             Err(error) => return error,
         };
-    let Ok(requested) = usize::try_from(length) else {
-        return LINUX_EFBIG;
+    if (input_offset as u64).checked_add(length).is_none()
+        || (output_offset as u64).checked_add(length).is_none()
+    {
+        return LINUX_EOVERFLOW;
+    }
+    let mut count = length.min(source.size.saturating_sub(input_offset as u64));
+    count = match linux_file_write_limit(output_offset, count as usize) {
+        Ok(allowed) => allowed as u64,
+        Err(error) => return error,
     };
-    if requested > isize::MAX as usize {
+    let largest = target_volume.map_or(i64::MAX as u64, |(_, largest)| largest);
+    if output_offset as u64 >= largest {
+        return LINUX_EFBIG;
+    }
+    count = count.min(largest - output_offset as u64);
+    if linux_descriptors_same_file(input, output, input_state, output_state)
+        && (output_offset as u64) + count > input_offset as u64
+        && (output_offset as u64) < input_offset as u64 + count
+    {
         return LINUX_EINVAL;
     }
+    let Ok(requested) = usize::try_from(count) else {
+        return LINUX_EFBIG;
+    };
     let mut buffer = [0_u8; PAGE_SIZE];
     let mut copied = 0_usize;
     let mut terminal_error = 0;
