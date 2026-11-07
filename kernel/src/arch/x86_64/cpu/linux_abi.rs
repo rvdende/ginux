@@ -829,7 +829,7 @@ pub(super) const LINUX_AIO_MAX_NR: u64 = 65_536;
 pub(super) const LINUX_MAX_MAP_COUNT: usize = 65_530;
 // threads-max below is linux_process::PROCESS_LIMIT.
 const _: () = assert!(crate::linux_process::PROCESS_LIMIT == 4096);
-pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 57] = linux_numbered_sysctls([
+pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 58] = linux_numbered_sysctls([
     // The most memory areas a process may have (LINUX_MAX_MAP_COUNT).
     (b"sys/vm/max_map_count", b"65530\n"),
     // Writing 1, 2 or 3 drops the volumes' page caches (linux_blockfs);
@@ -888,6 +888,11 @@ pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 57] = linux_numbered_
     (b"sys/net/ipv4/conf/all/tag", b"0\n"),
     (b"sys/net/ipv4/conf/default/tag", b"0\n"),
     (b"sys/net/ipv4/conf/lo/tag", b"0\n"),
+    // The groups that may make ping sockets (ICMP and ICMPv6 SOCK_DGRAM),
+    // a pair of gids, each network namespace's own; every group may, as
+    // systemd-based distributions set it (Linux's own default, "1 0", lets
+    // none).
+    (LINUX_PING_GROUP_RANGE, b"0\t2147483647\n"),
     (b"sys/fs/pipe-user-pages-soft", b"16384\n"),
     // Seconds a lease holder has to give up its lease (fcntl33 saves it).
     (b"sys/fs/lease-break-time", b"45\n"),
@@ -1075,6 +1080,10 @@ pub(super) const LINUX_FILE_PROC_PROCESS_ENVIRON: u16 =
 pub(super) const LINUX_PROC_FILE_MAX_NODE: u16 = 0xe800;
 pub(super) const LINUX_FILE_PROC_FILE_MAX: u16 = LINUX_FILE_MASK | LINUX_PROC_FILE_MAX_NODE;
 pub(super) const LINUX_PROC_NR_OPEN_NODE: u16 = linux_proc_sysctl_node_named(b"sys/fs/nr_open");
+/// `/proc/sys/net/ipv4/ping_group_range`, a two-number value.
+pub(super) const LINUX_PING_GROUP_RANGE: &[u8] = b"sys/net/ipv4/ping_group_range";
+/// The largest gid ping_group_range takes (Linux's GID_T_MAX).
+pub(super) const LINUX_PING_GROUP_MAX: i64 = 0x7fff_ffff;
 pub(super) const LINUX_FILE_PROC_NR_OPEN: u16 = LINUX_FILE_MASK | LINUX_PROC_NR_OPEN_NODE;
 pub(super) const LINUX_PROC_OOM_SCORE_ADJ_NODE: u16 = 0xe600;
 /// `/proc/PID/timens_offsets`: the offsets of the time namespace PID's

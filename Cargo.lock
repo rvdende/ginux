@@ -495,6 +495,7 @@ dependencies = [
  "ginux-native-abi",
  "ginux-oci",
  "ginux-oci-cache",
+ "ginux-rtnetlink",
  "ginux-seccomp",
  "ginux-tty",
  "ginux-usb-audio",
@@ -577,6 +578,10 @@ dependencies = [
 
 [[package]]
 name = "ginux-protocol-state"
+version = "0.1.0"
+
+[[package]]
+name = "ginux-rtnetlink"
 version = "0.1.0"
 
 [[package]]

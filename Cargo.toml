@@ -15,6 +15,7 @@ members = [
     "crates/oci",
     "crates/oci-cache",
     "crates/protocol-state",
+    "crates/rtnetlink",
     "crates/runtime-memory",
     "crates/seccomp",
     "crates/tty",

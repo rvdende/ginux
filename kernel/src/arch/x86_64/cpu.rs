@@ -24,6 +24,7 @@ mod linux_numa;
 mod linux_poll;
 mod linux_pty;
 mod linux_quota;
+mod linux_rtnetlink;
 mod linux_security;
 mod linux_signal;
 mod linux_syscall;
@@ -58,6 +59,7 @@ use linux_numa::*;
 use linux_poll::*;
 use linux_pty::*;
 use linux_quota::*;
+use linux_rtnetlink::*;
 use linux_security::*;
 use linux_signal::*;
 pub(crate) use linux_signal::{
@@ -13569,6 +13571,7 @@ fn linux_socket_ioctl(descriptor: u64, request: u64, argument: u64) -> Option<u6
     const SIOCSIFMTU: u64 = 0x8922;
     const SIOCGIFHWADDR: u64 = 0x8927;
     const SIOCGIFINDEX: u64 = 0x8933;
+    const SIOCGIFTXQLEN: u64 = 0x8942;
     const IFREQ_SIZE: usize = 40;
     let request = u64::from(request as u32);
     if !matches!(
@@ -13584,6 +13587,7 @@ fn linux_socket_ioctl(descriptor: u64, request: u64, argument: u64) -> Option<u6
             | SIOCSIFMTU
             | SIOCGIFHWADDR
             | SIOCGIFINDEX
+            | SIOCGIFTXQLEN
     ) {
         return None;
     }
@@ -13667,7 +13671,8 @@ fn linux_socket_ioctl(descriptor: u64, request: u64, argument: u64) -> Option<u6
         }
         SIOCGIFFLAGS => ifreq[16..18].copy_from_slice(&interface.flags.to_ne_bytes()),
         // Changing an interface takes CAP_NET_ADMIN. The domain's own stay
-        // as the kernel set them up; a network namespace's loopback goes up
+        // as the kernel set them up (EOPNOTSUPP for a change; setting what
+        // they have is a success); a network namespace's loopback goes up
         // and down and takes another MTU.
         SIOCSIFFLAGS | SIOCSIFMTU => {
             if !current_linux_credentials().is_some_and(|credentials| {
@@ -13681,6 +13686,14 @@ fn linux_socket_ioctl(descriptor: u64, request: u64, argument: u64) -> Option<u6
                 return Some(LINUX_EINVAL);
             }
             let network = current_linux_namespaces().net;
+            let unchanged = if request == SIOCSIFMTU {
+                mtu == interface.mtu
+            } else {
+                (flags ^ interface.flags) & LINUX_IFF_UP == 0
+            };
+            if network == 0 && !unchanged {
+                return Some(LINUX_EOPNOTSUPP);
+            }
             if network != 0 {
                 let changed = linux_namespace::set_loopback(
                     linux_execution_instance(),
@@ -13707,6 +13720,9 @@ fn linux_socket_ioctl(descriptor: u64, request: u64, argument: u64) -> Option<u6
             ifreq[16..32].copy_from_slice(&sockaddr_in(mask));
         }
         SIOCGIFMTU => ifreq[16..20].copy_from_slice(&interface.mtu.to_ne_bytes()),
+        // ifr_qlen: every interface's transmit queue holds 1000, as
+        // Linux's default.
+        SIOCGIFTXQLEN => ifreq[16..20].copy_from_slice(&1000_i32.to_ne_bytes()),
         SIOCGIFHWADDR => {
             ifreq[16..18].copy_from_slice(&interface.hardware.0.to_ne_bytes());
             ifreq[18..24].copy_from_slice(&interface.hardware.1);
@@ -32328,11 +32344,14 @@ fn linux_proc_sysctl_write_bytes(device: u16, index: usize, text: &[u8]) -> Resu
     let Some(slot) = current_container_slot() else {
         return Err(LINUX_EIO);
     };
-    let value = text
-        .split(|byte| *byte == 0)
-        .next()
-        .and_then(|text| linux_parse_kernel_integer(text.trim_ascii()))
-        .ok_or(LINUX_EINVAL)?;
+    let value = if LINUX_PROC_SYSCTLS[index].1 == LINUX_PING_GROUP_RANGE {
+        linux_ping_group_range_parse(text)?
+    } else {
+        text.split(|byte| *byte == 0)
+            .next()
+            .and_then(|text| linux_parse_kernel_integer(text.trim_ascii()))
+            .ok_or(LINUX_EINVAL)?
+    };
     // Values with bounds (proc_dointvec_minmax): io_uring_disabled is 0, 1
     // or 2, the link restrictions are off or on, and key quotas are from 1
     // to INT_MAX.
@@ -32396,6 +32415,71 @@ fn linux_proc_sysctl_write_bytes(device: u16, index: usize, text: &[u8]) -> Resu
     Ok(text.len())
 }
 
+/// A two-number /proc/sys value as its one stored number: the first in the
+/// high half. Both are at most `LINUX_PING_GROUP_MAX`, so the result never
+/// meets `LINUX_SYSCTL_UNSET`.
+fn linux_sysctl_pack_pair(low: u64, high: u64) -> i64 {
+    ((low << 32) | high) as i64
+}
+
+fn linux_sysctl_unpack_pair(value: i64) -> (u64, u64) {
+    let value = value as u64;
+    (value >> 32, value & 0xffff_ffff)
+}
+
+/// The current namespace's ping_group_range: the lowest and highest gid
+/// that may make ping sockets.
+fn linux_ping_group_range() -> (u64, u64) {
+    linux_proc_sysctl_value(LINUX_PING_GROUP_RANGE)
+        .map_or((0, LINUX_PING_GROUP_MAX as u64), linux_sysctl_unpack_pair)
+}
+
+/// A write of ping_group_range: one or two numbers from 0 to
+/// `LINUX_PING_GROUP_MAX` (EINVAL otherwise, as proc_dointvec_minmax
+/// answers); one number sets the low end alone. A range whose high end is
+/// below its low end is stored as Linux stores it, "1 0" (none).
+fn linux_ping_group_range_parse(text: &[u8]) -> Result<i64, u64> {
+    let text = text.split(|byte| *byte == 0).next().unwrap_or_default();
+    let mut numbers = text
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+        .map(|field| {
+            linux_parse_kernel_integer(field)
+                .filter(|value| (0..=LINUX_PING_GROUP_MAX).contains(value))
+                .map(|value| value as u64)
+                .ok_or(LINUX_EINVAL)
+        });
+    let low = numbers.next().ok_or(LINUX_EINVAL)??;
+    let high = match numbers.next() {
+        Some(high) => high?,
+        None => linux_ping_group_range().1,
+    };
+    if numbers.next().is_some() {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(if high < low {
+        linux_sysctl_pack_pair(1, 0)
+    } else {
+        linux_sysctl_pack_pair(low, high)
+    })
+}
+
+/// Whether the current process may make a ping socket: its effective group
+/// or one of its supplementary groups is in ping_group_range (Linux's
+/// ping_init_sock; CAP_NET_RAW does not matter).
+fn linux_ping_allowed() -> bool {
+    let (low, high) = linux_ping_group_range();
+    let within = |group: u32| (low..=high).contains(&u64::from(group));
+    let Some(credentials) = current_linux_credentials() else {
+        return false;
+    };
+    within(credentials.group.effective)
+        || linux_process::with_live_process_groups(current_linux_process_pid(), |groups| {
+            groups.iter().any(|group| within(*group))
+        })
+        .unwrap_or(false)
+}
+
 /// Where among the /proc/sys/net values, which each network namespace
 /// keeps for itself, `LINUX_PROC_SYSCTLS` value `index` is.
 fn linux_net_sysctl_number(index: usize) -> Option<usize> {
@@ -32423,6 +32507,17 @@ fn linux_proc_sysctl_text(state: u16) -> Option<([u8; LINUX_UTS_NAME_CAPACITY + 
     }
     let value = linux_fanotify_limit_value(LINUX_PROC_SYSCTLS[index].1)
         .or_else(|| linux_proc_sysctl_override(index));
+    if let Some((low, high)) = value
+        .filter(|_| LINUX_PROC_SYSCTLS[index].1 == LINUX_PING_GROUP_RANGE)
+        .map(linux_sysctl_unpack_pair)
+    {
+        let mut used = 0;
+        let generated = append_linux_decimal(&mut text, &mut used, low)
+            && append_linux_bytes(&mut text, &mut used, b"\t")
+            && append_linux_decimal(&mut text, &mut used, high)
+            && append_linux_bytes(&mut text, &mut used, b"\n");
+        return generated.then_some((text, used));
+    }
     if let Some(value) = value {
         let mut used = 0;
         let generated = (value >= 0 || append_linux_bytes(&mut text, &mut used, b"-"))
@@ -41435,9 +41530,13 @@ fn linux_socket_create(family: u64, socket_type: u64, protocol: u64) -> u64 {
         _ => return LINUX_EINVAL,
     };
     // A raw socket needs CAP_NET_RAW, checked once the protocol is known,
-    // as Linux's inet_create and inet6_create do.
+    // as Linux's inet_create and inet6_create do; a ping socket a group in
+    // ping_group_range (EACCES).
     if base == SOCK_RAW && !linux_has_capability(ginux_credentials::capability::NET_RAW) {
         return LINUX_EPERM;
+    }
+    if base == SOCK_DGRAM && kind == crate::linux_socket::Kind::Icmp && !linux_ping_allowed() {
+        return LINUX_EACCES;
     }
     let Some(descriptor) = (LINUX_AUX_DESCRIPTOR_FIRST..LINUX_AUX_DESCRIPTOR_LIMIT)
         .find(|descriptor| linux_aux_descriptor_free(*descriptor))
@@ -42091,10 +42190,14 @@ fn linux_socket_connect(descriptor: u64, address: u64, length: u64) -> u64 {
             Err(error) => linux_socket_error(error),
         };
     }
-    // AF_UNSPEC ends a TCP connection or forgets a UDP socket's peer.
+    // AF_UNSPEC ends a TCP connection or forgets a datagram socket's peer.
     if matches!(
         crate::linux_socket::kind(slot),
-        Some(crate::linux_socket::Kind::Tcp | crate::linux_socket::Kind::Udp)
+        Some(
+            crate::linux_socket::Kind::Tcp
+                | crate::linux_socket::Kind::Udp
+                | crate::linux_socket::Kind::Icmp
+        )
     ) {
         match linux_socket_unspecified_address(address, length) {
             Ok(true) => {
@@ -42381,7 +42484,11 @@ fn linux_socket_recvfrom(
     if flags & MSG_TRUNC != 0
         && matches!(
             crate::linux_socket::kind(slot),
-            Some(crate::linux_socket::Kind::Udp | crate::linux_socket::Kind::Icmp)
+            Some(
+                crate::linux_socket::Kind::Udp
+                    | crate::linux_socket::Kind::Icmp
+                    | crate::linux_socket::Kind::Netlink
+            )
         )
     {
         message_length as u64
@@ -42869,6 +42976,16 @@ fn linux_socket_recvmsg(
                 return LINUX_EFAULT;
             }
             header[8..12].copy_from_slice(&linux_inet_address_size(ipv6).to_ne_bytes());
+        } else if crate::linux_socket::kind(slot) == Some(crate::linux_socket::Kind::Netlink) {
+            // A netlink message comes from the kernel: sockaddr_nl, port 0.
+            let mut sockaddr = [0_u8; 12];
+            sockaddr[..2].copy_from_slice(&16_u16.to_ne_bytes());
+            let supplied = u32::from_ne_bytes(header[8..12].try_into().unwrap());
+            let length = (supplied as usize).min(sockaddr.len());
+            if !copy_to_linux_user(name, &sockaddr[..length]) {
+                return LINUX_EFAULT;
+            }
+            header[8..12].copy_from_slice(&(sockaddr.len() as u32).to_ne_bytes());
         } else if crate::linux_socket::unix_type(slot) == Some(2) {
             // A Unix datagram's sender, as recvfrom gives it.
             let name_length_address = message + 8;
@@ -43043,7 +43160,11 @@ fn linux_socket_recvmsg(
     if flags & MSG_TRUNC != 0
         && matches!(
             crate::linux_socket::kind(slot),
-            Some(crate::linux_socket::Kind::Udp | crate::linux_socket::Kind::Icmp)
+            Some(
+                crate::linux_socket::Kind::Udp
+                    | crate::linux_socket::Kind::Icmp
+                    | crate::linux_socket::Kind::Netlink
+            )
         )
     {
         message_length as u64
@@ -43232,6 +43353,9 @@ fn linux_socket_send_corked(
 ) -> Result<usize, crate::linux_socket::Error> {
     if remote.is_some_and(|remote| !linux_endpoint_reachable(remote)) {
         return Err(crate::linux_socket::Error::Unavailable);
+    }
+    if linux_rtnetlink_socket(slot) {
+        return linux_rtnetlink_send(slot, payload);
     }
     let corks = matches!(
         crate::linux_socket::kind(slot),
@@ -44584,16 +44708,15 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
             LINUX_EFAULT
         };
     }
-    // A /proc/sys value the domain wrote reads back as that number.
-    if let Some(value) = linux_proc_sysctl_index(state).and_then(linux_proc_sysctl_override) {
-        let mut file = [0_u8; 24];
-        let mut used = 0;
-        let generated = (value >= 0 || append_linux_bytes(&mut file, &mut used, b"-"))
-            && append_linux_decimal(&mut file, &mut used, value.unsigned_abs())
-            && append_linux_bytes(&mut file, &mut used, b"\n");
-        if !generated {
+    // A /proc/sys value the domain wrote reads back as what it wrote (a
+    // number, or ping_group_range's pair).
+    if linux_proc_sysctl_index(state)
+        .and_then(linux_proc_sysctl_override)
+        .is_some()
+    {
+        let Some((file, used)) = linux_proc_sysctl_text(state) else {
             return LINUX_EIO;
-        }
+        };
         let Ok(start) = usize::try_from(offset) else {
             return 0;
         };
