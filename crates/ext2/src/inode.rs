@@ -397,6 +397,23 @@ impl Inode {
         }
     }
 
+    /// Whether the inode's own checksum (metadata_csum) holds: over all its
+    /// bytes with the checksum's halves read as zeros, only the lower half
+    /// compared where the inode has no room for the upper.
+    pub(crate) fn checksum_valid(&self, seed: u32) -> bool {
+        use crate::checksum::{crc32c, crc32c_skipping};
+        let seed = self.checksum_seed(seed);
+        let (head, tail) = self.raw.split_at(CHECKSUM_HI);
+        let crc = crc32c_skipping(seed, head, CHECKSUM_LO..CHECKSUM_LO + 2);
+        let mut stored = u32::from(u16_at(&self.raw, CHECKSUM_LO));
+        if self.has_checksum_hi() {
+            stored |= u32::from(u16_at(&self.raw, CHECKSUM_HI)) << 16;
+            crc32c_skipping(crc, tail, 0..2) == stored
+        } else {
+            crc32c(crc, tail) & 0xffff == stored
+        }
+    }
+
     pub(crate) fn stat(&self, inode: u32) -> Option<Stat> {
         let kind = self.kind()?;
         Some(Stat {

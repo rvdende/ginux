@@ -34,6 +34,18 @@
 //! device directly. Nothing here allocates without being able to report
 //! it, and nothing panics on a corrupt image: every on-disk value is
 //! checked before it is used.
+//!
+//! With metadata_csum, every checksum is verified as Linux's ext4 driver
+//! verifies it when it reads the structure (the ext2 driver knows no
+//! checksums, so a filesystem mounted as ext2 is not checked): a bad
+//! superblock fails the mount (EBADMSG), a bad group descriptor a
+//! read-write one (EUCLEAN), and a bad bitmap, inode, extent, directory or
+//! attribute block fails the operation that read it with EBADMSG. A
+//! damaged bitmap's group is left alone by the allocators from then on,
+//! and readdir passes over a damaged block of a linear directory. Each
+//! damage found is recorded ([`Filesystem::take_failures`]) and marks the
+//! superblock as having errors, and the errors= policy
+//! ([`ErrorPolicy`]) says whether the filesystem goes on.
 
 #![no_std]
 
@@ -53,7 +65,9 @@ mod quota;
 mod xattr;
 
 pub use directory::{Damage, Entry};
-pub use filesystem::{Change, Extent, Filesystem, FsType, Options, RenameMode, Statfs};
+pub use filesystem::{
+    Change, ErrorPolicy, Extent, Failure, Filesystem, FsType, Options, RenameMode, Statfs,
+};
 pub use inode::{Kind, Stat};
 pub use quota::{Dquot, DquotChange, QuotaFormat, QuotaInfo, QuotaKind, QuotaOptions};
 pub use xattr::XattrMode;
@@ -84,6 +98,8 @@ pub enum Error {
     Io,
     /// EUCLEAN: the image contradicts itself.
     Corrupt,
+    /// EBADMSG (Linux's EFSBADCRC): a metadata checksum does not match.
+    BadChecksum,
     /// ENAMETOOLONG
     NameTooLong,
     /// EROFS
@@ -141,6 +157,7 @@ impl Error {
             Self::NoSys => 38,
             Self::NotEmpty => 39,
             Self::NoData => 61,
+            Self::BadChecksum => 74,
             Self::Unsupported => 95,
             Self::Corrupt => 117,
             Self::QuotaExceeded => 122,
@@ -158,6 +175,10 @@ pub trait BlockDevice {
     fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<()>;
     /// The device's size in bytes.
     fn size(&self) -> u64;
+    /// Hears of each damaged structure the filesystem finds, as it records
+    /// it ([`Filesystem::take_failures`] has them all): a caller that
+    /// reports them learns it has something to report without asking.
+    fn metadata_failed(&mut self, _failure: &Failure) {}
 }
 
 /// A point in time: seconds since the epoch and nanoseconds.

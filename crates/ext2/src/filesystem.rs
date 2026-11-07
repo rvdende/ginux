@@ -13,9 +13,9 @@ use crate::inode::{
     PROJINHERIT_FL,
 };
 use crate::layout::{
-    GroupDescriptor, Superblock, COMPAT_HAS_JOURNAL, GROUP_BLOCK_UNINIT, GROUP_INODE_UNINIT,
-    INCOMPAT_FILETYPE, INCOMPAT_RECOVER, RO_COMPAT_LARGE_FILE, RO_COMPAT_SPARSE_SUPER,
-    SUPERBLOCK_OFFSET, SUPERBLOCK_SIZE,
+    GroupDescriptor, Superblock, COMPAT_HAS_JOURNAL, DESCRIPTOR_SIZE_MAX, GROUP_BLOCK_UNINIT,
+    GROUP_INODE_UNINIT, INCOMPAT_FILETYPE, INCOMPAT_RECOVER, RO_COMPAT_LARGE_FILE,
+    RO_COMPAT_SPARSE_SUPER, SUPERBLOCK_OFFSET, SUPERBLOCK_SIZE,
 };
 use crate::{BlockDevice, Error, Result, Timestamp, NAME_MAX, ROOT_INODE};
 
@@ -45,7 +45,87 @@ pub struct Options {
     /// usrquota, grpquota, prjquota: quotaon(2) may use quota files, and
     /// with the quota feature their limits are enforced from the mount.
     pub quota: crate::QuotaOptions,
+    /// errors=: what to do on finding damage; `None` for what the
+    /// superblock says.
+    pub errors: Option<ErrorPolicy>,
 }
+
+/// What the filesystem does once it has found its metadata damaged (the
+/// errors= mount option, or the superblock's `s_errors`). Either way the
+/// damage is recorded ([`Filesystem::take_failures`]) and the superblock
+/// marked as having errors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ErrorPolicy {
+    /// errors=continue: go on as before.
+    Continue,
+    /// errors=remount-ro: change nothing more. Mounted as ext3 or ext4 the
+    /// filesystem shuts down, as Linux 6.12's ext4 does (changes and file
+    /// reads fail with EIO); mounted as ext2 it becomes read-only (EROFS).
+    ReadOnly,
+    /// errors=panic: Linux stops the machine; here it is remount-ro.
+    Panic,
+}
+
+impl ErrorPolicy {
+    /// The policy `s_errors` names: Linux takes any value but continue (1)
+    /// and panic (3) as remount-ro.
+    fn from_superblock(value: u16) -> Self {
+        match value {
+            1 => Self::Continue,
+            3 => Self::Panic,
+            _ => Self::ReadOnly,
+        }
+    }
+
+    /// `s_errors`'s value for the policy.
+    fn value(self) -> u16 {
+        match self {
+            Self::Continue => 1,
+            Self::ReadOnly => 2,
+            Self::Panic => 3,
+        }
+    }
+}
+
+/// A damaged structure the filesystem found, as Linux's ext4 reports one
+/// (ext4_error): the operation that read it failed with `error`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Failure {
+    /// The inode at fault: the damaged inode, or the directory, file or
+    /// attribute owner whose block is damaged; 0 for none (a bitmap).
+    pub inode: u32,
+    /// The block the damage lies in, 0 if none in particular.
+    pub block: u64,
+    /// EBADMSG for a checksum that does not match, EUCLEAN for other
+    /// damage.
+    pub error: Error,
+}
+
+/// Failures kept until [`Filesystem::take_failures`]; later ones are
+/// still counted in the superblock.
+const FAILURES_KEPT: usize = 32;
+
+/// ext4's code for an error's errno in the superblock's error record
+/// (`EXT4_ERR_*`).
+fn error_code(error: Error) -> u8 {
+    match error {
+        Error::Io => 2,
+        Error::NoMemory => 3,
+        Error::BadChecksum => 4,
+        Error::Corrupt => 5,
+        Error::NoSpace => 6,
+        Error::ReadOnly => 8,
+        _ => 1,
+    }
+}
+
+/// [`Filesystem`]'s marks on a group whose block bitmap, or inode bitmap,
+/// failed its checksum (the allocators pass it over), or whose descriptor
+/// did when it was mounted read-only (it is not made writable while it
+/// does).
+const DAMAGED_BLOCK_BITMAP: u8 = 1;
+const DAMAGED_INODE_BITMAP: u8 = 2;
+const DAMAGED_DESCRIPTOR: u8 = 4;
 
 /// Whether `superblock` may be mounted as `fs_type` (Linux's
 /// `ext2_feature_set_ok`/`ext3_feature_set_ok`).
@@ -133,6 +213,20 @@ pub struct Filesystem<D: BlockDevice> {
     descriptor_size: usize,
     link_max: u16,
     pub(crate) quotas: crate::quota::Quotas,
+    fs_type: FsType,
+    /// Metadata checksums are checked as they are read (metadata_csum, not
+    /// mounted as ext2, whose Linux driver knows none).
+    pub(crate) verify: bool,
+    /// Inodes' checksums are checked too (a filesystem Linux made).
+    verify_inodes: bool,
+    errors: ErrorPolicy,
+    /// An error under errors=remount-ro stopped all changes (ext4's
+    /// shutdown).
+    shut_down: bool,
+    /// Damage found and not yet taken.
+    failures: Vec<Failure>,
+    /// Each group's `DAMAGED_*` marks.
+    group_damage: Vec<u8>,
 }
 
 impl<D: BlockDevice> Filesystem<D> {
@@ -145,13 +239,19 @@ impl<D: BlockDevice> Filesystem<D> {
     /// their places, as on ext2, and the journal stays empty. One that
     /// holds transactions to replay (a filesystem not cleanly unmounted by
     /// a journalling driver) is refused, EINVAL.
+    ///
+    /// Mounted as ext3 or ext4, a filesystem with metadata_csum whose
+    /// superblock fails its checksum is refused with EBADMSG, and one with
+    /// a group descriptor that fails its own with EUCLEAN, unless it is
+    /// mounted read-only (as Linux's `ext4_check_descriptors` lets it).
     pub fn mount(mut device: D, options: Options) -> Result<Self> {
         let mut raw = vec![0; SUPERBLOCK_SIZE];
         if device.size() < SUPERBLOCK_OFFSET + SUPERBLOCK_SIZE as u64 {
             return Err(Error::Invalid);
         }
         device.read_at(SUPERBLOCK_OFFSET, &mut raw)?;
-        let superblock = Superblock::parse(raw)?;
+        let checked = options.fs_type != FsType::Ext2;
+        let superblock = Superblock::parse(raw, checked)?;
         if !type_allows(&superblock, options.fs_type, options.read_only) {
             return Err(Error::Invalid);
         }
@@ -195,6 +295,26 @@ impl<D: BlockDevice> Filesystem<D> {
         let seed = superblock
             .metadata_csum()
             .then(|| superblock.checksum_seed());
+        let verify = checked && seed.is_some();
+        let mut group_damage = Vec::new();
+        group_damage
+            .try_reserve_exact(group_count as usize)
+            .map_err(|_| Error::NoMemory)?;
+        group_damage.resize(group_count as usize, 0);
+        if let Some(seed) = seed.filter(|_| verify) {
+            for ((group, descriptor), marks) in (0..).zip(&groups).zip(&mut group_damage) {
+                if !descriptor.checksum_valid(group, seed) {
+                    if !options.read_only {
+                        return Err(Error::Corrupt);
+                    }
+                    *marks |= DAMAGED_DESCRIPTOR;
+                }
+            }
+        }
+        let errors = options
+            .errors
+            .unwrap_or_else(|| ErrorPolicy::from_superblock(superblock.error_behaviour()));
+        let verify_inodes = verify && superblock.linux_made();
         let link_max = match options.fs_type {
             FsType::Ext2 => EXT2_LINK_MAX,
             FsType::Ext3 | FsType::Ext4 => EXT4_LINK_MAX,
@@ -212,7 +332,20 @@ impl<D: BlockDevice> Filesystem<D> {
             descriptor_size,
             link_max,
             quotas: crate::quota::Quotas::new(options.quota),
+            fs_type: options.fs_type,
+            verify,
+            verify_inodes,
+            errors,
+            shut_down: false,
+            failures: Vec::new(),
+            group_damage,
         };
+        filesystem.set_caller(options.now, false);
+        // ext4 reads its journal's inode at mount (and fails on a bad one);
+        // the journal itself is left alone.
+        if let Some(journal) = filesystem.superblock.journal_inode().filter(|_| verify) {
+            filesystem.read_inode(journal)?;
+        }
         filesystem.load_system_quotas()?;
         if !filesystem.read_only {
             filesystem
@@ -227,10 +360,16 @@ impl<D: BlockDevice> Filesystem<D> {
         self.read_only
     }
 
-    /// Makes the filesystem read-only or writable again (a remount).
+    /// Makes the filesystem read-only or writable again (a remount). A
+    /// filesystem shut down by an error stays as it is (EROFS), and one
+    /// with a group descriptor that fails its checksum is not made
+    /// writable (EBADMSG).
     pub fn set_read_only(&mut self, read_only: bool, now: Timestamp) -> Result<()> {
         if read_only == self.read_only {
             return Ok(());
+        }
+        if self.shut_down {
+            return Err(Error::ReadOnly);
         }
         if read_only {
             self.quota_sync()?;
@@ -239,6 +378,13 @@ impl<D: BlockDevice> Filesystem<D> {
         } else {
             if !self.superblock.writable() {
                 return Err(Error::ReadOnly);
+            }
+            if self
+                .group_damage
+                .iter()
+                .any(|marks| marks & DAMAGED_DESCRIPTOR != 0)
+            {
+                return Err(Error::BadChecksum);
             }
             self.superblock.mark_mounted(now.seconds as u32);
             self.write_superblock()?;
@@ -251,7 +397,9 @@ impl<D: BlockDevice> Filesystem<D> {
     /// the device is the caller's again.
     pub fn unmount(mut self, now: Timestamp) -> Result<D> {
         if !self.read_only {
-            self.quota_sync()?;
+            if !self.shut_down {
+                self.quota_sync()?;
+            }
             self.superblock.mark_clean(now.seconds as u32);
             self.write_superblock()?;
         }
@@ -261,6 +409,9 @@ impl<D: BlockDevice> Filesystem<D> {
     /// Writes the superblock's counts (sync(2)); everything else is already
     /// on the device.
     pub fn sync(&mut self) -> Result<()> {
+        if self.shut_down {
+            return Ok(());
+        }
         if !self.read_only {
             self.quota_sync()?;
         }
@@ -268,6 +419,76 @@ impl<D: BlockDevice> Filesystem<D> {
             self.write_superblock()?;
         }
         Ok(())
+    }
+
+    /// Records damage found on inode `inode` (0 for none) in block `block`
+    /// (0 for none), which fails the operation that found it with `error`,
+    /// as Linux's ext4_error does: the superblock records the error (and,
+    /// mounted read-write, is written), the errors= policy applies, and
+    /// the failure waits for [`Filesystem::take_failures`]. Returns `error`.
+    pub fn report(&mut self, inode: u32, block: u64, error: Error) -> Error {
+        let now = self.quotas.now;
+        self.superblock
+            .note_error(now, inode, block, error_code(error));
+        if !self.read_only {
+            // The operation fails with `error` whether or not this lands.
+            let _ = self.write_superblock();
+            if self.errors != ErrorPolicy::Continue {
+                match self.fs_type {
+                    FsType::Ext2 => self.read_only = true,
+                    FsType::Ext3 | FsType::Ext4 => self.shut_down = true,
+                }
+            }
+        }
+        let failure = Failure {
+            inode,
+            block,
+            error,
+        };
+        if self.failures.len() < FAILURES_KEPT && self.failures.try_reserve(1).is_ok() {
+            self.failures.push(failure);
+        }
+        self.device.metadata_failed(&failure);
+        error
+    }
+
+    /// The damage found since the last call, oldest first.
+    pub fn take_failures(&mut self) -> Vec<Failure> {
+        core::mem::take(&mut self.failures)
+    }
+
+    /// Whether damage was found since [`Filesystem::take_failures`] last
+    /// took it.
+    pub fn has_failures(&self) -> bool {
+        !self.failures.is_empty()
+    }
+
+    /// The errors= policy in force.
+    pub fn error_policy(&self) -> ErrorPolicy {
+        self.errors
+    }
+
+    /// errors= on a remount.
+    pub fn set_error_policy(&mut self, policy: ErrorPolicy) {
+        self.errors = policy;
+    }
+
+    /// The errors= option /proc/mounts shows, if any: Linux's ext4 shows
+    /// one that differs from the superblock's; its ext2 driver any but
+    /// remount-ro, and remount-ro when the superblock says continue or
+    /// panic.
+    pub fn shown_error_policy(&self) -> Option<ErrorPolicy> {
+        let default = self.superblock.error_behaviour();
+        let shown = match self.fs_type {
+            FsType::Ext2 => self.errors != ErrorPolicy::ReadOnly || matches!(default, 1 | 3),
+            FsType::Ext3 | FsType::Ext4 => self.errors.value() != default,
+        };
+        shown.then_some(self.errors)
+    }
+
+    /// Whether an error under errors=remount-ro shut the filesystem down.
+    pub fn is_shut_down(&self) -> bool {
+        self.shut_down
     }
 
     fn write_superblock(&mut self) -> Result<()> {
@@ -298,15 +519,26 @@ impl<D: BlockDevice> Filesystem<D> {
     pub fn statfs(&mut self) -> Statfs {
         let overhead = self.overhead();
         let id = self.id();
+        // A group whose bitmap is damaged has nothing to give (Linux takes
+        // its free count off the filesystem's).
+        let (mut unusable_blocks, mut unusable_inodes) = (0, 0);
+        for (group, marks) in self.groups.iter().zip(&self.group_damage) {
+            if marks & DAMAGED_BLOCK_BITMAP != 0 {
+                unusable_blocks += u64::from(group.free_blocks);
+            }
+            if marks & DAMAGED_INODE_BITMAP != 0 {
+                unusable_inodes += u64::from(group.free_inodes);
+            }
+        }
         let superblock = &self.superblock;
-        let free = u64::from(superblock.free_blocks());
+        let free = u64::from(superblock.free_blocks()).saturating_sub(unusable_blocks);
         Statfs {
             block_size: self.block_size,
             blocks: u64::from(superblock.blocks_count()).saturating_sub(overhead),
             free_blocks: free,
             available_blocks: free.saturating_sub(u64::from(superblock.reserved_blocks())),
             inodes: u64::from(superblock.inodes_count()),
-            free_inodes: u64::from(superblock.free_inodes()),
+            free_inodes: u64::from(superblock.free_inodes()).saturating_sub(unusable_inodes),
             name_max: NAME_MAX as u32,
             id,
         }
@@ -380,8 +612,10 @@ impl<D: BlockDevice> Filesystem<D> {
             .min(MAX_LFS_FILESIZE)
     }
 
-    fn check_writable(&self) -> Result<()> {
-        if self.read_only {
+    pub(crate) fn check_writable(&self) -> Result<()> {
+        if self.shut_down {
+            Err(Error::Io)
+        } else if self.read_only {
             Err(Error::ReadOnly)
         } else {
             Ok(())
@@ -415,7 +649,21 @@ impl<D: BlockDevice> Filesystem<D> {
         Ok((block, byte % self.block_size as usize))
     }
 
+    /// Inode `number`, its checksum checked (EBADMSG, reported, if it
+    /// fails), as Linux's ext4 reads an inode in.
     pub(crate) fn read_inode(&mut self, number: u32) -> Result<Inode> {
+        let inode = self.load_inode(number)?;
+        if let Some(seed) = self.seed.filter(|_| self.verify_inodes) {
+            if !inode.checksum_valid(seed) {
+                let (block, _) = self.inode_location(number)?;
+                return Err(self.report(number, u64::from(block), Error::BadChecksum));
+            }
+        }
+        Ok(inode)
+    }
+
+    /// Inode `number` as the table holds it, unchecked.
+    pub(crate) fn load_inode(&mut self, number: u32) -> Result<Inode> {
         let (block, offset) = self.inode_location(number)?;
         let size = self.superblock.inode_size();
         let bytes = self.cache.get(&mut self.device, block)?;
@@ -505,6 +753,8 @@ impl<D: BlockDevice> Filesystem<D> {
 
     fn write_group(&mut self, group: u32) -> Result<()> {
         let (encoded, size) = self.groups[group as usize].encode(group, self.seed);
+        // A descriptor written is sealed again.
+        self.group_damage[group as usize] &= !DAMAGED_DESCRIPTOR;
         let byte = group as usize * self.descriptor_size;
         let block =
             self.superblock.first_data_block() + 1 + (byte / self.block_size as usize) as u32;
@@ -527,7 +777,8 @@ impl<D: BlockDevice> Filesystem<D> {
     }
 
     /// The inode bitmap of `group`, written out first if the group's has
-    /// never been (INODE_UNINIT: no inode of it was ever used).
+    /// never been (INODE_UNINIT: no inode of it was ever used), else
+    /// checked against its checksum.
     fn inode_bitmap(&mut self, group: u32) -> Result<u32> {
         let descriptor = self.groups.get(group as usize).ok_or(Error::Corrupt)?;
         let bitmap = descriptor.inode_bitmap;
@@ -537,8 +788,48 @@ impl<D: BlockDevice> Filesystem<D> {
             self.groups[group as usize].flags &= !GROUP_INODE_UNINIT;
             self.seal_inode_bitmap(group)?;
             self.write_group(group)?;
+            return Ok(bitmap);
         }
+        let length = self.superblock.inodes_per_group() / 8;
+        let stored = descriptor.inode_bitmap_checksum;
+        self.check_bitmap(group, DAMAGED_INODE_BITMAP, bitmap, length, stored)?;
         Ok(bitmap)
+    }
+
+    /// Checks bitmap block `bitmap` of `group` (`mark` says which), whose
+    /// first `length` bytes have checksum `stored`, as Linux validates a
+    /// bitmap it reads: EBADMSG, reported, the first time it fails, after
+    /// which the group is marked and EUCLEAN.
+    fn check_bitmap(
+        &mut self,
+        group: u32,
+        mark: u8,
+        bitmap: u32,
+        length: u32,
+        stored: u32,
+    ) -> Result<()> {
+        let Some(seed) = self.seed.filter(|_| self.verify) else {
+            return Ok(());
+        };
+        if self.group_damage[group as usize] & mark != 0 {
+            return Err(Error::Corrupt);
+        }
+        // Without room for the upper half, the lower one is compared.
+        let mask = if self.descriptor_size >= DESCRIPTOR_SIZE_MAX {
+            u32::MAX
+        } else {
+            0xffff
+        };
+        let valid = |bytes: &[u8]| crc32c(seed, &bytes[..length as usize]) & mask == stored & mask;
+        if self
+            .cache
+            .get_verified(&mut self.device, bitmap, valid)?
+            .is_none()
+        {
+            self.group_damage[group as usize] |= mark;
+            return Err(self.report(0, u64::from(bitmap), Error::BadChecksum));
+        }
+        Ok(())
     }
 
     /// The block bitmap of `group`, built first if the group's has never
@@ -548,6 +839,9 @@ impl<D: BlockDevice> Filesystem<D> {
         let descriptor = self.groups.get(group as usize).ok_or(Error::Corrupt)?;
         let bitmap = descriptor.block_bitmap;
         if self.seed.is_none() || descriptor.flags & GROUP_BLOCK_UNINIT == 0 {
+            let length = self.superblock.blocks_per_group() / 8;
+            let stored = descriptor.block_bitmap_checksum;
+            self.check_bitmap(group, DAMAGED_BLOCK_BITMAP, bitmap, length, stored)?;
             return Ok(bitmap);
         }
         let start = self.group_start(group);
@@ -628,7 +922,13 @@ impl<D: BlockDevice> Filesystem<D> {
             if self.groups[group as usize].free_inodes == 0 {
                 continue;
             }
-            let bitmap = self.inode_bitmap(group)?;
+            // A group whose bitmap is damaged is passed over, as Linux's
+            // allocator does (ENOSPC if no other has room).
+            let bitmap = match self.inode_bitmap(group) {
+                Ok(bitmap) => bitmap,
+                Err(Error::BadChecksum | Error::Corrupt) => continue,
+                Err(error) => return Err(error),
+            };
             let first = if group == 0 {
                 self.superblock.first_inode() - 1
             } else {
@@ -749,6 +1049,9 @@ impl<D: BlockDevice> Filesystem<D> {
         let total = self.superblock.blocks_count();
         let goal = goal.clamp(first_data, total - 1) - first_data;
         let (start_group, start_bit) = (goal / per_group, goal % per_group);
+        // A group whose bitmap is damaged is passed over, as Linux's
+        // allocator does; with no other to use, the damage is the error.
+        let mut damage = None;
         // The goal's group from the goal, the others, then the goal's group
         // from its start.
         for step in 0..=groups {
@@ -758,7 +1061,14 @@ impl<D: BlockDevice> Filesystem<D> {
                 continue;
             }
             let in_group = per_group.min(total - first_data - group * per_group);
-            let bitmap = self.block_bitmap(group)?;
+            let bitmap = match self.block_bitmap(group) {
+                Ok(bitmap) => bitmap,
+                Err(error @ (Error::BadChecksum | Error::Corrupt)) => {
+                    damage.get_or_insert(error);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let bytes = self.cache.get(&mut self.device, bitmap)?;
             let Some(bit) = find_clear_bit(bytes, from, in_group) else {
                 continue;
@@ -780,7 +1090,7 @@ impl<D: BlockDevice> Filesystem<D> {
             self.superblock_dirty = true;
             return Ok((first_data + group * per_group + bit, length));
         }
-        Err(Error::NoSpace)
+        Err(damage.unwrap_or(Error::NoSpace))
     }
 
     pub(crate) fn free_block(&mut self, block: u32) -> Result<()> {
@@ -1075,6 +1385,10 @@ impl<D: BlockDevice> Filesystem<D> {
     /// Reads inode `number`'s data at `offset` into `buffer`; returns how
     /// much (short at the end of the file). Holes read as zeros.
     pub fn read(&mut self, number: u32, offset: u64, buffer: &mut [u8]) -> Result<usize> {
+        // A shut-down ext4 reads no file data either.
+        if self.shut_down {
+            return Err(Error::Io);
+        }
         let mut inode = self.live_inode(number)?;
         match inode.kind() {
             Some(Kind::Directory) => return Err(Error::IsDirectory),
@@ -2150,7 +2464,7 @@ impl<D: BlockDevice> Filesystem<D> {
         }
         let group = self.group_of_inode(number);
         let bit = (number - 1) % self.superblock.inodes_per_group();
-        let bitmap = self.groups[group as usize].inode_bitmap;
+        let bitmap = self.inode_bitmap(group)?;
         if !test_bit(self.cache.get(&mut self.device, bitmap)?, bit) {
             return Ok(false);
         }

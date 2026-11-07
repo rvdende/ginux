@@ -15,8 +15,20 @@ pub(crate) const DESCRIPTOR_SIZE_MAX: usize = 64;
 /// Where the superblock keeps its own checksum.
 const SUPERBLOCK_CHECKSUM: usize = 0x3fc;
 
-/// `s_state`: unmounted cleanly.
+/// `s_state`: unmounted cleanly; errors found.
 const STATE_VALID: u16 = 1;
+const STATE_ERROR: u16 = 2;
+/// `s_creator_os` of Linux, whose inodes alone carry checksums.
+const CREATOR_LINUX: u32 = 0;
+
+/// Where the superblock records the errors found (`s_error_count`, then
+/// the first error's time, inode, block, function and line, then the
+/// last's) and the high bytes and codes of each (`s_first_error_time_hi`
+/// on).
+const ERROR_COUNT: usize = 0x194;
+const FIRST_ERROR: usize = 0x198;
+const LAST_ERROR: usize = 0x1cc;
+const ERROR_HIGHS: usize = 0x278;
 
 // s_feature_compat: nothing in it stops a driver. A journal is kept but
 // not written (see `Filesystem::mount`).
@@ -61,10 +73,20 @@ pub(crate) struct Superblock {
 }
 
 impl Superblock {
-    pub(crate) fn parse(raw: Vec<u8>) -> Result<Self> {
+    /// The superblock in `raw`, checked to be one this driver mounts; with
+    /// `checked`, its checksum is checked first (EBADMSG), as Linux's ext4
+    /// checks it right after the magic number and checksum type.
+    pub(crate) fn parse(raw: Vec<u8>, checked: bool) -> Result<Self> {
         let superblock = Self { raw };
         if superblock.raw.len() != SUPERBLOCK_SIZE || u16_at(&superblock.raw, 56) != MAGIC {
             return Err(Error::Invalid);
+        }
+        // metadata_csum is crc32c (s_checksum_type 1).
+        if superblock.metadata_csum() && superblock.raw[0x175] != 1 {
+            return Err(Error::Invalid);
+        }
+        if checked && !superblock.checksum_valid() {
+            return Err(Error::BadChecksum);
         }
         let log = superblock.u32(24);
         if log > 6
@@ -102,15 +124,13 @@ impl Superblock {
                 return Err(Error::Invalid);
             }
         }
-        // metadata_csum is crc32c (s_checksum_type 1), and the superblock's
-        // own checksum must hold.
-        if superblock.metadata_csum()
-            && (superblock.raw[0x175] != 1
-                || u32_at(&superblock.raw, SUPERBLOCK_CHECKSUM) != superblock.checksum())
-        {
-            return Err(Error::Invalid);
-        }
         Ok(superblock)
+    }
+
+    /// Whether the superblock's own checksum holds (without metadata_csum
+    /// there is none to hold).
+    pub(crate) fn checksum_valid(&self) -> bool {
+        !self.metadata_csum() || u32_at(&self.raw, SUPERBLOCK_CHECKSUM) == self.checksum()
     }
 
     /// The superblock's bytes, with its checksum brought up to date.
@@ -314,6 +334,43 @@ impl Superblock {
         set_u16(&mut self.raw, 52, count.wrapping_add(1));
     }
 
+    /// What the filesystem does on finding an error unless the mount says
+    /// otherwise (`s_errors`: 1 continue, 2 remount read-only, 3 panic).
+    pub(crate) fn error_behaviour(&self) -> u16 {
+        u16_at(&self.raw, 60)
+    }
+
+    /// Whether inodes carry checksums: Linux's ext4 checks them only on a
+    /// filesystem Linux made.
+    pub(crate) fn linux_made(&self) -> bool {
+        self.u32(72) == CREATOR_LINUX
+    }
+
+    /// Records an error found at `now` on inode `inode` and block `block`
+    /// (0 for none), with ext4's code for its errno (`EXT4_ERR_*`): the
+    /// state says the filesystem has errors, which e2fsck then checks.
+    pub(crate) fn note_error(&mut self, now: u64, inode: u32, block: u64, code: u8) {
+        let state = u16_at(&self.raw, 58);
+        set_u16(&mut self.raw, 58, state | STATE_ERROR);
+        let count = self.u32(ERROR_COUNT);
+        set_u32(&mut self.raw, ERROR_COUNT, count.saturating_add(1));
+        let first_time = self.u32(FIRST_ERROR) != 0 || self.raw[ERROR_HIGHS] != 0;
+        let time = now as u32;
+        let time_high = (now >> 32) as u8;
+        if !first_time {
+            set_u32(&mut self.raw, FIRST_ERROR, time);
+            set_u32(&mut self.raw, FIRST_ERROR + 4, inode);
+            self.raw[FIRST_ERROR + 8..FIRST_ERROR + 16].copy_from_slice(&block.to_le_bytes());
+            self.raw[ERROR_HIGHS] = time_high;
+            self.raw[ERROR_HIGHS + 2] = code;
+        }
+        set_u32(&mut self.raw, LAST_ERROR, time);
+        set_u32(&mut self.raw, LAST_ERROR + 4, inode);
+        self.raw[LAST_ERROR + 12..LAST_ERROR + 20].copy_from_slice(&block.to_le_bytes());
+        self.raw[ERROR_HIGHS + 1] = time_high;
+        self.raw[ERROR_HIGHS + 3] = code;
+    }
+
     /// Marks the filesystem cleanly unmounted at `now`.
     pub(crate) fn mark_clean(&mut self, now: u32) {
         let state = u16_at(&self.raw, 58);
@@ -398,6 +455,13 @@ impl GroupDescriptor {
             size,
             raw,
         })
+    }
+
+    /// Whether the descriptor's checksum (metadata_csum, `seed`) holds for
+    /// group `group`.
+    pub(crate) fn checksum_valid(&self, group: u32, seed: u32) -> bool {
+        let (encoded, _) = self.encode(group, Some(seed));
+        u16_at(&encoded, 0x1e) == u16_at(&self.raw, 0x1e)
     }
 
     /// The descriptor's bytes; with `seed`, its checksum (metadata_csum) for

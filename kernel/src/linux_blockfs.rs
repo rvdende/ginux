@@ -16,6 +16,13 @@
 //! stays allocated on the disk, as Linux keeps an unlinked open file, and
 //! is freed by [`reclaim`] once nothing does.
 //!
+//! A volume with metadata checksums (ext4's metadata_csum) has them checked
+//! as its metadata is read; damage found, and the damage [`note_damage_at`]
+//! finds when a lookup fails, is recorded by the filesystem (which applies
+//! the errors= policy) and taken by [`take_failures`] when the system call
+//! that met it returns, to report as ext4 reports it (fanotify's
+//! FAN_FS_ERROR) and to fail that call with its errno.
+//!
 //! The volume reads and writes its device directly: a loop device's
 //! backing file through the overlay (the mount holds the device open, so
 //! the binding stays put until the unmount, as Linux's loop driver keeps
@@ -29,10 +36,11 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use ginux_ext2::{
-    Change, Dquot, DquotChange, Error, Filesystem, Kind, Options, QuotaInfo, QuotaKind,
-    QuotaOptions, RenameMode, Timestamp, XattrMode,
+    Change, Dquot, DquotChange, Error, ErrorPolicy, Failure, Filesystem, Kind, Options, QuotaInfo,
+    QuotaKind, QuotaOptions, RenameMode, Timestamp, XattrMode,
 };
 
 use crate::arch::x86_64::cpu;
@@ -141,7 +149,18 @@ impl ginux_ext2::BlockDevice for Disk {
             Source::Loop { size, .. } | Source::Ram { size, .. } => size,
         }
     }
+
+    fn metadata_failed(&mut self, _failure: &Failure) {
+        FAILURES_PENDING.store(true, Ordering::Release);
+    }
 }
+
+/// Some volume's filesystem holds damage it found that [`take_failures`]
+/// has not taken: set by the filesystem's device as it records it (under
+/// the table lock), and worked out again by `take_failures` under it. Every
+/// system call's return reads it, so it stays one load while no volume is
+/// damaged.
+static FAILURES_PENDING: AtomicBool = AtomicBool::new(false);
 
 struct Volume {
     /// Tells volumes apart across a lock release.
@@ -682,12 +701,41 @@ pub(crate) fn next_child_at(path: &[u8], cursor: usize) -> Option<Option<Option<
             volume.remember(entry.inode, &child_path);
         }
         let handle = table.handle(index, entry.inode);
-        let metadata = table.volumes[index].metadata(entry.inode, handle)?;
+        // An inode that cannot be read (its checksum fails) is listed all
+        // the same, as Linux's readdir lists names without reading inodes.
+        let metadata = table.volumes[index]
+            .metadata(entry.inode, handle)
+            .unwrap_or_else(|| {
+                unread_metadata(handle, entry.kind, table.volumes[index].source.device())
+            });
         return Some(Some(Some(Child::new(
             next as usize,
             metadata,
             entry.name(),
         ))));
+    }
+}
+
+/// What a directory listing shows of a child whose inode cannot be read:
+/// the type its entry records, and nothing more.
+fn unread_metadata(handle: Handle, kind: Option<Kind>, filesystem: u32) -> Metadata {
+    Metadata {
+        handle,
+        kind: node_kind(kind.unwrap_or(Kind::File)),
+        mode: 0,
+        owner: 0,
+        group: 0,
+        links: 0,
+        device: 0,
+        attributes: 0,
+        size: 0,
+        atime: (0, 0),
+        mtime: (0, 0),
+        ctime: (0, 0),
+        filesystem,
+        sectors: 0,
+        block_size: 0,
+        btime: None,
     }
 }
 
@@ -1620,6 +1668,7 @@ pub(crate) fn mount(
     read_only: bool,
     fs_type: ginux_ext2::FsType,
     quota: QuotaOptions,
+    errors: Option<ErrorPolicy>,
 ) -> Result<(), Errno> {
     let mut stored = Vec::new();
     stored.try_reserve_exact(point.len()).map_err(|_| ENOMEM)?;
@@ -1631,10 +1680,15 @@ pub(crate) fn mount(
             now: now(),
             fs_type,
             quota,
+            errors,
         },
     )
     .map_err(|error| match error {
-        Error::Io | Error::NoMemory | Error::ReadOnly => errno(error),
+        // A superblock or group descriptor that fails its checksum
+        // (EBADMSG, EUCLEAN), as ext4 refuses them.
+        Error::Io | Error::NoMemory | Error::ReadOnly | Error::BadChecksum | Error::Corrupt => {
+            errno(error)
+        }
         _ => EINVAL,
     })?;
     let mut table = VOLUMES.lock();
@@ -1811,8 +1865,9 @@ pub(crate) fn quota_sync_all() {
 }
 
 /// The options the volume mounted from `device` shows in /proc/mounts
-/// past the mount's own (ext4's quota options), each with its comma.
-pub(crate) fn shown_options(device: u32) -> &'static [u8] {
+/// past the mount's own (errors= and the quota options, as ext4 and ext2
+/// show them), each with its comma.
+pub(crate) fn shown_options(device: u32) -> Vec<u8> {
     let instance = instance();
     let table = VOLUMES.lock();
     let Some(volume) = table
@@ -1820,9 +1875,25 @@ pub(crate) fn shown_options(device: u32) -> &'static [u8] {
         .iter()
         .find(|volume| volume.instance == instance && volume.source.device() == device)
     else {
-        return b"";
+        return Vec::new();
     };
-    let options = volume.filesystem.quota_options();
+    let errors: &[u8] = match volume.filesystem.shown_error_policy() {
+        None => b"",
+        Some(ErrorPolicy::Continue) => b",errors=continue",
+        Some(ErrorPolicy::ReadOnly) => b",errors=remount-ro",
+        Some(ErrorPolicy::Panic) => b",errors=panic",
+    };
+    let quota = quota_shown(volume.filesystem.quota_options());
+    let mut shown = Vec::new();
+    if shown.try_reserve_exact(errors.len() + quota.len()).is_ok() {
+        shown.extend_from_slice(errors);
+        shown.extend_from_slice(quota);
+    }
+    shown
+}
+
+/// The quota options a volume mounted with `options` shows.
+fn quota_shown(options: QuotaOptions) -> &'static [u8] {
     match (options.user, options.group, options.project) {
         (false, false, false) => b"",
         (true, false, false) => b",quota,usrquota",
@@ -1883,6 +1954,15 @@ pub(crate) fn unmount(point: &[u8]) -> Option<Result<Source, Errno>> {
             .map(|_| source)
             .map_err(errno),
     )
+}
+
+/// errors= on a remount of the volume at canonical `point`; `None` if no
+/// volume is mounted there.
+pub(crate) fn set_error_policy(point: &[u8], policy: ErrorPolicy) -> Option<()> {
+    let mut table = VOLUMES.lock();
+    let index = mounted_at(&table, point)?;
+    table.volumes[index].filesystem.set_error_policy(policy);
+    Some(())
 }
 
 /// MS_REMOUNT of the volume at canonical `point`: read-only or writable.
@@ -1947,19 +2027,26 @@ pub(crate) fn from_stable_identity(tag: u32, inode: u32) -> Option<Handle> {
     Some(table.handle(index, inode))
 }
 
-/// What a lookup of canonical `path` on a volume found broken, as ext4
-/// reports a corrupted filesystem: the volume's fsid and the inode at
-/// fault (a directory whose blocks hold malformed entries or an entry
-/// naming no valid inode, or the inode an entry names that has no links
-/// or file type), with its handle. `None` when the path is not on a
-/// volume or nothing on the way is damaged.
-pub(crate) fn damage_at(path: &[u8]) -> Option<([u32; 2], Handle)> {
+/// Records what a lookup of canonical `path` on a volume, which found
+/// nothing, met broken on the way, as ext4 reports a corrupted filesystem
+/// (EUCLEAN): a directory whose blocks hold malformed entries or an entry
+/// naming no valid inode, or the inode an entry names that has no links or
+/// file type. Nothing when the path is not on a volume, nothing on the way
+/// is damaged, or the lookup already recorded the damage it met (a
+/// checksum that failed), which [`take_failures`] then has.
+pub(crate) fn note_damage_at(path: &[u8]) {
     let mut table = VOLUMES.lock();
-    let index = volume_index(&table, path)?;
+    let Some(index) = volume_index(&table, path) else {
+        return;
+    };
     let volume = &mut table.volumes[index];
-    let relative = below(&volume.point, path)?;
+    let Some(relative) = below(&volume.point, path) else {
+        return;
+    };
+    if volume.filesystem.has_failures() {
+        return;
+    }
     let mut inode = ginux_ext2::ROOT_INODE;
-    let mut fault = None;
     for name in relative.split(|byte| *byte == b'/') {
         if name.is_empty() {
             continue;
@@ -1967,24 +2054,75 @@ pub(crate) fn damage_at(path: &[u8]) -> Option<([u32; 2], Handle)> {
         let child = match volume.filesystem.lookup(inode, name) {
             Ok(child) => child,
             Err(Error::Corrupt) => {
-                fault = Some(inode);
-                break;
+                volume.filesystem.report(inode, 0, Error::Corrupt);
+                return;
             }
-            Err(_) => return None,
+            Err(_) => return,
         };
-        match volume.filesystem.damaged_reference(child) {
-            Some(ginux_ext2::Damage::Number) => fault = Some(inode),
-            Some(ginux_ext2::Damage::Inode) => fault = Some(child),
+        let fault = match volume.filesystem.damaged_reference(child) {
+            Some(ginux_ext2::Damage::Number) => inode,
+            Some(ginux_ext2::Damage::Inode) => child,
+            // Recorded as the inode was read.
+            Some(ginux_ext2::Damage::Checksum) => return,
             None => {
                 inode = child;
                 continue;
             }
-        }
-        break;
+        };
+        volume.filesystem.report(fault, 0, Error::Corrupt);
+        return;
     }
-    let fault = fault?;
-    let fsid = volume.filesystem.id();
-    Some((fsid, table.handle(index, fault)))
+}
+
+/// Damage a volume found, as [`take_failures`] hands it on.
+pub(crate) struct VolumeFailure {
+    /// The volume's fsid (statfs's f_fsid).
+    pub(crate) fsid: [u32; 2],
+    /// The inode at fault, if one is.
+    pub(crate) handle: Option<Handle>,
+    /// What the call that met it fails with.
+    pub(crate) errno: Errno,
+    /// Whether fanotify hears of it: ext4 reports its errors to fsnotify,
+    /// Linux's ext2 driver does not.
+    pub(crate) notify: bool,
+}
+
+/// The damage this domain's volumes found since the last call, oldest
+/// first. Without any (the flag says so), nothing is locked.
+pub(crate) fn take_failures() -> Vec<VolumeFailure> {
+    let mut taken = Vec::new();
+    if !FAILURES_PENDING.load(Ordering::Acquire) {
+        return taken;
+    }
+    let instance = instance();
+    let mut table = VOLUMES.lock();
+    for index in 0..table.volumes.len() {
+        let volume = &mut table.volumes[index];
+        if volume.instance != instance || !volume.filesystem.has_failures() {
+            continue;
+        }
+        let failures = volume.filesystem.take_failures();
+        let fsid = volume.filesystem.id();
+        let notify = volume.fs_type != ginux_ext2::FsType::Ext2;
+        if taken.try_reserve(failures.len()).is_err() {
+            continue;
+        }
+        for failure in failures {
+            let handle = (failure.inode != 0).then(|| table.handle(index, failure.inode));
+            taken.push(VolumeFailure {
+                fsid,
+                handle,
+                errno: errno(failure.error),
+                notify,
+            });
+        }
+    }
+    let pending = table
+        .volumes
+        .iter()
+        .any(|volume| volume.filesystem.has_failures());
+    FAILURES_PENDING.store(pending, Ordering::Release);
+    taken
 }
 
 /// statfs(2) of the volume mounted at canonical `point`.

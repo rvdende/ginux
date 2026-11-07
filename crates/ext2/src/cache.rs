@@ -5,8 +5,13 @@
 //! always holds what the cache does. File data bypasses the cache; a block
 //! that is freed leaves it, so a metadata block reused for data (or the
 //! reverse) is never read back stale.
+//!
+//! A block whose checksum held when it was read is marked verified, as
+//! Linux marks a buffer, so it is not checked again while it stays: the
+//! changes made to it since were made here, and sealed. One read again
+//! from the device is checked again.
 
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
 use crate::{BlockDevice, Error, Result};
@@ -19,6 +24,8 @@ pub(crate) struct BlockCache {
     blocks: BTreeMap<u32, Vec<u8>>,
     /// Cached blocks, oldest first, for eviction.
     order: VecDeque<u32>,
+    /// Cached blocks whose checksum held.
+    verified: BTreeSet<u32>,
 }
 
 impl BlockCache {
@@ -27,6 +34,7 @@ impl BlockCache {
             block_size,
             blocks: BTreeMap::new(),
             order: VecDeque::new(),
+            verified: BTreeSet::new(),
         }
     }
 
@@ -50,6 +58,7 @@ impl BlockCache {
                 break;
             };
             self.blocks.remove(&oldest);
+            self.verified.remove(&oldest);
         }
         self.order.try_reserve(1).map_err(|_| Error::NoMemory)?;
         self.order.push_back(block);
@@ -102,5 +111,24 @@ impl BlockCache {
         if self.blocks.remove(&block).is_some() {
             self.order.retain(|cached| *cached != block);
         }
+        self.verified.remove(&block);
+    }
+
+    /// Block `block`, read from `device` unless cached, checked with
+    /// `valid` unless it was since it was read: `None` if it fails.
+    pub(crate) fn get_verified<D: BlockDevice>(
+        &mut self,
+        device: &mut D,
+        block: u32,
+        valid: impl FnOnce(&[u8]) -> bool,
+    ) -> Result<Option<&[u8]>> {
+        let checked = self.blocks.contains_key(&block) && self.verified.contains(&block);
+        if !checked {
+            if !valid(self.get(device, block)?) {
+                return Ok(None);
+            }
+            self.verified.insert(block);
+        }
+        self.get(device, block).map(Some)
     }
 }

@@ -1,7 +1,10 @@
 //! Directories: blocks of variable-length entries (inode, record length,
 //! name length, file type, name), searched linearly. With metadata_csum
 //! each block ends in a 12-byte checksum entry (an empty entry of type
-//! 0xde holding the block's checksum), which entries never take.
+//! 0xde holding the block's checksum), which entries never take; in a
+//! hash-indexed directory the index blocks (the root, block 0, and the
+//! nodes, each one empty entry spanning the block) instead end their
+//! index in an 8-byte tail holding its checksum.
 
 use crate::bytes::{set_u16, set_u32, u16_at, u32_at};
 use crate::checksum::crc32c;
@@ -15,6 +18,9 @@ pub enum Damage {
     Number,
     /// The inode named has no links or no file type: it is at fault.
     Inode,
+    /// The inode named fails its checksum: it is at fault, and the failure
+    /// is already recorded ([`Filesystem::take_failures`]).
+    Checksum,
 }
 
 /// The fixed part of an entry.
@@ -31,6 +37,49 @@ fn has_tail(bytes: &[u8]) -> bool {
         && usize::from(u16_at(bytes, at + 4)) == TAIL
         && bytes[at + 6] == 0
         && bytes[at + 7] == TAIL_TYPE
+}
+
+/// Whether leaf block `bytes` of a directory whose checksums start from
+/// `seed` ends in a checksum entry that holds.
+fn leaf_checksum_valid(bytes: &[u8], seed: u32) -> bool {
+    let at = bytes.len() - TAIL;
+    has_tail(bytes) && crc32c(seed, &bytes[..at]) == u32_at(bytes, at + 8)
+}
+
+/// Whether `bytes` is an index node of a hash-indexed directory: one empty
+/// entry spanning the block.
+fn is_index_node(bytes: &[u8]) -> bool {
+    u32_at(bytes, 0) == 0 && usize::from(u16_at(bytes, 4)) == bytes.len()
+}
+
+/// Whether index block `bytes` (the root or a node) of a hash-indexed
+/// directory whose checksums start from `seed` has a checksum that holds:
+/// over the block up to its last index entry, then the tail's reserved
+/// word and a zero checksum. The index's count and limit follow the root's
+/// `.`, `..` and 8-byte root information, or a node's empty entry.
+fn index_checksum_valid(bytes: &[u8], seed: u32) -> bool {
+    let block_size = bytes.len();
+    let first = usize::from(u16_at(bytes, 4));
+    let count_at = if first == block_size {
+        HEADER
+    } else if first == 12
+        && usize::from(u16_at(bytes, 16)) == block_size - 12
+        && u32_at(bytes, 24) == 0
+        && bytes[29] == 8
+    {
+        32
+    } else {
+        return false;
+    };
+    let limit = usize::from(u16_at(bytes, count_at));
+    let count = usize::from(u16_at(bytes, count_at + 2));
+    let tail = count_at + limit * 8;
+    if count > limit || tail + 8 > block_size {
+        return false;
+    }
+    let crc = crc32c(seed, &bytes[..count_at + count * 8]);
+    let crc = crc32c(crc, &bytes[tail..tail + 4]);
+    crc32c(crc, &[0; 4]) == u32_at(bytes, tail + 4)
 }
 
 /// Where a block's entries end: before its checksum entry, if it has one.
@@ -163,6 +212,33 @@ impl<D: BlockDevice> Filesystem<D> {
             .write(&mut self.device, block, at + 8, &checksum.to_le_bytes())
     }
 
+    /// Block `block`, file block `index` of `directory`, checked against
+    /// its checksum as Linux's ext4 checks a directory block it reads: a
+    /// leaf by its checksum entry, the root and nodes of a hash index by
+    /// the index's. EBADMSG, reported against the directory, if it fails.
+    fn directory_block(&mut self, directory: &Inode, index: u64, block: u32) -> Result<&[u8]> {
+        if let Some(seed) = self.seed.filter(|_| self.verify) {
+            let seed = directory.checksum_seed(seed);
+            let indexed = directory.flags() & INDEX_FL != 0;
+            let valid = |bytes: &[u8]| {
+                if indexed && (index == 0 || is_index_node(bytes)) {
+                    index_checksum_valid(bytes, seed)
+                } else {
+                    leaf_checksum_valid(bytes, seed)
+                }
+            };
+            if self
+                .cache
+                .get_verified(&mut self.device, block, valid)?
+                .is_none()
+            {
+                let error = Error::BadChecksum;
+                return Err(self.report(directory.number(), u64::from(block), error));
+            }
+        }
+        self.cache.get(&mut self.device, block)
+    }
+
     /// Makes hash-indexed `directory` a plain linear directory before it
     /// changes, with metadata_csum: the index blocks' (and the root's)
     /// last entries give up the space of a checksum entry, which every
@@ -172,12 +248,12 @@ impl<D: BlockDevice> Filesystem<D> {
         if self.seed.is_none() {
             return Ok(());
         }
-        let mut inode = self.read_inode(directory)?;
+        let (mut inode, blocks) = self.directory_blocks(directory)?;
         if inode.flags() & INDEX_FL == 0 {
             return Ok(());
         }
-        for block in self.directory_blocks(directory)? {
-            let bytes = self.cache.get(&mut self.device, block)?;
+        for (index, block) in blocks {
+            let bytes = self.directory_block(&inode, index, block)?;
             if has_tail(bytes) {
                 continue;
             }
@@ -210,8 +286,9 @@ impl<D: BlockDevice> Filesystem<D> {
         self.write_inode(directory, &inode)
     }
 
-    /// The data blocks of directory `directory`, in order (holes skipped).
-    fn directory_blocks(&mut self, directory: u32) -> Result<alloc::vec::Vec<u32>> {
+    /// Directory `directory`'s inode and its data blocks, in order (holes
+    /// skipped), each with its place in the directory.
+    fn directory_blocks(&mut self, directory: u32) -> Result<(Inode, alloc::vec::Vec<(u64, u32)>)> {
         let mut inode = self.read_inode(directory)?;
         if inode.kind() != Some(Kind::Directory) {
             return Err(Error::NotDirectory);
@@ -221,16 +298,17 @@ impl<D: BlockDevice> Filesystem<D> {
         for index in 0..count {
             if let Some((block, _)) = self.map_block(&mut inode, index, None)? {
                 blocks.try_reserve(1).map_err(|_| Error::NoMemory)?;
-                blocks.push(block);
+                blocks.push((index, block));
             }
         }
-        Ok(blocks)
+        Ok((inode, blocks))
     }
 
     /// Finds `name` in `directory`.
     fn find(&mut self, directory: u32, name: &[u8]) -> Result<Option<Found>> {
-        for block in self.directory_blocks(directory)? {
-            let bytes = self.cache.get(&mut self.device, block)?;
+        let (inode, blocks) = self.directory_blocks(directory)?;
+        for (index, block) in blocks {
+            let bytes = self.directory_block(&inode, index, block)?;
             let mut at = 0;
             let mut previous = None;
             while at < bytes.len() {
@@ -277,16 +355,25 @@ impl<D: BlockDevice> Filesystem<D> {
     /// What is wrong with a directory entry naming inode `number`, as
     /// Linux's ext4 lookup finds it (EFSCORRUPTED): `None` for a sound
     /// reference. An entry may name the root or an inode from the first
-    /// unreserved one up; the inode must have links and a file type.
+    /// unreserved one up; the inode must have links and a file type, and
+    /// (unless it was never used: no links and no mode) a checksum that
+    /// holds.
     pub fn damaged_reference(&mut self, number: u32) -> Option<Damage> {
         if number != ROOT_INODE
             && (number < self.superblock.first_inode() || number > self.superblock.inodes_count())
         {
             return Some(Damage::Number);
         }
+        match self.load_inode(number) {
+            Ok(inode) if inode.links() == 0 && inode.mode() == 0 => return Some(Damage::Inode),
+            Err(Error::Corrupt) => return Some(Damage::Inode),
+            Err(_) => return None,
+            Ok(_) => {}
+        }
         match self.read_inode(number) {
             Ok(inode) if inode.links() == 0 || inode.kind().is_none() => Some(Damage::Inode),
             Ok(_) => None,
+            Err(Error::BadChecksum) => Some(Damage::Checksum),
             Err(Error::Corrupt) => Some(Damage::Inode),
             Err(_) => None,
         }
@@ -294,18 +381,31 @@ impl<D: BlockDevice> Filesystem<D> {
 
     /// The first entry of `directory` at or after byte `offset`, and the
     /// offset after it; `None` at the end. `.` and `..` are entries too.
+    /// A block of a linear directory that fails its checksum is passed
+    /// over (and reported), as Linux's ext4 readdir passes over it; in a
+    /// hash-indexed directory, which Linux reads through its index, it
+    /// fails the read (EBADMSG).
     pub fn read_dir(&mut self, directory: u32, offset: u64) -> Result<Option<(Entry, u64)>> {
         let block_size = u64::from(self.block_size);
         let mut inode = self.read_inode(directory)?;
         if inode.kind() != Some(Kind::Directory) {
             return Err(Error::NotDirectory);
         }
+        let indexed = inode.flags() & INDEX_FL != 0;
         let count = inode.size() / block_size;
         let mut index = offset / block_size;
         let mut from = (offset % block_size) as usize;
         while index < count {
             if let Some((block, _)) = self.map_block(&mut inode, index, None)? {
-                let bytes = self.cache.get(&mut self.device, block)?;
+                let bytes = match self.directory_block(&inode, index, block) {
+                    Ok(bytes) => bytes,
+                    Err(Error::BadChecksum) if !indexed => {
+                        index += 1;
+                        from = 0;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 let mut at = 0;
                 while at < bytes.len() {
                     let record = record(bytes, at)?;
@@ -354,8 +454,9 @@ impl<D: BlockDevice> Filesystem<D> {
         self.drop_index(directory)?;
         let needed = entry_size(name.len());
         let checksums = self.seed.is_some();
-        for block in self.directory_blocks(directory)? {
-            let bytes = self.cache.get(&mut self.device, block)?;
+        let (inode_of_directory, blocks) = self.directory_blocks(directory)?;
+        for (index, block) in blocks {
+            let bytes = self.directory_block(&inode_of_directory, index, block)?;
             let end = entries_end(bytes, checksums);
             let mut at = 0;
             let mut gap = None;

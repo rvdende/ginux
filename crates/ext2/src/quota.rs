@@ -236,7 +236,7 @@ pub(crate) struct Quotas {
     /// What the current allocation may still use, in bytes.
     pub(crate) budget: Option<u64>,
     exempt: bool,
-    now: u64,
+    pub(crate) now: u64,
 }
 
 impl Quotas {
@@ -727,7 +727,7 @@ impl<D: BlockDevice> Filesystem<D> {
     }
 
     fn sync_quota(&mut self, kind: QuotaKind) -> Result<()> {
-        if self.read_only() {
+        if self.read_only() || self.is_shut_down() {
             return Ok(());
         }
         let dirty: Vec<u32> = self
@@ -747,7 +747,7 @@ impl<D: BlockDevice> Filesystem<D> {
     }
 
     fn write_quota_info(&mut self, kind: QuotaKind) -> Result<()> {
-        if self.read_only() {
+        if self.read_only() || self.is_shut_down() {
             return Ok(());
         }
         let loaded = self.loaded(kind)?;
@@ -775,7 +775,7 @@ impl<D: BlockDevice> Filesystem<D> {
     /// Writes `id`'s entry of `kind`, giving it a place in the file first
     /// if it has none (an entry that is all zeros and has none stays out).
     fn write_dquot(&mut self, kind: QuotaKind, id: u32) -> Result<()> {
-        if self.read_only() {
+        if self.read_only() || self.is_shut_down() {
             return Ok(());
         }
         let loaded = self.loaded(kind)?;

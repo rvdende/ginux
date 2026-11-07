@@ -475,6 +475,7 @@ interior-mutable	kernel/src/linux_pty.rs	PTYS	domain-runtime	allowlist	none	rank
 interior-mutable	kernel/src/linux_userfaultfd.rs	CONTEXTS	domain-runtime	allowlist	none	ranked-userfaultfd-contexts-owned-per-process
 interior-mutable	kernel/src/linux_userfaultfd.rs	LIVE	domain-runtime	allowlist	none	atomic-live-context-count
 interior-mutable	kernel/src/linux_blockfs.rs	VOLUMES	domain-runtime	allowlist	none	ranked-mounted-volumes
+interior-mutable	kernel/src/linux_blockfs.rs	FAILURES_PENDING	domain-runtime	allowlist	none	atomic-volume-damage-pending-flag
 interior-mutable	kernel/src/linux_fscontext.rs	OBJECTS	domain-runtime	allowlist	none	ranked-fs-contexts-and-detached-mounts
 interior-mutable	kernel/src/linux_mounts.rs	EXPIRY_MARKS	domain-runtime	allowlist	none	atomic-mnt-expire-mark-count
 interior-mutable	kernel/src/linux_mounts.rs	STRICT_ATIME_MOUNTS	domain-runtime	allowlist	none	atomic-strictatime-mount-count

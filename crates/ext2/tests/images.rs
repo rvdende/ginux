@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use ginux_ext2::{
-    BlockDevice, Change, Damage, DquotChange, Error, Filesystem, FsType, Kind, Options, QuotaKind,
-    QuotaOptions, RenameMode, Result, Timestamp, XattrMode, ROOT_INODE,
+    BlockDevice, Change, Damage, DquotChange, Error, ErrorPolicy, Failure, Filesystem, FsType,
+    Kind, Options, QuotaKind, QuotaOptions, RenameMode, Result, Timestamp, XattrMode, ROOT_INODE,
 };
 
 struct Memory(Vec<u8>);
@@ -116,6 +116,7 @@ impl Image {
                 now: NOW,
                 fs_type,
                 quota,
+                errors: None,
             },
         )
     }
@@ -1171,4 +1172,498 @@ fn quota_files_turn_on_and_keep_limits() {
     assert_eq!(filesystem.next_quota_id(QuotaKind::User, 6).unwrap(), 300);
     filesystem.quota_off(QuotaKind::User, NOW).unwrap();
     image.store(filesystem);
+}
+
+// ---- metadata checksums ----
+//
+// Each test damages one kind of metadata of an ext4 image (metadata_csum
+// on, as mke2fs -t ext4 makes it) by flipping bits where it lies, then
+// checks the error the driver gives, what it records, and that e2fsck
+// finds the damage too.
+
+impl Image {
+    fn mount_options(&self, options: Options) -> Result<Filesystem<Memory>> {
+        let bytes = std::fs::read(&self.path).unwrap();
+        Filesystem::mount(Memory(bytes), options)
+    }
+
+    fn mount_errors(&self, errors: Option<ErrorPolicy>) -> Filesystem<Memory> {
+        self.mount_options(Options {
+            read_only: false,
+            now: NOW,
+            fs_type: FsType::Ext4,
+            quota: QuotaOptions::default(),
+            errors,
+        })
+        .unwrap()
+    }
+
+    /// Unmounts `filesystem` into the image, unchecked.
+    fn save(&self, filesystem: Filesystem<Memory>) {
+        let device = filesystem.unmount(NOW).unwrap();
+        std::fs::write(&self.path, device.0).unwrap();
+    }
+
+    /// Flips the bits of `mask` in the image's byte `offset`.
+    fn flip(&self, offset: u64, mask: u8) {
+        let mut bytes = std::fs::read(&self.path).unwrap();
+        bytes[offset as usize] ^= mask;
+        std::fs::write(&self.path, bytes).unwrap();
+    }
+
+    /// The number `debugfs -R request` prints after `key` (hexadecimal
+    /// after "0x").
+    fn number_after(&self, request: &str, key: &str) -> u64 {
+        let output = self.debugfs(request);
+        let at = output
+            .find(key)
+            .unwrap_or_else(|| panic!("{key}?\n{output}"))
+            + key.len();
+        let rest = output[at..].trim_start();
+        let (rest, radix) = match rest.strip_prefix("0x") {
+            Some(hex) => (hex, 16),
+            None => (rest, 10),
+        };
+        let digits: String = rest.chars().take_while(|c| c.is_digit(radix)).collect();
+        u64::from_str_radix(&digits, radix).unwrap()
+    }
+
+    fn block_size(&self) -> u64 {
+        self.number_after("stats", "Block size:")
+    }
+
+    /// The image's byte `offset` of block `block`.
+    fn byte_of_block(&self, block: u64, offset: u64) -> u64 {
+        block * self.block_size() + offset
+    }
+
+    /// Asserts that `e2fsck -fn` finds the image damaged.
+    fn assert_damaged(&self) {
+        let output = Command::new(tool("e2fsck").unwrap())
+            .args(["-fn"])
+            .arg(&self.path)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "e2fsck found nothing wrong:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    /// The superblock's state, error count and last error inode.
+    fn error_record(&self) -> (u16, u32, u32) {
+        let bytes = std::fs::read(&self.path).unwrap();
+        let superblock = &bytes[1024..2048];
+        let u32_at = |at: usize| u32::from_le_bytes(superblock[at..at + 4].try_into().unwrap());
+        (
+            u16::from_le_bytes([superblock[58], superblock[59]]),
+            u32_at(0x194),
+            u32_at(0x1d0),
+        )
+    }
+}
+
+fn bad_checksum(inode: u32, block: u64) -> Failure {
+    Failure {
+        inode,
+        block,
+        error: Error::BadChecksum,
+    }
+}
+
+/// `filesystem.stat` of `number` fails as Linux's iget does on a bad
+/// inode checksum.
+fn assert_bad_checksum<T: std::fmt::Debug>(result: Result<T>) {
+    let error = result.unwrap_err();
+    assert_eq!(error, Error::BadChecksum);
+    assert_eq!(error.errno(), 74);
+}
+
+#[test]
+fn a_superblock_that_fails_its_checksum_is_not_mounted() {
+    let Some(image) = Image::new("csum-super", Format::Ext4, 16, &[]) else {
+        return;
+    };
+    // s_wtime: a field nothing else checks.
+    image.flip(1024 + 0x30, 0x01);
+    assert_eq!(
+        image.mount_as(FsType::Ext4, false).err(),
+        Some(Error::BadChecksum)
+    );
+    assert_eq!(
+        image.mount_as(FsType::Ext4, true).err(),
+        Some(Error::BadChecksum)
+    );
+    assert_eq!(
+        image.mount_as(FsType::Ext3, true).err(),
+        Some(Error::BadChecksum)
+    );
+    image.assert_damaged();
+}
+
+#[test]
+fn a_bad_group_descriptor_fails_a_writable_mount_only() {
+    let Some(image) = Image::new("csum-group", Format::Ext4, 16, &[]) else {
+        return;
+    };
+    // Group 0's free inode count, in the table after the superblock.
+    let table = image.byte_of_block(1, 0);
+    image.flip(table + 0x0e, 0x01);
+    assert_eq!(
+        image.mount_as(FsType::Ext4, false).err(),
+        Some(Error::Corrupt)
+    );
+    let mut filesystem = image.mount_as(FsType::Ext4, true).unwrap();
+    assert_eq!(
+        names(&mut filesystem, ROOT_INODE),
+        [".", "..", "lost+found"]
+    );
+    assert_eq!(
+        filesystem.set_read_only(false, NOW),
+        Err(Error::BadChecksum)
+    );
+    assert!(filesystem.read_only());
+    drop(filesystem);
+    image.assert_damaged();
+}
+
+#[test]
+fn sound_descriptors_remount_writable_after_changes() {
+    // quotacheck's remount: read-only, then writable again, after the
+    // descriptors changed.
+    let Some(image) = Image::new("csum-remount", Format::Ext4, 16, &[]) else {
+        return;
+    };
+    let mut filesystem = image.mount();
+    create_file(&mut filesystem, ROOT_INODE, "file");
+    filesystem.set_read_only(true, NOW).unwrap();
+    filesystem.set_read_only(false, NOW).unwrap();
+    create_file(&mut filesystem, ROOT_INODE, "other");
+    image.store(filesystem);
+    let mut filesystem = image.mount_as(FsType::Ext4, true).unwrap();
+    filesystem.set_read_only(false, NOW).unwrap();
+    image.store(filesystem);
+}
+
+#[test]
+fn a_bad_block_bitmap_leaves_its_group_alone() {
+    // 1 KiB blocks: two groups, so the allocator has another to go to.
+    let Some(image) = Image::new("csum-bbitmap", Format::Ext4, 16, &["-b", "1024"]) else {
+        return;
+    };
+    let bitmap = image.number_after("stats", "block bitmap at ");
+    let blocks_per_group = image.number_after("stats", "Blocks per group:");
+    // A bit for a block near the end of group 0, free on a fresh image.
+    image.flip(image.byte_of_block(bitmap, blocks_per_group / 8 - 2), 0x10);
+    let mut filesystem = image.mount();
+    let before = filesystem.statfs().free_blocks;
+    let file = create_file(&mut filesystem, ROOT_INODE, "file");
+    let data = pattern(0, 4096);
+    assert_eq!(filesystem.write(file, 0, &data).unwrap(), 4096);
+    assert_eq!(filesystem.take_failures(), [bad_checksum(0, bitmap)]);
+    // The data went to group 1; the damaged group is not read again.
+    let extents = filesystem.extents(file, 0, 4096).unwrap();
+    assert!(extents[0].physical / 1024 >= blocks_per_group);
+    filesystem.write(file, 4096, &data).unwrap();
+    assert!(!filesystem.has_failures());
+    assert!(filesystem.statfs().free_blocks < before - 8);
+    let mut back = vec![0; 4096];
+    filesystem.read(file, 0, &mut back).unwrap();
+    assert_eq!(back, data);
+    image.save(filesystem);
+    assert_eq!(image.error_record().0 & 2, 2);
+    image.assert_damaged();
+}
+
+#[test]
+fn a_bad_inode_bitmap_leaves_its_group_alone() {
+    let Some(image) = Image::new("csum-ibitmap", Format::Ext4, 16, &["-b", "1024"]) else {
+        return;
+    };
+    let bitmap = image.number_after("stats", "inode bitmap at ");
+    let per_group = image.number_after("stats", "Inodes per group:");
+    image.flip(image.byte_of_block(bitmap, per_group / 8 - 1), 0x20);
+    let mut filesystem = image.mount();
+    let file = create_file(&mut filesystem, ROOT_INODE, "file");
+    assert!(u64::from(file) > per_group, "inode {file} is in group 0");
+    assert_eq!(filesystem.take_failures(), [bad_checksum(0, bitmap)]);
+    let other = create_file(&mut filesystem, ROOT_INODE, "other");
+    assert!(u64::from(other) > per_group);
+    assert!(!filesystem.has_failures());
+    image.save(filesystem);
+    image.assert_damaged();
+}
+
+/// A file whose inode is damaged, its number and its inode table block.
+fn damaged_inode(name: &str) -> Option<(Image, u32, u64)> {
+    let image = Image::new(name, Format::Ext4, 16, &[])?;
+    let mut filesystem = image.mount();
+    let file = create_file(&mut filesystem, ROOT_INODE, "file");
+    filesystem.write(file, 0, b"data").unwrap();
+    image.store(filesystem);
+    let block = image.number_after("imap /file", "located at block ");
+    let offset = image.number_after("imap /file", "offset ");
+    // i_mtime.
+    image.flip(image.byte_of_block(block, offset + 0x10), 0x01);
+    Some((image, file, block))
+}
+
+#[test]
+fn an_inode_that_fails_its_checksum_is_not_read() {
+    let Some((image, file, block)) = damaged_inode("csum-inode") else {
+        return;
+    };
+    let mut filesystem = image.mount();
+    // The directory is sound: the name is found, the inode is not read.
+    assert_eq!(filesystem.lookup(ROOT_INODE, b"file"), Ok(file));
+    assert_bad_checksum(filesystem.stat(file));
+    assert_bad_checksum(filesystem.read(file, 0, &mut [0; 4]));
+    assert_eq!(filesystem.damaged_reference(file), Some(Damage::Checksum));
+    assert_eq!(filesystem.take_failures(), [bad_checksum(file, block); 3]);
+    // errors=continue (mke2fs's default) goes on.
+    assert_eq!(filesystem.error_policy(), ErrorPolicy::Continue);
+    create_file(&mut filesystem, ROOT_INODE, "after");
+    image.save(filesystem);
+    let (state, count, inode) = image.error_record();
+    assert_eq!(state, 3, "clean, with errors");
+    assert_eq!((count, inode), (3, file));
+    image.assert_damaged();
+}
+
+#[test]
+fn errors_remount_ro_stops_changes() {
+    for policy in [ErrorPolicy::ReadOnly, ErrorPolicy::Panic] {
+        let Some((image, file, _)) = damaged_inode("csum-policy") else {
+            return;
+        };
+        let mut filesystem = image.mount_errors(Some(policy));
+        assert_eq!(filesystem.shown_error_policy(), Some(policy));
+        let other = create_file(&mut filesystem, ROOT_INODE, "other");
+        assert_bad_checksum(filesystem.stat(file));
+        assert!(filesystem.is_shut_down());
+        // As Linux 6.12's ext4 shut down: changes and file reads fail.
+        let made = filesystem.create(ROOT_INODE, b"x", Kind::File, 0o644, 0, 0, 0, NOW);
+        assert_eq!(made, Err(Error::Io));
+        assert_eq!(filesystem.write(other, 0, b"x"), Err(Error::Io));
+        assert_eq!(filesystem.read(other, 0, &mut [0; 1]), Err(Error::Io));
+        assert_eq!(
+            filesystem.set_xattr(other, b"user.a", b"b", XattrMode::Any),
+            Err(Error::Io)
+        );
+        assert!(filesystem.stat(other).is_ok());
+        assert_eq!(filesystem.set_read_only(true, NOW), Err(Error::ReadOnly));
+        image.save(filesystem);
+        assert_eq!(image.error_record().0 & 2, 2);
+    }
+}
+
+#[test]
+fn the_superblock_names_the_default_error_policy() {
+    let Some(image) = Image::new("csum-default", Format::Ext4, 16, &[]) else {
+        return;
+    };
+    let filesystem = image.mount_errors(None);
+    assert_eq!(filesystem.error_policy(), ErrorPolicy::Continue);
+    assert_eq!(filesystem.shown_error_policy(), None);
+    image.store(filesystem);
+    let status = Command::new(tool("tune2fs").unwrap())
+        .args(["-e", "remount-ro"])
+        .arg(&image.path)
+        .output()
+        .unwrap()
+        .status;
+    assert!(status.success());
+    let filesystem = image.mount_errors(None);
+    assert_eq!(filesystem.error_policy(), ErrorPolicy::ReadOnly);
+    assert_eq!(filesystem.shown_error_policy(), None);
+    image.store(filesystem);
+    let filesystem = image.mount_errors(Some(ErrorPolicy::Continue));
+    assert_eq!(filesystem.shown_error_policy(), Some(ErrorPolicy::Continue));
+    image.store(filesystem);
+}
+
+#[test]
+fn ext2_shows_and_applies_its_error_policy() {
+    let Some(image) = Image::new("csum-ext2", Format::Ext2, 16, &[]) else {
+        return;
+    };
+    let options = |errors| Options {
+        read_only: false,
+        now: NOW,
+        fs_type: FsType::Ext2,
+        quota: QuotaOptions::default(),
+        errors,
+    };
+    // Linux's ext2 shows errors=continue though the superblock says it.
+    let filesystem = image.mount_options(options(None)).unwrap();
+    assert_eq!(filesystem.shown_error_policy(), Some(ErrorPolicy::Continue));
+    image.store(filesystem);
+    let mut filesystem = image
+        .mount_options(options(Some(ErrorPolicy::ReadOnly)))
+        .unwrap();
+    assert_eq!(filesystem.shown_error_policy(), Some(ErrorPolicy::ReadOnly));
+    assert_eq!(
+        filesystem.report(ROOT_INODE, 0, Error::Corrupt),
+        Error::Corrupt
+    );
+    // ext2 becomes read-only rather than shutting down.
+    assert!(filesystem.read_only() && !filesystem.is_shut_down());
+    let made = filesystem.create(ROOT_INODE, b"x", Kind::File, 0o644, 0, 0, 0, NOW);
+    assert_eq!(made, Err(Error::ReadOnly));
+    image.save(filesystem);
+    assert_eq!(image.error_record().0 & 2, 2);
+}
+
+#[test]
+fn a_bad_extent_block_fails_the_read() {
+    let Some(image) = Image::new("csum-extent", Format::Ext4, 16, &[]) else {
+        return;
+    };
+    let mut filesystem = image.mount();
+    let file = create_file(&mut filesystem, ROOT_INODE, "file");
+    // Six runs with holes between: more than the inode's root holds.
+    for index in (0..12_u64).step_by(2) {
+        filesystem
+            .write(file, index * 4096, &pattern(index, 4096))
+            .unwrap();
+    }
+    image.store(filesystem);
+    let tree = image.number_after("stat /file", "(ETB0):");
+    // The first entry's first file block.
+    image.flip(image.byte_of_block(tree, 12), 0x01);
+    let mut filesystem = image.mount();
+    assert!(filesystem.stat(file).is_ok());
+    assert_bad_checksum(filesystem.read(file, 0, &mut [0; 16]));
+    assert_bad_checksum(filesystem.extents(file, 0, u64::MAX));
+    assert_eq!(filesystem.take_failures()[0], bad_checksum(file, tree));
+    image.save(filesystem);
+    image.assert_damaged();
+}
+
+/// A directory of two blocks or more: the names, in the order made.
+fn fill_directory(filesystem: &mut Filesystem<Memory>, directory: u32) -> Vec<String> {
+    let names: Vec<String> = (0..60)
+        .map(|index| format!("{index:03}{}", "n".repeat(150)))
+        .collect();
+    for name in &names {
+        create_file(filesystem, directory, name);
+    }
+    names
+}
+
+#[test]
+fn a_bad_directory_block_fails_lookups_and_readdir_passes_it() {
+    let Some(image) = Image::new("csum-dir", Format::Ext4, 16, &[]) else {
+        return;
+    };
+    let mut filesystem = image.mount();
+    let directory = filesystem
+        .create(ROOT_INODE, b"dir", Kind::Directory, 0o755, 0, 0, 0, NOW)
+        .unwrap();
+    let names = fill_directory(&mut filesystem, directory);
+    image.store(filesystem);
+    let blocks = image.debugfs("blocks /dir");
+    let blocks: Vec<u64> = blocks
+        .split_whitespace()
+        .map(|b| b.parse().unwrap())
+        .collect();
+    assert!(blocks.len() >= 3, "{blocks:?}");
+    // The first name of the second block.
+    image.flip(image.byte_of_block(blocks[1], 8), 0x01);
+    let mut filesystem = image.mount();
+    assert!(filesystem.lookup(directory, names[0].as_bytes()).is_ok());
+    assert_bad_checksum(filesystem.lookup(directory, names[59].as_bytes()));
+    assert_eq!(
+        filesystem.take_failures(),
+        [bad_checksum(directory, blocks[1])]
+    );
+    // readdir lists the other blocks, passing over the damaged one.
+    let listed = names_of(&mut filesystem, directory);
+    assert!(listed.contains(&names[0]) && listed.contains(&names[59]));
+    assert!(listed.len() < names.len() + 2);
+    assert_eq!(
+        filesystem.take_failures(),
+        [bad_checksum(directory, blocks[1])]
+    );
+    assert_bad_checksum(filesystem.create(directory, b"new", Kind::File, 0o644, 0, 0, 0, NOW));
+    image.save(filesystem);
+    image.assert_damaged();
+}
+
+fn names_of(filesystem: &mut Filesystem<Memory>, directory: u32) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut offset = 0;
+    while let Some((entry, next)) = filesystem.read_dir(directory, offset).unwrap() {
+        names.push(String::from_utf8_lossy(entry.name()).into_owned());
+        offset = next;
+    }
+    names
+}
+
+#[test]
+fn hash_indexed_directories_are_checked_by_their_index() {
+    let Some(image) = Image::new("csum-htree", Format::Ext4, 16, &[]) else {
+        return;
+    };
+    let mut filesystem = image.mount();
+    let directory = filesystem
+        .create(ROOT_INODE, b"dir", Kind::Directory, 0o755, 0, 0, 0, NOW)
+        .unwrap();
+    let names = fill_directory(&mut filesystem, directory);
+    image.store(filesystem);
+    // e2fsck -D indexes the directory, with the index's checksums.
+    let status = Command::new(tool("e2fsck").unwrap())
+        .args(["-fyD"])
+        .arg(&image.path)
+        .output()
+        .unwrap()
+        .status;
+    assert!(status.code().is_some_and(|code| code <= 1));
+    let flags = image.number_after("stat /dir", "Flags: ");
+    assert_ne!(flags & 0x1000, 0, "not indexed");
+    let mut filesystem = image.mount();
+    for name in &names {
+        assert!(filesystem.lookup(directory, name.as_bytes()).is_ok());
+    }
+    assert_eq!(names_of(&mut filesystem, directory).len(), names.len() + 2);
+    assert!(!filesystem.has_failures());
+    drop(filesystem);
+    // The root's first index entry.
+    let root = image
+        .debugfs("blocks /dir")
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    image.flip(image.byte_of_block(root, 0x28), 0x01);
+    let mut filesystem = image.mount();
+    assert_bad_checksum(filesystem.lookup(directory, names[0].as_bytes()));
+    assert_bad_checksum(filesystem.read_dir(directory, 0).map(|_| ()));
+    assert_eq!(filesystem.take_failures()[0], bad_checksum(directory, root));
+    image.save(filesystem);
+    image.assert_damaged();
+}
+
+#[test]
+fn a_bad_attribute_block_fails_the_attribute_calls() {
+    let Some(image) = Image::new("csum-xattr", Format::Ext4, 16, &[]) else {
+        return;
+    };
+    let mut filesystem = image.mount();
+    let file = create_file(&mut filesystem, ROOT_INODE, "file");
+    filesystem
+        .set_xattr(file, b"user.name", &[7; 100], XattrMode::Any)
+        .unwrap();
+    image.store(filesystem);
+    let block = image.number_after("stat /file", "File ACL: ");
+    // The value, at the end of the block.
+    image.flip(image.byte_of_block(block, image.block_size() - 50), 0x01);
+    let mut filesystem = image.mount();
+    assert_bad_checksum(filesystem.get_xattr(file, b"user.name"));
+    assert_bad_checksum(filesystem.list_xattrs(file));
+    assert_eq!(filesystem.take_failures()[0], bad_checksum(file, block));
+    image.save(filesystem);
+    image.assert_damaged();
 }

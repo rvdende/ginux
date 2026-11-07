@@ -138,13 +138,36 @@ impl<D: BlockDevice> Filesystem<D> {
         }
         let block = inode.xattr_block();
         if block != 0 {
-            let bytes = self.cache.get(&mut self.device, block)?;
-            if u32_at(bytes, 0) != MAGIC || u32_at(bytes, 8) != 1 {
-                return Err(Error::Corrupt);
-            }
+            let bytes = self.xattr_block(inode, block)?;
             parse_entries(bytes, BLOCK_HEADER, 0, &mut attributes)?;
         }
         Ok(attributes)
+    }
+
+    /// Attribute block `block` of `inode`, checked as Linux's ext4 checks
+    /// one it reads: its header (EUCLEAN), then its checksum (EBADMSG,
+    /// reported against the inode).
+    fn xattr_block(&mut self, inode: &Inode, block: u32) -> Result<&[u8]> {
+        let bytes = self.cache.get(&mut self.device, block)?;
+        if u32_at(bytes, 0) != MAGIC || u32_at(bytes, 8) != 1 {
+            return Err(Error::Corrupt);
+        }
+        if let Some(seed) = self.seed.filter(|_| self.verify) {
+            let valid = |bytes: &[u8]| {
+                let seed = crc32c(seed, &u64::from(block).to_le_bytes());
+                let checksum = crc32c_skipping(seed, bytes, BLOCK_CHECKSUM..BLOCK_CHECKSUM + 4);
+                checksum == u32_at(bytes, BLOCK_CHECKSUM)
+            };
+            if self
+                .cache
+                .get_verified(&mut self.device, block, valid)?
+                .is_none()
+            {
+                let error = Error::BadChecksum;
+                return Err(self.report(inode.number(), u64::from(block), error));
+            }
+        }
+        self.cache.get(&mut self.device, block)
     }
 
     /// The value of attribute `name` of inode `number` (ENODATA if none).
@@ -177,9 +200,7 @@ impl<D: BlockDevice> Filesystem<D> {
         value: &[u8],
         mode: XattrMode,
     ) -> Result<()> {
-        if self.read_only() {
-            return Err(Error::ReadOnly);
-        }
+        self.check_writable()?;
         let (index, suffix) = split_name(name)?;
         if suffix.is_empty() || suffix.len() > 255 {
             return Err(Error::Range);
@@ -219,9 +240,7 @@ impl<D: BlockDevice> Filesystem<D> {
 
     /// Removes attribute `name` of inode `number` (ENODATA if none).
     pub fn remove_xattr(&mut self, number: u32, name: &[u8]) -> Result<()> {
-        if self.read_only() {
-            return Err(Error::ReadOnly);
-        }
+        self.check_writable()?;
         let (index, suffix) = split_name(name)?;
         let mut inode = self.read_inode(number)?;
         let mut attributes = self.attributes(&inode)?;
@@ -362,7 +381,7 @@ impl<D: BlockDevice> Filesystem<D> {
         if block == 0 {
             return Ok(());
         }
-        let references = u32_at(self.cache.get(&mut self.device, block)?, 4);
+        let references = u32_at(self.xattr_block(inode, block)?, 4);
         if references > 1 {
             self.release_shared(block)?;
         } else {

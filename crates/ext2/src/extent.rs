@@ -362,6 +362,19 @@ fn node(bytes: &[u8]) -> Result<Node> {
     Ok(Node { entries, depth })
 }
 
+/// Whether tree block `bytes` of an inode whose checksums start from
+/// `seed` has a checksum that holds: after the entries it has room for
+/// (its header's capacity), over everything before. A block whose header
+/// is itself broken is left to [`node`] to refuse (EUCLEAN), as Linux
+/// checks the header before the checksum.
+fn tree_checksum_valid(bytes: &[u8], seed: u32) -> bool {
+    if node(bytes).is_err() {
+        return true;
+    }
+    let tail = HEADER + usize::from(u16_at(bytes, 4)) * ENTRY;
+    tail + 4 <= bytes.len() && crc32c(seed, &bytes[..tail]) == u32_at(bytes, tail)
+}
+
 fn write_header(bytes: &mut [u8], entries: usize, capacity: usize, depth: u16) {
     set_u16(bytes, 0, MAGIC);
     set_u16(bytes, 2, entries as u16);
@@ -475,6 +488,24 @@ impl<D: BlockDevice> Filesystem<D> {
         (self.block_size as usize - HEADER) / ENTRY
     }
 
+    /// Tree block `block` of `inode`, checked against its checksum
+    /// (EBADMSG, reported against the inode, if it fails).
+    fn tree_block(&mut self, inode: &Inode, block: u32) -> Result<&[u8]> {
+        if let Some(seed) = self.seed.filter(|_| self.verify) {
+            let seed = inode.checksum_seed(seed);
+            let valid = |bytes: &[u8]| tree_checksum_valid(bytes, seed);
+            if self
+                .cache
+                .get_verified(&mut self.device, block, valid)?
+                .is_none()
+            {
+                let error = Error::BadChecksum;
+                return Err(self.report(inode.number(), u64::from(block), error));
+            }
+        }
+        self.cache.get(&mut self.device, block)
+    }
+
     fn check_run(&self, run: &Run) -> Result<()> {
         if run.physical < self.superblock.first_data_block()
             || u64::from(run.physical) + u64::from(run.length)
@@ -498,7 +529,7 @@ impl<D: BlockDevice> Filesystem<D> {
                 }
                 Step::Descend(block, depth) => {
                     let block = self.valid_block(block)?;
-                    next = step(self.cache.get(&mut self.device, block)?, index, Some(depth))?;
+                    next = step(self.tree_block(inode, block)?, index, Some(depth))?;
                 }
             }
         }
@@ -513,7 +544,7 @@ impl<D: BlockDevice> Filesystem<D> {
             let block = self.valid_block(block)?;
             map.blocks.try_reserve(1).map_err(|_| Error::NoMemory)?;
             map.blocks.push(block);
-            let bytes = self.cache.get(&mut self.device, block)?;
+            let bytes = self.tree_block(inode, block)?;
             collect(bytes, Some(depth), &mut map.runs, &mut pending)?;
         }
         if map

@@ -88,6 +88,8 @@ pub(super) extern "sysv64" fn linux_syscall_handler(
         (user_stack, user_rip, user_rflags),
         inotify,
     );
+    // Damage a volume found during the call is reported as it returns.
+    let result = linux_volume_failures(result);
     crate::linux_profile::time_syscall(number, timer::timestamp_counter().wrapping_sub(started));
     if let Some(call) = traced.filter(|call| !crate::linux_strace::logged_before(call.number)) {
         call.log(Some(result));

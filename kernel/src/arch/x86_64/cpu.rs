@@ -37875,29 +37875,54 @@ fn linux_openat_path(
         linux_note_descriptor_view(directory, &path[..path_length], opened);
     }
     if opened == LINUX_ENOENT {
-        if let Some(error) = linux_volume_damage(directory, &path[..path_length]) {
-            return error;
-        }
+        linux_volume_damage(directory, &path[..path_length]);
     }
     opened
 }
 
-/// Whether a lookup of `path` (from `directory`) that found nothing met a
-/// damaged volume on the way: a directory entry naming no valid inode, or
-/// an inode with no links or file type. Then, as ext4 does, the
-/// filesystem reports the error (fanotify's FAN_FS_ERROR, on the inode at
-/// fault) and the call fails with EFSCORRUPTED.
-fn linux_volume_damage(directory: u64, path: &[u8]) -> Option<u64> {
-    const EFSCORRUPTED: i32 = 117;
+/// Looks for the damage a lookup of `path` (from `directory`) that found
+/// nothing met on a volume: a directory entry naming no valid inode, or an
+/// inode with no links or file type. The volume records it as ext4 does,
+/// and the call fails with EFSCORRUPTED ([`linux_volume_failures`]).
+fn linux_volume_damage(directory: u64, path: &[u8]) {
     if !crate::linux_blockfs::any_mounted() {
-        return None;
+        return;
     }
     let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
-    let length = linux_canonical_path_at(u64::from(directory as u32), path, &mut canonical).ok()?;
+    let Ok(length) = linux_canonical_path_at(u64::from(directory as u32), path, &mut canonical)
+    else {
+        return;
+    };
     let storage = crate::linux_mount_paths::storage(&canonical[..length]);
-    let (fsid, handle) = crate::linux_blockfs::damage_at(&storage)?;
-    linux_fanotify_fs_error(fsid, Some(linux_handle_identity(handle)), EFSCORRUPTED);
-    Some(LINUX_EUCLEAN)
+    crate::linux_blockfs::note_damage_at(&storage);
+}
+
+/// Reports the damage this domain's volumes found during the system call
+/// that returns `result`, as ext4 reports each error (fanotify's
+/// FAN_FS_ERROR, on the inode at fault, or on none for a bitmap). A call
+/// that failed fails with the first damage's errno (EBADMSG for a
+/// checksum that does not match, EFSCORRUPTED for other damage) in place
+/// of what the volume's lookup or read made of it (ENOENT, EIO), as the
+/// ext4 operation that met the damage fails with it.
+pub(super) fn linux_volume_failures(result: u64) -> u64 {
+    let failures = crate::linux_blockfs::take_failures();
+    let Some(first) = failures.first() else {
+        return result;
+    };
+    for failure in failures.iter().filter(|failure| failure.notify) {
+        linux_fanotify_fs_error(
+            failure.fsid,
+            failure.handle.map(linux_handle_identity),
+            failure.errno as i32,
+        );
+    }
+    // A Linux errno, not a value or one of the kernel's own markers.
+    let failed = (1..=133).contains(&result.wrapping_neg());
+    if failed {
+        first.errno.wrapping_neg()
+    } else {
+        result
+    }
 }
 
 /// Whether mount(2)'s option string at `data_address` holds `option`
@@ -55258,7 +55283,7 @@ fn linux_proc_mount_table(mountinfo: bool) -> Option<Vec<u8>> {
                         b" rw"
                     },
                 )
-                && append_linux_bytes(&mut line, &mut used, linux_super_options(mount))
+                && append_linux_bytes(&mut line, &mut used, &linux_super_options(mount))
                 && append_linux_bytes(&mut line, &mut used, b"\n")
         } else {
             escaped(&mount.source, &mut line, &mut used)
@@ -55268,7 +55293,7 @@ fn linux_proc_mount_table(mountinfo: bool) -> Option<Vec<u8>> {
                 && escaped(&mount.filesystem, &mut line, &mut used)
                 && append_linux_bytes(&mut line, &mut used, b" ")
                 && linux_mount_options(mount.flags, &mut line, &mut used)
-                && append_linux_bytes(&mut line, &mut used, linux_super_options(mount))
+                && append_linux_bytes(&mut line, &mut used, &linux_super_options(mount))
                 && append_linux_bytes(&mut line, &mut used, b" 0 0\n")
         };
         if written && file.try_reserve(used).is_ok() {
@@ -55281,12 +55306,12 @@ fn linux_proc_mount_table(mountinfo: bool) -> Option<Vec<u8>> {
 }
 
 /// The filesystem's own options a mount shows after its mount options
-/// (ext4's quota options), each with its comma.
-fn linux_super_options(mount: &crate::linux_mounts::Mount) -> &'static [u8] {
+/// (ext4's errors= and quota options), each with its comma.
+fn linux_super_options(mount: &crate::linux_mounts::Mount) -> Vec<u8> {
     if linux_volume_type(&mount.filesystem).is_some() {
         crate::linux_blockfs::shown_options(mount.device)
     } else {
-        b""
+        Vec::new()
     }
 }
 
@@ -61564,6 +61589,22 @@ fn linux_mount_filesystem(
         {
             return LINUX_EBUSY;
         }
+        // A volume's errors= changes on a remount too.
+        if crate::linux_blockfs::generations_at(storage).is_some() {
+            let mut data = [0_u8; 512];
+            let data_length = if data_address == 0 {
+                0
+            } else {
+                copy_linux_c_string(data_address, &mut data).unwrap_or(0)
+            };
+            match linux_volume_error_option(&data[..data_length]) {
+                Ok(Some(policy)) => {
+                    crate::linux_blockfs::set_error_policy(storage, policy);
+                }
+                Ok(None) => {}
+                Err(error) => return error,
+            }
+        }
         match crate::linux_blockfs::remount(storage, flags & MS_RDONLY != 0) {
             Some(Err(error)) => return error.wrapping_neg(),
             // ext4's "abort" (a debugging option): the filesystem stops as
@@ -61875,9 +61916,6 @@ fn linux_volume_type(filesystem: &[u8]) -> Option<ginux_ext2::FsType> {
     }
 }
 
-/// mount(2) of the ext2, ext3 or ext4 filesystem (`fs_type`) on the block
-/// device at `source` on canonical `target`, a directory, with the domain
-/// mount options `options` (`linux_mounts`).
 /// The quota options of an ext filesystem's mount option string
 /// (usrquota or quota, grpquota, prjquota; noquota clears them). Other
 /// options are taken and have no effect here.
@@ -61895,11 +61933,33 @@ fn linux_volume_quota_options(data: &[u8]) -> ginux_ext2::QuotaOptions {
     quota
 }
 
+/// The errors= option of an ext filesystem's mount option string
+/// (continue, remount-ro, panic; EINVAL for another value), the last one
+/// given if several are.
+fn linux_volume_error_option(data: &[u8]) -> Result<Option<ginux_ext2::ErrorPolicy>, u64> {
+    let mut policy = None;
+    for option in data.split(|byte| *byte == b',') {
+        let Some(value) = option.strip_prefix(b"errors=") else {
+            continue;
+        };
+        policy = Some(match value {
+            b"continue" => ginux_ext2::ErrorPolicy::Continue,
+            b"remount-ro" => ginux_ext2::ErrorPolicy::ReadOnly,
+            b"panic" => ginux_ext2::ErrorPolicy::Panic,
+            _ => return Err(LINUX_EINVAL),
+        });
+    }
+    Ok(policy)
+}
+
 /// Whether the caller may go past quota limits (CAP_SYS_RESOURCE).
 pub(crate) fn linux_quota_exempt() -> bool {
     linux_has_capability(ginux_credentials::capability::SYS_RESOURCE)
 }
 
+/// mount(2) of the ext2, ext3 or ext4 filesystem (`fs_type`) on the block
+/// device at `source` on canonical `target`, a directory, with the domain
+/// mount options `options` (`linux_mounts`) and the option string `data`.
 fn linux_mount_volume(
     source: &[u8],
     target: &[u8],
@@ -61973,7 +62033,15 @@ fn linux_mount_volume(
     let superblock = crate::linux_mounts::new_superblock();
     let storage = crate::linux_mount_paths::storage_root(superblock);
     let quota = linux_volume_quota_options(data);
-    if let Err(error) = crate::linux_blockfs::mount(&storage, source, io, read_only, fs_type, quota)
+    let errors = match linux_volume_error_option(data) {
+        Ok(errors) => errors,
+        Err(error) => {
+            linux_release_volume_device(source);
+            return error;
+        }
+    };
+    if let Err(error) =
+        crate::linux_blockfs::mount(&storage, source, io, read_only, fs_type, quota, errors)
     {
         linux_release_volume_device(source);
         return error.wrapping_neg();
