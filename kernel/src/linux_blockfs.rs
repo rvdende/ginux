@@ -30,7 +30,10 @@ use alloc::{
     vec::Vec,
 };
 
-use ginux_ext2::{Change, Error, Filesystem, Kind, Options, RenameMode, Timestamp, XattrMode};
+use ginux_ext2::{
+    Change, Dquot, DquotChange, Error, Filesystem, Kind, Options, QuotaInfo, QuotaKind,
+    QuotaOptions, RenameMode, Timestamp, XattrMode,
+};
 
 use crate::arch::x86_64::cpu;
 use crate::linux_overlay::{Child, Handle, Metadata, NodeKind};
@@ -146,6 +149,8 @@ struct Volume {
     /// The canonical mount point, without a leading slash ("" for none).
     point: Vec<u8>,
     source: Source,
+    /// The filesystem type it was mounted as.
+    fs_type: ginux_ext2::FsType,
     filesystem: Filesystem<Disk>,
     /// Generations given out, both ways.
     generations: BTreeMap<u32, u32>,
@@ -201,6 +206,7 @@ pub(crate) type Errno = u64;
 const EBUSY: Errno = 16;
 const EINVAL: Errno = 22;
 const ENOMEM: Errno = 12;
+const EXDEV: Errno = 18;
 
 fn errno(error: Error) -> Errno {
     error.errno()
@@ -263,15 +269,22 @@ impl Volumes {
         let index = volume_index(self, path)?;
         let volume = &mut self.volumes[index];
         let relative = below(&volume.point, path)?;
+        volume
+            .filesystem
+            .set_caller(now(), cpu::linux_quota_exempt());
         Some((volume, relative))
     }
 
     fn of(&mut self, handle: Handle) -> Option<(&mut Volume, u32)> {
         let generation = crate::linux_overlay::generation(handle);
-        self.volumes.iter_mut().find_map(|volume| {
+        let (volume, inode) = self.volumes.iter_mut().find_map(|volume| {
             let inode = *volume.generations.get(&generation)?;
             Some((volume, inode))
-        })
+        })?;
+        volume
+            .filesystem
+            .set_caller(now(), cpu::linux_quota_exempt());
+        Some((volume, inode))
     }
 
     fn handle(&mut self, index: usize, inode: u32) -> Handle {
@@ -1444,6 +1457,7 @@ pub(crate) fn mount(
     io: Option<Arc<crate::linux_loop::IoCounters>>,
     read_only: bool,
     fs_type: ginux_ext2::FsType,
+    quota: QuotaOptions,
 ) -> Result<(), Errno> {
     let mut stored = Vec::new();
     stored.try_reserve_exact(point.len()).map_err(|_| ENOMEM)?;
@@ -1454,6 +1468,7 @@ pub(crate) fn mount(
             read_only,
             now: now(),
             fs_type,
+            quota,
         },
     )
     .map_err(|error| match error {
@@ -1469,6 +1484,7 @@ pub(crate) fn mount(
         instance: instance(),
         point: stored,
         source,
+        fs_type,
         filesystem,
         generations: BTreeMap::new(),
         inodes: BTreeMap::new(),
@@ -1481,6 +1497,180 @@ pub(crate) fn mount(
         cached_pages: 0,
     });
     Ok(())
+}
+
+/// The volume a quotactl(2) names: the one mounted from a block device,
+/// or the one a file is on (quotactl_fd).
+#[derive(Clone, Copy)]
+pub(crate) enum QuotaVolume {
+    Device(u32),
+    File(Handle),
+}
+
+/// Runs `operation` on the volume `which` names; None if none.
+fn with_quota_volume<T>(which: QuotaVolume, operation: impl FnOnce(&mut Volume) -> T) -> Option<T> {
+    let mut table = VOLUMES.lock();
+    let instance = instance();
+    let volume = match which {
+        QuotaVolume::Device(device) => table
+            .volumes
+            .iter_mut()
+            .find(|volume| volume.instance == instance && volume.source.device() == device)?,
+        QuotaVolume::File(handle) => table.of(handle)?.0,
+    };
+    volume
+        .filesystem
+        .set_caller(now(), cpu::linux_quota_exempt());
+    Some(operation(volume))
+}
+
+/// The quota kinds the volume's filesystem type keeps (ext2's driver:
+/// user and group; ext4's, for ext3 too: project as well).
+pub(crate) fn quota_kinds(which: QuotaVolume) -> Option<&'static [QuotaKind]> {
+    with_quota_volume(which, |volume| match volume.fs_type {
+        ginux_ext2::FsType::Ext2 => &QuotaKind::ALL[..2],
+        _ => &QuotaKind::ALL[..],
+    })
+}
+
+/// Whether the volume keeps its quotas in system files (ext4's quota
+/// feature).
+pub(crate) fn quota_system_files(which: QuotaVolume) -> Option<bool> {
+    with_quota_volume(which, |volume| volume.filesystem.quota_system_files())
+}
+
+/// Q_QUOTAON with a quota file: `file` must be on the same volume (EXDEV).
+pub(crate) fn quota_on(
+    which: QuotaVolume,
+    kind: QuotaKind,
+    file: Handle,
+    format: u32,
+) -> Option<Result<(), Errno>> {
+    let generation = crate::linux_overlay::generation(file);
+    with_quota_volume(which, |volume| {
+        let Some(inode) = volume.generations.get(&generation).copied() else {
+            return Err(EXDEV);
+        };
+        volume
+            .filesystem
+            .quota_on(kind, inode, format)
+            .map_err(errno)
+    })
+}
+
+/// Q_QUOTAOFF: a quota file's quotas go off; system files' limits stop
+/// being enforced.
+pub(crate) fn quota_off(which: QuotaVolume, kind: QuotaKind) -> Option<Result<(), Errno>> {
+    with_quota_volume(which, |volume| {
+        if volume.filesystem.quota_system_files() {
+            volume.filesystem.quota_disable(kind)
+        } else {
+            volume.filesystem.quota_off(kind, now())
+        }
+        .map_err(errno)
+    })
+}
+
+/// Q_QUOTAON on system quota files: their limits are enforced.
+pub(crate) fn quota_enable(which: QuotaVolume, kind: QuotaKind) -> Option<Result<(), Errno>> {
+    with_quota_volume(which, |volume| {
+        volume.filesystem.quota_enable(kind).map_err(errno)
+    })
+}
+
+pub(crate) fn quota_info(which: QuotaVolume, kind: QuotaKind) -> Option<Result<QuotaInfo, Errno>> {
+    with_quota_volume(which, |volume| {
+        volume.filesystem.quota_info(kind).map_err(errno)
+    })
+}
+
+pub(crate) fn set_quota_info(
+    which: QuotaVolume,
+    kind: QuotaKind,
+    space_grace: Option<u64>,
+    inode_grace: Option<u64>,
+) -> Option<Result<(), Errno>> {
+    with_quota_volume(which, |volume| {
+        volume
+            .filesystem
+            .set_quota_info(kind, space_grace, inode_grace)
+            .map_err(errno)
+    })
+}
+
+pub(crate) fn get_quota(
+    which: QuotaVolume,
+    kind: QuotaKind,
+    id: u32,
+) -> Option<Result<Dquot, Errno>> {
+    with_quota_volume(which, |volume| {
+        volume.filesystem.get_quota(kind, id).map_err(errno)
+    })
+}
+
+/// Q_GETNEXTQUOTA: the first id from `id` on with an entry, and its quota.
+pub(crate) fn next_quota(
+    which: QuotaVolume,
+    kind: QuotaKind,
+    id: u32,
+) -> Option<Result<(u32, Dquot), Errno>> {
+    with_quota_volume(which, |volume| {
+        let next = volume.filesystem.next_quota_id(kind, id)?;
+        Ok((next, volume.filesystem.get_quota(kind, next)?))
+    })
+    .map(|result| result.map_err(errno))
+}
+
+pub(crate) fn set_quota(
+    which: QuotaVolume,
+    kind: QuotaKind,
+    id: u32,
+    change: &DquotChange,
+) -> Option<Result<(), Errno>> {
+    with_quota_volume(which, |volume| {
+        volume.filesystem.set_quota(kind, id, change).map_err(errno)
+    })
+}
+
+pub(crate) fn quota_sync(which: QuotaVolume) -> Option<Result<(), Errno>> {
+    with_quota_volume(which, |volume| {
+        volume.filesystem.quota_sync().map_err(errno)
+    })
+}
+
+/// Q_SYNC without a device: every volume of the domain.
+pub(crate) fn quota_sync_all() {
+    let instance = instance();
+    for volume in &mut VOLUMES.lock().volumes {
+        if volume.instance == instance {
+            let _ = volume.filesystem.quota_sync();
+        }
+    }
+}
+
+/// The options the volume mounted from `device` shows in /proc/mounts
+/// past the mount's own (ext4's quota options), each with its comma.
+pub(crate) fn shown_options(device: u32) -> &'static [u8] {
+    let instance = instance();
+    let table = VOLUMES.lock();
+    let Some(volume) = table
+        .volumes
+        .iter()
+        .find(|volume| volume.instance == instance && volume.source.device() == device)
+    else {
+        return b"";
+    };
+    let options = volume.filesystem.quota_options();
+    match (options.user, options.group, options.project) {
+        (false, false, false) => b"",
+        (true, false, false) => b",quota,usrquota",
+        (false, true, false) => b",grpquota",
+        (false, false, true) => b",prjquota",
+        (true, true, false) => b",quota,usrquota,grpquota",
+        (true, false, true) => b",quota,usrquota,prjquota",
+        (false, true, true) => b",grpquota,prjquota",
+        (true, true, true) => b",quota,usrquota,grpquota,prjquota",
+    }
 }
 
 /// Whether block device `device` (a dev_t) backs a mounted volume.

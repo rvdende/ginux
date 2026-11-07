@@ -17,6 +17,13 @@ const GOOD_OLD_INODE_SIZE: usize = 128;
 /// directory has a hash index.
 pub(crate) const EXTENTS_FL: u32 = 0x8_0000;
 pub(crate) const INDEX_FL: u32 = 0x1000;
+/// Inode flags quota files get while quotas are on, and project
+/// inheritance (new inodes take the directory's project id).
+pub(crate) const IMMUTABLE_FL: u32 = 0x10;
+pub(crate) const NOATIME_FL: u32 = 0x80;
+pub(crate) const PROJINHERIT_FL: u32 = 0x2000_0000;
+/// Where a large inode keeps its project id.
+const PROJECT_ID: usize = 0x9c;
 /// Where the inode's checksum halves live (metadata_csum).
 const CHECKSUM_LO: usize = 0x7c;
 const CHECKSUM_HI: usize = 0x82;
@@ -224,6 +231,21 @@ impl Inode {
 
     pub(crate) fn block_bytes_mut(&mut self) -> &mut [u8] {
         &mut self.raw[40..40 + BLOCK_POINTERS * 4]
+    }
+
+    /// The project id (0 where the inode has no room for one).
+    pub(crate) fn project(&self) -> u32 {
+        if self.has_extra(PROJECT_ID + 4) {
+            u32_at(&self.raw, PROJECT_ID)
+        } else {
+            0
+        }
+    }
+
+    pub(crate) fn set_project(&mut self, project: u32) {
+        if self.has_extra(PROJECT_ID + 4) {
+            set_u32(&mut self.raw, PROJECT_ID, project);
+        }
     }
 
     pub(crate) fn generation(&self) -> u32 {

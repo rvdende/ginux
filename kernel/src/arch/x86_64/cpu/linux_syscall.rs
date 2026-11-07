@@ -2291,6 +2291,8 @@ fn linux_syscall_dispatch(
         LINUX_PIVOT_ROOT_SYSCALL => linux_landlock_check_mount()
             .map_or_else(|error| error, |()| linux_pivot_root(first_argument, buffer)),
         LINUX_ACCT_SYSCALL => linux_acct(first_argument),
+        LINUX_QUOTACTL_SYSCALL => linux_quotactl(first_argument, buffer, count, register(0)),
+        LINUX_QUOTACTL_FD_SYSCALL => linux_quotactl_fd(first_argument, buffer, count, register(0)),
         LINUX_PTRACE_SYSCALL
             if linux_privileged_operation_allowed(
                 linux_user::PrivilegedOperation::TraceProcesses,

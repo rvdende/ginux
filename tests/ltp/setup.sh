@@ -35,7 +35,7 @@ EOF
 # Tools a distribution has and busybox lacks, from the LTP tree
 # (tools/ltp/container-build.sh): the shadow user tools (useradd, ...) and
 # e2fsprogs (mkfs.ext2/3/4, e2fsck, tune2fs, chattr, ...), which the tests
-# that format a device run. Each overlay goes in unless the image already
+# that format a device run, and the quota tools (quotacheck). Each overlay goes in unless the image already
 # has its tool; files the image has are kept (busybox's cp -n skips whole
 # directories, so each file is copied on its own).
 install_overlay() {
@@ -49,6 +49,7 @@ install_overlay() {
 }
 install_overlay shadow useradd
 install_overlay e2fsprogs mke2fs
+install_overlay quota quotacheck
 # disk-tmpdir.sh TEST [ARG...]: runs a test with its TMPDIR on an ext2
 # filesystem of its own, for the tests whose files must live on a block
 # device (the domain's /tmp is the overlay, which has none).

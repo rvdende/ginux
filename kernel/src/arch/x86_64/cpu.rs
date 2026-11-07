@@ -20,6 +20,7 @@ mod linux_futex;
 mod linux_hugetlb;
 mod linux_poll;
 mod linux_pty;
+mod linux_quota;
 mod linux_security;
 mod linux_signal;
 mod linux_syscall;
@@ -52,6 +53,7 @@ use linux_futex::*;
 use linux_hugetlb::*;
 use linux_poll::*;
 use linux_pty::*;
+use linux_quota::*;
 use linux_security::*;
 use linux_signal::*;
 pub(crate) use linux_signal::{
@@ -52901,11 +52903,13 @@ fn linux_proc_mount_table(mountinfo: bool) -> Option<Vec<u8>> {
                     &mut line,
                     &mut used,
                     if mount.flags & crate::linux_mounts::READ_ONLY != 0 {
-                        b" ro\n"
+                        b" ro"
                     } else {
-                        b" rw\n"
+                        b" rw"
                     },
                 )
+                && append_linux_bytes(&mut line, &mut used, linux_super_options(mount))
+                && append_linux_bytes(&mut line, &mut used, b"\n")
         } else {
             escaped(&mount.source, &mut line, &mut used)
                 && append_linux_bytes(&mut line, &mut used, b" ")
@@ -52914,6 +52918,7 @@ fn linux_proc_mount_table(mountinfo: bool) -> Option<Vec<u8>> {
                 && escaped(&mount.filesystem, &mut line, &mut used)
                 && append_linux_bytes(&mut line, &mut used, b" ")
                 && linux_mount_options(mount.flags, &mut line, &mut used)
+                && append_linux_bytes(&mut line, &mut used, linux_super_options(mount))
                 && append_linux_bytes(&mut line, &mut used, b" 0 0\n")
         };
         if written && file.try_reserve(used).is_ok() {
@@ -52923,6 +52928,16 @@ fn linux_proc_mount_table(mountinfo: bool) -> Option<Vec<u8>> {
         }
     });
     complete.then_some(file)
+}
+
+/// The filesystem's own options a mount shows after its mount options
+/// (ext4's quota options), each with its comma.
+fn linux_super_options(mount: &crate::linux_mounts::Mount) -> &'static [u8] {
+    if linux_volume_type(&mount.filesystem).is_some() {
+        crate::linux_blockfs::shown_options(mount.device)
+    } else {
+        b""
+    }
 }
 
 fn linux_mountinfo_file(state: u16) -> bool {
@@ -58440,6 +58455,15 @@ fn linux_mount_filesystem(
     {
         return LINUX_EPERM;
     }
+    // The old magic number in the flags' top half is dropped (MS_MGC_VAL,
+    // which quotacheck still passes).
+    const MS_MGC_MASK: u64 = 0xffff_0000;
+    const MS_MGC_VAL: u64 = 0xc0ed_0000;
+    let flags = if flags & MS_MGC_MASK == MS_MGC_VAL {
+        flags & !MS_MGC_MASK
+    } else {
+        flags
+    };
     if flags & !VALID_FLAGS != 0 {
         return LINUX_EINVAL;
     }
@@ -58659,7 +58683,9 @@ fn linux_mount_filesystem(
     // no short string carries no options for a tmpfs, and is no business
     // of the filesystems that take none.
     let mut data = alloc::vec::Vec::new();
-    if data_address != 0 && matches!(filesystem, b"overlay" | b"tmpfs") {
+    if data_address != 0
+        && (matches!(filesystem, b"overlay" | b"tmpfs") || linux_volume_type(filesystem).is_some())
+    {
         let mut page = [0_u8; PAGE_SIZE];
         match copy_linux_c_string(data_address, &mut page) {
             Ok(length) => {
@@ -58715,7 +58741,7 @@ fn linux_mount_new(
         let Some(source) = source else {
             return LINUX_EINVAL;
         };
-        return linux_mount_volume(source, target, options, fs_type);
+        return linux_mount_volume(source, target, options, fs_type, data);
     }
     if filesystem == b"overlay" {
         return linux_mount_overlayfs(target, source.unwrap_or(b"none"), options, data);
@@ -58853,11 +58879,34 @@ fn linux_volume_type(filesystem: &[u8]) -> Option<ginux_ext2::FsType> {
 /// mount(2) of the ext2, ext3 or ext4 filesystem (`fs_type`) on the block
 /// device at `source` on canonical `target`, a directory, with the domain
 /// mount options `options` (`linux_mounts`).
+/// The quota options of an ext filesystem's mount option string
+/// (usrquota or quota, grpquota, prjquota; noquota clears them). Other
+/// options are taken and have no effect here.
+fn linux_volume_quota_options(data: &[u8]) -> ginux_ext2::QuotaOptions {
+    let mut quota = ginux_ext2::QuotaOptions::default();
+    for option in data.split(|byte| *byte == b',') {
+        match option {
+            b"usrquota" | b"quota" => quota.user = true,
+            b"grpquota" => quota.group = true,
+            b"prjquota" => quota.project = true,
+            b"noquota" => quota = ginux_ext2::QuotaOptions::default(),
+            _ => {}
+        }
+    }
+    quota
+}
+
+/// Whether the caller may go past quota limits (CAP_SYS_RESOURCE).
+pub(crate) fn linux_quota_exempt() -> bool {
+    linux_has_capability(ginux_credentials::capability::SYS_RESOURCE)
+}
+
 fn linux_mount_volume(
     source: &[u8],
     target: &[u8],
     options: u32,
     fs_type: ginux_ext2::FsType,
+    data: &[u8],
 ) -> u64 {
     let mut source_name = [0_u8; crate::linux_overlay::PATH_CAPACITY + 1];
     let (device, source_name_length) = match linux_volume_device(source, &mut source_name) {
@@ -58924,7 +58973,9 @@ fn linux_mount_volume(
     // The volume is stored below a storage root of its own.
     let superblock = crate::linux_mounts::new_superblock();
     let storage = crate::linux_mount_paths::storage_root(superblock);
-    if let Err(error) = crate::linux_blockfs::mount(&storage, source, io, read_only, fs_type) {
+    let quota = linux_volume_quota_options(data);
+    if let Err(error) = crate::linux_blockfs::mount(&storage, source, io, read_only, fs_type, quota)
+    {
         linux_release_volume_device(source);
         return error.wrapping_neg();
     }

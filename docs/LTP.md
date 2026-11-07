@@ -162,8 +162,15 @@ feature rather than a fix:
   64-bit descriptors, flex_bg, uninitialized groups and metadata_csum.
   The journal is not written (changes go to their places, as on ext2,
   and the journal stays empty); one that needs replaying is refused.
-  The LTP tree carries e2fsprogs from the builder (mkfs.ext2/3/4, e2fsck,
-  tune2fs, debugfs, chattr, e4crypt: `tools/ltp/container-build.sh`),
+  Disk quotas (quotactl, quotactl_fd: `crates/ext2/src/quota.rs`) are
+  kept in vfsv0/vfsv1 quota files, either the ones quotacheck makes
+  (mounted with usrquota/grpquota) or ext4's hidden quota inodes (the
+  quota and project features); usage follows every allocation, chown and
+  deletion, and enforced limits are EDQUOT (quotactl01, 04, 06, 08, 09;
+  the others need xfs).
+  The LTP tree carries e2fsprogs and the quota tools from the builder
+  (mkfs.ext2/3/4, e2fsck, tune2fs, debugfs, chattr, e4crypt, quotacheck:
+  `tools/ltp/container-build.sh`),
   which `tests/ltp/setup.sh` installs into the domain. xfs, btrfs, vfat,
   exfat and ntfs are not there (ENODEV), so LTP skips them. ioctl_loop05 runs through
   `/opt/ltp/disk-tmpdir.sh`, which gives it a TMPDIR on an ext2 volume of

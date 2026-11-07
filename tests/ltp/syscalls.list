@@ -1011,12 +1011,12 @@ pwritev202_64 pwritev202_64
 quotactl01 quotactl01
 quotactl02 quotactl02
 quotactl03 quotactl03
-!quotactl04 quotactl04  # ext4 quota (quota inodes, -O quota,project) is not kept: such a filesystem mounts read-only only (EROFS)
+quotactl04 quotactl04
 quotactl05 quotactl05
 quotactl06 quotactl06
 quotactl07 quotactl07
-!quotactl08 quotactl08  # ext4 quota (quota inodes, -O quota) is not kept: such a filesystem mounts read-only only (EROFS)
-!quotactl09 quotactl09  # ext4 quota (quota inodes, -O quota) is not kept: such a filesystem mounts read-only only (EROFS)
+quotactl08 quotactl08
+quotactl09 quotactl09
 read01 read01
 read02 read02
 read03 read03

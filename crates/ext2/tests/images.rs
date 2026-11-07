@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use ginux_ext2::{
-    BlockDevice, Change, Error, Filesystem, FsType, Kind, Options, RenameMode, Result, Timestamp,
-    XattrMode, ROOT_INODE,
+    BlockDevice, Change, DquotChange, Error, Filesystem, FsType, Kind, Options, QuotaKind,
+    QuotaOptions, RenameMode, Result, Timestamp, XattrMode, ROOT_INODE,
 };
 
 struct Memory(Vec<u8>);
@@ -99,6 +99,15 @@ impl Image {
     }
 
     fn mount_as(&self, fs_type: FsType, read_only: bool) -> Result<Filesystem<Memory>> {
+        self.mount_with(fs_type, read_only, QuotaOptions::default())
+    }
+
+    fn mount_with(
+        &self,
+        fs_type: FsType,
+        read_only: bool,
+        quota: QuotaOptions,
+    ) -> Result<Filesystem<Memory>> {
         let bytes = std::fs::read(&self.path).unwrap();
         Filesystem::mount(
             Memory(bytes),
@@ -106,6 +115,7 @@ impl Image {
                 read_only,
                 now: NOW,
                 fs_type,
+                quota,
             },
         )
     }
@@ -920,4 +930,209 @@ fn preallocated_blocks_take_writes_on_a_full_disk() {
         assert_eq!(back, data);
         image.store(filesystem);
     }
+}
+
+/// ext4's quota feature: usage kept in the hidden quota inodes through
+/// writes, chown and deletion (e2fsck checks it against the files), limits
+/// that persist, and EDQUOT past a hard limit once enforced.
+#[test]
+fn system_quota_files_count_and_enforce() {
+    let Some(image) = Image::new(
+        "quota",
+        Format::Ext4,
+        32,
+        &["-O", "quota,project", "-I", "256"],
+    ) else {
+        return;
+    };
+    let mut filesystem = image.mount();
+    assert!(filesystem.quota_system_files());
+    let user = 1000;
+    let file = create_file(&mut filesystem, ROOT_INODE, "owned");
+    filesystem.write(file, 0, &vec![1; 100_000]).unwrap();
+    let directory = filesystem
+        .create(
+            ROOT_INODE,
+            b"dir",
+            Kind::Directory,
+            0o755,
+            user,
+            100,
+            0,
+            NOW,
+        )
+        .unwrap();
+    let inner = create_file(&mut filesystem, directory, "inner");
+    filesystem.write(inner, 0, &vec![2; 5000]).unwrap();
+    let usage = filesystem.get_quota(QuotaKind::User, user).unwrap();
+    assert_eq!(usage.inodes, 3);
+    assert!(usage.space >= 100_000 + 5000);
+    // Ids get entries in the tree as they appear (new tree and data
+    // blocks), and e2fsck finds them right.
+    for id in [2000_u32, 70_000, 0x0102_0304] {
+        let name = format!("file-{id}");
+        let number = create_file(&mut filesystem, ROOT_INODE, &name);
+        filesystem
+            .change(
+                number,
+                &Change {
+                    owner: Some(id),
+                    ..Change::default()
+                },
+            )
+            .unwrap();
+        filesystem.write(number, 0, b"data").unwrap();
+    }
+    filesystem
+        .set_quota(
+            QuotaKind::User,
+            user,
+            &DquotChange {
+                space_soft: Some(100 << 10),
+                ..DquotChange::default()
+            },
+        )
+        .unwrap();
+    filesystem
+        .set_quota_info(QuotaKind::User, Some(80), None)
+        .unwrap();
+    image.store(filesystem);
+
+    let mut filesystem = image.mount();
+    assert_eq!(
+        filesystem
+            .get_quota(QuotaKind::User, user)
+            .unwrap()
+            .space_soft,
+        100 << 10
+    );
+    assert_eq!(
+        filesystem.quota_info(QuotaKind::User).unwrap().space_grace,
+        80
+    );
+    assert_eq!(filesystem.next_quota_id(QuotaKind::User, 1).unwrap(), 1000);
+    assert_eq!(
+        filesystem.next_quota_id(QuotaKind::User, 70_001).unwrap(),
+        0x0102_0304
+    );
+    assert_eq!(
+        filesystem.next_quota_id(QuotaKind::User, 0x0102_0305),
+        Err(Error::NoQuota)
+    );
+    // Deleting gives the usage back.
+    let gone = filesystem.unlink(directory, b"inner", NOW).unwrap();
+    assert!(filesystem.release(gone, NOW).unwrap());
+    assert_eq!(
+        filesystem.get_quota(QuotaKind::User, user).unwrap().inodes,
+        2
+    );
+    // Enforced: a write past the hard limit stops short, then EDQUOT.
+    filesystem
+        .set_quota(
+            QuotaKind::User,
+            user,
+            &DquotChange {
+                space_hard: Some(160 << 10),
+                ..DquotChange::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(filesystem.quota_enable(QuotaKind::User), Ok(()));
+    assert_eq!(filesystem.quota_enable(QuotaKind::User), Err(Error::Exists));
+    filesystem.set_caller(NOW, false);
+    let written = filesystem.write(file, 100_000, &vec![3; 200_000]).unwrap();
+    assert!(written < 200_000, "{written}");
+    assert_eq!(
+        filesystem.write(file, 100_000 + written as u64, &vec![3; 8192]),
+        Err(Error::QuotaExceeded)
+    );
+    // Root may go past it.
+    filesystem.set_caller(NOW, true);
+    filesystem.write(file, 400_000, &vec![4; 8192]).unwrap();
+    assert_eq!(filesystem.quota_disable(QuotaKind::User), Ok(()));
+    assert_eq!(
+        filesystem.quota_disable(QuotaKind::User),
+        Err(Error::Exists)
+    );
+    image.store(filesystem);
+}
+
+/// A quota file quotaon(2) names (what quotacheck makes): an empty vfsv1
+/// file of the format turns on, takes limits, and keeps them.
+#[test]
+fn quota_files_turn_on_and_keep_limits() {
+    let Some(image) = Image::new("quotafile", Format::Ext4, 16, &[]) else {
+        return;
+    };
+    let quota = QuotaOptions {
+        user: true,
+        ..QuotaOptions::default()
+    };
+    let mut filesystem = image.mount_with(FsType::Ext4, false, quota).unwrap();
+    let file = create_file(&mut filesystem, ROOT_INODE, "aquota.user");
+    // Header (magic, version 1), information (grace times, two blocks),
+    // and an empty tree root.
+    let mut contents = vec![0_u8; 2048];
+    contents[0..4].copy_from_slice(&0xd9c0_1f11_u32.to_le_bytes());
+    contents[4..8].copy_from_slice(&1_u32.to_le_bytes());
+    contents[8..12].copy_from_slice(&604_800_u32.to_le_bytes());
+    contents[12..16].copy_from_slice(&604_800_u32.to_le_bytes());
+    contents[20..24].copy_from_slice(&2_u32.to_le_bytes());
+    filesystem.write(file, 0, &contents).unwrap();
+    assert_eq!(
+        filesystem.get_quota(QuotaKind::User, 0),
+        Err(Error::NoQuota)
+    );
+    assert_eq!(
+        filesystem.quota_on(QuotaKind::User, file, 999),
+        Err(Error::NoQuota)
+    );
+    assert_eq!(
+        filesystem.quota_on(QuotaKind::User, ROOT_INODE, 4),
+        Err(Error::Access)
+    );
+    assert_eq!(
+        filesystem.quota_on(QuotaKind::User, file, 2),
+        Err(Error::Invalid)
+    );
+    filesystem.quota_on(QuotaKind::User, file, 4).unwrap();
+    assert_eq!(
+        filesystem.quota_on(QuotaKind::User, file, 4),
+        Err(Error::Busy)
+    );
+    assert_eq!(
+        filesystem.quota_info(QuotaKind::User).unwrap().space_grace,
+        604_800
+    );
+    let range = DquotChange {
+        space_soft: Some(u64::MAX),
+        ..DquotChange::default()
+    };
+    assert_eq!(
+        filesystem.set_quota(QuotaKind::User, 5, &range),
+        Err(Error::Range)
+    );
+    for id in [0_u32, 5, 300, 70_000] {
+        filesystem
+            .set_quota(
+                QuotaKind::User,
+                id,
+                &DquotChange {
+                    space_soft: Some(u64::from(id + 1) << 10),
+                    inode_hard: Some(u64::from(id) + 7),
+                    ..DquotChange::default()
+                },
+            )
+            .unwrap();
+    }
+    filesystem.quota_off(QuotaKind::User, NOW).unwrap();
+    filesystem.quota_on(QuotaKind::User, file, 4).unwrap();
+    for id in [0_u32, 5, 300, 70_000] {
+        let dquot = filesystem.get_quota(QuotaKind::User, id).unwrap();
+        assert_eq!(dquot.space_soft, u64::from(id + 1) << 10);
+        assert_eq!(dquot.inode_hard, u64::from(id) + 7);
+    }
+    assert_eq!(filesystem.next_quota_id(QuotaKind::User, 6).unwrap(), 300);
+    filesystem.quota_off(QuotaKind::User, NOW).unwrap();
+    image.store(filesystem);
 }

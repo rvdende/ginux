@@ -38,7 +38,12 @@ pub(crate) const RO_COMPAT_HUGE_FILE: u32 = 0x8;
 pub(crate) const RO_COMPAT_DIR_NLINK: u32 = 0x20;
 pub(crate) const RO_COMPAT_EXTRA_ISIZE: u32 = 0x40;
 pub(crate) const RO_COMPAT_METADATA_CSUM: u32 = 0x400;
-const RO_COMPAT_SUPPORTED: u32 = RO_COMPAT_SPARSE_SUPER
+/// Quotas in hidden system inodes, and project ids in inodes.
+pub(crate) const RO_COMPAT_QUOTA: u32 = 0x100;
+pub(crate) const RO_COMPAT_PROJECT: u32 = 0x2000;
+const RO_COMPAT_SUPPORTED: u32 = RO_COMPAT_QUOTA
+    | RO_COMPAT_PROJECT
+    | RO_COMPAT_SPARSE_SUPER
     | RO_COMPAT_LARGE_FILE
     | RO_COMPAT_HUGE_FILE
     | RO_COMPAT_DIR_NLINK
@@ -251,6 +256,24 @@ impl Superblock {
     /// 0 if it did not.
     pub(crate) fn overhead_blocks(&self) -> u32 {
         self.u32(0x248)
+    }
+
+    /// Quotas in hidden system inodes (the quota feature).
+    pub(crate) fn quota(&self) -> bool {
+        self.ro_compat() & RO_COMPAT_QUOTA != 0
+    }
+
+    /// Project ids in the inodes (the project feature).
+    pub(crate) fn project(&self) -> bool {
+        self.ro_compat() & RO_COMPAT_PROJECT != 0
+    }
+
+    /// The user, group and project quota inodes (0 for none).
+    pub(crate) fn quota_inodes(&self) -> [u32; 3] {
+        if !self.quota() {
+            return [0; 3];
+        }
+        [self.u32(0x240), self.u32(0x244), self.u32(0x26c)]
     }
 
     /// The inode of an internal journal.

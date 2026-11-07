@@ -10,6 +10,7 @@ use crate::checksum::crc32c;
 use crate::extent::{self, ExtentMap, Run};
 use crate::inode::{
     Inode, Kind, Stat, Time, BLOCK_POINTERS, DIRECT_BLOCKS, EXTENTS_FL, FAST_SYMLINK_MAX, INDEX_FL,
+    PROJINHERIT_FL,
 };
 use crate::layout::{
     GroupDescriptor, Superblock, COMPAT_HAS_JOURNAL, GROUP_BLOCK_UNINIT, GROUP_INODE_UNINIT,
@@ -41,6 +42,9 @@ pub struct Options {
     /// The time of the mount, recorded in the superblock.
     pub now: Timestamp,
     pub fs_type: FsType,
+    /// usrquota, grpquota, prjquota: quotaon(2) may use quota files, and
+    /// with the quota feature their limits are enforced from the mount.
+    pub quota: crate::QuotaOptions,
 }
 
 /// Whether `superblock` may be mounted as `fs_type` (Linux's
@@ -128,6 +132,7 @@ pub struct Filesystem<D: BlockDevice> {
     pub(crate) seed: Option<u32>,
     descriptor_size: usize,
     link_max: u16,
+    pub(crate) quotas: crate::quota::Quotas,
 }
 
 impl<D: BlockDevice> Filesystem<D> {
@@ -206,7 +211,9 @@ impl<D: BlockDevice> Filesystem<D> {
             seed,
             descriptor_size,
             link_max,
+            quotas: crate::quota::Quotas::new(options.quota),
         };
+        filesystem.load_system_quotas()?;
         if !filesystem.read_only {
             filesystem
                 .superblock
@@ -226,6 +233,7 @@ impl<D: BlockDevice> Filesystem<D> {
             return Ok(());
         }
         if read_only {
+            self.quota_sync()?;
             self.superblock.mark_clean(now.seconds as u32);
             self.write_superblock()?;
         } else {
@@ -243,6 +251,7 @@ impl<D: BlockDevice> Filesystem<D> {
     /// the device is the caller's again.
     pub fn unmount(mut self, now: Timestamp) -> Result<D> {
         if !self.read_only {
+            self.quota_sync()?;
             self.superblock.mark_clean(now.seconds as u32);
             self.write_superblock()?;
         }
@@ -252,6 +261,9 @@ impl<D: BlockDevice> Filesystem<D> {
     /// Writes the superblock's counts (sync(2)); everything else is already
     /// on the device.
     pub fn sync(&mut self) -> Result<()> {
+        if !self.read_only {
+            self.quota_sync()?;
+        }
         if self.superblock_dirty && !self.read_only {
             self.write_superblock()?;
         }
@@ -407,6 +419,7 @@ impl<D: BlockDevice> Filesystem<D> {
     }
 
     pub(crate) fn write_inode(&mut self, number: u32, inode: &Inode) -> Result<()> {
+        self.account_inode_write(number, inode)?;
         let (block, offset) = self.inode_location(number)?;
         match self.seed {
             Some(seed) => {
@@ -423,7 +436,7 @@ impl<D: BlockDevice> Filesystem<D> {
 
     /// An inode in use: one with a type (a freed inode keeps its mode, so
     /// the bitmap is the authority, but a zero mode is never in use).
-    fn live_inode(&mut self, number: u32) -> Result<Inode> {
+    pub(crate) fn live_inode(&mut self, number: u32) -> Result<Inode> {
         let inode = self.read_inode(number)?;
         if inode.kind().is_none() {
             return Err(Error::NotFound);
@@ -445,6 +458,17 @@ impl<D: BlockDevice> Filesystem<D> {
         if change.owner.is_some() || change.group.is_some() {
             let owner = change.owner.unwrap_or(inode.owner());
             let group = change.group.unwrap_or(inode.group());
+            let ids = [owner, group, inode.project()];
+            if ids != crate::quota::owners(&inode) && self.quota_counted(number) {
+                // The new owners take the inode's space and the inode.
+                if self
+                    .quota_room(ids)
+                    .is_some_and(|room| room < inode.sectors() * 512)
+                {
+                    return Err(Error::QuotaExceeded);
+                }
+                self.quota_inode_room(ids, 1)?;
+            }
             inode.set_owner(owner, group);
         }
         if let Some(flags) = change.flags {
@@ -622,6 +646,7 @@ impl<D: BlockDevice> Filesystem<D> {
             }
             self.seal_inode_bitmap(group)?;
             self.write_group(group)?;
+            self.quotas.note_fresh(group * per_group + bit + 1);
             let free = self.superblock.free_inodes() - 1;
             self.superblock.set_free_inodes(free);
             self.superblock_dirty = true;
@@ -631,6 +656,7 @@ impl<D: BlockDevice> Filesystem<D> {
     }
 
     fn free_inode(&mut self, number: u32, directory: bool) -> Result<()> {
+        self.account_inode_free(number)?;
         let group = self.group_of_inode(number);
         let bit = (number - 1) % self.superblock.inodes_per_group();
         let bitmap = self.inode_bitmap(group)?;
@@ -691,6 +717,25 @@ impl<D: BlockDevice> Filesystem<D> {
         if self.superblock.free_blocks() == 0 {
             return Err(Error::NoSpace);
         }
+        // What quota leaves the inode being written.
+        let count = match self.quotas.budget {
+            Some(budget) => {
+                let allowed = budget / u64::from(self.block_size);
+                if allowed == 0 {
+                    return Err(Error::QuotaExceeded);
+                }
+                count.min(allowed.min(u64::from(u32::MAX)) as u32)
+            }
+            None => count,
+        };
+        let (block, length) = self.allocate_free_blocks(goal, count)?;
+        if let Some(budget) = self.quotas.budget.as_mut() {
+            *budget = budget.saturating_sub(u64::from(length) * u64::from(self.block_size));
+        }
+        Ok((block, length))
+    }
+
+    fn allocate_free_blocks(&mut self, goal: u32, count: u32) -> Result<(u32, u32)> {
         let groups = self.groups.len() as u32;
         let per_group = self.superblock.blocks_per_group();
         let first_data = self.superblock.first_data_block();
@@ -1081,11 +1126,14 @@ impl<D: BlockDevice> Filesystem<D> {
         }
         let data = &data[..(data.len() as u64).min(limit - offset) as usize];
         let goal = self.group_of_inode(number);
-        let result = if inode.uses_extents() {
-            self.write_extents(&mut inode, offset, data)
-        } else {
-            self.write_data(&mut inode, goal, offset, data)
-        };
+        let budget_inode = inode.clone();
+        let result = self.with_quota_budget(number, &budget_inode, |filesystem| {
+            if inode.uses_extents() {
+                filesystem.write_extents(&mut inode, offset, data)
+            } else {
+                filesystem.write_data(&mut inode, goal, offset, data)
+            }
+        });
         let written = match result {
             Ok(written) | Err((written, _)) if written > 0 => written,
             Ok(written) => written,
@@ -1203,6 +1251,11 @@ impl<D: BlockDevice> Filesystem<D> {
         let mut index = offset / block_size;
         let last = end.div_ceil(block_size);
         let mut result = Ok(());
+        // Preallocated blocks count toward quota as written ones do.
+        let previous_budget = self.quotas.budget;
+        if self.quota_counted(number) {
+            self.quotas.budget = self.quota_room(crate::quota::owners(&inode));
+        }
         while index < last {
             let at = index as u32;
             if let Some(run) = map.find(at) {
@@ -1220,7 +1273,9 @@ impl<D: BlockDevice> Filesystem<D> {
                 }
             }
         }
-        self.store_extents(&mut inode, &mut map)?;
+        let stored = self.store_extents(&mut inode, &mut map);
+        self.quotas.budget = previous_budget;
+        stored?;
         if result.is_ok() && !keep_size && end > inode.size() {
             inode.set_size(end);
             if end > i32::MAX as u64 {
@@ -1636,6 +1691,13 @@ impl<D: BlockDevice> Filesystem<D> {
         group: u32,
         now: Timestamp,
     ) -> Result<(u32, Inode)> {
+        let parent_inode = self.read_inode(parent)?;
+        let project = if parent_inode.flags() & PROJINHERIT_FL != 0 {
+            parent_inode.project()
+        } else {
+            0
+        };
+        self.quota_inode_room([owner, group, project], 1)?;
         let number = self.allocate_inode(parent, kind)?;
         let mut inode = Inode::from_raw(vec![0; self.superblock.inode_size()], number);
         if self.superblock.inode_size() > 128 {
@@ -1650,6 +1712,10 @@ impl<D: BlockDevice> Filesystem<D> {
         }
         inode.set_mode(kind.mode_bits() | (mode & 0o7777) as u16);
         inode.set_owner(owner, group);
+        inode.set_project(project);
+        if parent_inode.flags() & PROJINHERIT_FL != 0 {
+            inode.set_flags(inode.flags() | PROJINHERIT_FL);
+        }
         inode.set_links(1);
         for which in [Time::Access, Time::Modify, Time::Change, Time::Create] {
             inode.set_time(which, now);

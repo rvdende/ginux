@@ -49,11 +49,13 @@ mod extent;
 mod filesystem;
 mod inode;
 mod layout;
+mod quota;
 mod xattr;
 
 pub use directory::Entry;
 pub use filesystem::{Change, Extent, Filesystem, FsType, Options, RenameMode, Statfs};
 pub use inode::{Kind, Stat};
+pub use quota::{Dquot, DquotChange, QuotaFormat, QuotaInfo, QuotaKind, QuotaOptions};
 pub use xattr::XattrMode;
 
 /// The inode of every ext2 filesystem's root directory.
@@ -102,6 +104,17 @@ pub enum Error {
     NoMemory,
     /// E2BIG: an attribute value larger than a block can hold.
     TooBig,
+    /// ESRCH: quotas of the kind are off, or no such quota.
+    NoQuota,
+    /// EDQUOT: past a quota limit.
+    QuotaExceeded,
+    /// EBUSY
+    Busy,
+    /// EACCES
+    Access,
+    /// ENOSYS: the filesystem does not do that (quota_enable without the
+    /// quota feature).
+    NoSys,
 }
 
 impl Error {
@@ -109,9 +122,12 @@ impl Error {
     pub const fn errno(self) -> u64 {
         match self {
             Self::NotFound => 2,
+            Self::NoQuota => 3,
             Self::Io => 5,
             Self::TooBig => 7,
             Self::NoMemory => 12,
+            Self::Access => 13,
+            Self::Busy => 16,
             Self::Exists => 17,
             Self::NotDirectory => 20,
             Self::IsDirectory => 21,
@@ -122,10 +138,12 @@ impl Error {
             Self::TooManyLinks => 31,
             Self::Range => 34,
             Self::NameTooLong => 36,
+            Self::NoSys => 38,
             Self::NotEmpty => 39,
             Self::NoData => 61,
             Self::Unsupported => 95,
             Self::Corrupt => 117,
+            Self::QuotaExceeded => 122,
         }
     }
 }
