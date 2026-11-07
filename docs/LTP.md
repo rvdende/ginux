@@ -226,6 +226,16 @@ feature rather than a fix:
   it munmap, mprotect and madvise take the program-image paths. Shrinking
   a file turns its pages past the new end into SIGBUS pages only in the
   process that truncates it.
+- **The main stack**: exec puts it at the top of the address space
+  (ending at 0x7fff_ffff_f000, far above the mmap area), where it grows
+  down to RLIMIT_STACK's soft limit as the limit is when it grows (8 MiB
+  by default, as Linux's _STK_LIM; unlimited stops at 64 GiB), and not
+  within the stack guard gap (256 pages) of a mapping below; past either,
+  the fault is SIGSEGV (ginux_stack01, process_madvise01's 1 MiB stack
+  array). The domain's first process keeps its stack above its heap
+  until it execs. stack_clash is skipped: it maps MAP_FIXED next to the
+  stack and over every gap below it, and MAP_FIXED takes only 256 MiB to
+  1 TiB.
 - **musl, not the kernel**: tests that cannot pass with musl are skipped
   in `tests/ltp/syscalls.list` with the reason (fork() is the fork system
   call, readlink with size 0 gets a one-byte buffer, fchmod retries

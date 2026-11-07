@@ -5299,6 +5299,54 @@ fn replace_live_process_mapping_inner(
     true
 }
 
+/// Drops `pid`'s registered mapping at `address`, whose page its page
+/// tables no longer hold; false if there was none.
+pub(crate) fn remove_live_process_mapping(pid: u32, address: usize) -> bool {
+    with_live_process_mappings(pid, |mappings| {
+        let index = mappings
+            .iter()
+            .position(|mapping| mapping.address == address)?;
+        mappings.remove(index);
+        Some(())
+    })
+    .is_some()
+}
+
+/// Moves `pid`'s registered mapping at `from` to `to`, as its page-table
+/// entry moved (exec moving the stack); false if there was none at `from`
+/// or there is one at `to`.
+pub(crate) fn move_live_process_mapping(pid: u32, from: usize, to: usize) -> bool {
+    with_live_process_mappings(pid, |mappings| {
+        if mappings.iter().any(|mapping| mapping.address == to) {
+            return None;
+        }
+        mappings
+            .iter_mut()
+            .find(|mapping| mapping.address == from)?
+            .address = to;
+        Some(())
+    })
+    .is_some()
+}
+
+/// Runs `change` on `pid`'s registered mapping list, keeping its count in
+/// step with the list.
+fn with_live_process_mappings<T>(
+    pid: u32,
+    change: impl FnOnce(&mut Vec<cpu::LinuxActiveImageMapping>) -> Option<T>,
+) -> Option<T> {
+    let table = live_process_table_mut()?;
+    let handle = table.handle_by_pid(pid)?;
+    let space = table.process_mut(handle)?.address_space.as_mut()?;
+    let storage = address_space_storage(usize::from(space.storage_slot))?;
+    if space.mapping_count as usize != storage.mappings.len() {
+        return None;
+    }
+    let result = change(&mut storage.mappings)?;
+    space.mapping_count = storage.mappings.len().try_into().ok()?;
+    Some(result)
+}
+
 pub(crate) fn add_live_process_mapping(pid: u32, mapping: cpu::LinuxActiveImageMapping) -> bool {
     if mapping.address == 0
         || !mapping.address.is_multiple_of(PAGE_SIZE)

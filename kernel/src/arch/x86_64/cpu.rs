@@ -407,7 +407,7 @@ struct X86RuntimeOwner {
         RuntimeRef<CpuBankedAtomicArray<AtomicU32, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
     ELF_PROBE_SOCKET_SLOTS:
         RuntimeRef<CpuBankedAtomicArray<AtomicU16, LINUX_DEVICE_DESCRIPTOR_COUNT>>,
-    ELF_PROBE_STACK: RuntimeRef<BankedAtomicU64>,
+    ELF_PROBE_STACK: RuntimeRef<CpuBankedAtomicU64>,
     ELF_PROBE_STACK_FRAME: RuntimeRef<CpuBankedAtomicU64>,
     ELF_PROBE_STACK_GENERATION: RuntimeRef<CpuBankedAtomicU32>,
     ELF_PROBE_STACK_LOW: RuntimeRef<CpuBankedAtomicU64>,
@@ -3439,7 +3439,7 @@ static X86_RUNTIME_BACKING_LINUX_MASKED_WAIT_INTERRUPT_COUNT: BankedAtomicU32 =
     BankedAtomicU32::new(0);
 static X86_RUNTIME_BACKING_LINUX_SIGNAL_WAIT_INTERRUPT_COUNT: BankedAtomicU32 =
     BankedAtomicU32::new(0);
-static X86_RUNTIME_BACKING_ELF_PROBE_STACK: BankedAtomicU64 = BankedAtomicU64::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_STACK: CpuBankedAtomicU64 = CpuBankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_STACK_LOW: CpuBankedAtomicU64 = CpuBankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_STACK_FRAME: CpuBankedAtomicU64 = CpuBankedAtomicU64::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_STACK_GENERATION: CpuBankedAtomicU32 =
@@ -6135,7 +6135,12 @@ pub(crate) fn live_linux_process_address_space_snapshot(
         let stack_pages = (stack_address - stack_low) / PAGE_SIZE + 1;
         for page in 1..stack_pages {
             let address = stack_address.checked_sub(page * PAGE_SIZE)?;
-            let frame_address = address_space::current_linux_mapping_frame_address(address as u64)?;
+            // A deep stack's pages need not all have been touched.
+            let Some(frame_address) =
+                address_space::current_linux_mapping_frame_address(address as u64)
+            else {
+                continue;
+            };
             let frame = memory::live_frame_lease(memory::FrameOwner::KERNEL, frame_address)
                 .or_else(|| {
                     memory::FrameLease::from_parts(frame_address, 1)
@@ -19314,6 +19319,8 @@ struct LinuxProcessRuntimeState {
     descriptors: LinuxDescriptorRuntimeState,
     image_extents: [u64; 8],
     brk: u64,
+    /// The main stack's top (exec moves it), and how far down it has grown.
+    stack: u64,
     stack_low: u64,
     cwd: u16,
     rootfs_cwd: u16,
@@ -19365,6 +19372,7 @@ impl LinuxProcessRuntimeState {
         descriptors: LinuxDescriptorRuntimeState::EMPTY,
         image_extents: [0; 8],
         brk: 0,
+        stack: 0,
         stack_low: 0,
         cwd: LINUX_ROOT_DIRECTORY,
         rootfs_cwd: crate::published_rootfs::ROOT_HANDLE,
@@ -20179,6 +20187,7 @@ fn capture_linux_process_runtime_state_for(thread_slot: u8) -> Option<LinuxProce
             X86_RUNTIME.ELF_PROBE_RELRO_SIZE.load(Ordering::SeqCst),
         ],
         brk: X86_RUNTIME.ELF_PROBE_BRK.load(Ordering::SeqCst),
+        stack: X86_RUNTIME.ELF_PROBE_STACK.load(Ordering::SeqCst),
         stack_low: X86_RUNTIME.ELF_PROBE_STACK_LOW.load(Ordering::SeqCst),
         cwd: X86_RUNTIME.ELF_PROBE_CWD.load(Ordering::SeqCst),
         rootfs_cwd: X86_RUNTIME.ELF_PROBE_ROOTFS_CWD.load(Ordering::SeqCst),
@@ -20294,6 +20303,11 @@ fn restore_linux_process_runtime_state(state: &LinuxProcessRuntimeState) {
         destination.store(value, Ordering::SeqCst);
     }
     X86_RUNTIME.ELF_PROBE_BRK.store(state.brk, Ordering::SeqCst);
+    if state.stack != 0 {
+        X86_RUNTIME
+            .ELF_PROBE_STACK
+            .store(state.stack, Ordering::SeqCst);
+    }
     X86_RUNTIME
         .ELF_PROBE_STACK_LOW
         .store(state.stack_low, Ordering::SeqCst);
@@ -34947,7 +34961,9 @@ fn linux_rootfs_execve_source(
         }
         serial_write("\r\n");
     }
-    let stack_page = X86_RUNTIME.ELF_PROBE_STACK.load(Ordering::SeqCst) & !(PAGE_SIZE as u64 - 1);
+    // The new program's stack is at the top of the address space, where it
+    // may grow down to RLIMIT_STACK (`linux_primary_stack_floor`).
+    let stack_page = LINUX_STACK_END - PAGE_SIZE as u64;
     let (mut stack_image, new_stack) = match build_linux_exec_stack_image(
         &launch_arguments,
         arguments_address,
@@ -34959,6 +34975,10 @@ fn linux_rootfs_execve_source(
         Ok(image) => image,
         Err(error) => return error,
     };
+    if !linux_relocate_primary_stack(current_linux_process_pid()) {
+        serial_write("ginux: Linux exec stack relocation failed\r\n");
+        return LINUX_ENOMEM;
+    }
 
     let replacement_count = (0..plan.segment_count()).try_fold(0_usize, |count, index| {
         count.checked_add(plan.segment(index)?.page_count)
@@ -58803,7 +58823,7 @@ fn append_linux_dirent(
 
 fn linux_default_resource_limit(resource: u64, runtime: bool) -> Option<[u64; 2]> {
     let value = match resource {
-        LINUX_RLIMIT_STACK if runtime => u64::MAX,
+        LINUX_RLIMIT_STACK if runtime => return Some([LINUX_STACK_DEFAULT_LIMIT, u64::MAX]),
         LINUX_RLIMIT_STACK => PAGE_SIZE as u64,
         // Linux's defaults (INR_OPEN_CUR, INR_OPEN_MAX): a process may raise
         // its soft limit to 4096 and, with CAP_SYS_RESOURCE, its hard limit
@@ -63490,13 +63510,14 @@ fn materialize_linux_runtime_user_range(address: u64, length: usize, writable: b
 
 fn materialize_linux_primary_stack_page(page_address: u64) -> bool {
     let low = X86_RUNTIME.ELF_PROBE_STACK_LOW.load(Ordering::SeqCst);
-    let floor = X86_RUNTIME
-        .ELF_PROBE_BRK_LIMIT
-        .load(Ordering::SeqCst)
-        .saturating_add(PAGE_SIZE as u64);
+    let floor = linux_primary_stack_floor();
     let end = (X86_RUNTIME.ELF_PROBE_STACK.load(Ordering::SeqCst) & !(PAGE_SIZE as u64 - 1))
         .saturating_add(PAGE_SIZE as u64);
-    if low == 0 || page_address < floor || page_address >= end {
+    if low == 0
+        || page_address < floor
+        || page_address >= end
+        || page_address < low && linux_stack_guard_gap_taken(page_address)
+    {
         return false;
     }
     let reserved = address_space::current_linux_runtime_page(page_address);
@@ -63527,10 +63548,7 @@ fn materialize_linux_primary_stack_page(page_address: u64) -> bool {
 }
 
 fn linux_runtime_primary_stack_contains(page_address: u64) -> bool {
-    let floor = X86_RUNTIME
-        .ELF_PROBE_BRK_LIMIT
-        .load(Ordering::SeqCst)
-        .saturating_add(PAGE_SIZE as u64);
+    let floor = linux_primary_stack_floor();
     let end = (X86_RUNTIME.ELF_PROBE_STACK.load(Ordering::SeqCst) & !(PAGE_SIZE as u64 - 1))
         .saturating_add(PAGE_SIZE as u64);
     page_address >= floor && page_address < end
@@ -68483,13 +68501,10 @@ fn grow_linux_runtime_stack(fault: domain::FaultMetadata) -> bool {
     }
     let page = fault.address & !(PAGE_SIZE as u64 - 1);
     let low = X86_RUNTIME.ELF_PROBE_STACK_LOW.load(Ordering::SeqCst);
-    let floor = X86_RUNTIME
-        .ELF_PROBE_BRK_LIMIT
-        .load(Ordering::SeqCst)
-        .saturating_add(PAGE_SIZE as u64);
+    let floor = linux_primary_stack_floor();
     let end = (X86_RUNTIME.ELF_PROBE_STACK.load(Ordering::SeqCst) & !(PAGE_SIZE as u64 - 1))
         .saturating_add(PAGE_SIZE as u64);
-    if low == 0 || page < floor || page >= low || page >= end {
+    if low == 0 || page < floor || page >= low || page >= end || linux_stack_guard_gap_taken(page) {
         return false;
     }
     let reserved = address_space::current_linux_runtime_page(page);
@@ -68531,6 +68546,102 @@ fn grow_linux_runtime_stack(fault: domain::FaultMetadata) -> bool {
 /// Linux's stack guard gap: a mapping that grows down stops this far
 /// above the mapping below it (256 pages).
 const LINUX_STACK_GUARD_GAP: u64 = 256 * PAGE_SIZE as u64;
+
+/// Where an exec'd program's main stack ends: near the top of the user
+/// address space, as on Linux, far above the mmap area and every region
+/// the kernel places, so it can grow down to RLIMIT_STACK.
+const LINUX_STACK_END: u64 = 0x7fff_ffff_f000;
+/// How far a stack with RLIMIT_STACK unlimited may grow (64 GiB).
+const LINUX_STACK_UNLIMITED: u64 = 1 << 36;
+/// RLIMIT_STACK's soft limit by default, as Linux's _STK_LIM (8 MiB).
+const LINUX_STACK_DEFAULT_LIMIT: u64 = 8 << 20;
+
+/// The lowest page the current process's main stack may grow to. A stack at
+/// the top of the address space (`LINUX_STACK_END`, every exec'd program's)
+/// may span RLIMIT_STACK's soft limit from its end, as Linux's
+/// acct_stack_growth allows, with the limit as it is when the stack grows;
+/// the domain's first process keeps its stack above its heap, which bounds
+/// it.
+fn linux_primary_stack_floor() -> u64 {
+    let end = (X86_RUNTIME.ELF_PROBE_STACK.load(Ordering::SeqCst) & !(PAGE_SIZE as u64 - 1))
+        .saturating_add(PAGE_SIZE as u64);
+    if end != LINUX_STACK_END {
+        return X86_RUNTIME
+            .ELF_PROBE_BRK_LIMIT
+            .load(Ordering::SeqCst)
+            .saturating_add(PAGE_SIZE as u64);
+    }
+    let limit = linux_resource_limit_values(LINUX_RLIMIT_STACK, true)
+        .map_or(LINUX_STACK_DEFAULT_LIMIT, |values| values[0]);
+    let size = if limit == u64::MAX {
+        LINUX_STACK_UNLIMITED
+    } else {
+        limit.min(LINUX_STACK_UNLIMITED)
+    };
+    end.saturating_sub(size)
+        .checked_next_multiple_of(PAGE_SIZE as u64)
+        .unwrap_or(end)
+}
+
+/// Whether the main stack growing down to `page` would come within the
+/// stack guard gap of a mapping below it (Linux's stack_guard_gap): the
+/// growth is refused then, and the access is SIGSEGV. A stack the domain's
+/// first process keeps above its heap has no mappings below to keep from.
+fn linux_stack_guard_gap_taken(page: u64) -> bool {
+    let end = (X86_RUNTIME.ELF_PROBE_STACK.load(Ordering::SeqCst) & !(PAGE_SIZE as u64 - 1))
+        .saturating_add(PAGE_SIZE as u64);
+    end == LINUX_STACK_END
+        && crate::sync::rank_available(crate::sync::LockRank::MEMORY_AREAS)
+        && crate::linux_areas::overlaps(
+            linux_execution_instance(),
+            current_linux_process_pid(),
+            page.saturating_sub(LINUX_STACK_GUARD_GAP),
+            LINUX_STACK_GUARD_GAP.min(page),
+        )
+}
+
+/// Moves process `pid`'s main stack (the active address space's) to the top
+/// of the address space for exec, if it is not there: the pages it grew
+/// into are freed and its top page moves to just below `LINUX_STACK_END`,
+/// which exec then fills. False if the move failed.
+fn linux_relocate_primary_stack(pid: u32) -> bool {
+    let target = LINUX_STACK_END - PAGE_SIZE as u64;
+    let stack = X86_RUNTIME.ELF_PROBE_STACK.load(Ordering::SeqCst);
+    let page = stack & !(PAGE_SIZE as u64 - 1);
+    if page == target {
+        return true;
+    }
+    let low = X86_RUNTIME.ELF_PROBE_STACK_LOW.load(Ordering::SeqCst);
+    if low == 0 || low > page {
+        return false;
+    }
+    for address in (low..page).step_by(PAGE_SIZE) {
+        let removed = address_space::remove_current_linux_runtime_page(address);
+        if !removed.occupied {
+            continue;
+        }
+        let _ = linux_process::remove_live_process_mapping(pid, address as usize);
+        if let Some(frame) = removed.frame.filter(|_| !removed.shared) {
+            if memory::frame_leases_releasable(memory::FrameOwner::KERNEL, &[frame])
+                && !address_space::release_linux_private_page(frame)
+            {
+                return false;
+            }
+        }
+    }
+    if !address_space::move_current_linux_runtime_page(page, target)
+        || !linux_process::move_live_process_mapping(pid, page as usize, target as usize)
+    {
+        return false;
+    }
+    X86_RUNTIME
+        .ELF_PROBE_STACK
+        .store(target | (stack & (PAGE_SIZE as u64 - 1)), Ordering::SeqCst);
+    X86_RUNTIME
+        .ELF_PROBE_STACK_LOW
+        .store(target, Ordering::SeqCst);
+    true
+}
 
 /// A fault just below a mapping made with MAP_GROWSDOWN grows it down to
 /// the faulting page (`linux_areas::grow_down`); the pages it gains are

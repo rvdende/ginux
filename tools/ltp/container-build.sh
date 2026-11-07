@@ -84,8 +84,10 @@ make -j"$JOBS" -C tools/apicmds >/work/make-apicmds.log 2>&1 ||
     find testcases/kernel -path testcases/kernel/syscalls -prune -o -name '*.c' -print |
         awk -F/ 'NR == FNR { want[$0]; next } ($NF in want) { sub("/[^/]*$", ""); print }' \
             /work/runtest-sources.txt -
-    # The memory controller's tests (memcontrol01-04, runtest/controllers).
+    # The memory controller's tests (memcontrol01-04, runtest/controllers)
+    # and the stack guard gap's (stack_clash, runtest/cve).
     echo testcases/kernel/controllers/memcg
+    echo testcases/cve
 } | LC_ALL=C sort -u >/work/leaf-dirs.txt
 xargs -P "$JOBS" -I{} sh -c 'make -k -C "$1" >"$1/.ginux-make.log" 2>&1 || true' sh {} \
     </work/leaf-dirs.txt

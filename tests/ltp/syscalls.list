@@ -968,7 +968,7 @@ process_vm_readv02 process_vm_readv02
 process_vm_readv03 process_vm_readv03
 process_vm_writev01 process_vm01
 process_vm_writev02 process_vm_writev02
-process_madvise01 process_madvise01
+process_madvise01 /opt/ltp/with-swap.sh 64 process_madvise01  # needs 2 MiB of free swap
 prot_hsymlinks prot_hsymlinks
 dirtyc0w dirtyc0w
 dirtyc0w_shmem dirtyc0w_shmem
@@ -1568,7 +1568,9 @@ perf_event_open03 perf_event_open03  # auto: budget=90
 
 # Tests from outside runtest/syscalls, curated by hand.
 ginux_swap01 ginux_swap01  # budget=300 Ginux's own (tools/ltp/tests): a memory cgroup oversubscribed with swap
+ginux_stack01 ginux_stack01  # Ginux's own (tools/ltp/tests): the main stack grows to RLIMIT_STACK
 memcontrol01 memcontrol01  # runtest/controllers: the memory controller
 !memcontrol02 memcontrol02  # runtest/controllers: page cache is not charged to memory cgroups (memory.stat file stays 0)
 !memcontrol03 memcontrol03  # runtest/controllers: page cache is not charged to memory cgroups (memory.stat file stays 0)
 !memcontrol04 memcontrol04  # runtest/controllers: page cache is not charged to memory cgroups (memory.stat file stays 0)
+!stack_clash stack_clash  # runtest/cve: maps MAP_FIXED next to the stack and over every gap below it, but MAP_FIXED takes only 256 MiB to 1 TiB
