@@ -491,6 +491,9 @@ pub(super) const LINUX_EDOM: u64 = u64::MAX - 32;
 pub(super) const LINUX_ENOLCK: u64 = u64::MAX - 36;
 pub(super) const LINUX_EDEADLK: u64 = u64::MAX - 34;
 pub(super) const LINUX_ENOMSG: u64 = u64::MAX - 41;
+/// "File descriptor in bad state": a descriptor of the wrong kind for a
+/// Landlock call.
+pub(super) const LINUX_EBADFD: u64 = u64::MAX - 76;
 pub(super) const LINUX_EIDRM: u64 = u64::MAX - 42;
 pub(super) const LINUX_EOVERFLOW: u64 = u64::MAX - 74;
 pub(super) const LINUX_ELOOP: u64 = u64::MAX - 39;
@@ -696,6 +699,7 @@ pub(super) const LINUX_FIONREAD: u64 = 0x541b;
 pub(super) const LINUX_FIONBIO: u64 = 0x5421;
 pub(super) const LINUX_FIONCLEX: u64 = 0x5450;
 pub(super) const LINUX_FIOCLEX: u64 = 0x5451;
+pub(super) const LINUX_FIOASYNC: u64 = 0x5452;
 pub(super) const LINUX_DESCRIPTOR_INPUT: u16 = 1;
 pub(super) const LINUX_DESCRIPTOR_OUTPUT: u16 = 2;
 pub(super) const LINUX_DEVICE_ZERO: u16 = 1 << 2;

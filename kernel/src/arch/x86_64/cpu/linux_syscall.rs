@@ -475,6 +475,12 @@ fn linux_syscall_dispatch(
     {
         return LINUX_EBADF;
     }
+    // Landlock decided at open whether a device's ioctls are allowed.
+    if number == LINUX_IOCTL_SYSCALL {
+        if let Err(error) = linux_landlock_check_ioctl(u64::from(first_argument as u32), buffer) {
+            return error;
+        }
+    }
     // A parent ignoring SIGCHLD has no zombies to see or wait for.
     if runtime_mode
         && matches!(
@@ -1639,10 +1645,12 @@ fn linux_syscall_dispatch(
         LINUX_SETDOMAINNAME_SYSCALL => linux_set_uts_name(LINUX_UTS_DOMAIN, first_argument, buffer),
         LINUX_STATFS_SYSCALL => linux_statfs(first_argument, buffer),
         LINUX_FSTATFS_SYSCALL => linux_fstatfs(first_argument, buffer),
-        LINUX_MOUNT_SYSCALL => {
-            linux_mount_filesystem(first_argument, buffer, count, register(0), register(2))
-        }
-        LINUX_UMOUNT2_SYSCALL => linux_umount(first_argument, buffer),
+        LINUX_MOUNT_SYSCALL => linux_landlock_check_mount().map_or_else(
+            |error| error,
+            |()| linux_mount_filesystem(first_argument, buffer, count, register(0), register(2)),
+        ),
+        LINUX_UMOUNT2_SYSCALL => linux_landlock_check_mount()
+            .map_or_else(|error| error, |()| linux_umount(first_argument, buffer)),
         LINUX_MOUNT_SETATTR_SYSCALL => {
             linux_mount_setattr(first_argument, buffer, count, register(0), register(2))
         }
@@ -1665,10 +1673,14 @@ fn linux_syscall_dispatch(
         LINUX_OPEN_BY_HANDLE_AT_SYSCALL => linux_open_by_handle_at(first_argument, buffer, count),
         LINUX_MEMFD_CREATE_SYSCALL => linux_memfd_create(first_argument, buffer),
         LINUX_MEMFD_SECRET_SYSCALL => linux_memfd_secret(first_argument),
-        LINUX_LANDLOCK_CREATE_RULESET_SYSCALL
-        | LINUX_LANDLOCK_ADD_RULE_SYSCALL
-        | LINUX_LANDLOCK_RESTRICT_SELF_SYSCALL => {
-            linux_landlock_disabled(first_argument, buffer, count, register(0))
+        LINUX_LANDLOCK_CREATE_RULESET_SYSCALL => {
+            linux_landlock_create_ruleset(first_argument, buffer, count)
+        }
+        LINUX_LANDLOCK_ADD_RULE_SYSCALL => {
+            linux_landlock_add_rule(first_argument, buffer, count, register(0))
+        }
+        LINUX_LANDLOCK_RESTRICT_SELF_SYSCALL => {
+            linux_landlock_restrict_self(first_argument, buffer)
         }
         LINUX_IO_URING_SETUP_SYSCALL => linux_io_uring_setup(first_argument, buffer),
         LINUX_IO_URING_ENTER_SYSCALL => linux_io_uring_enter(
@@ -2239,7 +2251,8 @@ fn linux_syscall_dispatch(
         LINUX_SETNS_SYSCALL => linux_setns(first_argument, buffer),
         LINUX_REBOOT_SYSCALL => linux_reboot(first_argument, buffer, count, register(0)),
         LINUX_CHROOT_SYSCALL => linux_chroot(first_argument),
-        LINUX_PIVOT_ROOT_SYSCALL => linux_pivot_root(first_argument, buffer),
+        LINUX_PIVOT_ROOT_SYSCALL => linux_landlock_check_mount()
+            .map_or_else(|error| error, |()| linux_pivot_root(first_argument, buffer)),
         LINUX_ACCT_SYSCALL => linux_acct(first_argument),
         LINUX_PTRACE_SYSCALL
             if linux_privileged_operation_allowed(

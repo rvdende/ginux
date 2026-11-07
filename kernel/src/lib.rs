@@ -35,6 +35,7 @@ mod linux_input;
 mod linux_io_uring;
 mod linux_keyring;
 mod linux_kmsg;
+mod linux_landlock;
 mod linux_loop;
 mod linux_mount;
 mod linux_mounts;

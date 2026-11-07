@@ -1037,19 +1037,12 @@ impl Sockets {
         Ok(())
     }
 
-    fn connect_unix(
-        &mut self,
-        id: SlotId,
-        path: &[u8],
-        credentials: (u32, u32, u32),
-    ) -> Result<(), Error> {
-        let state = self.unix(id).ok_or(Error::Invalid)?;
-        if state.peer.is_some() {
-            return Err(Error::Invalid);
-        }
+    /// The socket of `id`'s type bound to `path` that a connect of Unix
+    /// socket `id` reaches.
+    fn unix_connect_target(&self, id: SlotId, path: &[u8]) -> Option<SlotId> {
+        let state = self.unix(id)?;
         let (owner, unix_type, network) = (state.owner, state.unix_type, state.network);
-        let peer = self
-            .slots
+        self.slots
             .iter()
             .enumerate()
             .find(|(candidate, slot)| {
@@ -1063,27 +1056,40 @@ impl Sockets {
                     })
             })
             .map(|(candidate, _)| candidate as SlotId)
-            .ok_or_else(|| {
-                // A socket of another type at the name is EPROTOTYPE.
-                let other_type = self.slots.iter().flatten().any(|slot| {
-                    slot.owner == owner
-                        && slot.kind == Kind::Unix
-                        && slot.unix_type != unix_type
-                        && slot.unix_path == path
-                        && same_unix_namespace(path, slot.network, network)
-                });
-                if other_type {
-                    Error::WrongType
-                } else {
-                    Error::NotConnected
-                }
-            })?;
+    }
+
+    fn connect_unix(
+        &mut self,
+        id: SlotId,
+        path: &[u8],
+        credentials: (u32, u32, u32),
+    ) -> Result<(), Error> {
+        let state = self.unix(id).ok_or(Error::Invalid)?;
+        if state.peer.is_some() {
+            return Err(Error::Invalid);
+        }
+        let (owner, unix_type, network) = (state.owner, state.unix_type, state.network);
+        let peer = self.unix_connect_target(id, path).ok_or_else(|| {
+            // A socket of another type at the name is EPROTOTYPE.
+            let other_type = self.slots.iter().flatten().any(|slot| {
+                slot.owner == owner
+                    && slot.kind == Kind::Unix
+                    && slot.unix_type != unix_type
+                    && slot.unix_path == path
+                    && same_unix_namespace(path, slot.network, network)
+            });
+            if other_type {
+                Error::WrongType
+            } else {
+                Error::NotConnected
+            }
+        })?;
         if unix_type == 2 {
             unix_in_mut(&mut self.slots, id).ok_or(Error::Invalid)?.peer = Some(peer);
             return Ok(());
         }
         let listener = self.slot(peer).ok_or(Error::Invalid)?;
-        if !listener.listening || listener.pending.len() >= listener.backlog {
+        if !listener.listening || listener.pending.len() > listener.backlog {
             return Err(Error::WouldBlock);
         }
         // The listener's end of the connection, which accept hands out.
@@ -1458,7 +1464,9 @@ impl Sockets {
         if state.remote.is_some() {
             return Err(Error::Invalid);
         }
-        let backlog = requested_backlog.clamp(1, BACKLOG_LIMIT);
+        // Linux's accept queue is full only past the backlog
+        // (sk_acceptq_is_full): listen(fd, 1) takes two connections.
+        let backlog = requested_backlog.min(BACKLOG_LIMIT);
         if state.kind == Kind::Unix {
             if state.unix_path.is_empty() {
                 return Err(Error::Invalid);
@@ -1643,7 +1651,7 @@ impl Sockets {
                         && candidate.network == network
                         && candidate.listening
                         && candidate.local_port == remote.port
-                        && candidate.pending.len() < candidate.backlog
+                        && candidate.pending.len() <= candidate.backlog
                 })
             });
             if let Some(listener) = listener {
@@ -2928,6 +2936,11 @@ pub(crate) fn bind_unix(id: SlotId, path: &[u8]) -> Result<(), Error> {
 
 /// Connects Unix socket `id` to the socket bound to `path`; the connector's
 /// (pid, uid, gid) become the accepted end's peer credentials (SO_PEERCRED).
+/// The socket a connect of Unix socket `id` to `path` would reach.
+pub(crate) fn unix_connect_target(id: SlotId, path: &[u8]) -> Option<SlotId> {
+    SOCKETS.lock().unix_connect_target(id, path)
+}
+
 pub(crate) fn connect_unix(
     id: SlotId,
     path: &[u8],

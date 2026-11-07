@@ -485,6 +485,7 @@ dependencies = [
  "ginux-ext2",
  "ginux-image-store",
  "ginux-keyrings",
+ "ginux-landlock",
  "ginux-memory-areas",
  "ginux-native-abi",
  "ginux-oci",
@@ -502,6 +503,10 @@ dependencies = [
 
 [[package]]
 name = "ginux-keyrings"
+version = "0.1.0"
+
+[[package]]
+name = "ginux-landlock"
 version = "0.1.0"
 
 [[package]]

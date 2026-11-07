@@ -75,7 +75,11 @@ impl LockRank {
     pub(crate) const FUTEX_COORDINATION: Self = Self(180);
     /// The wait statuses of reaped processes that pidfds report; ranks
     /// below the heap so the list may grow while held.
-    pub(crate) const PIDFS_EXITS: Self = Self(184);
+    pub(crate) const PIDFS_EXITS: Self = Self(183);
+    /// Landlock rulesets and domains; asked at system call level, under no
+    /// file, volume or memory-area lock, and ranks below the heap so the
+    /// tables may grow while held.
+    pub(crate) const LANDLOCK: Self = Self(184);
     /// The mounted volumes (filesystems on block devices): every path walk
     /// looks at them, so they rank above the device and file tables whose
     /// holders make and remove files (loop devices, pseudo-terminals), and

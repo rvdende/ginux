@@ -1568,6 +1568,11 @@ pub(super) fn linux_signal_permitted(target: u32, signal: u64) -> bool {
     if target == current_linux_process_pid() {
         return true;
     }
+    // A Landlock domain that scopes signals reaches only its own and the
+    // domains nested in it (LANDLOCK_SCOPE_SIGNAL).
+    if !linux_landlock_may_signal(target) {
+        return false;
+    }
     if signal == LINUX_SIGCONT
         && linux_process::live_process_session(target)
             == linux_process::live_process_session(current_linux_process_pid())
@@ -1631,7 +1636,7 @@ pub(super) fn linux_reap_ignored_children() {
     while let Some(linux_process::ChildWaitState::Exited { pid, .. }) =
         linux_process::live_child_wait_state(parent, None, exited)
     {
-        if linux_process::wait_live_child(parent, pid).is_none() {
+        if linux_reap_child(parent, pid).is_none() {
             break;
         }
     }

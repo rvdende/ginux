@@ -16,6 +16,7 @@ mod linux_abi;
 mod linux_futex;
 mod linux_poll;
 mod linux_pty;
+mod linux_security;
 mod linux_signal;
 mod linux_syscall;
 mod linux_time;
@@ -42,6 +43,7 @@ pub(crate) use linux_abi::*;
 use linux_futex::*;
 use linux_poll::*;
 use linux_pty::*;
+use linux_security::*;
 use linux_signal::*;
 pub(crate) use linux_signal::{
     expire_linux_waits_from_timer, linux_nanoseconds_to_next_wait_deadline, sample_linux_profile,
@@ -6805,6 +6807,9 @@ fn execute_deferred_live_fork() -> bool {
         return false;
     }
     crate::linux_areas::fork(linux_execution_instance(), parent_pid, child.pid);
+    if !linux_landlock_fork(parent_pid, child.pid) {
+        return false;
+    }
     // The child shares the forking thread's session keyring; what an exited
     // process left under a reused id goes first.
     let _ = linux_with_keys(|keys, caller| {
@@ -13731,6 +13736,48 @@ fn linux_generic_ioctl(descriptor: u64, request: u64, argument: u64) -> Option<u
                 flags & !LINUX_O_ACCMODE,
             ))
         }
+        // FIOASYNC sets or clears O_ASYNC, as F_SETFL would (a file with
+        // no signal-driven I/O keeps the flag and nothing comes of it).
+        LINUX_FIOASYNC => {
+            const O_ASYNC: u64 = 0o20_000;
+            let mut value = [0_u8; size_of::<i32>()];
+            if !copy_from_linux_user(argument, &mut value) {
+                return Some(LINUX_EFAULT);
+            }
+            let flags = linux_descriptor_fcntl(descriptor, LINUX_F_GETFL, 0);
+            if flags >= u64::MAX - 4095 {
+                return Some(flags);
+            }
+            let flags = if i32::from_ne_bytes(value) != 0 {
+                flags | O_ASYNC
+            } else {
+                flags & !O_ASYNC
+            };
+            let result =
+                linux_descriptor_fcntl(descriptor, LINUX_F_SETFL, flags & !LINUX_O_ACCMODE);
+            Some(if result < LINUX_RETURN_TO_KERNEL {
+                0
+            } else {
+                result
+            })
+        }
+        // FIONREAD on a regular file: the bytes from the file position to
+        // its end (other files answer it themselves).
+        LINUX_FIONREAD => {
+            let stat = linux_descriptor_stat(descriptor)?;
+            let mode = u32::from_ne_bytes(stat[24..28].try_into().unwrap());
+            if mode & 0o170_000 != 0o100_000 || linux_socket_slot(descriptor).is_some() {
+                return None;
+            }
+            let size = i64::from_ne_bytes(stat[48..56].try_into().unwrap());
+            let position = linux_descriptor_offset(descriptor).load(Ordering::SeqCst) as i64;
+            let remaining = size.saturating_sub(position) as i32;
+            Some(if copy_to_linux_user(argument, &remaining.to_ne_bytes()) {
+                0
+            } else {
+                LINUX_EFAULT
+            })
+        }
         _ => None,
     }
 }
@@ -13780,6 +13827,7 @@ pub(crate) fn linux_runtime_diagnostics() -> (Option<u8>, Option<u64>) {
 }
 
 fn prepare_configured_linux_system_domain() -> bool {
+    linux_prepare_securityfs();
     if !prepare_linux_package_platform() {
         return false;
     }
@@ -15991,6 +16039,7 @@ fn linux_init_exit_kill_others_live_return(
                 let _ = release_linux_process_runtime_slot(pid);
                 release_linux_process_shared_mappings(pid);
                 release_linux_process_keys(pid);
+                linux_landlock_exit(pid);
             }
         }
     }
@@ -15998,6 +16047,15 @@ fn linux_init_exit_kill_others_live_return(
         Some(LinuxBlockedWait::Return(result)) => result,
         _ => linux_restart_syscall_live_return(output, caller, number),
     })
+}
+
+/// Reaps exited child `pid` of `parent` (`linux_process::wait_live_child`),
+/// and with it what an exited process keeps until then: its Landlock
+/// domain, which signals to the zombie are still judged by.
+fn linux_reap_child(parent: u32, pid: u32) -> Option<(u32, u8)> {
+    let reaped = linux_process::wait_live_child(parent, pid)?;
+    linux_landlock_exit(reaped.0);
+    Some(reaped)
 }
 
 /// Drops what the runtime saved for process `pid`, which will not run again:
@@ -16566,7 +16624,7 @@ fn linux_wait4(pid: u64, status_address: u64, options: u64, rusage: u64) -> u64 
     if reaped {
         let child_maxrss = linux_process::live_process_maxrss(waited);
         let identity = linux_pidfd_identity(waited);
-        if linux_process::wait_live_child(parent_pid, waited) != Some((waited, exit_status)) {
+        if linux_reap_child(parent_pid, waited) != Some((waited, exit_status)) {
             return LINUX_ECHILD;
         }
         linux_pidfd_record_exit(waited, identity, encoded);
@@ -16726,7 +16784,7 @@ fn linux_waitid(id_type: u64, id: u64, information: u64, options: u64, rusage: u
         if reaped {
             let child_maxrss = linux_process::live_process_maxrss(pid);
             let identity = linux_pidfd_identity(pid);
-            if linux_process::wait_live_child(parent, pid) != Some((pid, exit_status)) {
+            if linux_reap_child(parent, pid) != Some((pid, exit_status)) {
                 return LINUX_ECHILD;
             }
             // The wait4 status of the exit siginfo reports.
@@ -22753,66 +22811,6 @@ fn linux_aio_stream_read(descriptor: u64, buffer: u64, length: u64) -> u64 {
     }
 }
 
-fn linux_lsm_attribute_valid(attribute: u64) -> bool {
-    (100..=105).contains(&u64::from(attribute as u32))
-}
-
-fn linux_lsm_get_self_attr(attribute: u64, context: u64, size: u64, flags: u64) -> u64 {
-    const LSM_FLAG_SINGLE: u64 = 1;
-    let flags = u64::from(flags as u32);
-    if !linux_lsm_attribute_valid(attribute)
-        || flags & !LSM_FLAG_SINGLE != 0
-        || flags == LSM_FLAG_SINGLE && context == 0
-    {
-        return LINUX_EINVAL;
-    }
-    let mut available = [0_u8; 4];
-    if !copy_from_linux_user(size, &mut available)
-        || !copy_to_linux_user(size, &0_u32.to_ne_bytes())
-    {
-        return LINUX_EFAULT;
-    }
-    if flags == LSM_FLAG_SINGLE {
-        LINUX_EOPNOTSUPP
-    } else {
-        0
-    }
-}
-
-fn linux_lsm_set_self_attr(attribute: u64, _context: u64, _size: u64, flags: u64) -> u64 {
-    let flags = u64::from(flags as u32);
-    if !linux_lsm_attribute_valid(attribute) || flags != 0 {
-        LINUX_EINVAL
-    } else {
-        LINUX_EOPNOTSUPP
-    }
-}
-
-/// lsm_list_modules: the active security modules' ids. Ginux has the one
-/// every Linux has, the capability module (LSM_ID_CAPABILITY); `size`
-/// gets the bytes the list takes, and a smaller buffer is E2BIG.
-fn linux_lsm_list_modules(identifiers: u64, size: u64, flags: u64) -> u64 {
-    const LSM_ID_CAPABILITY: u64 = 100;
-    let flags = u64::from(flags as u32);
-    if flags != 0 {
-        return LINUX_EINVAL;
-    }
-    let mut available = [0_u8; 4];
-    let total = size_of::<u64>() as u32;
-    if !copy_from_linux_user(size, &mut available)
-        || !copy_to_linux_user(size, &total.to_ne_bytes())
-    {
-        return LINUX_EFAULT;
-    }
-    if u32::from_ne_bytes(available) < total {
-        return LINUX_E2BIG;
-    }
-    if !copy_to_linux_user(identifiers, &LSM_ID_CAPABILITY.to_ne_bytes()) {
-        return LINUX_EFAULT;
-    }
-    1
-}
-
 fn linux_mount_id_request(address: u64) -> Result<(u64, u64), u64> {
     const VERSION_ZERO_SIZE: usize = 24;
     const VERSION_ONE_SIZE: usize = 32;
@@ -23369,8 +23367,7 @@ fn verify_linux_sysv_shared_memory_syscalls() -> bool {
     let keyrings = verify_linux_keyring_syscalls();
     let userfaultfd = verify_linux_userfaultfd_syscall();
     let fanotify = verify_linux_fanotify_syscalls();
-    let landlock_disabled = linux_landlock_disabled(0, 0, 1, 0) == LINUX_EOPNOTSUPP
-        && linux_landlock_disabled(u64::MAX, u64::MAX, u64::MAX, u64::MAX) == LINUX_EOPNOTSUPP;
+    let landlock = verify_linux_landlock_syscalls();
     let io_uring = verify_linux_io_uring_syscalls();
     let scheduler_priorities = verify_linux_scheduler_priority_ranges();
     let process_priorities = verify_linux_process_priorities();
@@ -23432,7 +23429,7 @@ fn verify_linux_sysv_shared_memory_syscalls() -> bool {
         keyrings,
         userfaultfd,
         fanotify,
-        landlock_disabled,
+        landlock,
         io_uring,
         scheduler_priorities,
         process_priorities,
@@ -23493,7 +23490,7 @@ fn verify_linux_sysv_shared_memory_syscalls() -> bool {
         && keyrings
         && userfaultfd
         && fanotify
-        && landlock_disabled
+        && landlock
         && io_uring
         && scheduler_priorities
         && process_priorities
@@ -24868,12 +24865,6 @@ fn verify_linux_io_uring_syscalls() -> bool {
         && linux_runtime_munmap(sqes, PAGE_SIZE as u64) == 0
         && linux_runtime_munmap(parameters, PAGE_SIZE as u64) == 0;
     closed && unmapped
-}
-
-fn linux_landlock_disabled(_first: u64, _second: u64, _third: u64, _fourth: u64) -> u64 {
-    // Equivalent to a Linux kernel built with the Landlock syscall surface
-    // while the Landlock LSM is not enabled in the active security policy.
-    LINUX_EOPNOTSUPP
 }
 
 fn linux_io_uring_descriptor(descriptor: u64) -> bool {
@@ -26340,16 +26331,21 @@ fn verify_linux_aio_syscalls() -> bool {
         && linux_io_cancel(context, mapping + 128, mapping + 256) == LINUX_EINVAL
         && linux_io_destroy(context) == 0;
     const UPPER_REGISTER_BITS: u64 = 1_u64 << 32;
-    let lsm = copy_to_linux_user(mapping + 512, &8_u32.to_ne_bytes())
-        && linux_lsm_list_modules(mapping + 544, mapping + 512, UPPER_REGISTER_BITS) == 1
+    // The capability module and Landlock, neither of which keeps process
+    // attributes (lsm_get_self_attr and lsm_set_self_attr: EOPNOTSUPP).
+    let lsm = copy_to_linux_user(mapping + 512, &16_u32.to_ne_bytes())
+        && linux_lsm_list_modules(mapping + 544, mapping + 512, UPPER_REGISTER_BITS) == 2
         && {
             let mut size = [1_u8; 4];
-            let mut identifier = [0_u8; 8];
+            let mut identifiers = [0_u8; 16];
             copy_from_linux_user(mapping + 512, &mut size)
-                && u32::from_ne_bytes(size) == 8
-                && copy_from_linux_user(mapping + 544, &mut identifier)
-                && u64::from_ne_bytes(identifier) == 100
+                && u32::from_ne_bytes(size) == 16
+                && copy_from_linux_user(mapping + 544, &mut identifiers)
+                && u64::from_ne_bytes(identifiers[..8].try_into().unwrap()) == 100
+                && u64::from_ne_bytes(identifiers[8..].try_into().unwrap()) == 110
         }
+        && copy_to_linux_user(mapping + 512, &8_u32.to_ne_bytes())
+        && linux_lsm_list_modules(mapping + 544, mapping + 512, 0) == LINUX_E2BIG
         && (100..=105).all(|attribute| {
             copy_to_linux_user(mapping + 512, &16_u32.to_ne_bytes())
                 && linux_lsm_get_self_attr(
@@ -26357,7 +26353,7 @@ fn verify_linux_aio_syscalls() -> bool {
                     0,
                     mapping + 512,
                     UPPER_REGISTER_BITS,
-                ) == 0
+                ) == LINUX_EOPNOTSUPP
                 && {
                     let mut size = [1_u8; 4];
                     copy_from_linux_user(mapping + 512, &mut size) && u32::from_ne_bytes(size) == 0
@@ -26367,15 +26363,17 @@ fn verify_linux_aio_syscalls() -> bool {
                     0,
                     UPPER_REGISTER_BITS,
                     UPPER_REGISTER_BITS,
-                ) == LINUX_EOPNOTSUPP
+                ) == LINUX_EINVAL
         })
         && copy_to_linux_user(mapping + 512, &16_u32.to_ne_bytes())
         && linux_lsm_get_self_attr(100, mapping + 544, mapping + 512, 1) == LINUX_EOPNOTSUPP
         && linux_lsm_get_self_attr(100, 0, mapping + 512, 1) == LINUX_EINVAL
-        && linux_lsm_get_self_attr(99, 0, mapping + 512, 0) == LINUX_EINVAL
-        && linux_lsm_get_self_attr(106, 0, mapping + 512, 0) == LINUX_EINVAL
+        && linux_lsm_get_self_attr(0, 0, mapping + 512, 0) == LINUX_EINVAL
+        && linux_lsm_get_self_attr(100, 0, 0, 0) == LINUX_EINVAL
         && linux_lsm_get_self_attr(100, 0, 1, 0) == LINUX_EFAULT
-        && linux_lsm_set_self_attr(99, 0, 0, 0) == LINUX_EINVAL
+        && linux_lsm_set_self_attr(100, 0, 31, 0) == LINUX_EINVAL
+        && linux_lsm_set_self_attr(100, 0, PAGE_SIZE as u64 + 1, 0) == LINUX_E2BIG
+        && linux_lsm_set_self_attr(100, 1, 32, 0) == LINUX_EFAULT
         && linux_lsm_set_self_attr(100, 0, 0, 1) == LINUX_EINVAL
         && linux_lsm_list_modules(0, mapping + 512, 1) == LINUX_EINVAL
         && linux_lsm_list_modules(0, 1, 0) == LINUX_EFAULT;
@@ -33539,6 +33537,7 @@ fn linux_rootfs_execve_source(
     if domain_exec_slot.is_none() {
         exec_file = linux_exec_file_access(path);
         if let Err(error) = linux_check_access(exec_file, ginux_credentials::access::EXECUTE, false)
+            .and_then(|()| linux_landlock_check_execute(path.strip_prefix(b"/").unwrap_or(path)))
         {
             return error;
         }
@@ -36408,10 +36407,27 @@ fn linux_openat(directory: u64, path_address: u64, flags: u64, mode: u64) -> u64
 /// openat(2) of `path[..path_length]`, a path already in kernel memory.
 fn linux_openat_path(
     directory: u64,
+    path: [u8; LINUX_PATH_MAX],
+    path_length: usize,
+    flags: u64,
+    mode: u64,
+) -> u64 {
+    linux_landlock_opened(
+        linux_open_file_at(directory, path, path_length, flags, mode, false),
+        flags,
+    )
+}
+
+/// `linux_openat_path`'s open, without what Landlock marks on the
+/// descriptor; `truncating` is truncate(2)'s, which Landlock lets through
+/// with LANDLOCK_ACCESS_FS_TRUNCATE in place of WRITE_FILE.
+fn linux_open_file_at(
+    directory: u64,
     mut path: [u8; LINUX_PATH_MAX],
     mut path_length: usize,
     flags: u64,
     mode: u64,
+    truncating: bool,
 ) -> u64 {
     /// __O_TMPFILE: an unnamed file in the directory opened.
     const LINUX_O_TMPFILE_BIT: u64 = 0x40_0000;
@@ -36801,7 +36817,14 @@ fn linux_openat_path(
         } else {
             Ok(())
         };
-        if let Err(error) = check {
+        if let Err(error) = check.and_then(|()| {
+            linux_landlock_check_open(
+                path,
+                flags,
+                overlay_metadata.is_some() || rootfs_at_path.is_some() || virtual_device,
+                truncating,
+            )
+        }) {
             return error;
         }
     }
@@ -38015,7 +38038,9 @@ fn linux_mkdirat(directory: u64, path_address: u64, mode: u64) -> u64 {
     if !linux_overlay_parent_exists(path) {
         return linux_missing_path_error(path);
     }
-    if let Err(error) = linux_check_entry_change(path, false) {
+    if let Err(error) = linux_landlock_check_make(path, 0o040_000)
+        .and_then(|()| linux_check_entry_change(path, false))
+    {
         return error;
     }
     let Some(directory_handle) = crate::linux_overlay::create_directory(
@@ -38356,7 +38381,9 @@ fn linux_mknodat(directory: u64, path_address: u64, mode: u64, device: u64) -> u
     if !linux_overlay_parent_exists(path) {
         return linux_missing_path_error(path);
     }
-    if let Err(error) = linux_check_entry_change(path, false) {
+    if let Err(error) = linux_landlock_check_make(path, kind as u32)
+        .and_then(|()| linux_check_entry_change(path, false))
+    {
         return error;
     }
     let permissions = linux_file_creation_mode(path, mode as u32 & 0o7777);
@@ -38408,7 +38435,9 @@ fn linux_symlinkat(target_address: u64, directory: u64, path_address: u64) -> u6
     if !linux_overlay_parent_exists(path) {
         return linux_missing_path_error(path);
     }
-    if let Err(error) = linux_check_entry_change(path, false) {
+    if let Err(error) = linux_landlock_check_make(path, 0o120_000)
+        .and_then(|()| linux_check_entry_change(path, false))
+    {
         return error;
     }
     crate::linux_overlay::create_symlink(path, &target[..target_length]).map_or(LINUX_ENOSPC, |_| 0)
@@ -38546,6 +38575,9 @@ fn linux_linkat(
     {
         return LINUX_EXDEV;
     }
+    if let Err(error) = linux_landlock_check_link(old, destination) {
+        return error;
+    }
     // A file only the image has is copied up first, so both names share the
     // overlay's copy.
     let source = match linux_copy_up_path(&old_canonical[..old_length]) {
@@ -38679,7 +38711,10 @@ fn linux_unlinkat(directory: u64, path_address: u64, flags: u64) -> u64 {
         Err(error) => return error,
     };
     if linux_path_access(&canonical[..length]).is_some() {
-        if let Err(error) = linux_check_entry_change(&canonical[..length], true) {
+        if let Err(error) =
+            linux_landlock_check_remove(&canonical[..length], flags == LINUX_AT_REMOVEDIR)
+                .and_then(|()| linux_check_entry_change(&canonical[..length], true))
+        {
             return error;
         }
     }
@@ -38808,6 +38843,9 @@ fn linux_ftruncate(descriptor: u64, length: u64) -> u64 {
         || linux_socket_slot(descriptor).is_some()
     {
         return LINUX_EINVAL;
+    }
+    if let Err(error) = linux_landlock_check_ftruncate(descriptor) {
+        return error;
     }
     let handle = match linux_copy_up_descriptor(descriptor) {
         Ok(handle) => handle,
@@ -39913,11 +39951,15 @@ fn linux_utimes(directory: u64, path_address: u64, times_address: u64) -> u64 {
 }
 
 fn linux_truncate(path_address: u64, length: u64) -> u64 {
-    let descriptor = linux_openat(
-        u64::from(LINUX_AT_FDCWD),
-        path_address,
-        LINUX_O_LARGEFILE | 1,
-        0,
+    let mut path = [0_u8; LINUX_PATH_MAX];
+    let path_length = match copy_linux_c_string(path_address, &mut path) {
+        Ok(length) => length,
+        Err(error) => return error,
+    };
+    let flags = LINUX_O_LARGEFILE | 1;
+    let descriptor = linux_landlock_opened(
+        linux_open_file_at(u64::from(LINUX_AT_FDCWD), path, path_length, flags, 0, true),
+        flags,
     );
     if descriptor >= LINUX_RETURN_TO_KERNEL {
         return descriptor;
@@ -39996,6 +40038,9 @@ fn linux_renameat(
     }
     if below(new, old) {
         return LINUX_ENOTEMPTY;
+    }
+    if let Err(error) = linux_landlock_check_rename(old, new, flags == RENAME_EXCHANGE) {
+        return error;
     }
     if flags != RENAME_EXCHANGE {
         if let Some(target) = target.filter(|target| target.handle != source.handle) {
@@ -41138,6 +41183,7 @@ fn linux_socket_bind(descriptor: u64, address: u64, length: u64) -> u64 {
         if let Err(error) = crate::linux_socket::bind_unix(slot, &path[..path_length]) {
             return linux_socket_error(error);
         }
+        linux_landlock_bound_unix(slot, &path[..path_length]);
         if let Some(length) = node_length {
             let mode = 0o777 & !(X86_RUNTIME.ELF_PROBE_UMASK.load(Ordering::SeqCst) as u32);
             let _ = crate::linux_overlay::create_socket(&canonical[..length], mode);
@@ -41148,6 +41194,11 @@ fn linux_socket_bind(descriptor: u64, address: u64, length: u64) -> u64 {
         Ok(endpoint) => endpoint,
         Err(error) => return error,
     };
+    if crate::linux_socket::kind(slot) == Some(crate::linux_socket::Kind::Tcp) {
+        if let Err(error) = linux_landlock_check_port(port, false) {
+            return error;
+        }
+    }
     // Ports below 1024 need CAP_NET_BIND_SERVICE.
     if (1..1024).contains(&port)
         && !linux_has_capability(ginux_credentials::capability::NET_BIND_SERVICE)
@@ -41319,6 +41370,11 @@ fn linux_socket_connect(descriptor: u64, address: u64, length: u64) -> u64 {
         let credentials = current_linux_credentials().map_or((0, 0), |credentials| {
             (credentials.user.effective, credentials.group.effective)
         });
+        if let Some(peer) = crate::linux_socket::unix_connect_target(slot, &path[..path_length]) {
+            if let Err(error) = linux_landlock_check_unix_peer(peer, &path[..path_length]) {
+                return error;
+            }
+        }
         // No socket bound to the name: Linux fails a path that does not
         // exist with ENOENT and an abstract name with ECONNREFUSED (musl's
         // nscd lookup treats both as "no daemon").
@@ -41355,6 +41411,11 @@ fn linux_socket_connect(descriptor: u64, address: u64, length: u64) -> u64 {
         Ok(endpoint) => endpoint,
         Err(error) => return error,
     };
+    if crate::linux_socket::kind(slot) == Some(crate::linux_socket::Kind::Tcp) {
+        if let Err(error) = linux_landlock_check_port(endpoint.port, true) {
+            return error;
+        }
+    }
     if !linux_endpoint_reachable(endpoint) {
         return LINUX_ENETUNREACH;
     }
@@ -42504,7 +42565,10 @@ fn linux_unix_send_target(
         linux_unix_socket_file(&path[..path_length], &mut canonical)?;
     }
     let target = match crate::linux_socket::unix_datagram_target(slot, &path[..path_length]) {
-        Ok(target) => target,
+        Ok(target) => {
+            linux_landlock_check_unix_peer(target, &path[..path_length])?;
+            target
+        }
         Err(crate::linux_socket::Error::WrongType) => return Err(LINUX_EPROTOTYPE),
         Err(_) if path[0] == 0 => return Err(LINUX_ECONNREFUSED),
         Err(_) => {
@@ -46434,8 +46498,8 @@ fn linux_pipe(address: u64, flags: u64) -> u64 {
 }
 
 /// Releases the kernel objects whose last descriptor has closed: DRM
-/// render node files and dma-bufs, open loop devices, RAM disks and
-/// /dev/kmsg.
+/// render node files and dma-bufs, open loop devices, RAM disks,
+/// /dev/kmsg, pseudo-terminals, userfaultfds and Landlock rulesets.
 pub(crate) fn linux_release_objects() {
     for (class, id) in crate::linux_socket::take_released_objects() {
         crate::linux_drm::release(class, id);
@@ -46444,6 +46508,7 @@ pub(crate) fn linux_release_objects() {
         crate::linux_kmsg::release(class, id);
         crate::linux_pty::release(class, id);
         linux_userfaultfd_release(class, id);
+        crate::linux_landlock::release(class, id);
     }
 }
 
@@ -54908,7 +54973,8 @@ fn linux_descriptor_fcntl(descriptor: u64, command: u64, argument: u64) -> u64 {
                         & !(LINUX_PRIVATE_SECRET_DESCRIPTOR
                             | LINUX_PRIVATE_IO_URING_DESCRIPTOR
                             | LINUX_PRIVATE_PROC_LINK_DESCRIPTOR
-                            | LINUX_PRIVATE_NONOTIFY_DESCRIPTOR),
+                            | LINUX_PRIVATE_NONOTIFY_DESCRIPTOR
+                            | LINUX_PRIVATE_LANDLOCK_DESCRIPTOR),
                 )
         }
         LINUX_F_SETFL => {
@@ -59414,6 +59480,8 @@ fn linux_descriptor_link_target(
         (b"anon_inode:[fanotify]", false)
     } else if linux_io_uring_descriptor(descriptor) {
         (b"anon_inode:[io_uring]", false)
+    } else if linux_landlock_ruleset_descriptor(descriptor) {
+        (b"anon_inode:[landlock-ruleset]", false)
     } else if linux_object_descriptor(descriptor)
         .is_some_and(|(class, _)| class == crate::linux_drm::CLASS_FILE)
     {

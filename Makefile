@@ -369,6 +369,8 @@ check: manifest architecture-check linux-compat-check
 	@cargo test --package ginux-memory-areas
 	@cargo clippy --package ginux-keyrings --all-targets -- -D warnings
 	@cargo test --package ginux-keyrings
+	@cargo clippy --package ginux-landlock --all-targets -- -D warnings
+	@cargo test --package ginux-landlock
 	@cargo clippy --package ginux-tty --all-targets -- -D warnings
 	@cargo test --package ginux-tty
 	@cargo clippy --package ginux-drm --all-targets -- -D warnings

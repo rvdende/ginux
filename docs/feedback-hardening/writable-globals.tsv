@@ -453,6 +453,8 @@ interior-mutable	kernel/src/linux_keyring.rs	KEYRINGS	domain-runtime	allowlist	n
 interior-mutable	kernel/src/linux_drm.rs	DRM	domain-runtime	allowlist	none	ranked-drm-files-and-dmabufs
 interior-mutable	kernel/src/linux_drm.rs	MAKING_NODES	domain-runtime	allowlist	none	atomic-reentrancy-guard
 interior-mutable	kernel/src/linux_kmsg.rs	OPENS	domain-runtime	allowlist	none	ranked-kmsg-readers
+interior-mutable	kernel/src/linux_landlock.rs	STATE	domain-runtime	allowlist	none	ranked-landlock-rulesets-and-domains-owned-per-process
+interior-mutable	kernel/src/linux_landlock.rs	RESTRICTED	domain-runtime	allowlist	none	atomic-restricted-process-count
 interior-mutable	kernel/src/linux_loop.rs	LOOPS	domain-runtime	allowlist	none	ranked-loop-devices-and-opens
 interior-mutable	kernel/src/linux_loop.rs	MAKING_NODES	domain-runtime	allowlist	none	atomic-reentrancy-guard
 interior-mutable	kernel/src/linux_ramdisk.rs	RAM_DISKS	domain-runtime	allowlist	none	ranked-ram-disks-and-opens
