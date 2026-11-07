@@ -760,12 +760,23 @@ pub(super) fn linux_memcg_reclaim(slot: Slot, pages: u64, except: u32) -> u64 {
     let root = cgroup::root(instance).unwrap_or(NO_SLOT);
     let mut members = [0_u32; 64];
     let mut count = 0;
+    let mut running = [0_u32; 64];
+    let mut running_count = 0;
+    let current = current_linux_process_pid();
     for (pid, _) in linux_process::live_memcg_members(move |memcg| {
         cgroup::is_within(if memcg == NO_SLOT { root } else { memcg }, slot)
     }) {
-        if count < members.len() && pid != except && linux_process_quiescent(pid) {
-            members[count] = pid;
-            count += 1;
+        if pid == except || pid == current {
+            continue;
+        }
+        if linux_process_quiescent(pid) {
+            if count < members.len() {
+                members[count] = pid;
+                count += 1;
+            }
+        } else if running_count < running.len() {
+            running[running_count] = pid;
+            running_count += 1;
         }
     }
     let mut reclaimed = 0;
@@ -775,7 +786,22 @@ pub(super) fn linux_memcg_reclaim(slot: Slot, pages: u64, except: u32) -> u64 {
         }
         reclaimed += linux_reclaim_process_pages(instance, *pid, pages - reclaimed);
     }
-    let current = current_linux_process_pid();
+    // A process running user code on another CPU can still have pages
+    // paged out: each leaf is made non-present and that CPU's translation
+    // shot down before the page is copied, and the kernel-entry lock keeps
+    // its threads out of the kernel meanwhile. (Dropping its pages is left
+    // to when it stops: its registry lists change with them.)
+    for pid in &running[..running_count] {
+        if reclaimed >= pages {
+            break;
+        }
+        if let Some(root) = linux_process::live_process_root(*pid) {
+            reclaimed += address_space::with_live_linux_process_root(root, || {
+                linux_swap_out_current(*pid, pages - reclaimed)
+            })
+            .unwrap_or(0);
+        }
+    }
     if reclaimed < pages
         && (except == 0 || except == current && linux_own_pages_reclaimable())
         && process_memcg(current).is_some_and(|memcg| cgroup::is_within(memcg, slot))
