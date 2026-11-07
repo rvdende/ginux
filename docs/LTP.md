@@ -334,7 +334,14 @@ flags (`EINVAL`), `removexattr` returning `ENODATA` for `ENOENT`,
 fails with `ENOTDIR`). TCONF is
 mostly expected: NUMA tests that need two nodes (Ginux has one, node 0,
 as a one-node Linux machine does; the builder links libnuma from Alpine's
-numactl-dev), `ramfs` lacks leases, 32-bit-only syscalls.
+numactl-dev), `ramfs` lacks leases, 32-bit-only syscalls. Some test
+interfaces newer than 6.12, which Linux 6.12 also reports TCONF for:
+pre-content fanotify events (fanotify24, 6.14) and
+`AT_HANDLE_CONNECTABLE` (name_to_handle_at03, 6.13). Others are missing
+from Ginux or the test image: kprobe events (fanotify25), an NFS server's
+`exportfs` (statx07), and the `stx_dio_*` fields in musl's `struct statx`
+(statx10 and statx11, built against musl; the kernel reports
+`STATX_DIOALIGN`).
 
 `target/ltp-report.txt` lists every cluster with its tests;
 `tests/ltp/report.py --variant no-oom-protection` does the same for the

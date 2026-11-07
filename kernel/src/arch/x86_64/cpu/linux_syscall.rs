@@ -2318,6 +2318,7 @@ fn linux_syscall_dispatch(
     } else {
         result
     };
+    linux_account_call_io(number, result);
     if let Some(call) = inotify {
         linux_inotify_after(call, result);
         linux_send_dnotify_notices();

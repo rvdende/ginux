@@ -2474,6 +2474,42 @@ pub(crate) fn release_page_cache(handle: Handle, file: Handle) -> bool {
     true
 }
 
+/// Drops the pages of page cache `handle` (of file `file`) that no
+/// address space maps any more, as Linux's drop_caches drops clean
+/// unmapped pages: a cache whose frames were handed out to mappings stays
+/// otherwise ([`release_page_cache`]). Returns how many went; none while
+/// a shared mapping of the file is registered. The caller has written
+/// back what mappings changed.
+pub(crate) fn release_unmapped_cached_pages(handle: Handle, file: Handle) -> usize {
+    if live().is_some_and(|overlay| handle_mapped(overlay, file)) {
+        return 0;
+    }
+    let Some(node) = node_mut(handle).filter(|node| node.paged()) else {
+        return 0;
+    };
+    let mut released = 0;
+    let mut page = node.first_page;
+    while page != FrameLease::EMPTY {
+        let Some(entries) = frame_index_page_mut(page) else {
+            break;
+        };
+        for entry in &mut entries.frames {
+            if *entry != FrameLease::EMPTY
+                && !memory::frame_is_shared(*entry)
+                && memory::scrub_and_release_frames(
+                    FrameOwner::KERNEL,
+                    core::slice::from_ref(entry),
+                )
+            {
+                *entry = FrameLease::EMPTY;
+                released += 1;
+            }
+        }
+        page = entries.next;
+    }
+    released
+}
+
 /// Whether a process maps `handle`'s file shared.
 pub(crate) fn mapped_shared(handle: Handle) -> bool {
     live().is_some_and(|overlay| handle_mapped(overlay, handle))

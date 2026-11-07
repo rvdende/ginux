@@ -1115,6 +1115,9 @@ pub(super) const LINUX_FILE_PROC_DYNAMIC_SMAPS: u16 =
     LINUX_FILE_MASK | LINUX_PROC_DYNAMIC_SMAPS_NODE;
 pub(super) const LINUX_FILE_PROC_DYNAMIC_STATM: u16 =
     LINUX_FILE_MASK | LINUX_PROC_DYNAMIC_STATM_NODE;
+/// /proc/PID/io: the process's I/O counts (`linux_process::IoAccounting`).
+pub(super) const LINUX_PROC_DYNAMIC_IO_NODE: u16 = 0xc500;
+pub(super) const LINUX_FILE_PROC_DYNAMIC_IO: u16 = LINUX_FILE_MASK | LINUX_PROC_DYNAMIC_IO_NODE;
 pub(super) const LINUX_CGROUP_DIRECTORY_NODE: u16 = 0xeb00;
 pub(super) const LINUX_CGROUP_DIRECTORY: u16 =
     LINUX_DEVICE_DIRECTORY | LINUX_FILE_PROC_STATUS | LINUX_CGROUP_DIRECTORY_NODE;
@@ -1342,7 +1345,7 @@ use super::PAGE_SIZE;
 /// The fixed file nodes and the `/proc/sys` nodes are distinct and clear of
 /// the `/dev/input/eventN` range, so no file is taken for another.
 const _: () = {
-    const NODES: [u16; 52] = [
+    const NODES: [u16; 53] = [
         LINUX_PROC_TASK_DIRECTORY_NODE,
         LINUX_PROC_TASK_COMM_NODE,
         LINUX_PROC_TASK_STAT_NODE,
@@ -1383,6 +1386,7 @@ const _: () = {
         LINUX_PROC_DYNAMIC_STAT_NODE,
         LINUX_PROC_DYNAMIC_STATUS_NODE,
         LINUX_PROC_DYNAMIC_STATM_NODE,
+        LINUX_PROC_DYNAMIC_IO_NODE,
         LINUX_PROC_DYNAMIC_MAPS_NODE,
         LINUX_PROC_DYNAMIC_SMAPS_NODE,
         LINUX_PROC_DYNAMIC_PAGEMAP_NODE,

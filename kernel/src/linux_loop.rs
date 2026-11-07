@@ -927,6 +927,18 @@ fn simple(id: u64, request: u32, argument: u64) -> Result<u64, Error> {
     Ok(0)
 }
 
+/// The DMA alignment of a loop device's buffers less one, as its queue's
+/// `dma_alignment` shows it: the block layer's default, a sector's.
+pub(crate) const DMA_ALIGNMENT: u32 = SECTOR_SIZE as u32 - 1;
+
+/// The logical block size of this domain's loop device `minor`, if it
+/// has one (statx's STATX_DIOALIGN of the device node).
+pub(crate) fn block_size_of(minor: u32) -> Option<u32> {
+    let mut loops = LOOPS.lock();
+    let devices = loops.domain(current_domain());
+    devices.device(minor).map(|device| device.block_size)
+}
+
 /// What the block layer's ioctls report of a block device: its size in
 /// bytes, logical block size, whether it is read-only and whether its
 /// partitions may be read again.
@@ -1331,6 +1343,7 @@ fn make_device(attributes: &Attributes) {
         ("removable", "0\n".into()),
         ("queue/logical_block_size", block_size.clone()),
         ("queue/physical_block_size", block_size),
+        ("queue/dma_alignment", format!("{DMA_ALIGNMENT}\n")),
     ] {
         put_attribute(
             format!("{directory}/{name}").as_bytes(),

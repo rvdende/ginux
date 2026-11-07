@@ -81,6 +81,7 @@ impl Disk {
         if let Some(io) = &self.1 {
             io.count(write, bytes);
         }
+        cpu::linux_account_storage_io(write, bytes);
     }
 }
 
@@ -182,8 +183,17 @@ struct Cache {
     mapped: bool,
 }
 
-/// Pages a volume's caches hold before unmapped ones are dropped: 32 MiB.
+/// Pages a volume's caches hold at least before unmapped ones are
+/// dropped: 32 MiB; more while memory is free ([`cache_limit`]).
 const CACHE_LIMIT: usize = 8192;
+
+/// How many pages a volume's caches may hold: a quarter of the free
+/// memory, and at least [`CACHE_LIMIT`], as Linux's page cache takes what
+/// memory is free (readahead02 reads a 64 MiB file through it).
+fn cache_limit() -> usize {
+    let free = memory::frame_counts().map_or(0, |(_, free)| free);
+    CACHE_LIMIT.max(usize::try_from(free / 4).unwrap_or(usize::MAX))
+}
 const PAGE: usize = 4096;
 
 struct Volumes {
@@ -339,7 +349,7 @@ impl Volume {
             return None;
         }
         if populate {
-            if self.cached_pages >= CACHE_LIMIT {
+            if self.cached_pages >= cache_limit() {
                 self.drop_caches(Some(inode));
             }
             if let Some(cache) = self.cache(inode, true) {
@@ -401,8 +411,12 @@ impl Volume {
                 u64::from(inode),
             );
             if let Some(cache) = self.caches.get(&inode) {
+                // A cache once mapped keeps its node; its pages no mapping
+                // holds go all the same.
                 if crate::linux_overlay::release_page_cache(cache.pages, file) {
                     self.caches.remove(&inode);
+                } else {
+                    crate::linux_overlay::release_unmapped_cached_pages(cache.pages, file);
                 }
             }
         }
@@ -960,6 +974,54 @@ pub(crate) fn cached_bytes(handle: Handle, offset: usize, length: usize) -> Opti
         position = (position / PAGE + 1) * PAGE;
     }
     Some(position.min(end).saturating_sub(offset))
+}
+
+/// readahead(2) and POSIX_FADV_WILLNEED on `handle`'s file: its pages
+/// from byte `offset` for `length` bytes (up to its end) come into the
+/// page cache, as far as the cache has room without dropping others.
+/// None if the file is not a volume's.
+pub(crate) fn read_ahead(handle: Handle, offset: u64, length: u64) -> Option<()> {
+    let mut table = VOLUMES.lock();
+    let (volume, inode) = table.of(handle)?;
+    let stat = volume.filesystem.stat(inode).ok()?;
+    if stat.kind != Kind::File {
+        return Some(());
+    }
+    let end = offset.saturating_add(length).min(stat.size);
+    let first = usize::try_from(offset / PAGE as u64).ok()?;
+    let last = usize::try_from(end.div_ceil(PAGE as u64)).ok()?;
+    let limit = cache_limit();
+    for index in first..last {
+        if volume.cached_pages >= limit {
+            break;
+        }
+        let cached = volume
+            .cache(inode, false)
+            .is_some_and(|cache| crate::linux_overlay::page_cached(cache.pages, index));
+        if !cached {
+            volume.page(inode, index, true)?;
+        }
+    }
+    Some(())
+}
+
+/// Whether page `index` of file `inode` on the volume of device `device`
+/// (stat's st_dev) is in the page cache: what mincore reports of a
+/// mapping of it. None if no volume of the domain has that device.
+pub(crate) fn page_cached_at(device: u64, inode: u64, index: usize) -> Option<bool> {
+    let instance = instance();
+    let table = VOLUMES.lock();
+    let volume = table
+        .volumes
+        .iter()
+        .find(|volume| volume.visible(instance) && u64::from(volume.source.device()) == device)?;
+    let inode = u32::try_from(inode).ok()?;
+    Some(
+        volume
+            .caches
+            .get(&inode)
+            .is_some_and(|cache| crate::linux_overlay::page_cached(cache.pages, index)),
+    )
 }
 
 /// Writes back what shared mappings changed, on every volume (msync,
@@ -1848,9 +1910,10 @@ pub(crate) fn from_stable_identity(tag: u32, inode: u32) -> Option<Handle> {
 
 /// What a lookup of canonical `path` on a volume found broken, as ext4
 /// reports a corrupted filesystem: the volume's fsid and the inode at
-/// fault (a directory whose entry names no valid inode, or the inode an
-/// entry names that has no links or file type), with its handle. `None`
-/// when the path is not on a volume or nothing on the way is damaged.
+/// fault (a directory whose blocks hold malformed entries or an entry
+/// naming no valid inode, or the inode an entry names that has no links
+/// or file type), with its handle. `None` when the path is not on a
+/// volume or nothing on the way is damaged.
 pub(crate) fn damage_at(path: &[u8]) -> Option<([u32; 2], Handle)> {
     let mut table = VOLUMES.lock();
     let index = volume_index(&table, path)?;
@@ -1862,7 +1925,14 @@ pub(crate) fn damage_at(path: &[u8]) -> Option<([u32; 2], Handle)> {
         if name.is_empty() {
             continue;
         }
-        let child = volume.filesystem.lookup(inode, name).ok()?;
+        let child = match volume.filesystem.lookup(inode, name) {
+            Ok(child) => child,
+            Err(Error::Corrupt) => {
+                fault = Some(inode);
+                break;
+            }
+            Err(_) => return None,
+        };
         match volume.filesystem.damaged_reference(child) {
             Some(ginux_ext2::Damage::Number) => fault = Some(inode),
             Some(ginux_ext2::Damage::Inode) => fault = Some(child),

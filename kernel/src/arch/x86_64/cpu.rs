@@ -30432,17 +30432,42 @@ fn linux_runtime_mincore(address: u64, length: u64, vector: u64) -> u64 {
             return LINUX_ENOMEM;
         }
     }
+    let mut area: Option<crate::linux_areas::Area> = None;
     for page in 0..pages {
         let page_address = address + (page * PAGE_SIZE) as u64;
         let state = address_space::current_linux_runtime_page(page_address);
+        if area
+            .as_ref()
+            .is_none_or(|area| !(area.start..area.end).contains(&page_address))
+        {
+            area = crate::linux_areas::area_at(
+                linux_execution_instance(),
+                current_linux_process_pid(),
+                page_address,
+            );
+        }
+        // A volume file's page is resident while the page cache holds it,
+        // mapped or not, as Linux's mincore reports a file's pages.
+        let cached = area.as_ref().and_then(|area| match &area.backing {
+            crate::linux_areas::Backing::File {
+                device,
+                inode,
+                offset,
+                ..
+            } => {
+                let index = (offset + (page_address - area.start)) / PAGE_SIZE as u64;
+                crate::linux_blockfs::page_cached_at(*device, *inode, usize::try_from(index).ok()?)
+            }
+            _ => None,
+        });
         // Anonymous shared memory has its pages from the start; one counts
         // as resident once touched, as Linux allocates it then.
-        let resident = u8::from(
+        let resident = u8::from(cached.unwrap_or_else(|| {
             state.frame.is_some()
                 && (!state.shared
                     || !linux_anonymous_shared_area(page_address)
-                    || address_space::current_linux_page_accessed(page_address)),
-        );
+                    || address_space::current_linux_page_accessed(page_address))
+        }));
         if !copy_to_linux_user(vector + page as u64, &[resident]) {
             return LINUX_EFAULT;
         }
@@ -32789,6 +32814,7 @@ fn linux_proc_pid_file_kind(pid: u32, name: &[u8]) -> Option<u16> {
         (_, b"status") => Some(LINUX_FILE_PROC_DYNAMIC_STATUS),
         (_, b"stat") => Some(LINUX_FILE_PROC_DYNAMIC_STAT),
         (_, b"statm") => Some(LINUX_FILE_PROC_DYNAMIC_STATM),
+        (_, b"io") => Some(LINUX_FILE_PROC_DYNAMIC_IO),
         (_, b"maps") => Some(LINUX_FILE_PROC_DYNAMIC_MAPS),
         (_, b"smaps") => Some(LINUX_FILE_PROC_DYNAMIC_SMAPS),
         (_, b"pagemap") => Some(LINUX_FILE_PROC_DYNAMIC_PAGEMAP),
@@ -32826,6 +32852,7 @@ fn linux_proc_task_file_kind(pid: u32, name: &[u8]) -> Option<u16> {
         b"stat" => Some(LINUX_FILE_PROC_TASK_STAT),
         b"status" => Some(LINUX_FILE_PROC_DYNAMIC_STATUS),
         b"statm" => Some(LINUX_FILE_PROC_DYNAMIC_STATM),
+        b"io" => Some(LINUX_FILE_PROC_DYNAMIC_IO),
         _ => None,
     }
 }
@@ -37128,6 +37155,7 @@ fn linux_open_file_at(
                 b"status"
                     | b"stat"
                     | b"statm"
+                    | b"io"
                     | b"maps"
                     | b"smaps"
                     | b"pagemap"
@@ -41064,15 +41092,13 @@ fn linux_statx_unique_mount(
     if !copy_from_linux_user(stat_address, &mut stat) {
         return result;
     }
+    linux_statx_extras(directory, path_address, flags, mask, &mut stat);
     let reported = u32::from_ne_bytes(stat[..4].try_into().unwrap_or([0; 4]));
     let mut mount = u64::from_ne_bytes(stat[144..152].try_into().unwrap_or([0; 8]));
     let domain_mount = (reported & LINUX_STATX_MNT_ID != 0
         && mount == u64::from(crate::linux_mounts::ROOT_ID))
     .then(|| linux_statx_domain_mount(directory, path_address, flags))
     .flatten();
-    if domain_mount.is_none() && mask as u32 & STATX_MNT_ID_UNIQUE == 0 {
-        return result;
-    }
     if let Some(id) = domain_mount {
         mount = u64::from(id);
     }
@@ -41089,6 +41115,112 @@ fn linux_statx_unique_mount(
         0
     } else {
         LINUX_EFAULT
+    }
+}
+
+/// The canonical path of what statx found (`path_address` from
+/// `directory`, or the descriptor with AT_EMPTY_PATH), and, when `lookup`,
+/// its file's metadata with a final symlink followed unless
+/// AT_SYMLINK_NOFOLLOW. Without `lookup` a final symlink stays: a mount
+/// point is never one, so the path tells a mount root all the same unless
+/// a symlink leads to one.
+fn linux_statx_target(
+    directory: u64,
+    path_address: u64,
+    flags: u64,
+    lookup: bool,
+) -> Option<(LinuxInotifyPath, Option<crate::linux_overlay::Metadata>)> {
+    let directory = u64::from(directory as u32);
+    let mut path = [0_u8; LINUX_PATH_MAX];
+    let length = copy_linux_c_string(path_address, &mut path).ok()?;
+    let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    if length == 0 {
+        if flags & LINUX_AT_EMPTY_PATH == 0 {
+            return None;
+        }
+        let length = linux_descriptor_path(directory, &mut canonical)?;
+        let relative = canonical[..length]
+            .strip_prefix(b"/")
+            .unwrap_or(&canonical[..length]);
+        let metadata = linux_overlay_descriptor_handle(directory)
+            .filter(|_| lookup)
+            .and_then(crate::linux_overlay::metadata);
+        return Some((linux_heap_path(relative)?, metadata));
+    }
+    let length = match linux_canonical_path_at(directory, &path[..length], &mut canonical) {
+        Ok(length) => length,
+        Err(LINUX_EISDIR) => 0,
+        Err(_) => return None,
+    };
+    if !lookup {
+        return Some((linux_heap_path(&canonical[..length])?, None));
+    }
+    let follow = flags & LINUX_AT_SYMLINK_NOFOLLOW == 0;
+    let (length, _, metadata) =
+        linux_overlay_lookup_following(&mut canonical, length, follow).ok()?;
+    Some((linux_heap_path(&canonical[..length])?, metadata))
+}
+
+/// Whether canonical `path` is the root of a mount: the root's, /proc's,
+/// cgroup2's or a domain mount's.
+fn linux_mount_root(path: &[u8]) -> bool {
+    if matches!(path, b"" | b"proc" | b"sys/fs/cgroup") {
+        return true;
+    }
+    let space = linux_mount_space();
+    let id = crate::linux_mounts::mount_id_at(space, path);
+    crate::linux_mounts::with_mount(space, id, |mount| mount.path == path).unwrap_or(false)
+}
+
+/// What statx adds to the stat it found, as Linux's VFS and filesystems
+/// do: STATX_ATTR_MOUNT_ROOT (every filesystem knows it), and with
+/// STATX_DIOALIGN the direct I/O alignment of a volume's regular file (its
+/// device's 512-byte sectors, as ext4 gives it) or of a loop device (its
+/// queue's DMA alignment and logical block size).
+fn linux_statx_extras(
+    directory: u64,
+    path_address: u64,
+    flags: u64,
+    mask: u64,
+    stat: &mut [u8; 256],
+) {
+    use crate::linux_overlay::NodeKind;
+    const STATX_ATTR_MOUNT_ROOT: u64 = 0x2000;
+    const STATX_DIOALIGN: u32 = 0x2000;
+    const SECTOR_SIZE: u32 = 512;
+    let word =
+        |stat: &[u8; 256], at: usize| u64::from_ne_bytes(stat[at..at + 8].try_into().unwrap());
+    let attributes_mask = word(stat, 56) | STATX_ATTR_MOUNT_ROOT;
+    stat[56..64].copy_from_slice(&attributes_mask.to_ne_bytes());
+    let dio = mask as u32 & STATX_DIOALIGN != 0;
+    let Some((path, metadata)) = linux_statx_target(directory, path_address, flags, dio) else {
+        return;
+    };
+    if linux_mount_root(&path) {
+        let attributes = word(stat, 8) | STATX_ATTR_MOUNT_ROOT;
+        stat[8..16].copy_from_slice(&attributes.to_ne_bytes());
+    }
+    if !dio {
+        return;
+    }
+    let alignment = metadata.and_then(|metadata| match metadata.kind {
+        NodeKind::File if crate::linux_blockfs::owns(metadata.handle) => {
+            Some((SECTOR_SIZE, SECTOR_SIZE))
+        }
+        NodeKind::BlockDevice => {
+            let (major, minor) = linux_device_numbers(metadata.device);
+            (major == crate::linux_loop::MAJOR)
+                .then(|| crate::linux_loop::block_size_of(minor))
+                .flatten()
+                .map(|block_size| (crate::linux_loop::DMA_ALIGNMENT + 1, block_size))
+        }
+        _ => None,
+    });
+    if let Some((memory, offset)) = alignment {
+        let reported = u32::from_ne_bytes(stat[..4].try_into().unwrap()) | STATX_DIOALIGN;
+        stat[..4].copy_from_slice(&reported.to_ne_bytes());
+        stat[152..156].copy_from_slice(&memory.to_ne_bytes());
+        stat[156..160].copy_from_slice(&offset.to_ne_bytes());
     }
 }
 
@@ -44299,6 +44431,7 @@ fn linux_descriptor_read(descriptor: u64, address: u64, count: u64) -> u64 {
             | LINUX_FILE_PROC_DYNAMIC_STAT
             | LINUX_FILE_PROC_DYNAMIC_STATUS
             | LINUX_FILE_PROC_DYNAMIC_STATM
+            | LINUX_FILE_PROC_DYNAMIC_IO
             | LINUX_FILE_PROC_DYNAMIC_MAPS
             | LINUX_FILE_PROC_DYNAMIC_SMAPS
             | LINUX_FILE_PROC_DYNAMIC_PAGEMAP
@@ -44669,6 +44802,7 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
         LINUX_FILE_PROC_DYNAMIC_STAT
             | LINUX_FILE_PROC_DYNAMIC_STATUS
             | LINUX_FILE_PROC_DYNAMIC_STATM
+            | LINUX_FILE_PROC_DYNAMIC_IO
             | LINUX_FILE_PROC_OOM_SCORE_ADJ
             | LINUX_FILE_PROC_TIMENS_OFFSETS
             | LINUX_FILE_PROC_TASK_COMM
@@ -44745,6 +44879,23 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
             LINUX_FILE_PROC_DYNAMIC_STATM => {
                 append_linux_bytes(&mut file, &mut used, b"256 64 32 16 0 32 0\n")
             }
+            LINUX_FILE_PROC_DYNAMIC_IO => linux_process::live_process_io(pid).is_some_and(|io| {
+                [
+                    (&b"rchar: "[..], io.rchar),
+                    (b"wchar: ", io.wchar),
+                    (b"syscr: ", io.syscr),
+                    (b"syscw: ", io.syscw),
+                    (b"read_bytes: ", io.read_bytes),
+                    (b"write_bytes: ", io.write_bytes),
+                    (b"cancelled_write_bytes: ", io.cancelled_write_bytes),
+                ]
+                .into_iter()
+                .all(|(name, value)| {
+                    append_linux_bytes(&mut file, &mut used, name)
+                        && append_linux_decimal(&mut file, &mut used, value)
+                        && append_linux_bytes(&mut file, &mut used, b"\n")
+                })
+            }),
             // A thread's name is its process's (prctl PR_SET_NAME names the
             // process here).
             LINUX_FILE_PROC_TASK_COMM => {
@@ -50980,6 +51131,64 @@ pub(super) fn linux_inotify_before(number: u64, arguments: [u64; 6]) -> Option<L
     })
 }
 
+/// Counts a finished read or write call into the caller's /proc/self/io,
+/// as Linux's vfs_read and vfs_write do: the call (syscr, syscw) unless
+/// it failed its checks (a bad descriptor, buffer or argument), and the
+/// bytes it passed (rchar, wchar); sendfile, splice and copy_file_range
+/// read and write both.
+fn linux_account_call_io(number: u64, result: u64) {
+    let (read, write) = match number {
+        LINUX_READ_SYSCALL
+        | LINUX_PREAD64_SYSCALL
+        | LINUX_READV_SYSCALL
+        | LINUX_PREADV_SYSCALL
+        | LINUX_PREADV2_SYSCALL => (true, false),
+        LINUX_WRITE_SYSCALL
+        | LINUX_PWRITE64_SYSCALL
+        | LINUX_WRITEV_SYSCALL
+        | LINUX_PWRITEV_SYSCALL
+        | LINUX_PWRITEV2_SYSCALL => (false, true),
+        LINUX_SENDFILE_SYSCALL | LINUX_SPLICE_SYSCALL | LINUX_COPY_FILE_RANGE_SYSCALL => {
+            (true, true)
+        }
+        _ => return,
+    };
+    if matches!(
+        result,
+        LINUX_RETURN_TO_KERNEL | LINUX_RETURN_FROM_IRET | LINUX_EBADF | LINUX_EFAULT | LINUX_EINVAL
+    ) {
+        return;
+    }
+    let bytes = if result < LINUX_RETURN_TO_KERNEL {
+        result
+    } else {
+        0
+    };
+    linux_process::account_live_process_io(current_linux_process_pid(), |io| {
+        if read {
+            io.syscr += 1;
+            io.rchar = io.rchar.wrapping_add(bytes);
+        }
+        if write {
+            io.syscw += 1;
+            io.wchar = io.wchar.wrapping_add(bytes);
+        }
+    });
+}
+
+/// Storage I/O the current process caused: `bytes` read from (or written
+/// to, `write`) a volume's device, /proc/self/io's read_bytes and
+/// write_bytes.
+pub(crate) fn linux_account_storage_io(write: bool, bytes: usize) {
+    linux_process::account_live_process_io(current_linux_process_pid(), |io| {
+        if write {
+            io.write_bytes = io.write_bytes.wrapping_add(bytes as u64);
+        } else {
+            io.read_bytes = io.read_bytes.wrapping_add(bytes as u64);
+        }
+    });
+}
+
 /// After the call: the inotify and fanotify events its result stands for.
 pub(super) fn linux_inotify_after(call: LinuxInotifyCall, result: u64) {
     use crate::linux_fanotify::{
@@ -53326,6 +53535,7 @@ fn linux_proc_generation_kind(state: u16) -> bool {
         LINUX_FILE_PROC_DYNAMIC_STAT
             | LINUX_FILE_PROC_DYNAMIC_STATUS
             | LINUX_FILE_PROC_DYNAMIC_STATM
+            | LINUX_FILE_PROC_DYNAMIC_IO
             | LINUX_FILE_PROC_DYNAMIC_MAPS
             | LINUX_FILE_PROC_DYNAMIC_SMAPS
             | LINUX_FILE_PROC_DYNAMIC_PAGEMAP
@@ -53362,6 +53572,7 @@ fn linux_proc_dynamic_descriptor_pid(descriptor: u64) -> Option<u32> {
         LINUX_FILE_PROC_DYNAMIC_STAT
             | LINUX_FILE_PROC_DYNAMIC_STATUS
             | LINUX_FILE_PROC_DYNAMIC_STATM
+            | LINUX_FILE_PROC_DYNAMIC_IO
             | LINUX_FILE_PROC_DYNAMIC_MAPS
             | LINUX_FILE_PROC_DYNAMIC_SMAPS
             | LINUX_FILE_PROC_DYNAMIC_PAGEMAP
@@ -53421,6 +53632,7 @@ fn linux_proc_file(state: u16) -> bool {
             | LINUX_FILE_PROC_DYNAMIC_STAT
             | LINUX_FILE_PROC_DYNAMIC_STATUS
             | LINUX_FILE_PROC_DYNAMIC_STATM
+            | LINUX_FILE_PROC_DYNAMIC_IO
             | LINUX_FILE_PROC_DYNAMIC_MAPS
             | LINUX_FILE_PROC_DYNAMIC_SMAPS
             | LINUX_FILE_PROC_DYNAMIC_PAGEMAP
@@ -53753,6 +53965,7 @@ fn linux_regular_file(state: u16) -> Option<&'static [u8]> {
         LINUX_FILE_PROC_DYNAMIC_STAT
         | LINUX_FILE_PROC_DYNAMIC_STATUS
         | LINUX_FILE_PROC_DYNAMIC_STATM
+        | LINUX_FILE_PROC_DYNAMIC_IO
         | LINUX_FILE_PROC_DYNAMIC_MAPS
         | LINUX_FILE_PROC_DYNAMIC_SMAPS
         | LINUX_FILE_PROC_DYNAMIC_PAGEMAP
@@ -53861,6 +54074,7 @@ fn linux_regular_file_inode(state: u16) -> Option<u64> {
         LINUX_FILE_PROC_DYNAMIC_STAT
         | LINUX_FILE_PROC_DYNAMIC_STATUS
         | LINUX_FILE_PROC_DYNAMIC_STATM
+        | LINUX_FILE_PROC_DYNAMIC_IO
         | LINUX_FILE_PROC_DYNAMIC_MAPS
         | LINUX_FILE_PROC_DYNAMIC_SMAPS
         | LINUX_FILE_PROC_DYNAMIC_PAGEMAP
@@ -58008,7 +58222,7 @@ fn linux_syncfs(descriptor: u64) -> u64 {
     }
 }
 
-fn linux_readahead(descriptor: u64, offset: u64, _count: u64) -> u64 {
+fn linux_readahead(descriptor: u64, offset: u64, count: u64) -> u64 {
     let descriptor = u64::from(descriptor as u32);
     if !linux_descriptor_open(descriptor) {
         return LINUX_EBADF;
@@ -58024,12 +58238,12 @@ fn linux_readahead(descriptor: u64, offset: u64, _count: u64) -> u64 {
     if state & LINUX_DEVICE_DIRECTORY != 0 || linux_inotify_descriptor(descriptor) {
         return LINUX_EINVAL;
     }
-    if linux_overlay_descriptor_handle(descriptor).is_some()
-        || linux_rootfs_entry(descriptor).is_some()
-        || linux_regular_file(state).is_some()
-    {
-        // File contents are already resident in the immutable image or the
-        // in-memory overlay, so there is no asynchronous read-ahead work.
+    if let Some(handle) = linux_overlay_descriptor_handle(descriptor) {
+        // A volume's file comes into the page cache; the image's and the
+        // in-memory overlay's contents are resident already.
+        let _ = crate::linux_blockfs::read_ahead(handle, offset, count);
+        0
+    } else if linux_rootfs_entry(descriptor).is_some() || linux_regular_file(state).is_some() {
         0
     } else {
         LINUX_EINVAL
@@ -58048,8 +58262,16 @@ fn linux_fadvise64(descriptor: u64, offset: u64, length: u64, advice: u64) -> u6
     if (offset as i64) < 0 || (length as i64) < 0 || advice > 5 {
         return LINUX_EINVAL;
     }
-    // All Ginux file data is resident in immutable image pages or RAM-backed
-    // filesystems, so every valid Linux access pattern hint is already met.
+    // POSIX_FADV_WILLNEED reads a volume's file into the page cache, as
+    // readahead does (a length of 0: to the end). The image's and the
+    // in-memory filesystems' data is resident, so their hints are met.
+    const POSIX_FADV_WILLNEED: u32 = 3;
+    if advice == POSIX_FADV_WILLNEED {
+        if let Some(handle) = linux_overlay_descriptor_handle(descriptor) {
+            let length = if length == 0 { u64::MAX } else { length };
+            let _ = crate::linux_blockfs::read_ahead(handle, offset, length);
+        }
+    }
     0
 }
 
@@ -59743,71 +59965,87 @@ pub(crate) fn linux_reclaim_unlinked_files() {
     }
 }
 
-/// statfs's f_fsid of the tmpfs canonical `path` lies on (through any
-/// bind mount of it), none for other filesystems: the filesystem's
-/// anonymous device and the tmpfs magic, the same for every mount of one
-/// tmpfs (fanotify's filesystem marks and identifiers report it too).
-/// The filesystems a mount makes in memory, each stored below a storage
-/// root of its own (crate::linux_mount_paths).
+/// The filesystems a mount makes of its own that are not volumes, each
+/// stored below a storage root of its own (crate::linux_mount_paths): the
+/// in-memory ones and overlayfs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LinuxMemoryFilesystem {
+enum LinuxMountedFilesystem {
     Tmpfs,
     Ramfs,
     Hugetlbfs,
+    Overlay,
 }
 
-/// The in-memory filesystem the mount holding canonical `path` has, and
+/// The filesystem of its own the mount holding canonical `path` has, and
 /// its device; None for a path on any other filesystem.
-fn linux_memory_filesystem_at(path: &[u8]) -> Option<(LinuxMemoryFilesystem, u32)> {
+fn linux_mounted_filesystem_at(path: &[u8]) -> Option<(LinuxMountedFilesystem, u32)> {
     let space = linux_mount_space();
     let id = crate::linux_mounts::mount_id_at(space, path);
     crate::linux_mounts::with_mount(space, id, |mount| {
         let filesystem = match &mount.filesystem[..] {
-            b"tmpfs" => LinuxMemoryFilesystem::Tmpfs,
-            b"ramfs" => LinuxMemoryFilesystem::Ramfs,
-            b"hugetlbfs" => LinuxMemoryFilesystem::Hugetlbfs,
+            b"tmpfs" => LinuxMountedFilesystem::Tmpfs,
+            b"ramfs" => LinuxMountedFilesystem::Ramfs,
+            b"hugetlbfs" => LinuxMountedFilesystem::Hugetlbfs,
+            b"overlay" => LinuxMountedFilesystem::Overlay,
             _ => return None,
         };
         Some((filesystem, mount.device))
     })?
 }
 
-/// statfs's f_fsid of the in-memory filesystem holding canonical `path`
-/// (a bind mount of one too): each has its own, from its device, as
-/// Linux's simple_statfs and hugetlbfs give it (a tmpfs's carries its
-/// magic as well). None off such a filesystem.
+/// statfs's f_fsid of the filesystem of its own holding canonical `path`
+/// (a bind mount of one too), the same for every mount of it: from its
+/// device, as Linux's simple_statfs and hugetlbfs give it, with the magic
+/// as well for a tmpfs and an overlay (whose own fsid Linux makes from
+/// the UUID it gives each overlay). fanotify's filesystem marks and
+/// identifiers report it too. None off such a filesystem.
 fn linux_tmpfs_fsid(path: &[u8]) -> Option<[u8; 8]> {
     const TMPFS_MAGIC: u32 = 0x0102_1994;
-    let (filesystem, device) = linux_memory_filesystem_at(path)?;
+    const OVERLAYFS_SUPER_MAGIC: u32 = 0x794c_7630;
+    let (filesystem, device) = linux_mounted_filesystem_at(path)?;
     let mut fsid = [0_u8; 8];
     fsid[..4].copy_from_slice(&device.to_ne_bytes());
-    if filesystem == LinuxMemoryFilesystem::Tmpfs {
-        fsid[4..].copy_from_slice(&TMPFS_MAGIC.to_ne_bytes());
+    match filesystem {
+        LinuxMountedFilesystem::Tmpfs => fsid[4..].copy_from_slice(&TMPFS_MAGIC.to_ne_bytes()),
+        LinuxMountedFilesystem::Overlay => {
+            fsid[4..].copy_from_slice(&OVERLAYFS_SUPER_MAGIC.to_ne_bytes());
+        }
+        LinuxMountedFilesystem::Ramfs | LinuxMountedFilesystem::Hugetlbfs => {}
     }
     Some(fsid)
 }
 
-/// statfs(2)'s answer for canonical `path` when a ramfs or hugetlbfs
-/// mount holds it, as Linux's simple_statfs and hugetlbfs_statfs give it:
-/// the magic, the page size (the huge page size for hugetlbfs), the fsid,
-/// and no counts (hugetlbfs has no size limit here; its inodes are
-/// unlimited, -1).
+/// statfs(2)'s answer for canonical `path` when a ramfs, hugetlbfs or
+/// overlay mount holds it, as Linux's simple_statfs, hugetlbfs_statfs and
+/// ovl_statfs give it: the magic, the page size (the huge page size for
+/// hugetlbfs), the fsid, and no counts for the in-memory ones (hugetlbfs
+/// has no size limit here; its inodes are unlimited, -1); an overlay
+/// reports the domain's memory, where its upper layer's files are.
 fn linux_memory_statfs_data(
-    filesystem: LinuxMemoryFilesystem,
+    filesystem: LinuxMountedFilesystem,
     path: &[u8],
     fsid: [u8; 8],
 ) -> [u8; 120] {
     const RAMFS_MAGIC: u64 = 0x8584_58f6;
     const HUGETLBFS_MAGIC: u64 = 0x9584_58f6;
-    let (magic, block_size) = if filesystem == LinuxMemoryFilesystem::Hugetlbfs {
-        (HUGETLBFS_MAGIC, LINUX_HUGE_PAGE_SIZE)
-    } else {
-        (RAMFS_MAGIC, PAGE_SIZE as u64)
+    const OVERLAYFS_SUPER_MAGIC: u64 = 0x794c_7630;
+    let (magic, block_size) = match filesystem {
+        LinuxMountedFilesystem::Hugetlbfs => (HUGETLBFS_MAGIC, LINUX_HUGE_PAGE_SIZE),
+        LinuxMountedFilesystem::Overlay => (OVERLAYFS_SUPER_MAGIC, PAGE_SIZE as u64),
+        LinuxMountedFilesystem::Ramfs | LinuxMountedFilesystem::Tmpfs => {
+            (RAMFS_MAGIC, PAGE_SIZE as u64)
+        }
     };
     let flags = linux_mount_statfs_flags(crate::linux_mounts::flags_at(linux_mount_space(), path));
     let mut stat = [0_u8; 120];
     stat[0..8].copy_from_slice(&magic.to_ne_bytes());
     stat[8..16].copy_from_slice(&block_size.to_ne_bytes());
+    if filesystem == LinuxMountedFilesystem::Overlay {
+        let (total_frames, free_frames) = linux_domain_frame_counts();
+        stat[16..24].copy_from_slice(&total_frames.to_ne_bytes());
+        stat[24..32].copy_from_slice(&free_frames.to_ne_bytes());
+        stat[32..40].copy_from_slice(&free_frames.to_ne_bytes());
+    }
     stat[56..64].copy_from_slice(&fsid);
     stat[64..72].copy_from_slice(&(crate::linux_overlay::NAME_MAX as u64).to_ne_bytes());
     stat[72..80].copy_from_slice(&block_size.to_ne_bytes());
@@ -59817,13 +60055,13 @@ fn linux_memory_statfs_data(
 
 /// statfs(2)'s answer for canonical `path` when a tmpfs mount holds it:
 /// tmpfs's magic, and its size limits and use where it has them, else the
-/// domain's memory, as an unlimited tmpfs shows; a ramfs's or hugetlbfs's
-/// (`linux_memory_statfs_data`). None off those.
+/// domain's memory, as an unlimited tmpfs shows; a ramfs's, hugetlbfs's
+/// or overlay's (`linux_memory_statfs_data`). None off those.
 fn linux_tmpfs_statfs_data(path: &[u8]) -> Option<[u8; 120]> {
     const TMPFS_MAGIC: u64 = 0x0102_1994;
     let fsid = linux_tmpfs_fsid(path)?;
-    let (filesystem, _) = linux_memory_filesystem_at(path)?;
-    if filesystem != LinuxMemoryFilesystem::Tmpfs {
+    let (filesystem, _) = linux_mounted_filesystem_at(path)?;
+    if filesystem != LinuxMountedFilesystem::Tmpfs {
         return Some(linux_memory_statfs_data(filesystem, path, fsid));
     }
     let space = linux_mount_space();

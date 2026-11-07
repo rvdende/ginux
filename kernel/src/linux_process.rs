@@ -563,6 +563,8 @@ struct Process {
     deadline_parameters: [u64; 3],
     /// `/proc/PID/oom_score_adj`: inherited across fork, kept across exec.
     oom_score_adj: i16,
+    /// `/proc/PID/io`'s counts: none in a new child, kept across exec.
+    io: IoAccounting,
     /// Its memory policy (set_mempolicy): inherited across fork, kept
     /// across exec, as Linux's task policy is. Linux keeps one per thread;
     /// here the process's threads share it.
@@ -2040,6 +2042,7 @@ impl ProcessTable {
             timer_slack,
             stopped_in_call: false,
             oom_score_adj,
+            io: IoAccounting::default(),
             memory_policy,
             killed_by_signal: 0,
             oom_victim: false,
@@ -4200,6 +4203,38 @@ pub(crate) fn set_live_process_timer_slack(pid: u32, slack: u64) -> bool {
         slack
     };
     true
+}
+
+/// A process's I/O as `/proc/PID/io` counts it (Linux's task_io_accounting):
+/// bytes passed by read and write calls and how many such calls it made,
+/// and the bytes its file I/O read from and wrote to storage.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct IoAccounting {
+    pub(crate) rchar: u64,
+    pub(crate) wchar: u64,
+    pub(crate) syscr: u64,
+    pub(crate) syscw: u64,
+    pub(crate) read_bytes: u64,
+    pub(crate) write_bytes: u64,
+    pub(crate) cancelled_write_bytes: u64,
+}
+
+/// The I/O process `pid` did (`/proc/PID/io`).
+pub(crate) fn live_process_io(pid: u32) -> Option<IoAccounting> {
+    let table = live_process_table_mut()?;
+    let process = table.process(table.handle_by_pid(pid)?)?;
+    Some(process.io)
+}
+
+/// Adds to the I/O counts of process `pid`.
+pub(crate) fn account_live_process_io(pid: u32, account: impl FnOnce(&mut IoAccounting)) {
+    if let Some(process) = live_process_table_mut().and_then(|table| {
+        table
+            .handle_by_pid(pid)
+            .and_then(|handle| table.process_mut(handle))
+    }) {
+        account(&mut process.io);
+    }
 }
 
 pub(crate) fn live_process_oom_score_adj(pid: u32) -> Option<i16> {
