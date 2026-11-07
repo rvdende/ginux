@@ -4,6 +4,7 @@ members = [
     "control-plane/runtime",
     "crates/command",
     "crates/credentials",
+    "crates/deadline-heap",
     "crates/drm",
     "crates/ext2",
     "crates/image-store",

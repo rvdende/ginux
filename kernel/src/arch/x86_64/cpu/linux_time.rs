@@ -1122,6 +1122,9 @@ fn linux_sleep_live_return(
                 linux_wait_for_interrupt();
             }
         }
+        // Its deadline has passed: a mark left would count as a sleeper
+        // due for its next wait of another kind.
+        linux_process::set_live_process_futex_sleep(current_linux_process_pid(), None);
         return 0;
     };
     let Some(tls) = linux_thread_context(current) else {

@@ -464,6 +464,10 @@ name = "ginux-credentials"
 version = "0.1.0"
 
 [[package]]
+name = "ginux-deadline-heap"
+version = "0.1.0"
+
+[[package]]
 name = "ginux-drm"
 version = "0.1.0"
 
@@ -486,6 +490,7 @@ dependencies = [
  "font8x8",
  "ginux-cgroup",
  "ginux-credentials",
+ "ginux-deadline-heap",
  "ginux-drm",
  "ginux-ext2",
  "ginux-image-store",

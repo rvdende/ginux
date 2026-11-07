@@ -768,6 +768,12 @@ struct ProcessTable {
     /// next turn goes to the ready process after it (`next_ready_live_process`).
     dispatch_cursor: u32,
     init: Option<ProcessHandle>,
+    /// The deadlines processes are marked asleep until (`futex_sleep`), by
+    /// pid: one entry per mark, checked against the process when looked at
+    /// (`next_live_futex_sleep_deadline`) rather than taken out wherever a
+    /// mark ends. Lossy after an allocation failure, until rebuilt.
+    sleepers: ginux_deadline_heap::DeadlineHeap<u32>,
+    sleepers_lossy: bool,
 }
 
 /// One installed seccomp program and the filter before it in its chain.
@@ -798,6 +804,8 @@ impl ProcessTable {
             sharing: false,
             dispatch_cursor: 0,
             init: None,
+            sleepers: ginux_deadline_heap::DeadlineHeap::new(),
+            sleepers_lossy: false,
         }
     }
 
@@ -3651,6 +3659,11 @@ pub(crate) fn set_live_process_waiting(pid: u32, waiting: bool) {
             .and_then(|handle| table.process_mut(handle))
         {
             process.waiting = waiting;
+        } else {
+            return;
+        }
+        if waiting {
+            table.note_sleeper(pid);
         }
     }
 }
@@ -3664,7 +3677,10 @@ pub(crate) fn set_live_process_futex_sleep(pid: u32, deadline: Option<u64>) {
             .and_then(|handle| table.process_mut(handle))
         {
             process.futex_sleep = deadline;
+        } else {
+            return;
         }
+        table.note_sleeper(pid);
     }
 }
 
@@ -3685,17 +3701,83 @@ pub(crate) fn live_process_futex_asleep(pid: u32, now: u64) -> bool {
 /// it due (its deadline came between the look for work and the halt) a
 /// whole tick late.
 pub(crate) fn next_live_futex_sleep_deadline() -> Option<u64> {
-    live_process_table_mut()?
-        .processes
-        .iter()
-        .flatten()
-        .filter(|process| process.state == ProcessState::Running && process.waiting)
-        .filter_map(|process| process.futex_sleep)
-        .filter(|deadline| *deadline != 0)
-        .min()
+    let table = live_process_table_mut()?;
+    if table.sleepers_lossy {
+        table.rebuild_sleepers();
+    }
+    if table.sleepers_lossy {
+        return table
+            .processes
+            .iter()
+            .flatten()
+            .filter_map(|process| process.marked_asleep_until())
+            .min();
+    }
+    let mut sleepers = core::mem::take(&mut table.sleepers);
+    let earliest = sleepers.earliest(|pid, deadline| table.sleeper_holds(pid, deadline));
+    table.sleepers = sleepers;
+    earliest.map(|(deadline, _)| deadline)
+}
+
+impl ProcessTable {
+    /// Records `pid`'s deadline if it is now marked asleep (both its mark
+    /// and its `waiting`, which are set apart, hold), dropping the entries
+    /// no longer marked once they outnumber the processes.
+    fn note_sleeper(&mut self, pid: u32) {
+        let Some(deadline) = self
+            .handle_by_pid(pid)
+            .and_then(|handle| self.process(handle))
+            .and_then(Process::marked_asleep_until)
+        else {
+            return;
+        };
+        if self.sleepers_lossy {
+            return;
+        }
+        if self.sleepers.len() >= 2 * self.pid_slots.len() + 64 {
+            let mut sleepers = core::mem::take(&mut self.sleepers);
+            sleepers.retain(|pid, deadline| self.sleeper_holds(pid, deadline));
+            self.sleepers = sleepers;
+        }
+        if self.sleepers.push(deadline, pid).is_err() {
+            self.sleepers.clear();
+            self.sleepers_lossy = true;
+        }
+    }
+
+    /// Whether `pid` is still marked asleep until `deadline`.
+    fn sleeper_holds(&self, pid: u32, deadline: u64) -> bool {
+        self.handle_by_pid(pid)
+            .and_then(|handle| self.process(handle))
+            .and_then(Process::marked_asleep_until)
+            == Some(deadline)
+    }
+
+    /// Puts every current mark back after an allocation failure lost some.
+    fn rebuild_sleepers(&mut self) {
+        let mut sleepers = ginux_deadline_heap::DeadlineHeap::new();
+        for process in self.processes.iter().flatten() {
+            if let Some(deadline) = process.marked_asleep_until() {
+                if sleepers.push(deadline, process.handle.pid).is_err() {
+                    return;
+                }
+            }
+        }
+        self.sleepers = sleepers;
+        self.sleepers_lossy = false;
+    }
 }
 
 impl Process {
+    /// The deadline the process is marked asleep until, if it is: running,
+    /// waiting, with a deadline to its mark.
+    fn marked_asleep_until(&self) -> Option<u64> {
+        (self.state == ProcessState::Running && self.waiting)
+            .then_some(self.futex_sleep)
+            .flatten()
+            .filter(|deadline| *deadline != 0)
+    }
+
     /// Asleep in a futex wait that no wake (which clears `waiting`), signal
     /// it takes (likewise) or deadline has ended by `now`.
     fn is_asleep(&self, now: u64) -> bool {
