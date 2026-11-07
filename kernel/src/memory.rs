@@ -1,7 +1,9 @@
 //! Physical frame allocator.
 //!
 //! Every page of usable RAM has an 8-byte metadata word (generation, owner
-//! slot, a live flag and a sharer count) and a bit in a free bitmap. Both tables are sized to
+//! slot, a live flag and a sharer count), a bit in a free bitmap and a
+//! 2-byte charge: the memory cgroup a user page is charged to
+//! (`linux_cgroup`), uncharged when the frame is freed. The tables are sized to
 //! the installed memory and carved from it at boot, so lookups are O(1) and no
 //! compile-time table limits how much memory can be in use.
 //!
@@ -129,6 +131,9 @@ pub(crate) struct FrameAllocator {
     frames: usize,
     metadata: *mut u64,
     free: *mut u64,
+    /// Each frame's memory cgroup charge (`linux_cgroup::Slot`, 0 for none),
+    /// or null for an allocator that charges nothing (the self-test's).
+    charges: *mut u16,
     /// Lowest bitmap word that may hold a free bit.
     cursor: usize,
     free_frames: u64,
@@ -149,12 +154,14 @@ impl FrameAllocator {
     /// # Safety
     ///
     /// `metadata` must hold `frames` words and `free` `frames.div_ceil(64)`
-    /// words, both zeroed and valid for the allocator's lifetime.
+    /// words, both zeroed and valid for the allocator's lifetime, and
+    /// `charges`, unless null, `frames` zeroed half-words.
     unsafe fn with_tables(
         first_frame: u64,
         frames: usize,
         metadata: *mut u64,
         free: *mut u64,
+        charges: *mut u16,
         owner_limit: usize,
     ) -> Self {
         Self {
@@ -162,6 +169,7 @@ impl FrameAllocator {
             frames,
             metadata,
             free,
+            charges,
             cursor: 0,
             free_frames: 0,
             allocated_frames: 0,
@@ -199,6 +207,29 @@ impl FrameAllocator {
         // SAFETY: as for metadata. Lock-free readers (kernel_frame_metadata)
         // may load the word concurrently.
         unsafe { AtomicU64::from_ptr(self.metadata.add(index)).store(value, Ordering::Release) }
+    }
+
+    /// Records that frame `index` is charged to memory cgroup `slot`.
+    fn set_charge(&mut self, index: usize, slot: u16) {
+        if !self.charges.is_null() && index < self.frames {
+            // SAFETY: charges covers frames half-words (with_tables) and the
+            // allocator lock serializes access.
+            unsafe { self.charges.add(index).write(slot) };
+        }
+    }
+
+    /// Takes the memory cgroup frame `index` is charged to (0 for none).
+    fn take_charge(&mut self, index: usize) -> u16 {
+        if self.charges.is_null() || index >= self.frames {
+            return 0;
+        }
+        // SAFETY: as for set_charge.
+        unsafe {
+            let charge = self.charges.add(index);
+            let slot = charge.read();
+            charge.write(0);
+            slot
+        }
     }
 
     fn is_free(&self, index: usize) -> bool {
@@ -558,6 +589,11 @@ impl FrameAllocator {
     /// Ends a live frame's lease. A frame whose generation is exhausted is
     /// never handed out again.
     fn retire(&mut self, index: usize) {
+        // The page's memory cgroup is charged until its last mapping goes.
+        let charge = self.take_charge(index);
+        if charge != 0 {
+            crate::linux_cgroup::uncharge(charge, 1);
+        }
         let metadata = self.metadata(index);
         let slot = (metadata & META_OWNER) as usize;
         self.set_metadata(index, metadata & !(META_LIVE | META_OWNER | META_SHARERS));
@@ -734,8 +770,10 @@ pub(crate) fn initialize(boot_info: &BootInfo, ceiling: u64) -> bool {
     let frames = (highest / PAGE_SIZE) as usize;
     let metadata_bytes = frames as u64 * 8;
     let bitmap_bytes = frames.div_ceil(64) as u64 * 8;
+    let charge_bytes = frames as u64 * 2;
     // Place the tables at the top of the largest usable range.
-    let tables_size = (metadata_bytes + bitmap_bytes).div_ceil(PAGE_SIZE) * PAGE_SIZE;
+    let tables_size =
+        (metadata_bytes + bitmap_bytes + charge_bytes).div_ceil(PAGE_SIZE) * PAGE_SIZE;
     let Some(tables_start) = largest
         .1
         .checked_sub(tables_size)
@@ -756,8 +794,9 @@ pub(crate) fn initialize(boot_info: &BootInfo, ceiling: u64) -> bool {
         core::ptr::write_bytes(tables as *mut u8, 0, tables_size as usize);
         let metadata = tables as *mut u64;
         let free = (tables + metadata_bytes as usize) as *mut u64;
+        let charges = (tables + (metadata_bytes + bitmap_bytes) as usize) as *mut u16;
         let mut allocator =
-            FrameAllocator::with_tables(0, frames, metadata, free, DOMAIN_FRAME_LIMIT);
+            FrameAllocator::with_tables(0, frames, metadata, free, charges, DOMAIN_FRAME_LIMIT);
         let mut reclaimed = 0;
         for_each_descriptor(boot_info, |descriptor| {
             let (Some(boot_service), Some(end)) =
@@ -831,27 +870,64 @@ pub(crate) fn allocate_user_frames<const N: usize>() -> Option<[FrameLease; N]> 
     if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) {
         return None;
     }
-    let mut storage = PHYSICAL_MEMORY.allocator.lock();
-    // SAFETY: initialized is published only after the locked storage contains
-    // a valid FrameAllocator.
-    unsafe {
-        let allocator = storage.assume_init_mut();
-        let total = allocator.free_frames + allocator.allocated_frames;
-        if allocator.free_frames < N as u64 + user_reserve_frames(total) {
-            PHYSICAL_MEMORY
-                .user_frames_refused
-                .store(true, Ordering::Release);
-            return None;
+    // The pages are charged to the current process's memory cgroup first,
+    // which may reclaim or OOM-kill within it (before the allocator lock is
+    // taken); a charge it refuses fails the allocation as running out of
+    // memory does.
+    let Some(charge) = crate::arch::x86_64::cpu::charge_linux_user_pages(N as u64) else {
+        PHYSICAL_MEMORY
+            .user_frames_refused
+            .store(true, Ordering::Release);
+        return None;
+    };
+    let uncharge = || {
+        if charge != 0 {
+            crate::linux_cgroup::uncharge(charge, N as u64);
         }
-        let frames = allocator.reserve::<N>(FrameOwner::KERNEL)?;
-        for frame in &frames {
-            let Some(address) = frame.direct_map_address() else {
-                let _ = allocator.release(FrameOwner::KERNEL, frames);
+    };
+    // Short of memory, what the domain's processes may give up (lazily
+    // freed and droppable pages) is taken first, once, without the lock.
+    let mut reclaimed = false;
+    loop {
+        let mut storage = PHYSICAL_MEMORY.allocator.lock();
+        // SAFETY: initialized is published only after the locked storage
+        // contains a valid FrameAllocator.
+        unsafe {
+            let allocator = storage.assume_init_mut();
+            let total = allocator.free_frames + allocator.allocated_frames;
+            if allocator.free_frames < N as u64 + user_reserve_frames(total) {
+                if !reclaimed {
+                    drop(storage);
+                    reclaimed = true;
+                    if crate::arch::x86_64::cpu::reclaim_linux_user_pages(N as u64) {
+                        continue;
+                    }
+                }
+                PHYSICAL_MEMORY
+                    .user_frames_refused
+                    .store(true, Ordering::Release);
+                uncharge();
+                return None;
+            }
+            let Some(frames) = allocator.reserve::<N>(FrameOwner::KERNEL) else {
+                uncharge();
                 return None;
             };
-            core::ptr::write_bytes(address as *mut u8, 0, PAGE_SIZE as usize);
+            for frame in &frames {
+                let Some(address) = frame.direct_map_address() else {
+                    let _ = allocator.release(FrameOwner::KERNEL, frames);
+                    uncharge();
+                    return None;
+                };
+                core::ptr::write_bytes(address as *mut u8, 0, PAGE_SIZE as usize);
+            }
+            for frame in &frames {
+                if let Some(index) = allocator.index(frame.address) {
+                    allocator.set_charge(index, charge);
+                }
+            }
+            return Some(frames);
         }
-        Some(frames)
     }
 }
 
@@ -1276,7 +1352,14 @@ pub(crate) fn verify_reservation_invariants() -> bool {
         let free = core::ptr::addr_of_mut!(FREE).cast::<u64>();
         metadata.write_bytes(0, FRAMES);
         free.write_bytes(0, FRAMES / 64);
-        let mut allocator = FrameAllocator::with_tables(FIRST_FRAME, FRAMES, metadata, free, 16);
+        let mut allocator = FrameAllocator::with_tables(
+            FIRST_FRAME,
+            FRAMES,
+            metadata,
+            free,
+            core::ptr::null_mut(),
+            16,
+        );
         for (start, end) in ranges {
             allocator.add_free_range(*start, *end);
         }

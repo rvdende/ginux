@@ -23,6 +23,7 @@ mod linux_aio;
 mod linux_areas;
 mod linux_async_io;
 mod linux_blockfs;
+mod linux_cgroup;
 mod linux_debug_registers;
 mod linux_drm;
 mod linux_elf;

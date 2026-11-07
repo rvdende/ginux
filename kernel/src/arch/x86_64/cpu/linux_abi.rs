@@ -565,6 +565,10 @@ pub(super) const LINUX_PROT_WRITE: u64 = 2;
 pub(super) const LINUX_PROT_EXEC: u64 = 4;
 pub(super) const LINUX_MAP_SHARED: u64 = 1;
 pub(super) const LINUX_MAP_PRIVATE: u64 = 2;
+/// Private anonymous memory the kernel may drop under memory pressure.
+pub(super) const LINUX_MAP_DROPPABLE: u64 = 0x08;
+/// The bits of mmap's flags that give the mapping's type.
+pub(super) const LINUX_MAP_TYPE: u64 = 0x0f;
 pub(super) const LINUX_MAP_FIXED: u64 = 0x10;
 pub(super) const LINUX_MAP_SHARED_VALIDATE: u64 = 0x3;
 pub(super) const LINUX_MAP_32BIT: u64 = 0x40;

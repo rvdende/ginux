@@ -181,6 +181,9 @@ const LINUX_RUNTIME_SECRET: u64 = 1 << 56;
 const LINUX_RUNTIME_DONTFORK: u64 = 1 << 55;
 const LINUX_RUNTIME_WIPEONFORK: u64 = 1 << 54;
 const LINUX_RUNTIME_COW: u64 = 1 << 53;
+/// A private page freed lazily (MADV_FREE): reclaim may drop it, unless it
+/// was written since (the hardware sets DIRTY again).
+const LINUX_RUNTIME_LAZYFREE: u64 = 1 << 52;
 const LINUX_INIT_ARGUMENT: [u8; 6] = [b'/', b'i', b'n', b'i', b't', 0];
 const LINUX_INIT_ENVIRONMENT: [u8; 8] = [b'G', b'I', b'N', b'U', b'X', b'=', b'1', 0];
 const LINUX_PLATFORM: [u8; 7] = [b'x', b'8', b'6', b'_', b'6', b'4', 0];
@@ -6498,6 +6501,110 @@ pub(crate) fn verify_linux_runtime_translation_permissions() -> bool {
         && linux_runtime_leaf_grants(executable, false, true)
         && !linux_runtime_leaf_grants(executable & !PRESENT, false, true)
         && !linux_runtime_leaf_grants(executable & !USER, false, true)
+}
+
+/// Calls `visit` with the address and entry of each present 4-KiB user leaf
+/// of the active address space, in address order, until it returns false.
+fn for_each_current_linux_user_leaf(mut visit: impl FnMut(u64, PageEntry) -> bool) {
+    let Some(root) = mapped_frame::<u64>(current_root()) else {
+        return;
+    };
+    let user = |value: u64| value & (PRESENT | USER | LARGE_PAGE) == PRESENT | USER;
+    for root_index in 0..ENTRY_COUNT / 2 {
+        let root_value = unsafe { root.add(root_index).read() };
+        let Some(pdpt) = user(root_value)
+            .then(|| mapped_frame::<u64>(root_value & ADDRESS_MASK))
+            .flatten()
+        else {
+            continue;
+        };
+        for pdpt_index in 0..ENTRY_COUNT {
+            let pdpt_value = unsafe { pdpt.add(pdpt_index).read() };
+            let Some(directory) = user(pdpt_value)
+                .then(|| mapped_frame::<u64>(pdpt_value & ADDRESS_MASK))
+                .flatten()
+            else {
+                continue;
+            };
+            for directory_index in 0..ENTRY_COUNT {
+                let directory_value = unsafe { directory.add(directory_index).read() };
+                let Some(table) = user(directory_value)
+                    .then(|| mapped_frame::<u64>(directory_value & ADDRESS_MASK))
+                    .flatten()
+                else {
+                    continue;
+                };
+                for leaf_index in 0..ENTRY_COUNT {
+                    // SAFETY: the table was reached through present user
+                    // entries of the active address space's own tables.
+                    let entry = unsafe { PageEntry::new(table.add(leaf_index)) };
+                    if entry.read() & (PRESENT | USER) != PRESENT | USER {
+                        continue;
+                    }
+                    let address = (root_index as u64) << 39
+                        | (pdpt_index as u64) << 30
+                        | (directory_index as u64) << 21
+                        | (leaf_index as u64) << 12;
+                    if !visit(address, entry) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The pages the active address space has in memory (its resident set).
+pub(crate) fn current_linux_resident_pages() -> u64 {
+    let mut pages = 0;
+    for_each_current_linux_user_leaf(|_, _| {
+        pages += 1;
+        true
+    });
+    pages
+}
+
+/// Marks the active address space's private page at `address` lazily
+/// freed (MADV_FREE): its contents stay until memory runs short, unless it
+/// is written first. Its dirty bit is cleared, so the hardware shows a
+/// later write. False for a page not in memory.
+pub(crate) fn mark_current_linux_page_lazyfree(address: u64) -> bool {
+    let Some(entry) = current_linux_leaf(address) else {
+        return false;
+    };
+    let value = entry.read();
+    if value & (PRESENT | USER) != PRESENT | USER || value & LINUX_RUNTIME_SHARED != 0 {
+        return false;
+    }
+    entry.write((value | LINUX_RUNTIME_LAZYFREE) & !DIRTY);
+    unsafe {
+        asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
+    }
+    true
+}
+
+/// Fills `output` with the active address space's lazily freed pages not
+/// written since MADV_FREE, as many as fit, and gives back how many. One
+/// written since is not lazily freed any more and loses the mark.
+pub(crate) fn current_linux_lazyfree_pages(output: &mut [u64]) -> usize {
+    let mut found = 0;
+    for_each_current_linux_user_leaf(|address, entry| {
+        let value = entry.read();
+        if value & LINUX_RUNTIME_LAZYFREE == 0 {
+            return true;
+        }
+        if value & DIRTY != 0 || value & LINUX_RUNTIME_SHARED != 0 {
+            entry.write(value & !LINUX_RUNTIME_LAZYFREE);
+            return true;
+        }
+        let Some(slot) = output.get_mut(found) else {
+            return false;
+        };
+        *slot = address;
+        found += 1;
+        true
+    });
+    found
 }
 
 pub(crate) fn current_linux_user_page_count() -> Option<usize> {

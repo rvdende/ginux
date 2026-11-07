@@ -64,6 +64,9 @@ impl Protection {
 pub enum Backing {
     /// Zero-filled memory.
     Anonymous,
+    /// Zero-filled memory the kernel may drop under memory pressure, which
+    /// then reads as zeros again (`MAP_DROPPABLE`, Linux's VM_DROPPABLE).
+    Droppable,
     /// The program break's heap.
     Heap,
     /// The main thread's stack.

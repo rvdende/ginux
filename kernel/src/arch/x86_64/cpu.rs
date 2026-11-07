@@ -14,6 +14,7 @@ mod architecture;
 mod execution;
 mod fanotify;
 mod linux_abi;
+mod linux_cgroupfs;
 mod linux_fsmount;
 mod linux_futex;
 mod linux_hugetlb;
@@ -44,6 +45,8 @@ use execution::{
 };
 use fanotify::*;
 pub(crate) use linux_abi::*;
+use linux_cgroupfs::*;
+pub(crate) use linux_cgroupfs::{charge_linux_user_pages, reclaim_linux_user_pages};
 use linux_fsmount::*;
 use linux_futex::*;
 use linux_hugetlb::*;
@@ -26908,12 +26911,14 @@ fn verify_linux_process_madvise_syscall() -> bool {
     let freed = populated
         && copy_to_linux_user(first, &[0xa5])
         && linux_madvise(first, PAGE_SIZE as u64, LINUX_MADV_FREE) == 0
+        // Lazily freed: the page and its contents stay until reclaim takes
+        // them.
         && address_space::current_linux_runtime_page(first)
             .frame
-            .is_none()
+            .is_some()
         && {
             let mut byte = [1_u8];
-            copy_from_linux_user(first, &mut byte) && byte == [0]
+            copy_from_linux_user(first, &mut byte) && byte == [0xa5]
         }
         && linux_madvise(
             X86_RUNTIME.ELF_PROBE_CODE_BASE.load(Ordering::SeqCst),
@@ -27908,6 +27913,20 @@ fn linux_runtime_mmap(
     } else {
         flags
     };
+    // MAP_DROPPABLE is private anonymous memory the kernel may drop under
+    // memory pressure, after which it reads as zeros (Linux 6.11): never a
+    // file's, never locked, and not inherited by a child (VM_WIPEONFORK).
+    // Its pages are reserved as it is made (not lazily), so they carry
+    // their wipe-on-fork mark.
+    let droppable = flags & LINUX_MAP_TYPE == LINUX_MAP_DROPPABLE;
+    if droppable && (flags & LINUX_MAP_ANONYMOUS == 0 || flags & LINUX_MAP_LOCKED != 0) {
+        return LINUX_EINVAL;
+    }
+    let flags = if droppable {
+        flags & !LINUX_MAP_TYPE | LINUX_MAP_PRIVATE
+    } else {
+        flags
+    };
     let protection = linux_runtime_page_protection(linux_implied_protection(protection));
     if length == 0
         || ![
@@ -28007,6 +28026,7 @@ fn linux_runtime_mmap(
     // and its pages are made as they are touched.
     let lazy = anonymous
         && sharing == LINUX_MAP_PRIVATE
+        && !droppable
         && !fixed
         && !no_replace
         && !low
@@ -28307,6 +28327,20 @@ fn linux_runtime_mmap(
             pages.saturating_mul(PAGE_SIZE),
             protection & LINUX_PROT_WRITE != 0,
         );
+    }
+    if droppable
+        && !(0..pages).all(|page| {
+            address_space::set_current_linux_runtime_page_wipeonfork(
+                mapping + (page * PAGE_SIZE) as u64,
+                true,
+            )
+        })
+    {
+        let _ = rollback_linux_runtime_mapping(mapping, pages);
+        return LINUX_ENOMEM;
+    }
+    if droppable {
+        crate::linux_cgroup::note_reclaimable();
     }
     mapping
 }
@@ -28684,7 +28718,9 @@ fn linux_record_mapping(
             && !linux_overlay_descriptor_handle(descriptor)
                 .and_then(crate::linux_overlay::file_seals)
                 .is_some_and(|seals| seals & (LINUX_F_SEAL_WRITE | LINUX_F_SEAL_FUTURE_WRITE) != 0);
-    let backing = if flags & LINUX_MAP_ANONYMOUS != 0 || linux_dev_zero_descriptor(descriptor) {
+    let backing = if flags & LINUX_MAP_TYPE == LINUX_MAP_DROPPABLE {
+        Backing::Droppable
+    } else if flags & LINUX_MAP_ANONYMOUS != 0 || linux_dev_zero_descriptor(descriptor) {
         Backing::Anonymous
     } else {
         let mut path = [0_u8; crate::linux_overlay::PATH_CAPACITY];
@@ -29957,6 +29993,15 @@ fn linux_runtime_madvise(address: u64, length: u64, advice: u64) -> u64 {
                     return LINUX_EINVAL;
                 }
             }
+            continue;
+        }
+        // MADV_FREE keeps the page until memory runs short; written first,
+        // it stays (`linux_memcg_reclaim` drops it otherwise).
+        if free && state.frame.is_some() {
+            if !address_space::mark_current_linux_page_lazyfree(page_address) {
+                return LINUX_EINVAL;
+            }
+            crate::linux_cgroup::note_reclaimable();
             continue;
         }
         if state.frame.is_some() {
@@ -36053,7 +36098,7 @@ fn linux_canonical_path_at(
     }
     let length = linux_hugepages_proc_alias(output, length);
     if output[..length].starts_with(b"sys/fs/cgroup/") {
-        linux_ensure_cgroup_root();
+        linux_cgroup_ensure_root();
     }
     if output[..length].starts_with(b"sys/kernel/mm") {
         linux_refresh_hugepages_sysfs();
@@ -38307,16 +38352,13 @@ fn linux_mkdirat(directory: u64, path_address: u64, mode: u64) -> u64 {
     ) else {
         return LINUX_ENOSPC;
     };
-    if path.starts_with(b"sys/fs/cgroup/") && !linux_create_cgroup_control_files(path) {
+    if path.starts_with(b"sys/fs/cgroup/") && !linux_cgroup_mkdir(path, directory_handle) {
         let _ = crate::linux_overlay::unlink(directory_handle);
         return LINUX_ENOSPC;
     }
     0
 }
 
-/// Creates the root cgroup's control files if they are missing. /proc/mounts
-/// shows cgroup2 mounted at /sys/fs/cgroup from the start, so they must
-/// exist before anything mounts it.
 /// Set while `linux_ensure_dev_nodes` makes the nodes: making one walks its
 /// parent, `/dev`, which comes back here.
 static LINUX_MAKING_DEV_NODES: AtomicBool = AtomicBool::new(false);
@@ -38401,112 +38443,6 @@ fn linux_ensure_dev_nodes() {
         }
     }
     LINUX_MAKING_DEV_NODES.store(false, Ordering::Release);
-}
-
-fn linux_ensure_cgroup_root() -> bool {
-    [
-        (&b"sys/fs/cgroup/cgroup.procs"[..], &b""[..]),
-        (
-            &b"sys/fs/cgroup/cgroup.events"[..],
-            &b"populated 1\nfrozen 0\n"[..],
-        ),
-        (&b"sys/fs/cgroup/cgroup.controllers"[..], &b""[..]),
-        (&b"sys/fs/cgroup/cgroup.subtree_control"[..], &b""[..]),
-    ]
-    .into_iter()
-    .all(|(path, contents)| {
-        crate::linux_overlay::lookup(path).is_some()
-            || crate::linux_overlay::create_file(path, 0o644, contents)
-                .is_some_and(|handle| crate::linux_overlay::set_owner(handle, 0, 0))
-    })
-}
-
-fn linux_create_cgroup_control_files(path: &[u8]) -> bool {
-    for (name, contents) in [
-        (&b"/cgroup.procs"[..], &b""[..]),
-        (&b"/cgroup.events"[..], &b"populated 0\nfrozen 0\n"[..]),
-    ] {
-        let mut control = [0_u8; crate::linux_overlay::PATH_CAPACITY];
-        let Some(end) = path.len().checked_add(name.len()) else {
-            return false;
-        };
-        let Some(output) = control.get_mut(..end) else {
-            return false;
-        };
-        output[..path.len()].copy_from_slice(path);
-        output[path.len()..].copy_from_slice(name);
-        if crate::linux_overlay::lookup(output).is_none()
-            && crate::linux_overlay::create_file(output, 0o644, contents).is_none()
-        {
-            return false;
-        }
-    }
-    true
-}
-
-fn linux_cgroup_control_handle(
-    generation: u32,
-    name: &[u8],
-) -> Option<crate::linux_overlay::Handle> {
-    let directory = crate::linux_overlay::from_generation(generation)?;
-    let metadata = crate::linux_overlay::metadata(directory)?;
-    if metadata.kind != crate::linux_overlay::NodeKind::Directory {
-        return None;
-    }
-    let mut path = [0_u8; crate::linux_overlay::PATH_CAPACITY];
-    let length = crate::linux_overlay::copy_path(directory, &mut path)?;
-    let end = length.checked_add(1 + name.len())?;
-    let output = path.get_mut(..end)?;
-    output[length] = b'/';
-    output[length + 1..].copy_from_slice(name);
-    crate::linux_overlay::lookup(output).map(|metadata| metadata.handle)
-}
-
-fn linux_update_cgroup_files(generation: u32, populated: bool, pid: u32) -> bool {
-    let Some(procs) = linux_cgroup_control_handle(generation, b"cgroup.procs") else {
-        return false;
-    };
-    let Some(events) = linux_cgroup_control_handle(generation, b"cgroup.events") else {
-        return false;
-    };
-    let mut process = [0_u8; 16];
-    let process_length = if populated {
-        let length = write_linux_decimal(u64::from(pid), &mut process);
-        process[length] = b'\n';
-        length + 1
-    } else {
-        0
-    };
-    let event = if populated {
-        &b"populated 1\nfrozen 0\n"[..]
-    } else {
-        &b"populated 0\nfrozen 0\n"[..]
-    };
-    if !crate::linux_overlay::truncate(procs, 0)
-        || crate::linux_overlay::write(procs, 0, &process[..process_length]) != Some(process_length)
-        || !crate::linux_overlay::truncate(events, 0)
-        || crate::linux_overlay::write(events, 0, event) != Some(event.len())
-    {
-        return false;
-    }
-    linux_inotify_overlay_event(events, crate::linux_inotify::IN_MODIFY);
-    wake_linux_descriptor_waits();
-    true
-}
-
-fn linux_assign_process_cgroup(pid: u32, generation: u32) -> bool {
-    if generation == 0 {
-        return true;
-    }
-    linux_process::replace_live_process_cgroup(pid, generation).is_some()
-        && linux_update_cgroup_files(generation, true, pid)
-}
-
-fn linux_release_process_cgroup(pid: u32) {
-    let generation = linux_process::replace_live_process_cgroup(pid, 0).unwrap_or(0);
-    if generation != 0 && !linux_process::live_cgroup_populated(generation, pid) {
-        let _ = linux_update_cgroup_files(generation, false, 0);
-    }
 }
 
 /// The major and minor numbers of a device number as mknod(2) and stat(2)
@@ -39030,11 +38966,10 @@ fn linux_unlinkat(directory: u64, path_address: u64, flags: u64) -> u64 {
     if flags == 0 && metadata.kind == crate::linux_overlay::NodeKind::Directory {
         return LINUX_EISDIR;
     }
-    if flags == LINUX_AT_REMOVEDIR
-        && canonical[..length].starts_with(b"sys/fs/cgroup/")
-        && !linux_remove_empty_cgroup_controls(metadata.handle)
-    {
-        return LINUX_ENOTEMPTY;
+    if flags == LINUX_AT_REMOVEDIR && canonical[..length].starts_with(b"sys/fs/cgroup/") {
+        if let Err(error) = linux_cgroup_rmdir(metadata.handle) {
+            return error;
+        }
     }
     let lower_exists = crate::published_rootfs::lookup_at(
         crate::published_rootfs::ROOT_HANDLE,
@@ -39064,25 +38999,6 @@ fn linux_unlinkat(directory: u64, path_address: u64, flags: u64) -> u64 {
     } else {
         LINUX_EIO
     }
-}
-
-fn linux_remove_empty_cgroup_controls(directory: crate::linux_overlay::Handle) -> bool {
-    let generation = crate::linux_overlay::generation(directory);
-    let Some(procs) = linux_cgroup_control_handle(generation, b"cgroup.procs") else {
-        return false;
-    };
-    if crate::linux_overlay::metadata(procs).is_none_or(|metadata| metadata.size != 0) {
-        return false;
-    }
-    for name in [b"cgroup.procs".as_slice(), b"cgroup.events".as_slice()] {
-        let Some(handle) = linux_cgroup_control_handle(generation, name) else {
-            return false;
-        };
-        if !crate::linux_overlay::unlink(handle) {
-            return false;
-        }
-    }
-    true
 }
 
 fn linux_ftruncate(descriptor: u64, length: u64) -> u64 {
@@ -53150,7 +53066,7 @@ fn linux_regular_file(state: u16) -> Option<&'static [u8]> {
         LINUX_FILE_PROC_MODULES => return Some(b""),
         LINUX_FILE_PROC_CONFIG => return Some(&LINUX_PROC_CONFIG_GZ),
         LINUX_FILE_PROC_CMDLINE => return Some(LINUX_PROC_CMDLINE),
-        LINUX_FILE_PROC_CGROUP => return Some(LINUX_PROC_CGROUP),
+        LINUX_FILE_PROC_CGROUP => return Some(linux_proc_cgroup()),
         LINUX_FILE_PROC_COREDUMP_FILTER => return Some(b"00000000\n"),
         LINUX_FILE_PROC_PROCESS_CMDLINE => return Some(LINUX_PROC_PROCESS_CMDLINE),
         LINUX_FILE_PROC_PROCESS_ENVIRON => return Some(LINUX_PROC_PROCESS_ENVIRON),
@@ -53501,6 +53417,7 @@ fn linux_overlay_copy_to_user(
     let Ok(requested) = usize::try_from(count) else {
         return LINUX_EINVAL;
     };
+    linux_cgroup_refresh_control(handle);
     let mut output = [0_u8; PAGE_SIZE];
     let mut total = 0_usize;
     while total < requested {
@@ -53550,6 +53467,9 @@ fn linux_overlay_copy_from_user(
     };
     if requested == 0 {
         return 0;
+    }
+    if let Some(result) = linux_cgroup_user_write(handle, address, requested) {
+        return result;
     }
     if let Some(seals) = crate::linux_overlay::file_seals(handle) {
         if seals & (LINUX_F_SEAL_WRITE | LINUX_F_SEAL_FUTURE_WRITE) != 0 {
@@ -58745,7 +58665,7 @@ fn linux_mount_new(
     if filesystem == b"overlay" {
         return linux_mount_overlayfs(target, source.unwrap_or(b"none"), options, data);
     }
-    if filesystem == b"cgroup2" && !linux_ensure_cgroup_root() {
+    if filesystem == b"cgroup2" && !linux_cgroup_ensure_root() {
         return LINUX_ENOSPC;
     }
     let source = source.unwrap_or(b"none");

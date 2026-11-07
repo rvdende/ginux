@@ -444,6 +444,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ginux-cgroup"
+version = "0.1.0"
+
+[[package]]
 name = "ginux-command"
 version = "0.1.0"
 
@@ -480,6 +484,7 @@ version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "font8x8",
+ "ginux-cgroup",
  "ginux-credentials",
  "ginux-drm",
  "ginux-ext2",

@@ -565,6 +565,9 @@ struct Process {
     oom_score_adj: i16,
     /// The signal whose default action terminated the process, or 0.
     killed_by_signal: u8,
+    /// Chosen by a memory cgroup's OOM killer: dying for its memory, so no
+    /// other process is killed for the same shortage meanwhile.
+    oom_victim: bool,
     /// Its newest seccomp filter (index + 1 in the table's filters), or 0:
     /// inherited across fork, kept across exec.
     seccomp_filter: u32,
@@ -595,9 +598,13 @@ struct Process {
     /// parent reaps it at once, leaving no zombie to wait for. A child that
     /// ended before its parent did so stays a zombie, as in Linux.
     reaped_by_parent: bool,
-    /// The cgroup it was placed in (CLONE_INTO_CGROUP), by the cgroup
-    /// directory's generation, or 0 for the domain's root.
+    /// Its cgroup, by the cgroup directory's generation, or 0 for the
+    /// domain's root: its parent's, unless it was cloned into another
+    /// (CLONE_INTO_CGROUP) or moved (a write to `cgroup.procs`).
     cgroup_generation: u32,
+    /// The memory cgroup its user pages are charged to (`linux_cgroup`),
+    /// that cgroup's; 0 until it is known (the domain's root then).
+    memcg: u16,
     /// The process that cloned this one when that is not its parent
     /// (CLONE_PARENT): the fork transaction that runs it first resumes that
     /// one, not the parent.
@@ -1933,6 +1940,10 @@ impl ProcessTable {
         let seccomp_filter = parent
             .and_then(|parent| self.process(parent))
             .map_or(0, |parent| parent.seccomp_filter);
+        // A child starts in its parent's cgroup.
+        let (cgroup_generation, memcg) = parent
+            .and_then(|parent| self.process(parent))
+            .map_or((0, 0), |parent| (parent.cgroup_generation, parent.memcg));
         let namespaces = match parent.and_then(|parent| self.process_mut(parent)) {
             Some(parent) => parent
                 .child_namespaces
@@ -1988,6 +1999,7 @@ impl ProcessTable {
             stopped_in_call: false,
             oom_score_adj,
             killed_by_signal: 0,
+            oom_victim: false,
             seccomp_filter,
             tracer: 0,
             ptrace_resume_signal: 0,
@@ -1999,7 +2011,8 @@ impl ProcessTable {
             shared,
             exit_signal: DEFAULT_EXIT_SIGNAL,
             reaped_by_parent: false,
-            cgroup_generation: 0,
+            cgroup_generation,
+            memcg,
             cloned_by: None,
             vfork_child: 0,
             waiting: false,
@@ -4731,31 +4744,67 @@ pub(crate) fn live_processes_share_state() -> bool {
 }
 
 /// Places process `pid` in the cgroup of generation `generation` (0: the
-/// root) and gives back the one it was in.
-pub(crate) fn replace_live_process_cgroup(pid: u32, generation: u32) -> Option<u32> {
+/// root), whose memory cgroup is `memcg`, and gives back the one it was in.
+pub(crate) fn replace_live_process_cgroup(pid: u32, generation: u32, memcg: u16) -> Option<u32> {
     let table = live_process_table_mut()?;
     let process = table
         .handle_by_pid(pid)
         .and_then(|handle| table.process_mut(handle))?;
+    process.memcg = memcg;
     Some(core::mem::replace(
         &mut process.cgroup_generation,
         generation,
     ))
 }
 
-/// Whether a running process other than `except` is in the cgroup of
-/// generation `generation`.
-pub(crate) fn live_cgroup_populated(generation: u32, except: u32) -> bool {
+/// Marks process `pid` as an OOM victim (`oom_victim`).
+pub(crate) fn note_live_process_killed(pid: u32) {
+    if let Some(table) = live_process_table_mut() {
+        if let Some(process) = table
+            .handle_by_pid(pid)
+            .and_then(|handle| table.process_mut(handle))
+        {
+            process.oom_victim = true;
+        }
+    }
+}
+
+/// Whether process `pid` is an OOM victim not yet gone.
+pub(crate) fn live_process_killed(pid: u32) -> bool {
     live_process_table_mut().is_some_and(|table| {
-        table.processes.iter().flatten().any(|process| {
-            process.handle.pid != except
-                && process.cgroup_generation == generation
+        table
+            .handle_by_pid(pid)
+            .and_then(|handle| table.process(handle))
+            .is_some_and(|process| {
+                process.oom_victim
+                    && matches!(
+                        process.state,
+                        ProcessState::Running | ProcessState::Stopped { .. }
+                    )
+            })
+    })
+}
+
+/// The memory cgroup process `pid`'s pages are charged to (0: not known).
+pub(crate) fn live_process_memcg(pid: u32) -> Option<u16> {
+    let table = live_process_table_mut()?;
+    Some(table.process(table.handle_by_pid(pid)?)?.memcg)
+}
+
+/// The running or stopped processes charged to memory cgroups for which
+/// `within` holds, with their `oom_score_adj`.
+pub(crate) fn live_memcg_members(within: impl Fn(u16) -> bool) -> impl Iterator<Item = (u32, i32)> {
+    live_process_table_mut()
+        .into_iter()
+        .flat_map(|table| table.processes.iter().flatten())
+        .filter(move |process| {
+            within(process.memcg)
                 && matches!(
                     process.state,
                     ProcessState::Running | ProcessState::Stopped { .. }
                 )
         })
-    })
+        .map(|process| (process.handle.pid, i32::from(process.oom_score_adj)))
 }
 
 /// The signal process `pid`'s end sends its parent (clone's exit signal).
