@@ -112,6 +112,18 @@ pub(crate) fn anonymous_protection(instance: usize, pid: u32, address: u64) -> O
         .map(|area| area.protection)
 }
 
+/// Leaves `length` bytes at `start` of `pid` out of its core dumps, or
+/// puts them back (MADV_DONTDUMP, MADV_DODUMP).
+pub(crate) fn set_dont_dump(instance: usize, pid: u32, start: u64, length: u64, dont_dump: bool) {
+    let start = start & !(PAGE_SIZE - 1);
+    let Some(end) = page_end(start, length) else {
+        return;
+    };
+    update(instance, pid, |areas| {
+        let _ = areas.set_dont_dump(start, end, dont_dump);
+    });
+}
+
 /// Locks or unlocks `length` bytes at `start` of `pid` (mlock, munlock).
 pub(crate) fn lock(instance: usize, pid: u32, start: u64, length: u64, locked: bool) {
     let start = start & !(PAGE_SIZE - 1);
@@ -353,6 +365,7 @@ pub(crate) fn remap(
             grows_down: area.grows_down,
             huge: area.huge,
             huge_reserved: area.huge_reserved,
+            dont_dump: area.dont_dump,
             policy: area.policy,
             backing,
         });

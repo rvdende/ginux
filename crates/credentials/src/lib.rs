@@ -219,6 +219,7 @@ pub mod capability {
     pub const SYS_TIME: u32 = 25;
     pub const SYS_TTY_CONFIG: u32 = 26;
     pub const MKNOD: u32 = 27;
+    pub const LEASE: u32 = 28;
     pub const MAC_OVERRIDE: u32 = 33;
     pub const SYSLOG: u32 = 34;
     pub const PERFMON: u32 = 38;

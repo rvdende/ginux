@@ -331,17 +331,33 @@ Smaller ones: setting the clock is Policy-denied (`clock_settime01..04`,
 reading stale data, guarded-buffer corruption in `chmod01`, `renameat2`
 flags (`EINVAL`), `removexattr` returning `ENODATA` for `ENOENT`,
 `open(O_DIRECTORY)` succeeding on a FIFO (`fcntl07`: LTP's cleanup then
-fails with `ENOTDIR`). TCONF is
-mostly expected: NUMA tests that need two nodes (Ginux has one, node 0,
-as a one-node Linux machine does; the builder links libnuma from Alpine's
-numactl-dev), `ramfs` lacks leases, 32-bit-only syscalls. Some test
-interfaces newer than 6.12, which Linux 6.12 also reports TCONF for:
-pre-content fanotify events (fanotify24, 6.14) and
-`AT_HANDLE_CONNECTABLE` (name_to_handle_at03, 6.13). Others are missing
-from Ginux or the test image: kprobe events (fanotify25), an NFS server's
-`exportfs` (statx07), and the `stx_dio_*` fields in musl's `struct statx`
-(statx10 and statx11, built against musl; the kernel reports
-`STATX_DIOALIGN`).
+fails with `ENOTDIR`). The tests read the kernel's configuration from
+`/proc/config.gz` (`kernel/src/arch/x86_64/cpu/kernel_config`, which lists
+what Ginux implements; `KCONFIG_SKIP_CHECK` is no longer set). The lease
+tests (fcntl24-26, 32, 33) and lseek11 run with their TMPDIR on an ext2
+volume (`disk-tmpdir.sh`), as on a Linux machine whose /tmp is on disk:
+LTP skips them on tmpfs and ramfs. TCONF is mostly expected:
+
+- **As on Linux 6.12 (x86_64, musl):** interfaces newer than 6.12:
+  pre-content fanotify events (fanotify24, 6.14), `AT_HANDLE_CONNECTABLE`
+  (name_to_handle_at03, 6.13), madvise12 (6.13). No `readdir` system call
+  on x86_64 (readdir21); ptrace04 knows no x86_64 registers. ioprio_set01
+  steps a priority of 0 down to -1 (a fresh process's ioprio is
+  IOPRIO_CLASS_NONE, 0, as on Linux). kill13 needs a UBSAN kernel. musl
+  has no `sethostid` (gethostid01), and the image no `<sys/acl.h>`
+  (getxattr05, listxattr04). 32-bit-only syscalls; NUMA tests that need two
+  nodes (Ginux has one, node 0, as a one-node Linux machine does).
+- **Filesystems Ginux does not have:** xfs (getxattr04), btrfs (ioctl08),
+  NFS (statx07, which also needs `exportfs`), RDS sockets (recvmsg03,
+  io_uring04), fs-verity, XFS quotas, kTLS (setsockopt10), netfilter
+  (setsockopt08), swap (madvise06, process_madvise01, swapon04), kprobe
+  events (fanotify25), block integrity (ioctl_getlbmd01).
+- **The test image:** no `parted` (ioctl09); musl's `struct statx` has no
+  `stx_dio_*` fields (statx10, statx11: the kernel reports
+  `STATX_DIOALIGN`).
+- **Ginux's limits:** a process has at most 1024 descriptors, so pipe15
+  (which needs 2051 for 1024 pipes) stops; sendfile09 wants 5 GiB free
+  where the LTP domain has 4 GiB; no TUN/TAP device (ioctl03).
 
 `target/ltp-report.txt` lists every cluster with its tests;
 `tests/ltp/report.py --variant no-oom-protection` does the same for the

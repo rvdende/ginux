@@ -999,6 +999,17 @@ fn linux_syscall_dispatch(
             (first_argument, buffer, count, register(0)),
         ),
         LINUX_MREMAP_SYSCALL => {
+            const MREMAP_DONTUNMAP: u64 = 4;
+            // MREMAP_DONTUNMAP leaves the old mapping where it was.
+            let kept = (runtime_mode && register(0) & MREMAP_DONTUNMAP != 0)
+                .then(|| {
+                    crate::linux_areas::area_at(
+                        linux_execution_instance(),
+                        current_linux_process_pid(),
+                        first_argument,
+                    )
+                })
+                .flatten();
             let moved = linux_mremap(first_argument, buffer, count, register(0), register(2));
             if runtime_mode && moved < 1 << 47 {
                 crate::linux_areas::remap(
@@ -1007,6 +1018,35 @@ fn linux_syscall_dispatch(
                     (first_argument, buffer),
                     (moved, count),
                 );
+                if let Some(area) = kept {
+                    let start = first_argument;
+                    let end = start + buffer.next_multiple_of(PAGE_SIZE as u64);
+                    let offset = start - area.start;
+                    let backing = match area.backing {
+                        crate::linux_areas::Backing::File {
+                            device,
+                            inode,
+                            offset: file_offset,
+                            path,
+                        } => crate::linux_areas::Backing::File {
+                            device,
+                            inode,
+                            offset: file_offset + offset,
+                            path,
+                        },
+                        backing => backing,
+                    };
+                    crate::linux_areas::map(
+                        linux_execution_instance(),
+                        current_linux_process_pid(),
+                        crate::linux_areas::Area {
+                            start,
+                            end,
+                            backing,
+                            ..area
+                        },
+                    );
+                }
             }
             moved
         }
@@ -1215,7 +1255,12 @@ fn linux_syscall_dispatch(
         }
         LINUX_FSYNC_SYSCALL | LINUX_FDATASYNC_SYSCALL => linux_fsync(first_argument),
         LINUX_FADVISE64_SYSCALL => linux_fadvise64(first_argument, buffer, count, register(0)),
-        LINUX_TRUNCATE_SYSCALL => linux_truncate(first_argument, buffer),
+        LINUX_TRUNCATE_SYSCALL => linux_lease_live_return(
+            registers,
+            syscall_return,
+            (number, u64::from(LINUX_AT_FDCWD), first_argument, 1),
+            || linux_truncate(first_argument, buffer),
+        ),
         LINUX_FTRUNCATE_SYSCALL => linux_ftruncate(first_argument, buffer),
         LINUX_FALLOCATE_SYSCALL => linux_fallocate(first_argument, buffer, count, register(0)),
         LINUX_COPY_FILE_RANGE_SYSCALL => linux_copy_file_range(
@@ -1699,10 +1744,18 @@ fn linux_syscall_dispatch(
         LINUX_READLINK_SYSCALL => {
             linux_readlink_at(u64::from(LINUX_AT_FDCWD), first_argument, buffer, count)
         }
-        LINUX_OPEN_SYSCALL => {
-            linux_openat(u64::from(LINUX_AT_FDCWD), first_argument, buffer, count)
-        }
-        LINUX_OPENAT_SYSCALL => linux_openat(first_argument, buffer, count, register(0)),
+        LINUX_OPEN_SYSCALL => linux_lease_live_return(
+            registers,
+            syscall_return,
+            (number, u64::from(LINUX_AT_FDCWD), first_argument, buffer),
+            || linux_openat(u64::from(LINUX_AT_FDCWD), first_argument, buffer, count),
+        ),
+        LINUX_OPENAT_SYSCALL => linux_lease_live_return(
+            registers,
+            syscall_return,
+            (number, first_argument, buffer, count),
+            || linux_openat(first_argument, buffer, count, register(0)),
+        ),
         LINUX_OPENAT2_SYSCALL => linux_openat2(first_argument, buffer, count, register(0)),
         LINUX_NAME_TO_HANDLE_AT_SYSCALL => {
             linux_name_to_handle_at(first_argument, buffer, count, register(0), register(2))
@@ -1741,11 +1794,23 @@ fn linux_syscall_dispatch(
         ),
         LINUX_SECCOMP_SYSCALL => linux_seccomp(first_argument, buffer, count),
         LINUX_RSEQ_SYSCALL => linux_rseq(first_argument, buffer, count, register(0)),
-        LINUX_CREAT_SYSCALL => linux_openat(
-            u64::from(LINUX_AT_FDCWD),
-            first_argument,
-            LINUX_O_CREAT | LINUX_O_TRUNC | 1,
-            buffer,
+        LINUX_CREAT_SYSCALL => linux_lease_live_return(
+            registers,
+            syscall_return,
+            (
+                number,
+                u64::from(LINUX_AT_FDCWD),
+                first_argument,
+                LINUX_O_CREAT | LINUX_O_TRUNC | 1,
+            ),
+            || {
+                linux_openat(
+                    u64::from(LINUX_AT_FDCWD),
+                    first_argument,
+                    LINUX_O_CREAT | LINUX_O_TRUNC | 1,
+                    buffer,
+                )
+            },
         ),
         LINUX_STAT_SYSCALL => {
             linux_newfstatat(u64::from(LINUX_AT_FDCWD), first_argument, buffer, 0)

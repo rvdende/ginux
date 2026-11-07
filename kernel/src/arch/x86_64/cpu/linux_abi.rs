@@ -503,6 +503,9 @@ pub(super) const LINUX_PATH_MAX: usize = 4096;
 pub(super) const LINUX_ESTALE: u64 = u64::MAX - 115;
 /// EFSCORRUPTED: a filesystem's structures are damaged (ext4's lookups).
 pub(super) const LINUX_EUCLEAN: u64 = u64::MAX - 116;
+/// Not an errno: an open or truncate waits for a lease to be broken
+/// (`linux_lease_live_return` retries it; it never reaches the caller).
+pub(super) const LINUX_LEASE_PENDING: u64 = u64::MAX - 700;
 pub(super) const LINUX_ENOKEY: u64 = u64::MAX - 125;
 pub(super) const LINUX_EKEYREVOKED: u64 = u64::MAX - 127;
 pub(super) const LINUX_ENODATA: u64 = u64::MAX - 60;
@@ -611,6 +614,8 @@ pub(super) const LINUX_MADV_POPULATE_READ: u64 = 22;
 pub(super) const LINUX_MADV_POPULATE_WRITE: u64 = 23;
 pub(super) const LINUX_MADV_DONTNEED_LOCKED: u64 = 24;
 pub(super) const LINUX_MADV_SOFT_OFFLINE: u64 = 101;
+/// madvise(MADV_HWPOISON): the pages act as if their memory failed.
+pub(super) const LINUX_MADV_HWPOISON: u64 = 100;
 pub(super) const LINUX_STAT_SIZE: usize = 144;
 pub(super) const LINUX_STAT_CHARACTER_DEVICE_MODE: u32 = 0o020600;
 pub(super) const LINUX_STAT_DIRECTORY_MODE: u32 = 0o040555;

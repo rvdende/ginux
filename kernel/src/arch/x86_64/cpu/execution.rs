@@ -189,6 +189,53 @@ pub(super) fn save_linux_thread_extended_state(pid: u32, thread: usize) -> bool 
     true
 }
 
+/// The size of the XSAVE area the enabled features (x87, SSE, AVX) take,
+/// in the standard format: CPUID.(EAX=0DH, ECX=0):EBX.
+pub(super) fn linux_xstate_size() -> usize {
+    (__cpuid_count(CPUID_EXTENDED_STATE, 0).ebx as usize).min(EXTENDED_STATE_SIZE)
+}
+
+/// The x87, SSE and AVX state of thread `thread` of process `pid` in
+/// XSAVE's standard format, as PTRACE_GETREGSET's NT_X86_XSTATE shows it:
+/// the saved state, or the state a thread starts with when it never saved
+/// one. None when extended state is off or there is no such thread.
+pub(super) fn linux_thread_xstate(pid: u32, thread: usize) -> Option<ExtendedState> {
+    if !CPU_ARCHITECTURE
+        .extended_user_state_enabled
+        .load(Ordering::Acquire)
+    {
+        return None;
+    }
+    let (record, thread) = linux_thread_extended_record(pid, thread)?;
+    if record.extended_state_valid[thread] {
+        return Some(record.extended_states[thread]);
+    }
+    // The initial state: FCW 0x37f, MXCSR 0x1f80, nothing else in use.
+    let mut state = ExtendedState([0; EXTENDED_STATE_SIZE]);
+    state.0[..2].copy_from_slice(&0x37f_u16.to_le_bytes());
+    state.0[24..28].copy_from_slice(&0x1f80_u32.to_le_bytes());
+    state.0[28..32].copy_from_slice(&0xffbf_u32.to_le_bytes());
+    Some(state)
+}
+
+/// Replaces the saved x87, SSE and AVX state of thread `thread` of
+/// process `pid` with `state` (XSAVE's standard format, already checked).
+pub(super) fn set_linux_thread_xstate(pid: u32, thread: usize, state: &[u8]) -> bool {
+    if !CPU_ARCHITECTURE
+        .extended_user_state_enabled
+        .load(Ordering::Acquire)
+    {
+        return false;
+    }
+    let Some((record, thread)) = linux_thread_extended_record(pid, thread) else {
+        return false;
+    };
+    let length = state.len().min(EXTENDED_STATE_SIZE);
+    record.extended_states[thread].0[..length].copy_from_slice(&state[..length]);
+    record.extended_state_valid[thread] = true;
+    true
+}
+
 pub(super) fn restore_linux_thread_extended_state(pid: u32, thread: usize) -> bool {
     if !CPU_ARCHITECTURE
         .extended_user_state_enabled

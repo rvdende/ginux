@@ -310,12 +310,12 @@ fcntl22 fcntl22
 fcntl22_64 fcntl22_64
 fcntl23 fcntl23
 fcntl23_64 fcntl23_64
-fcntl24 fcntl24
-fcntl24_64 fcntl24_64
-fcntl25 fcntl25
-fcntl25_64 fcntl25_64
-fcntl26 fcntl26
-fcntl26_64 fcntl26_64
+fcntl24 /opt/ltp/disk-tmpdir.sh fcntl24  # TMPDIR on an ext2 volume: leases are refused on tmpfs and ramfs
+fcntl24_64 /opt/ltp/disk-tmpdir.sh fcntl24_64  # TMPDIR on an ext2 volume: leases are refused on tmpfs and ramfs
+fcntl25 /opt/ltp/disk-tmpdir.sh fcntl25  # TMPDIR on an ext2 volume: leases are refused on tmpfs and ramfs
+fcntl25_64 /opt/ltp/disk-tmpdir.sh fcntl25_64  # TMPDIR on an ext2 volume: leases are refused on tmpfs and ramfs
+fcntl26 /opt/ltp/disk-tmpdir.sh fcntl26  # TMPDIR on an ext2 volume: leases are refused on tmpfs and ramfs
+fcntl26_64 /opt/ltp/disk-tmpdir.sh fcntl26_64  # TMPDIR on an ext2 volume: leases are refused on tmpfs and ramfs
 fcntl27 fcntl27
 fcntl27_64 fcntl27_64
 fcntl29 fcntl29
@@ -324,10 +324,10 @@ fcntl30 fcntl30
 fcntl30_64 fcntl30_64
 fcntl31 fcntl31
 fcntl31_64 fcntl31_64
-fcntl32 fcntl32
-fcntl32_64 fcntl32_64
-fcntl33 fcntl33
-fcntl33_64 fcntl33_64
+fcntl32 /opt/ltp/disk-tmpdir.sh fcntl32  # TMPDIR on an ext2 volume: leases are refused on tmpfs and ramfs
+fcntl32_64 /opt/ltp/disk-tmpdir.sh fcntl32_64  # TMPDIR on an ext2 volume: leases are refused on tmpfs and ramfs
+fcntl33 /opt/ltp/disk-tmpdir.sh fcntl33  # TMPDIR on an ext2 volume: leases are refused on tmpfs and ramfs
+fcntl33_64 /opt/ltp/disk-tmpdir.sh fcntl33_64  # TMPDIR on an ext2 volume: leases are refused on tmpfs and ramfs
 fcntl34 fcntl34
 fcntl34_64 fcntl34_64
 fcntl35 fcntl35
@@ -675,7 +675,7 @@ lremovexattr01 lremovexattr01
 lseek01 lseek01
 lseek02 lseek02
 lseek07 lseek07
-lseek11 lseek11
+lseek11 /opt/ltp/disk-tmpdir.sh lseek11  # TMPDIR on an ext2 volume: ramfs (the domain's /tmp) has no holes to seek
 lsm_get_self_attr01 lsm_get_self_attr01
 lsm_get_self_attr02 lsm_get_self_attr02
 lsm_get_self_attr03 lsm_get_self_attr03

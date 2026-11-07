@@ -42,11 +42,12 @@ pub(crate) use execution::enable_extended_user_state;
 use execution::{
     clone_linux_process_extended_state, discard_container_extended_state,
     discard_linux_process_extended_state, discard_linux_thread_extended_state,
-    initialize_linux_thread_extended_state, reset_extended_user_state,
-    restore_container_extended_state, restore_linux_process_extended_state,
-    restore_linux_thread_extended_state, save_container_extended_state,
-    save_linux_process_extended_state, save_linux_thread_extended_state,
-    switch_linux_thread_extended_state, ExtendedState, EXTENDED_STATE_SIZE,
+    initialize_linux_thread_extended_state, linux_thread_xstate, linux_xstate_size,
+    reset_extended_user_state, restore_container_extended_state,
+    restore_linux_process_extended_state, restore_linux_thread_extended_state,
+    save_container_extended_state, save_linux_process_extended_state,
+    save_linux_thread_extended_state, set_linux_thread_xstate, switch_linux_thread_extended_state,
+    ExtendedState, EXTENDED_STATE_SIZE,
 };
 use fanotify::*;
 pub(crate) use linux_abi::*;
@@ -7607,6 +7608,8 @@ pub(crate) fn stop_configured_container() {
     crate::linux_exe::forget_instance(X86_RUNTIME.LINUX_EXECUTION_INSTANCE.load(Ordering::SeqCst));
     crate::linux_areas::forget_instance(linux_execution_instance());
     crate::linux_mounts::forget_instance(linux_execution_instance());
+    crate::linux_lease::forget_domain(linux_execution_instance());
+    crate::linux_core::forget_domain(linux_execution_instance());
     crate::linux_tmpfs_quota::forget_instance(linux_execution_instance());
     crate::linux_pidfs::forget_instance(linux_execution_instance());
     crate::linux_fscontext::forget_instance(linux_execution_instance());
@@ -28901,6 +28904,7 @@ fn linux_record_exec_image(
                 grows_down: false,
                 huge: false,
                 huge_reserved: false,
+                dont_dump: false,
                 policy: crate::linux_areas::Policy::DEFAULT,
                 backing: Backing::File {
                     device: 0,
@@ -28931,6 +28935,7 @@ fn linux_record_exec_image(
                 grows_down: false,
                 huge: false,
                 huge_reserved: false,
+                dont_dump: false,
                 policy: crate::linux_areas::Policy::DEFAULT,
                 backing: Backing::Stack,
             },
@@ -28962,6 +28967,7 @@ fn linux_record_heap(program_break: u64) {
                 grows_down: false,
                 huge: false,
                 huge_reserved: false,
+                dont_dump: false,
                 policy: crate::linux_areas::Policy::DEFAULT,
                 backing: Backing::Heap,
             },
@@ -29043,6 +29049,7 @@ fn linux_record_mapping(
             grows_down: flags & LINUX_MAP_GROWSDOWN != 0,
             huge: false,
             huge_reserved: false,
+            dont_dump: false,
             policy: crate::linux_areas::Policy::DEFAULT,
             backing,
         },
@@ -29139,9 +29146,10 @@ fn linux_mremap(
     if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
         return LINUX_ENOSYS;
     }
+    let dont_unmap = flags & MREMAP_DONTUNMAP != 0;
     if flags & !(MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP) != 0
         || flags & MREMAP_FIXED != 0 && flags & MREMAP_MAYMOVE == 0
-        || flags & MREMAP_DONTUNMAP != 0
+        || dont_unmap && flags & MREMAP_MAYMOVE == 0
     {
         return LINUX_EINVAL;
     }
@@ -29151,7 +29159,8 @@ fn linux_mremap(
     let Ok(new_pages) = usize::try_from(new_length.div_ceil(PAGE_SIZE as u64)) else {
         return LINUX_ENOMEM;
     };
-    if new_length == 0 {
+    // MREMAP_DONTUNMAP moves a mapping without resizing it.
+    if new_length == 0 || dont_unmap && new_pages != old_pages {
         return LINUX_EINVAL;
     }
     let fixed = flags & MREMAP_FIXED != 0;
@@ -29183,6 +29192,14 @@ fn linux_mremap(
         .shared
         .then(|| linux_shared_file_page(old_address))
         .flatten();
+    if dont_unmap {
+        return linux_mremap_dont_unmap(
+            (old_address, old_pages),
+            fixed.then_some(fixed_address),
+            &template,
+            shared_file,
+        );
+    }
     if fixed {
         if template.file && new_pages > old_pages {
             return LINUX_ENOMEM;
@@ -29291,6 +29308,84 @@ fn linux_mremap(
         &template,
         shared_file,
     )
+}
+
+/// mremap with MREMAP_DONTUNMAP: the `pages` pages at `old_address` move
+/// to `fixed` (or a place chosen for them), and the old range stays mapped
+/// as it was, without pages: a private anonymous mapping's then fault in
+/// as zeros (or reach a userfaultfd registered there), a shared file
+/// mapping's map the file again. Other mappings (anonymous shared memory,
+/// private file mappings) are not supported here (EINVAL).
+fn linux_mremap_dont_unmap(
+    (old_address, pages): (u64, usize),
+    fixed: Option<u64>,
+    template: &address_space::LinuxRuntimePage,
+    shared_file: Option<(crate::linux_overlay::Handle, usize)>,
+) -> u64 {
+    if template.file && shared_file.is_none() || template.shared && shared_file.is_none() {
+        return LINUX_EINVAL;
+    }
+    let bytes = (pages * PAGE_SIZE) as u64;
+    let destination = match fixed {
+        Some(destination) => {
+            let unmapped = linux_munmap(destination, bytes);
+            if unmapped != 0 {
+                return unmapped;
+            }
+            crate::linux_areas::unmap(
+                linux_execution_instance(),
+                current_linux_process_pid(),
+                destination,
+                bytes,
+            );
+            destination
+        }
+        None => {
+            if !linux_address_space_limit_allows(pages) {
+                return LINUX_ENOMEM;
+            }
+            let Some(destination) = linux_runtime_select_mapping(0, pages, false, false)
+                .filter(|destination| linux_runtime_range_available(*destination, pages))
+            else {
+                return LINUX_ENOMEM;
+            };
+            destination
+        }
+    };
+    let moved = linux_mremap_move(
+        old_address,
+        pages,
+        pages,
+        destination,
+        template,
+        shared_file,
+    );
+    if moved >= LINUX_RETURN_TO_KERNEL {
+        return moved;
+    }
+    for page in 0..pages {
+        let address = old_address + (page * PAGE_SIZE) as u64;
+        let remapped = match shared_file {
+            Some((handle, offset)) => linux_map_shared_file_page(
+                address,
+                handle,
+                offset + page * PAGE_SIZE,
+                template.protection,
+            ),
+            None => {
+                address_space::reserve_current_linux_runtime_page(
+                    address,
+                    template.protection,
+                    false,
+                    false,
+                ) == Some(None)
+            }
+        };
+        if !remapped {
+            return LINUX_ENOMEM;
+        }
+    }
+    destination
 }
 
 /// Moves the first `old_pages` pages at `old_address` to `destination`
@@ -30093,7 +30188,20 @@ fn linux_runtime_madvise(address: u64, length: u64, advice: u64) -> u64 {
                 && (!matches!(advice, LINUX_MADV_MERGEABLE | LINUX_MADV_UNMERGEABLE)
                     || !state.file && !state.shared && !state.secret)
         });
-        return if valid { 0 } else { LINUX_ENOMEM };
+        if !valid {
+            return LINUX_ENOMEM;
+        }
+        // Core dumps leave MADV_DONTDUMP's areas out.
+        if matches!(advice, LINUX_MADV_DONTDUMP | LINUX_MADV_DODUMP) {
+            crate::linux_areas::set_dont_dump(
+                linux_execution_instance(),
+                current_linux_process_pid(),
+                address,
+                length,
+                advice == LINUX_MADV_DONTDUMP,
+            );
+        }
+        return 0;
     }
     let Some((_, pages)) = linux_runtime_mapping_range(address, length) else {
         return LINUX_EINVAL;
@@ -30336,6 +30444,45 @@ fn linux_madvise_reclaim_hint(address: u64, length: u64) -> u64 {
 /// otherwise, as for a caller without CAP_SYS_ADMIN. EFAULT for a page
 /// nothing maps; EBUSY for one that cannot move (memory another process
 /// shares, file cache, System V or secret memory).
+/// madvise(MADV_HWPOISON), Linux's memory-failure injection for testing:
+/// each page's memory is taken away as a failed page's would be, and
+/// touching the page again is SIGBUS. Needs CAP_SYS_ADMIN.
+fn linux_madvise_hwpoison(address: u64, length: u64) -> u64 {
+    if !address.is_multiple_of(PAGE_SIZE as u64) {
+        return LINUX_EINVAL;
+    }
+    let Some(end) = length
+        .checked_next_multiple_of(PAGE_SIZE as u64)
+        .and_then(|length| address.checked_add(length))
+    else {
+        return LINUX_EINVAL;
+    };
+    if !linux_privileged_operation_allowed(linux_user::PrivilegedOperation::ManageKernel)
+        || !linux_has_capability(ginux_credentials::capability::SYS_ADMIN)
+    {
+        return LINUX_EPERM;
+    }
+    for page in (address..end).step_by(PAGE_SIZE) {
+        let state = address_space::current_linux_runtime_page(page);
+        if !state.occupied {
+            return LINUX_EFAULT;
+        }
+        crate::serial_write_bytes(
+            alloc::format!("Injecting memory failure at process virtual address {page:#x}\n")
+                .as_bytes(),
+        );
+        // The page stays in the mapping without memory, as a page past a
+        // mapped file's end does: its next touch is SIGBUS.
+        if !release_linux_runtime_page(address_space::remove_current_linux_runtime_page(page))
+            || address_space::reserve_current_linux_past_eof_page(page, state.protection, false)
+                .is_none()
+        {
+            return LINUX_EFAULT;
+        }
+    }
+    0
+}
+
 fn linux_madvise_soft_offline(address: u64, length: u64) -> u64 {
     if !address.is_multiple_of(PAGE_SIZE as u64) {
         return LINUX_EINVAL;
@@ -31439,6 +31586,9 @@ fn linux_madvise(address: u64, length: u64, advice: u64) -> u64 {
     if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) && advice == LINUX_MADV_SOFT_OFFLINE {
         return linux_madvise_soft_offline(address, length);
     }
+    if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) && advice == LINUX_MADV_HWPOISON {
+        return linux_madvise_hwpoison(address, length);
+    }
     if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) && address >= LINUX_FIXED_LOW_BASE {
         return linux_runtime_madvise(address, length, advice);
     }
@@ -32320,7 +32470,7 @@ fn linux_proc_domainname_write_bytes(device: u16, text: &[u8]) -> Result<usize, 
 }
 
 fn linux_proc_sysctl_write(device: u16, index: usize, address: u64, count: u64) -> u64 {
-    let mut text = [0_u8; 24];
+    let mut text = [0_u8; LINUX_SYSCTL_TEXT_CAPACITY];
     let length = usize::try_from(count).map_or(text.len(), |count| count.min(text.len()));
     if device & 3 & LINUX_DESCRIPTOR_OUTPUT != 0
         && current_linux_credentials().is_some_and(|credentials| credentials.user.effective == 0)
@@ -32340,6 +32490,19 @@ fn linux_proc_sysctl_write_bytes(device: u16, index: usize, text: &[u8]) -> Resu
     }
     if current_linux_credentials().is_none_or(|credentials| credentials.user.effective != 0) {
         return Err(LINUX_EACCES);
+    }
+    // core_pattern is text: up to a newline, as Linux's proc_dostring
+    // takes it.
+    if LINUX_PROC_SYSCTLS[index].1 == b"sys/kernel/core_pattern" {
+        let pattern = text
+            .split(|byte| *byte == b'\n' || *byte == 0)
+            .next()
+            .unwrap_or_default();
+        return if crate::linux_core::set_pattern(linux_execution_instance(), pattern) {
+            Ok(text.len())
+        } else {
+            Err(LINUX_EINVAL)
+        };
     }
     let Some(slot) = current_container_slot() else {
         return Err(LINUX_EIO);
@@ -32492,12 +32655,23 @@ fn linux_net_sysctl_number(index: usize) -> Option<usize> {
     })
 }
 
+/// The longest /proc/sys value text: a core pattern and its newline.
+const LINUX_SYSCTL_TEXT_CAPACITY: usize = crate::linux_core::PATTERN_MAX + 2;
+
 /// The text of the /proc/sys value a descriptor state names, as a read
-/// shows it: the domain's name for kernel/domainname, a number the domain
-/// wrote, else the built-in value; with its length.
-fn linux_proc_sysctl_text(state: u16) -> Option<([u8; LINUX_UTS_NAME_CAPACITY + 1], usize)> {
+/// shows it: the domain's name for kernel/domainname, its core pattern for
+/// kernel/core_pattern, a number the domain wrote, else the built-in
+/// value; with its length.
+fn linux_proc_sysctl_text(state: u16) -> Option<([u8; LINUX_SYSCTL_TEXT_CAPACITY], usize)> {
     let index = linux_proc_sysctl_index(state)?;
-    let mut text = [0_u8; LINUX_UTS_NAME_CAPACITY + 1];
+    let mut text = [0_u8; LINUX_SYSCTL_TEXT_CAPACITY];
+    if LINUX_PROC_SYSCTLS[index].1 == b"sys/kernel/core_pattern" {
+        let pattern = crate::linux_core::pattern(linux_execution_instance());
+        let length = pattern.len().min(LINUX_SYSCTL_TEXT_CAPACITY - 1);
+        text[..length].copy_from_slice(&pattern[..length]);
+        text[length] = b'\n';
+        return Some((text, length + 1));
+    }
     if LINUX_PROC_SYSCTLS[index].1 == b"sys/kernel/domainname" {
         let mut name = [0_u8; LINUX_UTS_NAME_CAPACITY];
         let length = linux_uts_name(LINUX_UTS_DOMAIN, &mut name);
@@ -54165,7 +54339,9 @@ fn linux_regular_file(state: u16) -> Option<&'static [u8]> {
         LINUX_FILE_PROC_CONFIG => return Some(&LINUX_PROC_CONFIG_GZ),
         LINUX_FILE_PROC_CMDLINE => return Some(LINUX_PROC_CMDLINE),
         LINUX_FILE_PROC_CGROUP => return Some(linux_proc_cgroup()),
-        LINUX_FILE_PROC_COREDUMP_FILTER => return Some(b"00000000\n"),
+        // Linux's default filter: anonymous private and shared memory, ELF
+        // headers and private huge pages (only anonymous memory is dumped).
+        LINUX_FILE_PROC_COREDUMP_FILTER => return Some(b"00000033\n"),
         LINUX_FILE_PROC_PROCESS_CMDLINE => return Some(LINUX_PROC_PROCESS_CMDLINE),
         LINUX_FILE_PROC_PROCESS_ENVIRON => return Some(LINUX_PROC_PROCESS_ENVIRON),
         LINUX_FILE_PROC_FILE_MAX => return Some(LINUX_PROC_FILE_MAX),
@@ -54793,31 +54969,228 @@ fn reset_linux_descriptor_flags(descriptor: u64, created: bool) {
 /// reading only (EAGAIN), as a writer anywhere forbids one in Linux. Leases
 /// are kept per descriptor and never broken: no other opener is told.
 fn linux_fcntl_set_lease(descriptor: u64, kind: u64) -> u64 {
+    use crate::linux_lease::Kind;
     const F_RDLCK: u64 = 0;
     const F_WRLCK: u64 = 1;
     const F_UNLCK: u64 = 2;
-    let (read, write) = match u64::from(kind as u32) {
-        F_RDLCK => {
-            if linux_device_descriptor(descriptor) & LINUX_DESCRIPTOR_OUTPUT != 0 {
-                return LINUX_EAGAIN;
-            }
-            (true, false)
-        }
-        F_WRLCK => (false, true),
-        F_UNLCK => (false, false),
+    let kind = match u64::from(kind as u32) {
+        F_RDLCK => Some(Kind::Read),
+        F_WRLCK => Some(Kind::Write),
+        F_UNLCK => None,
         _ => return LINUX_EINVAL,
     };
-    set_linux_descriptor_flag(
-        &X86_RUNTIME.ELF_PROBE_DESCRIPTOR_READ_LEASES,
-        descriptor,
-        read,
+    // Leases are on regular files: an overlay node's or a volume's.
+    let Some(handle) = linux_overlay_descriptor_handle(descriptor) else {
+        return LINUX_EINVAL;
+    };
+    let Some(metadata) = crate::linux_overlay::metadata(handle)
+        .filter(|metadata| metadata.kind == crate::linux_overlay::NodeKind::File)
+    else {
+        return LINUX_EINVAL;
+    };
+    // Only the file's owner may take one, or a holder of CAP_LEASE.
+    if kind.is_some()
+        && current_linux_credentials().is_none_or(|credentials| {
+            credentials.user.filesystem != metadata.owner
+                && !credentials.has(ginux_credentials::capability::LEASE)
+        })
+    {
+        return LINUX_EACCES;
+    }
+    let file = crate::linux_overlay::generation(handle);
+    let pid = current_linux_process_pid();
+    let opens = linux_lease_opens(file, descriptor);
+    match crate::linux_lease::set(
+        linux_execution_instance(),
+        (pid, descriptor as u32, file),
+        kind,
+        opens,
+        |holder, held| linux_lease_holder_valid(holder, held, file),
+    ) {
+        Ok(()) => 0,
+        Err(crate::linux_lease::Error::Conflict) => LINUX_EAGAIN,
+        Err(crate::linux_lease::Error::NoMemory) => LINUX_ENOMEM,
+    }
+}
+
+/// The descriptors of the domain's processes that have overlay node
+/// `file` open (the calling process's from its live table, the others'
+/// from their saved ones): each with its process, number and whether it
+/// writes.
+fn linux_file_descriptors(file: u32, mut visit: impl FnMut(u32, u64, bool)) {
+    let open = |state: u16, generation: u32| {
+        (state & !3 == LINUX_FILE_TMP_SCRATCH && state & 3 != 0 && generation == file)
+            .then_some(state & 2 != 0)
+    };
+    let me = current_linux_process_pid();
+    for index in 0..X86_RUNTIME.ELF_PROBE_STDIO_DEVICE_DESCRIPTORS.len() {
+        if let Some(writes) = open(
+            X86_RUNTIME.ELF_PROBE_STDIO_DEVICE_DESCRIPTORS[index].load(Ordering::SeqCst),
+            X86_RUNTIME.ELF_PROBE_STDIO_TMP_FILE_GENERATIONS[index].load(Ordering::SeqCst),
+        ) {
+            visit(me, index as u64, writes);
+        }
+    }
+    for index in 0..LINUX_DEVICE_DESCRIPTOR_COUNT {
+        if let Some(writes) = X86_RUNTIME
+            .ELF_PROBE_DEVICE_DESCRIPTORS
+            .get(index)
+            .zip(X86_RUNTIME.ELF_PROBE_TMP_FILE_GENERATIONS.get(index))
+            .and_then(|(state, generation)| {
+                open(
+                    state.load(Ordering::SeqCst),
+                    generation.load(Ordering::SeqCst),
+                )
+            })
+        {
+            visit(me, LINUX_AUX_DESCRIPTOR_FIRST + index as u64, writes);
+        }
+    }
+    for pid in (0..linux_process::live_process_slots())
+        .filter_map(linux_process::live_process_pid_at)
+        .filter(|pid| *pid != me)
+    {
+        let Some(state) = linux_process_runtime_state(pid).filter(|state| state.valid) else {
+            continue;
+        };
+        let descriptors = &state.descriptors;
+        for (index, (state, generation)) in descriptors
+            .stdio_devices
+            .iter()
+            .zip(&descriptors.stdio_tmp_generations)
+            .enumerate()
+        {
+            if let Some(writes) = open(*state, *generation) {
+                visit(pid, index as u64, writes);
+            }
+        }
+        for (index, (state, generation)) in descriptors
+            .devices
+            .iter()
+            .zip(&descriptors.tmp_generations)
+            .enumerate()
+        {
+            if let Some(writes) = open(*state, *generation) {
+                visit(pid, LINUX_AUX_DESCRIPTOR_FIRST + index as u64, writes);
+            }
+        }
+    }
+}
+
+/// How the opens of overlay node `file` other than the caller's
+/// `descriptor` stand, for a lease on it.
+fn linux_lease_opens(file: u32, descriptor: u64) -> crate::linux_lease::Opens {
+    let me = current_linux_process_pid();
+    let mut opens = crate::linux_lease::Opens::default();
+    linux_file_descriptors(file, |pid, held, writes| {
+        opens.writers |= writes;
+        opens.others |= pid != me || held != descriptor;
+    });
+    opens
+}
+
+/// Whether descriptor `descriptor` of `pid` still has overlay node `file`
+/// open: a lease it holds lasts as long.
+fn linux_lease_holder_valid(pid: u32, descriptor: u32, file: u32) -> bool {
+    let mut held = false;
+    linux_file_descriptors(file, |holder, number, _| {
+        held |= holder == pid && number == u64::from(descriptor);
+    });
+    held
+}
+
+/// What an open of `path` (from `directory`) with `flags`, or a truncate
+/// (`truncating`), does about leases on the file: None when none is in
+/// the way, else the call's result for now (EWOULDBLOCK for O_NONBLOCK,
+/// or LINUX_LEASE_PENDING to wait and try again). The holders hear SIGIO
+/// as their leases start to break.
+fn linux_lease_break_at(
+    directory: u64,
+    path_address: u64,
+    flags: u64,
+    truncating: bool,
+) -> Option<u64> {
+    const SIGIO: u64 = 29;
+    if !crate::linux_lease::active() {
+        return None;
+    }
+    let mut path = [0_u8; LINUX_PATH_MAX];
+    let length = copy_linux_c_string(path_address, &mut path).ok()?;
+    let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    let length =
+        linux_canonical_path_at(u64::from(directory as u32), &path[..length], &mut canonical)
+            .ok()?;
+    let follow = flags & LINUX_O_NOFOLLOW == 0;
+    let (_, _, metadata) = linux_overlay_lookup_following(&mut canonical, length, follow).ok()?;
+    let file = crate::linux_overlay::generation(metadata?.handle);
+    let write = truncating || flags & 3 != 0 || flags & LINUX_O_TRUNC != 0;
+    let seconds = linux_proc_sysctl_value(b"sys/fs/lease-break-time")
+        .and_then(|value| u64::try_from(value).ok())
+        .unwrap_or(45);
+    let now = linux_elapsed_nanoseconds()?;
+    let mut holders = Vec::new();
+    let breaking = crate::linux_lease::break_for(
+        linux_execution_instance(),
+        (file, current_linux_process_pid(), write),
+        (now, seconds.saturating_mul(NANOSECONDS_PER_SECOND)),
+        |holder, held| linux_lease_holder_valid(holder, held, file),
+        |holder, _| holders.push(holder),
     );
-    set_linux_descriptor_flag(
-        &X86_RUNTIME.ELF_PROBE_DESCRIPTOR_WRITE_LEASES,
-        descriptor,
-        write,
-    );
-    0
+    for holder in holders {
+        let _ = linux_queue_process_signal(holder, SIGIO, LINUX_SI_KERNEL, None);
+    }
+    match breaking {
+        crate::linux_lease::Breaking::Clear => None,
+        crate::linux_lease::Breaking::Wait if flags & LINUX_O_NONBLOCK != 0 && !truncating => {
+            Some(LINUX_EAGAIN)
+        }
+        crate::linux_lease::Breaking::Wait => Some(LINUX_LEASE_PENDING),
+    }
+}
+
+/// An open or truncate that may meet a lease: `call` runs once no lease is
+/// in the way; until then the caller waits as F_SETLKW does, a signal
+/// interrupting it, while the lease holder gives the lease up (or its
+/// break time runs out).
+fn linux_lease_live_return(
+    output: *mut LinuxSyscallFrame,
+    caller: LinuxUserContext,
+    (number, directory, path_address, flags): (u64, u64, u64, u64),
+    call: impl FnOnce() -> u64,
+) -> u64 {
+    let truncating = number == LINUX_TRUNCATE_SYSCALL;
+    loop {
+        match linux_lease_break_at(directory, path_address, flags, truncating) {
+            None => return call(),
+            Some(LINUX_LEASE_PENDING) => {}
+            Some(result) => return result,
+        }
+        if linux_light_thread_here().is_some() {
+            if let (Some(current), Some(deadline)) = (
+                current_linux_thread_handle(),
+                linux_elapsed_nanoseconds().map(|now| now.saturating_add(1_000_000)),
+            ) {
+                let mut restart = caller;
+                restart.rip = caller.rip.wrapping_sub(LINUX_SYSCALL_INSTRUCTION_SIZE);
+                restart.rax = number;
+                if save_linux_thread_return_context(current, restart)
+                    && block_current_linux_thread(LINUX_THREAD_WAIT_RETRY, number, 0, deadline)
+                {
+                    return LINUX_RETURN_TO_KERNEL;
+                }
+            }
+        }
+        match run_other_linux_processes(output, caller, number) {
+            Some(LinuxBlockedWait::Recheck) => {}
+            Some(LinuxBlockedWait::Return(result)) => return result,
+            None => match ready_linux_thread_handle() {
+                Some(target) => {
+                    return linux_retry_after_thread_live_return(output, caller, number, target)
+                }
+                None => linux_wait_for_interrupt(),
+            },
+        }
+    }
 }
 
 /// F_NOTIFY (dnotify) on a directory descriptor: the process is signalled
@@ -54869,14 +55242,21 @@ pub(super) fn linux_send_dnotify_notices() {
     }
 }
 
-/// F_GETLEASE: F_RDLCK, F_WRLCK or F_UNLCK.
+/// F_GETLEASE: F_RDLCK, F_WRLCK or F_UNLCK (what a lease being broken
+/// becomes).
 fn linux_fcntl_get_lease(descriptor: u64) -> u64 {
-    if linux_descriptor_flag(&X86_RUNTIME.ELF_PROBE_DESCRIPTOR_READ_LEASES, descriptor) {
-        0
-    } else if linux_descriptor_flag(&X86_RUNTIME.ELF_PROBE_DESCRIPTOR_WRITE_LEASES, descriptor) {
-        1
-    } else {
-        2
+    let lease = linux_overlay_descriptor_handle(descriptor).and_then(|handle| {
+        crate::linux_lease::get(
+            linux_execution_instance(),
+            current_linux_process_pid(),
+            descriptor as u32,
+            crate::linux_overlay::generation(handle),
+        )
+    });
+    match lease {
+        Some(crate::linux_lease::Kind::Read) => 0,
+        Some(crate::linux_lease::Kind::Write) => 1,
+        None => 2,
     }
 }
 
@@ -57113,41 +57493,98 @@ fn linux_default_resource_limit(resource: u64, runtime: bool) -> Option<[u64; 2]
     Some([value, value])
 }
 
-/// Writes a core file for the current process, ending by a core-dumping
-/// signal, when its RLIMIT_CORE allows: "core" in its working directory
-/// (core_pattern), a minimal ELF core with the process's NT_PRPSINFO note
-/// and no memory segments. Whether one was written, which the wait
-/// status reports (WCOREDUMP, CLD_DUMPED).
-fn linux_write_core_file() -> bool {
+/// Writes a core file for the current process, ending by `signal`, a
+/// core-dumping one, when its RLIMIT_CORE allows: named by the domain's
+/// core_pattern (from its working directory; Linux's "core" unless set),
+/// an ELF core with the process's NT_PRPSINFO note and a PT_LOAD segment
+/// for each area of anonymous memory coredump_filter's default dumps, not
+/// marked MADV_DONTDUMP, with the pages it has (the others read as zeros).
+/// Whether one was written, which the wait status reports (WCOREDUMP,
+/// CLD_DUMPED).
+fn linux_write_core_file(signal: u64) -> bool {
+    use crate::linux_areas::Backing;
     const RLIMIT_CORE: u64 = 4;
     const O_WRONLY: u64 = 1;
     const O_TRUNC: u64 = 0o1000;
     const NOTE_SIZE: usize = 20 + 136;
-    const SIZE: usize = 64 + 56 + NOTE_SIZE;
+    const ELF_HEADER: usize = 64;
+    const PROGRAM_HEADER: usize = 56;
+    const PF_R: u32 = 4;
+    const PF_W: u32 = 2;
+    const PF_X: u32 = 1;
     let limit = linux_resource_limit_values(RLIMIT_CORE, true).map_or(0, |values| values[0]);
-    if limit < SIZE as u64 {
+    let pid = current_linux_process_pid();
+    let instance = linux_execution_instance();
+    // The areas dumped: anonymous memory (the heap and stack too), private
+    // and shared, which the default filter 0x33 names.
+    let segments: Vec<crate::linux_areas::Area> = crate::linux_areas::snapshot(instance, pid)
+        .map(|areas| {
+            areas
+                .iter()
+                .filter(|area| {
+                    !area.dont_dump
+                        && matches!(
+                            area.backing,
+                            Backing::Anonymous
+                                | Backing::Heap
+                                | Backing::Stack
+                                | Backing::Droppable
+                        )
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let headers = 1 + segments.len();
+    let note_offset = ELF_HEADER + headers * PROGRAM_HEADER;
+    let data_offset = (note_offset + NOTE_SIZE).next_multiple_of(PAGE_SIZE);
+    let size = segments
+        .iter()
+        .fold(data_offset as u64, |size, area| size + area.len());
+    if limit < (note_offset + NOTE_SIZE) as u64 {
         return false;
     }
-    let pid = current_linux_process_pid();
-    let mut core = [0_u8; SIZE];
-    // ELF header: 64-bit, little-endian, ET_CORE for x86-64, one program
-    // header (PT_NOTE) right after it.
+    let mut core = Vec::new();
+    if core.try_reserve_exact(note_offset + NOTE_SIZE).is_err() {
+        return false;
+    }
+    core.resize(note_offset + NOTE_SIZE, 0);
+    // ELF header: 64-bit, little-endian, ET_CORE for x86-64, the program
+    // headers (PT_NOTE, then the PT_LOADs) right after it.
     core[..7].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1]);
     core[16..18].copy_from_slice(&4_u16.to_le_bytes());
     core[18..20].copy_from_slice(&62_u16.to_le_bytes());
     core[20..24].copy_from_slice(&1_u32.to_le_bytes());
-    core[32..40].copy_from_slice(&64_u64.to_le_bytes());
-    core[52..54].copy_from_slice(&64_u16.to_le_bytes());
-    core[54..56].copy_from_slice(&56_u16.to_le_bytes());
-    core[56..58].copy_from_slice(&1_u16.to_le_bytes());
-    core[58..60].copy_from_slice(&64_u16.to_le_bytes());
-    let header = 64;
+    core[32..40].copy_from_slice(&(ELF_HEADER as u64).to_le_bytes());
+    core[52..54].copy_from_slice(&(ELF_HEADER as u16).to_le_bytes());
+    core[54..56].copy_from_slice(&(PROGRAM_HEADER as u16).to_le_bytes());
+    core[56..58].copy_from_slice(&(headers as u16).to_le_bytes());
+    let header = ELF_HEADER;
     core[header..header + 4].copy_from_slice(&4_u32.to_le_bytes());
-    core[header + 8..header + 16].copy_from_slice(&120_u64.to_le_bytes());
+    core[header + 8..header + 16].copy_from_slice(&(note_offset as u64).to_le_bytes());
     core[header + 32..header + 40].copy_from_slice(&(NOTE_SIZE as u64).to_le_bytes());
     core[header + 48..header + 56].copy_from_slice(&4_u64.to_le_bytes());
+    let mut offset = data_offset as u64;
+    for (index, area) in segments.iter().enumerate() {
+        let at = ELF_HEADER + (index + 1) * PROGRAM_HEADER;
+        let flags = if area.protection.readable() { PF_R } else { 0 }
+            | if area.protection.writable() { PF_W } else { 0 }
+            | if area.protection.executable() {
+                PF_X
+            } else {
+                0
+            };
+        core[at..at + 4].copy_from_slice(&1_u32.to_le_bytes());
+        core[at + 4..at + 8].copy_from_slice(&flags.to_le_bytes());
+        core[at + 8..at + 16].copy_from_slice(&offset.to_le_bytes());
+        core[at + 16..at + 24].copy_from_slice(&area.start.to_le_bytes());
+        core[at + 32..at + 40].copy_from_slice(&area.len().to_le_bytes());
+        core[at + 40..at + 48].copy_from_slice(&area.len().to_le_bytes());
+        core[at + 48..at + 56].copy_from_slice(&(PAGE_SIZE as u64).to_le_bytes());
+        offset += area.len();
+    }
     // NT_PRPSINFO: name "CORE", then elf_prpsinfo.
-    let note = 120;
+    let note = note_offset;
     core[note..note + 4].copy_from_slice(&5_u32.to_le_bytes());
     core[note + 4..note + 8].copy_from_slice(&136_u32.to_le_bytes());
     core[note + 8..note + 12].copy_from_slice(&3_u32.to_le_bytes());
@@ -57167,20 +57604,74 @@ fn linux_write_core_file() -> bool {
     let length = name.len().min(15);
     core[info + 40..info + 40 + length].copy_from_slice(&name[..length]);
     core[info + 56..info + 56 + length].copy_from_slice(&name[..length]);
+    let (uid, gid) = current_linux_credentials().map_or((0, 0), |credentials| {
+        (credentials.user.real, credentials.group.real)
+    });
+    let mut hostname = [0_u8; LINUX_UTS_NAME_CAPACITY];
+    let hostname_length = linux_uts_name(LINUX_UTS_HOST, &mut hostname);
+    let uses_pid =
+        linux_proc_sysctl_value(b"sys/kernel/core_uses_pid").is_some_and(|value| value != 0);
+    let Some(file_name) = crate::linux_core::file_name(
+        &crate::linux_core::pattern(instance),
+        uses_pid,
+        &crate::linux_core::Process {
+            pid,
+            uid,
+            gid,
+            signal: signal as u32,
+            seconds: linux_realtime_now().0.max(0) as u64,
+            name,
+            hostname: &hostname[..hostname_length],
+        },
+    ) else {
+        return false;
+    };
     let mut path = [0_u8; LINUX_PATH_MAX];
-    path[..4].copy_from_slice(b"core");
+    let Some(target) = path
+        .get_mut(..file_name.len())
+        .filter(|_| !file_name.is_empty())
+    else {
+        return false;
+    };
+    target.copy_from_slice(&file_name);
     let descriptor = linux_openat_path(
         u64::from(LINUX_AT_FDCWD),
         path,
-        4,
-        O_WRONLY | LINUX_O_CREAT | O_TRUNC,
+        file_name.len(),
+        O_WRONLY | LINUX_O_CREAT | O_TRUNC | LINUX_O_NOFOLLOW,
         0o600,
     );
     if descriptor > u64::MAX - 4096 {
         return false;
     }
-    let written = linux_overlay_descriptor_handle(descriptor)
-        .is_some_and(|handle| crate::linux_overlay::write(handle, 0, &core) == Some(SIZE));
+    let Some(handle) = linux_overlay_descriptor_handle(descriptor) else {
+        let _ = linux_descriptor_close(descriptor);
+        return false;
+    };
+    // The headers and note, then each segment's pages as far as
+    // RLIMIT_CORE lets the file grow: a page the process never touched is
+    // a hole, which reads as zeros.
+    let mut written = crate::linux_overlay::write(handle, 0, &core) == Some(core.len());
+    let mut offset = data_offset as u64;
+    let mut page = [0_u8; PAGE_SIZE];
+    for area in &segments {
+        for address in (area.start..area.end).step_by(PAGE_SIZE) {
+            let at = offset + (address - area.start);
+            if !written || at + PAGE_SIZE as u64 > limit {
+                break;
+            }
+            let state = address_space::current_linux_runtime_page(address);
+            if state.frame.is_none() || !copy_from_linux_user(address, &mut page) {
+                continue;
+            }
+            written = crate::linux_overlay::write(handle, at as usize, &page) == Some(PAGE_SIZE);
+        }
+        offset += area.len();
+    }
+    // The file is as long as its segments say, holes and all.
+    if written && size <= limit {
+        let _ = crate::linux_overlay::truncate(handle, size as usize);
+    }
     let _ = linux_descriptor_close(descriptor);
     written
 }
@@ -58150,11 +58641,19 @@ fn linux_sched_getparam(pid: u64, address: u64) -> u64 {
 }
 
 fn linux_sched_rr_get_interval(pid: u64, address: u64) -> u64 {
-    if let Err(error) = linux_scheduler_process(pid) {
-        return error;
-    }
+    const SCHED_FIFO: u8 = 1;
+    let pid = match linux_scheduler_process(pid) {
+        Ok(pid) => pid,
+        Err(error) => return error,
+    };
+    // A SCHED_FIFO task runs until it yields: no time slice, as Linux
+    // reports it; the others' is the 100 ms round-robin slice.
+    let fifo = linux_process::live_process_scheduling(pid)
+        .is_some_and(|(policy, _)| policy & 0x7f == SCHED_FIFO);
     let mut interval = [0_u8; 16];
-    interval[8..].copy_from_slice(&100_000_000_u64.to_ne_bytes());
+    if !fifo {
+        interval[8..].copy_from_slice(&100_000_000_u64.to_ne_bytes());
+    }
     if copy_to_linux_user(address, &interval) {
         0
     } else {

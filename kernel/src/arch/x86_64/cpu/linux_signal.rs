@@ -1487,7 +1487,7 @@ fn linux_terminate_by_signal(signal: u64, may_dump: bool) -> u64 {
         // The signals whose default action dumps core do, when RLIMIT_CORE
         // allows; bit 7 of the recorded signal says one was written.
         let dumps_core = matches!(signal, 3..=8 | 11 | 24 | 25 | 31);
-        let dumped = dumps_core && may_dump && linux_write_core_file();
+        let dumped = dumps_core && may_dump && linux_write_core_file(signal);
         let _ = linux_process::set_live_process_killed_by_signal(
             pid,
             signal.min(127) as u8 | if dumped { 0x80 } else { 0 },
@@ -1937,6 +1937,8 @@ pub(super) fn linux_ptrace(request: u64, pid: u64, address: u64, data: u64) -> u
     const ATTACH: u64 = 16;
     const DETACH: u64 = 17;
     const SEIZE: u64 = 0x4206;
+    const GETREGSET: u64 = 0x4204;
+    const SETREGSET: u64 = 0x4205;
     let caller = current_linux_process_pid();
     let request = u64::from(request as u32);
     if request == TRACEME {
@@ -2008,6 +2010,7 @@ pub(super) fn linux_ptrace(request: u64, pid: u64, address: u64, data: u64) -> u
             linux_process::set_live_process_waiting(pid, false);
             0
         }
+        GETREGSET | SETREGSET => linux_ptrace_regset(pid, request == SETREGSET, address, data),
         PEEKUSER | POKEUSER => {
             /// `struct user`: the end of its general registers, where
             /// `u_debugreg[8]` starts, and its size.
@@ -2047,6 +2050,75 @@ pub(super) fn linux_ptrace(request: u64, pid: u64, address: u64, data: u64) -> u
         }
         _ => LINUX_EIO,
     }
+}
+
+/// PTRACE_GETREGSET and PTRACE_SETREGSET (`set`) of regset `kind` of the
+/// stopped tracee `pid`, through the struct iovec at `iovec`: only
+/// NT_X86_XSTATE so far, its main thread's x87, SSE and AVX state in
+/// XSAVE's standard format with the software-reserved bytes Linux fills
+/// in. A write needs the whole area with a header naming only enabled
+/// features in the standard format (EINVAL otherwise, as Linux's
+/// validate_user_xstate_header has it).
+fn linux_ptrace_regset(pid: u32, set: bool, kind: u64, iovec: u64) -> u64 {
+    const NT_X86_XSTATE: u64 = 0x202;
+    const SOFTWARE_RESERVED: usize = 464;
+    const HEADER: usize = 512;
+    const FP_XSTATE_MAGIC1: u32 = 0x4650_5853;
+    const FP_XSTATE_MAGIC2_SIZE: u32 = 4;
+    const FEATURES: u64 = 7;
+    if kind != NT_X86_XSTATE {
+        return LINUX_EINVAL;
+    }
+    let mut vector = [0_u8; 16];
+    if !copy_from_linux_user(iovec, &mut vector) {
+        return LINUX_EFAULT;
+    }
+    let base = u64::from_ne_bytes(vector[..8].try_into().unwrap());
+    let length = u64::from_ne_bytes(vector[8..].try_into().unwrap());
+    let size = linux_xstate_size();
+    let Some(mut state) = linux_thread_xstate(pid, 0) else {
+        return LINUX_ENODEV;
+    };
+    if set {
+        if length != size as u64 {
+            return LINUX_EFAULT;
+        }
+        let mut given = [0_u8; EXTENDED_STATE_SIZE];
+        if !copy_from_linux_user(base, &mut given[..size]) {
+            return LINUX_EFAULT;
+        }
+        let word = |at: usize| u64::from_le_bytes(given[at..at + 8].try_into().unwrap());
+        let mxcsr = u32::from_le_bytes(given[24..28].try_into().unwrap());
+        if word(HEADER) & !FEATURES != 0
+            || word(HEADER + 8) != 0
+            || given[HEADER + 16..HEADER + 64]
+                .iter()
+                .any(|byte| *byte != 0)
+            || mxcsr & !0xffff != 0
+        {
+            return LINUX_EINVAL;
+        }
+        return if set_linux_thread_xstate(pid, 0, &given[..size]) {
+            0
+        } else {
+            LINUX_ESRCH
+        };
+    }
+    let bytes = &mut state.0;
+    bytes[SOFTWARE_RESERVED..SOFTWARE_RESERVED + 4]
+        .copy_from_slice(&FP_XSTATE_MAGIC1.to_le_bytes());
+    bytes[SOFTWARE_RESERVED + 4..SOFTWARE_RESERVED + 8]
+        .copy_from_slice(&(size as u32 + FP_XSTATE_MAGIC2_SIZE).to_le_bytes());
+    bytes[SOFTWARE_RESERVED + 8..SOFTWARE_RESERVED + 16].copy_from_slice(&FEATURES.to_le_bytes());
+    bytes[SOFTWARE_RESERVED + 16..SOFTWARE_RESERVED + 20]
+        .copy_from_slice(&(size as u32).to_le_bytes());
+    let copied = (length as usize).min(size);
+    if !copy_to_linux_user(base, &bytes[..copied])
+        || !copy_to_linux_user(iovec + 8, &(copied as u64).to_ne_bytes())
+    {
+        return LINUX_EFAULT;
+    }
+    0
 }
 
 pub(super) fn linux_kill_current(

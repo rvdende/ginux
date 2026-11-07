@@ -182,6 +182,8 @@ pub struct Area {
     pub huge_reserved: bool,
     /// Its memory policy (mbind; Linux's `vm_policy`).
     pub policy: Policy,
+    /// Left out of core dumps (madvise MADV_DONTDUMP, Linux's VM_DONTDUMP).
+    pub dont_dump: bool,
     pub backing: Backing,
 }
 
@@ -215,6 +217,7 @@ impl Area {
             huge: self.huge,
             huge_reserved: self.huge_reserved,
             policy: self.policy,
+            dont_dump: self.dont_dump,
             backing: self.backing.advanced(start - self.start),
         }
     }
@@ -230,6 +233,7 @@ impl Area {
             && self.huge == next.huge
             && self.huge_reserved == next.huge_reserved
             && self.policy == next.policy
+            && self.dont_dump == next.dont_dump
             && self.backing.continues_into(self.len(), &next.backing)
     }
 }
@@ -460,6 +464,25 @@ impl Areas {
         Ok(())
     }
 
+    /// Leaves the areas in `[start, end)` out of core dumps, or puts them
+    /// back (MADV_DONTDUMP, MADV_DODUMP).
+    pub fn set_dont_dump(&mut self, start: u64, end: u64, dont_dump: bool) -> Result<(), Error> {
+        valid_range(start, end)?;
+        let pieces = || {
+            self.overlapping(start, end)
+                .map(|area| (area.start.max(start), area.end.min(end)))
+        };
+        let mut changed = Vec::new();
+        changed
+            .try_reserve_exact(pieces().count())
+            .map_err(|_| Error::NoMemory)?;
+        changed.extend(pieces());
+        for (piece_start, piece_end) in changed {
+            self.change(piece_start, piece_end, |area| area.dont_dump = dont_dump)?;
+        }
+        Ok(())
+    }
+
     /// The bytes of huge areas holding a huge page reservation.
     pub fn huge_reserved_bytes(&self) -> u64 {
         self.areas
@@ -609,6 +632,7 @@ mod tests {
             grows_down: false,
             huge: false,
             huge_reserved: false,
+            dont_dump: false,
             policy: Policy::DEFAULT,
             backing: Backing::Anonymous,
         }
@@ -625,6 +649,7 @@ mod tests {
             grows_down: false,
             huge: false,
             huge_reserved: false,
+            dont_dump: false,
             policy: Policy::DEFAULT,
             backing: Backing::File {
                 device: 1,

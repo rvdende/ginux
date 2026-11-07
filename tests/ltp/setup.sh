@@ -81,8 +81,4 @@ export LTP_COLORIZE_OUTPUT=0
 # Tests that loop for a runtime (races, stress) run a tenth of it; the run
 # list's budgets (tools/ltp/make-list.py) assume this.
 export LTP_RUNTIME_MUL=0.1
-# Ginux has no kernel .config (/proc/config.gz); without this, every test
-# that checks a CONFIG_ option stops with "TBROK: Cannot parse kernel
-# .config". LTP's switch treats the options as present, so they run.
-export KCONFIG_SKIP_CHECK=1
 exec /opt/ltp/ltp-runner /opt/ltp/runlist.txt "$first"

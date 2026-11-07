@@ -60,6 +60,10 @@ impl LockRank {
     /// The record (fcntl) lock table; ranks below the heap so the table may
     /// grow while held.
     pub(crate) const RECORD_LOCKS: Self = Self(160);
+    /// File leases (`linux_lease`): a leaf, taken from fcntl and open.
+    pub(crate) const LEASES: Self = Self(161);
+    /// The domains' core patterns (`linux_core`): a leaf.
+    pub(crate) const CORE_PATTERNS: Self = Self(162);
     /// inotify instances, watches and queues; ranks below the heap so the
     /// queues may grow while held.
     pub(crate) const INOTIFY: Self = Self(165);
