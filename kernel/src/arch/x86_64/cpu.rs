@@ -22199,13 +22199,17 @@ fn linux_semctl(id: u64, number: u64, command: u64, argument: u64) -> u64 {
             }
         }
         SETVAL => {
-            if argument > u64::from(crate::linux_sysv_ipc::SEM_VALUE_MAX) {
+            // The value is the union semun's int: Linux reads the low 32
+            // bits of the argument (musl passes the whole union, whose
+            // upper half is whatever the caller's stack held).
+            let value = argument as u32 as i32;
+            if value < 0 || value > i32::from(crate::linux_sysv_ipc::SEM_VALUE_MAX) {
                 return LINUX_ERANGE;
             }
             crate::linux_sysv_ipc::semaphore_set_value(
                 id,
                 number,
-                argument as u16,
+                value as u16,
                 current_linux_process_pid(),
             )
             .map_or_else(linux_sysv_ipc_error, |()| 0)
