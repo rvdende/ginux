@@ -40962,6 +40962,14 @@ fn linux_unix_socket_path(address: u64, length: u64, output: &mut [u8; 108]) -> 
     Ok(path_length)
 }
 
+/// The socket-table slot behind `descriptor` for a call only sockets take
+/// (bind, accept, setsockopt...): none for the table's other objects, such
+/// as a userfaultfd or a pseudo-terminal, which are no sockets (accept03).
+fn linux_socket_call_slot(descriptor: u64) -> Option<crate::linux_socket::SlotId> {
+    linux_socket_slot(descriptor)
+        .filter(|slot| crate::linux_socket::kind(*slot) != Some(crate::linux_socket::Kind::Object))
+}
+
 /// The error for a socket call on `descriptor` that is not a socket: ENOTSOCK
 /// when it is an open descriptor of another kind, EBADF when it is not open.
 /// A socket call's error for a descriptor that is no socket: EBADF when
@@ -40977,7 +40985,7 @@ fn linux_not_socket_error(descriptor: u64) -> u64 {
 }
 
 fn linux_socket_bind(descriptor: u64, address: u64, length: u64) -> u64 {
-    let Some(slot) = linux_socket_slot(descriptor) else {
+    let Some(slot) = linux_socket_call_slot(descriptor) else {
         return linux_not_socket_error(descriptor);
     };
     if crate::linux_socket::kind(slot) == Some(crate::linux_socket::Kind::Netlink) {
@@ -41056,7 +41064,7 @@ fn linux_socket_bind(descriptor: u64, address: u64, length: u64) -> u64 {
 }
 
 fn linux_socket_listen(descriptor: u64, backlog: u64) -> u64 {
-    let Some(slot) = linux_socket_slot(descriptor) else {
+    let Some(slot) = linux_socket_call_slot(descriptor) else {
         return linux_not_socket_error(descriptor);
     };
     // Linux reads the backlog as an unsigned int capped at somaxconn, so a
@@ -41093,7 +41101,7 @@ fn linux_socket_accept(descriptor: u64, address: u64, length: u64, flags: u64) -
         return LINUX_EINVAL;
     }
     // A pipe end is no socket here, though pipes are socket pairs inside.
-    let Some(listener_slot) = linux_socket_slot(descriptor)
+    let Some(listener_slot) = linux_socket_call_slot(descriptor)
         .filter(|_| !linux_pipe_descriptor(u64::from(descriptor as u32)))
     else {
         return linux_not_socket_error(descriptor);
@@ -41180,7 +41188,7 @@ fn linux_socket_accept_live_return(
 }
 
 fn linux_socket_connect(descriptor: u64, address: u64, length: u64) -> u64 {
-    let Some(slot) = linux_socket_slot(descriptor) else {
+    let Some(slot) = linux_socket_call_slot(descriptor) else {
         return linux_not_socket_error(descriptor);
     };
     if crate::linux_socket::kind(slot) == Some(crate::linux_socket::Kind::Unix) {
@@ -41524,7 +41532,7 @@ fn linux_socket_sendmsg(descriptor: u64, message: u64, flags: u64) -> u64 {
     const MSG_OOB: u64 = 1;
     const SUPPORTED_FLAGS: u64 = 0x40 | 0x4000 | LINUX_MSG_MORE;
     let flags = u64::from(flags as u32);
-    let Some(slot) = linux_socket_slot(descriptor) else {
+    let Some(slot) = linux_socket_call_slot(descriptor) else {
         return linux_not_socket_error(descriptor);
     };
     // Only TCP has urgent data, as sendto answers (sendmsg01).
@@ -41866,7 +41874,7 @@ fn linux_socket_recvmsg(
     const SUPPORTED_FLAGS: u64 =
         MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT | MSG_WAITALL | MSG_CMSG_CLOEXEC | MSG_NOSIGNAL;
     let flags = u64::from(flags as u32);
-    let Some(slot) = linux_socket_slot(descriptor) else {
+    let Some(slot) = linux_socket_call_slot(descriptor) else {
         return linux_not_socket_error(descriptor);
     };
     // Linux's order: MSG_CMSG_COMPAT is EINVAL, then the header is read
@@ -42570,7 +42578,7 @@ fn linux_socket_setsockopt(
     let level = u64::from(level as u32);
     let option = u64::from(option as u32);
     let length = u64::from(length as u32);
-    let Some(slot) = linux_socket_slot(descriptor) else {
+    let Some(slot) = linux_socket_call_slot(descriptor) else {
         return linux_not_socket_error(descriptor);
     };
     // SO_OOBINLINE: an int, read and checked as Linux does (a short length
@@ -42718,7 +42726,7 @@ fn linux_socket_getsockopt(
 ) -> u64 {
     let level = u64::from(level as u32);
     let option = u64::from(option as u32);
-    let Some(slot) = linux_socket_slot(descriptor) else {
+    let Some(slot) = linux_socket_call_slot(descriptor) else {
         return linux_not_socket_error(descriptor);
     };
     if level == 1 && option == 17 {
