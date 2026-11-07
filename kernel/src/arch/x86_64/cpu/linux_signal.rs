@@ -2508,9 +2508,7 @@ pub(super) fn linux_deliver_signal_to_blocked_wait(
             Some((address, replaced, remaining))
         }
     } else if wait_kind == LINUX_THREAD_WAIT_SELECT {
-        let descriptor_count = X86_RUNTIME.LINUX_THREAD_WAIT_OUTPUTS[slot].load(Ordering::SeqCst);
-        let snapshot = load_linux_select_snapshot(slot, descriptor_count);
-        let address = snapshot.input.timeout_address;
+        let address = linux_select_timeout_address(slot);
         if address == 0 {
             None
         } else {

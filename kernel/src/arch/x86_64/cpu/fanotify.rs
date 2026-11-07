@@ -160,15 +160,13 @@ pub(super) fn linux_fanotify_init(flags: u64, event_flags: u64) -> u64 {
     {
         return LINUX_EINVAL;
     }
-    let Some(descriptor) = (LINUX_AUX_DESCRIPTOR_FIRST..LINUX_AUX_DESCRIPTOR_LIMIT)
-        .find(|descriptor| linux_aux_descriptor_free(*descriptor))
-    else {
-        return LINUX_EMFILE;
+    let descriptor = match linux_allocate_descriptor(LINUX_AUX_DESCRIPTOR_FIRST) {
+        Ok(descriptor) => descriptor,
+        Err(error) => return error,
     };
-    let index = (descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
-    X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index]
+    linux_fd_cell::<u16>(descriptor, LinuxFdField::Device)
         .store(LINUX_DEVICE_FANOTIFY | 3, Ordering::SeqCst);
-    X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index].store(
+    linux_fd_cell::<u32>(descriptor, LinuxFdField::Flags).store(
         if flags & FAN_NONBLOCK != 0 {
             LINUX_O_NONBLOCK as u32
         } else {
@@ -190,8 +188,8 @@ pub(super) fn linux_fanotify_init(flags: u64, event_flags: u64) -> u64 {
         None => Err(fanotify::Error::NoMemory),
     };
     if let Err(error) = created {
-        X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index].store(0, Ordering::SeqCst);
-        X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index].store(0, Ordering::SeqCst);
+        linux_fd_cell::<u16>(descriptor, LinuxFdField::Device).store(0, Ordering::SeqCst);
+        linux_fd_cell::<u32>(descriptor, LinuxFdField::Flags).store(0, Ordering::SeqCst);
         return match error {
             fanotify::Error::TooMany => LINUX_EMFILE,
             _ => LINUX_ENOMEM,
@@ -1028,17 +1026,8 @@ fn linux_fanotify_open(path: &[u8], flags: u32) -> Result<Option<i32>, u64> {
     let Ok(event_descriptor) = i32::try_from(descriptor) else {
         return Ok(None);
     };
-    let flags = usize::try_from(descriptor)
-        .ok()
-        .and_then(|index| X86_RUNTIME.ELF_PROBE_STDIO_SOCKET_FLAGS.get(index))
-        .or_else(|| {
-            X86_RUNTIME
-                .ELF_PROBE_SOCKET_FLAGS
-                .get(linux_socket_descriptor_index(descriptor)?)
-        });
-    if let Some(flags) = flags {
-        flags.fetch_or(LINUX_PRIVATE_NONOTIFY_DESCRIPTOR, Ordering::SeqCst);
-    }
+    linux_fd_cell::<u32>(descriptor, LinuxFdField::Flags)
+        .fetch_or(LINUX_PRIVATE_NONOTIFY_DESCRIPTOR, Ordering::SeqCst);
     Ok(Some(event_descriptor))
 }
 
@@ -1269,7 +1258,7 @@ pub(super) fn linux_fanotify_release(descriptor: u64) {
     let Some((domain, group)) = linux_fanotify_key(descriptor) else {
         return;
     };
-    if (0..LINUX_DESCRIPTOR_TABLE_LIMIT).any(|candidate| {
+    if linux_descriptor_numbers().any(|candidate| {
         candidate != descriptor
             && linux_fanotify_descriptor(candidate)
             && linux_descriptor_open_file_id(candidate) == Some(group)

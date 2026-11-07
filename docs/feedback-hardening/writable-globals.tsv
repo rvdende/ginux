@@ -464,6 +464,7 @@ interior-mutable	kernel/src/linux_lease.rs	COUNT	process-runtime	allowlist	none	
 interior-mutable	kernel/src/linux_core.rs	PATTERNS	domain-runtime	allowlist	none	ranked-core-pattern-table
 interior-mutable	kernel/src/linux_fd_table.rs	TABLES	process-runtime	allowlist	none	ranked-descriptor-table-overflow
 interior-mutable	kernel/src/linux_fd_table.rs	LIVE	process-runtime	allowlist	none	atomic-descriptor-table-count
+interior-mutable	kernel/src/linux_wait_sets.rs	SETS	process-runtime	allowlist	none	ranked-large-wait-sets
 interior-mutable	kernel/src/linux_loop.rs	LOOPS	domain-runtime	allowlist	none	ranked-loop-devices-and-opens
 interior-mutable	kernel/src/linux_loop.rs	MAKING_NODES	domain-runtime	allowlist	none	atomic-reentrancy-guard
 interior-mutable	kernel/src/linux_ramdisk.rs	RAM_DISKS	domain-runtime	allowlist	none	ranked-ram-disks-and-opens

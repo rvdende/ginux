@@ -99,7 +99,7 @@ pub(super) fn linux_open_pty_slave(index: u64, flags: u64) -> u64 {
         Err(error) => return linux_pty_open_error(error),
     };
     let descriptor = linux_install_pty_descriptor(slot, flags);
-    if descriptor < LINUX_DESCRIPTOR_TABLE_LIMIT
+    if descriptor < LINUX_RETURN_TO_KERNEL
         && flags & LINUX_O_NOCTTY == 0
         && flags & LINUX_O_ACCMODE != 1
     {

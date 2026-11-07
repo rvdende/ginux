@@ -67,6 +67,8 @@ impl LockRank {
     /// The descriptor tables' parts above the fixed table
     /// (`linux_fd_table`): a leaf.
     pub(crate) const DESCRIPTOR_TABLES: Self = Self(163);
+    /// The large poll and select wait sets (`linux_wait_sets`): a leaf.
+    pub(crate) const WAIT_SETS: Self = Self(164);
     /// inotify instances, watches and queues; ranks below the heap so the
     /// queues may grow while held.
     pub(crate) const INOTIFY: Self = Self(165);

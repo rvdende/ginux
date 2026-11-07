@@ -38,6 +38,21 @@ pub(crate) struct Entry {
     pub(crate) close_on_exec: bool,
     /// Its open created the file (F_CREATED_QUERY).
     pub(crate) created: bool,
+    /// An eventfd (1) or timerfd (2), whose open file `offset` names.
+    pub(crate) event: u8,
+    /// An epoll instance (non-zero).
+    pub(crate) epoll: u8,
+    /// The descriptor + 1 owning the epoll instance this one duplicates
+    /// (0: its own).
+    pub(crate) epoll_alias: u32,
+}
+
+impl Entry {
+    /// Whether the entry refers to nothing, so its descriptor is free: a
+    /// change left it so, or set its other fields before what it is.
+    pub(crate) fn vacant(&self) -> bool {
+        self.state == 0 && self.socket == 0 && self.event == 0 && self.epoll == 0
+    }
 }
 
 struct Table {
@@ -127,6 +142,33 @@ pub(crate) fn update(id: u32, descriptor: u64, change: impl FnOnce(&mut Entry)) 
     true
 }
 
+/// Changes descriptor `descriptor` of table `id`, made (empty) first if
+/// absent; one the change leaves vacant goes, unless it was vacant before
+/// (its other fields set before what it is). False without the table.
+pub(crate) fn upsert(id: u32, descriptor: u64, change: impl FnOnce(&mut Entry)) -> bool {
+    let mut tables = TABLES.lock();
+    let Some(table) = tables.table(id) else {
+        return false;
+    };
+    match table.entries.get_mut(&descriptor) {
+        Some(entry) => {
+            let was_vacant = entry.vacant();
+            change(entry);
+            if entry.vacant() && !was_vacant {
+                table.entries.remove(&descriptor);
+            }
+        }
+        None => {
+            let mut entry = Entry::default();
+            change(&mut entry);
+            if entry != Entry::default() {
+                table.entries.insert(descriptor, entry);
+            }
+        }
+    }
+    true
+}
+
 /// Takes descriptor `descriptor` out of table `id`.
 pub(crate) fn remove(id: u32, descriptor: u64) -> Option<Entry> {
     TABLES.lock().table(id)?.entries.remove(&descriptor)
@@ -143,6 +185,7 @@ pub(crate) fn first_free(id: u32, first: u64, limit: u64) -> Option<u64> {
     for descriptor in table
         .entries
         .range(first..)
+        .filter(|(_, entry)| !entry.vacant())
         .map(|(descriptor, _)| *descriptor)
     {
         if descriptor != candidate {
@@ -153,7 +196,7 @@ pub(crate) fn first_free(id: u32, first: u64, limit: u64) -> Option<u64> {
     (candidate < limit).then_some(candidate)
 }
 
-/// The descriptors of table `id`, in order.
+/// The open descriptors of table `id`, in order.
 pub(crate) fn entries(id: u32) -> Vec<(u64, Entry)> {
     let mut tables = TABLES.lock();
     let Some(table) = tables.table(id) else {
@@ -165,6 +208,7 @@ pub(crate) fn entries(id: u32) -> Vec<(u64, Entry)> {
             table
                 .entries
                 .iter()
+                .filter(|(_, entry)| !entry.vacant())
                 .map(|(descriptor, entry)| (*descriptor, *entry)),
         );
     }

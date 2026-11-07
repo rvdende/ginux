@@ -2961,11 +2961,15 @@ fn linux_pipe_fionread_contract(console: u64) -> bool {
         0,
         0,
     );
+    // nfds past the descriptor table is cut to it, as in Linux: these
+    // sets cover the table's 1024 descriptors.
+    let mut wide_select = [0_u64; 16];
+    wide_select[0] = 1_u64 << writer;
     let select_descriptor_limit = linux_syscall6(
         LINUX_SELECT_SYSCALL,
         1025,
         0,
-        multiword_select.as_mut_ptr() as u64,
+        wide_select.as_mut_ptr() as u64,
         0,
         0,
         0,
@@ -3140,7 +3144,8 @@ fn linux_pipe_fionread_contract(console: u64) -> bool {
         && pselected_write == 1_u64 << writer
         && multiword_ready == 1
         && multiword_select == [1_u64 << writer, 0]
-        && select_descriptor_limit == LINUX_EINVAL
+        && select_descriptor_limit == 1
+        && wide_select[0] == 1_u64 << writer
         && select_bad_time == LINUX_EINVAL
         && select_bad_time_address == LINUX_EFAULT
         && pselect_bad_time == LINUX_EINVAL

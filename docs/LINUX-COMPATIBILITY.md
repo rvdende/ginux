@@ -399,8 +399,12 @@ signal-mask pointer and size. The kernel now snapshots their sets into typed
 scheduler waits, wakes them on descriptor changes, expires positive deadlines
 from the APIC timer, writes `select` remaining time, and atomically restores a
 temporary `pselect6` mask on every completion and interruption path. Their
-variable-length descriptor sets cover the first 1,024 descriptors (glibc's
-and musl's `FD_SETSIZE`), including blocked-wait snapshots. Blocking still requires
+variable-length descriptor sets reach as far as the descriptor table does,
+past `FD_SETSIZE` when a caller passes larger sets (`nfds` beyond the table
+is cut to it, as in Linux): up to 1,024 descriptors a blocked wait keeps
+its sets in the thread's snapshot, past that in `kernel/src/linux_wait_sets.rs`,
+as poll keeps more than 64 pollfds (poll takes as many as `RLIMIT_NOFILE`,
+`EINVAL` past it). Blocking still requires
 another runnable thread rather than idling the processor, so both calls remain
 Partial.
 
@@ -454,11 +458,16 @@ with `EMFILE`. A process's first 1024 descriptors live in the fixed table
 its CPU bank holds; those above it, in a sparse table of its own
 (`kernel/src/linux_fd_table.rs`) that holds only the descriptors in use,
 is shared under `CLONE_FILES`, copied at fork, unshare and exec, and
-freed with its last process. Files, pipes and sockets (`SCM_RIGHTS`
-too) go there and dup2, `F_DUPFD`, `close_range`, close-on-exec, `F_GETFL`/
-`F_SETFL` and `/proc/self/fd` reach them; an epoll instance, eventfd or
-timerfd stays below 1024 (`EMFILE` above it), epoll watches only the
-first 1024 descriptors, and poll takes 64 pollfds at a time.
+freed with its last process. Every kind of descriptor goes there once the
+fixed table is full or dup2 and `F_DUPFD` put it there: files, pipes,
+fifos, sockets (`SCM_RIGHTS` too), epoll instances, eventfd, timerfd,
+signalfd, inotify, fanotify, pidfds, memfds, `O_TMPFILE` files,
+userfaultfds, io_uring rings, namespaces and POSIX queues. One accessor
+(`linux_fd_cell`) reaches a descriptor's fields wherever it lives, so the
+system calls, close, close-on-exec, `close_range`, `F_GETFL`/`F_SETFL`,
+the private status marks, epoll watches, select, poll, flock and record
+locks, leases, `/proc/self/fd` and fdinfo treat a descriptor above 1024
+as one below it. A process still keeps at most 1024 epoll watches.
 `RLIMIT_NPROC` makes fork and thread creation fail
 with `EAGAIN`. `RLIMIT_FSIZE` shortens writes at the file-size boundary and
 enforces `EFBIG` plus `SIGXFSZ` for writes and file extensions beyond it across

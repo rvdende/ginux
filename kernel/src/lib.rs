@@ -70,6 +70,7 @@ mod linux_tmpfs;
 mod linux_tmpfs_quota;
 mod linux_user;
 mod linux_userfaultfd;
+mod linux_wait_sets;
 mod machine_control;
 mod manifest;
 mod memory;

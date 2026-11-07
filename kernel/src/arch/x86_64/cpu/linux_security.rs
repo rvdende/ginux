@@ -443,17 +443,7 @@ pub(super) fn linux_landlock_opened(opened: u64, flags: u64) -> u64 {
 }
 
 fn linux_landlock_mark_descriptor(descriptor: u64, mark: u32) {
-    let flags = usize::try_from(descriptor)
-        .ok()
-        .and_then(|index| X86_RUNTIME.ELF_PROBE_STDIO_SOCKET_FLAGS.get(index))
-        .or_else(|| {
-            X86_RUNTIME
-                .ELF_PROBE_SOCKET_FLAGS
-                .get(linux_socket_descriptor_index(descriptor)?)
-        });
-    if let Some(flags) = flags {
-        flags.fetch_or(mark, Ordering::SeqCst);
-    }
+    linux_fd_cell::<u32>(descriptor, LinuxFdField::Flags).fetch_or(mark, Ordering::SeqCst);
 }
 
 fn linux_landlock_marked(descriptor: u64, mark: u32) -> bool {
