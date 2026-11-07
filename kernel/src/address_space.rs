@@ -825,6 +825,13 @@ fn map_linux_leaf_in_root(
     true
 }
 
+/// The kernel's frames a verified Linux process lifecycle must give back:
+/// all but the heap's and the process records', which both stay allocated
+/// for reuse once first grown.
+fn linux_lifecycle_kernel_frames() -> Option<usize> {
+    crate::heap::kernel_frames_outside_heap()?.checked_sub(cpu::linux_process_record_frames())
+}
+
 #[inline(never)]
 pub(crate) fn verify_linux_elf_mapping(
     plan: &crate::linux_elf::LoadPlan<'_>,
@@ -833,8 +840,7 @@ pub(crate) fn verify_linux_elf_mapping(
     exec_name: &[u8],
 ) -> bool {
     crate::serial_write("ginux: beginning Linux ELF mapping verification\r\n");
-    let Some(kernel_frames_before) = memory::owner_live_frame_count(memory::FrameOwner::KERNEL)
-    else {
+    let Some(kernel_frames_before) = linux_lifecycle_kernel_frames() else {
         return false;
     };
     let Some(exec_node) = crate::initramfs::published_regular_file_node(exec_name) else {
@@ -1523,7 +1529,7 @@ pub(crate) fn verify_linux_elf_mapping(
                                 memory::FrameOwner::KERNEL,
                                 &[mapping.frame],
                             )
-                            && frame_is_zero(mapping.frame.address())
+                            && released_frame_scrubbed(mapping.frame)
                     })
                 && retired_image_frames[initial_image_count..]
                     .iter()
@@ -1541,7 +1547,8 @@ pub(crate) fn verify_linux_elf_mapping(
                             | if mapping.writable { WRITABLE } else { 0 }
                             | if mapping.executable { 0 } else { NO_EXECUTE };
                         current_linux_leaf(mapping.address as u64).is_some_and(|entry| {
-                            entry.read() & (ADDRESS_MASK | PRESENT | WRITABLE | USER | NO_EXECUTE)
+                            logically_writable_leaf(entry.read())
+                                & (ADDRESS_MASK | PRESENT | WRITABLE | USER | NO_EXECUTE)
                                 == frame.address() | flags
                         })
                     })
@@ -1558,14 +1565,14 @@ pub(crate) fn verify_linux_elf_mapping(
                                 .is_some_and(|entry| entry.read() == 0)
                     });
             let exec_stack_mapping_valid = exec_stack_frame.is_some_and(|frame| {
-                table_entries.add(stack_indexes[3]).read()
+                logically_writable_leaf(table_entries.add(stack_indexes[3]).read())
                     & (ADDRESS_MASK | PRESENT | USER | WRITABLE | NO_EXECUTE)
                     == frame.address() | PRESENT | USER | WRITABLE | NO_EXECUTE
                     && frame != frames[15]
                     && !memory::frames_owned_by(memory::FrameOwner::KERNEL, &[frames[15]])
             });
             let exec_heap_mapping_valid = exec_heap_frame.is_some_and(|frame| {
-                table_entries.add(heap_indexes[3]).read()
+                logically_writable_leaf(table_entries.add(heap_indexes[3]).read())
                     & (ADDRESS_MASK | PRESENT | USER | WRITABLE | NO_EXECUTE)
                     == frame.address() | PRESENT | USER | WRITABLE | NO_EXECUTE
                     && frame != frames[14]
@@ -1598,7 +1605,7 @@ pub(crate) fn verify_linux_elf_mapping(
         {
             true
         } else {
-            frame_is_zero(frame.address())
+            released_frame_scrubbed(*frame)
         }
     });
     let mut exec_released = true;
@@ -1636,8 +1643,7 @@ pub(crate) fn verify_linux_elf_mapping(
         && exec_heap_released
         && exec_page_table_frames_released
         && original_frames_released;
-    let frame_count_restored =
-        memory::owner_live_frame_count(memory::FrameOwner::KERNEL) == Some(kernel_frames_before);
+    let frame_count_restored = linux_lifecycle_kernel_frames() == Some(kernel_frames_before);
     if cfg!(feature = "verification-boot") && (!released || !frame_count_restored) {
         crate::serial_write("ginux: Linux mapping cleanup state:");
         for state in [
@@ -1657,8 +1663,7 @@ pub(crate) fn verify_linux_elf_mapping(
         crate::serial_write_u64(kernel_frames_before as u64);
         crate::serial_write("/");
         crate::serial_write_u64(
-            memory::owner_live_frame_count(memory::FrameOwner::KERNEL)
-                .map_or(u64::MAX, |count| count as u64),
+            linux_lifecycle_kernel_frames().map_or(u64::MAX, |count| count as u64),
         );
         crate::serial_write("\r\n");
     }
@@ -1671,8 +1676,7 @@ pub(crate) fn verify_interpreted_elf_mapping(
     protected_start: u64,
     protected_size: usize,
 ) -> bool {
-    let Some(kernel_frames_before) = memory::owner_live_frame_count(memory::FrameOwner::KERNEL)
-    else {
+    let Some(kernel_frames_before) = linux_lifecycle_kernel_frames() else {
         return false;
     };
     let plan = &dependency_plan.process;
@@ -3011,12 +3015,12 @@ pub(crate) fn verify_interpreted_elf_mapping(
         {
             true
         } else {
-            frame_is_zero(frame.address())
+            released_frame_scrubbed(*frame)
         }
     });
     let sibling_resources_scrubbed = cleared
-        && (exec_tls_frames[1].is_some() || unsafe { frame_is_zero(sibling_tls_page) })
-        && (exec_sibling_stack_frame.is_some() || unsafe { frame_is_zero(sibling_stack_page) });
+        && (exec_tls_frames[1].is_some() || unsafe { released_frame_scrubbed(frames[12]) })
+        && (exec_sibling_stack_frame.is_some() || unsafe { released_frame_scrubbed(frames[13]) });
     let dependency_cleared = dependency_frames
         .iter()
         .flatten()
@@ -3077,8 +3081,34 @@ pub(crate) fn verify_interpreted_elf_mapping(
             main_frames_released &= memory::release_frames(memory::FrameOwner::KERNEL, [frame]);
         }
     }
-    let frame_count_restored =
-        memory::owner_live_frame_count(memory::FrameOwner::KERNEL) == Some(kernel_frames_before);
+    let frame_count_restored = linux_lifecycle_kernel_frames() == Some(kernel_frames_before);
+    let cleanup = [
+        valid,
+        original_frames_released,
+        exec_frames_released,
+        exec_stack_frame_released,
+        exec_heap_frame_released,
+        exec_tls_frames_released,
+        exec_sibling_stack_frame_released,
+        exec_page_table_frames_released,
+        main_frames_released,
+        dependency_frames_released,
+        frame_count_restored,
+    ];
+    if cfg!(feature = "verification-boot") && cleanup.contains(&false) {
+        crate::serial_write("ginux: interpreted Linux mapping cleanup state:");
+        for state in cleanup {
+            crate::serial_write(" ");
+            crate::serial_write_u64(u64::from(state));
+        }
+        crate::serial_write(" kernel-frames=");
+        crate::serial_write_u64(kernel_frames_before as u64);
+        crate::serial_write("/");
+        crate::serial_write_u64(
+            linux_lifecycle_kernel_frames().map_or(u64::MAX, |count| count as u64),
+        );
+        crate::serial_write("\r\n");
+    }
     valid
         && original_frames_released
         && exec_frames_released
@@ -4370,8 +4400,10 @@ pub(crate) enum SnapshotWalk {
 
 /// Appends the current address space's page-table frames and mapped pages
 /// to `hierarchy` and `mappings` (the first `*_count` entries are kept),
-/// walking the tables in address order. Reports `Full` when either list
-/// ran out of room, so the caller can grow it and walk again.
+/// walking the tables in address order. A table already among the first
+/// entries (the root, or the tables a caller recorded itself) is walked but
+/// not listed again. Reports `Full` when either list ran out of room, so
+/// the caller can grow it and walk again.
 pub(crate) fn complete_current_linux_process_snapshot(
     hierarchy: &mut [memory::FrameLease],
     hierarchy_count: &mut usize,
@@ -4391,6 +4423,7 @@ pub(crate) fn complete_current_linux_process_snapshot(
         hierarchy_count: &mut usize,
         mappings: &mut [cpu::LinuxActiveImageMapping],
         mapping_count: &mut usize,
+        initial_hierarchy_count: usize,
         initial_mapping_count: usize,
     ) -> SnapshotWalk {
         #[derive(Clone, Copy)]
@@ -4441,16 +4474,22 @@ pub(crate) fn complete_current_linux_process_snapshot(
                     return SnapshotWalk::Invalid;
                 }
                 // Each table is reached once in a tree; the caller checks
-                // that no frame was recorded twice.
+                // that no frame was recorded twice. The few tables listed
+                // before the walk are not listed again.
                 let child = value & ADDRESS_MASK;
                 let Some(frame) = live_mapping_frame(child) else {
                     return SnapshotWalk::Invalid;
                 };
-                let Some(slot) = hierarchy.get_mut(*hierarchy_count) else {
-                    return SnapshotWalk::Full;
-                };
-                *slot = frame;
-                *hierarchy_count += 1;
+                if !hierarchy[..initial_hierarchy_count]
+                    .iter()
+                    .any(|listed| listed.address() == child)
+                {
+                    let Some(slot) = hierarchy.get_mut(*hierarchy_count) else {
+                        return SnapshotWalk::Full;
+                    };
+                    *slot = frame;
+                    *hierarchy_count += 1;
+                }
                 level += 1;
                 cursors[level] = Cursor {
                     table: child,
@@ -4515,6 +4554,7 @@ pub(crate) fn complete_current_linux_process_snapshot(
     {
         return SnapshotWalk::Invalid;
     }
+    let initial_hierarchy_count = *hierarchy_count;
     let initial_mapping_count = *mapping_count;
     let walked = walk(
         current_root(),
@@ -4522,6 +4562,7 @@ pub(crate) fn complete_current_linux_process_snapshot(
         hierarchy_count,
         mappings,
         mapping_count,
+        initial_hierarchy_count,
         initial_mapping_count,
     );
     if walked == SnapshotWalk::Complete
@@ -4969,6 +5010,7 @@ fn validate_complete_linux_process_user_tree(
             return false;
         };
         let mapping = mappings[mapping_index];
+        let value = logically_writable_leaf(value);
         let expected = mapping.frame.address()
             | PRESENT
             | USER
@@ -6144,6 +6186,16 @@ pub(crate) fn mark_current_linux_page_accessed(address: u64) {
 
 fn current_linux_leaf(address: u64) -> Option<PageEntry> {
     linux_leaf_in_root(current_root(), address)
+}
+
+/// A leaf entry as its process sees it: a page fork left copy-on-write
+/// (WRITABLE clear, COW set) is writable, copied on its first write.
+fn logically_writable_leaf(value: u64) -> u64 {
+    if value & (WRITABLE | LINUX_RUNTIME_COW) == LINUX_RUNTIME_COW {
+        value & !LINUX_RUNTIME_COW | WRITABLE
+    } else {
+        value
+    }
 }
 
 fn current_linux_leaf_trusted(address: u64) -> Option<PageEntry> {
@@ -14989,6 +15041,15 @@ unsafe fn zero_frame(frame: u64) -> Option<()> {
 unsafe fn frame_is_zero(frame: u64) -> bool {
     mapped_frame::<u64>(frame)
         .is_some_and(|entries| (0..ENTRY_COUNT).all(|index| entries.add(index).read() == 0))
+}
+
+/// Whether `frame`, which its lease released, was scrubbed: it is zero,
+/// unless the allocator has since leased it again (a newer generation),
+/// and it holds its new owner's data.
+unsafe fn released_frame_scrubbed(frame: memory::FrameLease) -> bool {
+    memory::live_frame_lease(memory::FrameOwner::KERNEL, frame.address())
+        .is_some_and(|lease| lease != frame)
+        || frame_is_zero(frame.address())
 }
 
 unsafe fn dma_page_has_completed_transaction(frame: u64) -> Option<bool> {

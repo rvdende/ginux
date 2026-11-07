@@ -211,7 +211,8 @@ ginux_linux_system_init:
     lea r10, [rip + .Lsocket_pair]
     mov eax, 53
     syscall
-    cmp rax, -97
+    # An AF_INET socket exists but makes no pairs (EOPNOTSUPP), as Linux.
+    cmp rax, -95
     jne .Lfailure
     mov edi, 1
     mov esi, 1
@@ -301,7 +302,9 @@ ginux_linux_system_init:
     xor r9d, r9d
     mov eax, 44
     syscall
-    call .Lrequire_einval
+    # MSG_OOB on a Unix stream (Linux without CONFIG_AF_UNIX_OOB).
+    cmp rax, -95
+    jne .Lfailure
     mov edi, dword ptr [rip + .Lsocket_pair + 4]
     lea rsi, [rip + .Lmmsg_output]
     mov edx, 5
@@ -404,7 +407,9 @@ ginux_linux_system_init:
     mov edx, 1
     mov eax, 46
     syscall
-    call .Lrequire_einval
+    # MSG_OOB on a Unix stream (Linux without CONFIG_AF_UNIX_OOB).
+    cmp rax, -95
+    jne .Lfailure
     mov edi, dword ptr [rip + .Lsocket_pair + 4]
     lea rsi, [rip + .Lmmsg_recv]
     mov edx, 1
@@ -1651,11 +1656,12 @@ ginux_linux_system_init:
     mov eax, 49
     syscall
     call .Lrequire_efault
+    # A negative backlog is the largest (somaxconn), as on Linux.
     mov edi, 4
     mov rsi, -1
     mov eax, 50
     syscall
-    call .Lrequire_einval
+    call .Lrequire_zero
     mov edi, 4
     mov esi, 4
     mov eax, 50
@@ -1722,19 +1728,18 @@ ginux_linux_system_init:
     syscall
     test rax, rax
     js .Lfailure
+    # /proc lists ".", "..", cpuinfo first of its files and init's "1" last.
     mov r9, rax
     mov rdi, rax
     lea rsi, [rip + .Lstatus]
-    mov edx, 512
+    mov edx, 1024
     mov eax, 217
     syscall
-    cmp rax, 288
-    jne .Lfailure
+    test rax, rax
+    jle .Lfailure
     cmp dword ptr [rip + .Lstatus + 67], 0x69757063
     jne .Lfailure
-    cmp dword ptr [rip + .Lstatus + 251], 0x6c646d63
-    jne .Lfailure
-    cmp byte ptr [rip + .Lstatus + 283], '1'
+    cmp byte ptr [rsi + rax - 5], '1'
     jne .Lfailure
     mov rdi, r9
     call .Lclose_descriptor
@@ -1859,10 +1864,11 @@ ginux_linux_system_init:
     cmp rax, 13
     jne .Lfailure
 
+    # uid 1 has no mapping in init's namespace: EINVAL before EPERM, as Linux.
     mov edi, 1
     mov eax, 105
     syscall
-    cmp rax, -1
+    cmp rax, -22
     jne .Lfailure
     xor edi, edi
     xor esi, esi
@@ -1901,11 +1907,6 @@ ginux_linux_system_init:
     xor edx, edx
     xor r10d, r10d
     mov eax, 101
-    syscall
-    cmp rax, -1
-    jne .Lfailure
-    mov edi, 0x10000000
-    mov eax, 272
     syscall
     cmp rax, -1
     jne .Lfailure
@@ -2526,13 +2527,13 @@ ginux_linux_system_init:
     mov eax, 144
     syscall
     call .Lrequire_zero
+    # SCHED_FIFO at priority 0 is invalid before it is unpermitted.
     xor edi, edi
     mov esi, 1
     lea rdx, [rip + .Lstatus]
     mov eax, 144
     syscall
-    cmp rax, -1
-    jne .Lfailure
+    call .Lrequire_einval
     xor edi, edi
     mov esi, 4
     lea rdx, [rip + .Lstatus]
@@ -2581,13 +2582,14 @@ ginux_linux_system_init:
     mov eax, 315
     syscall
     call .Lrequire_einval
+    # Any size from version 0's 48 bytes to a page reads as much.
     xor edi, edi
     lea rsi, [rip + .Lsched_attr]
     mov edx, 55
     xor r10d, r10d
     mov eax, 315
     syscall
-    call .Lrequire_einval
+    call .Lrequire_zero
     xor edi, edi
     lea rsi, [rip + .Lsched_attr]
     mov edx, 56
@@ -2649,14 +2651,15 @@ ginux_linux_system_init:
     mov eax, 314
     syscall
     call .Lrequire_einval
+    # SCHED_FIFO at priority 0 is invalid; nice 1 under SCHED_OTHER is
+    # taken (and put back).
     mov dword ptr [rip + .Lsched_attr + 4], 1
     xor edi, edi
     lea rsi, [rip + .Lsched_attr]
     xor edx, edx
     mov eax, 314
     syscall
-    cmp rax, -1
-    jne .Lfailure
+    call .Lrequire_einval
     mov dword ptr [rip + .Lsched_attr + 4], 0
     mov dword ptr [rip + .Lsched_attr + 16], 1
     xor edi, edi
@@ -2664,8 +2667,14 @@ ginux_linux_system_init:
     xor edx, edx
     mov eax, 314
     syscall
-    call .Lrequire_einval
+    call .Lrequire_zero
     mov dword ptr [rip + .Lsched_attr + 16], 0
+    xor edi, edi
+    lea rsi, [rip + .Lsched_attr]
+    xor edx, edx
+    mov eax, 314
+    syscall
+    call .Lrequire_zero
 
     mov dword ptr [rip + .Ltimer_event + 12], 1
     mov edi, 1
@@ -3113,12 +3122,14 @@ ginux_linux_system_init:
     mov r9, rax
     mov rdi, rax
     lea rsi, [rip + .Lstatus]
-    mov edx, 512
+    mov edx, 1024
     mov eax, 217
     syscall
-    cmp rax, 312
-    jne .Lfailure
-    cmp byte ptr [rip + .Lstatus + 307], '2'
+    # The last entry, after the fixed files and init, is the zombie's "2"
+    # (a 24-byte record whose name starts 19 bytes in).
+    test rax, rax
+    jle .Lfailure
+    cmp byte ptr [rsi + rax - 5], '2'
     jne .Lfailure
     mov rdi, r9
     call .Lclose_descriptor
@@ -3136,8 +3147,8 @@ ginux_linux_system_init:
     mov edx, 512
     mov eax, 217
     syscall
-    cmp rax, 168
-    jne .Lfailure
+    test rax, rax
+    jle .Lfailure
     cmp dword ptr [rip + .Lstatus + 67], 0x74617473
     jne .Lfailure
     mov rdi, r9
@@ -3167,13 +3178,15 @@ ginux_linux_system_init:
     mov rdi, r9
     call .Lclose_descriptor
 
+    # __WCLONE waits only for children that signal other than SIGCHLD.
     mov rdi, r12
     xor esi, esi
     mov edx, 0x80000000
     xor r10d, r10d
     mov eax, 61
     syscall
-    call .Lrequire_einval
+    cmp rax, -10
+    jne .Lfailure
 
     mov rdi, r12
     mov esi, 1
@@ -3472,6 +3485,13 @@ ginux_linux_system_init:
 
     mov rdi, r15
     call .Lclose_descriptor
+
+    # Any process may make itself a user namespace (CLONE_NEWUSER), as on
+    # Linux; init does so last, as it has no ids mapped there.
+    mov edi, 0x10000000
+    mov eax, 272
+    syscall
+    call .Lrequire_zero
 
     mov edi, 42
     mov eax, 231
@@ -3778,5 +3798,8 @@ ginux_linux_system_init:
     .ascii "USERNS_READY\n"
 .Lprivilege_marker:
     .ascii "PRIVILEGE_BOUNDARY_READY\n"
+
+# Zero-filled: takes no room in the image.
+.section .bss
 .Lstatus:
-    .space 512
+    .space 1024

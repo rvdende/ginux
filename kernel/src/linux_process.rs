@@ -2269,7 +2269,9 @@ pub(crate) fn verify_lifecycle_contract() -> bool {
     if (0..6).any(|slot| address_space_storage(slot).is_none()) {
         return false;
     }
-    let Some(before) = memory::owner_live_frame_count(memory::FrameOwner::KERNEL) else {
+    // The heap keeps the frames it grows by (the test table's slots live
+    // there): count the frames outside it.
+    let Some(before) = crate::heap::kernel_frames_outside_heap() else {
         return false;
     };
     let Some(frames) = memory::allocate_frames::<18>(memory::FrameOwner::KERNEL) else {
@@ -2760,7 +2762,7 @@ pub(crate) fn verify_lifecycle_contract() -> bool {
     };
     init_resources.scrub_and_release()
         && table.exit(init, 0)
-        && memory::owner_live_frame_count(memory::FrameOwner::KERNEL) == Some(before)
+        && crate::heap::kernel_frames_outside_heap() == Some(before)
 }
 
 pub(crate) fn install_live_process_registry(

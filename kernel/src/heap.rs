@@ -15,6 +15,7 @@
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::arch::x86_64::paging;
 use crate::memory::{self, FrameOwner};
@@ -32,6 +33,17 @@ struct FreeLists([usize; CLASS_SIZES.len()]);
 
 struct KernelHeap {
     free: IrqSpinLock<FreeLists>,
+}
+
+/// Frames the heap holds: its slabs (kept once carved) and the frame runs of
+/// live large allocations.
+static HEAP_FRAMES: AtomicUsize = AtomicUsize::new(0);
+
+/// The kernel's frames outside the heap. Checks that a lifecycle gives back
+/// what it took compare this: the heap keeps the frames it grew by.
+pub(crate) fn kernel_frames_outside_heap() -> Option<usize> {
+    memory::owner_live_frame_count(FrameOwner::KERNEL)?
+        .checked_sub(HEAP_FRAMES.load(Ordering::Acquire))
 }
 
 #[global_allocator]
@@ -80,6 +92,7 @@ impl KernelHeap {
 /// list and returns its head.
 fn new_slab(size: usize) -> Option<usize> {
     let [frame] = memory::allocate_frames::<1>(FrameOwner::KERNEL)?;
+    HEAP_FRAMES.fetch_add(1, Ordering::AcqRel);
     let base = frame.direct_map_address()?;
     for offset in (0..PAGE_SIZE).step_by(size) {
         let next = if offset + size < PAGE_SIZE {
@@ -106,6 +119,7 @@ fn allocate_pages(layout: Layout) -> *mut u8 {
     let count = page_count(layout);
     memory::allocate_contiguous_extent(FrameOwner::KERNEL, count)
         .and_then(|(first, count)| {
+            HEAP_FRAMES.fetch_add(count, Ordering::AcqRel);
             paging::direct_map_range_address(first.address(), count * PAGE_SIZE)
         })
         .map_or(ptr::null_mut(), |address| address as *mut u8)
@@ -124,6 +138,7 @@ fn free_pages(pointer: *mut u8, layout: Layout) {
     if !released {
         crate::kernel_fail("ginux: kernel heap free of frames it never allocated\r\n");
     }
+    HEAP_FRAMES.fetch_sub(page_count(layout), Ordering::AcqRel);
 }
 
 // SAFETY: slab objects are distinct, aligned to their class size (which

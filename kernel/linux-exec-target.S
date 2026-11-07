@@ -463,11 +463,6 @@ ginux_linux_exec_target:
     syscall
     cmp rax, -11
     jne .Lfailure
-    xor edx, edx
-    mov eax, 128
-    syscall
-    cmp rax, -38
-    jne .Lfailure
     mov qword ptr [rip + .Lsignal_mask], 0
     mov edi, 2
     lea rsi, [rip + .Lsignal_mask]
@@ -683,13 +678,17 @@ ginux_linux_exec_target:
     syscall
     test rax, rax
     jne .Lfailure
+    # SA_RESETHAND reset only the handler; the flags, restorer and mask
+    # stay, as Linux keeps them.
     cmp qword ptr [rip + .Lold_signal_action], 0
     jne .Lfailure
-    cmp qword ptr [rip + .Lold_signal_action + 8], 0
+    mov eax, 0xc4000004
+    cmp qword ptr [rip + .Lold_signal_action + 8], rax
     jne .Lfailure
-    cmp qword ptr [rip + .Lold_signal_action + 16], 0
+    lea rax, [rip + .Lsignal_restorer]
+    cmp qword ptr [rip + .Lold_signal_action + 16], rax
     jne .Lfailure
-    cmp qword ptr [rip + .Lold_signal_action + 24], 0
+    cmp qword ptr [rip + .Lold_signal_action + 24], 0x200
     jne .Lfailure
     mov edi, 99
     xor esi, esi

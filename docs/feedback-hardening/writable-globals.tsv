@@ -512,6 +512,7 @@ interior-mutable	kernel/src/drivers/virtio_gpu.rs	SCANOUT	platform-device	allowl
 interior-mutable	kernel/src/framebuffer.rs	BUSY	platform-device	allowlist	none	framebuffer-console-reentrancy-latch
 interior-mutable	kernel/src/framebuffer.rs	OWNED	platform-device	allowlist	none	framebuffer-domain-ownership-flag
 interior-mutable	kernel/src/framebuffer.rs	READY	platform-device	allowlist	none	framebuffer-publication-flag
+interior-mutable	kernel/src/heap.rs	HEAP_FRAMES	platform-device	allowlist	none	heap-frame-accounting-counter
 interior-mutable	kernel/src/lib.rs	SERIAL_PRESENT	platform-device	allowlist	none	immutable-after-boot-serial-presence
 interior-mutable	kernel/src/linux_input.rs	BUSY	platform-device	allowlist	none	evdev-queue-reentrancy-latch
 interior-mutable	kernel/src/linux_process.rs	PROCESS_SCRATCH	process-runtime	allowlist	none	explicit-process-fork-scratch-owner-root

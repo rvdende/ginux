@@ -5009,7 +5009,16 @@ pub(crate) fn execute_cross_cpu_runtime_operation(operation: u64) -> bool {
             false,
         )
         .is_ok_and(|queued| queued),
-        CROSS_CPU_RUNTIME_FUTEX_WAKE => wake_linux_futex(CROSS_CPU_RUNTIME_KEY, 1) == 1,
+        // The waiter is a thread of the process the boot CPU runs: this
+        // CPU wakes it from that process's bank (the operation's argument),
+        // as a light thread of the process would.
+        CROSS_CPU_RUNTIME_FUTEX_WAKE => {
+            let bank = &LINUX_CPU_BANK[linux_bank_cpu()][linux_execution_instance()];
+            let previous = bank.swap((operation >> 8) as u8, Ordering::AcqRel);
+            let woken = wake_linux_futex(CROSS_CPU_RUNTIME_KEY, 1) == 1;
+            bank.store(previous, Ordering::Release);
+            woken
+        }
         CROSS_CPU_RUNTIME_SOCKET_SEND => {
             crate::linux_socket::send(slot, b"socket-smp", None) == Ok(10)
         }
@@ -5062,13 +5071,14 @@ pub(crate) fn verify_cross_cpu_linux_runtime_mechanisms() -> bool {
     X86_RUNTIME.LINUX_THREAD_WAIT_KINDS[futex_slot]
         .store(LINUX_THREAD_WAIT_FUTEX, Ordering::Release);
     X86_RUNTIME.LINUX_THREAD_STATES[futex_slot].store(LINUX_THREAD_BLOCKED, Ordering::Release);
-    let futex_woke =
-        crate::arch::x86_64::smp::execute_runtime_operation(cpu, CROSS_CPU_RUNTIME_FUTEX_WAKE)
-            && X86_RUNTIME.LINUX_THREAD_STATES[futex_slot].load(Ordering::Acquire)
-                == LINUX_THREAD_READY
-            && X86_RUNTIME.LINUX_THREAD_WAIT_KINDS[futex_slot].load(Ordering::Acquire)
-                == LINUX_THREAD_WAIT_NONE
-            && X86_RUNTIME.LINUX_THREAD_WAIT_KEYS[futex_slot].load(Ordering::Acquire) == 0;
+    let futex_woke = crate::arch::x86_64::smp::execute_runtime_operation(
+        cpu,
+        CROSS_CPU_RUNTIME_FUTEX_WAKE | (linux_cpu_bank() as u64) << 8,
+    ) && X86_RUNTIME.LINUX_THREAD_STATES[futex_slot].load(Ordering::Acquire)
+        == LINUX_THREAD_READY
+        && X86_RUNTIME.LINUX_THREAD_WAIT_KINDS[futex_slot].load(Ordering::Acquire)
+            == LINUX_THREAD_WAIT_NONE
+        && X86_RUNTIME.LINUX_THREAD_WAIT_KEYS[futex_slot].load(Ordering::Acquire) == 0;
     X86_RUNTIME.LINUX_THREAD_STATES[futex_slot].store(0, Ordering::Release);
     X86_RUNTIME.LINUX_THREAD_WAIT_KINDS[futex_slot]
         .store(LINUX_THREAD_WAIT_NONE, Ordering::Release);
@@ -6516,6 +6526,17 @@ fn install_live_linux_process_registry(entry: usize, stack: usize, fs_base: u64)
 }
 
 fn sync_live_linux_process_address_space(pid: u32) -> bool {
+    // The registry holds what the process mapped at its last snapshot; a
+    // page mapped since (an interpreted program's image, mapped after the
+    // registry was installed at the interpreter's entry) is read from the
+    // live tables of the running process.
+    let lookup = |address: usize| {
+        linux_process::live_process_mapping(pid, address).or_else(|| {
+            (pid == current_linux_process_pid())
+                .then(|| address_space::current_linux_active_mapping(address as u64))
+                .flatten()
+        })
+    };
     for index in 0..X86_RUNTIME.ELF_PROBE_PAGE_TABLE_FRAMES.len() {
         let Some(frame) = linux_process::live_process_hierarchy_frame(pid, index) else {
             if index < 5 {
@@ -6538,7 +6559,7 @@ fn sync_live_linux_process_address_space(pid: u32) -> bool {
     for index in 0..active_count {
         let address =
             X86_RUNTIME.ELF_PROBE_ACTIVE_IMAGE_ADDRESSES[index].load(Ordering::SeqCst) as usize;
-        let Some(mapping) = linux_process::live_process_mapping(pid, address) else {
+        let Some(mapping) = lookup(address) else {
             serial_write("ginux: process address-space sync missing image mapping ");
             serial_write_u64(index as u64);
             serial_write("\r\n");
@@ -6562,7 +6583,7 @@ fn sync_live_linux_process_address_space(pid: u32) -> bool {
         if address == 0 {
             continue;
         }
-        let Some(mapping) = linux_process::live_process_mapping(pid, address) else {
+        let Some(mapping) = lookup(address) else {
             serial_write("ginux: process address-space sync missing exec mapping ");
             serial_write_u64(index as u64);
             serial_write("\r\n");
@@ -6581,10 +6602,7 @@ fn sync_live_linux_process_address_space(pid: u32) -> bool {
         } else {
             PAGE_SIZE
         };
-    let (Some(stack), Some(heap)) = (
-        linux_process::live_process_mapping(pid, stack_address),
-        linux_process::live_process_mapping(pid, heap_address),
-    ) else {
+    let (Some(stack), Some(heap)) = (lookup(stack_address), lookup(heap_address)) else {
         serial_write("ginux: process address-space sync missing stack or heap mapping\r\n");
         return false;
     };
@@ -19204,6 +19222,20 @@ fn release_linux_process_runtime_slot(pid: u32) -> bool {
     released
 }
 
+/// The frames held by the process records allocated so far, every domain
+/// instance's: those of the kept slots stay for the next process.
+pub(crate) fn linux_process_record_frames() -> usize {
+    // SAFETY: as in linux_process_record; only the entries are read.
+    let tables = unsafe { &*X86_MUTABLE_RUNTIME.process_records.get() };
+    let pages = size_of::<LinuxProcessRecord>().div_ceil(PAGE_SIZE);
+    tables
+        .iter()
+        .flatten()
+        .filter(|entry| !entry.record.is_null())
+        .count()
+        * pages
+}
+
 /// The records already allocated for the current domain instance.
 fn allocated_linux_process_records() -> impl Iterator<Item = &'static mut LinuxProcessRecord> {
     let instance = current_container_slot().unwrap_or(control_abi::DOMAIN_LIMIT);
@@ -23769,8 +23801,18 @@ fn verify_linux_process_priorities() -> bool {
             UPPER_REGISTER_BITS | 0xffff_fffe,
             0,
         ) == LINUX_ESRCH;
+    // setpriority sets the calling thread's nice as well as the process's:
+    // put both back.
+    let thread_restored = linux_setpriority(
+        LINUX_PRIO_PROCESS.into(),
+        0,
+        u64::from((i32::from(saved) - 20) as u32),
+    ) == 0
+        && linux_getpriority(LINUX_PRIO_PROCESS.into(), 0) == initial;
     X86_RUNTIME.ELF_PROBE_NICE.store(saved, Ordering::SeqCst);
-    signed_and_clamped && X86_RUNTIME.ELF_PROBE_NICE.load(Ordering::SeqCst) == saved
+    signed_and_clamped
+        && thread_restored
+        && X86_RUNTIME.ELF_PROBE_NICE.load(Ordering::SeqCst) == saved
 }
 
 fn verify_linux_modify_ldt_syscall() -> bool {
@@ -23972,9 +24014,8 @@ fn verify_linux_personality_syscall() -> bool {
     let uname26 = set
         && copy_from_linux_user(mapping, &mut name)
         && name[130..].starts_with(b"2.6.52.0-ginux.0.1\0")
-        && linux_personality(1) == LINUX_EINVAL
-        && linux_personality(u64::from(LINUX_PERSONALITY_QUERY))
-            == u64::from(LINUX_PERSONALITY_UNAME26);
+        && linux_personality(1) == u64::from(LINUX_PERSONALITY_UNAME26)
+        && linux_personality(u64::from(LINUX_PERSONALITY_QUERY)) == 1;
     X86_RUNTIME
         .ELF_PROBE_PERSONALITY
         .store(saved, Ordering::SeqCst);
@@ -24009,9 +24050,9 @@ fn verify_linux_scheduler_queries() -> bool {
             let mut value = [0_u8; 4];
             copy_from_linux_user(mapping, &mut value) && u32::from_ne_bytes(value) == 0
         }
-        && linux_sched_getparam(0, 0) == LINUX_EFAULT
+        && linux_sched_getparam(0, 0) == LINUX_EINVAL
         && linux_sched_getparam(u64::MAX, mapping) == LINUX_EINVAL
-        && linux_sched_getparam(2, 0) == LINUX_ESRCH
+        && linux_sched_getparam(2, 0) == LINUX_EINVAL
         && linux_sched_getparam(2, 1) == LINUX_ESRCH
         && linux_sched_getparam(current, 1) == LINUX_EFAULT;
     let setters = parameter
@@ -24022,7 +24063,7 @@ fn verify_linux_scheduler_queries() -> bool {
         && linux_set_scheduler(2, 0, mapping) == LINUX_ESRCH
         && linux_set_scheduler(u64::MAX, 0, mapping) == LINUX_EINVAL
         && linux_set_scheduler(0, 4, mapping) == LINUX_EINVAL
-        && linux_set_scheduler(0, 1, mapping) == LINUX_EPERM
+        && linux_set_scheduler(0, 1, mapping) == LINUX_EINVAL
         && linux_set_scheduler(0, 0, 1) == LINUX_EFAULT
         && copy_to_linux_user(mapping, &1_u32.to_ne_bytes())
         && linux_set_scheduler(0, 0, mapping) == LINUX_EINVAL;
@@ -24208,9 +24249,11 @@ fn verify_linux_resource_accounting() -> bool {
         && elapsed < LINUX_RETURN_TO_KERNEL
         && {
             let mut accounting = [0_u8; 32];
+            // The process's system time includes kernel work charged to
+            // it; it has no children, so theirs is zero.
             copy_from_linux_user(mapping + 160, &mut accounting)
                 && u64::from_ne_bytes(accounting[..8].try_into().unwrap()) <= elapsed
-                && accounting[8..] == [0; 24]
+                && accounting[16..] == [0; 16]
         }
         && linux_times(0) >= elapsed
         && linux_times(1) == LINUX_EFAULT;
@@ -25749,7 +25792,7 @@ fn verify_linux_keyring_syscalls() -> bool {
             ginux_keyrings::PAYLOAD_LIMIT as u64 + 1,
             (-2_i64) as u64,
         ) == LINUX_EINVAL
-        && linux_request_key(mapping, mapping + 64, 0, 0) == LINUX_ENOKEY;
+        && linux_request_key(mapping, mapping + 64, 0, 0) == LINUX_EKEYREVOKED;
     let cleared = crate::linux_keyring::teardown();
     let unmapped = linux_runtime_munmap(mapping, PAGE_SIZE as u64) == 0;
     rejected && cleared && unmapped
@@ -26490,7 +26533,7 @@ fn verify_linux_posix_message_queue_syscalls() -> bool {
     {
         return false;
     }
-    let name = b"/ginux-abi\0";
+    let name = b"ginux-abi\0";
     let mut attr = [0_u8; 64];
     attr[8..16].copy_from_slice(&4_u64.to_ne_bytes());
     attr[16..24].copy_from_slice(&32_u64.to_ne_bytes());
@@ -26714,8 +26757,6 @@ fn verify_linux_process_madvise_syscall() -> bool {
             LINUX_MADV_RANDOM,
             LINUX_MADV_SEQUENTIAL,
             LINUX_MADV_WILLNEED,
-            LINUX_MADV_MERGEABLE,
-            LINUX_MADV_UNMERGEABLE,
             LINUX_MADV_HUGEPAGE,
             LINUX_MADV_NOHUGEPAGE,
             LINUX_MADV_DONTDUMP,
@@ -26723,6 +26764,9 @@ fn verify_linux_process_madvise_syscall() -> bool {
         ]
         .into_iter()
         .all(|advice| linux_madvise(first, PAGE_SIZE as u64, advice) == 0)
+        && [LINUX_MADV_MERGEABLE, LINUX_MADV_UNMERGEABLE]
+            .into_iter()
+            .all(|advice| linux_madvise(first, PAGE_SIZE as u64, advice) == LINUX_EINVAL)
         && linux_madvise(first, PAGE_SIZE as u64, 1_u64 << 32) == 0
         && linux_madvise(first, PAGE_SIZE as u64, u64::from(u32::MAX)) == LINUX_EINVAL;
     let inheritance = hints
@@ -27181,7 +27225,7 @@ fn verify_linux_signal_argument_widths() -> bool {
             core::ptr::null_mut(),
             interrupted,
             (0, 0),
-        ) == LINUX_EPERM
+        ) == 0
         && linux_pidfd_send_signal(pidfd, 0, 1, 0, core::ptr::null_mut(), interrupted, (0, 0))
             == LINUX_EFAULT;
     let pidfd_valid = valid
@@ -57454,7 +57498,9 @@ fn linux_memory_lock(address: u64, length: u64, flags: u64, lock: bool) -> u64 {
     let pid = current_linux_process_pid();
     let mapped = crate::linux_areas::snapshot(linux_execution_instance(), pid)
         .is_some_and(|areas| areas.covers(start, end))
-        || address_space::current_linux_range_mapped(address, length, false);
+        || (start..end)
+            .step_by(PAGE_SIZE)
+            .all(|page| address_space::current_linux_runtime_page(page).occupied);
     if !mapped {
         return LINUX_ENOMEM;
     }

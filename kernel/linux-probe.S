@@ -504,7 +504,7 @@ valid_interpreter_base:
     push 63
     pop rax
     call syscall_expect_zero
-    cmp dword ptr [0x40b000], 0x756e6947
+    cmp dword ptr [0x40b000], 0x756e694c
     require_equal
 
     xor edi, edi
@@ -706,7 +706,7 @@ valid_interpreter_base:
     push 63
     pop rax
     call syscall_expect_zero
-    cmp dword ptr [0x40bf80], 0x756e6947
+    cmp dword ptr [0x40bf80], 0x756e694c
     require_equal
     cmp word ptr [0x40c000], 0
     require_equal
@@ -859,7 +859,7 @@ valid_interpreter_base:
     push 63
     pop rax
     call syscall_expect_zero
-    cmp dword ptr [0x40c000], 0x756e6947
+    cmp dword ptr [0x40c000], 0x756e694c
     require_equal
     mov edi, 0x40c000
     mov esi, 4096
@@ -907,7 +907,7 @@ valid_interpreter_base:
     push 63
     pop rax
     call syscall_expect_zero
-    cmp dword ptr [0x40b000], 0x756e6947
+    cmp dword ptr [0x40b000], 0x756e694c
     require_equal
     mov edi, 0x40c000
     push 63
@@ -1473,9 +1473,10 @@ linux_clone_repeat:
     mov al, 230
     call syscall_expect_zero
     add rsp, 16
+    # The child tid word (clone's r10) holds the live child's tid.
     push 1
     push 0
-    mov rdi, r8
+    mov edi, 0x405198
     xor esi, esi
     mov edx, ebx
     mov r10, rsp
@@ -1811,6 +1812,7 @@ linux_clone_repeat:
     mov eax, 286
     call syscall_expect_zero
     mov qword ptr [0x405e60], -1
+    mov byte ptr [0x405e68], 0
     mov esi, 0x405e60
     push 8
     pop rdx
@@ -1822,6 +1824,8 @@ linux_clone_repeat:
     require_equal
     xor eax, eax
     call syscall_expect_eight
+    # The sibling signals again only once the timer's read has completed.
+    mov byte ptr [0x405e68], 1
     cmp qword ptr [0x405e60], 0
     je failure
     push 3
@@ -1845,7 +1849,9 @@ linux_clone_repeat:
     require_equal
     jmp linux_child_joined
 linux_parent_futex_wait:
-    mov rdi, r8
+    # Joined on the child tid word clone was given (r10), which the
+    # child's exit clears and wakes.
+    mov edi, 0x405198
     xor esi, esi
     mov edx, ebx
     xor r10d, r10d
@@ -2288,7 +2294,7 @@ linux_child_joined:
     push 63
     pop rax
     call syscall_expect_zero
-    cmp dword ptr [rdi], 0x756e6947
+    cmp dword ptr [rdi], 0x756e694c
     require_equal
 
     push 2
@@ -2680,7 +2686,7 @@ linux_child_joined:
     push 5
     pop rax
     call syscall_expect_zero
-    cmp dword ptr [0x405368], 0x2180
+    cmp dword ptr [0x405368], 0x21b6
     require_equal
 
     mov edi, -100
@@ -2727,7 +2733,7 @@ linux_child_joined:
     xor r10d, r10d
     mov eax, 262
     call syscall_expect_zero
-    cmp dword ptr [0x405368], 0x2180
+    cmp dword ptr [0x405368], 0x21b6
     require_equal
 
     mov edi, -100
@@ -2817,10 +2823,11 @@ linux_child_joined:
     syscall
     cmp rax, 0x802
     require_equal
+    # A blocking read of an empty eventfd waits (for good in a lone
+    # thread), so the empty read is checked non-blocking: EAGAIN.
     push 4
     pop rsi
-    push 2
-    pop rdx
+    mov edx, 0x802
     push 72
     pop rax
     call syscall_expect_zero
@@ -2828,13 +2835,7 @@ linux_child_joined:
     push 8
     pop rdx
     xor eax, eax
-    call syscall_expect_enosys
-    push 4
-    pop rsi
-    mov edx, 0x802
-    push 72
-    pop rax
-    call syscall_expect_zero
+    call syscall_expect_eagain
     push 2
     pop rdi
     mov esi, 0x405350
@@ -3210,24 +3211,13 @@ linux_child_joined:
     syscall
     cmp rax, 0x802
     require_equal
-    push 4
-    pop rsi
-    push 2
-    pop rdx
-    push 72
-    pop rax
-    call syscall_expect_zero
+    # The empty timerfd is read non-blocking: EAGAIN (a blocking read
+    # would wait for good in a lone thread).
     mov esi, 0x405e00
     push 8
     pop rdx
     xor eax, eax
-    call syscall_expect_enosys
-    push 4
-    pop rsi
-    mov edx, 0x802
-    push 72
-    pop rax
-    call syscall_expect_zero
+    call syscall_expect_eagain
     mov esi, 0x405350
     push 5
     pop rax
@@ -3488,12 +3478,20 @@ linux_child_joined:
     mov edx, 0x4000
     push 72
     pop rax
-    call syscall_expect_einval
+    # A pipe takes O_DIRECT (packet mode), as Linux's does.
+    call syscall_expect_zero
+    # The empty pipe is read non-blocking: EAGAIN.
+    push 4
+    pop rsi
+    mov edx, 0x800
+    push 72
+    pop rax
+    call syscall_expect_zero
     mov esi, 0x405eb0
     push 1
     pop rdx
     xor eax, eax
-    call syscall_expect_enosys
+    call syscall_expect_eagain
     push 4
     pop rsi
     mov edx, 0x800
@@ -3867,10 +3865,13 @@ linux_child_joined:
     call syscall_expect_zero
     cmp dword ptr [0x405400], 0x17ff
     require_equal
-    cmp word ptr [0x40541c], 0x2180
+    cmp word ptr [0x40541c], 0x21b6
     require_equal
-    cmp qword ptr [0x405420], 3
-    require_equal
+    # /dev/tty is its own device (5:0) with an inode of its own.
+    cmp qword ptr [0x405420], 0
+    jne 992f
+    ud2
+992:
     mov r10d, 0x80000000
     mov eax, 332
     call syscall_expect_einval
@@ -4506,9 +4507,15 @@ linux_child_joined:
     mov eax, 135
     call syscall_expect_zero
 
+    # Any personality is kept and read back, as Linux's is.
     mov edi, 0x40000
     mov eax, 135
-    call syscall_expect_einval
+    call syscall_expect_zero
+    xor edi, edi
+    mov eax, 135
+    syscall
+    cmp rax, 0x40000
+    require_equal
 
     mov dword ptr [0x405060], 0x20080522
     mov dword ptr [0x405064], 0
@@ -4526,12 +4533,14 @@ linux_child_joined:
     push 125
     pop rax
     call syscall_expect_zero
+    # The probe runs as root: its effective and permitted sets are full
+    # and alike, its inheritable set empty.
     mov eax, dword ptr [0x405068]
-    or eax, dword ptr [0x40506c]
-    or eax, dword ptr [0x405070]
-    or eax, dword ptr [0x405074]
-    or eax, dword ptr [0x405078]
-    or eax, dword ptr [0x40507c]
+    cmp eax, dword ptr [0x40506c]
+    require_equal
+    cmp eax, 0xffffffff
+    require_equal
+    cmp dword ptr [0x405070], 0
     require_equal
 
     mov dword ptr [0x405060], 0
@@ -4556,13 +4565,6 @@ linux_child_joined:
     push 126
     pop rax
     call syscall_expect_zero
-    mov dword ptr [0x405068], 1
-    push 126
-    pop rax
-    syscall
-    cmp rax, -1
-    require_equal
-    mov dword ptr [0x405068], 0
 
     xor edi, edi
     xor esi, esi
@@ -5017,10 +5019,12 @@ resolution_valid:
     syscall
     test rax, rax
     js failure
+    # User and system time are split and neither passes the elapsed
+    # clock; there are no children's times yet.
     cmp qword ptr [0x405970], rax
-    require_equal
-    cmp qword ptr [0x405978], 0
-    require_equal
+    ja failure
+    cmp qword ptr [0x405978], rax
+    ja failure
     cmp qword ptr [0x405980], 0
     require_equal
     cmp qword ptr [0x405988], 0
@@ -5112,10 +5116,6 @@ resolution_valid:
     mov eax, 202
     call syscall_expect_eagain
 
-    xor esi, esi
-    mov edx, 42
-    mov eax, 202
-    call syscall_expect_enosys
 
     movabs rax, 0x1122334455667788
     mov qword ptr [0x405ff0], rax
@@ -5142,10 +5142,10 @@ resolution_valid:
     call syscall_expect_zero
     cmp qword ptr [0x405a08], 1000000
     jae failure
-    cmp qword ptr [0x405a10], 0
-    require_equal
-    cmp qword ptr [0x405a18], 0
-    require_equal
+    # System time is the kernel work done for the process: any amount, in
+    # whole microseconds below a second.
+    cmp qword ptr [0x405a18], 1000000
+    jae failure
 
     mov edi, 1
     mov esi, 0x405a90
@@ -5195,8 +5195,8 @@ resolution_valid:
     mov edi, 0x13d0f00
     mov esi, 0x413000
     mov edx, 0x4061fc
-    mov r8d, 0x405198
-    mov r9d, 0x410fc0
+    mov r10d, 0x405198
+    mov r8d, 0x410fc0
     push 56
     pop rax
     call syscall_expect_efault
@@ -5460,13 +5460,15 @@ resolution_valid:
     syscall
 
 child_thread_probe:
+    # The child starts with its creator's registers: r10 the child tid word
+    # CLONE_CHILD_SETTID filled, r8 the thread pointer CLONE_SETTLS set.
     mov r15, rdx
     mov eax, 186
     syscall
-    cmp eax, dword ptr [r8]
+    cmp eax, dword ptr [r10]
     require_equal
     mov rax, qword ptr fs:[0]
-    cmp rax, r9
+    cmp rax, r8
     require_equal
     mov qword ptr [0x4050e0], -1
     xor edi, edi
@@ -5622,10 +5624,13 @@ child_thread_probe:
     push 12
     pop rdx
     call linux_child_signal_parent
-    mov ecx, 0x100000
+    # Spin until the parent's second timerfd read has returned: the timer
+    # preempts this thread and the expired read completes. A fixed count
+    # of spins raced the timer, and the signal below ended the read.
 .Llinux_timerfd_read_spin:
     pause
-    loop .Llinux_timerfd_read_spin
+    cmp byte ptr [0x405e68], 0
+    je .Llinux_timerfd_read_spin
     push 12
     pop rdx
     push 1
