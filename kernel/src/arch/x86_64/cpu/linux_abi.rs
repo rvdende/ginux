@@ -1169,7 +1169,7 @@ pub(super) const LINUX_PROC_CPUINFO: &[u8] = b"processor\t: 0\nvendor_id\t: Genu
 pub(super) const LINUX_PROC_STAT: &[u8] = b"cpu  1 0 1 100 0 0 0 0 0 0\ncpu0 1 0 1 100 0 0 0 0 0 0\nintr 0\nctxt 1\nbtime 0\nprocesses 1\nprocs_running 1\nprocs_blocked 0\nsoftirq 0 0 0 0 0 0 0 0 0 0 0\n";
 pub(super) const LINUX_PROC_LOADAVG: &[u8] = b"0.00 0.00 0.00 1/1 1\n";
 pub(super) const LINUX_PROC_FILESYSTEMS: &[u8] =
-    b"nodev\tproc\nnodev\ttmpfs\nnodev\tdevtmpfs\n\text2\n\text3\n\text4\nnodev\toverlay\n";
+    b"nodev\tproc\nnodev\ttmpfs\nnodev\tramfs\nnodev\tdevtmpfs\n\text2\n\text3\n\text4\nnodev\toverlay\n";
 pub(super) const LINUX_PROC_CMDLINE: &[u8] = b"ginux immutable=1\n";
 pub(super) const LINUX_PROC_CGROUP: &[u8] = b"0::/\n";
 pub(super) const LINUX_PROC_PROCESS_CMDLINE: &[u8] = b"/sbin/init\0";

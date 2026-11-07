@@ -60329,6 +60329,7 @@ fn linux_mountable_filesystem(filesystem: &[u8]) -> bool {
             | b"ext3"
             | b"ext4"
             | b"tmpfs"
+            | b"ramfs"
             | b"proc"
             | b"sysfs"
             | b"devtmpfs"
