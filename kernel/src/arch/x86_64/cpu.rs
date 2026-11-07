@@ -16,6 +16,7 @@ mod fanotify;
 mod linux_abi;
 mod linux_fsmount;
 mod linux_futex;
+mod linux_hugetlb;
 mod linux_poll;
 mod linux_pty;
 mod linux_security;
@@ -45,6 +46,7 @@ use fanotify::*;
 pub(crate) use linux_abi::*;
 use linux_fsmount::*;
 use linux_futex::*;
+use linux_hugetlb::*;
 use linux_poll::*;
 use linux_pty::*;
 use linux_security::*;
@@ -13911,6 +13913,7 @@ pub(crate) fn linux_runtime_diagnostics() -> (Option<u8>, Option<u64>) {
 
 fn prepare_configured_linux_system_domain() -> bool {
     linux_prepare_securityfs();
+    linux_prepare_hugetlbfs();
     if !prepare_linux_package_platform() {
         return false;
     }
@@ -21132,10 +21135,28 @@ fn linux_shmget(key: u64, size: u64, flags: u64) -> u64 {
     const IPC_CREAT: u64 = 0o1000;
     const IPC_EXCL: u64 = 0o2000;
     let flags = u64::from(flags as u32);
-    if flags & !(0o777 | IPC_CREAT | IPC_EXCL) != 0 {
+    if flags & !(0o777 | IPC_CREAT | IPC_EXCL | LINUX_SHM_HUGE_FLAGS) != 0 {
         return LINUX_EINVAL;
     }
     let key = key as u32 as i32;
+    // A new segment of huge pages needs the caller's right to them and the
+    // pool's pages (hugetlb_file_setup); an existing one is only found.
+    let huge = flags & LINUX_SHM_HUGETLB != 0;
+    if huge
+        && (key == 0 || flags & IPC_CREAT != 0)
+        && (key == 0
+            || crate::linux_sysv_ipc::segments()
+                .iter()
+                .all(|(_, segment)| segment.key != key))
+        && size >= 1
+        && linux_proc_sysctl_value(b"sys/kernel/shmmax")
+            .and_then(|largest| u64::try_from(largest).ok())
+            .is_none_or(|largest| size <= largest)
+    {
+        if let Err(error) = linux_shm_huge_allowed(size, flags) {
+            return error;
+        }
+    }
     let requested =
         linux_proc_sysctl_value(b"sys/kernel/shm_next_id").and_then(|id| u32::try_from(id).ok());
     let limit = linux_proc_sysctl_value(b"sys/kernel/shmmni")
@@ -21154,6 +21175,7 @@ fn linux_shmget(key: u64, size: u64, flags: u64) -> u64 {
             largest: linux_proc_sysctl_value(b"sys/kernel/shmmax")
                 .and_then(|largest| u64::try_from(largest).ok())
                 .unwrap_or(u64::MAX),
+            huge,
         },
     );
     // shm_next_id is used up by the segment it named.
@@ -28548,6 +28570,8 @@ fn linux_record_exec_image(
                 may_write: true,
                 locked: false,
                 grows_down: false,
+                huge: false,
+                huge_reserved: false,
                 backing: Backing::File {
                     device: 0,
                     inode: 0,
@@ -28575,6 +28599,8 @@ fn linux_record_exec_image(
                 may_write: true,
                 locked: false,
                 grows_down: false,
+                huge: false,
+                huge_reserved: false,
                 backing: Backing::Stack,
             },
         );
@@ -28603,6 +28629,8 @@ fn linux_record_heap(program_break: u64) {
                 may_write: true,
                 locked: false,
                 grows_down: false,
+                huge: false,
+                huge_reserved: false,
                 backing: Backing::Heap,
             },
         );
@@ -28679,6 +28707,8 @@ fn linux_record_mapping(
             may_write,
             locked: flags & LINUX_MAP_LOCKED != 0,
             grows_down: flags & LINUX_MAP_GROWSDOWN != 0,
+            huge: false,
+            huge_reserved: false,
             backing,
         },
     );
@@ -29711,6 +29741,9 @@ fn linux_cachestat(descriptor: u64, range_address: u64, output_address: u64, fla
     }
     if !linux_descriptor_open(descriptor) {
         return LINUX_EBADF;
+    }
+    if linux_overlay_descriptor_handle(descriptor).is_some_and(linux_overlay_huge) {
+        return LINUX_EOPNOTSUPP;
     }
     let size = if let Some(metadata) =
         linux_overlay_descriptor_handle(descriptor).and_then(crate::linux_overlay::metadata)
@@ -36004,8 +36037,12 @@ fn linux_canonical_path_at(
     if length == 0 {
         return Err(LINUX_EISDIR);
     }
+    let length = linux_hugepages_proc_alias(output, length);
     if output[..length].starts_with(b"sys/fs/cgroup/") {
         linux_ensure_cgroup_root();
+    }
+    if output[..length].starts_with(b"sys/kernel/mm") {
+        linux_refresh_hugepages_sysfs();
     }
     if output[..length].starts_with(b"dev/dri") || output[..length].starts_with(b"sys/dev") {
         crate::linux_drm::ensure_nodes();
@@ -37645,9 +37682,11 @@ fn linux_resolve_restricted(
 fn linux_memfd_create(name_address: u64, flags: u64) -> u64 {
     const MFD_CLOEXEC: u64 = 1;
     const MFD_ALLOW_SEALING: u64 = 2;
-    if flags & !(MFD_CLOEXEC | MFD_ALLOW_SEALING) != 0 {
-        return LINUX_EINVAL;
-    }
+    let flags = u64::from(flags as u32);
+    let huge = match linux_memfd_huge_flags(flags, MFD_CLOEXEC | MFD_ALLOW_SEALING) {
+        Ok(huge) => huge,
+        Err(error) => return error,
+    };
     // A name past 249 bytes (NAME_MAX less "memfd:") is EINVAL.
     let mut name = [0_u8; 250];
     if let Err(error) = copy_linux_c_string(name_address, &mut name) {
@@ -37666,6 +37705,7 @@ fn linux_memfd_create(name_address: u64, flags: u64) -> u64 {
         return LINUX_ENOSPC;
     };
     if !crate::linux_overlay::configure_memfd(handle, flags & MFD_ALLOW_SEALING != 0)
+        || huge && !crate::linux_overlay::set_huge(handle)
         || !crate::linux_overlay::unlink(handle)
     {
         return LINUX_EIO;
@@ -44575,6 +44615,9 @@ fn linux_regular_file_write_kernel(
         let metadata = crate::linux_overlay::metadata(handle).ok_or(LINUX_EBADF)?;
         if metadata.kind != crate::linux_overlay::NodeKind::File {
             return Err(LINUX_EISDIR);
+        }
+        if linux_overlay_huge(handle) {
+            return Err(LINUX_EINVAL);
         }
         return crate::linux_overlay::write(handle, offset, input).ok_or(LINUX_ENOSPC);
     }
@@ -52916,6 +52959,7 @@ fn linux_proc_meminfo() -> &'static [u8] {
     let (total, free) = linux_domain_frame_counts();
     let (total, free) = (total * 4, free * 4);
     let used = total - free;
+    let huge = linux_huge_page_counts();
     // SAFETY: the kernel is single-processor and readers copy the bytes
     // before another /proc/meminfo read can rewrite them.
     let buffer = unsafe { &mut *core::ptr::addr_of_mut!(MEMINFO) };
@@ -52929,10 +52973,17 @@ fn linux_proc_meminfo() -> &'static [u8] {
              Active:         {used:>10} kB\nInactive:       {zero:>10} kB\n\
              SwapTotal:      {zero:>10} kB\nSwapFree:       {zero:>10} kB\n\
              CommitLimit:    {total:>10} kB\nCommitted_AS:   {used:>10} kB\n\
-             VmallocTotal:   13743895347199 kB\nHugePages_Total:       0\n\
-             HugePages_Free:        0\nHugepagesize:       2048 kB\n\
+             VmallocTotal:   13743895347199 kB\n\
+             HugePages_Total:   {huge_total:>5}\nHugePages_Free:    {huge_free:>5}\n\
+             HugePages_Rsvd:    {huge_reserved:>5}\nHugePages_Surp:    {huge_surplus:>5}\n\
+             Hugepagesize:       2048 kB\nHugetlb:        {hugetlb:>10} kB\n\
              DirectMap4k:    {total:>10} kB\n",
-            zero = 0
+            zero = 0,
+            huge_total = huge.total,
+            huge_free = huge.free,
+            huge_reserved = huge.reserved,
+            huge_surplus = huge.surplus,
+            hugetlb = huge.total * 2048,
         ),
     );
     &buffer.bytes[..buffer.length]
@@ -53291,6 +53342,10 @@ fn linux_overlay_write(descriptor: u64, state: u16, address: u64, count: u64) ->
     if state & 3 != LINUX_DESCRIPTOR_OUTPUT && state & 3 != 3 {
         return Some(LINUX_EBADF);
     }
+    // hugetlbfs has no write(2) (memfd_create03).
+    if linux_overlay_huge(handle) {
+        return Some(LINUX_EINVAL);
+    }
     let start = if linux_socket_flags(descriptor)
         .is_some_and(|flags| flags & LINUX_O_APPEND as u32 != 0)
     {
@@ -53308,6 +53363,7 @@ fn linux_overlay_write(descriptor: u64, state: u16, address: u64, count: u64) ->
             start.saturating_add(result as usize) as u64,
             Ordering::SeqCst,
         );
+        linux_hugepages_sysfs_written(handle);
     }
     Some(result)
 }

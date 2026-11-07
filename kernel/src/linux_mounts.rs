@@ -871,6 +871,15 @@ pub(crate) fn flags_at(space: Space, path: &[u8]) -> u32 {
         .map_or(0, |index| table.mounts[index].flags)
 }
 
+/// Whether canonical `path` lies on a mount of `filesystem` (by the mount
+/// tree): a file under a hugetlbfs mount is made of huge pages.
+pub(crate) fn on_filesystem(space: Space, path: &[u8], filesystem: &[u8]) -> bool {
+    let table = MOUNTS.lock();
+    table
+        .covering(space, path)
+        .is_some_and(|index| table.mounts[index].filesystem == filesystem)
+}
+
 /// The id of the mount canonical `path` lies on, by the mount tree
 /// ([`ROOT_ID`] for the root's own files). Two paths on
 /// different mounts cannot be linked or renamed into one another (EXDEV).

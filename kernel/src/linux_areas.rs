@@ -11,7 +11,7 @@
 
 use alloc::vec::Vec;
 
-pub(crate) use ginux_memory_areas::{Area, Areas, Backing, Protection, PAGE_SIZE};
+pub(crate) use ginux_memory_areas::{Area, Areas, Backing, Protection, HUGE_PAGE_SIZE, PAGE_SIZE};
 
 use crate::sync::{LockRank, SpinLock};
 
@@ -349,9 +349,48 @@ pub(crate) fn remap(
             may_write: area.may_write,
             locked: area.locked,
             grows_down: area.grows_down,
+            huge: area.huge,
+            huge_reserved: area.huge_reserved,
             backing,
         });
     });
+}
+
+/// Marks `length` bytes at `start`, which `pid` just mapped, as mapped with
+/// huge pages; `reserved` when the pages are reserved for the mapping (a
+/// private one).
+pub(crate) fn mark_huge(instance: usize, pid: u32, start: u64, length: u64, reserved: bool) {
+    let Some(end) = page_end(start, length) else {
+        return;
+    };
+    update(instance, pid, |areas| {
+        let _ = areas.set_huge(start, end, reserved);
+    });
+}
+
+/// Whether changing `length` bytes at `start` alone (munmap, mprotect)
+/// would cut one of `pid`'s huge mappings inside a huge page (EINVAL).
+pub(crate) fn huge_split(instance: usize, pid: u32, start: u64, length: u64) -> bool {
+    let Some(end) = page_end(start, length) else {
+        return false;
+    };
+    PROCESSES
+        .lock()
+        .iter()
+        .find(|process| process.instance == instance && process.pid == pid)
+        .is_some_and(|process| process.areas.huge_split(start, end))
+}
+
+/// The huge pages the private huge mappings of `instance`'s processes
+/// hold reserved: they go with the mappings (munmap, exec, exit).
+pub(crate) fn huge_reserved_pages(instance: usize) -> u64 {
+    PROCESSES
+        .lock()
+        .iter()
+        .filter(|process| process.instance == instance)
+        .map(|process| process.areas.huge_reserved_bytes())
+        .sum::<u64>()
+        .div_ceil(ginux_memory_areas::HUGE_PAGE_SIZE)
 }
 
 /// Gives a forked `child` a copy of its parent's areas.

@@ -222,6 +222,11 @@ struct Node {
     /// A frame of the paged file was handed out to be mapped: it may be in
     /// page tables, so the data stays until the overlay goes.
     frames_lent: bool,
+    /// A file of huge pages: a hugetlbfs file or an MFD_HUGETLB memfd.
+    huge: bool,
+    /// The huge pages its shared mappings have taken from the huge page
+    /// pool, which it holds until it goes.
+    huge_pages: u32,
     handle: Handle,
     size: usize,
     first_page: FrameLease,
@@ -261,6 +266,8 @@ impl Node {
         fifo_socket: 0,
         charged: 0,
         frames_lent: false,
+        huge: false,
+        huge_pages: 0,
         handle: Handle {
             generation: 0,
             inode: 0,
@@ -650,6 +657,56 @@ pub(crate) fn configure_memfd(handle: Handle, allow_sealing: bool) -> bool {
     node.origin = Origin::Pseudo;
     node.seals = if allow_sealing { 0 } else { 1 };
     true
+}
+
+/// Makes `handle` a file of huge pages (hugetlbfs, MFD_HUGETLB).
+pub(crate) fn set_huge(handle: Handle) -> bool {
+    node_mut(handle).is_some_and(|node| {
+        node.huge = true;
+        true
+    })
+}
+
+/// Whether `handle` is a file of huge pages.
+pub(crate) fn is_huge(handle: Handle) -> bool {
+    node(handle).is_some_and(|node| node.huge)
+}
+
+/// The huge pages `handle`'s shared mappings hold.
+pub(crate) fn huge_pages(handle: Handle) -> u32 {
+    node(handle).map_or(0, |node| node.huge_pages)
+}
+
+/// Records that `handle`'s shared mappings now hold `pages` huge pages,
+/// when that is more than before.
+pub(crate) fn hold_huge_pages(handle: Handle, pages: u32) -> bool {
+    node_mut(handle).is_some_and(|node| {
+        node.huge = true;
+        node.huge_pages = node.huge_pages.max(pages);
+        true
+    })
+}
+
+/// The huge pages every file of huge pages holds, for the pool's count.
+pub(crate) fn huge_pages_in_use() -> u64 {
+    let Some(overlay) = live() else {
+        return 0;
+    };
+    let mut total = 0;
+    let mut page = overlay.first_node_page;
+    while page != FrameLease::EMPTY {
+        let Some(nodes) = node_page(page) else {
+            break;
+        };
+        total += nodes
+            .nodes
+            .iter()
+            .filter(|node| node.active && node.huge)
+            .map(|node| u64::from(node.huge_pages))
+            .sum::<u64>();
+        page = nodes.next;
+    }
+    total
 }
 
 /// Marks `handle` a file of an internal filesystem (secret memory): one
@@ -1235,6 +1292,8 @@ fn create(path: &[u8], kind: NodeKind, mode: u32, initial: &[u8]) -> Option<Hand
         fifo_socket: 0,
         charged: 0,
         frames_lent: false,
+        huge: false,
+        huge_pages: 0,
         handle,
         size: 0,
         first_page: FrameLease::EMPTY,
@@ -1316,6 +1375,8 @@ pub(crate) fn whiteout_stored(path: &[u8]) -> bool {
         fifo_socket: 0,
         charged: 0,
         frames_lent: false,
+        huge: false,
+        huge_pages: 0,
         handle: Handle { generation, inode },
         size: 0,
         first_page: FrameLease::EMPTY,

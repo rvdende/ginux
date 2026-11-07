@@ -123,6 +123,8 @@ pub(crate) struct SegmentInfo {
     pub(crate) creator_pid: u32,
     pub(crate) last_pid: u32,
     pub(crate) attachments: u64,
+    /// Made with SHM_HUGETLB: its size is in huge pages.
+    pub(crate) huge: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -267,7 +269,9 @@ struct SegmentPage {
     size: u64,
     mode: u16,
     marked_for_removal: u8,
-    _reserved: u8,
+    /// A segment of huge pages (SHM_HUGETLB), 1, which holds its pages
+    /// from the huge page pool while it exists.
+    huge: u8,
     creator_pid: u32,
     last_pid: u32,
     attachments: u64,
@@ -585,6 +589,7 @@ fn info(page: &SegmentPage) -> SegmentInfo {
         creator_pid: page.creator_pid,
         last_pid: page.last_pid,
         attachments: page.attachments,
+        huge: page.huge != 0,
     }
 }
 
@@ -647,6 +652,7 @@ pub(crate) fn get_or_create(
         requested,
         limit,
         largest,
+        huge,
     } = ids;
     let guard = Guard::acquire().ok_or(Error::Invalid)?;
     if key != 0 {
@@ -707,6 +713,7 @@ pub(crate) fn get_or_create(
         page.key = key;
         page.size = size;
         page.mode = mode & 0o777;
+        page.huge = u8::from(huge);
         page.creator_pid = pid;
         page.last_pid = pid;
     }
@@ -762,6 +769,8 @@ pub(crate) struct SegmentIds {
     pub(crate) limit: usize,
     /// The largest segment that may be made (shmmax).
     pub(crate) largest: u64,
+    /// The segment is made of huge pages (SHM_HUGETLB).
+    pub(crate) huge: bool,
 }
 
 /// Every segment of the current instance with its id, in creation order,
@@ -2649,6 +2658,7 @@ pub(crate) fn verify_shared_memory_lifecycle() -> bool {
             requested: None,
             limit: 4096,
             largest: u64::MAX,
+            huge: false,
         },
     ) else {
         return false;
@@ -2700,6 +2710,7 @@ pub(crate) fn verify_shared_memory_lifecycle() -> bool {
                 requested: None,
                 limit: 4096,
                 largest: u64::MAX,
+                huge: false,
             },
         ) == Err(Error::NoEntry)
 }

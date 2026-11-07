@@ -830,7 +830,7 @@ fn linux_syscall_dispatch(
             }
         }
         LINUX_MMAP_SYSCALL => {
-            let arguments = [
+            let mut arguments = [
                 first_argument,
                 buffer,
                 count,
@@ -838,6 +838,16 @@ fn linux_syscall_dispatch(
                 register(2),
                 register(1),
             ];
+            // A huge page mapping becomes the small-page mapping that backs
+            // it (`linux_huge_mmap_arguments`).
+            let huge = if runtime_mode {
+                match linux_huge_mmap_arguments(&mut arguments) {
+                    Ok(huge) => huge,
+                    Err(error) => return error,
+                }
+            } else {
+                None
+            };
             // A process past vm.max_map_count areas maps no more, as
             // Linux refuses (munmap04 maps until this fails).
             if runtime_mode
@@ -864,6 +874,9 @@ fn linux_syscall_dispatch(
                 arguments[4],
                 arguments[5],
             );
+            if let Some(huge) = huge.filter(|_| mapped < LINUX_RETURN_TO_KERNEL) {
+                linux_huge_mapped(mapped, huge);
+            }
             mapped
         }
         LINUX_MUNMAP_SYSCALL => {
@@ -874,6 +887,11 @@ fn linux_syscall_dispatch(
                     first_argument,
                     first_argument.saturating_add(buffer),
                 );
+            }
+            // A huge mapping is only cut on a huge page boundary
+            // (memfd_create03).
+            if runtime_mode && linux_huge_split(first_argument, buffer) {
+                return LINUX_EINVAL;
             }
             // Unmapping the middle of an area makes two of it: at the
             // vm.max_map_count limit that is ENOMEM (munmap04).
@@ -996,6 +1014,12 @@ fn linux_syscall_dispatch(
             linux_remap_file_pages(first_argument, buffer, count, register(0), register(2))
         }
         LINUX_MSYNC_SYSCALL => linux_msync(first_argument, buffer, count),
+        // A huge mapping is only changed in whole huge pages.
+        LINUX_MPROTECT_SYSCALL | LINUX_PKEY_MPROTECT_SYSCALL
+            if runtime_mode && linux_huge_split(first_argument, buffer) =>
+        {
+            LINUX_EINVAL
+        }
         // A shared mapping that may not be written cannot be made writable
         // (EACCES: Linux's VM_MAYWRITE).
         LINUX_MPROTECT_SYSCALL | LINUX_PKEY_MPROTECT_SYSCALL

@@ -138,8 +138,18 @@ pub struct Area {
     /// A stack that grows down (MAP_GROWSDOWN, Linux's VM_GROWSDOWN): a
     /// fault just below it extends it (`Areas::grows_down_over`).
     pub grows_down: bool,
+    /// Mapped with huge pages (MAP_HUGETLB, a hugetlbfs file, Linux's
+    /// VM_HUGETLB): it may only be split on a huge page boundary.
+    pub huge: bool,
+    /// A private huge mapping whose pages are reserved from the huge page
+    /// pool for it (Linux's HPAGE_RESV_OWNER): the mapper's, not the copy a
+    /// forked child gets.
+    pub huge_reserved: bool,
     pub backing: Backing,
 }
+
+/// The size of a huge page (x86's 2 MiB).
+pub const HUGE_PAGE_SIZE: u64 = 2 << 20;
 
 impl Area {
     pub fn len(&self) -> u64 {
@@ -165,6 +175,8 @@ impl Area {
             may_write: self.may_write,
             locked: self.locked,
             grows_down: self.grows_down,
+            huge: self.huge,
+            huge_reserved: self.huge_reserved,
             backing: self.backing.advanced(start - self.start),
         }
     }
@@ -177,6 +189,8 @@ impl Area {
             && self.may_write == next.may_write
             && self.locked == next.locked
             && self.grows_down == next.grows_down
+            && self.huge == next.huge
+            && self.huge_reserved == next.huge_reserved
             && self.backing.continues_into(self.len(), &next.backing)
     }
 }
@@ -262,13 +276,22 @@ impl Areas {
     }
 
     /// The copy a forked child gets: the same areas, none of them locked,
-    /// as memory locks are not inherited across fork.
+    /// as memory locks are not inherited across fork, and none holding a
+    /// huge page reservation, which stays with the parent as in Linux.
     pub fn forked(&self) -> Result<Self, Error> {
         let mut copy = Self {
             lock_future: false,
             ..self.try_clone()?
         };
         copy.lock_all(false);
+        for area in &mut copy.areas {
+            area.huge_reserved = false;
+        }
+        for index in (0..copy.areas.len()).rev() {
+            if index < copy.areas.len() {
+                copy.merge_around(index);
+            }
+        }
         Ok(copy)
     }
 
@@ -354,6 +377,38 @@ impl Areas {
     pub fn splits(&self, start: u64, end: u64) -> bool {
         self.find(start)
             .is_some_and(|area| area.start < start && end < area.end)
+    }
+
+    /// Whether changing `[start, end)` alone (munmap, mprotect) would cut
+    /// a huge area somewhere other than a huge page boundary, which Linux
+    /// refuses with EINVAL.
+    pub fn huge_split(&self, start: u64, end: u64) -> bool {
+        let cuts = |address: u64| {
+            self.find(address).is_some_and(|area| {
+                area.huge
+                    && area.start < address
+                    && !(address - area.start).is_multiple_of(HUGE_PAGE_SIZE)
+            })
+        };
+        cuts(start) || cuts(end)
+    }
+
+    /// Marks `[start, end)`, which must be wholly mapped, as mapped with
+    /// huge pages, `reserved` if its pages are reserved for it.
+    pub fn set_huge(&mut self, start: u64, end: u64, reserved: bool) -> Result<(), Error> {
+        self.change(start, end, |area| {
+            area.huge = true;
+            area.huge_reserved = reserved;
+        })
+    }
+
+    /// The bytes of huge areas holding a huge page reservation.
+    pub fn huge_reserved_bytes(&self) -> u64 {
+        self.areas
+            .iter()
+            .filter(|area| area.huge_reserved)
+            .map(Area::len)
+            .sum()
     }
 
     /// Whether some area overlapping `[start, end)` is locked.
@@ -494,6 +549,8 @@ mod tests {
             may_write: true,
             locked: false,
             grows_down: false,
+            huge: false,
+            huge_reserved: false,
             backing: Backing::Anonymous,
         }
     }
@@ -507,6 +564,8 @@ mod tests {
             may_write: true,
             locked: false,
             grows_down: false,
+            huge: false,
+            huge_reserved: false,
             backing: Backing::File {
                 device: 1,
                 inode: 7,
@@ -731,5 +790,29 @@ mod tests {
             })
             .unwrap();
         assert_eq!(ranges(&areas), [(0, 2, 3), (9, 12, 3)]);
+    }
+
+    #[test]
+    fn huge_areas_split_only_on_huge_page_boundaries() {
+        const HUGE: u64 = HUGE_PAGE_SIZE / PAGE_SIZE;
+        let mut areas = Areas::new();
+        areas.map(anonymous(0, 2 * HUGE, RW)).unwrap();
+        areas.set_huge(0, 2 * HUGE_PAGE_SIZE, true).unwrap();
+        // A cut inside a huge page is refused; one on a boundary is not.
+        assert!(areas.huge_split(0, HUGE_PAGE_SIZE / 4));
+        assert!(areas.huge_split(PAGE_SIZE, 2 * HUGE_PAGE_SIZE));
+        assert!(!areas.huge_split(0, HUGE_PAGE_SIZE));
+        assert!(!areas.huge_split(0, 2 * HUGE_PAGE_SIZE));
+        assert_eq!(areas.huge_reserved_bytes(), 2 * HUGE_PAGE_SIZE);
+        areas.unmap(HUGE_PAGE_SIZE, 2 * HUGE_PAGE_SIZE).unwrap();
+        assert_eq!(areas.huge_reserved_bytes(), HUGE_PAGE_SIZE);
+        // A forked child's copy holds no reservation of its own.
+        let child = areas.forked().unwrap();
+        assert_eq!(child.huge_reserved_bytes(), 0);
+        assert!(child.find(0).is_some_and(|area| area.huge));
+        // An ordinary area is never a huge split.
+        let mut small = Areas::new();
+        small.map(anonymous(0, 4, RW)).unwrap();
+        assert!(!small.huge_split(PAGE_SIZE, 2 * PAGE_SIZE));
     }
 }
