@@ -771,9 +771,12 @@ pub(super) const LINUX_AIO_MAX_NR: u64 = 65_536;
 pub(super) const LINUX_MAX_MAP_COUNT: usize = 65_530;
 // threads-max below is linux_process::PROCESS_LIMIT.
 const _: () = assert!(crate::linux_process::PROCESS_LIMIT == 4096);
-pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 47] = [
+pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 48] = [
     // The most memory areas a process may have (LINUX_MAX_MAP_COUNT).
     (0xa000, b"sys/vm/max_map_count", b"65530\n"),
+    // Writing 1, 2 or 3 drops the volumes' page caches (linux_blockfs);
+    // it reads as the last value written.
+    (0x9800, b"sys/vm/drop_caches", b"0\n"),
     // The random pool is always full, as Linux reports it since 5.18.
     (0xac00, b"sys/kernel/random/entropy_avail", b"256\n"),
     (0xad00, b"sys/kernel/random/poolsize", b"256\n"),
@@ -1328,7 +1331,7 @@ const _: () = {
     // The /proc/sys directory nodes stay below every other node.
     assert!(
         LINUX_PROC_SYS_DIRECTORY_FIRST_NODE as usize + (LINUX_PROC_SYS_DIRECTORIES.len() << 8)
-            <= 0x9900
+            <= 0x9800
     );
     // Every /proc/sys value's directory is listed.
     let mut value = 0;

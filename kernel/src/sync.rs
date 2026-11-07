@@ -84,6 +84,10 @@ impl LockRank {
     /// Overlay files that lost their last name, waiting for their last
     /// close; ranks above the tables under which files are unlinked.
     pub(crate) const UNLINKED_FILES: Self = Self(188);
+    /// The limits of tmpfs mounts and their use, charged as overlay files
+    /// grow, which they may under the volumes' lock (a loop device's
+    /// backing file).
+    pub(crate) const TMPFS_LIMITS: Self = Self(189);
     /// The kernel heap refills from the frame allocator while holding its
     /// lock, so it ranks just below it.
     pub(crate) const KERNEL_HEAP: Self = Self(190);

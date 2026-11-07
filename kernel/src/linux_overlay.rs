@@ -1,6 +1,6 @@
 use crate::{
     arch::x86_64::cpu,
-    control_abi, linux_blockfs as blockfs,
+    control_abi, linux_blockfs as blockfs, linux_tmpfs_quota as tmpfs_quota,
     memory::{self, FrameLease, FrameOwner},
     sync::{LockRank, SpinLock},
 };
@@ -213,6 +213,11 @@ struct Node {
     attributes: u8,
     /// The pipe socket behind a FIFO, plus one; 0 before one opens it.
     fifo_socket: u16,
+    /// The tmpfs blocks the file's size is charged for (`linux_tmpfs_quota`).
+    charged: u32,
+    /// A frame of the paged file was handed out to be mapped: it may be in
+    /// page tables, so the data stays until the overlay goes.
+    frames_lent: bool,
     handle: Handle,
     size: usize,
     first_page: FrameLease,
@@ -250,6 +255,8 @@ impl Node {
         seals: 0,
         attributes: 0,
         fifo_socket: 0,
+        charged: 0,
+        frames_lent: false,
         handle: Handle {
             generation: 0,
             inode: 0,
@@ -739,16 +746,24 @@ pub(crate) fn linked(handle: Handle) -> bool {
 /// written. Shared mappings map this frame directly; it lives until the
 /// overlay is torn down with its domain.
 pub(crate) fn memfd_frame(handle: Handle, index: usize) -> Option<FrameLease> {
+    if blockfs::owns(handle) {
+        return blockfs::cached_frame(handle, index, true);
+    }
     let node = node_mut(handle)?;
     node.paged().then_some(())?;
+    node.frames_lent = true;
     memfd_page(node, index, true)
 }
 
 /// The frame holding page `index` of a paged file, if the page has one:
 /// what a shared mapping of that page maps. Nothing is allocated.
 pub(crate) fn paged_frame(handle: Handle, index: usize) -> Option<FrameLease> {
+    if blockfs::owns(handle) {
+        return blockfs::cached_frame(handle, index, false);
+    }
     let node = node_mut(handle)?;
     node.paged().then_some(())?;
+    node.frames_lent = true;
     memfd_page(node, index, false)
 }
 
@@ -761,6 +776,10 @@ pub(crate) fn replace_paged_frame(
     expected: FrameLease,
     replacement: FrameLease,
 ) -> bool {
+    // A volume's cached pages stay where they are.
+    if blockfs::owns(handle) {
+        return false;
+    }
     let Some(node) = node_mut(handle).filter(|node| node.paged()) else {
         return false;
     };
@@ -817,7 +836,11 @@ pub(crate) fn sole_shared_mapping(handle: Handle, offset: usize, pid: u32, addre
 
 /// The paged file whose inode is `inode` (not a hard link's name for it):
 /// the file a shared mapping recorded by inode maps.
-pub(crate) fn paged_file(inode: u64) -> Option<Handle> {
+pub(crate) fn paged_file(device: u64, inode: u64) -> Option<Handle> {
+    // A file on a disk is a volume's, mapped through its page cache.
+    if device != 0 {
+        return blockfs::cached_file(device, inode);
+    }
     let overlay = live()?;
     for_each_node(overlay, |node| {
         (node.handle.inode == inode
@@ -891,6 +914,9 @@ fn handle_mapped(overlay: &Overlay, handle: Handle) -> bool {
 /// shared maps the same pages (as Linux maps the page cache), instead of a
 /// copy written back at munmap. Already paged files stay as they are.
 pub(crate) fn make_paged(handle: Handle) -> bool {
+    if blockfs::owns(handle) {
+        return blockfs::map_shared(handle);
+    }
     node_mut(handle).is_some_and(|node| node.kind == NodeKind::File && make_node_paged(node))
 }
 
@@ -1113,6 +1139,10 @@ fn create(path: &[u8], kind: NodeKind, mode: u32, initial: &[u8]) -> Option<Hand
     }
     let replace_whiteout = hidden(path);
     let stored_path = stored_path(path)?;
+    // A tmpfs with nr_inodes= has room for so many files (ENOSPC).
+    if !tmpfs_quota::charge(cpu::current_linux_execution_instance(), path, 0, 1) {
+        return None;
+    }
     let overlay = live_mut();
     let generation = overlay.next_generation.checked_add(1)?;
     let inode = overlay.next_inode.checked_add(1)?;
@@ -1142,6 +1172,8 @@ fn create(path: &[u8], kind: NodeKind, mode: u32, initial: &[u8]) -> Option<Hand
         seals: 0,
         attributes: 0,
         fifo_socket: 0,
+        charged: 0,
+        frames_lent: false,
         handle,
         size: 0,
         first_page: FrameLease::EMPTY,
@@ -1221,6 +1253,8 @@ pub(crate) fn whiteout(path: &[u8]) -> bool {
         seals: 0,
         attributes: 0,
         fifo_socket: 0,
+        charged: 0,
+        frames_lent: false,
         handle: Handle { generation, inode },
         size: 0,
         first_page: FrameLease::EMPTY,
@@ -1313,6 +1347,10 @@ pub(crate) fn write(handle: Handle, offset: usize, input: &[u8]) -> Option<usize
     if blockfs::owns(handle) {
         return blockfs::write(handle, offset, input);
     }
+    let end = offset.checked_add(input.len())?;
+    if !input.is_empty() && !charge_size(handle, offset, end) {
+        return None;
+    }
     let written = write_data(handle, offset, input)?;
     if written != 0 {
         let _ = touch_modified(handle, crate::arch::x86_64::cpu::linux_realtime_now());
@@ -1388,6 +1426,18 @@ pub(crate) fn truncate(handle: Handle, size: usize) -> bool {
     };
     if node.kind != NodeKind::File {
         return false;
+    }
+    // A tmpfs file that shrinks gives its blocks back (growing leaves a
+    // hole, which uses none).
+    let kept = size.div_ceil(tmpfs_quota::BLOCK_SIZE as usize) as u32;
+    if kept < node.charged {
+        tmpfs_quota::release(
+            cpu::current_linux_execution_instance(),
+            node.path(),
+            u64::from(node.charged - kept),
+            0,
+        );
+        node.charged = kept;
     }
     if node.paged() {
         // Frames stay allocated when a paged file shrinks, since processes
@@ -1943,6 +1993,151 @@ pub(crate) fn unlink(handle: Handle) -> bool {
     true
 }
 
+/// Reserves the blocks of `handle`'s file up to `end` (fallocate) in its
+/// tmpfs; false (ENOSPC) past the tmpfs's size.
+pub(crate) fn reserve(handle: Handle, end: usize) -> bool {
+    let size = node(handle).map_or(0, |node| node.size);
+    charge_size(handle, size, end)
+}
+
+/// Charges to its tmpfs, if one with a limit holds `handle`'s file, the
+/// blocks a write from `offset` to `end` adds past the file's end (what
+/// lies between stays a hole, which uses none); false (ENOSPC) past the
+/// limit.
+fn charge_size(handle: Handle, offset: usize, end: usize) -> bool {
+    let Some(node) = node_mut(handle) else {
+        return true;
+    };
+    let block = tmpfs_quota::BLOCK_SIZE as usize;
+    // The block the end of the file lies in is charged already.
+    let first = if offset <= node.size {
+        node.size.div_ceil(block)
+    } else {
+        offset / block
+    };
+    let added = end.div_ceil(block).saturating_sub(first);
+    if added == 0 {
+        return true;
+    }
+    if !tmpfs_quota::charge(
+        cpu::current_linux_execution_instance(),
+        node.path(),
+        added as u64,
+        0,
+    ) {
+        return false;
+    }
+    node.charged = node
+        .charged
+        .saturating_add(added.min(u32::MAX as usize) as u32);
+    true
+}
+
+/// A page cache for a file of a volume (`linux_blockfs`): an unnamed paged
+/// file whose frames hold the pages read from the disk, which shared
+/// mappings of the volume's file map. No path leads to it.
+pub(crate) fn create_page_cache(size: usize) -> Option<Handle> {
+    let created = cpu::linux_realtime_now();
+    let overlay = live_mut();
+    let generation = overlay.next_generation.checked_add(1)?;
+    let inode = overlay.next_inode.checked_add(1)?;
+    let node = empty_node_slot(overlay)?;
+    let handle = Handle { generation, inode };
+    *node = Node {
+        active: true,
+        linked: false,
+        origin: Origin::Pseudo,
+        kind: NodeKind::File,
+        mode: 0o600,
+        links: 1,
+        handle,
+        atime: created,
+        mtime: created,
+        ctime: created,
+        ..Node::EMPTY
+    };
+    if !make_node_paged(node) {
+        *node = Node::EMPTY;
+        return None;
+    }
+    node.size = size;
+    overlay.next_generation = generation;
+    overlay.next_inode = inode;
+    Some(handle)
+}
+
+/// Sets a page cache's size: the file's, which bounds what reads of it
+/// return. Pages past it read as zeros.
+pub(crate) fn resize_page_cache(handle: Handle, size: usize) -> bool {
+    node_mut(handle).is_some_and(|node| {
+        node.paged() && {
+            node.size = size;
+            true
+        }
+    })
+}
+
+/// Page `index` of page cache `handle` into `output`, if it holds that page.
+pub(crate) fn read_cached_page(handle: Handle, index: usize, output: &mut [u8; PAGE_SIZE]) -> bool {
+    let Some(node) = node_mut(handle).filter(|node| node.paged()) else {
+        return false;
+    };
+    let Some(address) = memfd_page(node, index, false).and_then(FrameLease::direct_map_address)
+    else {
+        return false;
+    };
+    // SAFETY: a paged node's frames are whole pages of the direct map that
+    // it owns; nothing else writes them during the system call.
+    output.copy_from_slice(unsafe { core::slice::from_raw_parts(address as *const u8, PAGE_SIZE) });
+    true
+}
+
+/// Puts `page` in page cache `handle` as page `index`, allocating its frame.
+pub(crate) fn fill_cached_page(handle: Handle, index: usize, page: &[u8; PAGE_SIZE]) -> bool {
+    let Some(node) = node_mut(handle).filter(|node| node.paged()) else {
+        return false;
+    };
+    let Some(address) = memfd_page(node, index, true).and_then(FrameLease::direct_map_address)
+    else {
+        return false;
+    };
+    // SAFETY: as in `read_cached_page`; the frame may be mapped into
+    // processes, which then see the page as the file now holds it.
+    unsafe { core::slice::from_raw_parts_mut(address as *mut u8, PAGE_SIZE) }.copy_from_slice(page);
+    true
+}
+
+/// Whether page cache `handle` holds page `index`.
+pub(crate) fn page_cached(handle: Handle, index: usize) -> bool {
+    node_mut(handle)
+        .filter(|node| node.paged())
+        .is_some_and(|node| memfd_page(node, index, false).is_some())
+}
+
+/// Frees a page cache whose frames were never handed out to be mapped
+/// (false for one that was: it stays until the overlay goes, as shared
+/// files do).
+pub(crate) fn release_page_cache(handle: Handle, file: Handle) -> bool {
+    if live().is_some_and(|overlay| handle_mapped(overlay, file)) {
+        return false;
+    }
+    let Some(node) =
+        node_mut(handle).filter(|node| node.origin == Origin::Pseudo && !node.frames_lent)
+    else {
+        return false;
+    };
+    if !release_node_data(node) {
+        return false;
+    }
+    *node = Node::EMPTY;
+    true
+}
+
+/// Whether a process maps `handle`'s file shared.
+pub(crate) fn mapped_shared(handle: Handle) -> bool {
+    live().is_some_and(|overlay| handle_mapped(overlay, handle))
+}
+
 /// Files that lost their last name, whose data [`reclaim_unlinked`] frees
 /// once nothing has them open: per domain instance.
 static UNLINKED: SpinLock<Vec<(usize, Handle)>> =
@@ -1994,10 +2189,11 @@ pub(crate) fn reclaim_unlinked(in_use: impl Fn(Handle) -> bool) {
             settled.push(handle);
             continue;
         }
-        // A paged file's frames may be mapped (shared, or copy-on-write
-        // into private mappings) where no registration says so; such a
-        // file stays until the overlay goes, as before.
-        if node.paged() {
+        // A paged file's frames, once handed out, may be mapped (shared, or
+        // copy-on-write into private mappings) where no registration says
+        // so; such a file stays until the overlay goes. One paged only to
+        // be read and written at random (a loop device's) goes.
+        if node.paged() && node.frames_lent {
             settled.push(handle);
             continue;
         }
@@ -2008,6 +2204,12 @@ pub(crate) fn reclaim_unlinked(in_use: impl Fn(Handle) -> bool) {
             continue;
         };
         if release_node_data(node) && release_xattr_pages(node.xattr_first) {
+            tmpfs_quota::release(
+                cpu::current_linux_execution_instance(),
+                node.path(),
+                u64::from(node.charged),
+                1,
+            );
             *node = Node::EMPTY;
             settled.push(handle);
         }

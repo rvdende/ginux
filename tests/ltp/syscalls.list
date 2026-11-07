@@ -223,8 +223,8 @@ fallocate01 fallocate01
 fallocate02 fallocate02
 fallocate03 fallocate03
 !fallocate04 fallocate04  # holes punched in a tmpfs file are not tracked (SEEK_HOLE finds none)
-!fallocate05 fallocate05  # tmpfs ignores size=: filling it exhausts the domain's memory
-!fallocate06 fallocate06  # tmpfs ignores size=: filling it exhausts the domain's memory
+!fallocate05 fallocate05  # punching a hole in a tmpfs file frees no blocks and leaves no hole SEEK_HOLE finds
+fallocate06 fallocate06  # auto: budget=210
 fsetxattr01 fsetxattr01
 fsetxattr02 fsetxattr02
 file_attr01 file_attr01
@@ -829,7 +829,7 @@ msgsnd06 msgsnd06
 msync01 msync01
 msync02 msync02
 msync03 msync03
-!msync04 msync04  # a shared mapping of an ext2 file is a copy, written back at msync and munmap
+msync04 msync04
 munlock01 munlock01
 munlock02 munlock02
 munlockall01 munlockall01
@@ -960,8 +960,8 @@ preadv201 preadv201
 preadv201_64 preadv201_64
 preadv202 preadv202
 preadv202_64 preadv202_64
-!preadv203 preadv203  # /proc/sys/vm/drop_caches is missing
-!preadv203_64 preadv203_64  # /proc/sys/vm/drop_caches is missing
+preadv203 preadv203  # budget=240 min_runtime 60 on each filesystem
+preadv203_64 preadv203_64  # budget=240 min_runtime 60 on each filesystem
 profil01 profil01
 process_vm_readv01 process_vm01 -r
 process_vm_readv02 process_vm_readv02

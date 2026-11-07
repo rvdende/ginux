@@ -7508,6 +7508,7 @@ pub(crate) fn stop_configured_container() {
     crate::linux_exe::forget_instance(X86_RUNTIME.LINUX_EXECUTION_INSTANCE.load(Ordering::SeqCst));
     crate::linux_areas::forget_instance(linux_execution_instance());
     crate::linux_mounts::forget_instance(linux_execution_instance());
+    crate::linux_tmpfs_quota::forget_instance(linux_execution_instance());
     linux_namespace::forget_instance(
         linux_execution_instance(),
         crate::linux_sysv_ipc::release_instance,
@@ -28190,7 +28191,7 @@ fn linux_shared_file_page(address: u64) -> Option<(crate::linux_overlay::Handle,
     if !area.shared {
         return None;
     }
-    let handle = crate::linux_overlay::paged_file(inode)?;
+    let handle = crate::linux_overlay::paged_file(device, inode)?;
     (linux_overlay_file_identity(handle)? == (device, inode)).then_some(())?;
     let offset = usize::try_from(offset.checked_add(address - area.start)?).ok()?;
     Some((handle, offset))
@@ -28899,11 +28900,15 @@ fn linux_fsync(descriptor: u64) -> u64 {
     if !linux_descriptor_open(descriptor) || linux_path_descriptor(descriptor) {
         return LINUX_EBADF;
     }
-    if linux_overlay_descriptor_handle(descriptor).is_some()
-        || linux_rootfs_entry(descriptor).is_some()
-    {
-        // Immutable OCI objects and RAM-backed overlay objects have no dirty
-        // data outside their authoritative backing store.
+    if let Some(handle) = linux_overlay_descriptor_handle(descriptor) {
+        // A volume's pages that shared mappings changed go to its disk; the
+        // overlay's files are their own backing store.
+        if crate::linux_blockfs::owns(handle) {
+            crate::linux_blockfs::write_back_all();
+        }
+        0
+    } else if linux_rootfs_entry(descriptor).is_some() {
+        // Immutable OCI objects have no dirty data.
         0
     } else {
         LINUX_EINVAL
@@ -31917,6 +31922,7 @@ fn linux_proc_sysctl_write_bytes(device: u16, index: usize, text: &[u8]) -> Resu
     let bounds = match LINUX_PROC_SYSCTLS[index].1 {
         b"sys/kernel/io_uring_disabled" => Some(0..=2),
         b"sys/fs/protected_hardlinks" | b"sys/fs/protected_symlinks" => Some(0..=1),
+        b"sys/vm/drop_caches" => Some(1..=4),
         b"sys/kernel/keys/maxkeys"
         | b"sys/kernel/keys/maxbytes"
         | b"sys/kernel/keys/root_maxkeys"
@@ -31941,6 +31947,9 @@ fn linux_proc_sysctl_write_bytes(device: u16, index: usize, text: &[u8]) -> Resu
                 Err(LINUX_EIO)
             };
         }
+    }
+    if LINUX_PROC_SYSCTLS[index].1 == b"sys/vm/drop_caches" && value & 1 != 0 {
+        crate::linux_blockfs::drop_caches();
     }
     LINUX_SYSCTL_OVERRIDES[slot][index].store(value, Ordering::Release);
     Ok(text.len())
@@ -38884,11 +38893,16 @@ fn linux_fallocate(descriptor: u64, mode: u64, offset: u64, length: u64) -> u64 
         }
         return 0;
     }
-    if mode & KEEP_SIZE != 0 {
-        return 0;
-    }
     if metadata.size < end as usize && linux_file_extension_limit(end as usize).is_err() {
         return LINUX_EFBIG;
+    }
+    // The allocated range counts against a tmpfs's size, with or without
+    // FALLOC_FL_KEEP_SIZE.
+    if !crate::linux_overlay::reserve(handle, end as usize) {
+        return LINUX_ENOSPC;
+    }
+    if mode & KEEP_SIZE != 0 {
+        return 0;
     }
     if metadata.size >= end as usize || crate::linux_overlay::truncate(handle, end as usize) {
         0
@@ -51125,7 +51139,7 @@ fn linux_descriptor_readv(descriptor: u64, vectors: u64, count: u64) -> u64 {
 
 /// preadv/pwritev and their v2 forms. x86-64 passes the whole offset in the
 /// low word and Linux ignores the high one. Regular files never block and are
-/// written through, so the priority, sync and no-wait flags change nothing.
+/// written through, so the priority and sync flags change nothing.
 /// A positioned write to a file opened with O_APPEND goes to its end, as
 /// Linux's does, unless RWF_NOAPPEND (which Rust's `write_at` passes) asks
 /// for the position.
@@ -51171,8 +51185,42 @@ fn linux_positioned_iov(
     } else {
         offset
     };
+    // RWF_NOWAIT reads only what a volume's page cache holds: none of it is
+    // EAGAIN, part of it a short read.
+    let mut cached = usize::MAX;
+    // Only a disk's files take RWF_NOWAIT (Linux's FMODE_NOWAIT): tmpfs and
+    // ramfs files, the overlay's, refuse it.
+    if flags & LINUX_RWF_NOWAIT != 0
+        && (linux_overlay_descriptor_handle(descriptor)
+            .is_some_and(|handle| !crate::linux_blockfs::owns(handle))
+            || linux_rootfs_entry(descriptor).is_some())
+    {
+        return LINUX_EOPNOTSUPP;
+    }
+    if !write && flags & LINUX_RWF_NOWAIT != 0 {
+        if let Some(handle) = linux_overlay_descriptor_handle(descriptor) {
+            let wanted = ranges[..vector_count]
+                .iter()
+                .map(|(_, length)| *length)
+                .sum::<usize>();
+            if let Some(bytes) = crate::linux_blockfs::cached_bytes(handle, offset as usize, wanted)
+            {
+                if bytes == 0 && wanted != 0 {
+                    let size = crate::linux_overlay::metadata(handle).map_or(0, |m| m.size);
+                    if (offset as usize) < size {
+                        return LINUX_EAGAIN;
+                    }
+                }
+                cached = bytes;
+            }
+        }
+    }
     let mut total = 0_u64;
     for (address, length) in ranges[..vector_count].iter().copied() {
+        let length = length.min(cached.saturating_sub(total as usize));
+        if length == 0 && cached != usize::MAX {
+            break;
+        }
         let result = if write {
             linux_regular_file_write_at(descriptor, address, length as u64, offset)
         } else {
@@ -58093,6 +58141,15 @@ fn linux_statfs(path_address: u64, stat_address: u64) -> u64 {
             linux_missing_path_error(&canonical[..length])
         });
     }
+    if let Some(data) =
+        canonical_length.and_then(|length| linux_tmpfs_statfs_data(&canonical[..length]))
+    {
+        return if copy_to_linux_user(stat_address, &data) {
+            0
+        } else {
+            LINUX_EFAULT
+        };
+    }
     if let Some(statfs) = overlay
         .map(|metadata| metadata.handle)
         .and_then(crate::linux_blockfs::statfs_of)
@@ -58126,7 +58183,7 @@ fn linux_mount_filesystem(
     target_address: u64,
     filesystem_address: u64,
     flags: u64,
-    _data_address: u64,
+    data_address: u64,
 ) -> u64 {
     const MS_RDONLY: u64 = 1;
     const MS_NOSUID: u64 = 2;
@@ -58300,6 +58357,21 @@ fn linux_mount_filesystem(
         {
             return error.wrapping_neg();
         }
+        // A tmpfs remount may change its size (EINVAL below what it uses).
+        match linux_tmpfs_mount_options(data_address) {
+            Ok(Some(options))
+                if options != crate::linux_tmpfs_quota::Options::default()
+                    && !crate::linux_tmpfs_quota::remounted(
+                        linux_execution_instance(),
+                        canonical_target,
+                        options,
+                    ) =>
+            {
+                return LINUX_EINVAL;
+            }
+            Err(error) => return error,
+            _ => {}
+        }
         return match crate::linux_mounts::remount(space, canonical_target, mount_flags) {
             Ok(()) => 0,
             Err(_) if flags & MS_BIND != 0 || linux_kernel_mount_point(canonical_target) => 0,
@@ -58389,6 +58461,11 @@ fn linux_mount_filesystem(
     if linux_kernel_mount_point(canonical_target) {
         return 0;
     }
+    let tmpfs_options = match linux_tmpfs_mount_options(data_address) {
+        Ok(options) => options,
+        Err(error) if filesystem == b"tmpfs" => return error,
+        Err(_) => None,
+    };
     // A new tmpfs's root is the mounter's, mode 1777, as in Linux; the
     // directory it covers gets its own attributes back at unmount.
     let tmpfs_root = matches!(filesystem, b"tmpfs" | b"ramfs" | b"devtmpfs")
@@ -58416,10 +58493,38 @@ fn linux_mount_filesystem(
                 let _ = crate::linux_overlay::set_mode(metadata.handle, 0o1777)
                     && crate::linux_overlay::set_owner(metadata.handle, owner, group);
             }
+            if let Some(options) = tmpfs_options.filter(|_| filesystem == b"tmpfs") {
+                let _ = crate::linux_tmpfs_quota::mounted(
+                    linux_execution_instance(),
+                    canonical_target,
+                    options,
+                );
+            }
             0
         }
         Err(_) => LINUX_ENOMEM,
     }
+}
+
+/// A tmpfs's size options in mount(2)'s `data` (`size=`, `nr_blocks=`,
+/// `nr_inodes=`): None without data; EINVAL for a malformed size.
+fn linux_tmpfs_mount_options(
+    data_address: u64,
+) -> Result<Option<crate::linux_tmpfs_quota::Options>, u64> {
+    if data_address == 0 {
+        return Ok(None);
+    }
+    let mut data = [0_u8; 512];
+    let length = match copy_linux_c_string(data_address, &mut data) {
+        Ok(length) => length,
+        // Data that is not a short string carries no size options.
+        Err(LINUX_ENAMETOOLONG) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let (total_frames, _) = linux_domain_frame_counts();
+    crate::linux_tmpfs_quota::parse(&data[..length], total_frames * PAGE_SIZE as u64)
+        .map(Some)
+        .ok_or(LINUX_EINVAL)
 }
 
 /// mount(2) of the ext2 filesystem on the block device at `source_address`
@@ -58491,13 +58596,18 @@ fn linux_mount_volume(source_address: u64, target: &[u8], options: u32) -> u64 {
                     crate::linux_loop::release(crate::linux_loop::CLASS_DEVICE, open);
                     return LINUX_EACCES;
                 }
-                Ok((backing, offset, size, _)) => crate::linux_blockfs::Source::Loop {
-                    minor,
-                    open,
-                    backing,
-                    offset,
-                    size,
-                },
+                Ok((backing, offset, size, _)) => {
+                    // A volume reads its disk all over: index the backing
+                    // file's pages rather than chaining them.
+                    let _ = crate::linux_overlay::make_paged(backing);
+                    crate::linux_blockfs::Source::Loop {
+                        minor,
+                        open,
+                        backing,
+                        offset,
+                        size,
+                    }
+                }
                 Err(_) => {
                     crate::linux_loop::release(crate::linux_loop::CLASS_DEVICE, open);
                     return LINUX_EINVAL;
@@ -58617,6 +58727,66 @@ pub(crate) fn linux_reclaim_unlinked_files() {
             linux_release_volume_device(source);
         }
     }
+}
+
+/// statfs(2)'s answer for canonical `path` when a tmpfs mount holds it:
+/// tmpfs's magic, and its size limits and use where it has them, else the
+/// domain's memory, as an unlimited tmpfs shows. None off a tmpfs.
+fn linux_tmpfs_statfs_data(path: &[u8]) -> Option<[u8; 120]> {
+    const TMPFS_MAGIC: u64 = 0x0102_1994;
+    const ST_RDONLY: u64 = 1;
+    const ST_NOSUID: u64 = 2;
+    const ST_NODEV: u64 = 4;
+    const ST_NOEXEC: u64 = 8;
+    const ST_VALID: u64 = 32;
+    const ST_RELATIME: u64 = 4096;
+    let space = linux_mount_space();
+    let id = crate::linux_mounts::mount_id_at(space, path);
+    let tmpfs = crate::linux_mounts::with_mount(space, id, |mount| {
+        !mount.bind && mount.filesystem == b"tmpfs"
+    })?;
+    if !tmpfs {
+        return None;
+    }
+    let (total_frames, free_frames) = linux_domain_frame_counts();
+    let (blocks, free, files, free_files) =
+        match crate::linux_tmpfs_quota::usage(linux_execution_instance(), path) {
+            Some((limit, used, inodes, used_inodes)) => {
+                let blocks = limit.unwrap_or(total_frames);
+                let files = inodes.unwrap_or(total_frames);
+                (
+                    blocks,
+                    blocks.saturating_sub(used),
+                    files,
+                    files.saturating_sub(used_inodes),
+                )
+            }
+            None => (total_frames, free_frames, total_frames, free_frames),
+        };
+    let options = crate::linux_mounts::flags_at(space, path);
+    let flags = [
+        (crate::linux_mounts::READ_ONLY, ST_RDONLY),
+        (crate::linux_mounts::NO_SUID, ST_NOSUID),
+        (crate::linux_mounts::NO_DEVICES, ST_NODEV),
+        (crate::linux_mounts::NO_EXEC, ST_NOEXEC),
+    ]
+    .into_iter()
+    .filter(|(option, _)| options & option != 0)
+    .fold(ST_VALID | ST_RELATIME, |flags, (_, flag)| flags | flag);
+    let mut stat = [0_u8; 120];
+    let block_size = crate::linux_tmpfs_quota::BLOCK_SIZE;
+    stat[0..8].copy_from_slice(&TMPFS_MAGIC.to_ne_bytes());
+    stat[8..16].copy_from_slice(&block_size.to_ne_bytes());
+    stat[16..24].copy_from_slice(&blocks.to_ne_bytes());
+    stat[24..32].copy_from_slice(&free.to_ne_bytes());
+    stat[32..40].copy_from_slice(&free.to_ne_bytes());
+    stat[40..48].copy_from_slice(&files.to_ne_bytes());
+    stat[48..56].copy_from_slice(&free_files.to_ne_bytes());
+    stat[56..60].copy_from_slice(&id.to_ne_bytes());
+    stat[64..72].copy_from_slice(&(crate::linux_overlay::NAME_MAX as u64).to_ne_bytes());
+    stat[72..80].copy_from_slice(&block_size.to_ne_bytes());
+    stat[80..88].copy_from_slice(&flags.to_ne_bytes());
+    Some(stat)
 }
 
 /// statfs(2)'s answer for a volume: ext2's counts, and the options of the
@@ -58800,6 +58970,7 @@ fn linux_umount(target_address: u64, flags: u64) -> u64 {
 /// A tmpfs mounted at canonical `path` went with its last mount: its files
 /// go, and the directory it covered gets its own attributes back.
 fn linux_filesystem_gone(path: &[u8], gone: crate::linux_mounts::Gone) {
+    crate::linux_tmpfs_quota::unmounted(linux_execution_instance(), path);
     crate::linux_overlay::unlink_below(path);
     if let Some((covered, metadata)) = gone.covered.zip(crate::linux_overlay::lookup(path)) {
         let _ = crate::linux_overlay::set_mode(metadata.handle, covered.mode)
@@ -59219,6 +59390,16 @@ fn linux_fstatfs(descriptor: u64, stat_address: u64) -> u64 {
         return LINUX_EBADF;
     }
     if let Some(handle) = linux_overlay_descriptor_handle(descriptor) {
+        let mut path = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+        if let Some(data) = crate::linux_overlay::copy_path(handle, &mut path)
+            .and_then(|length| linux_tmpfs_statfs_data(&path[..length]))
+        {
+            return if copy_to_linux_user(stat_address, &data) {
+                0
+            } else {
+                LINUX_EFAULT
+            };
+        }
         if let Some(statfs) = crate::linux_blockfs::statfs_of(handle) {
             let mut path = [0_u8; crate::linux_overlay::PATH_CAPACITY];
             let length = crate::linux_overlay::copy_path(handle, &mut path).unwrap_or(0);

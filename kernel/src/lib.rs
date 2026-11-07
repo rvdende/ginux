@@ -50,6 +50,7 @@ mod linux_socket;
 mod linux_strace;
 mod linux_sysv_ipc;
 mod linux_tmpfs;
+mod linux_tmpfs_quota;
 mod linux_user;
 mod linux_userfaultfd;
 mod machine_control;

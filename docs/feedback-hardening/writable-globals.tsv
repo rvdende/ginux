@@ -461,6 +461,8 @@ interior-mutable	kernel/src/linux_userfaultfd.rs	CONTEXTS	domain-runtime	allowli
 interior-mutable	kernel/src/linux_userfaultfd.rs	LIVE	domain-runtime	allowlist	none	atomic-live-context-count
 interior-mutable	kernel/src/linux_blockfs.rs	VOLUMES	domain-runtime	allowlist	none	ranked-mounted-volumes
 interior-mutable	kernel/src/linux_overlay.rs	UNLINKED	domain-runtime	allowlist	none	ranked-unlinked-files-awaiting-last-close
+interior-mutable	kernel/src/linux_tmpfs_quota.rs	LIMITS	domain-runtime	allowlist	none	ranked-tmpfs-size-limits
+interior-mutable	kernel/src/linux_tmpfs_quota.rs	COUNT	domain-runtime	allowlist	none	atomic-limit-count-fast-path
 interior-mutable	kernel/src/drivers/virtio_gpu.rs	THREE_D_CAPSETS	platform-device	allowlist	none	atomic-published-at-activation
 interior-mutable	kernel/src/drivers/virtio_gpu.rs	PCI_ADDRESS	platform-device	allowlist	none	atomic-published-at-activation
 interior-mutable	kernel/src/linux_mount.rs	MOUNT_RUNTIME	domain-runtime	allowlist	none	explicit-domain-mount-runtime-owner-root

@@ -34,6 +34,7 @@ use ginux_ext2::{Change, Error, Filesystem, Kind, Options, RenameMode, Timestamp
 
 use crate::arch::x86_64::cpu;
 use crate::linux_overlay::{Child, Handle, Metadata, NodeKind};
+use crate::memory;
 use crate::sync::{LockRank, SpinLock};
 
 /// Volume file generations: below the overlay's, which start at 2^31.
@@ -160,7 +161,25 @@ struct Volume {
     /// Unmounted lazily (MNT_DETACH) while files were open: no path leads
     /// to it, and it goes once they are closed.
     detached: bool,
+    /// The page cache: the pages of each file read lately or mapped
+    /// shared, in an overlay page cache node.
+    caches: BTreeMap<u32, Cache>,
+    /// Pages the caches hold, which [`CACHE_LIMIT`] bounds.
+    cached_pages: usize,
 }
+
+/// One file's cached pages.
+#[derive(Clone, Copy)]
+struct Cache {
+    pages: Handle,
+    /// Mapped shared since it was last written back: its pages may be
+    /// newer than the disk's.
+    mapped: bool,
+}
+
+/// Pages a volume's caches hold before unmapped ones are dropped: 32 MiB.
+const CACHE_LIMIT: usize = 8192;
+const PAGE: usize = 4096;
 
 struct Volumes {
     volumes: Vec<Volume>,
@@ -272,6 +291,155 @@ impl Volumes {
 }
 
 impl Volume {
+    /// The page cache of `inode`, made if `make`.
+    fn cache(&mut self, inode: u32, make: bool) -> Option<Cache> {
+        if let Some(cache) = self.caches.get(&inode) {
+            return Some(*cache);
+        }
+        if !make {
+            return None;
+        }
+        let size = self.filesystem.stat(inode).ok()?.size as usize;
+        let pages = crate::linux_overlay::create_page_cache(size)?;
+        let cache = Cache {
+            pages,
+            mapped: false,
+        };
+        self.caches.insert(inode, cache);
+        Some(cache)
+    }
+
+    /// Page `index` of `inode`, cached first if `populate`; None for a page
+    /// past the file's end.
+    fn page(&mut self, inode: u32, index: usize, populate: bool) -> Option<[u8; PAGE]> {
+        let mut page = [0_u8; PAGE];
+        if let Some(cache) = self.caches.get(&inode) {
+            if crate::linux_overlay::read_cached_page(cache.pages, index, &mut page) {
+                return Some(page);
+            }
+        }
+        let read = self
+            .filesystem
+            .read(inode, (index * PAGE) as u64, &mut page)
+            .ok()?;
+        if read == 0 {
+            return None;
+        }
+        if populate {
+            if self.cached_pages >= CACHE_LIMIT {
+                self.drop_caches(Some(inode));
+            }
+            if let Some(cache) = self.cache(inode, true) {
+                if crate::linux_overlay::fill_cached_page(cache.pages, index, &page) {
+                    self.cached_pages += 1;
+                }
+            }
+        }
+        Some(page)
+    }
+
+    /// Writes the pages of `inode`'s cache back to the disk if a shared
+    /// mapping may have changed them.
+    fn write_back(&mut self, inode: u32) {
+        let unmapped = !crate::linux_overlay::mapped_shared(Handle::volume(
+            self.inodes.get(&inode).copied().unwrap_or(0),
+            u64::from(inode),
+        ));
+        self.write_back_range(inode, 0, usize::MAX);
+        if unmapped {
+            if let Some(cache) = self.caches.get_mut(&inode) {
+                cache.mapped = false;
+            }
+        }
+    }
+
+    /// Writes back the cached pages of `inode` from byte `start` to `end`
+    /// that a shared mapping may have changed.
+    fn write_back_range(&mut self, inode: u32, start: usize, end: usize) {
+        let Some(cache) = self.caches.get(&inode).filter(|cache| cache.mapped) else {
+            return;
+        };
+        let pages = cache.pages;
+        let Ok(size) = self.filesystem.stat(inode).map(|stat| stat.size as usize) else {
+            return;
+        };
+        let mut page = [0_u8; PAGE];
+        for index in start / PAGE..end.min(size).div_ceil(PAGE) {
+            if crate::linux_overlay::read_cached_page(pages, index, &mut page) {
+                let length = (size - index * PAGE).min(PAGE);
+                let _ = self
+                    .filesystem
+                    .write(inode, (index * PAGE) as u64, &page[..length]);
+            }
+        }
+    }
+
+    /// Drops the page caches no shared mapping maps (but `keep`'s), after
+    /// writing back what mappings changed.
+    fn drop_caches(&mut self, keep: Option<u32>) {
+        let inodes: Vec<u32> = self.caches.keys().copied().collect();
+        for inode in inodes {
+            self.write_back(inode);
+            if Some(inode) == keep {
+                continue;
+            }
+            let file = Handle::volume(
+                self.inodes.get(&inode).copied().unwrap_or(0),
+                u64::from(inode),
+            );
+            if let Some(cache) = self.caches.get(&inode) {
+                if crate::linux_overlay::release_page_cache(cache.pages, file) {
+                    self.caches.remove(&inode);
+                }
+            }
+        }
+        // What stays is counted again from scratch as it fills.
+        self.cached_pages = 0;
+    }
+
+    /// Brings the cached pages of `inode` from `start` to `end` up to date
+    /// with the disk after a write, and the cache's size with the file's.
+    fn refresh_cache(&mut self, inode: u32, start: usize, end: usize) {
+        let Some(cache) = self.caches.get(&inode).copied() else {
+            return;
+        };
+        if let Ok(stat) = self.filesystem.stat(inode) {
+            let _ = crate::linux_overlay::resize_page_cache(cache.pages, stat.size as usize);
+        }
+        for index in start / PAGE..end.div_ceil(PAGE) {
+            if !crate::linux_overlay::page_cached(cache.pages, index) {
+                continue;
+            }
+            let mut page = [0_u8; PAGE];
+            if self
+                .filesystem
+                .read(inode, (index * PAGE) as u64, &mut page)
+                .is_ok()
+            {
+                let _ = crate::linux_overlay::fill_cached_page(cache.pages, index, &page);
+            }
+        }
+    }
+
+    /// Forgets `inode`'s cache (its file is gone, or the volume), whose
+    /// file had generation `generation`.
+    fn forget_cache(&mut self, inode: u32, generation: u32) {
+        if let Some(cache) = self.caches.remove(&inode) {
+            let file = Handle::volume(generation, u64::from(inode));
+            let _ = crate::linux_overlay::release_page_cache(cache.pages, file);
+        }
+    }
+
+    /// Writes back and forgets every cache (the volume goes).
+    fn forget_caches(&mut self) {
+        let inodes: Vec<u32> = self.caches.keys().copied().collect();
+        for inode in inodes {
+            self.write_back(inode);
+            let generation = self.inodes.get(&inode).copied().unwrap_or(0);
+            self.forget_cache(inode, generation);
+        }
+    }
+
     /// Whether paths of `instance` reach the volume.
     fn visible(&self, instance: usize) -> bool {
         self.instance == instance && !self.detached
@@ -623,7 +791,21 @@ pub(crate) fn read(handle: Handle, offset: usize, output: &mut [u8]) -> Option<u
     let (volume, inode) = table.of(handle)?;
     let filesystem = &mut volume.filesystem;
     match filesystem.stat(inode).ok()?.kind {
-        Kind::File => filesystem.read(inode, offset as u64, output).ok(),
+        Kind::File => {
+            // Through the page cache, which reads fill.
+            let size = filesystem.stat(inode).ok()?.size as usize;
+            let end = offset.saturating_add(output.len()).min(size);
+            let mut position = offset;
+            while position < end {
+                let within = position % PAGE;
+                let length = (end - position).min(PAGE - within);
+                let page = volume.page(inode, position / PAGE, true)?;
+                output[position - offset..position - offset + length]
+                    .copy_from_slice(&page[within..within + length]);
+                position += length;
+            }
+            Some(end.saturating_sub(offset))
+        }
         Kind::Symlink => {
             let mut target = [0; 4096];
             let length = filesystem.read_link(inode, &mut target).ok()?;
@@ -636,12 +818,104 @@ pub(crate) fn read(handle: Handle, offset: usize, output: &mut [u8]) -> Option<u
     }
 }
 
+/// The frame holding page `index` of `handle`'s file in the page cache
+/// (cached first if `load`): what a shared mapping of the page maps.
+pub(crate) fn cached_frame(handle: Handle, index: usize, load: bool) -> Option<memory::FrameLease> {
+    let mut table = VOLUMES.lock();
+    let (volume, inode) = table.of(handle)?;
+    let cache = volume.cache(inode, load)?;
+    if load && !crate::linux_overlay::page_cached(cache.pages, index) {
+        // A page past the end maps as zeros, as a hole would.
+        let page = volume.page(inode, index, false).unwrap_or([0; PAGE]);
+        if !crate::linux_overlay::fill_cached_page(cache.pages, index, &page) {
+            return None;
+        }
+        volume.cached_pages += 1;
+    }
+    if load {
+        crate::linux_overlay::memfd_frame(cache.pages, index)
+    } else {
+        crate::linux_overlay::paged_frame(cache.pages, index)
+    }
+}
+
+/// mmap(MAP_SHARED) of `handle`'s file: its mappings map its cached pages,
+/// which go back to the disk at msync, fsync, sync and unmount.
+pub(crate) fn map_shared(handle: Handle) -> bool {
+    let mut table = VOLUMES.lock();
+    let Some((volume, inode)) = table.of(handle) else {
+        return false;
+    };
+    if volume.filesystem.stat(inode).map(|stat| stat.kind) != Ok(Kind::File) {
+        return false;
+    }
+    match volume.cache(inode, true) {
+        Some(_) => {
+            if let Some(cache) = volume.caches.get_mut(&inode) {
+                cache.mapped = true;
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+/// The volume file with cached pages that is `inode` on device `device`.
+pub(crate) fn cached_file(device: u64, inode: u64) -> Option<Handle> {
+    let mut table = VOLUMES.lock();
+    let index = table.volumes.iter().position(|volume| {
+        u64::from(volume.source.device()) == device
+            && u32::try_from(inode).is_ok_and(|inode| volume.caches.contains_key(&inode))
+    })?;
+    Some(table.handle(index, u32::try_from(inode).ok()?))
+}
+
+/// How many bytes of `handle`'s file from `offset` (up to `length`) the
+/// page cache holds: what an RWF_NOWAIT read may read without the disk.
+pub(crate) fn cached_bytes(handle: Handle, offset: usize, length: usize) -> Option<usize> {
+    let mut table = VOLUMES.lock();
+    let (volume, inode) = table.of(handle)?;
+    let size = volume.filesystem.stat(inode).ok()?.size as usize;
+    let end = offset.saturating_add(length).min(size);
+    let Some(cache) = volume.cache(inode, false) else {
+        return Some(0);
+    };
+    let mut position = offset;
+    while position < end && crate::linux_overlay::page_cached(cache.pages, position / PAGE) {
+        position = (position / PAGE + 1) * PAGE;
+    }
+    Some(position.min(end).saturating_sub(offset))
+}
+
+/// Writes back what shared mappings changed, on every volume (msync,
+/// fsync, sync).
+pub(crate) fn write_back_all() {
+    for volume in &mut VOLUMES.lock().volumes {
+        let inodes: Vec<u32> = volume.caches.keys().copied().collect();
+        for inode in inodes {
+            volume.write_back(inode);
+        }
+    }
+}
+
+/// /proc/sys/vm/drop_caches: drops the cached pages no shared mapping
+/// maps, as Linux drops clean page cache.
+pub(crate) fn drop_caches() {
+    for volume in &mut VOLUMES.lock().volumes {
+        volume.drop_caches(None);
+    }
+}
+
 /// Writes `handle`'s file at `offset` and marks it modified.
 pub(crate) fn write(handle: Handle, offset: usize, input: &[u8]) -> Option<usize> {
     let now = now();
     let mut table = VOLUMES.lock();
     let (volume, inode) = table.of(handle)?;
+    // Pages a mapping changed go to the disk first, so the write lands on
+    // them.
+    volume.write_back_range(inode, offset, offset.saturating_add(input.len()));
     let written = volume.filesystem.write(inode, offset as u64, input).ok()?;
+    volume.refresh_cache(inode, offset, offset + written);
     if written != 0 {
         let _ = volume.filesystem.change(
             inode,
@@ -658,7 +932,13 @@ pub(crate) fn write(handle: Handle, offset: usize, input: &[u8]) -> Option<usize
 pub(crate) fn truncate(handle: Handle, size: usize) -> Option<bool> {
     let mut table = VOLUMES.lock();
     let (volume, inode) = table.of(handle)?;
-    Some(volume.filesystem.truncate(inode, size as u64).is_ok())
+    volume.write_back(inode);
+    let truncated = volume.filesystem.truncate(inode, size as u64).is_ok();
+    if let Some(cache) = volume.cache(inode, false) {
+        // Cut-off pages read as zeros if the file grows again.
+        let _ = crate::linux_overlay::truncate(cache.pages, size);
+    }
+    Some(truncated)
 }
 
 /// Applies `change` to `handle`'s file.
@@ -1013,6 +1293,8 @@ pub(crate) fn reclaim(in_use: impl Fn(u32) -> bool) -> Vec<Source> {
         volume.temporaries.remove(&inode);
         volume.fifo_sockets.remove(&inode);
         volume.paths.remove(&inode);
+        let generation = volume.inodes.get(&inode).copied().unwrap_or(0);
+        volume.forget_cache(inode, generation);
         if let Some(generation) = volume.inodes.remove(&inode) {
             volume.generations.remove(&generation);
         }
@@ -1035,6 +1317,7 @@ fn finish_detached(ids: &[u64]) -> Vec<Source> {
     let now = now();
     gone.into_iter()
         .filter_map(|mut volume| {
+            volume.forget_caches();
             for inode in core::mem::take(&mut volume.orphans) {
                 let _ = volume.filesystem.release(inode, now);
             }
@@ -1106,6 +1389,8 @@ pub(crate) fn mount(
         temporaries: BTreeMap::new(),
         fifo_sockets: BTreeMap::new(),
         detached: false,
+        caches: BTreeMap::new(),
+        cached_pages: 0,
     });
     Ok(())
 }
@@ -1146,6 +1431,7 @@ pub(crate) fn unmount(point: &[u8]) -> Option<Result<Source, Errno>> {
     let mut volume = table.volumes.remove(index);
     drop(table);
     let now = now();
+    volume.forget_caches();
     for inode in core::mem::take(&mut volume.orphans) {
         let _ = volume.filesystem.release(inode, now);
     }
@@ -1174,6 +1460,10 @@ pub(crate) fn remount(point: &[u8], read_only: bool) -> Option<Result<(), Errno>
 /// Writes every volume's superblock counts (sync(2), syncfs(2)).
 pub(crate) fn sync_all() {
     for volume in &mut VOLUMES.lock().volumes {
+        let inodes: Vec<u32> = volume.caches.keys().copied().collect();
+        for inode in inodes {
+            volume.write_back(inode);
+        }
         let _ = volume.filesystem.sync();
     }
 }

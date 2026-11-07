@@ -162,6 +162,15 @@ feature rather than a fix:
   `/opt/ltp/disk-tmpdir.sh`, which gives it a TMPDIR on an ext2 volume of
   its own (the domain's /tmp is the overlay, device 0). The device tests
   still skipped in `syscalls.list` say what they lack.
+- **Page cache and tmpfs limits**: a volume's file data goes through a
+  page cache (`linux_blockfs`, frames in overlay page-cache nodes) that
+  reads fill and `/proc/sys/vm/drop_caches` empties, so RWF_NOWAIT reads
+  only cached pages (preadv203) and shared mappings of ext2 files map the
+  cached pages, written back at msync, fsync, sync and unmount. A tmpfs
+  mounted with `size=`, `nr_blocks=` or `nr_inodes=`
+  (`linux_tmpfs_quota.rs`) fills to ENOSPC instead of exhausting memory
+  (fallocate06); holes punched in its files are not tracked yet
+  (fallocate04, fallocate05).
 - **Memory details**: mmap, madvise, mremap, msync, mlock and mseal
   corner cases, `/proc/self/smaps`, `/proc/PID/pagemap`. A Linux
   process's first 4 GiB hold only the kernel's own 2 MiB regions (its
