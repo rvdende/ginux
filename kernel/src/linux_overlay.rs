@@ -70,8 +70,8 @@ pub(crate) struct Metadata {
     pub(crate) atime: (i64, i64),
     pub(crate) mtime: (i64, i64),
     pub(crate) ctime: (i64, i64),
-    /// The device of the filesystem the file is on (stat's st_dev): 0 for
-    /// the overlay's own files.
+    /// The device of the filesystem the file is on (stat's st_dev): the
+    /// root filesystem's (0:1) for the overlay's own files.
     pub(crate) filesystem: u32,
     /// Space used, in 512-byte sectors (stat's st_blocks).
     pub(crate) sectors: u64,
@@ -309,7 +309,8 @@ impl Node {
             atime: self.atime,
             mtime: self.mtime,
             ctime: self.ctime,
-            // A tmpfs's files show its device.
+            // A tmpfs's files show its device, the root's files the
+            // root's.
             filesystem: crate::linux_mount_paths::device_of(&self.path),
             // A paged file has holes: only its pages count.
             sectors: if self.paged() {
@@ -983,16 +984,19 @@ pub(crate) fn sole_shared_mapping(handle: Handle, offset: usize, pid: u32, addre
 /// the file a shared mapping recorded by inode maps.
 pub(crate) fn paged_file(device: u64, inode: u64) -> Option<Handle> {
     // A file on a disk is a volume's, mapped through its page cache.
-    if device != 0 {
-        return blockfs::cached_file(device, inode);
+    if let Some(handle) = blockfs::cached_file(device, inode) {
+        return Some(handle);
     }
+    // Else an overlay file with that identity: the root filesystem's, or
+    // a tmpfs's or ramfs's (each with its own device).
     let overlay = live()?;
     for_each_node(overlay, |node| {
         (node.handle.inode == inode
             && node.alias_of.is_none()
             && node.kind == NodeKind::File
-            && node.paged())
-        .then_some(node.handle)
+            && node.paged()
+            && u64::from(crate::linux_mount_paths::device_of(&node.path)) == device)
+            .then_some(node.handle)
     })
 }
 

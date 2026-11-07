@@ -83,11 +83,18 @@ pub(crate) fn storage_device(number: u32) -> u32 {
     (minor & 0xff) | ((minor & !0xff) << 12)
 }
 
-/// The device of the files stored below storage path `path`, 0 for the
-/// root filesystem's.
+/// The root filesystem's device, 0:1, as /proc/self/mountinfo and
+/// statmount name the root mount's.
+pub(crate) const ROOT_DEVICE: u32 = 1;
+
+/// The device (stat's st_dev) of an overlay file at storage path `path`:
+/// its filesystem's below a storage root, else the root filesystem's.
+/// Every identity the kernel keeps for a file (stat, memory areas, the
+/// shared mappings' lookup in `linux_overlay::paged_file`) comes from
+/// here, so they agree.
 pub(crate) fn device_of(path: &[u8]) -> u32 {
     let Some(rest) = path.strip_prefix(&[0]) else {
-        return 0;
+        return ROOT_DEVICE;
     };
     let digits = rest.iter().take_while(|byte| byte.is_ascii_digit());
     let number = digits.fold(0_u32, |number, digit| {
