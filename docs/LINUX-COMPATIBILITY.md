@@ -279,7 +279,14 @@ user-session keyrings, shared at fork and thread creation and dropped at
 exec; links, moves, restrictions, searches and negative keys from
 `request_key` with callout data. There are no upcalls, so instantiation is
 EPERM, and Diffie-Hellman, public-key and persistent-keyring operations are
-EOPNOTSUPP. `/proc/keys` and the key quota sysctls are not served yet.
+EOPNOTSUPP. `/proc/keys` lists the keys the reader may view and
+`/proc/key-users` each user's key count and quota usage; the quotas are
+the domain's `/proc/sys/kernel/keys/{maxkeys,maxbytes,root_maxkeys,root_maxbytes}`.
+The domain's `fs.protected_hardlinks` and `fs.protected_symlinks` (off by
+default, as Linux boots) restrict links as Linux's: a hard link to a file
+the caller neither owns nor may read and write is EPERM, and following a
+symlink in a sticky, world-writable directory that neither the follower
+nor the directory's owner owns is EACCES.
 Socket descriptor lookup and descriptor-local status flags now convert the
 Linux `int` descriptor from its low 32 register bits for the complete socket
 operation family. The live system-init TCP/AF_UNIX lifecycle includes dirty

@@ -31837,8 +31837,19 @@ fn linux_proc_sysctl_write_bytes(device: u16, index: usize, text: &[u8]) -> Resu
         .next()
         .and_then(|text| linux_parse_kernel_integer(text.trim_ascii()))
         .ok_or(LINUX_EINVAL)?;
-    // io_uring_disabled takes 0, 1 or 2 (proc_dointvec_minmax).
-    if LINUX_PROC_SYSCTLS[index].1 == b"sys/kernel/io_uring_disabled" && !(0..=2).contains(&value) {
+    // Values with bounds (proc_dointvec_minmax): io_uring_disabled is 0, 1
+    // or 2, the link restrictions are off or on, and key quotas are from 1
+    // to INT_MAX.
+    let bounds = match LINUX_PROC_SYSCTLS[index].1 {
+        b"sys/kernel/io_uring_disabled" => Some(0..=2),
+        b"sys/fs/protected_hardlinks" | b"sys/fs/protected_symlinks" => Some(0..=1),
+        b"sys/kernel/keys/maxkeys"
+        | b"sys/kernel/keys/maxbytes"
+        | b"sys/kernel/keys/root_maxkeys"
+        | b"sys/kernel/keys/root_maxbytes" => Some(1..=i64::from(i32::MAX)),
+        _ => None,
+    };
+    if bounds.is_some_and(|bounds| !bounds.contains(&value)) {
         return Err(LINUX_EINVAL);
     }
     if let Some(number) = linux_net_sysctl_number(index) {
@@ -31911,6 +31922,8 @@ fn linux_proc_root_file_kind(name: &[u8]) -> Option<u16> {
         b"loadavg" => Some(LINUX_FILE_PROC_LOADAVG),
         b"filesystems" => Some(LINUX_FILE_PROC_FILESYSTEMS),
         b"modules" => Some(LINUX_FILE_PROC_MODULES),
+        b"keys" => Some(LINUX_FILE_PROC_KEYS),
+        b"key-users" => Some(LINUX_FILE_PROC_KEY_USERS),
         b"config.gz" => Some(LINUX_FILE_PROC_CONFIG),
         b"cmdline" => Some(LINUX_FILE_PROC_CMDLINE),
         b"sysrq-trigger" => Some(LINUX_FILE_PROC_SYSRQ_TRIGGER),
@@ -32088,6 +32101,46 @@ fn linux_proc_sysvipc_read(state: u16, address: u64, count: u64, offset: u64) ->
         .saturating_add(usize::try_from(count).unwrap_or(usize::MAX))
         .min(used);
     if copy_to_linux_user(address, &file[start..end]) {
+        (end - start) as u64
+    } else {
+        LINUX_EFAULT
+    }
+}
+
+/// Whether a descriptor state names /proc/keys or /proc/key-users.
+fn linux_proc_keys_file(state: u16) -> bool {
+    matches!(state & !3, LINUX_FILE_PROC_KEYS | LINUX_FILE_PROC_KEY_USERS)
+}
+
+/// The text of /proc/keys (the domain's keys the caller may view) or
+/// /proc/key-users (each user's key count and quota usage).
+fn linux_proc_keys_contents(state: u16) -> Result<Vec<u8>, u64> {
+    let now = linux_key_clock();
+    linux_with_keys(|keys, caller| {
+        if state & !3 == LINUX_FILE_PROC_KEYS {
+            keys.proc_keys(caller, now)
+        } else {
+            keys.proc_key_users()
+        }
+    })
+}
+
+/// Reads /proc/keys or /proc/key-users from `offset`.
+fn linux_proc_keys_read(state: u16, address: u64, count: u64, offset: u64) -> u64 {
+    let text = match linux_proc_keys_contents(state) {
+        Ok(text) => text,
+        Err(error) => return error,
+    };
+    let Ok(start) = usize::try_from(offset) else {
+        return 0;
+    };
+    if start >= text.len() || count == 0 {
+        return 0;
+    }
+    let end = start
+        .saturating_add(usize::try_from(count).unwrap_or(usize::MAX))
+        .min(text.len());
+    if copy_to_linux_user(address, &text[start..end]) {
         (end - start) as u64
     } else {
         LINUX_EFAULT
@@ -35632,6 +35685,7 @@ fn linux_walk_path_components(
         if *followed > LINK_LIMIT {
             return Err(LINUX_ELOOP);
         }
+        linux_check_follow_link(&output[..length], link.owner)?;
         // The target is kept on the heap, at its own length: the walk
         // recurses into it, as deep as links lead to links.
         let mut target = Vec::new();
@@ -35670,6 +35724,7 @@ fn linux_overlay_lookup_following(
         else {
             return Ok((length, followed != 0, metadata));
         };
+        linux_check_follow_link(&canonical[..length], link.owner)?;
         let mut target = [0_u8; crate::linux_overlay::PATH_CAPACITY];
         let target_length =
             crate::linux_overlay::read(link.handle, 0, &mut target).ok_or(LINUX_EIO)?;
@@ -35682,6 +35737,66 @@ fn linux_overlay_lookup_following(
         canonical[..length].copy_from_slice(&resolved[..length]);
     }
     Err(LINUX_ELOOP)
+}
+
+/// fs.protected_symlinks (Linux's may_follow_link): while it is on, a
+/// symlink in a sticky, world-writable directory is followed only by its
+/// owner, or when the directory's owner owns it too; anyone else gets
+/// EACCES. Root is held to it like everyone.
+fn linux_check_follow_link(path: &[u8], link_owner: u32) -> Result<(), u64> {
+    if linux_proc_sysctl_value(b"sys/fs/protected_symlinks").unwrap_or(0) == 0 {
+        return Ok(());
+    }
+    let Some(credentials) = current_linux_credentials() else {
+        return Ok(());
+    };
+    if credentials.user.filesystem == link_owner {
+        return Ok(());
+    }
+    let Some(directory) = linux_path_access(linux_parent_path(path)) else {
+        return Ok(());
+    };
+    const STICKY_WORLD_WRITABLE: u32 = 0o1002;
+    if directory.mode & STICKY_WORLD_WRITABLE != STICKY_WORLD_WRITABLE
+        || directory.owner == link_owner
+    {
+        return Ok(());
+    }
+    Err(LINUX_EACCES)
+}
+
+/// fs.protected_hardlinks (Linux's may_linkat): while it is on, only the
+/// file's owner, root, or a caller who may read and write the file (a
+/// regular file neither set-user-ID nor executable set-group-ID) may give
+/// it another name; others get EPERM.
+fn linux_check_hardlink_source(source: crate::linux_overlay::Metadata) -> Result<(), u64> {
+    const SET_USER_ID: u32 = 0o4000;
+    const SET_GROUP_ID: u32 = 0o2000;
+    const GROUP_EXECUTE: u32 = 0o010;
+    if linux_proc_sysctl_value(b"sys/fs/protected_hardlinks").unwrap_or(0) == 0 {
+        return Ok(());
+    }
+    let Some(credentials) = current_linux_credentials() else {
+        return Ok(());
+    };
+    if credentials.user.filesystem == source.owner || credentials.filesystem_privileged() {
+        return Ok(());
+    }
+    let safe = source.kind == crate::linux_overlay::NodeKind::File
+        && source.mode & SET_USER_ID == 0
+        && source.mode & (SET_GROUP_ID | GROUP_EXECUTE) != SET_GROUP_ID | GROUP_EXECUTE;
+    let readable_writable = safe
+        && linux_check_access(
+            Some(linux_overlay_file_access(source)),
+            ginux_credentials::access::READ | ginux_credentials::access::WRITE,
+            false,
+        )
+        .is_ok();
+    if readable_writable {
+        Ok(())
+    } else {
+        Err(LINUX_EPERM)
+    }
 }
 
 /// The canonical path a symlink at canonical `link` leads to: its `target`,
@@ -36276,6 +36391,11 @@ fn linux_openat_path(
         if flags & LINUX_O_NOFOLLOW != 0 || followed > LINK_LIMIT {
             return LINUX_ELOOP;
         }
+        if let Err(error) =
+            linux_check_follow_link(&canonical[..canonical_length.unwrap_or(0)], link.owner)
+        {
+            return error;
+        }
         let mut target = [0_u8; crate::linux_overlay::PATH_CAPACITY];
         let Some(target_length) = crate::linux_overlay::read(link.handle, 0, &mut target) else {
             return LINUX_EIO;
@@ -36310,6 +36430,9 @@ fn linux_openat_path(
         let Some(link_path_length) = canonical_length else {
             return LINUX_ENOENT;
         };
+        if let Err(error) = linux_check_follow_link(&canonical[..link_path_length], entry.owner) {
+            return error;
+        }
         let mut target = [0_u8; crate::linux_overlay::PATH_CAPACITY];
         let target_length = if entry.link.starts_with(b"/") {
             if entry.link.len() >= target.len() {
@@ -36450,9 +36573,23 @@ fn linux_openat_path(
         if !linux_overlay_parent_exists(&canonical[..length]) {
             return linux_missing_path_error(&canonical[..length]);
         }
+        // A file the image has is copied up with its mode and owner, as a
+        // write to it on Linux keeps them (useradd rewrites /etc/passwd from
+        // what fstat says); only a new file takes the creation mode.
+        let image_file = rootfs_at_path.and_then(|(_, entry)| entry).filter(|entry| {
+            matches!(
+                entry.kind,
+                crate::published_rootfs::EntryKind::File
+                    | crate::published_rootfs::EntryKind::Hardlink
+            )
+        });
+        let permissions = image_file.map_or_else(
+            || (mode as u32) & !(X86_RUNTIME.ELF_PROBE_UMASK.load(Ordering::SeqCst) as u32),
+            |entry| linux_rootfs_mode(entry) & 0o7777,
+        );
         let Some(handle) = crate::linux_overlay::create_file(
             &canonical[..length],
-            (mode as u32) & !(X86_RUNTIME.ELF_PROBE_UMASK.load(Ordering::SeqCst) as u32),
+            permissions,
             if flags & LINUX_O_TRUNC != 0 {
                 &[]
             } else {
@@ -36461,6 +36598,9 @@ fn linux_openat_path(
         ) else {
             return LINUX_ENOSPC;
         };
+        if let Some(entry) = image_file {
+            crate::linux_overlay::set_owner(handle, entry.owner, entry.group);
+        }
         overlay_handle = Some(handle);
         created = rootfs_at_path.is_none();
     } else if canonical_length.is_some()
@@ -38143,6 +38283,9 @@ fn linux_linkat(
     if let Some(source) = source {
         if source.kind == crate::linux_overlay::NodeKind::Directory {
             return LINUX_EPERM;
+        }
+        if let Err(error) = linux_check_hardlink_source(source) {
+            return error;
         }
         if crate::linux_overlay::create_link(destination, source.handle) {
             return 0;
@@ -42459,6 +42602,8 @@ fn linux_descriptor_read(descriptor: u64, address: u64, count: u64) -> u64 {
             | LINUX_FILE_PROC_SYSVIPC_MSG
             | LINUX_FILE_PROC_SYSVIPC_SHM
             | LINUX_FILE_PROC_SYSVIPC_SEM
+            | LINUX_FILE_PROC_KEYS
+            | LINUX_FILE_PROC_KEY_USERS
             | LINUX_FILE_PROC_STAT
             | LINUX_FILE_PROC_DYNAMIC_STAT
             | LINUX_FILE_PROC_DYNAMIC_STATUS
@@ -42667,6 +42812,9 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
     }
     if linux_proc_sysvipc_file(state) {
         return linux_proc_sysvipc_read(state, address, count, offset);
+    }
+    if linux_proc_keys_file(state) {
+        return linux_proc_keys_read(state, address, count, offset);
     }
     if state & !3 == LINUX_FILE_PROC_TASK_STAT {
         return linux_proc_task_stat_read(descriptor, address, count, offset);
@@ -51751,6 +51899,8 @@ fn linux_proc_file(state: u16) -> bool {
             | LINUX_FILE_PROC_LOADAVG
             | LINUX_FILE_PROC_FILESYSTEMS
             | LINUX_FILE_PROC_MODULES
+            | LINUX_FILE_PROC_KEYS
+            | LINUX_FILE_PROC_KEY_USERS
             | LINUX_FILE_PROC_CONFIG
             | LINUX_FILE_PROC_CMDLINE
             | LINUX_FILE_PROC_PID1_STAT
@@ -52148,6 +52298,8 @@ fn linux_regular_file_inode(state: u16) -> Option<u64> {
         LINUX_FILE_PROC_LOADAVG => return Some(29),
         LINUX_FILE_PROC_FILESYSTEMS => return Some(30),
         LINUX_FILE_PROC_MODULES => return Some(99),
+        LINUX_FILE_PROC_KEYS => return Some(51),
+        LINUX_FILE_PROC_KEY_USERS => return Some(52),
         LINUX_FILE_PROC_CONFIG => return Some(97),
         LINUX_FILE_PROC_CMDLINE => return Some(31),
         LINUX_FILE_PROC_PID1_STAT => return Some(32),
@@ -58029,6 +58181,8 @@ fn linux_file_size(state: u16) -> u64 {
     } else if linux_proc_sysvipc_file(state) {
         let mut file = [0_u8; LINUX_PROC_SYSVIPC_CAPACITY];
         linux_proc_sysvipc_contents(state, &mut file).unwrap_or(0) as u64
+    } else if linux_proc_keys_file(state) {
+        linux_proc_keys_contents(state).map_or(0, |text| text.len() as u64)
     } else if state & !3 == LINUX_FILE_PROC_CPUINFO {
         let count = linux_available_cpu_count();
         let mut record = [0_u8; 768];
@@ -58474,7 +58628,29 @@ fn linux_with_keys<R>(
         tid,
         privileged,
     };
-    crate::linux_keyring::with(|keys| operation(keys, &caller)).map_err(linux_key_error)
+    let limits = linux_key_limits();
+    crate::linux_keyring::with(|keys| {
+        keys.set_limits(limits)?;
+        operation(keys, &caller)
+    })
+    .map_err(linux_key_error)
+}
+
+/// The domain's key quotas: /proc/sys/kernel/keys as written, else Linux's
+/// defaults.
+fn linux_key_limits() -> ginux_keyrings::Limits {
+    let defaults = ginux_keyrings::Limits::LINUX;
+    let value = |path: &[u8], default: u32| {
+        linux_proc_sysctl_value(path)
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(default)
+    };
+    ginux_keyrings::Limits {
+        root_max_keys: value(b"sys/kernel/keys/root_maxkeys", defaults.root_max_keys),
+        root_max_bytes: value(b"sys/kernel/keys/root_maxbytes", defaults.root_max_bytes),
+        max_keys: value(b"sys/kernel/keys/maxkeys", defaults.max_keys),
+        max_bytes: value(b"sys/kernel/keys/maxbytes", defaults.max_bytes),
+    }
 }
 
 /// The kernel clock the key service measures timeouts with.

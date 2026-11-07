@@ -6,6 +6,4 @@
 # From target/ltp-results.txt (2026-11-03), list=tests/ltp/syscalls.list ltp=20260930 kernel=468a6a67.
 ioctl_loop05 TBROK
 msgstress01 TBROK
-prot_hsymlinks TBROK
 futex_cmp_requeue01 TBROK
-add_key05 TBROK

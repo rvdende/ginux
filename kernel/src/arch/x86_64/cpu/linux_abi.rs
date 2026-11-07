@@ -767,7 +767,7 @@ pub(super) const LINUX_FILE_PROC_TASK_STAT: u16 = LINUX_FILE_MASK | LINUX_PROC_T
 pub(super) const LINUX_AIO_MAX_NR: u64 = 65_536;
 /// `/proc/sys/vm/max_map_count`: the most memory areas a process may have.
 pub(super) const LINUX_MAX_MAP_COUNT: usize = 65_530;
-pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 42] = [
+pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 46] = [
     // The most memory areas a process may have (LINUX_MAX_MAP_COUNT).
     (0xa000, b"sys/vm/max_map_count", b"65530\n"),
     // The random pool is always full, as Linux reports it since 5.18.
@@ -834,6 +834,14 @@ pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 42] = [
     (0xc500, b"sys/fs/inotify/max_user_watches", b"65536\n"),
     (0xc600, b"sys/kernel/keys/root_maxkeys", b"1000000\n"),
     (0xc700, b"sys/kernel/keys/root_maxbytes", b"25000000\n"),
+    // The key quotas of users other than root (linux_key_limits).
+    (0x9a00, b"sys/kernel/keys/maxkeys", b"200\n"),
+    (0x9b00, b"sys/kernel/keys/maxbytes", b"20000\n"),
+    // Link restrictions in sticky, world-writable directories (off, as
+    // Linux boots; distributions turn them on): linux_check_hardlink_source
+    // and linux_check_follow_link.
+    (0x9c00, b"sys/fs/protected_hardlinks", b"0\n"),
+    (0x9d00, b"sys/fs/protected_symlinks", b"0\n"),
 ];
 pub(super) const LINUX_PROC_CPUINFO_NODE: u16 = 0xf800;
 pub(super) const LINUX_FILE_PROC_CPUINFO: u16 = LINUX_FILE_MASK | LINUX_PROC_CPUINFO_NODE;
@@ -853,6 +861,12 @@ pub(super) const LINUX_FILE_PROC_FILESYSTEMS: u16 = LINUX_FILE_MASK | LINUX_PROC
 /// in, as /lib/modules/RELEASE/modules.builtin lists it).
 pub(super) const LINUX_PROC_MODULES_NODE: u16 = 0xba00;
 pub(super) const LINUX_FILE_PROC_MODULES: u16 = LINUX_FILE_MASK | LINUX_PROC_MODULES_NODE;
+/// /proc/keys and /proc/key-users: the domain's keys a reader may view,
+/// and each user's key count and quota (ginux_keyrings).
+pub(super) const LINUX_PROC_KEYS_NODE: u16 = 0x9e00;
+pub(super) const LINUX_FILE_PROC_KEYS: u16 = LINUX_FILE_MASK | LINUX_PROC_KEYS_NODE;
+pub(super) const LINUX_PROC_KEY_USERS_NODE: u16 = 0x9f00;
+pub(super) const LINUX_FILE_PROC_KEY_USERS: u16 = LINUX_FILE_MASK | LINUX_PROC_KEY_USERS_NODE;
 /// /proc/config.gz: Ginux's kernel configuration (`kernel_config`).
 pub(super) const LINUX_PROC_CONFIG_NODE: u16 = 0xa900;
 pub(super) const LINUX_FILE_PROC_CONFIG: u16 = LINUX_FILE_MASK | LINUX_PROC_CONFIG_NODE;
@@ -1210,7 +1224,7 @@ use super::PAGE_SIZE;
 /// The fixed file nodes and the `/proc/sys` nodes are distinct and clear of
 /// the `/dev/input/eventN` range, so no file is taken for another.
 const _: () = {
-    const NODES: [u16; 50] = [
+    const NODES: [u16; 52] = [
         LINUX_PROC_TASK_DIRECTORY_NODE,
         LINUX_PROC_TASK_COMM_NODE,
         LINUX_PROC_TASK_STAT_NODE,
@@ -1229,6 +1243,8 @@ const _: () = {
         LINUX_PROC_LOADAVG_NODE,
         LINUX_PROC_FILESYSTEMS_NODE,
         LINUX_PROC_MODULES_NODE,
+        LINUX_PROC_KEYS_NODE,
+        LINUX_PROC_KEY_USERS_NODE,
         LINUX_PROC_CONFIG_NODE,
         LINUX_PROC_COREDUMP_FILTER_NODE,
         LINUX_PROC_CMDLINE_NODE,

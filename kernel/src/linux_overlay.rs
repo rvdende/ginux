@@ -1647,19 +1647,25 @@ pub(crate) fn unlink_path(path: &[u8]) -> bool {
             });
             match alias {
                 Some(alias) => {
-                    // The file's node takes the alias's name (its path moves
-                    // over) and the alias goes.
-                    let Some(alias_path) =
-                        node_mut(alias).map(|node| core::mem::take(&mut node.path))
-                    else {
+                    // The file moves into the alias's slot under the
+                    // alias's name, and its own slot goes. The name stays
+                    // where it was among the slots, which is a directory
+                    // listing's cursor (`next_child_at`): `rm -r`, removing
+                    // what it has read, still meets the names after it.
+                    let Some(alias_slot) = node_mut(alias) else {
                         return false;
                     };
-                    let Some(node) = node_mut(file) else {
+                    let alias_path = core::mem::take(&mut alias_slot.path);
+                    let Some(file_slot) = node_mut(file) else {
+                        alias_slot.path = alias_path;
                         return false;
                     };
+                    let mut moved = core::mem::replace(file_slot, Node::EMPTY);
                     note_path(&alias_path);
-                    node.path = alias_path;
-                    drop_alias(alias, file)
+                    moved.path = alias_path;
+                    moved.links = moved.links.saturating_sub(1).max(1);
+                    *alias_slot = moved;
+                    true
                 }
                 None => unlink(file),
             }
