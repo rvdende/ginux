@@ -30,6 +30,13 @@ pub(crate) const NO_DEVICES: u32 = 1 << 2;
 pub(crate) const NO_EXEC: u32 = 1 << 3;
 /// Access times are not updated (MS_NOATIME).
 pub(crate) const NO_ATIME: u32 = 1 << 4;
+/// Directories' access times are not updated (MS_NODIRATIME).
+pub(crate) const NO_DIRATIME: u32 = 1 << 5;
+/// Symlinks are not followed (MS_NOSYMFOLLOW).
+pub(crate) const NO_SYMFOLLOW: u32 = 1 << 6;
+/// Every access updates the access time (MS_STRICTATIME): neither relatime,
+/// the default, nor noatime.
+pub(crate) const STRICT_ATIME: u32 = 1 << 7;
 
 /// The id of the root mount, which every other mount sits on top of.
 pub(crate) const ROOT_ID: u32 = 1;
@@ -410,6 +417,113 @@ pub(crate) fn bind(
     Ok(id)
 }
 
+/// Sets the options of mount `id` of `space` (a detached mount's, once
+/// attached).
+pub(crate) fn set_flags(space: Space, id: u32, flags: u32) {
+    let mut table = MOUNTS.lock();
+    if let Some(mount) = table
+        .mounts
+        .iter_mut()
+        .find(|mount| mount.space == space && mount.id == id)
+    {
+        mount.flags = flags;
+        table.changed(space.instance);
+    }
+}
+
+/// Puts mount `id` of `space` beneath the other mounts at its mount point
+/// (move_mount's MOVE_MOUNT_BENEATH): they now sit on top of it.
+pub(crate) fn put_beneath(space: Space, id: u32) {
+    let mut table = MOUNTS.lock();
+    let Some(index) = table
+        .mounts
+        .iter()
+        .position(|mount| mount.space == space && mount.id == id)
+    else {
+        return;
+    };
+    let path = table.mounts[index].path.clone();
+    let Some(first) = table
+        .mounts
+        .iter()
+        .position(|mount| mount.space == space && mount.path == path)
+    else {
+        return;
+    };
+    if first < index {
+        let mount = table.mounts.remove(index);
+        // The old bottom mount now sits on the new one.
+        let parent = table.mounts[first].parent;
+        table.mounts[first].parent = id;
+        table.mounts.insert(first, Mount { parent, ..mount });
+        table.changed(space.instance);
+    }
+}
+
+/// Puts mount `to` of `space` in the peer group of mount `from`
+/// (move_mount's MOVE_MOUNT_SET_GROUP), with its master too.
+pub(crate) fn share_group(space: Space, from: u32, to: u32) -> Result<(), Error> {
+    let mut table = MOUNTS.lock();
+    let sharing = table
+        .mounts
+        .iter()
+        .find(|mount| mount.space == space && mount.id == from)
+        .ok_or(Error::NotMounted)?
+        .sharing;
+    let target = table
+        .mounts
+        .iter_mut()
+        .find(|mount| mount.space == space && mount.id == to)
+        .ok_or(Error::NotMounted)?;
+    target.sharing = Sharing {
+        unbindable: false,
+        ..sharing
+    };
+    table.changed(space.instance);
+    Ok(())
+}
+
+/// Moves the topmost mount at canonical `from`, with the mounts below it,
+/// to canonical `to` (MS_MOVE, move_mount).
+pub(crate) fn move_tree(space: Space, from: &[u8], to: &[u8]) -> Result<(), Error> {
+    let mut table = MOUNTS.lock();
+    let top = table.topmost(space, from).ok_or(Error::NotMounted)?;
+    let mut moved = Vec::new();
+    for (index, mount) in table.mounts.iter().enumerate() {
+        if mount.space != space {
+            continue;
+        }
+        let rest = if index == top {
+            Some(&b""[..])
+        } else if index > top && mount.path.len() > from.len() && covers(from, &mount.path) {
+            Some(&mount.path[from.len()..])
+        } else {
+            None
+        };
+        if let Some(rest) = rest {
+            let rest = if to.is_empty() {
+                rest.strip_prefix(b"/").unwrap_or(rest)
+            } else {
+                rest
+            };
+            let mut path = copy(to)?;
+            path.try_reserve(rest.len()).map_err(|_| Error::NoMemory)?;
+            path.extend_from_slice(rest);
+            moved.try_reserve(1).map_err(|_| Error::NoMemory)?;
+            moved.push((index, path));
+        }
+    }
+    let parent = table
+        .covering(space, to)
+        .map_or(ROOT_ID, |index| table.mounts[index].id);
+    for (index, path) in moved {
+        table.mounts[index].path = path;
+    }
+    table.mounts[top].parent = parent;
+    table.changed(space.instance);
+    Ok(())
+}
+
 /// Changes the options of the topmost mount at canonical `path`
 /// (MS_REMOUNT).
 pub(crate) fn remount(space: Space, path: &[u8], flags: u32) -> Result<(), Error> {
@@ -612,6 +726,14 @@ pub(crate) fn changes(instance: usize) -> u32 {
 /// Something is mounted at canonical `path`.
 pub(crate) fn is_mount_point(space: Space, path: &[u8]) -> bool {
     MOUNTS.lock().topmost(space, path).is_some()
+}
+
+/// The id of the topmost mount at canonical `path`.
+pub(crate) fn topmost_id(space: Space, path: &[u8]) -> Option<u32> {
+    let table = MOUNTS.lock();
+    table
+        .topmost(space, path)
+        .map(|index| table.mounts[index].id)
 }
 
 /// The options of the mount canonical `path` lies on: the deepest mount

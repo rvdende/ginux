@@ -13,6 +13,7 @@ mod activation;
 mod architecture;
 mod execution;
 mod linux_abi;
+mod linux_fsmount;
 mod linux_futex;
 mod linux_poll;
 mod linux_pty;
@@ -40,6 +41,7 @@ use execution::{
     switch_linux_thread_extended_state, ExtendedState, EXTENDED_STATE_SIZE,
 };
 pub(crate) use linux_abi::*;
+use linux_fsmount::*;
 use linux_futex::*;
 use linux_poll::*;
 use linux_pty::*;
@@ -7515,6 +7517,7 @@ pub(crate) fn stop_configured_container() {
     crate::linux_mounts::forget_instance(linux_execution_instance());
     crate::linux_tmpfs_quota::forget_instance(linux_execution_instance());
     crate::linux_pidfs::forget_instance(linux_execution_instance());
+    crate::linux_fscontext::forget_instance(linux_execution_instance());
     linux_namespace::forget_instance(
         linux_execution_instance(),
         crate::linux_sysv_ipc::release_instance,
@@ -14213,7 +14216,8 @@ fn linux_privileged_operation(number: u64) -> Option<linux_user::PrivilegedOpera
         | LINUX_FSCONFIG_SYSCALL
         | LINUX_FSMOUNT_SYSCALL
         | LINUX_FSPICK_SYSCALL
-        | LINUX_MOUNT_SETATTR_SYSCALL => Some(PrivilegedOperation::ManageMounts),
+        | LINUX_MOUNT_SETATTR_SYSCALL
+        | LINUX_OPEN_TREE_ATTR_SYSCALL => Some(PrivilegedOperation::ManageMounts),
         LINUX_REBOOT_SYSCALL
         | LINUX_INIT_MODULE_SYSCALL
         | LINUX_DELETE_MODULE_SYSCALL
@@ -22893,9 +22897,12 @@ fn linux_filesystem_magic(filesystem: &[u8]) -> u64 {
     }
 }
 
-/// A domain mount's options as mountinfo's sixth field shows them.
+/// A domain mount's options as mountinfo's sixth field shows them, in
+/// Linux's order.
 fn linux_mount_options(flags: u32, output: &mut [u8], used: &mut usize) -> bool {
-    use crate::linux_mounts::{NO_ATIME, NO_DEVICES, NO_EXEC, NO_SUID, READ_ONLY};
+    use crate::linux_mounts::{
+        NO_ATIME, NO_DEVICES, NO_DIRATIME, NO_EXEC, NO_SUID, NO_SYMFOLLOW, READ_ONLY, STRICT_ATIME,
+    };
     append_linux_bytes(
         output,
         used,
@@ -22903,15 +22910,11 @@ fn linux_mount_options(flags: u32, output: &mut [u8], used: &mut usize) -> bool 
     ) && (flags & NO_SUID == 0 || append_linux_bytes(output, used, b",nosuid"))
         && (flags & NO_DEVICES == 0 || append_linux_bytes(output, used, b",nodev"))
         && (flags & NO_EXEC == 0 || append_linux_bytes(output, used, b",noexec"))
-        && append_linux_bytes(
-            output,
-            used,
-            if flags & NO_ATIME != 0 {
-                b",noatime"
-            } else {
-                b",relatime"
-            },
-        )
+        && (flags & NO_ATIME == 0 || append_linux_bytes(output, used, b",noatime"))
+        && (flags & NO_DIRATIME == 0 || append_linux_bytes(output, used, b",nodiratime"))
+        && (flags & (NO_ATIME | STRICT_ATIME) != 0
+            || append_linux_bytes(output, used, b",relatime"))
+        && (flags & NO_SYMFOLLOW == 0 || append_linux_bytes(output, used, b",nosymfollow"))
 }
 
 /// Canonical mount point `path` as the current process sees it from its
@@ -33475,20 +33478,21 @@ fn linux_execveat(
     )
 }
 
-fn linux_rootfs_execve(path: &[u8], arguments_address: u64, environment_address: u64) -> u64 {
-    linux_rootfs_execve_source(path, arguments_address, environment_address, None)
-}
-
 fn linux_rootfs_execve_domain(path: &[u8], slot: usize) -> u64 {
-    linux_rootfs_execve_source(path, 0, 0, Some(slot))
+    linux_rootfs_execve_source(path, 0, 0, Some(slot), None)
 }
 
+/// Runs the program at `path`, or, when `file` is given, the program in
+/// that file, which `path` named before its name went (execveat of a
+/// descriptor of an unlinked file).
 fn linux_rootfs_execve_source(
     path: &[u8],
     arguments_address: u64,
     environment_address: u64,
     domain_exec_slot: Option<usize>,
+    file: Option<crate::linux_overlay::Handle>,
 ) -> u64 {
+    let unlinked = file.and_then(crate::linux_overlay::metadata);
     if cfg!(feature = "linux-boot-profile")
         && X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::Relaxed)
     {
@@ -33535,7 +33539,10 @@ fn linux_rootfs_execve_source(
     let mut overlay_image = None;
     let mut exec_file = None;
     if domain_exec_slot.is_none() {
-        exec_file = linux_exec_file_access(path);
+        exec_file = match unlinked {
+            Some(metadata) => Some(linux_overlay_file_access(metadata)),
+            None => linux_exec_file_access(path),
+        };
         if let Err(error) = linux_check_access(exec_file, ginux_credentials::access::EXECUTE, false)
             .and_then(|()| linux_landlock_check_execute(path.strip_prefix(b"/").unwrap_or(path)))
         {
@@ -33543,14 +33550,19 @@ fn linux_rootfs_execve_source(
         }
         // A file some process has open for writing cannot be executed
         // (execve04).
-        if crate::linux_overlay::lookup(path.strip_prefix(b"/").unwrap_or(path)).is_some_and(
-            |metadata| {
+        if unlinked
+            .or_else(|| crate::linux_overlay::lookup(path.strip_prefix(b"/").unwrap_or(path)))
+            .is_some_and(|metadata| {
                 linux_overlay_file_open_for_write(crate::linux_overlay::generation(metadata.handle))
-            },
-        ) {
+            })
+        {
             return LINUX_ETXTBSY;
         }
-        match linux_overlay_exec_image(path) {
+        let image = match unlinked {
+            Some(metadata) => linux_overlay_exec_image_of(metadata),
+            None => linux_overlay_exec_image(path),
+        };
+        match image {
             Ok(image) => overlay_image = image,
             Err(error) => return error,
         }
@@ -34201,6 +34213,13 @@ fn linux_overlay_exec_image(path: &[u8]) -> Result<Option<(LinuxExecScratch, usi
     else {
         return Ok(None);
     };
+    linux_overlay_exec_image_of(metadata)
+}
+
+/// The program in the overlay file `metadata` describes, read whole.
+fn linux_overlay_exec_image_of(
+    metadata: crate::linux_overlay::Metadata,
+) -> Result<Option<(LinuxExecScratch, usize)>, u64> {
     match metadata.kind {
         crate::linux_overlay::NodeKind::File => {}
         crate::linux_overlay::NodeKind::Symlink => return Ok(None),
@@ -34510,7 +34529,11 @@ fn linux_execve_at(
     };
     if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) && current_linux_process_pid() != 1 {
         let mut resolved = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+        // A descriptor of a file whose last name went runs that file.
+        let mut unlinked = None;
         let resolved_length = if path_length == 0 && allow_empty_path {
+            unlinked = linux_overlay_descriptor_handle(u64::from(directory as u32))
+                .filter(|handle| !crate::linux_overlay::linked(*handle));
             match linux_descriptor_path(directory, &mut resolved) {
                 Some(length) => Some(length),
                 None => return LINUX_EBADF,
@@ -34528,7 +34551,13 @@ fn linux_execve_at(
         let exec_path = resolved_length
             .map(|length| &resolved[..length])
             .unwrap_or(&path[..path_length]);
-        let result = linux_rootfs_execve(exec_path, arguments_address, environment_address);
+        let result = linux_rootfs_execve_source(
+            exec_path,
+            arguments_address,
+            environment_address,
+            None,
+            unlinked,
+        );
         if result == 0 {
             return LINUX_RETURN_TO_KERNEL;
         }
@@ -40051,6 +40080,21 @@ fn linux_renameat(
                 _ => {}
             }
         }
+    }
+    // An overlay renames in its upper layer.
+    if crate::linux_overlayfs::owns(source.handle) {
+        let mode = match flags {
+            RENAME_EXCHANGE => crate::linux_overlayfs::RenameMode::Exchange,
+            RENAME_NOREPLACE => crate::linux_overlayfs::RenameMode::NoReplace,
+            _ => crate::linux_overlayfs::RenameMode::Replace,
+        };
+        let result = crate::linux_overlayfs::rename(old, new, mode);
+        linux_reclaim_unlinked_files();
+        return match result {
+            Some(Ok(())) => 0,
+            Some(Err(errno)) => errno.wrapping_neg(),
+            None => LINUX_EXDEV,
+        };
     }
     // A volume renames in one step, replacing the target as it goes.
     if crate::linux_blockfs::owns(source.handle) {
@@ -46507,6 +46551,7 @@ pub(crate) fn linux_release_objects() {
         crate::linux_ramdisk::release(class, id);
         crate::linux_kmsg::release(class, id);
         crate::linux_pty::release(class, id);
+        crate::linux_fscontext::release(class, id);
         linux_userfaultfd_release(class, id);
         crate::linux_landlock::release(class, id);
     }
@@ -58373,7 +58418,19 @@ fn linux_statfs(path_address: u64, stat_address: u64) -> u64 {
     } else {
         LinuxFilesystemKind::Root
     };
-    if copy_to_linux_user(stat_address, &linux_statfs_data(kind)) {
+    let mut data = linux_statfs_data(kind);
+    // A file below a domain mount (a tmpfs, a bind mount) has its options.
+    if kind == LinuxFilesystemKind::Root {
+        if let Some(length) = canonical_length {
+            let space = linux_mount_space();
+            let path = &canonical[..length];
+            if crate::linux_mounts::mount_id_at(space, path) != crate::linux_mounts::ROOT_ID {
+                let flags = linux_mount_statfs_flags(crate::linux_mounts::flags_at(space, path));
+                data[80..88].copy_from_slice(&flags.to_ne_bytes());
+            }
+        }
+    }
+    if copy_to_linux_user(stat_address, &data) {
         0
     } else {
         LINUX_EFAULT
@@ -58530,6 +58587,9 @@ fn linux_mount_filesystem(
         (MS_NODEV, crate::linux_mounts::NO_DEVICES),
         (MS_NOEXEC, crate::linux_mounts::NO_EXEC),
         (MS_NOATIME, crate::linux_mounts::NO_ATIME),
+        (MS_NODIRATIME, crate::linux_mounts::NO_DIRATIME),
+        (MS_NOSYMFOLLOW, crate::linux_mounts::NO_SYMFOLLOW),
+        (MS_STRICTATIME, crate::linux_mounts::STRICT_ATIME),
     ]
     .into_iter()
     .filter(|(flag, _)| flags & flag != 0)
@@ -58612,7 +58672,28 @@ fn linux_mount_filesystem(
         };
     }
     if flags & MS_MOVE != 0 {
-        return 0;
+        if source_address == 0 {
+            return LINUX_EFAULT;
+        }
+        let mut source = [0_u8; LINUX_PATH_MAX];
+        let length = match copy_linux_c_string(source_address, &mut source) {
+            Ok(length) => length,
+            Err(error) => return error,
+        };
+        let mut from = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+        let from_length = match linux_canonical_path_at(
+            u64::from(LINUX_AT_FDCWD),
+            &source[..length],
+            &mut from,
+        ) {
+            Ok(length) => length,
+            Err(LINUX_EISDIR) => return LINUX_EINVAL,
+            Err(error) => return error,
+        };
+        if !target_is_directory {
+            return LINUX_ENOTDIR;
+        }
+        return linux_move_mounted_tree(&from[..from_length], canonical_target);
     }
     if !target_is_directory {
         return LINUX_ENOTDIR;
@@ -58626,12 +58707,45 @@ fn linux_mount_filesystem(
         Err(error) => return error,
     };
     let filesystem = &filesystem[..filesystem_length];
-    if filesystem == b"ext2" {
-        return linux_mount_volume(source_address, canonical_target, mount_flags);
+    if !linux_mountable_filesystem(filesystem) {
+        return LINUX_ENODEV;
     }
-    if !matches!(
+    let mut source = [0_u8; LINUX_PATH_MAX];
+    let source = if source_address != 0 {
+        match copy_linux_c_string(source_address, &mut source) {
+            Ok(length) => Some(&source[..length]),
+            Err(error) => return error,
+        }
+    } else {
+        None
+    };
+    // The option string: overlayfs's layers, a tmpfs's size. Data that is
+    // no short string carries no options for a tmpfs, and is no business
+    // of the filesystems that take none.
+    let mut data = alloc::vec::Vec::new();
+    if data_address != 0 && matches!(filesystem, b"overlay" | b"tmpfs") {
+        let mut page = [0_u8; PAGE_SIZE];
+        match copy_linux_c_string(data_address, &mut page) {
+            Ok(length) => {
+                if data.try_reserve_exact(length).is_err() {
+                    return LINUX_ENOMEM;
+                }
+                data.extend_from_slice(&page[..length]);
+            }
+            Err(LINUX_ENAMETOOLONG) if filesystem == b"tmpfs" => {}
+            Err(LINUX_ENAMETOOLONG) => return LINUX_EINVAL,
+            Err(error) => return error,
+        }
+    }
+    linux_mount_new(canonical_target, source, filesystem, mount_flags, &data)
+}
+
+/// The filesystems mount(2) and fsopen(2) know.
+fn linux_mountable_filesystem(filesystem: &[u8]) -> bool {
+    matches!(
         filesystem,
-        b"tmpfs"
+        b"ext2"
+            | b"tmpfs"
             | b"proc"
             | b"sysfs"
             | b"devtmpfs"
@@ -58644,26 +58758,39 @@ fn linux_mount_filesystem(
             | b"debugfs"
             | b"hugetlbfs"
             | b"mqueue"
-    ) {
-        return LINUX_ENODEV;
+            | b"overlay"
+    )
+}
+
+/// Mounts a new `filesystem` from `source` on canonical directory `target`
+/// with the domain mount options `options` and the option string `data`:
+/// the part of mount(2) after its checks, which a mount fsmount(2) made
+/// goes through when move_mount(2) attaches it.
+fn linux_mount_new(
+    target: &[u8],
+    source: Option<&[u8]>,
+    filesystem: &[u8],
+    options: u32,
+    data: &[u8],
+) -> u64 {
+    if filesystem == b"ext2" {
+        let Some(source) = source else {
+            return LINUX_EINVAL;
+        };
+        return linux_mount_volume(source, target, options);
+    }
+    if filesystem == b"overlay" {
+        return linux_mount_overlayfs(target, source.unwrap_or(b"none"), options, data);
     }
     if filesystem == b"cgroup2" && !linux_ensure_cgroup_root() {
         return LINUX_ENOSPC;
     }
-    let mut source = [0_u8; LINUX_PATH_MAX];
-    let source = if source_address != 0 {
-        match copy_linux_c_string(source_address, &mut source) {
-            Ok(length) => &source[..length],
-            Err(error) => return error,
-        }
-    } else {
-        b"none"
-    };
+    let source = source.unwrap_or(b"none");
     // The kernel's own /proc and cgroup mounts are always there.
-    if linux_kernel_mount_point(canonical_target) {
+    if linux_kernel_mount_point(target) {
         return 0;
     }
-    let tmpfs_options = match linux_tmpfs_mount_options(data_address) {
+    let tmpfs_options = match linux_tmpfs_options(data) {
         Ok(options) => options,
         Err(error) if filesystem == b"tmpfs" => return error,
         Err(_) => None,
@@ -58671,7 +58798,7 @@ fn linux_mount_filesystem(
     // A new tmpfs's root is the mounter's, mode 1777, as in Linux; the
     // directory it covers gets its own attributes back at unmount.
     let tmpfs_root = matches!(filesystem, b"tmpfs" | b"ramfs" | b"devtmpfs")
-        .then(|| crate::linux_overlay::lookup(canonical_target))
+        .then(|| crate::linux_overlay::lookup(target))
         .flatten()
         .filter(|metadata| metadata.kind == crate::linux_overlay::NodeKind::Directory);
     let covered = tmpfs_root.map(|metadata| crate::linux_mounts::Attributes {
@@ -58680,11 +58807,11 @@ fn linux_mount_filesystem(
         group: metadata.group,
     });
     match crate::linux_mounts::mount(
-        space,
-        canonical_target,
+        linux_mount_space(),
+        target,
         source,
         filesystem,
-        mount_flags,
+        options,
         covered,
     ) {
         Ok(_) => {
@@ -58696,11 +58823,8 @@ fn linux_mount_filesystem(
                     && crate::linux_overlay::set_owner(metadata.handle, owner, group);
             }
             if let Some(options) = tmpfs_options.filter(|_| filesystem == b"tmpfs") {
-                let _ = crate::linux_tmpfs_quota::mounted(
-                    linux_execution_instance(),
-                    canonical_target,
-                    options,
-                );
+                let _ =
+                    crate::linux_tmpfs_quota::mounted(linux_execution_instance(), target, options);
             }
             0
         }
@@ -58723,58 +58847,60 @@ fn linux_tmpfs_mount_options(
         Err(LINUX_ENAMETOOLONG) => return Ok(None),
         Err(error) => return Err(error),
     };
+    linux_tmpfs_options(&data[..length])
+}
+
+/// A tmpfs's size options in the option string `data`: None for none.
+fn linux_tmpfs_options(data: &[u8]) -> Result<Option<crate::linux_tmpfs_quota::Options>, u64> {
+    if data.is_empty() {
+        return Ok(None);
+    }
     let (total_frames, _) = linux_domain_frame_counts();
-    crate::linux_tmpfs_quota::parse(&data[..length], total_frames * PAGE_SIZE as u64)
+    crate::linux_tmpfs_quota::parse(data, total_frames * PAGE_SIZE as u64)
         .map(Some)
         .ok_or(LINUX_EINVAL)
 }
 
-/// mount(2) of the ext2 filesystem on the block device at `source_address`
-/// on canonical `target`, a directory, with the domain mount options
-/// `options` (`linux_mounts`).
-fn linux_mount_volume(source_address: u64, target: &[u8], options: u32) -> u64 {
-    if source_address == 0 {
-        return LINUX_EINVAL;
+/// The block device an ext2 volume would be mounted from: the device file
+/// at `source`, as its number, with its canonical path (a leading slash
+/// first, as /proc/mounts names it) in `name`, returning that length too.
+/// A file that is no block device is ENOTBLK, which is how LTP tells a
+/// filesystem the kernel has from one it lacks.
+fn linux_volume_device(
+    source: &[u8],
+    name: &mut [u8; crate::linux_overlay::PATH_CAPACITY + 1],
+) -> Result<(u32, usize), u64> {
+    if source.is_empty() {
+        return Err(LINUX_ENOENT);
     }
-    let mut source = [0_u8; LINUX_PATH_MAX];
-    let source_length = match copy_linux_c_string(source_address, &mut source) {
-        Ok(0) => return LINUX_ENOENT,
-        Ok(length) => length,
-        Err(error) => return error,
-    };
     let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
-    let length = match linux_canonical_path_at(
-        u64::from(LINUX_AT_FDCWD),
-        &source[..source_length],
-        &mut canonical,
-    ) {
-        Ok(length) => length,
-        Err(error) => return error,
-    };
-    // /proc/mounts names the device by its canonical path.
-    let mut source_name = [0_u8; crate::linux_overlay::PATH_CAPACITY + 1];
-    source_name[0] = b'/';
-    source_name[1..=length].copy_from_slice(&canonical[..length]);
-    let source_name_length = length + 1;
-    let device = match linux_overlay_lookup_following(&mut canonical, length, true) {
-        Ok((_, _, Some(metadata)))
-            if metadata.kind == crate::linux_overlay::NodeKind::BlockDevice =>
-        {
-            metadata.device
+    let length = linux_canonical_path_at(u64::from(LINUX_AT_FDCWD), source, &mut canonical)?;
+    name[0] = b'/';
+    name[1..=length].copy_from_slice(&canonical[..length]);
+    match linux_overlay_lookup_following(&mut canonical, length, true)? {
+        (_, _, Some(metadata)) if metadata.kind == crate::linux_overlay::NodeKind::BlockDevice => {
+            Ok((metadata.device, length + 1))
         }
-        // Anything else that exists is no block device (ENOTBLK), which is
-        // how LTP tells a filesystem the kernel has from one it lacks.
-        Ok((_, _, Some(_))) => return LINUX_ENOTBLK,
-        Ok((length, _, None)) => {
-            return if linux_rootfs_path_at(u64::from(LINUX_AT_FDCWD), &source[..source_length])
-                .is_some()
-                || LinuxCharacterDevice::from_path(&source[..source_length]).is_some()
+        (_, _, Some(_)) => Err(LINUX_ENOTBLK),
+        (length, _, None) => Err(
+            if linux_rootfs_path_at(u64::from(LINUX_AT_FDCWD), source).is_some()
+                || LinuxCharacterDevice::from_path(source).is_some()
             {
                 LINUX_ENOTBLK
             } else {
                 linux_missing_path_error(&canonical[..length])
-            };
-        }
+            },
+        ),
+    }
+}
+
+/// mount(2) of the ext2 filesystem on the block device at `source` on
+/// canonical `target`, a directory, with the domain mount options
+/// `options` (`linux_mounts`).
+fn linux_mount_volume(source: &[u8], target: &[u8], options: u32) -> u64 {
+    let mut source_name = [0_u8; crate::linux_overlay::PATH_CAPACITY + 1];
+    let (device, source_name_length) = match linux_volume_device(source, &mut source_name) {
+        Ok(found) => found,
         Err(error) => return error,
     };
     if crate::linux_blockfs::device_mounted(device) {
@@ -58789,8 +58915,12 @@ fn linux_mount_volume(source_address: u64, target: &[u8], options: u32) -> u64 {
                 Err(error) => return linux_loop_errno(error),
             };
             match crate::linux_loop::backing(open) {
-                // A volume's own file cannot carry another volume here.
-                Ok((backing, _, _, _)) if crate::linux_blockfs::owns(backing) => {
+                // A volume's or an overlay's own file cannot carry another
+                // volume here.
+                Ok((backing, _, _, _))
+                    if crate::linux_blockfs::owns(backing)
+                        || crate::linux_overlayfs::owns(backing) =>
+                {
                     crate::linux_loop::release(crate::linux_loop::CLASS_DEVICE, open);
                     return LINUX_EINVAL;
                 }
@@ -58920,12 +59050,17 @@ pub(crate) fn linux_generation_in_use(generation: u32) -> bool {
 /// Frees the files, on the overlay or a volume, that lost their last name
 /// once nothing has them open (after a close or an unlink).
 pub(crate) fn linux_reclaim_unlinked_files() {
+    // An overlay file whose name went holds its layer's file while open.
+    let in_use = |generation: u32| {
+        linux_generation_in_use(generation)
+            || crate::linux_overlayfs::pinned(generation, linux_generation_in_use)
+    };
+    crate::linux_overlayfs::reclaim(linux_generation_in_use);
     crate::linux_overlay::reclaim_unlinked(|handle| {
-        linux_generation_in_use(crate::linux_overlay::generation(handle))
-            || crate::linux_loop::backs(handle)
+        in_use(crate::linux_overlay::generation(handle)) || crate::linux_loop::backs(handle)
     });
     if crate::linux_blockfs::has_orphans() {
-        for source in crate::linux_blockfs::reclaim(linux_generation_in_use) {
+        for source in crate::linux_blockfs::reclaim(in_use) {
             linux_release_volume_device(source);
         }
     }
@@ -58994,22 +59129,7 @@ fn linux_tmpfs_statfs_data(path: &[u8]) -> Option<[u8; 120]> {
 /// statfs(2)'s answer for a volume: ext2's counts, and the options of the
 /// mount at canonical `path`.
 fn linux_volume_statfs_data(statfs: ginux_ext2::Statfs, path: &[u8]) -> [u8; 120] {
-    const ST_RDONLY: u64 = 1;
-    const ST_NOSUID: u64 = 2;
-    const ST_NODEV: u64 = 4;
-    const ST_NOEXEC: u64 = 8;
-    const ST_VALID: u64 = 32;
-    const ST_RELATIME: u64 = 4096;
-    let options = crate::linux_mounts::flags_at(linux_mount_space(), path);
-    let flags = [
-        (crate::linux_mounts::READ_ONLY, ST_RDONLY),
-        (crate::linux_mounts::NO_SUID, ST_NOSUID),
-        (crate::linux_mounts::NO_DEVICES, ST_NODEV),
-        (crate::linux_mounts::NO_EXEC, ST_NOEXEC),
-    ]
-    .into_iter()
-    .filter(|(option, _)| options & option != 0)
-    .fold(ST_VALID | ST_RELATIME, |flags, (_, flag)| flags | flag);
+    let flags = linux_mount_statfs_flags(crate::linux_mounts::flags_at(linux_mount_space(), path));
     let mut stat = [0_u8; 120];
     let block_size = u64::from(statfs.block_size);
     stat[0..8].copy_from_slice(&u64::from(ginux_ext2::MAGIC).to_ne_bytes());
@@ -59025,6 +59145,40 @@ fn linux_volume_statfs_data(statfs: ginux_ext2::Statfs, path: &[u8]) -> [u8; 120
     stat[72..80].copy_from_slice(&block_size.to_ne_bytes());
     stat[80..88].copy_from_slice(&flags.to_ne_bytes());
     stat
+}
+
+/// statfs(2)'s f_flags for a domain mount with options `options`.
+fn linux_mount_statfs_flags(options: u32) -> u64 {
+    const ST_RDONLY: u64 = 1;
+    const ST_NOSUID: u64 = 2;
+    const ST_NODEV: u64 = 4;
+    const ST_NOEXEC: u64 = 8;
+    const ST_VALID: u64 = 32;
+    const ST_NOATIME: u64 = 1024;
+    const ST_NODIRATIME: u64 = 2048;
+    const ST_RELATIME: u64 = 4096;
+    const ST_NOSYMFOLLOW: u64 = 0x2000;
+    let relatime =
+        options & (crate::linux_mounts::NO_ATIME | crate::linux_mounts::STRICT_ATIME) == 0;
+    [
+        (crate::linux_mounts::READ_ONLY, ST_RDONLY),
+        (crate::linux_mounts::NO_SUID, ST_NOSUID),
+        (crate::linux_mounts::NO_DEVICES, ST_NODEV),
+        (crate::linux_mounts::NO_EXEC, ST_NOEXEC),
+        (crate::linux_mounts::NO_ATIME, ST_NOATIME),
+        (crate::linux_mounts::NO_DIRATIME, ST_NODIRATIME),
+        (crate::linux_mounts::NO_SYMFOLLOW, ST_NOSYMFOLLOW),
+    ]
+    .into_iter()
+    .filter(|(option, _)| options & option != 0)
+    .fold(
+        if relatime {
+            ST_VALID | ST_RELATIME
+        } else {
+            ST_VALID
+        },
+        |flags, (_, flag)| flags | flag,
+    )
 }
 
 /// The root and the mounts the kernel makes itself (/proc, cgroup2).
@@ -59140,6 +59294,14 @@ fn linux_umount(target_address: u64, flags: u64) -> u64 {
     {
         return linux_missing_path_error(canonical);
     }
+    if let Some(generations) = crate::linux_overlayfs::generations_at(canonical) {
+        // An overlay with a file in use stays (EBUSY) unless the unmount is
+        // lazy; its layers' files stay where they are either way.
+        if flags & MNT_DETACH == 0 && generations.into_iter().any(linux_generation_in_use) {
+            return LINUX_EBUSY;
+        }
+        crate::linux_overlayfs::unmount(canonical);
+    }
     if let Some(generations) = crate::linux_blockfs::generations_at(canonical) {
         // A file of the volume still open, or a working directory on it,
         // keeps it mounted (EBUSY), unless the unmount is lazy (MNT_DETACH):
@@ -59206,6 +59368,25 @@ fn linux_mount_setattr(
     attributes_address: u64,
     size: u64,
 ) -> u64 {
+    linux_mount_setattr_at(
+        directory,
+        Some(path_address),
+        flags,
+        attributes_address,
+        size,
+    )
+}
+
+/// mount_setattr(2) of the path at `path_address`, or (None) of the
+/// descriptor `directory` itself, as open_tree_attr(2) applies it to the
+/// tree it opened.
+pub(super) fn linux_mount_setattr_at(
+    directory: u64,
+    path_address: Option<u64>,
+    flags: u64,
+    attributes_address: u64,
+    size: u64,
+) -> u64 {
     const MOUNT_ATTR_SIZE: usize = 32;
     const AT_EMPTY_PATH: u64 = 0x1000;
     const AT_RECURSIVE: u64 = 0x8000;
@@ -59218,15 +59399,18 @@ fn linux_mount_setattr(
     const MOUNT_ATTR_NOEXEC: u64 = 8;
     const MOUNT_ATTR_ATIME: u64 = 0x70;
     const MOUNT_ATTR_NOATIME: u64 = 0x10;
+    const MOUNT_ATTR_STRICTATIME: u64 = 0x20;
+    const MOUNT_ATTR_NODIRATIME: u64 = 0x80;
     const MOUNT_ATTR_IDMAP: u64 = 0x10_0000;
+    const MOUNT_ATTR_NOSYMFOLLOW: u64 = 0x20_0000;
     const VALID_ATTRIBUTES: u64 = MOUNT_ATTR_RDONLY
         | MOUNT_ATTR_NOSUID
         | MOUNT_ATTR_NODEV
         | MOUNT_ATTR_NOEXEC
         | MOUNT_ATTR_ATIME
-        | 0x80
+        | MOUNT_ATTR_NODIRATIME
         | MOUNT_ATTR_IDMAP
-        | 0x20_0000;
+        | MOUNT_ATTR_NOSYMFOLLOW;
     const MS_UNBINDABLE: u64 = 1 << 17;
     const MS_PRIVATE: u64 = 1 << 18;
     const MS_SLAVE: u64 = 1 << 19;
@@ -59290,6 +59474,8 @@ fn linux_mount_setattr(
             (MOUNT_ATTR_NOSUID, crate::linux_mounts::NO_SUID),
             (MOUNT_ATTR_NODEV, crate::linux_mounts::NO_DEVICES),
             (MOUNT_ATTR_NOEXEC, crate::linux_mounts::NO_EXEC),
+            (MOUNT_ATTR_NODIRATIME, crate::linux_mounts::NO_DIRATIME),
+            (MOUNT_ATTR_NOSYMFOLLOW, crate::linux_mounts::NO_SYMFOLLOW),
         ]
         .into_iter()
         .filter(|(attribute, _)| attributes & attribute != 0)
@@ -59298,27 +59484,36 @@ fn linux_mount_setattr(
     let mut set_options = options(set);
     let mut clear_options = options(clear);
     if clear & MOUNT_ATTR_ATIME != 0 {
-        clear_options |= crate::linux_mounts::NO_ATIME;
-        if set & MOUNT_ATTR_ATIME == MOUNT_ATTR_NOATIME {
-            set_options |= crate::linux_mounts::NO_ATIME;
+        clear_options |= crate::linux_mounts::NO_ATIME | crate::linux_mounts::STRICT_ATIME;
+        match set & MOUNT_ATTR_ATIME {
+            MOUNT_ATTR_NOATIME => set_options |= crate::linux_mounts::NO_ATIME,
+            MOUNT_ATTR_STRICTATIME => set_options |= crate::linux_mounts::STRICT_ATIME,
+            _ => {}
         }
     }
     let mut path = [0_u8; LINUX_PATH_MAX];
-    let length = match copy_linux_c_string(path_address, &mut path) {
-        Ok(length) => length,
-        Err(error) => return error,
+    let length = match path_address {
+        Some(address) => match copy_linux_c_string(address, &mut path) {
+            Ok(length) => length,
+            Err(error) => return error,
+        },
+        None => 0,
     };
     let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
     let length = if length == 0 {
-        if flags & AT_EMPTY_PATH == 0 {
+        if flags & AT_EMPTY_PATH == 0 && path_address.is_some() {
             return LINUX_ENOENT;
         }
         if !linux_descriptor_open(directory) {
             return LINUX_EBADF;
         }
-        // A descriptor of a detached mount (fsmount, open_tree) has no
-        // place in the table to change.
-        match linux_descriptor_path(directory, &mut canonical) {
+        // A detached mount (fsmount, open_tree) takes the options with it
+        // to where it is attached.
+        if let Some(id) = linux_detached_mount_descriptor(directory) {
+            crate::linux_fscontext::change_mount_flags(id, set_options, clear_options);
+            return 0;
+        }
+        match linux_descriptor_canonical(directory, &mut canonical) {
             Some(length) => length,
             None => return 0,
         }

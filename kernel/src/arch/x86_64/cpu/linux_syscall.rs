@@ -1654,6 +1654,19 @@ fn linux_syscall_dispatch(
         LINUX_MOUNT_SETATTR_SYSCALL => {
             linux_mount_setattr(first_argument, buffer, count, register(0), register(2))
         }
+        LINUX_FSOPEN_SYSCALL => linux_fsopen(first_argument, buffer),
+        LINUX_FSCONFIG_SYSCALL => {
+            linux_fsconfig(first_argument, buffer, count, register(0), register(2))
+        }
+        LINUX_FSMOUNT_SYSCALL => linux_fsmount(first_argument, buffer, count),
+        LINUX_FSPICK_SYSCALL => linux_fspick(first_argument, buffer, count),
+        LINUX_MOVE_MOUNT_SYSCALL => {
+            linux_move_mount(first_argument, buffer, count, register(0), register(2))
+        }
+        LINUX_OPEN_TREE_SYSCALL => linux_open_tree(first_argument, buffer, count),
+        LINUX_OPEN_TREE_ATTR_SYSCALL => {
+            linux_open_tree_attr(first_argument, buffer, count, register(0), register(2))
+        }
         LINUX_SYSFS_SYSCALL => linux_sysfs(first_argument, buffer, count),
         LINUX_USTAT_SYSCALL => linux_ustat(first_argument, buffer),
         LINUX_GETCWD_SYSCALL => linux_getcwd(first_argument, buffer),

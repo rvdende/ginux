@@ -549,6 +549,14 @@ pub(crate) fn covers(path: &[u8]) -> bool {
     VOLUMES.lock().at(path).is_some()
 }
 
+/// The length of the mount point of the volume canonical `path` lies on,
+/// if it lies on one.
+pub(crate) fn point_depth(path: &[u8]) -> Option<usize> {
+    let table = VOLUMES.lock();
+    let index = volume_index(&table, path)?;
+    Some(table.volumes[index].point.len())
+}
+
 /// What `lookup` of canonical `path` finds: `None` if the path is not on a
 /// volume, else the file there, if any.
 pub(crate) fn lookup(path: &[u8]) -> Option<Option<Metadata>> {
@@ -1443,6 +1451,38 @@ pub(crate) fn unmount(point: &[u8]) -> Option<Result<Source, Errno>> {
             .map(|_| source)
             .map_err(errno),
     )
+}
+
+/// Moves the volume mounted at canonical `from`, and those mounted below
+/// it, to canonical `to` (MS_MOVE); false if none is mounted at `from`.
+pub(crate) fn move_point(from: &[u8], to: &[u8]) -> bool {
+    let mut table = VOLUMES.lock();
+    if mounted_at(&table, from).is_none() {
+        return false;
+    }
+    let instance = instance();
+    for volume in table
+        .volumes
+        .iter_mut()
+        .filter(|volume| volume.visible(instance))
+    {
+        let Some(rest) = below(from, &volume.point) else {
+            continue;
+        };
+        let mut point = Vec::new();
+        if point.try_reserve_exact(to.len() + 1 + rest.len()).is_err() {
+            continue;
+        }
+        point.extend_from_slice(to);
+        if !rest.is_empty() {
+            if !point.is_empty() {
+                point.push(b'/');
+            }
+            point.extend_from_slice(rest);
+        }
+        volume.point = point;
+    }
+    true
 }
 
 /// MS_REMOUNT of the volume at canonical `point`: read-only or writable.

@@ -54,6 +54,9 @@ impl LockRank {
     /// userfaultfd contexts; ranks below the heap so their tables may grow
     /// while held.
     pub(crate) const USERFAULTFD: Self = Self(159);
+    /// The new mount API's filesystem contexts and detached mounts; ranks
+    /// below the heap so the tables may grow while held.
+    pub(crate) const FS_CONTEXTS: Self = Self(157);
     /// The record (fcntl) lock table; ranks below the heap so the table may
     /// grow while held.
     pub(crate) const RECORD_LOCKS: Self = Self(160);
@@ -73,6 +76,11 @@ impl LockRank {
     /// heap so the list may grow while held.
     pub(crate) const MEMORY_FAILURE: Self = Self(175);
     pub(crate) const FUTEX_COORDINATION: Self = Self(180);
+    /// The overlay mounts (overlayfs) and the files they handed out; every
+    /// path walk looks at them, so they rank above the tables whose holders
+    /// make and remove files (loop devices, pseudo-terminals). Nothing else
+    /// is taken while they are held.
+    pub(crate) const OVERLAY_MOUNTS: Self = Self(182);
     /// The wait statuses of reaped processes that pidfds report; ranks
     /// below the heap so the list may grow while held.
     pub(crate) const PIDFS_EXITS: Self = Self(183);

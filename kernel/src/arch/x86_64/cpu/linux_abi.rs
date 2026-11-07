@@ -353,6 +353,7 @@ pub(super) const LINUX_FSCONFIG_SYSCALL: u64 = 431;
 pub(super) const LINUX_FSMOUNT_SYSCALL: u64 = 432;
 pub(super) const LINUX_FSPICK_SYSCALL: u64 = 433;
 pub(super) const LINUX_MOUNT_SETATTR_SYSCALL: u64 = 442;
+pub(super) const LINUX_OPEN_TREE_ATTR_SYSCALL: u64 = 467;
 pub(super) const LINUX_SET_MEMPOLICY_HOME_NODE_SYSCALL: u64 = 450;
 pub(super) const LINUX_CACHESTAT_SYSCALL: u64 = 451;
 pub(super) const LINUX_PIPE2_SYSCALL: u64 = 293;
@@ -1075,7 +1076,7 @@ pub(super) const LINUX_PROC_CPUINFO: &[u8] = b"processor\t: 0\nvendor_id\t: Genu
 pub(super) const LINUX_PROC_STAT: &[u8] = b"cpu  1 0 1 100 0 0 0 0 0 0\ncpu0 1 0 1 100 0 0 0 0 0 0\nintr 0\nctxt 1\nbtime 0\nprocesses 1\nprocs_running 1\nprocs_blocked 0\nsoftirq 0 0 0 0 0 0 0 0 0 0 0\n";
 pub(super) const LINUX_PROC_LOADAVG: &[u8] = b"0.00 0.00 0.00 1/1 1\n";
 pub(super) const LINUX_PROC_FILESYSTEMS: &[u8] =
-    b"nodev\tproc\nnodev\ttmpfs\nnodev\tdevtmpfs\n\text2\n";
+    b"nodev\tproc\nnodev\ttmpfs\nnodev\tdevtmpfs\n\text2\nnodev\toverlay\n";
 pub(super) const LINUX_PROC_CMDLINE: &[u8] = b"ginux immutable=1\n";
 pub(super) const LINUX_PROC_CGROUP: &[u8] = b"0::/\n";
 pub(super) const LINUX_PROC_PROCESS_CMDLINE: &[u8] = b"/sbin/init\0";
