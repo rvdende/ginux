@@ -110,6 +110,22 @@ for library in $(ldd /usr/sbin/useradd /usr/sbin/userdel /usr/sbin/usermod \
 done
 cp /etc/login.defs "$overlay/etc/login.defs"
 
+# e2fsprogs (mkfs.ext2/3/4, e2fsck, tune2fs, debugfs, chattr, e4crypt,
+# ...), which the tests that format a device run, as the same kind of
+# overlay: every file of the builder's packages and the libraries they
+# link, so the domain needs no network to get them.
+apk add --no-cache --quiet e2fsprogs e2fsprogs-extra
+overlay="$root/distro/e2fsprogs"
+for file in $(apk info -qL e2fsprogs e2fsprogs-extra | grep -v '^$'); do
+    mkdir -p "$overlay/${file%/*}"
+    cp -a "/$file" "$overlay/$file"
+done
+for library in $(find "$overlay" -type f -perm -u+x -exec ldd {} \; 2>/dev/null |
+    awk '$3 ~ "^/usr/lib/" { print $3 }' | LC_ALL=C sort -u); do
+    mkdir -p "$overlay/usr/lib"
+    cp -L "$library" "$overlay/usr/lib/${library##*/}"
+done
+
 # Map each test binary to its syscall directory, for grouping results.
 while IFS= read -r dir; do
     for file in "$dir"/*; do

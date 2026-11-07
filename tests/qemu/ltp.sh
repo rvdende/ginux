@@ -123,8 +123,6 @@ for name in LTP_LIST GINUX_ESP_DIR LTP_BASELINE; do
 done
 
 cd "$repo_root"
-# mkfs.ext2 for the domain (a no-op once fetched).
-tools/ltp/fetch-e2fsprogs.sh || echo "ltp.sh: no e2fsprogs; device tests will report mkfs missing" >&2
 # Build the harness, then run it directly rather than through `cargo test`,
 # so that SIGTERM to this script's PID or a Ctrl-C reaches it (it stops QEMU
 # and writes the final results).

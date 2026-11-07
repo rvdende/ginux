@@ -155,10 +155,11 @@ feature rather than a fix:
   `kernel/src/linux_blockfs.rs`) on a loop device or RAM disk, so the
   tests that format and mount a device (`.needs_device`,
   `.mount_device`, `.all_filesystems`) run, on ext2 and tmpfs.
-  `tests/ltp/setup.sh` unpacks e2fsprogs (mkfs.ext2,
-  `tools/ltp/fetch-e2fsprogs.sh`, pinned Alpine packages) into the
-  domain; mkfs.ext3/ext4 exist too, but the kernel answers ENODEV for
-  those types, so LTP skips them. ioctl_loop05 runs through
+  The LTP tree carries e2fsprogs from the builder (mkfs.ext2/3/4, e2fsck,
+  tune2fs, debugfs, chattr, e4crypt: `tools/ltp/container-build.sh`),
+  which `tests/ltp/setup.sh` installs into the domain. mkfs.ext3 and
+  mkfs.ext4 exist too, but the kernel answers ENODEV for those types, so
+  LTP skips them. ioctl_loop05 runs through
   `/opt/ltp/disk-tmpdir.sh`, which gives it a TMPDIR on an ext2 volume of
   its own (the domain's /tmp is the overlay, device 0). The device tests
   still skipped in `syscalls.list` say what they lack.

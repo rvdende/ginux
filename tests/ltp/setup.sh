@@ -32,23 +32,23 @@ kernel/mm/hwpoison-inject.ko
 kernel/net/dns_resolver/dns_resolver.ko
 kernel/security/keys/encrypted-keys/encrypted-keys.ko
 EOF
-# The shadow user tools (useradd, userdel, ...) a distribution has and
-# busybox lacks, from the LTP tree (tools/ltp/container-build.sh). Files the
-# image already has are kept (busybox's cp -n skips whole directories, so
-# each file is copied on its own).
-overlay=/opt/ltp/distro/shadow
-if [ -d "$overlay" ] && ! command -v useradd >/dev/null 2>&1; then
-    for file in $(cd "$overlay" && find . -type f); do
+# Tools a distribution has and busybox lacks, from the LTP tree
+# (tools/ltp/container-build.sh): the shadow user tools (useradd, ...) and
+# e2fsprogs (mkfs.ext2/3/4, e2fsck, tune2fs, chattr, ...), which the tests
+# that format a device run. Each overlay goes in unless the image already
+# has its tool; files the image has are kept (busybox's cp -n skips whole
+# directories, so each file is copied on its own).
+install_overlay() {
+    overlay=/opt/ltp/distro/$1
+    [ -d "$overlay" ] && ! command -v "$2" >/dev/null 2>&1 || return 0
+    for file in $(cd "$overlay" && find . ! -type d); do
         file=${file#./}
-        [ -e "/$file" ] && continue
-        mkdir -p "/${file%/*}" && cp -a "$overlay/$file" "/$file" || fail "shadow tools: $file"
+        [ -e "/$file" ] || [ -L "/$file" ] && continue
+        mkdir -p "/${file%/*}" && cp -a "$overlay/$file" "/$file" || fail "$1 tools: $file"
     done
-fi
-# e2fsprogs, for the tests that format a device (mkfs.ext2); without it
-# they report mkfs missing.
-if [ ! -x /sbin/mke2fs ]; then
-    wget -q -O - "$base/e2fsprogs.tar.gz" 2>/dev/null | tar -xzf - -C / 2>/dev/null
-fi
+}
+install_overlay shadow useradd
+install_overlay e2fsprogs mke2fs
 # disk-tmpdir.sh TEST [ARG...]: runs a test with its TMPDIR on an ext2
 # filesystem of its own, for the tests whose files must live on a block
 # device (the domain's /tmp is the overlay, which has none).
