@@ -361,9 +361,8 @@ LTP skips them on tmpfs and ramfs. TCONF is mostly expected:
 - **The test image:** no `parted` (ioctl09); musl's `struct statx` has no
   `stx_dio_*` fields (statx10, statx11: the kernel reports
   `STATX_DIOALIGN`).
-- **Ginux's limits:** a process has at most 1024 descriptors, so pipe15
-  (which needs 2051 for 1024 pipes) stops; sendfile09 wants 5 GiB free
-  where the LTP domain has 4 GiB; no TUN/TAP device (ioctl03).
+- **Ginux's limits:** sendfile09 wants 5 GiB free where the LTP domain has
+  4 GiB; no TUN/TAP device (ioctl03).
 
 `target/ltp-report.txt` lists every cluster with its tests;
 `tests/ltp/report.py --variant no-oom-protection` does the same for the

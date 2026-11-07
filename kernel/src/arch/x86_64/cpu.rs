@@ -293,6 +293,9 @@ struct X86RuntimeOwner {
     ELF_PROBE_EPOLL_DATA:
         RuntimeRef<CpuBankedAtomicArray<AtomicU64, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>>,
     ELF_PROBE_EPOLL_DESCRIPTOR: RuntimeRef<CpuBankedAtomicU16>,
+    /// The `linux_fd_table` id of the current process's descriptors above
+    /// the fixed table (0: none).
+    ELF_PROBE_DESCRIPTOR_OVERFLOW: RuntimeRef<CpuBankedAtomicU32>,
     ELF_PROBE_EPOLL_EVENTS:
         RuntimeRef<CpuBankedAtomicArray<AtomicU32, { LINUX_DESCRIPTOR_TABLE_LIMIT as usize }>>,
     ELF_PROBE_EVENTFD_COUNTER: RuntimeRef<BankedAtomicU64>,
@@ -764,6 +767,7 @@ static X86_RUNTIME: X86RuntimeOwner = X86RuntimeOwner {
     ELF_PROBE_TSC_SIGSEGV: RuntimeRef(&X86_RUNTIME_BACKING_ELF_PROBE_TSC_SIGSEGV),
     ELF_PROBE_EPOLL_DATA: RuntimeRef(&X86_RUNTIME_BACKING_ELF_PROBE_EPOLL_DATA),
     ELF_PROBE_EPOLL_DESCRIPTOR: RuntimeRef(&X86_RUNTIME_BACKING_ELF_PROBE_EPOLL_DESCRIPTOR),
+    ELF_PROBE_DESCRIPTOR_OVERFLOW: RuntimeRef(&X86_RUNTIME_BACKING_ELF_PROBE_DESCRIPTOR_OVERFLOW),
     ELF_PROBE_EPOLL_EVENTS: RuntimeRef(&X86_RUNTIME_BACKING_ELF_PROBE_EPOLL_EVENTS),
     ELF_PROBE_EVENTFD_COUNTER: RuntimeRef(&X86_RUNTIME_BACKING_ELF_PROBE_EVENTFD_COUNTER),
     ELF_PROBE_EVENTFD_DESCRIPTOR: RuntimeRef(&X86_RUNTIME_BACKING_ELF_PROBE_EVENTFD_DESCRIPTOR),
@@ -2318,7 +2322,7 @@ fn run_linux_light_thread(cpu: usize, bank: usize, slot: usize) -> bool {
                     state.completed = false;
                     state.exit_status = 0;
                     state.termination_signal = 0;
-                    if retain_linux_descriptor_runtime_state(&state.descriptors) {
+                    if retain_linux_descriptor_runtime_state(&mut state.descriptors) {
                         release_linux_descriptor_runtime_state(&destination.descriptors);
                     }
                 }
@@ -3768,6 +3772,8 @@ static X86_RUNTIME_BACKING_ELF_PROBE_ROOTFS_CWD: CpuBankedAtomicU16 =
 static X86_RUNTIME_BACKING_ELF_PROBE_OVERLAY_CWD: CpuBankedAtomicU32 = CpuBankedAtomicU32::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_EPOLL_DESCRIPTOR: CpuBankedAtomicU16 =
     CpuBankedAtomicU16::new(0);
+static X86_RUNTIME_BACKING_ELF_PROBE_DESCRIPTOR_OVERFLOW: CpuBankedAtomicU32 =
+    CpuBankedAtomicU32::new(0);
 static X86_RUNTIME_BACKING_ELF_PROBE_EPOLL_EVENTS: CpuBankedAtomicArray<
     AtomicU32,
     { LINUX_DESCRIPTOR_TABLE_LIMIT as usize },
@@ -7622,6 +7628,7 @@ pub(crate) fn stop_configured_container() {
     crate::linux_mounts::forget_instance(linux_execution_instance());
     crate::linux_lease::forget_domain(linux_execution_instance());
     crate::linux_core::forget_domain(linux_execution_instance());
+    crate::linux_fd_table::forget_domain(linux_execution_instance());
     crate::linux_tmpfs_quota::forget_instance(linux_execution_instance());
     crate::linux_swap::forget_instance(linux_execution_instance());
     crate::linux_pidfs::forget_instance(linux_execution_instance());
@@ -10882,6 +10889,9 @@ pub(crate) fn verify_linux_elf_entry(execution: &LinuxElfExecution<'_>) -> Linux
     X86_RUNTIME.ELF_PROBE_OVERLAY_CWD.store(0, Ordering::SeqCst);
     X86_RUNTIME
         .ELF_PROBE_EPOLL_DESCRIPTOR
+        .store(0, Ordering::SeqCst);
+    X86_RUNTIME
+        .ELF_PROBE_DESCRIPTOR_OVERFLOW
         .store(0, Ordering::SeqCst);
     for descriptor in 0..LINUX_DESCRIPTOR_TABLE_LIMIT as usize {
         X86_RUNTIME.ELF_PROBE_EPOLL_EVENTS[descriptor].store(0, Ordering::SeqCst);
@@ -19065,6 +19075,9 @@ struct LinuxDescriptorRuntimeState {
     runtime_epoll_watch_target: [u16; LINUX_DESCRIPTOR_TABLE_LIMIT as usize],
     runtime_eventfd_active: [u64; LINUX_DESCRIPTOR_FLAG_WORD_COUNT],
     runtime_timerfd_active: [u64; LINUX_DESCRIPTOR_FLAG_WORD_COUNT],
+    /// The `linux_fd_table` id of the descriptors above the fixed table
+    /// (0: none): processes sharing the table (CLONE_FILES) name the same.
+    overflow: u32,
 }
 
 impl LinuxMmapRuntimeState {
@@ -19113,6 +19126,7 @@ impl LinuxDescriptorRuntimeState {
         runtime_epoll_watch_target: [0; LINUX_DESCRIPTOR_TABLE_LIMIT as usize],
         runtime_eventfd_active: [0; LINUX_DESCRIPTOR_FLAG_WORD_COUNT],
         runtime_timerfd_active: [0; LINUX_DESCRIPTOR_FLAG_WORD_COUNT],
+        overflow: 0,
     };
 }
 
@@ -19644,7 +19658,7 @@ fn stage_linux_fork_parent_runtime_state(
     state.termination_signal = 0;
     // The child's copy holds the open files again, unless the two share
     // the one table (CLONE_FILES), whose files the group holds once.
-    if !share_descriptors && !retain_linux_descriptor_runtime_state(&state.descriptors) {
+    if !share_descriptors && !retain_linux_descriptor_runtime_state(&mut state.descriptors) {
         return None;
     }
     let parent_stack = current_linux_thread_slot().map(|slot| {
@@ -20496,11 +20510,17 @@ fn unshare_linux_descriptors(pid: u32) -> bool {
     if !linux_process::live_process_resource_shared(pid, SharedResource::Descriptors) {
         return true;
     }
-    // The bank is the group's table as this call found it.
+    // The bank is the group's table as this call found it; the part above
+    // the fixed table becomes a copy of the process's own.
     assign_linux_open_file_ids();
-    let table = capture_linux_descriptor_runtime_state();
-    retain_linux_descriptor_runtime_state(&table)
-        && linux_process::share_live_process_resource(pid, SharedResource::Descriptors, None)
+    let mut table = capture_linux_descriptor_runtime_state();
+    if !retain_linux_descriptor_runtime_state(&mut table) {
+        return false;
+    }
+    X86_RUNTIME
+        .ELF_PROBE_DESCRIPTOR_OVERFLOW
+        .store(table.overflow, Ordering::SeqCst);
+    linux_process::share_live_process_resource(pid, SharedResource::Descriptors, None)
 }
 
 /// An exec leaves what the process shared with others behind, as Linux's
@@ -20526,6 +20546,14 @@ fn unshare_linux_state_for_exec(pid: u32) {
 fn assign_linux_open_file_ids() {
     for descriptor in 0..LINUX_DESCRIPTOR_TABLE_LIMIT {
         if linux_descriptor_open(descriptor) {
+            let _ = linux_descriptor_open_file_id(descriptor);
+        }
+    }
+    let table = X86_RUNTIME
+        .ELF_PROBE_DESCRIPTOR_OVERFLOW
+        .load(Ordering::SeqCst);
+    for (descriptor, entry) in crate::linux_fd_table::entries(table) {
+        if entry.open_file_id == 0 {
             let _ = linux_descriptor_open_file_id(descriptor);
         }
     }
@@ -20599,6 +20627,9 @@ fn capture_linux_descriptor_runtime_state() -> LinuxDescriptorRuntimeState {
             &X86_RUNTIME.LINUX_RUNTIME_TIMERFD_ACTIVE.snapshot(),
         ),
         max_open_file_id: 0,
+        overflow: X86_RUNTIME
+            .ELF_PROBE_DESCRIPTOR_OVERFLOW
+            .load(Ordering::Relaxed),
     };
     state.max_open_file_id = state
         .open_file_ids
@@ -20646,7 +20677,83 @@ fn linux_saved_event_files(
     })
 }
 
-fn retain_linux_descriptor_runtime_state(state: &LinuxDescriptorRuntimeState) -> bool {
+fn retain_linux_descriptor_runtime_state(state: &mut LinuxDescriptorRuntimeState) -> bool {
+    if !retain_linux_fixed_descriptors(state) {
+        return false;
+    }
+    // The descriptors above the fixed table: a reference to their table,
+    // which the first change through either copy copies
+    // (`linux_own_overflow_table`).
+    if state.overflow != 0 && !crate::linux_fd_table::retain(state.overflow) {
+        release_linux_descriptor_runtime_state(&LinuxDescriptorRuntimeState {
+            overflow: 0,
+            ..*state
+        });
+        return false;
+    }
+    true
+}
+
+/// The current process's table above the fixed one, made its own first
+/// when another copy of its descriptors refers to it too (copy on write):
+/// the copy holds again what its descriptors refer to. None without
+/// memory, or without a table.
+fn linux_own_overflow_table() -> Option<u32> {
+    let table = X86_RUNTIME
+        .ELF_PROBE_DESCRIPTOR_OVERFLOW
+        .load(Ordering::SeqCst);
+    if table == 0 || !crate::linux_fd_table::shared(table) {
+        return (table != 0).then_some(table);
+    }
+    let copy = crate::linux_fd_table::copy(table)?;
+    if !retain_linux_overflow_descriptors(copy) {
+        let _ = crate::linux_fd_table::free(copy);
+        return None;
+    }
+    // Other references remain, so this frees nothing.
+    let _ = crate::linux_fd_table::release(table);
+    X86_RUNTIME
+        .ELF_PROBE_DESCRIPTOR_OVERFLOW
+        .store(copy, Ordering::SeqCst);
+    Some(copy)
+}
+
+/// Holds again what table `id`'s descriptors above the fixed table refer
+/// to (sockets and pipes, POSIX message queues), for a copy of them.
+fn retain_linux_overflow_descriptors(id: u32) -> bool {
+    let entries = crate::linux_fd_table::entries(id);
+    for (retained, (_, entry)) in entries.iter().enumerate() {
+        let held = if entry.socket != 0 {
+            crate::linux_socket::duplicate(entry.socket - 1)
+        } else if entry.state & !3 == LINUX_DEVICE_POSIX_MQ {
+            u32::try_from(entry.offset)
+                .is_ok_and(|queue| crate::linux_sysv_ipc::posix_queue_duplicate(queue).is_ok())
+        } else {
+            true
+        };
+        if !held {
+            release_linux_overflow_entries(entries.iter().take(retained).map(|(_, entry)| *entry));
+            return false;
+        }
+    }
+    true
+}
+
+/// Lets go of what the descriptors `entries` (above the fixed table)
+/// refer to.
+fn release_linux_overflow_entries(entries: impl Iterator<Item = crate::linux_fd_table::Entry>) {
+    for entry in entries {
+        if entry.socket != 0 {
+            let _ = crate::linux_socket::close(entry.socket - 1);
+        } else if entry.state & !3 == LINUX_DEVICE_POSIX_MQ {
+            if let Ok(destroyed) = crate::linux_sysv_ipc::posix_queue_close(entry.offset as u32) {
+                let _ = linux_release_posix_queue_charge(destroyed);
+            }
+        }
+    }
+}
+
+fn retain_linux_fixed_descriptors(state: &LinuxDescriptorRuntimeState) -> bool {
     for (retained, (kind, id)) in linux_saved_event_files(state).enumerate() {
         if !crate::linux_event_files::retain(kind, id) {
             for (kind, id) in linux_saved_event_files(state).take(retained) {
@@ -20716,6 +20823,13 @@ fn retain_linux_descriptor_sockets_and_queues(state: &LinuxDescriptorRuntimeStat
 }
 
 fn release_linux_descriptor_runtime_state(state: &LinuxDescriptorRuntimeState) {
+    if state.overflow != 0 {
+        release_linux_overflow_entries(
+            crate::linux_fd_table::release(state.overflow)
+                .into_iter()
+                .map(|(_, entry)| entry),
+        );
+    }
     for (kind, id) in linux_saved_event_files(state) {
         crate::linux_event_files::release(kind, id);
     }
@@ -20824,6 +20938,9 @@ fn install_linux_descriptor_runtime_state(state: &LinuxDescriptorRuntimeState) {
     X86_RUNTIME
         .ELF_PROBE_EPOLL_DESCRIPTOR
         .store(state.epoll_descriptor, Ordering::Relaxed);
+    X86_RUNTIME
+        .ELF_PROBE_DESCRIPTOR_OVERFLOW
+        .store(state.overflow, Ordering::Relaxed);
     X86_RUNTIME
         .ELF_PROBE_EPOLL_EVENTS
         .install(&state.epoll_events);
@@ -34838,6 +34955,7 @@ fn linux_rootfs_execve_source(
             let _ = linux_descriptor_close(descriptor);
         }
     }
+    linux_close_overflow_on_exec();
     end_other_linux_threads_for_exec();
     reset_linux_signal_state_after_exec();
     let _ = set_current_linux_clear_child_tid(0);
@@ -36048,6 +36166,7 @@ fn linux_execve_at(
             let _ = linux_descriptor_close(descriptor);
         }
     }
+    linux_close_overflow_on_exec();
     end_other_linux_threads_for_exec();
     reset_linux_signal_state_after_exec();
     X86_RUNTIME
@@ -36584,7 +36703,9 @@ fn linux_overlay_descriptor_handle(descriptor: u64) -> Option<crate::linux_overl
     if linux_proc_generation_kind(linux_device_descriptor(descriptor)) {
         return None;
     }
-    let generation = if let Some(generation) = usize::try_from(descriptor)
+    let generation = if descriptor >= LINUX_DESCRIPTOR_TABLE_LIMIT {
+        linux_overflow_entry(descriptor)?.generation
+    } else if let Some(generation) = usize::try_from(descriptor)
         .ok()
         .and_then(|index| X86_RUNTIME.ELF_PROBE_STDIO_TMP_FILE_GENERATIONS.get(index))
     {
@@ -37264,6 +37385,9 @@ fn linux_rootfs_metadata_path_at(
 }
 
 fn linux_rootfs_descriptor(descriptor: u64) -> u16 {
+    if descriptor >= LINUX_DESCRIPTOR_TABLE_LIMIT {
+        return linux_overflow_entry(descriptor).map_or(0, |entry| entry.rootfs);
+    }
     if let Some(handle) = usize::try_from(descriptor)
         .ok()
         .and_then(|index| X86_RUNTIME.ELF_PROBE_STDIO_ROOTFS_DESCRIPTORS.get(index))
@@ -38071,8 +38195,9 @@ fn linux_open_file_at(
         return LINUX_EACCES;
     }
     let state = kind | (access + 1) as u16;
-    let Some(descriptor) =
-        (0..LINUX_AUX_DESCRIPTOR_LIMIT).find(|descriptor| !linux_descriptor_open(*descriptor))
+    let Some(descriptor) = (0..LINUX_AUX_DESCRIPTOR_LIMIT)
+        .find(|descriptor| !linux_descriptor_open(*descriptor))
+        .or_else(|| linux_free_overflow_descriptor(LINUX_DESCRIPTOR_TABLE_LIMIT))
     else {
         if tmp_created {
             let _ = tmp_handle.is_some_and(|handle| linux_tmpfs::unlink(b"ginux-ready", handle));
@@ -38097,6 +38222,21 @@ fn linux_open_file_at(
         );
     let descriptor_flags =
         (flags & (LINUX_O_APPEND | LINUX_O_NONBLOCK | LINUX_O_PATH | LINUX_O_NOATIME)) as u32;
+    if descriptor >= LINUX_DESCRIPTOR_TABLE_LIMIT {
+        let installed = install_linux_overflow_descriptor(
+            descriptor,
+            crate::linux_fd_table::Entry {
+                state,
+                rootfs: rootfs_handle,
+                generation: tmp_generation,
+                socket_flags: descriptor_flags,
+                close_on_exec: flags & LINUX_O_CLOEXEC != 0,
+                created,
+                ..Default::default()
+            },
+        );
+        return if installed { descriptor } else { LINUX_ENOMEM };
+    }
     if descriptor < LINUX_AUX_DESCRIPTOR_FIRST {
         let index = descriptor as usize;
         X86_RUNTIME.ELF_PROBE_STDIO_DEVICE_DESCRIPTORS[index].store(state, Ordering::SeqCst);
@@ -41719,6 +41859,9 @@ fn linux_statx_set_mount(stat: &mut [u8; 256], filesystem: LinuxFilesystemKind) 
 
 fn linux_socket_slot(descriptor: u64) -> Option<crate::linux_socket::SlotId> {
     let descriptor = u64::from(descriptor as u32);
+    if descriptor >= LINUX_DESCRIPTOR_TABLE_LIMIT {
+        return linux_overflow_entry(descriptor).and_then(|entry| entry.socket.checked_sub(1));
+    }
     if let Some(slot) = usize::try_from(descriptor)
         .ok()
         .and_then(|index| X86_RUNTIME.ELF_PROBE_STDIO_SOCKET_SLOTS.get(index))
@@ -41768,6 +41911,10 @@ fn linux_socket_nonblocking(descriptor: u64) -> bool {
         return true;
     }
     let descriptor = u64::from(descriptor as u32);
+    if descriptor >= LINUX_DESCRIPTOR_TABLE_LIMIT {
+        return linux_overflow_entry(descriptor)
+            .is_some_and(|entry| entry.socket_flags & LINUX_O_NONBLOCK as u32 != 0);
+    }
     if let Some(flags) = usize::try_from(descriptor)
         .ok()
         .and_then(|index| X86_RUNTIME.ELF_PROBE_STDIO_SOCKET_FLAGS.get(index))
@@ -41782,6 +41929,9 @@ fn linux_socket_nonblocking(descriptor: u64) -> bool {
 
 fn linux_socket_flags(descriptor: u64) -> Option<u32> {
     let descriptor = u64::from(descriptor as u32);
+    if descriptor >= LINUX_DESCRIPTOR_TABLE_LIMIT {
+        return linux_overflow_entry(descriptor).map(|entry| entry.socket_flags);
+    }
     if let Some(flags) = usize::try_from(descriptor)
         .ok()
         .and_then(|index| X86_RUNTIME.ELF_PROBE_STDIO_SOCKET_FLAGS.get(index))
@@ -41809,23 +41959,37 @@ fn linux_netlink_socket_create(socket_type: u64, protocol: u64) -> u64 {
     if protocol >= NETLINK_PROTOCOLS {
         return LINUX_EPROTONOSUPPORT;
     }
-    let Some(descriptor) = (LINUX_AUX_DESCRIPTOR_FIRST..linux_nofile_soft_limit())
-        .find(|descriptor| linux_aux_descriptor_free(*descriptor))
-    else {
+    let Some(descriptor) = linux_free_descriptor(LINUX_AUX_DESCRIPTOR_FIRST) else {
         return LINUX_EMFILE;
     };
     let slot = match crate::linux_socket::open_netlink(protocol as u8) {
         Ok(slot) => slot,
         Err(error) => return linux_socket_error(error),
     };
-    let index = (descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
-    X86_RUNTIME.ELF_PROBE_SOCKET_SLOTS[index].store(slot + 1, Ordering::SeqCst);
-    X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index]
-        .store((socket_type & SOCK_NONBLOCK) as u32, Ordering::SeqCst);
-    X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index]
-        .store(LINUX_DEVICE_SOCKET | 3, Ordering::SeqCst);
-    set_linux_descriptor_close_on_exec(descriptor, socket_type & SOCK_CLOEXEC != 0);
-    descriptor
+    linux_socket_descriptor_installed(
+        descriptor,
+        slot,
+        LINUX_DEVICE_SOCKET | 3,
+        (socket_type & SOCK_NONBLOCK) as u32,
+        socket_type & SOCK_CLOEXEC != 0,
+    )
+}
+
+/// `install_linux_socket_descriptor`, the descriptor (or ENOMEM, the
+/// socket closed again) returned.
+fn linux_socket_descriptor_installed(
+    descriptor: u64,
+    slot: crate::linux_socket::SlotId,
+    state: u16,
+    flags: u32,
+    close_on_exec: bool,
+) -> u64 {
+    if install_linux_socket_descriptor(descriptor, slot, state, flags, close_on_exec) {
+        descriptor
+    } else {
+        let _ = crate::linux_socket::close(slot);
+        LINUX_ENOMEM
+    }
 }
 
 fn linux_socket_create(family: u64, socket_type: u64, protocol: u64) -> u64 {
@@ -41896,9 +42060,7 @@ fn linux_socket_create(family: u64, socket_type: u64, protocol: u64) -> u64 {
     if base == SOCK_DGRAM && kind == crate::linux_socket::Kind::Icmp && !linux_ping_allowed() {
         return LINUX_EACCES;
     }
-    let Some(descriptor) = (LINUX_AUX_DESCRIPTOR_FIRST..LINUX_AUX_DESCRIPTOR_LIMIT)
-        .find(|descriptor| linux_aux_descriptor_free(*descriptor))
-    else {
+    let Some(descriptor) = linux_free_descriptor(LINUX_AUX_DESCRIPTOR_FIRST) else {
         return LINUX_EMFILE;
     };
     let slot = match if kind == crate::linux_socket::Kind::Unix {
@@ -41937,14 +42099,13 @@ fn linux_socket_create(family: u64, socket_type: u64, protocol: u64) -> u64 {
             return result;
         }
     };
-    let index = (descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
-    X86_RUNTIME.ELF_PROBE_SOCKET_SLOTS[index].store(slot + 1, Ordering::SeqCst);
-    X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index]
-        .store((socket_type & SOCK_NONBLOCK) as u32, Ordering::SeqCst);
-    X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index]
-        .store(LINUX_DEVICE_SOCKET | 3, Ordering::SeqCst);
-    set_linux_descriptor_close_on_exec(descriptor, socket_type & SOCK_CLOEXEC != 0);
-    descriptor
+    linux_socket_descriptor_installed(
+        descriptor,
+        slot,
+        LINUX_DEVICE_SOCKET | 3,
+        (socket_type & SOCK_NONBLOCK) as u32,
+        socket_type & SOCK_CLOEXEC != 0,
+    )
 }
 
 /// socket(AF_PACKET, ...): a packet socket of base type SOCK_RAW or
@@ -41966,23 +42127,20 @@ fn linux_packet_socket_create(socket_type: u64, protocol: u64) -> u64 {
     if !linux_has_capability(ginux_credentials::capability::NET_RAW) {
         return LINUX_EPERM;
     }
-    let Some(descriptor) = (LINUX_AUX_DESCRIPTOR_FIRST..LINUX_AUX_DESCRIPTOR_LIMIT)
-        .find(|descriptor| linux_aux_descriptor_free(*descriptor))
-    else {
+    let Some(descriptor) = linux_free_descriptor(LINUX_AUX_DESCRIPTOR_FIRST) else {
         return LINUX_EMFILE;
     };
     let slot = match crate::linux_socket::open_packet(base as u8, protocol as u16) {
         Ok(slot) => slot,
         Err(error) => return linux_socket_error(error),
     };
-    let index = (descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
-    X86_RUNTIME.ELF_PROBE_SOCKET_SLOTS[index].store(slot + 1, Ordering::SeqCst);
-    X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index]
-        .store((socket_type & SOCK_NONBLOCK) as u32, Ordering::SeqCst);
-    X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index]
-        .store(LINUX_DEVICE_SOCKET | 3, Ordering::SeqCst);
-    set_linux_descriptor_close_on_exec(descriptor, socket_type & SOCK_CLOEXEC != 0);
-    descriptor
+    linux_socket_descriptor_installed(
+        descriptor,
+        slot,
+        LINUX_DEVICE_SOCKET | 3,
+        (socket_type & SOCK_NONBLOCK) as u32,
+        socket_type & SOCK_CLOEXEC != 0,
+    )
 }
 
 fn linux_socket_pair(family: u64, socket_type: u64, protocol: u64, output: u64) -> u64 {
@@ -42030,20 +42188,9 @@ fn linux_socket_pair(family: u64, socket_type: u64, protocol: u64, output: u64) 
     {
         return LINUX_EPROTONOSUPPORT;
     }
-    let mut descriptors = [0_u64; 2];
-    let mut found = 0;
-    for descriptor in 2..LINUX_AUX_DESCRIPTOR_LIMIT {
-        if linux_aux_descriptor_free(descriptor) {
-            descriptors[found] = descriptor;
-            found += 1;
-            if found == descriptors.len() {
-                break;
-            }
-        }
-    }
-    if found != descriptors.len() {
+    let Some(descriptors) = linux_free_descriptors::<2>(2) else {
         return LINUX_EMFILE;
-    }
+    };
     let (first, second) = match crate::linux_socket::open_pair(base as u8) {
         Ok(pair) => pair,
         Err(error) => return linux_socket_error(error),
@@ -42074,14 +42221,25 @@ fn linux_socket_pair(family: u64, socket_type: u64, protocol: u64, output: u64) 
         let _ = crate::linux_socket::close(second);
         return LINUX_EFAULT;
     }
-    for (descriptor, slot) in descriptors.into_iter().zip([first, second]) {
-        let index = (descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
-        X86_RUNTIME.ELF_PROBE_SOCKET_SLOTS[index].store(slot + 1, Ordering::SeqCst);
-        X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index]
-            .store((socket_type & SOCK_NONBLOCK) as u32, Ordering::SeqCst);
-        X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index]
-            .store(LINUX_DEVICE_SOCKET | 3, Ordering::SeqCst);
-        set_linux_descriptor_close_on_exec(descriptor, socket_type & SOCK_CLOEXEC != 0);
+    let mut installed = [first, second].map(|slot| (slot, false));
+    for (descriptor, (slot, done)) in descriptors.into_iter().zip(installed.iter_mut()) {
+        *done = install_linux_socket_descriptor(
+            descriptor,
+            *slot,
+            LINUX_DEVICE_SOCKET | 3,
+            (socket_type & SOCK_NONBLOCK) as u32,
+            socket_type & SOCK_CLOEXEC != 0,
+        );
+    }
+    if installed.iter().any(|(_, done)| !done) {
+        for (descriptor, (slot, done)) in descriptors.into_iter().zip(installed) {
+            if done {
+                let _ = linux_descriptor_close(descriptor);
+            } else {
+                let _ = crate::linux_socket::close(slot);
+            }
+        }
+        return LINUX_ENOMEM;
     }
     0
 }
@@ -42411,9 +42569,7 @@ fn linux_socket_accept(descriptor: u64, address: u64, length: u64, flags: u64) -
     if !crate::linux_socket::is_listening(listener_slot) {
         return LINUX_EINVAL;
     }
-    let Some(accepted_descriptor) = (LINUX_AUX_DESCRIPTOR_FIRST..LINUX_AUX_DESCRIPTOR_LIMIT)
-        .find(|descriptor| linux_aux_descriptor_free(*descriptor))
-    else {
+    let Some(accepted_descriptor) = linux_free_descriptor(LINUX_AUX_DESCRIPTOR_FIRST) else {
         return LINUX_EMFILE;
     };
     let ipv6 = crate::linux_socket::is_ipv6(listener_slot);
@@ -42443,14 +42599,13 @@ fn linux_socket_accept(descriptor: u64, address: u64, length: u64, flags: u64) -
         let _ = crate::linux_socket::close(accepted_slot);
         return LINUX_EFAULT;
     }
-    let index = (accepted_descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
-    X86_RUNTIME.ELF_PROBE_SOCKET_SLOTS[index].store(accepted_slot + 1, Ordering::SeqCst);
-    X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index]
-        .store((flags & SOCK_NONBLOCK) as u32, Ordering::SeqCst);
-    X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index]
-        .store(LINUX_DEVICE_SOCKET | 3, Ordering::SeqCst);
-    set_linux_descriptor_close_on_exec(accepted_descriptor, flags & SOCK_CLOEXEC != 0);
-    accepted_descriptor
+    linux_socket_descriptor_installed(
+        accepted_descriptor,
+        accepted_slot,
+        LINUX_DEVICE_SOCKET | 3,
+        (flags & SOCK_NONBLOCK) as u32,
+        flags & SOCK_CLOEXEC != 0,
+    )
 }
 
 /// accept(2) (system call `number`) on a blocking listener waits as a
@@ -43136,15 +43291,15 @@ fn linux_install_received_socket(
     flags: u32,
     close_on_exec: bool,
 ) -> Option<u64> {
-    let descriptor = (LINUX_AUX_DESCRIPTOR_FIRST..linux_nofile_soft_limit())
-        .find(|descriptor| linux_aux_descriptor_free(*descriptor))?;
-    let index = (descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
-    X86_RUNTIME.ELF_PROBE_SOCKET_SLOTS[index].store(slot + 1, Ordering::SeqCst);
-    X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index].store(flags, Ordering::SeqCst);
-    X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index]
-        .store(LINUX_DEVICE_SOCKET | 3, Ordering::SeqCst);
-    set_linux_descriptor_close_on_exec(descriptor, close_on_exec);
-    Some(descriptor)
+    let descriptor = linux_free_descriptor(LINUX_AUX_DESCRIPTOR_FIRST)?;
+    install_linux_socket_descriptor(
+        descriptor,
+        slot,
+        LINUX_DEVICE_SOCKET | 3,
+        flags,
+        close_on_exec,
+    )
+    .then_some(descriptor)
 }
 
 // Describes a non-socket descriptor for SCM_RIGHTS with the same state a
@@ -43159,19 +43314,7 @@ fn linux_file_right(descriptor: u64) -> Option<crate::linux_socket::FileRight> {
     {
         return None;
     }
-    let generation = usize::try_from(descriptor)
-        .ok()
-        .and_then(|index| X86_RUNTIME.ELF_PROBE_STDIO_TMP_FILE_GENERATIONS.get(index))
-        .or_else(|| {
-            descriptor
-                .checked_sub(LINUX_AUX_DESCRIPTOR_FIRST)
-                .and_then(|index| {
-                    X86_RUNTIME
-                        .ELF_PROBE_TMP_FILE_GENERATIONS
-                        .get(index as usize)
-                })
-        })
-        .map_or(0, |generation| generation.load(Ordering::SeqCst));
+    let generation = linux_descriptor_tmp_generation(descriptor).unwrap_or(0);
     Some(crate::linux_socket::FileRight {
         device,
         rootfs: linux_rootfs_descriptor(descriptor),
@@ -43185,8 +43328,22 @@ fn linux_install_received_file(
     file: crate::linux_socket::FileRight,
     close_on_exec: bool,
 ) -> Option<u64> {
-    let descriptor = (LINUX_AUX_DESCRIPTOR_FIRST..linux_nofile_soft_limit())
-        .find(|descriptor| linux_aux_descriptor_free(*descriptor))?;
+    let descriptor = linux_free_descriptor(LINUX_AUX_DESCRIPTOR_FIRST)?;
+    if descriptor >= LINUX_DESCRIPTOR_TABLE_LIMIT {
+        return install_linux_overflow_descriptor(
+            descriptor,
+            crate::linux_fd_table::Entry {
+                state: file.device,
+                rootfs: file.rootfs,
+                generation: file.generation,
+                socket_flags: file.flags,
+                offset: file.offset,
+                close_on_exec,
+                ..Default::default()
+            },
+        )
+        .then_some(descriptor);
+    }
     let index = (descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
     X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index].store(file.device, Ordering::SeqCst);
     X86_RUNTIME.ELF_PROBE_ROOTFS_DESCRIPTORS[index].store(file.rootfs, Ordering::SeqCst);
@@ -48232,21 +48389,22 @@ fn linux_install_object_descriptor_with_access(
     flags: u64,
     access: u16,
 ) -> u64 {
-    let Some(descriptor) = (LINUX_AUX_DESCRIPTOR_FIRST..LINUX_AUX_DESCRIPTOR_LIMIT)
-        .find(|descriptor| linux_aux_descriptor_free(*descriptor))
-    else {
+    let Some(descriptor) = linux_free_descriptor(LINUX_AUX_DESCRIPTOR_FIRST) else {
         let _ = crate::linux_socket::close(slot);
         linux_release_objects();
         return LINUX_EMFILE;
     };
-    let index = (descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
-    X86_RUNTIME.ELF_PROBE_SOCKET_SLOTS[index].store(slot + 1, Ordering::SeqCst);
-    X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index]
-        .store((flags & LINUX_O_NONBLOCK) as u32, Ordering::SeqCst);
-    X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index]
-        .store(LINUX_DEVICE_SOCKET | access, Ordering::SeqCst);
-    set_linux_descriptor_close_on_exec(descriptor, flags & LINUX_O_CLOEXEC != 0);
-    descriptor
+    let installed = linux_socket_descriptor_installed(
+        descriptor,
+        slot,
+        LINUX_DEVICE_SOCKET | access,
+        (flags & LINUX_O_NONBLOCK) as u32,
+        flags & LINUX_O_CLOEXEC != 0,
+    );
+    if installed >= LINUX_RETURN_TO_KERNEL {
+        linux_release_objects();
+    }
+    installed
 }
 
 /// /dev/userfaultfd (10:126), whose USERFAULTFD_IOC_NEW makes userfaultfds:
@@ -49432,20 +49590,9 @@ fn linux_socket_pipe(
     if flags & !(LINUX_O_NONBLOCK | LINUX_O_CLOEXEC | LINUX_O_DIRECT) != 0 {
         return LINUX_EINVAL;
     }
-    let mut descriptors = [0_u64; 2];
-    let mut found = 0;
-    for descriptor in first_descriptor..LINUX_AUX_DESCRIPTOR_LIMIT {
-        if linux_aux_descriptor_free(descriptor) {
-            descriptors[found] = descriptor;
-            found += 1;
-            if found == descriptors.len() {
-                break;
-            }
-        }
-    }
-    if found != descriptors.len() {
+    let Some(descriptors) = linux_free_descriptors::<2>(first_descriptor) else {
         return LINUX_EMFILE;
-    }
+    };
     // A packet-mode (O_DIRECT) pipe keeps each write as one packet, which a
     // read returns on its own: a sequenced-packet pair, where a plain pipe
     // is a byte stream.
@@ -49470,21 +49617,30 @@ fn linux_socket_pipe(
         let _ = crate::linux_socket::close(writer);
         return LINUX_EFAULT;
     }
-    for (descriptor, slot, access) in [
+    let ends = [
         (descriptors[0], reader, LINUX_DESCRIPTOR_INPUT),
         (descriptors[1], writer, LINUX_DESCRIPTOR_OUTPUT),
-    ] {
-        let index = (descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
-        X86_RUNTIME.ELF_PROBE_SOCKET_SLOTS[index].store(slot + 1, Ordering::SeqCst);
-        X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index].store(
-            (flags & (LINUX_O_NONBLOCK | LINUX_O_DIRECT)) as u32,
-            Ordering::SeqCst,
-        );
-        X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index].store(
+    ];
+    let installed = ends.map(|(descriptor, slot, access)| {
+        install_linux_socket_descriptor(
+            descriptor,
+            slot,
             LINUX_DEVICE_SOCKET | LINUX_DEVICE_PIPE | access,
-            Ordering::SeqCst,
-        );
-        set_linux_descriptor_close_on_exec(descriptor, flags & LINUX_O_CLOEXEC != 0);
+            (flags & (LINUX_O_NONBLOCK | LINUX_O_DIRECT)) as u32,
+            flags & LINUX_O_CLOEXEC != 0,
+        )
+    });
+    if installed.contains(&false) {
+        // Out of memory for the table above the fixed one: neither end
+        // stays open (closing an installed end closes its socket).
+        for ((descriptor, slot, _), installed) in ends.into_iter().zip(installed) {
+            if installed {
+                let _ = linux_descriptor_close(descriptor);
+            } else {
+                let _ = crate::linux_socket::close(slot);
+            }
+        }
+        return LINUX_ENOMEM;
     }
     0
 }
@@ -53588,7 +53744,60 @@ fn linux_tty_ioctl(request: u64, argument: u64) -> u64 {
     }
 }
 
+/// The current process's descriptor `descriptor`, when it lies above the
+/// fixed table (`linux_fd_table`); None for one in the fixed table or not
+/// open.
+fn linux_overflow_entry(descriptor: u64) -> Option<crate::linux_fd_table::Entry> {
+    if descriptor < LINUX_DESCRIPTOR_TABLE_LIMIT {
+        return None;
+    }
+    crate::linux_fd_table::get(
+        X86_RUNTIME
+            .ELF_PROBE_DESCRIPTOR_OVERFLOW
+            .load(Ordering::SeqCst),
+        descriptor,
+    )
+}
+
+/// Changes the current process's descriptor `descriptor` above the fixed
+/// table; false if it is not open there.
+fn update_linux_overflow_entry(
+    descriptor: u64,
+    change: impl FnOnce(&mut crate::linux_fd_table::Entry),
+) -> bool {
+    descriptor >= LINUX_DESCRIPTOR_TABLE_LIMIT
+        && linux_overflow_entry(descriptor).is_some()
+        && linux_own_overflow_table()
+            .is_some_and(|table| crate::linux_fd_table::update(table, descriptor, change))
+}
+
+/// Opens descriptor `descriptor` above the fixed table as `entry`, the
+/// current process's table there made on first use; false without memory.
+fn install_linux_overflow_descriptor(descriptor: u64, entry: crate::linux_fd_table::Entry) -> bool {
+    let table = match linux_own_overflow_table() {
+        Some(table) => table,
+        None if X86_RUNTIME
+            .ELF_PROBE_DESCRIPTOR_OVERFLOW
+            .load(Ordering::SeqCst)
+            == 0 =>
+        {
+            let Some(created) = crate::linux_fd_table::create(linux_execution_instance()) else {
+                return false;
+            };
+            X86_RUNTIME
+                .ELF_PROBE_DESCRIPTOR_OVERFLOW
+                .store(created, Ordering::SeqCst);
+            created
+        }
+        None => return false,
+    };
+    crate::linux_fd_table::set(table, descriptor, entry)
+}
+
 fn linux_device_descriptor(descriptor: u64) -> u16 {
+    if descriptor >= LINUX_DESCRIPTOR_TABLE_LIMIT {
+        return linux_overflow_entry(descriptor).map_or(0, |entry| entry.state);
+    }
     if let Some(state) = usize::try_from(descriptor)
         .ok()
         .and_then(|index| X86_RUNTIME.ELF_PROBE_STDIO_DEVICE_DESCRIPTORS.get(index))
@@ -53664,6 +53873,9 @@ fn linux_proc_mounts_changed(descriptor: u64) -> bool {
 }
 
 fn linux_descriptor_tmp_generation(descriptor: u64) -> Option<u32> {
+    if descriptor >= LINUX_DESCRIPTOR_TABLE_LIMIT {
+        return Some(linux_overflow_entry(descriptor).map_or(0, |entry| entry.generation));
+    }
     if let Some(value) = usize::try_from(descriptor)
         .ok()
         .and_then(|index| X86_RUNTIME.ELF_PROBE_STDIO_TMP_FILE_GENERATIONS.get(index))
@@ -54987,22 +55199,89 @@ fn linux_overlay_copy_from_user(
     total as u64
 }
 
-fn linux_legacy_descriptor_offset(descriptor: u64) -> &'static AtomicU64 {
-    if descriptor < LINUX_AUX_DESCRIPTOR_FIRST {
-        return &X86_RUNTIME.ELF_PROBE_STDIO_OFFSETS[descriptor as usize];
-    }
-    &X86_RUNTIME.ELF_PROBE_DESCRIPTOR_OFFSETS[(descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize]
+/// A descriptor's 64-bit field: in the fixed table's banked arrays, or in
+/// its entry above the fixed table (`linux_fd_table`).
+#[derive(Clone, Copy)]
+enum LinuxDescriptorCell {
+    Banked(&'static AtomicU64),
+    /// The entry's offset (`false`) or open-file id (`true`).
+    Overflow {
+        descriptor: u64,
+        open_file_id: bool,
+    },
 }
 
-fn linux_descriptor_open_file_id_cell(descriptor: u64) -> Option<&'static AtomicU64> {
+impl LinuxDescriptorCell {
+    fn load(self, ordering: Ordering) -> u64 {
+        match self {
+            Self::Banked(cell) => cell.load(ordering),
+            Self::Overflow {
+                descriptor,
+                open_file_id,
+            } => linux_overflow_entry(descriptor).map_or(0, |entry| {
+                if open_file_id {
+                    entry.open_file_id
+                } else {
+                    entry.offset
+                }
+            }),
+        }
+    }
+
+    fn store(self, value: u64, ordering: Ordering) {
+        match self {
+            Self::Banked(cell) => cell.store(value, ordering),
+            Self::Overflow {
+                descriptor,
+                open_file_id,
+            } => {
+                let _ = update_linux_overflow_entry(descriptor, |entry| {
+                    if open_file_id {
+                        entry.open_file_id = value;
+                    } else {
+                        entry.offset = value;
+                    }
+                });
+            }
+        }
+    }
+}
+
+fn linux_legacy_descriptor_offset(descriptor: u64) -> LinuxDescriptorCell {
+    if descriptor >= LINUX_DESCRIPTOR_TABLE_LIMIT {
+        return LinuxDescriptorCell::Overflow {
+            descriptor,
+            open_file_id: false,
+        };
+    }
+    if descriptor < LINUX_AUX_DESCRIPTOR_FIRST {
+        return LinuxDescriptorCell::Banked(
+            &X86_RUNTIME.ELF_PROBE_STDIO_OFFSETS[descriptor as usize],
+        );
+    }
+    LinuxDescriptorCell::Banked(
+        &X86_RUNTIME.ELF_PROBE_DESCRIPTOR_OFFSETS
+            [(descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize],
+    )
+}
+
+fn linux_descriptor_open_file_id_cell(descriptor: u64) -> Option<LinuxDescriptorCell> {
+    if descriptor >= LINUX_DESCRIPTOR_TABLE_LIMIT {
+        return linux_overflow_entry(descriptor).map(|_| LinuxDescriptorCell::Overflow {
+            descriptor,
+            open_file_id: true,
+        });
+    }
     if descriptor < LINUX_AUX_DESCRIPTOR_FIRST {
         return X86_RUNTIME
             .ELF_PROBE_STDIO_OPEN_FILE_IDS
-            .get(descriptor as usize);
+            .get(descriptor as usize)
+            .map(LinuxDescriptorCell::Banked);
     }
     X86_RUNTIME
         .ELF_PROBE_OPEN_FILE_IDS
         .get((descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize)
+        .map(LinuxDescriptorCell::Banked)
 }
 
 fn linux_descriptor_open_file_id(descriptor: u64) -> Option<u64> {
@@ -55066,7 +55345,10 @@ impl LinuxDescriptorOffset {
         };
         linux_open_file_offset_cells(id)
             .next()
-            .unwrap_or_else(|| linux_legacy_descriptor_offset(self.descriptor))
+            .map_or_else(
+                || linux_legacy_descriptor_offset(self.descriptor),
+                LinuxDescriptorCell::Banked,
+            )
             .load(ordering)
     }
 
@@ -55078,6 +55360,8 @@ impl LinuxDescriptorOffset {
         for offset in linux_open_file_offset_cells(id) {
             offset.store(value, ordering);
         }
+        // The descriptors above the fixed tables that share the file.
+        crate::linux_fd_table::sync_offset(id, value);
         sync_saved_linux_open_file_offset(id, value);
     }
 }
@@ -55110,7 +55394,7 @@ fn linux_descriptor_offset(descriptor: u64) -> LinuxDescriptorOffset {
 
 fn linux_descriptor_close_on_exec(descriptor: u64) -> bool {
     if descriptor >= LINUX_DESCRIPTOR_TABLE_LIMIT {
-        return false;
+        return linux_overflow_entry(descriptor).is_some_and(|entry| entry.close_on_exec);
     }
     let word = descriptor as usize / u64::BITS as usize;
     let mask = 1_u64 << (descriptor % u64::BITS as u64);
@@ -55123,7 +55407,9 @@ fn linux_descriptor_flag(
     descriptor: u64,
 ) -> bool {
     if descriptor >= LINUX_DESCRIPTOR_TABLE_LIMIT {
-        return false;
+        // Above the fixed table only F_CREATED_QUERY's bit is kept.
+        return core::ptr::eq(table, &*X86_RUNTIME.ELF_PROBE_DESCRIPTOR_CREATED)
+            && linux_overflow_entry(descriptor).is_some_and(|entry| entry.created);
     }
     let word = descriptor as usize / u64::BITS as usize;
     let mask = 1_u64 << (descriptor % u64::BITS as u64);
@@ -55136,6 +55422,9 @@ fn set_linux_descriptor_flag(
     enabled: bool,
 ) {
     if descriptor >= LINUX_DESCRIPTOR_TABLE_LIMIT {
+        if core::ptr::eq(table, &*X86_RUNTIME.ELF_PROBE_DESCRIPTOR_CREATED) {
+            let _ = update_linux_overflow_entry(descriptor, |entry| entry.created = enabled);
+        }
         return;
     }
     let word = descriptor as usize / u64::BITS as usize;
@@ -55464,6 +55753,7 @@ fn linux_fcntl_get_lease(descriptor: u64) -> u64 {
 
 fn set_linux_descriptor_close_on_exec(descriptor: u64, enabled: bool) {
     if descriptor >= LINUX_DESCRIPTOR_TABLE_LIMIT {
+        let _ = update_linux_overflow_entry(descriptor, |entry| entry.close_on_exec = enabled);
         return;
     }
     let word = descriptor as usize / u64::BITS as usize;
@@ -55529,6 +55819,10 @@ fn linux_descriptor_close(descriptor: u64) -> u64 {
 fn linux_close_all_descriptors() -> bool {
     crate::framebuffer::set_owned(false);
     crate::linux_input::flush();
+    if linux_close_overflow_range(LINUX_DESCRIPTOR_TABLE_LIMIT, u64::MAX, false) != 0 {
+        serial_write("ginux: descriptor teardown failed above the fixed table\r\n");
+        return false;
+    }
     for descriptor in 0..LINUX_DESCRIPTOR_TABLE_LIMIT {
         if linux_descriptor_open(descriptor) {
             let result = linux_descriptor_close(descriptor);
@@ -55553,6 +55847,79 @@ fn linux_close_all_descriptors() -> bool {
     true
 }
 
+/// Closes descriptor `descriptor`, above the fixed table: what it refers
+/// to (a socket or pipe, a POSIX message queue) is let go of.
+fn linux_close_overflow_descriptor(descriptor: u64, wake_waiters: bool) -> u64 {
+    if linux_overflow_entry(descriptor).is_none() {
+        return LINUX_EBADF;
+    }
+    let Some(table) = linux_own_overflow_table() else {
+        return LINUX_ENOMEM;
+    };
+    let Some(entry) = crate::linux_fd_table::remove(table, descriptor) else {
+        return LINUX_EBADF;
+    };
+    if entry.socket != 0 {
+        let closed = crate::linux_socket::close(entry.socket - 1);
+        linux_release_objects();
+        linux_pty_send_hangups();
+        if !closed {
+            return LINUX_EBADF;
+        }
+    } else if entry.state & !3 == LINUX_DEVICE_POSIX_MQ {
+        let Ok(id) = u32::try_from(entry.offset) else {
+            return LINUX_EBADF;
+        };
+        match crate::linux_sysv_ipc::posix_queue_close_by(id, current_linux_process_pid()) {
+            Ok((destroyed, removed)) => {
+                if let Some(removed) = removed {
+                    linux_mq_finish_registration(removed, false);
+                }
+                if !linux_release_posix_queue_charge(destroyed) {
+                    return LINUX_EIO;
+                }
+            }
+            Err(_) => return LINUX_EBADF,
+        }
+    }
+    if wake_waiters {
+        wake_linux_descriptor_waits();
+    }
+    0
+}
+
+/// Closes every open descriptor of the current process above the fixed
+/// table, or marks them close-on-exec (`close_on_exec`), from `first` to
+/// `last`; the first error.
+fn linux_close_overflow_range(first: u64, last: u64, close_on_exec: bool) -> u64 {
+    let table = X86_RUNTIME
+        .ELF_PROBE_DESCRIPTOR_OVERFLOW
+        .load(Ordering::SeqCst);
+    for (descriptor, _) in crate::linux_fd_table::entries(table) {
+        if descriptor < first || descriptor > last {
+            continue;
+        }
+        if close_on_exec {
+            set_linux_descriptor_close_on_exec(descriptor, true);
+        } else if linux_descriptor_close(descriptor) != 0 {
+            return LINUX_EBADF;
+        }
+    }
+    0
+}
+
+/// exec: the descriptors above the fixed table marked close-on-exec close.
+fn linux_close_overflow_on_exec() {
+    let table = X86_RUNTIME
+        .ELF_PROBE_DESCRIPTOR_OVERFLOW
+        .load(Ordering::SeqCst);
+    for (descriptor, entry) in crate::linux_fd_table::entries(table) {
+        if entry.close_on_exec {
+            let _ = linux_descriptor_close(descriptor);
+        }
+    }
+}
+
 fn linux_close_range(first: u64, last: u64, flags: u64) -> u64 {
     let first = u64::from(first as u32);
     let last = u64::from(last as u32);
@@ -55568,18 +55935,20 @@ fn linux_close_range(first: u64, last: u64, flags: u64) -> u64 {
         return LINUX_ENOMEM;
     }
     let end = last.min(LINUX_DESCRIPTOR_TABLE_LIMIT - 1);
-    if first > end {
-        return 0;
+    if first <= end {
+        for descriptor in first..=end {
+            if !linux_descriptor_open(descriptor) {
+                continue;
+            }
+            if flags & LINUX_CLOSE_RANGE_CLOEXEC != 0 {
+                set_linux_descriptor_close_on_exec(descriptor, true);
+            } else if linux_descriptor_close(descriptor) != 0 {
+                return LINUX_EBADF;
+            }
+        }
     }
-    for descriptor in first..=end {
-        if !linux_descriptor_open(descriptor) {
-            continue;
-        }
-        if flags & LINUX_CLOSE_RANGE_CLOEXEC != 0 {
-            set_linux_descriptor_close_on_exec(descriptor, true);
-        } else if linux_descriptor_close(descriptor) != 0 {
-            return LINUX_EBADF;
-        }
+    if last >= LINUX_DESCRIPTOR_TABLE_LIMIT {
+        return linux_close_overflow_range(first, last, flags & LINUX_CLOSE_RANGE_CLOEXEC != 0);
     }
     0
 }
@@ -55632,6 +56001,9 @@ fn linux_descriptor_close_with_wake(descriptor: u64, wake_waiters: bool) -> u64 
 }
 
 fn linux_descriptor_close_with_wake_inner(descriptor: u64, wake_waiters: bool) -> u64 {
+    if descriptor >= LINUX_DESCRIPTOR_TABLE_LIMIT {
+        return linux_close_overflow_descriptor(descriptor, wake_waiters);
+    }
     linux_epoll_forget_descriptor(descriptor);
     if let Some(slot) = linux_socket_slot(descriptor) {
         let closed = crate::linux_socket::close(slot);
@@ -55941,6 +56313,19 @@ fn linux_finish_descriptor_dup(source: u64, target: u64) -> u64 {
 fn linux_console_dup2(source: u64, target: u64) -> u64 {
     let source = u64::from(source as u32);
     let target = u64::from(target as u32);
+    // The table above the fixed one holds files, sockets and pipes; an
+    // epoll instance, eventfd or timerfd keeps state only the fixed table
+    // has room for.
+    if target >= LINUX_DESCRIPTOR_TABLE_LIMIT
+        && (linux_epoll_descriptor(source)
+            || linux_eventfd_descriptor(source)
+            || linux_timerfd_descriptor(source))
+    {
+        return LINUX_EMFILE;
+    }
+    if target >= LINUX_DESCRIPTOR_TABLE_LIMIT && source != target {
+        return linux_dup_above_fixed_table(source, target);
+    }
     if linux_epoll_descriptor(source) {
         return linux_epoll_dup(source, target);
     }
@@ -55996,20 +56381,7 @@ fn linux_console_dup2(source: u64, target: u64) -> u64 {
         let source_offset = linux_descriptor_offset(source).load(Ordering::SeqCst);
         let source_flags = linux_socket_flags(source).unwrap_or(0);
         let source_rootfs = linux_rootfs_descriptor(source);
-        let source_tmp = usize::try_from(source)
-            .ok()
-            .and_then(|index| X86_RUNTIME.ELF_PROBE_STDIO_TMP_FILE_GENERATIONS.get(index))
-            .or_else(|| {
-                source
-                    .checked_sub(LINUX_AUX_DESCRIPTOR_FIRST)
-                    .and_then(|index| {
-                        X86_RUNTIME
-                            .ELF_PROBE_TMP_FILE_GENERATIONS
-                            .get(index as usize)
-                    })
-            })
-            .map(|generation| generation.load(Ordering::SeqCst))
-            .unwrap_or(0);
+        let source_tmp = linux_descriptor_tmp_generation(source).unwrap_or(0);
         if device & LINUX_DEVICE_CONSOLE != 0 {
             if target == 2 {
                 X86_RUNTIME
@@ -56101,6 +56473,52 @@ fn linux_console_dup2(source: u64, target: u64) -> u64 {
             return linux_finish_descriptor_dup(source, target);
         }
     }
+}
+
+/// dup2 of `source` to `target`, a descriptor above the fixed table: the
+/// target (closed first if open) gets the source's file, as the fixed
+/// table's copy does.
+fn linux_dup_above_fixed_table(source: u64, target: u64) -> u64 {
+    let console = linux_console_descriptor(source);
+    let state = match linux_device_descriptor(source) {
+        0 if console != 0 => LINUX_DEVICE_CONSOLE | u16::from(console),
+        0 => return LINUX_EBADF,
+        state => state,
+    };
+    if target >= linux_nofile_soft_limit() {
+        return LINUX_EBADF;
+    }
+    if linux_descriptor_open(target) && linux_descriptor_close(target) != 0 {
+        return LINUX_EBADF;
+    }
+    let socket = linux_socket_slot(source);
+    if let Some(slot) = socket {
+        if !crate::linux_socket::duplicate(slot) {
+            return LINUX_EBADF;
+        }
+    }
+    if let Some(id) = linux_mq_descriptor_id(source) {
+        if crate::linux_sysv_ipc::posix_queue_duplicate(id).is_err() {
+            if let Some(slot) = socket {
+                let _ = crate::linux_socket::close(slot);
+            }
+            return LINUX_EBADF;
+        }
+    }
+    let entry = crate::linux_fd_table::Entry {
+        state,
+        rootfs: linux_rootfs_descriptor(source),
+        socket: socket.map_or(0, |slot| slot + 1),
+        socket_flags: linux_socket_flags(source).unwrap_or(0),
+        generation: linux_descriptor_tmp_generation(source).unwrap_or(0),
+        offset: linux_descriptor_offset(source).load(Ordering::SeqCst),
+        ..Default::default()
+    };
+    if !install_linux_overflow_descriptor(target, entry) {
+        release_linux_overflow_entries(core::iter::once(entry));
+        return LINUX_ENOMEM;
+    }
+    linux_finish_descriptor_dup(source, target)
 }
 
 fn linux_dup3(source: u64, target: u64, flags: u64) -> u64 {
@@ -56385,13 +56803,18 @@ fn linux_descriptor_fcntl(descriptor: u64, command: u64, argument: u64) -> u64 {
         } else {
             2
         };
-        let flags = usize::try_from(descriptor)
-            .ok()
-            .and_then(|index| X86_RUNTIME.ELF_PROBE_STDIO_SOCKET_FLAGS.get(index))
-            .unwrap_or_else(|| {
-                &X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS
-                    [linux_socket_descriptor_index(descriptor).unwrap()]
-            });
+        let overflow = LinuxOverflowFlags(descriptor);
+        let flags: &dyn LinuxFileCell<u32> = if descriptor >= LINUX_DESCRIPTOR_TABLE_LIMIT {
+            &overflow
+        } else {
+            usize::try_from(descriptor)
+                .ok()
+                .and_then(|index| X86_RUNTIME.ELF_PROBE_STDIO_SOCKET_FLAGS.get(index))
+                .unwrap_or_else(|| {
+                    &X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS
+                        [linux_socket_descriptor_index(descriptor).unwrap()]
+                })
+        };
         return match command {
             LINUX_F_DUPFD => linux_device_dup_at_least(descriptor, argument, false),
             LINUX_F_DUPFD_CLOEXEC => linux_device_dup_at_least(descriptor, argument, true),
@@ -56570,10 +56993,16 @@ fn linux_descriptor_fcntl(descriptor: u64, command: u64, argument: u64) -> u64 {
                 )
         }
         LINUX_F_SETFL => {
-            let Some(flags) = linux_socket_descriptor_index(descriptor)
-                .map(|index| &X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index])
-            else {
-                return LINUX_EBADF;
+            let overflow = LinuxOverflowFlags(descriptor);
+            let flags: &dyn LinuxFileCell<u32> = if descriptor >= LINUX_DESCRIPTOR_TABLE_LIMIT {
+                &overflow
+            } else {
+                let Some(flags) = linux_socket_descriptor_index(descriptor)
+                    .map(|index| &X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index])
+                else {
+                    return LINUX_EBADF;
+                };
+                flags
             };
             linux_descriptor_set_status_flags(flags, argument, LINUX_O_APPEND | LINUX_O_NONBLOCK)
         }
@@ -56954,6 +57383,20 @@ fn linux_descriptor_set_nonblocking(flags: &dyn LinuxFileCell<u32>, argument: u6
     linux_descriptor_set_status_flags(flags, argument, LINUX_O_NONBLOCK)
 }
 
+/// The status flags (O_NONBLOCK, O_APPEND, ...) of a descriptor above the
+/// fixed table, as a cell F_GETFL and F_SETFL work on.
+struct LinuxOverflowFlags(u64);
+
+impl LinuxFileCell<u32> for LinuxOverflowFlags {
+    fn load(&self, _ordering: Ordering) -> u32 {
+        linux_overflow_entry(self.0).map_or(0, |entry| entry.socket_flags)
+    }
+
+    fn store(&self, value: u32, _ordering: Ordering) {
+        let _ = update_linux_overflow_entry(self.0, |entry| entry.socket_flags = value);
+    }
+}
+
 fn linux_descriptor_set_status_flags(
     flags: &dyn LinuxFileCell<u32>,
     argument: u64,
@@ -57265,12 +57708,27 @@ fn linux_getdents_entries(descriptor: u64, address: u64, count: u64, legacy: boo
             }
         }
         if directory == b"proc/self/fd" {
-            if cursor > LINUX_AUX_DESCRIPTOR_LIMIT as usize {
-                return LINUX_EINVAL;
-            }
-            while cursor < LINUX_AUX_DESCRIPTOR_LIMIT as usize {
-                let descriptor = cursor as u64;
-                cursor += 1;
+            // The fixed table's descriptors, then those above it (the
+            // cursor is the next descriptor to look at).
+            let overflow = crate::linux_fd_table::entries(
+                X86_RUNTIME
+                    .ELF_PROBE_DESCRIPTOR_OVERFLOW
+                    .load(Ordering::SeqCst),
+            );
+            loop {
+                let descriptor = if cursor < LINUX_AUX_DESCRIPTOR_LIMIT as usize {
+                    cursor as u64
+                } else {
+                    match overflow
+                        .iter()
+                        .map(|(descriptor, _)| *descriptor)
+                        .find(|descriptor| *descriptor >= cursor as u64)
+                    {
+                        Some(descriptor) => descriptor,
+                        None => break,
+                    }
+                };
+                cursor = descriptor as usize + 1;
                 if !linux_descriptor_open(descriptor) {
                     continue;
                 }
@@ -57679,7 +58137,11 @@ fn linux_default_resource_limit(resource: u64, runtime: bool) -> Option<[u64; 2]
     let value = match resource {
         LINUX_RLIMIT_STACK if runtime => u64::MAX,
         LINUX_RLIMIT_STACK => PAGE_SIZE as u64,
-        LINUX_RLIMIT_NOFILE if runtime => LINUX_DESCRIPTOR_TABLE_LIMIT,
+        // Linux's defaults (INR_OPEN_CUR, INR_OPEN_MAX): a process may raise
+        // its soft limit to 4096 and, with CAP_SYS_RESOURCE, its hard limit
+        // to /proc/sys/fs/nr_open; descriptors past the fixed table live in
+        // `linux_fd_table`.
+        LINUX_RLIMIT_NOFILE if runtime => return Some([LINUX_DESCRIPTOR_TABLE_LIMIT, 4096]),
         LINUX_RLIMIT_NOFILE => LINUX_AUX_DESCRIPTOR_LIMIT,
         // Linux counts every task; the process table and thread slots bound
         // the real capacity.
@@ -58475,11 +58937,100 @@ fn linux_prlimit64(pid: u64, resource: u64, new_limit: u64, old_limit: u64) -> u
 }
 
 fn linux_nofile_soft_limit() -> u64 {
-    linux_resource_limit_values(
-        LINUX_RLIMIT_NOFILE,
-        X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst),
+    let runtime = X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst);
+    linux_resource_limit_values(LINUX_RLIMIT_NOFILE, runtime).map_or(0, |limit| {
+        // Only a running Linux process has a table above the fixed one.
+        if runtime {
+            limit[0].min(linux_nr_open())
+        } else {
+            limit[0].min(LINUX_DESCRIPTOR_TABLE_LIMIT)
+        }
+    })
+}
+
+/// The lowest descriptor at or above `first` past the fixed table that
+/// the current process may open (below its RLIMIT_NOFILE soft limit), for
+/// a kind of file the table above it holds, when the fixed table has no
+/// room.
+fn linux_free_overflow_descriptor(first: u64) -> Option<u64> {
+    let limit = linux_nofile_soft_limit();
+    if limit <= LINUX_DESCRIPTOR_TABLE_LIMIT {
+        return None;
+    }
+    crate::linux_fd_table::first_free(
+        X86_RUNTIME
+            .ELF_PROBE_DESCRIPTOR_OVERFLOW
+            .load(Ordering::SeqCst),
+        first.max(LINUX_DESCRIPTOR_TABLE_LIMIT),
+        limit,
     )
-    .map_or(0, |limit| limit[0].min(LINUX_DESCRIPTOR_TABLE_LIMIT))
+}
+
+/// The `N` lowest free descriptors from `first`: in the fixed table, then
+/// above it, for a kind of file the table above it holds (a socket, a
+/// pipe, a regular file).
+fn linux_free_descriptors<const N: usize>(first: u64) -> Option<[u64; N]> {
+    let mut found = [0_u64; N];
+    let mut count = 0;
+    for descriptor in first..LINUX_AUX_DESCRIPTOR_LIMIT {
+        if count == N {
+            break;
+        }
+        if linux_aux_descriptor_free(descriptor) {
+            found[count] = descriptor;
+            count += 1;
+        }
+    }
+    let mut next = first.max(LINUX_DESCRIPTOR_TABLE_LIMIT);
+    while count < N {
+        let descriptor = linux_free_overflow_descriptor(next)?;
+        found[count] = descriptor;
+        count += 1;
+        next = descriptor + 1;
+    }
+    Some(found)
+}
+
+/// `linux_free_descriptors` for one descriptor.
+fn linux_free_descriptor(first: u64) -> Option<u64> {
+    linux_free_descriptors::<1>(first).map(|[descriptor]| descriptor)
+}
+
+/// Opens descriptor `descriptor` (free) on socket slot `slot` as `state`
+/// with descriptor flags `flags`, in the fixed table or above it; false
+/// without memory for the table above it.
+fn install_linux_socket_descriptor(
+    descriptor: u64,
+    slot: crate::linux_socket::SlotId,
+    state: u16,
+    flags: u32,
+    close_on_exec: bool,
+) -> bool {
+    if descriptor >= LINUX_DESCRIPTOR_TABLE_LIMIT {
+        return install_linux_overflow_descriptor(
+            descriptor,
+            crate::linux_fd_table::Entry {
+                state,
+                socket: slot + 1,
+                socket_flags: flags,
+                close_on_exec,
+                ..Default::default()
+            },
+        );
+    }
+    if descriptor < LINUX_AUX_DESCRIPTOR_FIRST {
+        let index = descriptor as usize;
+        X86_RUNTIME.ELF_PROBE_STDIO_SOCKET_SLOTS[index].store(slot + 1, Ordering::SeqCst);
+        X86_RUNTIME.ELF_PROBE_STDIO_SOCKET_FLAGS[index].store(flags, Ordering::SeqCst);
+        X86_RUNTIME.ELF_PROBE_STDIO_DEVICE_DESCRIPTORS[index].store(state, Ordering::SeqCst);
+    } else {
+        let index = (descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
+        X86_RUNTIME.ELF_PROBE_SOCKET_SLOTS[index].store(slot + 1, Ordering::SeqCst);
+        X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index].store(flags, Ordering::SeqCst);
+        X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index].store(state, Ordering::SeqCst);
+    }
+    set_linux_descriptor_close_on_exec(descriptor, close_on_exec);
+    true
 }
 
 fn linux_file_size_limit() -> u64 {

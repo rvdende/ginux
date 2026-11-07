@@ -8,7 +8,7 @@ synchronization required for SMP; that remains Gate 8.
 
 - All Gate 4 entries classified for Gate 5 have been migrated.
 - The x86-64 execution bank is reachable through one `X86RuntimeOwner` root.
-  Its 403 stable backing objects are private implementation storage rather than
+  Its 404 stable backing objects are private implementation storage rather than
   ambient lookup points.
 - Five raw mutable x86-64 runtime banks are owned by
   `X86MutableRuntimeOwner`; their existing single-CPU access semantics are

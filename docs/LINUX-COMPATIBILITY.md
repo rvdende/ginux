@@ -399,8 +399,8 @@ signal-mask pointer and size. The kernel now snapshots their sets into typed
 scheduler waits, wakes them on descriptor changes, expires positive deadlines
 from the APIC timer, writes `select` remaining time, and atomically restores a
 temporary `pselect6` mask on every completion and interruption path. Their
-variable-length descriptor sets cover the domain's full 1,024-descriptor
-`RLIMIT_NOFILE`, including blocked-wait snapshots. Blocking still requires
+variable-length descriptor sets cover the first 1,024 descriptors (glibc's
+and musl's `FD_SETSIZE`), including blocked-wait snapshots. Blocking still requires
 another runnable thread rather than idling the processor, so both calls remain
 Partial.
 
@@ -448,8 +448,18 @@ signal, nice, and realtime-priority boundaries; resources without a present
 quota report infinity. The ring-3 controller verifies the full query range,
 ordering, and error behavior. Linux programs can lower and restore the soft
 resource limits within the existing hard limit; hard-limit raises remain
-permission-denied. `RLIMIT_NOFILE` enforcement makes descriptor allocation
-fail with `EMFILE`, while `RLIMIT_NPROC` makes fork and thread creation fail
+permission-denied. `RLIMIT_NOFILE` (soft 1024, hard 4096, as Linux
+starts; raised up to `/proc/sys/fs/nr_open`) bounds descriptor allocation
+with `EMFILE`. A process's first 1024 descriptors live in the fixed table
+its CPU bank holds; those above it, in a sparse table of its own
+(`kernel/src/linux_fd_table.rs`) that holds only the descriptors in use,
+is shared under `CLONE_FILES`, copied at fork, unshare and exec, and
+freed with its last process. Files, pipes and sockets (`SCM_RIGHTS`
+too) go there and dup2, `F_DUPFD`, `close_range`, close-on-exec, `F_GETFL`/
+`F_SETFL` and `/proc/self/fd` reach them; an epoll instance, eventfd or
+timerfd stays below 1024 (`EMFILE` above it), epoll watches only the
+first 1024 descriptors, and poll takes 64 pollfds at a time.
+`RLIMIT_NPROC` makes fork and thread creation fail
 with `EAGAIN`. `RLIMIT_FSIZE` shortens writes at the file-size boundary and
 enforces `EFBIG` plus `SIGXFSZ` for writes and file extensions beyond it across
 ordinary, positioned, vectored, `sendfile`, `copy_file_range`, `ftruncate`, and

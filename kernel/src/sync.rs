@@ -64,6 +64,9 @@ impl LockRank {
     pub(crate) const LEASES: Self = Self(161);
     /// The domains' core patterns (`linux_core`): a leaf.
     pub(crate) const CORE_PATTERNS: Self = Self(162);
+    /// The descriptor tables' parts above the fixed table
+    /// (`linux_fd_table`): a leaf.
+    pub(crate) const DESCRIPTOR_TABLES: Self = Self(163);
     /// inotify instances, watches and queues; ranks below the heap so the
     /// queues may grow while held.
     pub(crate) const INOTIFY: Self = Self(165);

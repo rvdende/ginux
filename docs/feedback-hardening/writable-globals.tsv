@@ -93,6 +93,7 @@ interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_ELF_PROBE_DUM
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_ELF_PROBE_TSC_SIGSEGV	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_ELF_PROBE_EPOLL_DATA	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_ELF_PROBE_EPOLL_DESCRIPTOR	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
+interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_ELF_PROBE_DESCRIPTOR_OVERFLOW	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_ELF_PROBE_EPOLL_EVENTS	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_ELF_PROBE_EVENTFD_COUNTER	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_ELF_PROBE_EVENTFD_DESCRIPTOR	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
@@ -461,6 +462,8 @@ interior-mutable	kernel/src/linux_landlock.rs	RESTRICTED	domain-runtime	allowlis
 interior-mutable	kernel/src/linux_lease.rs	LEASES	process-runtime	allowlist	none	ranked-lease-table
 interior-mutable	kernel/src/linux_lease.rs	COUNT	process-runtime	allowlist	none	atomic-lease-count
 interior-mutable	kernel/src/linux_core.rs	PATTERNS	domain-runtime	allowlist	none	ranked-core-pattern-table
+interior-mutable	kernel/src/linux_fd_table.rs	TABLES	process-runtime	allowlist	none	ranked-descriptor-table-overflow
+interior-mutable	kernel/src/linux_fd_table.rs	LIVE	process-runtime	allowlist	none	atomic-descriptor-table-count
 interior-mutable	kernel/src/linux_loop.rs	LOOPS	domain-runtime	allowlist	none	ranked-loop-devices-and-opens
 interior-mutable	kernel/src/linux_loop.rs	MAKING_NODES	domain-runtime	allowlist	none	atomic-reentrancy-guard
 interior-mutable	kernel/src/linux_ramdisk.rs	RAM_DISKS	domain-runtime	allowlist	none	ranked-ram-disks-and-opens

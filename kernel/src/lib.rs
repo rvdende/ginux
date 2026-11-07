@@ -31,6 +31,7 @@ mod linux_elf;
 mod linux_event_files;
 mod linux_exe;
 mod linux_fanotify;
+mod linux_fd_table;
 mod linux_file_cache;
 mod linux_fscontext;
 mod linux_inotify;
