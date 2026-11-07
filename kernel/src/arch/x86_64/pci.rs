@@ -992,6 +992,72 @@ fn set_msix_entry_mask_raw(
     read_mmio_u32(entry + 12) == if masked { MSIX_VECTOR_MASK } else { 0 }
 }
 
+/// Whether MSI-X entry `index` of `target` has a message pending (its Pending
+/// Bit Array bit): one the device raised while the entry or the function was
+/// masked, which the device sends as soon as both are unmasked.
+fn msix_entry_pending(target: MsixTarget, mapping: MmioMapping, index: u16) -> Option<bool> {
+    let msix = target.capability;
+    if index >= msix.vector_count {
+        return None;
+    }
+    let (pba, pba_length) = region_bounds(msix.pba_bar_address, msix.pba_offset, msix.pba_length)?;
+    let word = u32::from(index) / MSIX_PBA_BITS_PER_ENTRY;
+    let offset = (word * MSIX_PBA_ENTRY_SIZE) as usize;
+    if offset + MSIX_PBA_ENTRY_SIZE as usize > pba_length {
+        return None;
+    }
+    let address = mapping.address(
+        pba.checked_add(offset as u64)?,
+        MSIX_PBA_ENTRY_SIZE as usize,
+    )?;
+    let bit = u32::from(index) % MSIX_PBA_BITS_PER_ENTRY;
+    let half = if bit < 32 { 0 } else { 4 };
+    Some(read_mmio_u32(address + half) & (1 << (bit % 32)) != 0)
+}
+
+/// Takes the message MSI-X entry `index` holds pending from an earlier
+/// generation of the device, before a new generation starts counting: a
+/// completion raised while the entry was masked (a forced timeout, a
+/// faulted service's last request) stays pending across the device's
+/// reset, since the device cannot send it while bus mastering is off, and
+/// it would otherwise complete the new generation's first wait. With no
+/// wait active the handler only counts it; the count starts again from
+/// zero. The entry and the function are masked again either way.
+fn drain_stale_msix_message(target: MsixTarget, mapping: MmioMapping, index: u16) -> bool {
+    match msix_entry_pending(target, mapping, index) {
+        Some(false) => return true,
+        None => return false,
+        Some(true) => {}
+    }
+    if PCI_INTERRUPTS.virtio_active.load(Ordering::SeqCst)
+        || !set_msix_entry_mask_raw(target, mapping, index, false)
+        || !set_msix_control_raw(target, true, false)
+    {
+        let _ = set_msix_control_raw(target, true, true);
+        let _ = set_msix_entry_mask_raw(target, mapping, index, true);
+        return false;
+    }
+    // Unmasking sends the message; let this CPU take it.
+    let mut delivered = false;
+    for _ in 0..QUEUE_POLL_LIMIT {
+        // SAFETY: the vector's handler is installed and only counts the
+        // message, as no device wait is active.
+        unsafe { asm!("sti", "nop", "cli", options(nomem, nostack)) };
+        if PCI_INTERRUPTS.virtio_count.load(Ordering::SeqCst) != 0
+            && msix_entry_pending(target, mapping, index) == Some(false)
+        {
+            delivered = true;
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    let masked = set_msix_control_raw(target, true, true)
+        && set_msix_entry_mask_raw(target, mapping, index, true);
+    PCI_INTERRUPTS.virtio_fired.store(false, Ordering::SeqCst);
+    PCI_INTERRUPTS.virtio_count.store(0, Ordering::SeqCst);
+    delivered && masked
+}
+
 fn install_virtio_interrupt(apic: &LocalApic) -> bool {
     install_virtio_interrupt_at(apic, VIRTIO_INTERRUPT_VECTOR)
 }
@@ -3716,7 +3782,8 @@ pub(crate) fn arm_isolated_device_interrupt(
     }
     let armed = set_msix_control(device, true, true)
         && set_pci_command(device, true)
-        && bus_master_is_enabled(device);
+        && bus_master_is_enabled(device)
+        && drain_stale_msix_message(device.msix_target(), msix_mapping, 0);
     if armed {
         PCI_INTERRUPTS.virtio_domain.store(domain, Ordering::SeqCst);
         PCI_INTERRUPTS

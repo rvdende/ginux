@@ -1596,6 +1596,12 @@ pub(crate) fn verify_linux_elf_mapping(
         }
     })()
     .unwrap_or(false);
+    // A check that failed part-way through can leave the probe's tables
+    // loaded; they are scrubbed below, and the kernel would then fetch its
+    // own code through zeroed tables.
+    if current_root() != kernel_root_physical {
+        unsafe { activate(kernel_root_physical) };
+    }
     let cleared = frames.iter().enumerate().all(|(index, frame)| unsafe {
         if memory::frames_owned_by(memory::FrameOwner::KERNEL, &[*frame]) {
             zero_frame(frame.address()).is_some()
@@ -3003,6 +3009,12 @@ pub(crate) fn verify_interpreted_elf_mapping(
         }
     })()
     .unwrap_or(false);
+    // A check that failed part-way through can leave the probe's tables
+    // loaded; they are scrubbed below, and the kernel would then fetch its
+    // own code through zeroed tables.
+    if current_root() != kernel_root_physical {
+        unsafe { activate(kernel_root_physical) };
+    }
     let cleared = frames.iter().enumerate().all(|(index, frame)| unsafe {
         if memory::frames_owned_by(memory::FrameOwner::KERNEL, &[*frame]) {
             zero_frame(frame.address()).is_some()

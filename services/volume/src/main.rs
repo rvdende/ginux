@@ -287,18 +287,25 @@ impl VirtioBlock {
                 }
                 Operation::Flush => {}
             }
-            let available_slot = usize::from(self.available % QUEUE_SIZE);
-            write_u16(self.dma + AVAIL_OFFSET + 4 + available_slot * 2, 0);
-            compiler_fence(Ordering::SeqCst);
-            self.available = self.available.wrapping_add(1);
-            write_u16(self.dma + AVAIL_OFFSET + 2, self.available);
         }
+        // Before the first request is available to the device, a wait for
+        // a later request and a wait with nothing to complete both fail.
+        // The device may take an available buffer without being notified
+        // (QEMU kicks its queues when the driver starts it), so the
+        // request is published only after them.
         if self.request == 1
             && (wait(self.capability, NATIVE_BLOCK_WAIT_PREPARED, 2) != NATIVE_BLOCK_WAIT_FAILED
                 || wait(self.capability, NATIVE_BLOCK_WAIT_PREPARED, self.request)
                     != NATIVE_BLOCK_WAIT_FAILED)
         {
             return false;
+        }
+        unsafe {
+            let available_slot = usize::from(self.available % QUEUE_SIZE);
+            write_u16(self.dma + AVAIL_OFFSET + 4 + available_slot * 2, 0);
+            compiler_fence(Ordering::SeqCst);
+            self.available = self.available.wrapping_add(1);
+            write_u16(self.dma + AVAIL_OFFSET + 2, self.available);
         }
         unsafe { write_u16(self.notification, 0) };
         let wait_result = wait(self.capability, NATIVE_BLOCK_WAIT_NOTIFIED, self.request);
