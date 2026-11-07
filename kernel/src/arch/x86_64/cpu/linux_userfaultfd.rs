@@ -187,10 +187,15 @@ fn linux_userfaultfd_range(start: u64, length: u64) -> Result<(u64, u64), u64> {
     }
 }
 
-/// Whether `page` is an anonymous page with nothing in it yet.
+/// Whether `page` is an anonymous page with nothing in it yet (a page
+/// paged out to swap has its contents there).
 fn linux_page_missing(page: u64) -> bool {
     let state = address_space::current_linux_runtime_page(page);
-    state.occupied && state.frame.is_none() && !state.file && state.protection != 0
+    state.occupied
+        && state.frame.is_none()
+        && state.swap.is_none()
+        && !state.file
+        && state.protection != 0
 }
 
 /// Whether `page` is a shared file page with contents in its file but not

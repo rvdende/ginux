@@ -12,7 +12,7 @@
 #
 # A build that is already up to date does nothing: build/ltp[-NAME] keeps a
 # stamp of everything the build depends on (the LTP release, the builder
-# image, the variant and the scripts in tools/ltp), so a rerun starts Docker
+# image, the variant and the scripts and tests in tools/ltp), so a rerun starts Docker
 # only when one of those changed, and only for the runner when that is all
 # that changed. --force rebuilds anyway.
 #
@@ -82,7 +82,8 @@ runner_inputs=$(
 tree_inputs=$(
     {
         echo "$ltp_version $ltp_sha256 $builder_image ${variant:-default}"
-        sha256sum "$repo_root/tools/ltp/container-build.sh" "$repo_root/tools/ltp/no-oom-protection.c"
+        sha256sum "$repo_root/tools/ltp/container-build.sh" "$repo_root/tools/ltp/no-oom-protection.c" \
+            "$repo_root"/tools/ltp/tests/*.c
     } | sha256sum | cut -d' ' -f1
 )
 runner_stamp="$out_dir/.runner-inputs"

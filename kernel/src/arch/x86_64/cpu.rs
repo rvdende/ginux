@@ -70,7 +70,9 @@ use linux_signal::*;
 pub(crate) use linux_signal::{
     expire_linux_waits_from_timer, linux_nanoseconds_to_next_wait_deadline, sample_linux_profile,
 };
+pub(crate) use linux_swapon::linux_swap_read_page;
 use linux_swapon::*;
+use linux_swapon::{linux_own_pages_reclaimable, linux_swap_out_current};
 use linux_syscall::linux_syscall_handler;
 use linux_time::*;
 use linux_tun::*;
@@ -28904,17 +28906,30 @@ fn linux_refill_shared_file_page(address: u64) -> bool {
     if !address_space::current_linux_page_past_eof(address) {
         return false;
     }
+    let protection = address_space::current_linux_runtime_page(address).protection;
+    // Anonymous shared memory's page, which reclaim unmapped to page it out:
+    // its shmem node's (the registry has which), which has no end.
+    if linux_anonymous_shared_area(address) {
+        let Some((handle, offset)) =
+            crate::linux_overlay::shared_mapping(current_linux_process_pid(), address)
+        else {
+            return false;
+        };
+        return release_linux_runtime_page(address_space::remove_current_linux_runtime_page(
+            address,
+        )) && crate::linux_overlay::memfd_frame(handle, offset / PAGE_SIZE).is_some_and(
+            |frame| {
+                address_space::install_current_linux_shared_page(address, frame, protection.max(1))
+            },
+        ) && (protection != 0
+            || address_space::protect_current_linux_runtime_page(address, 0));
+    }
     let Some((handle, offset)) = linux_shared_file_page(address) else {
         return false;
     };
     crate::linux_overlay::metadata(handle)
         .is_some_and(|metadata| offset < metadata.size.next_multiple_of(PAGE_SIZE))
-        && linux_map_shared_file_page(
-            address,
-            handle,
-            offset,
-            address_space::current_linux_runtime_page(address).protection,
-        )
+        && linux_map_shared_file_page(address, handle, offset, protection)
 }
 
 /// After volume file `handle` grew from `old_size`, the current process's
@@ -30402,6 +30417,10 @@ fn linux_runtime_madvise(address: u64, length: u64, advice: u64) -> u64 {
                 advice == LINUX_MADV_DONTDUMP,
             );
         }
+        if advice == LINUX_MADV_WILLNEED {
+            // Pages out in swap are read into the swap cache.
+            linux_swapon::linux_swap_willneed(address, pages);
+        }
         return 0;
     }
     let Some((_, pages)) = linux_runtime_mapping_range(address, length) else {
@@ -30455,7 +30474,9 @@ fn linux_runtime_madvise(address: u64, length: u64, advice: u64) -> u64 {
             crate::linux_cgroup::note_reclaimable();
             continue;
         }
-        if state.frame.is_some() {
+        // A page out in swap goes as one in memory does: its swap is freed
+        // and it reads as zeros next.
+        if state.frame.is_some() || state.swap.is_some() {
             let removed = address_space::remove_current_linux_runtime_page(page_address);
             if removed.frame != state.frame
                 || address_space::reserve_current_linux_runtime_page(
@@ -30471,7 +30492,10 @@ fn linux_runtime_madvise(address: u64, length: u64, advice: u64) -> u64 {
             {
                 return LINUX_EINVAL;
             }
-            if !release_linux_runtime_frame(removed.frame.unwrap()) {
+            if removed
+                .frame
+                .is_some_and(|frame| !release_linux_runtime_frame(frame))
+            {
                 return LINUX_EINVAL;
             }
         } else if !address_space::current_linux_runtime_page(page_address).occupied {
@@ -30606,7 +30630,7 @@ fn linux_madvise_populate(address: u64, length: u64, writable: bool) -> u64 {
     }
 }
 
-fn linux_madvise_reclaim_hint(address: u64, length: u64) -> u64 {
+fn linux_madvise_reclaim_hint(address: u64, length: u64, pageout: bool) -> u64 {
     if length == 0 || !address.is_multiple_of(PAGE_SIZE as u64) {
         return LINUX_EINVAL;
     }
@@ -30631,8 +30655,13 @@ fn linux_madvise_reclaim_hint(address: u64, length: u64) -> u64 {
             return LINUX_EINVAL;
         }
     }
-    // There is currently no swap or page-reclaim queue. Linux treats both
-    // operations as best-effort advice, so a validated no-op is accurate.
+    // MADV_PAGEOUT pages the range's private anonymous pages out to swap
+    // now, if there is swap; both are advice, so what stays is no error.
+    // MADV_COLD only makes the pages the first reclaim takes, which its
+    // scan does as it finds them (there is no LRU to move them in).
+    if pageout {
+        linux_swapon::linux_swap_pageout(current_linux_process_pid(), address, pages);
+    }
     0
 }
 
@@ -31782,7 +31811,7 @@ fn linux_madvise(address: u64, length: u64, advice: u64) -> u64 {
     if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
         && matches!(advice, LINUX_MADV_COLD | LINUX_MADV_PAGEOUT)
     {
-        return linux_madvise_reclaim_hint(address, length);
+        return linux_madvise_reclaim_hint(address, length, advice == LINUX_MADV_PAGEOUT);
     }
     if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) && advice == LINUX_MADV_SOFT_OFFLINE {
         return linux_madvise_soft_offline(address, length);
@@ -31883,7 +31912,7 @@ fn linux_process_madvise(
         return LINUX_ESRCH;
     };
     if process != current_linux_process_pid() {
-        return LINUX_EPERM;
+        return linux_remote_process_madvise(process, vectors, vector_count, advice);
     }
     let mut advised = 0_u64;
     for index in 0..vector_count {
@@ -31913,6 +31942,58 @@ fn linux_process_madvise(
             return if advised == 0 { LINUX_EINVAL } else { advised };
         }
         advised = total;
+    }
+    advised
+}
+
+/// process_madvise on another process: only the advice Linux takes from
+/// outside (MADV_COLD, MADV_PAGEOUT, MADV_WILLNEED; EINVAL otherwise),
+/// from a caller that may read the process as ptrace would and has
+/// CAP_SYS_NICE (EPERM). MADV_PAGEOUT pages its pages out when it is not
+/// running on a CPU; the rest is advice nothing acts on. The bytes
+/// advised.
+fn linux_remote_process_madvise(process: u32, vectors: u64, vector_count: u64, advice: u64) -> u64 {
+    if !matches!(
+        advice,
+        LINUX_MADV_COLD | LINUX_MADV_PAGEOUT | LINUX_MADV_WILLNEED
+    ) {
+        return LINUX_EINVAL;
+    }
+    if !linux_ptrace_access_permitted(process)
+        || !linux_has_capability(ginux_credentials::capability::SYS_NICE)
+    {
+        return LINUX_EPERM;
+    }
+    let instance = linux_execution_instance();
+    let mut advised = 0_u64;
+    for index in 0..vector_count {
+        let mut entry = [0_u8; 16];
+        if !index
+            .checked_mul(16)
+            .and_then(|offset| vectors.checked_add(offset))
+            .is_some_and(|address| copy_from_linux_user(address, &mut entry))
+        {
+            return if advised == 0 { LINUX_EFAULT } else { advised };
+        }
+        let address = u64::from_ne_bytes(entry[..8].try_into().unwrap());
+        let length = u64::from_ne_bytes(entry[8..].try_into().unwrap());
+        if length == 0 {
+            continue;
+        }
+        if !address.is_multiple_of(PAGE_SIZE as u64)
+            || address.checked_add(length).is_none_or(|end| end > 1 << 47)
+        {
+            return if advised == 0 { LINUX_EINVAL } else { advised };
+        }
+        let pages = length.div_ceil(PAGE_SIZE as u64) as usize;
+        if advice == LINUX_MADV_PAGEOUT && linux_live_process_bank(process, instance).is_none() {
+            if let Some(root) = linux_process::live_process_root(process) {
+                let _ = address_space::with_live_linux_process_root(root, || {
+                    linux_swapon::linux_swap_pageout(process, address, pages)
+                });
+            }
+        }
+        advised = advised.saturating_add(length);
     }
     advised
 }
@@ -32723,6 +32804,7 @@ fn linux_proc_sysctl_write_bytes(device: u16, index: usize, text: &[u8]) -> Resu
         b"sys/kernel/io_uring_disabled" => Some(0..=2),
         b"sys/fs/protected_hardlinks" | b"sys/fs/protected_symlinks" => Some(0..=1),
         b"sys/vm/drop_caches" => Some(1..=4),
+        b"sys/vm/swappiness" => Some(0..=200),
         b"sys/vm/nr_hugepages"
         | b"sys/vm/nr_overcommit_hugepages"
         | b"sys/vm/vfs_cache_pressure"
@@ -45606,7 +45688,13 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
                         crate::linux_areas::locked_bytes(linux_execution_instance(), status.pid)
                             / 1024,
                     )
-                    && append_linux_bytes(&mut file, &mut used, b" kB\nVmSwap:\t0 kB\n")
+                    && append_linux_bytes(&mut file, &mut used, b" kB\nVmSwap:\t")
+                    && append_linux_decimal(
+                        &mut file,
+                        &mut used,
+                        linux_process_swap_pages(status.pid) * (PAGE_SIZE as u64 / 1024),
+                    )
+                    && append_linux_bytes(&mut file, &mut used, b" kB\n")
                     && append_linux_bytes(&mut file, &mut used, &linux_capability_status(pid))
                     && append_linux_bytes(
                         &mut file,
@@ -54025,6 +54113,20 @@ fn append_linux_maps_line(
 /// Rss counts the pages present (in the caller's own address space; a
 /// lazily reserved area of 64 MiB or more is not walked), and Locked is
 /// Rss for a locked area.
+/// The pages process `pid` has paged out to swap (VmSwap).
+fn linux_process_swap_pages(pid: u32) -> u64 {
+    if pid == current_linux_process_pid() {
+        return address_space::current_linux_swap_pages(0, 0).0;
+    }
+    linux_process::live_process_root(pid)
+        .and_then(|root| {
+            address_space::with_live_linux_process_root(root, || {
+                address_space::current_linux_swap_pages(0, 0).0
+            })
+        })
+        .unwrap_or(0)
+}
+
 fn append_linux_smaps_details(
     text: &mut Vec<u8>,
     (start, end): (u64, u64),
@@ -54046,6 +54148,18 @@ fn append_linux_smaps_details(
             })
             .count() as u64
             * (PAGE_SIZE as u64 / 1024)
+    } else {
+        0
+    };
+    // Pages out in swap: the area's own, and for a shared mapping its
+    // file's (shared memory's) pages that are.
+    let swapped = if countable {
+        let shared = recorded
+            .filter(|part| part.shared && end - start < 64 << 20)
+            .map_or(0, |part| {
+                linux_swapon::linux_shared_swapped_pages(part, start, end)
+            });
+        (address_space::current_linux_swap_pages(start, end).1 + shared) * (PAGE_SIZE as u64 / 1024)
     } else {
         0
     };
@@ -54071,8 +54185,8 @@ fn append_linux_smaps_details(
         (b"LazyFree", 0),
         (b"AnonHugePages", 0),
         (b"ShmemPmdMapped", 0),
-        (b"Swap", 0),
-        (b"SwapPss", 0),
+        (b"Swap", swapped),
+        (b"SwapPss", swapped),
         (b"Locked", locked),
     ];
     for (name, value) in fields {
@@ -54713,6 +54827,7 @@ fn linux_proc_meminfo() -> &'static [u8] {
     let huge = linux_huge_page_counts();
     let kernel_stack = activation::kernel_stack_bytes() / 1024;
     let (swap_total, swap_free) = crate::linux_swap::totals(linux_execution_instance());
+    let swap_cached = crate::linux_swap::cached_pages(linux_execution_instance()) * 4;
     // SAFETY: the kernel is single-processor and readers copy the bytes
     // before another /proc/meminfo read can rewrite them.
     let buffer = unsafe { &mut *core::ptr::addr_of_mut!(MEMINFO) };
@@ -54722,7 +54837,7 @@ fn linux_proc_meminfo() -> &'static [u8] {
         format_args!(
             "MemTotal:       {total:>10} kB\nMemFree:        {free:>10} kB\n\
              MemAvailable:   {free:>10} kB\nBuffers:        {zero:>10} kB\n\
-             Cached:         {zero:>10} kB\nSwapCached:     {zero:>10} kB\n\
+             Cached:         {zero:>10} kB\nSwapCached:     {swap_cached:>10} kB\n\
              Active:         {used:>10} kB\nInactive:       {zero:>10} kB\n\
              SwapTotal:      {swap_total:>10} kB\nSwapFree:       {swap_free:>10} kB\n\
              KernelStack:    {kernel_stack:>10} kB\n\
@@ -62682,6 +62797,10 @@ fn materialize_linux_runtime_user_range(address: u64, length: usize, writable: b
     }
     let first = address & !(PAGE_SIZE as u64 - 1);
     let last = (end - 1) & !(PAGE_SIZE as u64 - 1);
+    // Reclaim for the pages brought in may page out the process's other
+    // pages, not these.
+    let _reclaim =
+        linux_swapon::LinuxUserFaultReclaim::enter_pinning(first, last + PAGE_SIZE as u64);
     let mut page_address = first;
     loop {
         if address_space::current_linux_runtime_page(page_address).secret {
@@ -67417,6 +67536,9 @@ fn handle_user_fault(frame: *mut UserFaultFrame) -> u64 {
     {
         return 0;
     }
+    // Reclaim for the pages this fault allocates may page out the faulting
+    // process's own pages.
+    let reclaim = linux_swapon::LinuxUserFaultReclaim::enter();
     if fault_domain.is_none() && materialize_linux_cow_page(fault_metadata) {
         return 0;
     }
@@ -67440,6 +67562,7 @@ fn handle_user_fault(frame: *mut UserFaultFrame) -> u64 {
     {
         return 0;
     }
+    drop(reclaim);
     if fault_domain.is_some() && failure_policy.is_none() {
         serial_write("ginux: unexpected control fault vector/rip: ");
         serial_write_u64(fault_metadata.vector);

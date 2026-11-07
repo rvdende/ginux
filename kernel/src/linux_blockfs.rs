@@ -1056,6 +1056,32 @@ pub(crate) fn drop_caches() {
     }
 }
 
+/// Reads or writes a page of swap file `handle` at `offset` straight to
+/// and from its blocks, past the page cache and without touching its
+/// times, as Linux's swap I/O goes to the blocks swapon mapped. Its blocks
+/// all exist (swapon refused holes), so a write allocates nothing. False
+/// if the page is not wholly in the file.
+pub(crate) fn swap_page_io(handle: Handle, offset: u64, page: &mut [u8], write: bool) -> bool {
+    let mut table = VOLUMES.lock();
+    let Some((volume, inode)) = table.of(handle) else {
+        return false;
+    };
+    let start = offset as usize;
+    if write {
+        let written = volume.filesystem.write(inode, offset, page);
+        if written.as_ref().is_ok_and(|written| *written == page.len()) {
+            volume.refresh_cache(inode, start, start + page.len());
+            return true;
+        }
+        false
+    } else {
+        volume
+            .filesystem
+            .read(inode, offset, page)
+            .is_ok_and(|read| read == page.len())
+    }
+}
+
 /// Writes `handle`'s file at `offset` and marks it modified.
 pub(crate) fn write(handle: Handle, offset: usize, input: &[u8]) -> Option<usize> {
     let now = now();

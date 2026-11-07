@@ -81,6 +81,8 @@ struct Memcg {
     reclaimed: AtomicU64,
     events: [AtomicU64; EVENT_COUNT],
     local_events: [AtomicU64; EVENT_COUNT],
+    /// `memory.swap.events`: high, max and fail.
+    swap_events: [AtomicU64; 3],
 }
 
 impl Memcg {
@@ -106,6 +108,7 @@ impl Memcg {
             reclaimed: AtomicU64::new(0),
             events: [const { AtomicU64::new(0) }; EVENT_COUNT],
             local_events: [const { AtomicU64::new(0) }; EVENT_COUNT],
+            swap_events: [const { AtomicU64::new(0) }; 3],
         }
     }
 
@@ -129,7 +132,12 @@ impl Memcg {
         for limit in [&self.max, &self.high, &self.swap_max, &self.swap_high] {
             limit.store(UNLIMITED, Ordering::Relaxed);
         }
-        for event in self.events.iter().chain(&self.local_events) {
+        for event in self
+            .events
+            .iter()
+            .chain(&self.local_events)
+            .chain(&self.swap_events)
+        {
             event.store(0, Ordering::Relaxed);
         }
     }
@@ -419,6 +427,58 @@ pub(crate) fn uncharge(slot: Slot, pages: u64) {
     if memcg(slot).is_some_and(|memcg| memcg.state.load(Ordering::Acquire) == RETIRED) {
         free_if_unused(slot);
     }
+}
+
+/// Charges a page of swap to `slot` and its ancestors, unless that takes
+/// one of them past its `memory.swap.max` (counted in its
+/// `memory.swap.events` max and fail): then nothing is charged. A page
+/// charged to no cgroup is charged nothing.
+pub(crate) fn try_charge_swap(slot: Slot, pages: u64) -> bool {
+    if memcg(slot).is_none() {
+        return true;
+    }
+    for memcg in lineage(slot) {
+        if ginux_cgroup::exceeds(
+            memcg.swap_usage.load(Ordering::Acquire),
+            pages,
+            memcg.swap_max.load(Ordering::Acquire),
+        ) {
+            memcg.swap_events[1].fetch_add(1, Ordering::Relaxed);
+            if let Some(own) = self::memcg(slot) {
+                own.swap_events[2].fetch_add(1, Ordering::Relaxed);
+            }
+            return false;
+        }
+    }
+    for memcg in lineage(slot) {
+        let usage = memcg.swap_usage.fetch_add(pages, Ordering::AcqRel) + pages;
+        memcg.swap_peak.fetch_max(usage, Ordering::AcqRel);
+        if usage > memcg.swap_high.load(Ordering::Acquire) {
+            memcg.swap_events[0].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    true
+}
+
+/// Gives back `pages` of swap charged to `slot`, as their slots are freed.
+pub(crate) fn uncharge_swap(slot: Slot, pages: u64) {
+    for memcg in lineage(slot) {
+        let _ = memcg
+            .swap_usage
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |usage| {
+                Some(usage.saturating_sub(pages))
+            });
+    }
+    if memcg(slot).is_some_and(|memcg| memcg.state.load(Ordering::Acquire) == RETIRED) {
+        free_if_unused(slot);
+    }
+}
+
+/// `memory.swap.events`: high, max and fail.
+pub(crate) fn swap_events(slot: Slot) -> [u64; 3] {
+    memcg(slot).map_or([0; 3], |memcg| {
+        [0, 1, 2].map(|index| memcg.swap_events[index].load(Ordering::Relaxed))
+    })
 }
 
 /// Records an event of `slot` in its `memory.events.local` and in the

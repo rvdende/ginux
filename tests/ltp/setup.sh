@@ -70,6 +70,27 @@ rm -rf "$image" "$mount"
 exit $status
 EOF
 chmod +x /opt/ltp/disk-tmpdir.sh || fail chmod
+# with-swap.sh MIB TEST [ARG...]: runs a test with MIB MiB of swap on, a
+# loop device over a sparse file of the overlay, for the tests that need
+# free swap rather than making their own (madvise06, madvise09, ...).
+cat > /opt/ltp/with-swap.sh <<'EOF' || fail "with-swap.sh"
+#!/bin/sh
+size=$1
+shift
+image=/tmp/ltp/with-swap.img
+rm -f "$image"
+dd if=/dev/zero of="$image" bs=1M count=0 seek="$size" 2>/dev/null &&
+    device=$(losetup -f) && losetup "$device" "$image" &&
+    mkswap "$device" >/dev/null && swapon "$device" ||
+    { echo "with-swap.sh: TBROK: cannot turn swap on"; exit 2; }
+"$@"
+status=$?
+swapoff "$device" || echo "with-swap.sh: TWARN: swapoff failed"
+losetup -d "$device"
+rm -f "$image"
+exit $status
+EOF
+chmod +x /opt/ltp/with-swap.sh || fail chmod
 wget -q -O /opt/ltp/ltp-runner "$base/ltp-runner" || fail "runner download"
 chmod +x /opt/ltp/ltp-runner || fail chmod
 wget -q -O /opt/ltp/runlist.txt "$base/runlist.txt" || fail "run list download"

@@ -882,10 +882,10 @@ madvise01 madvise01
 madvise02 madvise02
 madvise03 madvise03
 madvise05 madvise05
-madvise06 madvise06  # auto: budget=120
+madvise06 /opt/ltp/with-swap.sh 1024 madvise06  # budget=120 needs 800 MiB of free swap
 madvise07 madvise07
 madvise08 madvise08
-madvise09 madvise09
+madvise09 /opt/ltp/with-swap.sh 64 madvise09  # needs 16 MiB of free swap
 madvise10 madvise10
 madvise11 madvise11
 madvise12 madvise12
@@ -1565,3 +1565,10 @@ io_uring02 io_uring02
 io_uring03 io_uring03
 io_uring04 io_uring04  # auto: budget=120
 perf_event_open03 perf_event_open03  # auto: budget=90
+
+# Tests from outside runtest/syscalls, curated by hand.
+ginux_swap01 ginux_swap01  # budget=300 Ginux's own (tools/ltp/tests): a memory cgroup oversubscribed with swap
+memcontrol01 memcontrol01  # runtest/controllers: the memory controller
+!memcontrol02 memcontrol02  # runtest/controllers: page cache is not charged to memory cgroups (memory.stat file stays 0)
+!memcontrol03 memcontrol03  # runtest/controllers: page cache is not charged to memory cgroups (memory.stat file stays 0)
+!memcontrol04 memcontrol04  # runtest/controllers: page cache is not charged to memory cgroups (memory.stat file stays 0)

@@ -834,7 +834,7 @@ pub(super) const LINUX_AIO_MAX_NR: u64 = 65_536;
 pub(super) const LINUX_MAX_MAP_COUNT: usize = 65_530;
 // threads-max below is linux_process::PROCESS_LIMIT.
 const _: () = assert!(crate::linux_process::PROCESS_LIMIT == 4096);
-pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 59] = linux_numbered_sysctls([
+pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 60] = linux_numbered_sysctls([
     // The most memory areas a process may have (LINUX_MAX_MAP_COUNT).
     (b"sys/vm/max_map_count", b"65530\n"),
     // Writing 1, 2 or 3 drops the volumes' page caches (linux_blockfs);
@@ -855,6 +855,9 @@ pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 59] = linux_numbered_
     // (sqrt(lowmem KiB * 16)), kept when written. Memory tests read it to
     // leave that much free.
     (b"sys/vm/min_free_kbytes", b"8192\n"),
+    // How readily reclaim pages anonymous memory out to swap rather than
+    // dropping caches (0 to 200); Ginux keeps the value.
+    (b"sys/vm/swappiness", b"60\n"),
     // The random pool is always full, as Linux reports it since 5.18.
     (b"sys/kernel/random/entropy_avail", b"256\n"),
     (b"sys/kernel/random/poolsize", b"256\n"),

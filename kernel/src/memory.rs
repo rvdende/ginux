@@ -232,6 +232,15 @@ impl FrameAllocator {
         }
     }
 
+    /// The memory cgroup frame `index` is charged to (0 for none).
+    fn charge(&self, index: usize) -> u16 {
+        if self.charges.is_null() || index >= self.frames {
+            return 0;
+        }
+        // SAFETY: as for set_charge.
+        unsafe { self.charges.add(index).read() }
+    }
+
     fn is_free(&self, index: usize) -> bool {
         // SAFETY: index / 64 < words(), which the bitmap covers.
         unsafe { self.free.add(index / 64).read() & (1 << (index % 64)) != 0 }
@@ -928,6 +937,54 @@ pub(crate) fn allocate_user_frames<const N: usize>() -> Option<[FrameLease; N]> 
             }
             return Some(frames);
         }
+    }
+}
+
+/// The memory cgroup `frame` is charged to (0 for none): whose swap a
+/// page paged out of it is charged to.
+pub(crate) fn frame_charge(frame: FrameLease) -> u16 {
+    if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) {
+        return 0;
+    }
+    let storage = PHYSICAL_MEMORY.allocator.lock();
+    // SAFETY: as for allocate_frames.
+    unsafe {
+        let allocator = storage.assume_init_ref();
+        allocator
+            .index(frame.address)
+            .map_or(0, |index| allocator.charge(index))
+    }
+}
+
+/// Allocates a zeroed frame of user memory charged to memory cgroup
+/// `slot` whatever its limit says, without reclaim: a page read back from
+/// swap for another process (swapoff), whose cgroup it was charged to
+/// before it went out.
+pub(crate) fn allocate_user_frame_charged_to(slot: u16) -> Option<FrameLease> {
+    if !PHYSICAL_MEMORY.initialized.load(Ordering::Acquire) {
+        return None;
+    }
+    let mut storage = PHYSICAL_MEMORY.allocator.lock();
+    // SAFETY: as for allocate_user_frames.
+    unsafe {
+        let allocator = storage.assume_init_mut();
+        let total = allocator.free_frames + allocator.allocated_frames;
+        if allocator.free_frames < 1 + user_reserve_frames(total) {
+            return None;
+        }
+        let [frame] = allocator.reserve::<1>(FrameOwner::KERNEL)?;
+        let Some(address) = frame.direct_map_address() else {
+            let _ = allocator.release(FrameOwner::KERNEL, [frame]);
+            return None;
+        };
+        core::ptr::write_bytes(address as *mut u8, 0, PAGE_SIZE as usize);
+        if slot != 0 {
+            crate::linux_cgroup::force_charge(slot, 1);
+            if let Some(index) = allocator.index(frame.address) {
+                allocator.set_charge(index, slot);
+            }
+        }
+        Some(frame)
     }
 }
 

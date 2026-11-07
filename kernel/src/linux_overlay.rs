@@ -2396,6 +2396,11 @@ fn take_paged_frame(node: &mut Node, index: usize) -> Option<bool> {
     if *entry == FrameLease::EMPTY {
         return Some(false);
     }
+    if let Some(swap) = swapped_entry(*entry) {
+        crate::linux_swap::free(swap);
+        *entry = FrameLease::EMPTY;
+        return Some(true);
+    }
     if !memory::scrub_and_release_frames(FrameOwner::KERNEL, core::slice::from_ref(entry)) {
         return None;
     }
@@ -2894,7 +2899,82 @@ fn memfd_page(node: &mut Node, index: usize, allocate: bool) -> Option<FrameLeas
         allocate.then_some(())?;
         *entry = allocate_zeroed_frame()?;
     }
+    // A page out in swap comes back first, whatever wants it.
+    if let Some(swap) = swapped_entry(*entry) {
+        let frame = allocate_zeroed_frame()?;
+        if !crate::arch::x86_64::cpu::linux_swap_read_page(swap, frame) {
+            let _ = memory::scrub_and_release_frames(FrameOwner::KERNEL, &[frame]);
+            return None;
+        }
+        *entry = frame;
+        crate::linux_swap::free(swap);
+    }
     Some(*entry)
+}
+
+/// Marks a paged file's page out in swap: the index holds this in place of
+/// its frame, the swap entry in the address bits above any frame's.
+const SWAPPED_TAG: u64 = 1 << 51;
+const SWAPPED_GENERATION: u32 = u32::MAX;
+
+fn swapped_entry(lease: FrameLease) -> Option<u64> {
+    (lease.generation() == SWAPPED_GENERATION && lease.address() & SWAPPED_TAG != 0)
+        .then_some((lease.address() & !SWAPPED_TAG) >> 12)
+}
+
+/// The index slot of page `index` of paged `node`, if its index reaches it.
+fn paged_slot(node: &Node, index: usize) -> Option<&'static mut FrameLease> {
+    let mut page = node.first_page;
+    for _ in 0..index / FRAME_INDEX_CAPACITY {
+        page = frame_index_page_mut(page)?.next;
+    }
+    frame_index_page_mut(page).map(|entries| &mut entries.frames[index % FRAME_INDEX_CAPACITY])
+}
+
+/// The frame holding page `index` of shared memory `handle` (an unnamed
+/// shmem or memfd node of the overlay, not a volume's), for paging it out:
+/// None if it has none in memory.
+pub(crate) fn paged_frame_for_swap(handle: Handle, index: usize) -> Option<FrameLease> {
+    if blockfs::owns(handle) {
+        return None;
+    }
+    let node = node_mut(handle).filter(|node| node.paged())?;
+    let frame = *paged_slot(node, index)?;
+    (frame != FrameLease::EMPTY && swapped_entry(frame).is_none()).then_some(frame)
+}
+
+/// Records page `index` of `handle`, whose `frame` was written to swap
+/// entry `entry`, as out in swap; false (nothing changed) if the page no
+/// longer has that frame. The caller frees the frame.
+pub(crate) fn mark_paged_page_swapped(
+    handle: Handle,
+    index: usize,
+    frame: FrameLease,
+    entry: u64,
+) -> bool {
+    let Some(mark) = FrameLease::from_parts(SWAPPED_TAG | entry << 12, SWAPPED_GENERATION) else {
+        return false;
+    };
+    let Some(slot) = node_mut(handle)
+        .filter(|node| node.paged())
+        .and_then(|node| paged_slot(node, index))
+    else {
+        return false;
+    };
+    if *slot != frame {
+        return false;
+    }
+    *slot = mark;
+    true
+}
+
+/// Whether page `index` of paged file `handle` is out in swap.
+pub(crate) fn paged_page_swapped(handle: Handle, index: usize) -> bool {
+    !blockfs::owns(handle)
+        && node_mut(handle)
+            .filter(|node| node.paged())
+            .and_then(|node| paged_slot(node, index))
+            .is_some_and(|slot| swapped_entry(*slot).is_some())
 }
 
 fn release_node_data(node: &Node) -> bool {
@@ -2916,6 +2996,10 @@ fn release_frame_index(mut page: FrameLease) -> bool {
             .iter()
             .filter(|frame| **frame != FrameLease::EMPTY)
         {
+            if let Some(swap) = swapped_entry(*frame) {
+                crate::linux_swap::free(swap);
+                continue;
+            }
             if !memory::scrub_and_release_frames(FrameOwner::KERNEL, core::slice::from_ref(frame)) {
                 return false;
             }

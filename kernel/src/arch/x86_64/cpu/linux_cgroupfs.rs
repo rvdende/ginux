@@ -469,7 +469,10 @@ fn write_control(slot: Slot, control: Control, output: &mut Output<'_>) -> bool 
             ginux_cgroup::write_memory_limit(cgroup::limit(slot, Limit::SwapMax), output)
         }
         Control::SwapPeak => ginux_cgroup::write_bytes(cgroup::peak(slot, true), output),
-        Control::SwapEvents => ginux_cgroup::write_swap_events(0, 0, 0, output),
+        Control::SwapEvents => {
+            let [high, max, fail] = cgroup::swap_events(slot);
+            ginux_cgroup::write_swap_events(high, max, fail, output)
+        }
     }
 }
 
@@ -724,7 +727,7 @@ pub(crate) fn reclaim_linux_user_pages(pages: u64) -> bool {
     {
         return false;
     }
-    if !cgroup::reclaimable() {
+    if !cgroup::reclaimable() && !crate::linux_swap::available(linux_execution_instance()) {
         return false;
     }
     let reclaimed = cgroup::root(linux_execution_instance())
@@ -744,13 +747,16 @@ fn linux_process_quiescent(pid: u32) -> bool {
 
 /// Reclaims up to `pages` pages from the processes of cgroup `slot` and
 /// below it, other than `except` and any running on a CPU: what they mapped
-/// droppable (MAP_DROPPABLE) and what they freed lazily (MADV_FREE) and
-/// have not written since. The count reclaimed.
+/// droppable (MAP_DROPPABLE), what they freed lazily (MADV_FREE) and have
+/// not written since, then their private anonymous pages, paged out to
+/// swap. The current process gives up its own pages too when nothing of
+/// its own is in use by the kernel (`except` 0, a control file's write, or
+/// a user page fault: `linux_own_pages_reclaimable`). The count reclaimed.
 pub(super) fn linux_memcg_reclaim(slot: Slot, pages: u64, except: u32) -> u64 {
-    if !cgroup::reclaimable() {
+    let instance = linux_execution_instance();
+    if !cgroup::reclaimable() && !crate::linux_swap::available(instance) {
         return 0;
     }
-    let instance = linux_execution_instance();
     let root = cgroup::root(instance).unwrap_or(NO_SLOT);
     let mut members = [0_u32; 64];
     let mut count = 0;
@@ -769,14 +775,53 @@ pub(super) fn linux_memcg_reclaim(slot: Slot, pages: u64, except: u32) -> u64 {
         }
         reclaimed += linux_reclaim_process_pages(instance, *pid, pages - reclaimed);
     }
+    let current = current_linux_process_pid();
+    if reclaimed < pages
+        && (except == 0 || except == current && linux_own_pages_reclaimable())
+        && process_memcg(current).is_some_and(|memcg| cgroup::is_within(memcg, slot))
+    {
+        reclaimed += linux_reclaim_active_pages(current, pages - reclaimed);
+    }
+    // Last, the swap cache's copies of pages still in swap.
+    if reclaimed < pages {
+        reclaimed += crate::linux_swap::shrink_cache(instance, pages - reclaimed, |memcg| {
+            cgroup::is_within(if memcg == NO_SLOT { root } else { memcg }, slot)
+        });
+    }
     if reclaimed != 0 {
         cgroup::note_reclaimed(slot, reclaimed);
     }
     reclaimed
 }
 
-/// Drops up to `budget` reclaimable pages of process `pid`.
-fn linux_reclaim_process_pages(instance: usize, pid: u32, budget: u64) -> u64 {
+/// Reclaims up to `budget` pages of process `pid`, which is not running.
+fn linux_reclaim_process_pages(_instance: usize, pid: u32, budget: u64) -> u64 {
+    let Some(root) = linux_process::live_process_root(pid) else {
+        return 0;
+    };
+    address_space::with_live_linux_process_root(root, || linux_reclaim_active_pages(pid, budget))
+        .unwrap_or(0)
+}
+
+/// Reclaims up to `budget` pages of process `pid`, whose address space is
+/// the active one: droppable pages and lazily freed ones first, which cost
+/// no I/O, then pages paged out to swap.
+fn linux_reclaim_active_pages(pid: u32, budget: u64) -> u64 {
+    let instance = linux_execution_instance();
+    let mut reclaimed = if cgroup::reclaimable() {
+        linux_drop_active_pages(instance, pid, budget)
+    } else {
+        0
+    };
+    if reclaimed < budget {
+        reclaimed += linux_swap_out_current(pid, budget - reclaimed);
+    }
+    reclaimed
+}
+
+/// Drops up to `budget` droppable or lazily freed pages of process `pid`,
+/// whose address space is the active one.
+fn linux_drop_active_pages(instance: usize, pid: u32, budget: u64) -> u64 {
     let Some(areas) = crate::linux_areas::snapshot(instance, pid) else {
         return 0;
     };
@@ -788,26 +833,19 @@ fn linux_reclaim_process_pages(instance: usize, pid: u32, budget: u64) -> u64 {
             count += 1;
         }
     }
-    let Some(root) = linux_process::live_process_root(pid) else {
-        return 0;
-    };
-    let reclaimed = address_space::with_live_linux_process_root(root, || {
-        let mut reclaimed = 0;
-        for (start, end) in &ranges[..count] {
-            let mut page = *start;
-            while page < *end && reclaimed < budget {
-                if linux_drop_private_page(page) {
-                    reclaimed += 1;
-                }
-                page += PAGE_SIZE as u64;
+    let mut reclaimed = 0;
+    for (start, end) in &ranges[..count] {
+        let mut page = *start;
+        while page < *end && reclaimed < budget {
+            if linux_drop_private_page(page) {
+                reclaimed += 1;
             }
+            page += PAGE_SIZE as u64;
         }
-        if reclaimed < budget {
-            reclaimed += linux_reclaim_lazyfree_pages(budget - reclaimed);
-        }
-        reclaimed
-    })
-    .unwrap_or(0);
+    }
+    if reclaimed < budget {
+        reclaimed += linux_reclaim_lazyfree_pages(budget - reclaimed);
+    }
     if reclaimed != 0 {
         // The registry's list of the process's pages is out of date; its
         // release reads its page tables instead.

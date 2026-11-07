@@ -84,6 +84,8 @@ make -j"$JOBS" -C tools/apicmds >/work/make-apicmds.log 2>&1 ||
     find testcases/kernel -path testcases/kernel/syscalls -prune -o -name '*.c' -print |
         awk -F/ 'NR == FNR { want[$0]; next } ($NF in want) { sub("/[^/]*$", ""); print }' \
             /work/runtest-sources.txt -
+    # The memory controller's tests (memcontrol01-04, runtest/controllers).
+    echo testcases/kernel/controllers/memcg
 } | LC_ALL=C sort -u >/work/leaf-dirs.txt
 xargs -P "$JOBS" -I{} sh -c 'make -k -C "$1" >"$1/.ginux-make.log" 2>&1 || true' sh {} \
     </work/leaf-dirs.txt
@@ -96,6 +98,18 @@ xargs -I{} sh -c 'make -k -C "$1" install DESTDIR=/work/install || true' sh {} \
 make -k -C testcases/lib install DESTDIR=/work/install >>/work/install.log 2>&1 || true
 make -C tools/apicmds install DESTDIR=/work/install >>/work/install.log 2>&1
 root=/work/install/opt/ltp
+
+# Ginux's own tests (tools/ltp/tests), built against libltp as LTP's are.
+: >/work/ginux-tests.txt
+for test in /scripts/tests/*.c; do
+    name=${test##*/}
+    name=${name%.c}
+    gcc $cflags $ldflags -Wall -Wextra -I"$src/include" -I"$src/include/old" \
+        -o "$root/testcases/bin/$name" "$test" \
+        -L"$src/libs/swap" -L"$src/lib" -lltpswap -lltp ||
+        { echo "building $name failed"; exit 1; }
+    printf '%s\tginux\n' "$name" >>/work/ginux-tests.txt
+done
 
 # useradd and friends, which tests run as on a distribution that has them
 # (add_key05, prot_hsymlinks); the domain's Alpine has only busybox's
@@ -146,7 +160,7 @@ while IFS= read -r dir; do
             printf '%s\t%s\n' "${file##*/}" "${dir#testcases/kernel/}"
         fi
     done
-done </work/leaf-dirs.txt | LC_ALL=C sort >/work/test-dirs.txt
+done </work/leaf-dirs.txt | cat - /work/ginux-tests.txt | LC_ALL=C sort >/work/test-dirs.txt
 mkdir -p "$root/runtest"
 cp runtest/syscalls "$root/runtest/syscalls"
 cp VERSION "$root/VERSION"

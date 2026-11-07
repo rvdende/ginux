@@ -165,10 +165,7 @@ feature rather than a fix:
   and the journal stays empty); one that needs replaying is refused.
   swapon/swapoff (`kernel/src/linux_swap.rs`) take mkswap'd swap files
   on volumes and swap partitions (loop devices, RAM disks), with
-  /proc/swaps and SwapTotal/SwapFree; SWAP_FLAG_DISCARD punches a loop
-  device's backing file. Anonymous memory is not paged out to them, so
-  their pages all show free (swapon01 fills memory in a memory cgroup
-  and reads /proc/sys/vm/min_free_kbytes, 8192).
+  /proc/swaps; SWAP_FLAG_DISCARD punches a loop device's backing file.
   Disk quotas (quotactl, quotactl_fd: `crates/ext2/src/quota.rs`) are
   kept in vfsv0/vfsv1 quota files, either the ones quotacheck makes
   (mounted with usrquota/grpquota) or ext4's hidden quota inodes (the
@@ -183,6 +180,33 @@ feature rather than a fix:
   `/opt/ltp/disk-tmpdir.sh`, which gives it a TMPDIR on an ext2 volume of
   its own (the domain's /tmp is the overlay, device 0). The device tests
   still skipped in `syscalls.list` say what they lack.
+- **Swap**: memory is paged out to the swap areas
+  (`kernel/src/linux_swap.rs` hands out the slots,
+  `cpu/linux_swapon.rs` does the I/O and reclaim). A charge past a
+  cgroup's memory.max, or the machine short of frames, first drops
+  MAP_DROPPABLE and unwritten MADV_FREE pages, then pages out private
+  anonymous memory (mappings and the heap; not the stack, locked, huge,
+  shared or copy-on-write pages), coldest first by the accessed bit, 32
+  pages at a time, then drops the swap cache. A paged-out page is a
+  non-present page-table entry holding its swap entry and protection; a
+  fault reads it back, fork shares the slot (counted per slot, Linux's
+  swap_map), munmap, exit, MADV_DONTNEED and MADV_FREE free it, and
+  swapoff reads every page back first (ENOMEM if it cannot).
+  MADV_PAGEOUT and process_madvise(MADV_PAGEOUT) page out at once,
+  shared memory too (a shmem or memfd page only one mapping maps, whose
+  node then notes the swap entry); MADV_WILLNEED reads pages into the
+  swap cache (SwapCached). Swap is charged to the page's cgroup
+  (memory.swap.current, .max, .events) and shown in VmSwap, smaps' Swap,
+  SwapFree, sysinfo and /proc/swaps' Used column. The current process's
+  own pages go only while one of its faults is resolved, or while the
+  kernel brings in a range of its memory it is about to use (that range
+  stays). The tests that need free swap rather than making their own
+  (madvise06, madvise09, process_madvise01) run through
+  `/opt/ltp/with-swap.sh MIB`, which turns a loop device over a sparse
+  file on for the test; ginux_swap01 (`tools/ltp/tests`, built with LTP)
+  oversubscribes a memory cgroup from three processes with a swap file on
+  ext4, forks while pages are out and turns swap off while they are.
+  /proc/sys/vm/min_free_kbytes reads 8192 and swappiness 60.
 - **Page cache and tmpfs limits**: a volume's file data goes through a
   page cache (`linux_blockfs`, frames in overlay page-cache nodes) that
   reads fill and `/proc/sys/vm/drop_caches` empties, so RWF_NOWAIT reads

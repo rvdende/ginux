@@ -665,6 +665,10 @@ pub(super) fn linux_sysinfo_information(
     information[..8].copy_from_slice(&uptime.to_ne_bytes());
     information[32..40].copy_from_slice(&total_memory.to_ne_bytes());
     information[40..48].copy_from_slice(&free_memory.to_ne_bytes());
+    // The domain's swap, as /proc/meminfo's SwapTotal and SwapFree.
+    let (swap_total, swap_free) = crate::linux_swap::totals(linux_execution_instance());
+    information[64..72].copy_from_slice(&(swap_total * 1024).to_ne_bytes());
+    information[72..80].copy_from_slice(&(swap_free * 1024).to_ne_bytes());
     information[80..82].copy_from_slice(&processes.to_ne_bytes());
     information[104..108].copy_from_slice(&1_u32.to_ne_bytes());
     Ok(information)

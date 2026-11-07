@@ -52,6 +52,9 @@ HEADER = """\
 """
 
 
+EXTRA_HEADER = "Tests from outside runtest/syscalls, curated by hand."
+
+
 def read_metadata(source):
     """Returns (timeout, runtime, skip reason) from a test's source."""
     try:
@@ -92,12 +95,14 @@ def main():
 
     lines = [HEADER, f"# Generated from LTP {version} runtest/syscalls.", ""]
     budgets = skipped = 0
+    listed = set()
     for raw in runtest:
         entry = raw.strip()
         if not entry or entry.startswith("#"):
             continue
         tag, command = entry.split(None, 1)
         command = " ".join(command.split())
+        listed.add(tag)
         if tag in curated:
             lines.append(curated[tag])
             continue
@@ -125,6 +130,11 @@ def main():
             budgets += 1
         else:
             lines.append(f"{tag} {command}")
+    # Curated tests from outside runtest/syscalls (Ginux's own tests in
+    # tools/ltp/tests, the memory controller's) stay, at the end.
+    extra = [line for tag, line in curated.items() if tag not in listed]
+    if extra:
+        lines += ["", f"# {EXTRA_HEADER}", *extra]
     out.write_text("\n".join(lines) + "\n")
     print(
         f"Wrote {out}: {sum(1 for l in lines if l and not l.startswith('#'))} tests, "

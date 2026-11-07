@@ -184,6 +184,14 @@ const LINUX_RUNTIME_COW: u64 = 1 << 53;
 /// A private page freed lazily (MADV_FREE): reclaim may drop it, unless it
 /// was written since (the hardware sets DIRTY again).
 const LINUX_RUNTIME_LAZYFREE: u64 = 1 << 52;
+/// A private page paged out to swap: a non-present entry whose address bits
+/// hold `LINUX_SWAP_ENTRY_TAG` and the swap entry (`crate::linux_swap`),
+/// never a frame, with the page's protection kept as a reservation keeps
+/// it. Touching it reads the page back (`materialize_current_linux_runtime_page`).
+const LINUX_RUNTIME_SWAP: u64 = 1 << 59;
+/// Above any physical address the machine has, so a swap entry's address
+/// bits never name a frame lease.
+const LINUX_SWAP_ENTRY_TAG: u64 = 1 << 51;
 const LINUX_INIT_ARGUMENT: [u8; 6] = [b'/', b'i', b'n', b'i', b't', 0];
 const LINUX_INIT_ENVIRONMENT: [u8; 8] = [b'G', b'I', b'N', b'U', b'X', b'=', b'1', 0];
 const LINUX_PLATFORM: [u8; 7] = [b'x', b'8', b'6', b'_', b'6', b'4', 0];
@@ -4012,7 +4020,9 @@ fn clone_shared_linux_hierarchy(
             }
         }
     }
-    // The copied tables map every private page of the old address space.
+    // The copied tables map every private page of the old address space,
+    // and name each of its pages paged out.
+    share_linux_swap_leaves(new_hierarchy[0].address());
     share_linux_leaf_pages(new_hierarchy[0].address())
 }
 
@@ -4196,6 +4206,12 @@ fn clone_linux_process_hierarchy_inner(
         && (share_vm
             || !child_pages.is_empty()
             || install_linux_fork_cow(parent_mappings, parent_hierarchy[0], child_hierarchy[0]))
+        && {
+            if !share_vm {
+                share_linux_swap_leaves(child_hierarchy[0].address());
+            }
+            true
+        }
 }
 
 /// Whether the frame allocator counts a private page's mappings. Pages of a
@@ -4300,7 +4316,216 @@ fn share_linux_leaf_pages(root: u64) -> bool {
 /// Drops the mappings of an abandoned child's page tables, which took a
 /// count of each private page when they were built from its parent's.
 pub(crate) fn release_linux_leaf_pages(root: memory::FrameLease) -> bool {
+    visit_linux_swap_leaves(root.address(), &mut |_, entry| {
+        release_linux_leaf_swap(entry.read());
+        entry.write(0);
+    });
     visit_linux_leaf_pages(root.address(), &mut release_linux_private_page)
+}
+
+/// Calls `visit` with the address and entry of every leaf of the user half
+/// of `root` that names a page paged out to swap.
+fn visit_linux_swap_leaves(root: u64, visit: &mut impl FnMut(u64, PageEntry)) {
+    fn walk(table_address: u64, level: usize, prefix: u64, visit: &mut impl FnMut(u64, PageEntry)) {
+        let Some(table) = mapped_frame::<u64>(table_address) else {
+            return;
+        };
+        let end = if level == 0 { 256 } else { ENTRY_COUNT };
+        for index in 0..end {
+            let value = unsafe { table.add(index).read() };
+            let address = prefix | (index as u64) << [39_u32, 30, 21, 12][level];
+            if level < 3 {
+                if value & (PRESENT | USER | LARGE_PAGE) == PRESENT | USER {
+                    walk(value & ADDRESS_MASK, level + 1, address, visit);
+                }
+            } else if linux_leaf_swap_entry(value).is_some() {
+                // SAFETY: the table was reached through present user entries
+                // of the root's own tables.
+                visit(address, unsafe { PageEntry::new(table.add(index)) });
+            }
+        }
+    }
+    walk(root, 0, 0, visit);
+}
+
+/// A forked child's copy of its parent's page tables names the parent's
+/// pages paged out: each takes another reference, except the wipe-on-fork
+/// pages, which start empty in the child (reservations), and the
+/// don't-fork pages, which the child does not get.
+fn share_linux_swap_leaves(root: u64) {
+    visit_linux_swap_leaves(root, &mut |_, entry| {
+        let value = entry.read();
+        if value & LINUX_RUNTIME_DONTFORK != 0 {
+            entry.write(0);
+        } else if value & LINUX_RUNTIME_WIPEONFORK != 0 {
+            entry.write(value & !(ADDRESS_MASK | LINUX_RUNTIME_SWAP | LINUX_RUNTIME_SEALED));
+        } else if !linux_leaf_swap_entry(value).is_some_and(crate::linux_swap::duplicate) {
+            // An entry no area knows (it cannot be read back) is dropped,
+            // leaving the page empty.
+            entry.write(value & !(ADDRESS_MASK | LINUX_RUNTIME_SWAP));
+        }
+    });
+}
+
+/// How many pages the active address space has paged out to swap
+/// (VmSwap), and of them how many lie in [start, end).
+pub(crate) fn current_linux_swap_pages(start: u64, end: u64) -> (u64, u64) {
+    let (mut all, mut within) = (0, 0);
+    visit_linux_swap_leaves(current_root(), &mut |address, _| {
+        all += 1;
+        if (start..end).contains(&address) {
+            within += 1;
+        }
+    });
+    (all, within)
+}
+
+/// The addresses of the active address space's pages paged out to the swap
+/// area of type `kind`, as many as fit in `output`; how many.
+pub(crate) fn current_linux_swapped_pages_in(kind: u8, output: &mut [u64]) -> usize {
+    let mut found = 0;
+    visit_linux_swap_leaves(current_root(), &mut |address, entry| {
+        if found < output.len()
+            && linux_leaf_swap_entry(entry.read())
+                .is_some_and(|swap| crate::linux_swap::in_kind(swap, kind))
+        {
+            output[found] = address;
+            found += 1;
+        }
+    });
+    found
+}
+
+/// Pages out the active address space's page at `address` to swap entry
+/// `swap`: the leaf becomes the swap entry (keeping the page's protection
+/// and fork flags) and every CPU's translation of it is dropped, so no
+/// thread writes the page after it is copied out. Returns the frame, whose
+/// contents the caller writes to the slot before freeing it, and the leaf
+/// as it was, for `restore_current_linux_swapped_page` should the write
+/// fail. None for a page that may not go: not present, shared, a file's,
+/// secret, copy-on-write, lazily freed, or mapped by another address
+/// space.
+pub(crate) fn swap_out_current_linux_page(
+    address: u64,
+    swap: u64,
+) -> Option<(memory::FrameLease, u64)> {
+    let entry = current_linux_leaf(address)?;
+    let old = entry.read();
+    if old & (PRESENT | USER) != PRESENT | USER
+        || old
+            & (LINUX_RUNTIME_SHARED
+                | LINUX_RUNTIME_FILE
+                | LINUX_RUNTIME_SECRET
+                | LINUX_RUNTIME_COW
+                | LINUX_RUNTIME_LAZYFREE
+                | LARGE_PAGE)
+            != 0
+        || swap >= 1 << 39
+    {
+        return None;
+    }
+    let frame = memory::live_frame_lease(memory::FrameOwner::KERNEL, old & ADDRESS_MASK)?;
+    if !linux_private_page_counted(frame) || memory::frame_is_shared(frame) {
+        return None;
+    }
+    let value = USER
+        | LINUX_RUNTIME_RESERVED
+        | LINUX_RUNTIME_DEMAND
+        | LINUX_RUNTIME_SWAP
+        | LINUX_SWAP_ENTRY_TAG
+        | swap << 12
+        | old
+            & (WRITABLE
+                | NO_EXECUTE
+                | LINUX_RUNTIME_DONTFORK
+                | LINUX_RUNTIME_WIPEONFORK
+                | LINUX_RUNTIME_SEALED);
+    entry.write(value);
+    if !invalidate_changed_runtime_translation(address, old) {
+        unsafe {
+            entry.write(old);
+            asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
+        }
+        return None;
+    }
+    Some((frame, old))
+}
+
+/// Puts back the leaf `swap_out_current_linux_page` replaced, whose page
+/// could not be written out.
+pub(crate) fn restore_current_linux_swapped_page(address: u64, old: u64) -> bool {
+    let Some(entry) = current_linux_leaf(address) else {
+        return false;
+    };
+    if linux_leaf_swap_entry(entry.read()).is_none() {
+        return false;
+    }
+    entry.write(old);
+    // SAFETY: invalidating a translation has no effect beyond the TLB; the
+    // non-present entry it replaces was cached nowhere.
+    unsafe { asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags)) };
+    true
+}
+
+/// Fills `output` with addresses in [start, end) of the active address
+/// space's private pages that could be paged out, from the coldest: on the
+/// first pass (`second_chance`) a page accessed since the last pass only
+/// loses its accessed bit, as Linux's LRU gives it a second round. Returns
+/// how many were found and where to go on next time.
+pub(crate) fn current_linux_swap_candidates(
+    start: u64,
+    end: u64,
+    second_chance: bool,
+    output: &mut [u64],
+) -> (usize, u64) {
+    let mut found = 0;
+    let mut address = start;
+    while address < end && found < output.len() {
+        let Some(table) = next_current_linux_leaf_table(address, end) else {
+            return (found, end);
+        };
+        if table > address {
+            address = table;
+        }
+        let table_end = ((address | ((1 << 21) - 1)) + 1).min(end);
+        while address < table_end && found < output.len() {
+            if let Some(entry) = current_linux_leaf(address) {
+                let value = entry.read();
+                let candidate = value & (PRESENT | USER) == PRESENT | USER
+                    && value
+                        & (LINUX_RUNTIME_SHARED
+                            | LINUX_RUNTIME_FILE
+                            | LINUX_RUNTIME_SECRET
+                            | LINUX_RUNTIME_COW
+                            | LINUX_RUNTIME_LAZYFREE)
+                        == 0;
+                if candidate {
+                    if second_chance && value & ACCESSED != 0 {
+                        entry.write(value & !ACCESSED);
+                    } else {
+                        output[found] = address;
+                        found += 1;
+                    }
+                }
+            }
+            address += PAGE_SIZE as u64;
+        }
+    }
+    (found, address)
+}
+
+/// Copies `frame`'s contents into `output`.
+pub(crate) fn read_linux_frame(frame: memory::FrameLease, output: &mut [u8; PAGE_SIZE]) -> bool {
+    if !memory::frames_owned_by(memory::FrameOwner::KERNEL, &[frame]) {
+        return false;
+    }
+    let Some(source) = frame.direct_map_address() else {
+        return false;
+    };
+    // SAFETY: the frame is a live kernel-owned page, mapped whole by the
+    // direct map.
+    unsafe { core::ptr::copy_nonoverlapping(source as *const u8, output.as_mut_ptr(), PAGE_SIZE) };
+    true
 }
 
 fn install_linux_fork_cow(
@@ -6333,6 +6558,8 @@ pub(crate) struct LinuxRuntimePage {
     pub(crate) secret: bool,
     pub(crate) dontfork: bool,
     pub(crate) wipeonfork: bool,
+    /// The swap entry of a page paged out (it has no frame then).
+    pub(crate) swap: Option<u64>,
 }
 
 impl LinuxRuntimePage {
@@ -6346,7 +6573,22 @@ impl LinuxRuntimePage {
         secret: false,
         dontfork: false,
         wipeonfork: false,
+        swap: None,
     };
+}
+
+/// The swap entry a leaf names, if it is a page paged out.
+fn linux_leaf_swap_entry(value: u64) -> Option<u64> {
+    (value & (PRESENT | LINUX_RUNTIME_SWAP) == LINUX_RUNTIME_SWAP)
+        .then_some((value & ADDRESS_MASK & !LINUX_SWAP_ENTRY_TAG) >> 12)
+}
+
+/// Drops the swap reference of a leaf that held `value` and was cleared or
+/// replaced: the page it paged out is gone (munmap, MADV_DONTNEED, exit).
+fn release_linux_leaf_swap(value: u64) {
+    if let Some(entry) = linux_leaf_swap_entry(value) {
+        crate::linux_swap::free(entry);
+    }
 }
 
 fn linux_runtime_page_from_value(value: u64) -> LinuxRuntimePage {
@@ -6354,7 +6596,8 @@ fn linux_runtime_page_from_value(value: u64) -> LinuxRuntimePage {
     if !occupied {
         return LinuxRuntimePage::EMPTY;
     }
-    let frame = (value & ADDRESS_MASK != 0)
+    let swap = linux_leaf_swap_entry(value);
+    let frame = (value & ADDRESS_MASK != 0 && swap.is_none())
         .then(|| memory::live_frame_lease(memory::FrameOwner::KERNEL, value & ADDRESS_MASK))
         .flatten();
     let protection = if value & PRESENT != 0 || value & LINUX_RUNTIME_DEMAND != 0 {
@@ -6376,6 +6619,7 @@ fn linux_runtime_page_from_value(value: u64) -> LinuxRuntimePage {
         secret: value & LINUX_RUNTIME_SECRET != 0,
         dontfork: value & LINUX_RUNTIME_DONTFORK != 0,
         wipeonfork: value & LINUX_RUNTIME_WIPEONFORK != 0,
+        swap,
     }
 }
 
@@ -6717,6 +6961,7 @@ pub(crate) fn install_current_linux_runtime_page(
     if old.occupied && (!replace || old.sealed) {
         return None;
     }
+    release_linux_leaf_swap(old_value);
     let flags = PRESENT
         | USER
         | if protection & 2 != 0 { WRITABLE } else { 0 }
@@ -6959,6 +7204,7 @@ pub(crate) fn reserve_current_linux_runtime_page(
         }
         return None;
     }
+    release_linux_leaf_swap(old_value);
     (entry.read() == value).then_some(old.frame)
 }
 
@@ -7001,6 +7247,7 @@ pub(crate) fn remove_current_linux_runtime_page(address: u64) -> LinuxRuntimePag
             }
             return LinuxRuntimePage::EMPTY;
         }
+        release_linux_leaf_swap(old_value);
     }
     old
 }
@@ -7115,6 +7362,16 @@ pub(crate) fn protect_current_linux_runtime_page(address: u64, protection: u8) -
         return false;
     }
     let value = match old.frame {
+        None if old.swap.is_some() => {
+            old_value & !(WRITABLE | NO_EXECUTE | LINUX_RUNTIME_DEMAND)
+                | if protection != 0 {
+                    LINUX_RUNTIME_DEMAND
+                } else {
+                    0
+                }
+                | if protection & 2 != 0 { WRITABLE } else { 0 }
+                | if protection & 4 != 0 { 0 } else { NO_EXECUTE }
+        }
         None => {
             LINUX_RUNTIME_RESERVED
                 | USER
@@ -7318,6 +7575,12 @@ pub(crate) fn materialize_current_linux_runtime_page(
     if !old.occupied || old.frame.is_some() || old.protection != protection || old.file != file {
         return false;
     }
+    // A page paged out comes back from swap into the frame first.
+    if let Some(swap) = old.swap {
+        if !cpu::linux_swap_read_page(swap, frame) {
+            return false;
+        }
+    }
     let value = frame.address()
         | PRESENT
         | USER
@@ -7346,6 +7609,7 @@ pub(crate) fn materialize_current_linux_runtime_page(
         }
         return false;
     }
+    release_linux_leaf_swap(old_value);
     let current = linux_runtime_page_from_value(entry.read());
     current.frame == Some(frame)
         && current.protection == protection
@@ -7569,6 +7833,7 @@ fn release_linux_runtime_tables(
                     continue;
                 }
                 unsafe { leaf.write(0) };
+                release_linux_leaf_swap(value);
                 if let Some(frame) = page.frame.filter(|frame| {
                     !page.shared
                         && !memory::frame_lease_is_runtime(*frame)
@@ -7689,6 +7954,7 @@ pub(crate) fn retire_linux_child_address_space(root: memory::FrameLease) -> bool
                 continue;
             }
             unsafe { entry.write(0) };
+            release_linux_leaf_swap(value);
             // Each private page loses this mapping; the allocator frees the
             // pages no other address space still maps.
             if linux_leaf_private_page(value)
