@@ -26361,13 +26361,19 @@ fn verify_linux_mount_query_syscalls() -> bool {
                 && u64::from_ne_bytes(basic[48..56].try_into().unwrap()) == root
                 && u32::from_ne_bytes(basic[56..60].try_into().unwrap()) == 2
         };
-    request[16..24].copy_from_slice(&0x100_u64.to_ne_bytes());
-    let rejected = proc_valid
+    // As Linux: a mask bit statmount does not know is dropped, not
+    // refused, and listmount with no room lists nothing.
+    request[16..24].copy_from_slice(&0x102_u64.to_ne_bytes());
+    let lenient = proc_valid
         && copy_to_linux_user(mapping, &request)
-        && linux_statmount(mapping, mapping + 512, 1024, 0) == LINUX_EINVAL
-        && linux_listmount(mapping, mapping + 64, 0, 0) == LINUX_EINVAL;
+        && linux_statmount(mapping, mapping + 512, 1024, 0) == 0
+        && {
+            let mut mask = [0_u8; 8];
+            copy_from_linux_user(mapping + 520, &mut mask) && u64::from_ne_bytes(mask) == 2
+        }
+        && linux_listmount(mapping, mapping + 64, 0, 0) == 0;
     let unmapped = linux_runtime_munmap(mapping, PAGE_SIZE as u64) == 0;
-    rejected && unmapped
+    lenient && unmapped
 }
 
 fn verify_linux_memfd_seals() -> bool {
