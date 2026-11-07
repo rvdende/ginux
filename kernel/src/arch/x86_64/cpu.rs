@@ -2998,6 +2998,7 @@ fn settle_linux_process_exit(pid: u32, status: u8) -> bool {
 
     linux_release_process_cgroup(pid);
     release_linux_process_shared_mappings(pid);
+    release_linux_process_keys(pid);
     if let Some(state) = linux_process_runtime_state(pid) {
         release_linux_process_descriptors(pid, state);
         *state = LinuxProcessRuntimeState::EMPTY;
@@ -7149,6 +7150,7 @@ fn execute_deferred_live_fork() -> bool {
     }
     linux_release_process_cgroup(child.pid);
     release_linux_process_shared_mappings(child.pid);
+    release_linux_process_keys(child.pid);
     let mut left_namespace = None;
     if let Some(child_state_slot) = linux_process_runtime_state(child.pid) {
         release_linux_process_descriptors(child.pid, child_state_slot);
@@ -8699,6 +8701,17 @@ fn clear_linux_thread_slot(slot: usize) {
                 break;
             }
         }
+    }
+    // The thread's keyrings go with it (the process's go at its exit).
+    let tid = X86_RUNTIME.LINUX_THREAD_TIDS[slot].load(Ordering::SeqCst);
+    if tid != 0
+        && X86_RUNTIME.LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) != LINUX_THREAD_FREE
+        && crate::sync::rank_available(crate::sync::LockRank::KEYRINGS)
+    {
+        let _ = crate::linux_keyring::with(|keys| {
+            keys.exit_thread(tid);
+            Ok(())
+        });
     }
     X86_RUNTIME.LINUX_THREAD_TIDS[slot].store(0, Ordering::SeqCst);
     X86_RUNTIME.LINUX_THREAD_POINTERS[slot].store(0, Ordering::SeqCst);
@@ -15975,6 +15988,7 @@ fn linux_init_exit_kill_others_live_return(
                 retire_linux_process_record(pid);
                 let _ = release_linux_process_runtime_slot(pid);
                 release_linux_process_shared_mappings(pid);
+                release_linux_process_keys(pid);
             }
         }
     }
@@ -18581,6 +18595,7 @@ fn release_linux_runtime_mmaps(expected_base: u64) -> bool {
     }
     let address_cleared = X86_RUNTIME.ELF_PROBE_MMAP.swap(0, Ordering::SeqCst) == expected_base;
     release_linux_process_shared_mappings(pid);
+    release_linux_process_keys(pid);
     shared_flushed
         && address_valid
         && address_cleared
@@ -31906,6 +31921,7 @@ fn linux_proc_sysctl_write_bytes(device: u16, index: usize, text: &[u8]) -> Resu
         | b"sys/kernel/keys/maxbytes"
         | b"sys/kernel/keys/root_maxkeys"
         | b"sys/kernel/keys/root_maxbytes" => Some(1..=i64::from(i32::MAX)),
+        b"sys/kernel/keys/gc_delay" => Some(0..=i64::from(i32::MAX)),
         _ => None,
     };
     if bounds.is_some_and(|bounds| !bounds.contains(&value)) {
@@ -32576,6 +32592,9 @@ fn linux_root_directory_kind(path: &[u8]) -> Option<u16> {
         b"/sys/fs/cgroup" => Some(LINUX_CGROUP_DIRECTORY),
         _ => {
             let name = path.strip_prefix(b"/")?;
+            if let Some(index) = linux_proc_sys_directory_index(name) {
+                return Some(linux_proc_sys_directory_kind(index));
+            }
             let node = initramfs::published_directory_node(name)?;
             Some(LINUX_ROOT_MEASURED_DIRECTORY | (u16::from(node) << LINUX_ROOT_NODE_SHIFT))
         }
@@ -32591,6 +32610,9 @@ fn linux_measured_path_kind(path: &[u8]) -> Option<u16> {
     }
     if path == b"sys/fs/cgroup" {
         return Some(LINUX_CGROUP_DIRECTORY);
+    }
+    if let Some(index) = linux_proc_sys_directory_index(path) {
+        return Some(linux_proc_sys_directory_kind(index));
     }
     if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) && path == b"proc/sys/fs/file-max" {
         return Some(LINUX_FILE_PROC_FILE_MAX);
@@ -35270,6 +35292,163 @@ fn reset_linux_signal_state_after_exec() {
     unsafe { linux_signal_context().get().write(LinuxSignalContext::ZERO) };
 }
 
+/// The /proc/sys directory at `path` (from the root, "proc/sys/..."), with
+/// or without a trailing slash: its place in `LINUX_PROC_SYS_DIRECTORIES`.
+fn linux_proc_sys_directory_index(path: &[u8]) -> Option<usize> {
+    let path = path.strip_suffix(b"/").unwrap_or(path);
+    LINUX_PROC_SYS_DIRECTORIES
+        .iter()
+        .position(|directory| *directory == path)
+}
+
+fn linux_proc_sys_directory_kind(index: usize) -> u16 {
+    LINUX_PROC_PID1_DIRECTORY | (LINUX_PROC_SYS_DIRECTORY_FIRST_NODE + ((index as u16) << 8))
+}
+
+/// The /proc/sys directory a directory kind names.
+fn linux_proc_sys_directory_of(kind: u16) -> Option<usize> {
+    if kind & (LINUX_DEVICE_DIRECTORY | LINUX_FILE_MASK) != LINUX_PROC_PID1_DIRECTORY {
+        return None;
+    }
+    let index = usize::from(
+        (kind & LINUX_ROOT_NODE_MASK).checked_sub(LINUX_PROC_SYS_DIRECTORY_FIRST_NODE)? >> 8,
+    );
+    (index < LINUX_PROC_SYS_DIRECTORIES.len()).then_some(index)
+}
+
+/// The entries of /proc/sys directory `directory` (from the root): its
+/// subdirectories, then its values, then the values with kinds of their
+/// own that live there, as (inode, dirent type, name).
+fn linux_proc_sys_children(
+    directory: &'static [u8],
+) -> impl Iterator<Item = (u64, u8, &'static [u8])> {
+    // The values' paths are under /proc.
+    let relative = &directory[b"proc/".len()..];
+    let child = move |path: &'static [u8]| {
+        path.strip_prefix(relative)?
+            .strip_prefix(b"/")
+            .filter(|name| !name.is_empty() && !name.contains(&b'/'))
+    };
+    let directories =
+        LINUX_PROC_SYS_DIRECTORIES
+            .iter()
+            .enumerate()
+            .filter_map(move |(index, path)| {
+                child(&path[b"proc/".len()..])
+                    .map(|name| (LINUX_PROC_SYS_DIRECTORY_INODES + index as u64, 4, name))
+            });
+    let values = LINUX_PROC_SYSCTLS
+        .iter()
+        .enumerate()
+        .filter_map(move |(index, (_, path, _))| {
+            child(path).map(|name| (LINUX_PROC_SYSCTL_INODES + index as u64, 8, name))
+        });
+    let own_kinds: [(&'static [u8], u16); 3] = [
+        (b"sys/fs/file-max", LINUX_FILE_PROC_FILE_MAX),
+        (b"sys/kernel/hostname", LINUX_FILE_PROC_HOSTNAME),
+        (b"sys/kernel/random/boot_id", LINUX_FILE_PROC_BOOT_ID),
+    ];
+    let own = own_kinds.into_iter().filter_map(move |(path, kind)| {
+        child(path).map(|name| (linux_regular_file_inode(kind).unwrap_or(0), 8, name))
+    });
+    directories.chain(values).chain(own)
+}
+
+/// The inode of process `pid`'s /proc directory, as /proc lists it.
+fn linux_proc_pid_directory_inode(pid: u32) -> u64 {
+    match pid {
+        1 => 16,
+        2 => 23,
+        _ => 0x1_0000_0000 + u64::from(pid),
+    }
+}
+
+/// The process a /proc/PID directory descriptor was opened for (open keeps
+/// its pid with the descriptor).
+fn linux_proc_directory_descriptor_pid(descriptor: u64) -> Option<u32> {
+    matches!(
+        linux_device_descriptor(descriptor) & !3,
+        LINUX_PROC_PID1_DIRECTORY | LINUX_PROC_PID2_DIRECTORY
+    )
+    .then(|| linux_descriptor_tmp_generation(descriptor))
+    .flatten()?
+    .checked_sub(1)
+}
+
+/// The inode of thread `tid`'s /proc/PID/task directory.
+fn linux_proc_task_directory_inode(tid: u32) -> u64 {
+    0x2_0000_0000 + u64::from(tid)
+}
+
+/// The inode of the kernel's directory `kind` at absolute `path`: a
+/// process's or thread's /proc directory has its own, by its id.
+fn linux_virtual_directory_inode(path: &[u8], kind: u16) -> u64 {
+    let path = path.strip_suffix(b"/").unwrap_or(path);
+    if path == b"/proc/self" {
+        return linux_proc_pid_directory_inode(current_linux_process_pid());
+    }
+    if let Some(pid) = linux_proc_pid_directory(path, true) {
+        return linux_proc_pid_directory_inode(pid);
+    }
+    let thread = linux_proc_process_file(path)
+        .and_then(|(_, name)| name.strip_prefix(b"task/"))
+        .filter(|tid| !tid.is_empty() && tid.iter().all(u8::is_ascii_digit))
+        .and_then(linux_leading_decimal);
+    thread.map_or_else(
+        || linux_root_directory_inode(kind).unwrap_or(0),
+        linux_proc_task_directory_inode,
+    )
+}
+
+/// `linux_virtual_directory_inode` for a /proc path from the root
+/// (`linux_virtual_mount_path_at`), with or without its leading slash.
+fn linux_virtual_mount_directory_inode(path: &[u8], kind: u16) -> u64 {
+    let mut absolute = [0_u8; LINUX_PATH_MAX + 1];
+    let relative = path.strip_prefix(b"/").unwrap_or(path);
+    absolute[0] = b'/';
+    absolute[1..1 + relative.len()].copy_from_slice(relative);
+    let absolute = &absolute[..1 + relative.len()];
+    // /proc itself is the image's directory, which lookups through the
+    // image (/proc/., /proc/1/..) report.
+    if kind & (LINUX_DEVICE_DIRECTORY | LINUX_FILE_MASK) == LINUX_ROOT_MEASURED_DIRECTORY {
+        if let Some((handle, _)) = linux_rootfs_path_at(u64::from(LINUX_AT_FDCWD), absolute) {
+            return linux_rootfs_inode(handle);
+        }
+    }
+    linux_virtual_directory_inode(absolute, kind)
+}
+
+/// `canonical`, a canonical path under /proc, as an absolute path in
+/// `output`, for the kernel's own lookups, which know /proc names only as
+/// spelled from the root: a path with "." or ".." in it, or one relative
+/// to a /proc directory (`ls` in /proc/sys/kernel stats "."). None for
+/// anything else, which is looked up as given.
+fn linux_proc_normalized_path(
+    path: &[u8],
+    canonical: &[u8],
+    output: &mut [u8; crate::linux_overlay::PATH_CAPACITY + 1],
+) -> Option<usize> {
+    let under_proc = canonical == b"proc" || canonical.starts_with(b"proc/");
+    let irregular = !path.starts_with(b"/")
+        || path
+            .split(|byte| *byte == b'/')
+            .any(|component| component == b"." || component == b"..");
+    if !under_proc || !irregular || linux_chrooted() {
+        return None;
+    }
+    output[0] = b'/';
+    output
+        .get_mut(1..1 + canonical.len())?
+        .copy_from_slice(canonical);
+    Some(1 + canonical.len())
+}
+
+/// The inode of a /proc file whose node is its own: from
+/// `LINUX_PROC_NODE_INODES` on, one per node, so none is another's.
+fn linux_proc_node_inode(kind: u16) -> u64 {
+    LINUX_PROC_NODE_INODES + u64::from(kind >> 8)
+}
+
 fn linux_root_directory_inode(kind: u16) -> Option<u64> {
     let role = kind & (LINUX_DEVICE_DIRECTORY | LINUX_FILE_MASK);
     if role == LINUX_DEVICE_DIRECTORY {
@@ -35283,9 +35462,10 @@ fn linux_root_directory_inode(kind: u16) -> Option<u64> {
             0 => Some(16),
             LINUX_PROC_PID2_DIRECTORY_NODE => Some(23),
             LINUX_PROC_FD_DIRECTORY_NODE => Some(36),
-            LINUX_PROC_TASK_DIRECTORY_NODE => Some(94),
+            LINUX_PROC_TASK_DIRECTORY_NODE => Some(linux_proc_node_inode(kind)),
             LINUX_CGROUP_DIRECTORY_NODE => Some(39),
-            _ => None,
+            _ => linux_proc_sys_directory_of(kind)
+                .map(|index| LINUX_PROC_SYS_DIRECTORY_INODES + index as u64),
         };
     }
     let node = (kind & LINUX_ROOT_NODE_MASK) >> LINUX_ROOT_NODE_SHIFT;
@@ -35307,7 +35487,7 @@ fn linux_measured_directory_path(kind: u16) -> Option<&'static [u8]> {
             LINUX_PROC_FD_DIRECTORY_NODE => Some(b"proc/self/fd"),
             LINUX_PROC_TASK_DIRECTORY_NODE => Some(b"proc/self/task"),
             LINUX_CGROUP_DIRECTORY_NODE => Some(b"sys/fs/cgroup"),
-            _ => None,
+            _ => linux_proc_sys_directory_of(kind).map(|index| LINUX_PROC_SYS_DIRECTORIES[index]),
         };
     }
     let node = ((kind & LINUX_ROOT_NODE_MASK) >> LINUX_ROOT_NODE_SHIFT) as u8;
@@ -35634,9 +35814,21 @@ fn linux_walk_start(
 ) -> Result<usize, u64> {
     Ok(if directory as u32 == LINUX_AT_FDCWD {
         let overlay = X86_RUNTIME.ELF_PROBE_OVERLAY_CWD.load(Ordering::SeqCst);
+        let rootfs = X86_RUNTIME.ELF_PROBE_ROOTFS_CWD.load(Ordering::SeqCst);
+        let kernel_directory = (overlay == 0 && rootfs == 0)
+            .then(|| {
+                linux_measured_directory_path(X86_RUNTIME.ELF_PROBE_CWD.load(Ordering::SeqCst))
+            })
+            .flatten();
         if overlay != 0 {
             let handle = crate::linux_overlay::from_generation(overlay).ok_or(LINUX_ENOENT)?;
             crate::linux_overlay::copy_path(handle, output).ok_or(LINUX_ENOENT)?
+        } else if let Some(path) = kernel_directory {
+            // A kernel directory (/proc/sys/kernel) is the working
+            // directory: the walk starts from its path.
+            let destination = output.get_mut(..path.len()).ok_or(LINUX_ENAMETOOLONG)?;
+            destination.copy_from_slice(path);
+            path.len()
         } else {
             crate::published_rootfs::copy_path(
                 X86_RUNTIME.ELF_PROBE_ROOTFS_CWD.load(Ordering::SeqCst),
@@ -36424,6 +36616,7 @@ fn linux_openat_path(
     let mut created = false;
     let mut rootfs_handle = 0;
     let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    let mut normalized = [0_u8; crate::linux_overlay::PATH_CAPACITY + 1];
     let mut canonical_length = if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
         match linux_canonical_path_at(directory, path, &mut canonical) {
             Ok(length) => Some(length),
@@ -36803,6 +36996,19 @@ fn linux_openat_path(
             }
             path => match linux_relative_path_kind(directory, path) {
                 Ok(Some(kind)) => kind,
+                // A /proc directory named with "." or "..", or relative
+                // to a /proc directory, is looked up from the root.
+                _ if canonical_length
+                    .and_then(|length| {
+                        linux_proc_normalized_path(path, &canonical[..length], &mut normalized)
+                    })
+                    .is_some_and(|length| {
+                        linux_root_directory_kind(&normalized[..length]).is_some()
+                    }) =>
+                {
+                    let length = canonical_length.map_or(0, |length| length + 1);
+                    linux_root_directory_kind(&normalized[..length]).unwrap_or(0)
+                }
                 Ok(None) => match linux_root_directory_kind(path)
                     .or_else(|| linux_runtime_file_kind(path))
                 {
@@ -37643,7 +37849,7 @@ fn linux_newfstatat(directory: u64, path_address: u64, stat_address: u64, flags:
         let stat = if kind & LINUX_DEVICE_DIRECTORY != 0 {
             linux_stat(
                 LINUX_STAT_DIRECTORY_MODE,
-                linux_root_directory_inode(kind).unwrap_or(0),
+                linux_virtual_mount_directory_inode(path, kind),
             )
         } else {
             linux_regular_file_stat(kind)
@@ -37714,6 +37920,15 @@ fn linux_newfstatat(directory: u64, path_address: u64, stat_address: u64, flags:
             };
         }
     }
+    // A /proc name spelled with "." or "..", or relative to a /proc
+    // directory, is looked up from the root.
+    let mut normalized = [0_u8; crate::linux_overlay::PATH_CAPACITY + 1];
+    let path = match canonical_length
+        .and_then(|length| linux_proc_normalized_path(path, &canonical[..length], &mut normalized))
+    {
+        Some(length) => &normalized[..length],
+        None => path,
+    };
     let relative_kind = match linux_relative_path_kind(directory, path) {
         Ok(kind) => kind,
         Err(LINUX_ENOENT) => {
@@ -37735,9 +37950,14 @@ fn linux_newfstatat(directory: u64, path_address: u64, stat_address: u64, flags:
         }
         (None, path) if linux_root_directory_kind(path).is_some() => linux_stat(
             LINUX_STAT_DIRECTORY_MODE,
-            linux_root_directory_inode(linux_root_directory_kind(path).unwrap_or(0)).unwrap_or(0),
+            linux_virtual_directory_inode(path, linux_root_directory_kind(path).unwrap_or(0)),
         ),
         (None, path) => match linux_runtime_file_kind(path) {
+            // A kernel directory below a process's (/proc/self/fd).
+            Some(kind) if kind & LINUX_DEVICE_DIRECTORY != 0 => linux_stat(
+                LINUX_STAT_DIRECTORY_MODE,
+                linux_virtual_directory_inode(path, kind),
+            ),
             Some(kind) => linux_regular_file_stat(kind),
             None => {
                 return canonical_length.map_or(LINUX_ENOENT, |length| {
@@ -40060,7 +40280,7 @@ fn linux_statx(directory: u64, path_address: u64, flags: u64, mask: u64, stat_ad
     if let Some(kind) = linux_virtual_mount_path_at(directory, path) {
         let (inode, mode, size) = if kind & LINUX_DEVICE_DIRECTORY != 0 {
             (
-                linux_root_directory_inode(kind).unwrap_or(0),
+                linux_virtual_mount_directory_inode(path, kind),
                 LINUX_STAT_DIRECTORY_MODE,
                 0,
             )
@@ -40141,6 +40361,15 @@ fn linux_statx(directory: u64, path_address: u64, flags: u64, mask: u64, stat_ad
             };
         }
     }
+    // As in newfstatat: /proc names with "." or "..", or relative to a /proc
+    // directory, are looked up from the root.
+    let mut normalized = [0_u8; crate::linux_overlay::PATH_CAPACITY + 1];
+    let path = match canonical_length
+        .and_then(|length| linux_proc_normalized_path(path, &canonical[..length], &mut normalized))
+    {
+        Some(length) => &normalized[..length],
+        None => path,
+    };
     let relative_kind = match linux_relative_path_kind(directory, path) {
         Ok(kind) => kind,
         Err(error) => return error,
@@ -40164,12 +40393,18 @@ fn linux_statx(directory: u64, path_address: u64, flags: u64, mask: u64, stat_ad
             (inode, Some((major, minor)), 0o020_000 | permissions, 0)
         }
         (None, path) if linux_root_directory_kind(path).is_some() => (
-            linux_root_directory_inode(linux_root_directory_kind(path).unwrap_or(0)).unwrap_or(0),
+            linux_virtual_directory_inode(path, linux_root_directory_kind(path).unwrap_or(0)),
             None,
             LINUX_STAT_DIRECTORY_MODE,
             0,
         ),
         (None, path) => match linux_runtime_file_kind(path) {
+            Some(kind) if kind & LINUX_DEVICE_DIRECTORY != 0 => (
+                linux_virtual_directory_inode(path, kind),
+                None,
+                LINUX_STAT_DIRECTORY_MODE,
+                0,
+            ),
             Some(kind) => (
                 linux_regular_file_inode(kind).unwrap_or(0),
                 None,
@@ -52486,7 +52721,7 @@ fn linux_regular_file_inode(state: u16) -> Option<u64> {
         .iter()
         .position(|(node, ..)| state & !3 == LINUX_FILE_MASK | node)
     {
-        return Some(61 + index as u64);
+        return Some(LINUX_PROC_SYSCTL_INODES + index as u64);
     }
     if state & !3 == LINUX_FILE_RESOLV_CONF {
         return Some(36);
@@ -52508,34 +52743,44 @@ fn linux_regular_file_inode(state: u16) -> Option<u64> {
     }
     match state & !3 {
         LINUX_FILE_PROC_CPUINFO => return Some(25),
-        LINUX_FILE_PROC_SYSVIPC_MSG => return Some(90),
-        LINUX_FILE_PROC_SYSVIPC_SHM => return Some(91),
-        LINUX_FILE_PROC_SYSVIPC_SEM => return Some(92),
+        LINUX_FILE_PROC_SYSVIPC_MSG => {
+            return Some(linux_proc_node_inode(LINUX_FILE_PROC_SYSVIPC_MSG))
+        }
+        LINUX_FILE_PROC_SYSVIPC_SHM => {
+            return Some(linux_proc_node_inode(LINUX_FILE_PROC_SYSVIPC_SHM))
+        }
+        LINUX_FILE_PROC_SYSVIPC_SEM => {
+            return Some(linux_proc_node_inode(LINUX_FILE_PROC_SYSVIPC_SEM))
+        }
         LINUX_FILE_PROC_MEMINFO => return Some(26),
         LINUX_FILE_PROC_STAT => return Some(27),
         LINUX_FILE_PROC_UPTIME => return Some(28),
         LINUX_FILE_PROC_LOADAVG => return Some(29),
         LINUX_FILE_PROC_FILESYSTEMS => return Some(30),
-        LINUX_FILE_PROC_MODULES => return Some(99),
-        LINUX_FILE_PROC_KEYS => return Some(51),
-        LINUX_FILE_PROC_KEY_USERS => return Some(52),
-        LINUX_FILE_PROC_CONFIG => return Some(97),
+        LINUX_FILE_PROC_MODULES => return Some(linux_proc_node_inode(LINUX_FILE_PROC_MODULES)),
+        LINUX_FILE_PROC_KEYS => return Some(linux_proc_node_inode(LINUX_FILE_PROC_KEYS)),
+        LINUX_FILE_PROC_KEY_USERS => return Some(linux_proc_node_inode(LINUX_FILE_PROC_KEY_USERS)),
+        LINUX_FILE_PROC_CONFIG => return Some(linux_proc_node_inode(LINUX_FILE_PROC_CONFIG)),
         LINUX_FILE_PROC_CMDLINE => return Some(31),
         LINUX_FILE_PROC_PID1_STAT => return Some(32),
         LINUX_FILE_PROC_PID1_STATM => return Some(33),
         LINUX_FILE_PROC_PID2_STAT => return linux_process::live_process_status(2).map(|_| 34),
         LINUX_FILE_PROC_PID2_STATM => return linux_process::live_process_status(2).map(|_| 35),
         LINUX_FILE_PROC_CGROUP => return Some(37),
-        LINUX_FILE_PROC_COREDUMP_FILTER => return Some(98),
+        LINUX_FILE_PROC_COREDUMP_FILTER => {
+            return Some(linux_proc_node_inode(LINUX_FILE_PROC_COREDUMP_FILTER))
+        }
         LINUX_FILE_PROC_PROCESS_CMDLINE => return Some(40),
         LINUX_FILE_PROC_PROCESS_ENVIRON => return Some(41),
         LINUX_FILE_PROC_FILE_MAX => return Some(42),
         LINUX_FILE_PROC_NR_OPEN => return Some(43),
         LINUX_FILE_PROC_OOM_SCORE_ADJ => return Some(44),
-        LINUX_FILE_PROC_TIMENS_OFFSETS => return Some(99),
+        LINUX_FILE_PROC_TIMENS_OFFSETS => {
+            return Some(linux_proc_node_inode(LINUX_FILE_PROC_TIMENS_OFFSETS))
+        }
         LINUX_FILE_PROC_USER_NAMESPACE => return Some(45),
         LINUX_FILE_PROC_FDINFO => return Some(46),
-        LINUX_FILE_PROC_HOSTNAME => return Some(47),
+        LINUX_FILE_PROC_HOSTNAME => return Some(linux_proc_node_inode(LINUX_FILE_PROC_HOSTNAME)),
         LINUX_FILE_PROC_BOOT_ID => return Some(49),
         LINUX_FILE_PROC_SYSRQ_TRIGGER => return Some(50),
         LINUX_FILE_PROC_DYNAMIC_STAT
@@ -52544,9 +52789,9 @@ fn linux_regular_file_inode(state: u16) -> Option<u64> {
         | LINUX_FILE_PROC_DYNAMIC_MAPS
         | LINUX_FILE_PROC_DYNAMIC_SMAPS
         | LINUX_FILE_PROC_DYNAMIC_PAGEMAP
-        | LINUX_FILE_PROC_DYNAMIC_MEM => return Some(48),
-        LINUX_FILE_PROC_TASK_COMM => return Some(95),
-        LINUX_FILE_PROC_TASK_STAT => return Some(96),
+        | LINUX_FILE_PROC_DYNAMIC_MEM => return Some(linux_proc_node_inode(state & !3)),
+        LINUX_FILE_PROC_TASK_COMM => return Some(linux_proc_node_inode(LINUX_FILE_PROC_TASK_COMM)),
+        LINUX_FILE_PROC_TASK_STAT => return Some(linux_proc_node_inode(LINUX_FILE_PROC_TASK_STAT)),
         _ => {}
     }
     if linux_tmp_file(state) {
@@ -54827,13 +55072,19 @@ fn linux_getdents(descriptor: u64, address: u64, count: u64, legacy: bool) -> u6
         }
         next_offset = cookie + 2;
     } else if let Some(directory) = linux_measured_directory_path(state) {
-        let directory_inode = linux_root_directory_inode(state).unwrap_or(0);
+        let directory_inode = linux_proc_directory_descriptor_pid(descriptor).map_or_else(
+            || linux_root_directory_inode(state).unwrap_or(0),
+            linux_proc_pid_directory_inode,
+        );
         let parent_inode = if directory.is_empty() {
             directory_inode
-        } else if directory == b"proc/1" || directory == b"proc/2" {
+        } else if directory == b"proc/1" || directory == b"proc/2" || directory == b"proc/sys" {
             initramfs::published_directory_node(b"proc")
                 .map(|node| 64 + u64::from(node))
                 .unwrap_or(11)
+        } else if linux_proc_sys_directory_index(directory).is_some() {
+            linux_proc_sys_directory_index(linux_parent_path(directory))
+                .map_or(11, |index| LINUX_PROC_SYS_DIRECTORY_INODES + index as u64)
         } else {
             11
         };
@@ -54923,7 +55174,7 @@ fn linux_getdents(descriptor: u64, address: u64, count: u64, legacy: bool) -> u6
                             &mut entries[..output_capacity],
                             &mut used,
                             legacy,
-                            48,
+                            linux_proc_task_directory_inode(*tid),
                             (index + 3) as i64,
                             4,
                             &name[..length],
@@ -54972,6 +55223,16 @@ fn linux_getdents(descriptor: u64, address: u64, count: u64, legacy: bool) -> u6
             .enumerate()
             .take(entry_count)
             {
+                // Only init's command line and environment are served
+                // (linux_proc_pid_file_kind); other processes' directories
+                // do not list them.
+                let listed_pid = linux_proc_directory_descriptor_pid(descriptor).unwrap_or(1);
+                if listed_pid != 1 && matches!(name, b"cmdline" | b"environ") {
+                    if cursor == index {
+                        cursor += 1;
+                    }
+                    continue;
+                }
                 if cursor == index {
                     if !append_linux_dirent(
                         &mut entries[..output_capacity],
@@ -55021,11 +55282,32 @@ fn linux_getdents(descriptor: u64, address: u64, count: u64, legacy: bool) -> u6
                     cursor += 1;
                 }
             }
+        } else if linux_proc_sys_directory_index(directory).is_some() {
+            for (index, (inode, kind, name)) in linux_proc_sys_children(directory).enumerate() {
+                if cursor == index {
+                    if !append_linux_dirent(
+                        &mut entries[..output_capacity],
+                        &mut used,
+                        legacy,
+                        inode,
+                        (index + 3) as i64,
+                        kind,
+                        name,
+                    ) {
+                        if used == 0 {
+                            return LINUX_EINVAL;
+                        }
+                        break;
+                    }
+                    cursor += 1;
+                }
+            }
         } else if directory == b"proc" {
             // The fixed files, then `self`, then a directory per process.
             // Cursors from PROC_PID_CURSOR on name the next pid to list, so
             // processes that come and go between calls shift no others.
             const PROC_PID_CURSOR: usize = 64;
+            let file = |kind| linux_regular_file_inode(kind).unwrap_or(0);
             let fixed = [
                 (25_u64, 8_u8, &b"cpuinfo"[..]),
                 (26, 8, &b"meminfo"[..]),
@@ -55034,7 +55316,18 @@ fn linux_getdents(descriptor: u64, address: u64, count: u64, legacy: bool) -> u6
                 (29, 8, &b"loadavg"[..]),
                 (30, 8, &b"filesystems"[..]),
                 (31, 8, &b"cmdline"[..]),
-                (32, 10, &b"self"[..]),
+                (12, 10, &b"self"[..]),
+                (LINUX_PROC_SYS_DIRECTORY_INODES, 4, &b"sys"[..]),
+                (file(LINUX_FILE_PROC_MOUNTS), 8, &b"mounts"[..]),
+                (file(LINUX_FILE_PROC_MODULES), 8, &b"modules"[..]),
+                (file(LINUX_FILE_PROC_KEYS), 8, &b"keys"[..]),
+                (file(LINUX_FILE_PROC_KEY_USERS), 8, &b"key-users"[..]),
+                (file(LINUX_FILE_PROC_CONFIG), 8, &b"config.gz"[..]),
+                (
+                    file(LINUX_FILE_PROC_SYSRQ_TRIGGER),
+                    8,
+                    &b"sysrq-trigger"[..],
+                ),
             ];
             let mut full = false;
             while let Some((inode, kind, name)) = fixed.get(cursor).copied() {
@@ -55068,11 +55361,7 @@ fn linux_getdents(descriptor: u64, address: u64, count: u64, legacy: bool) -> u6
                         &mut entries[..output_capacity],
                         &mut used,
                         legacy,
-                        match pid {
-                            1 => 16,
-                            2 => 23,
-                            _ => 0x1_0000_0000 + u64::from(pid),
-                        },
+                        linux_proc_pid_directory_inode(pid),
                         (next + 2) as i64,
                         4,
                         &name[..length],
@@ -57279,7 +57568,10 @@ fn linux_descriptor_stat(descriptor: u64) -> Option<[u8; LINUX_STAT_SIZE]> {
     }
     (device != 0).then(|| {
         if device & LINUX_DEVICE_DIRECTORY != 0 {
-            let inode = linux_root_directory_inode(device).unwrap_or(0);
+            let inode = linux_proc_directory_descriptor_pid(descriptor).map_or_else(
+                || linux_root_directory_inode(device).unwrap_or(0),
+                linux_proc_pid_directory_inode,
+            );
             linux_stat(LINUX_STAT_DIRECTORY_MODE, inode)
         } else if device & LINUX_FILE_MASK != 0 {
             linux_regular_file_stat(device)
@@ -59170,11 +59462,33 @@ fn linux_with_keys<R>(
         privileged,
     };
     let limits = linux_key_limits();
+    let now = linux_key_clock();
+    let gc_delay = linux_proc_sysctl_value(b"sys/kernel/keys/gc_delay")
+        .and_then(|seconds| u64::try_from(seconds).ok())
+        .unwrap_or(LINUX_KEY_GC_DELAY_SECONDS)
+        .saturating_mul(NANOSECONDS_PER_SECOND);
     crate::linux_keyring::with(|keys| {
         keys.set_limits(limits)?;
+        keys.collect_garbage(now, gc_delay);
         operation(keys, &caller)
     })
     .map_err(linux_key_error)
+}
+
+/// Linux's default /proc/sys/kernel/keys/gc_delay.
+const LINUX_KEY_GC_DELAY_SECONDS: u64 = 300;
+
+/// Process `pid` ended: its threads' and its own keyrings go, as Linux
+/// drops them with the tasks' credentials, and keys only they kept leave
+/// their owners' quotas. Skipped (left to the next fork that reuses the
+/// id) when a lock ranked above the keys' is held.
+fn release_linux_process_keys(pid: u32) {
+    if crate::sync::rank_available(crate::sync::LockRank::KEYRINGS) {
+        let _ = crate::linux_keyring::with(|keys| {
+            keys.exit_process(pid);
+            Ok(())
+        });
+    }
 }
 
 /// The domain's key quotas: /proc/sys/kernel/keys as written, else Linux's

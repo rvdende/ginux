@@ -677,6 +677,46 @@ fn exiting_frees_keys_and_their_quota() {
     assert!(keys.keys.is_empty());
 }
 
+/// A process's exit takes every thread's keyrings with it, not only the
+/// main thread's (add_key05's children run with a thread keyring each).
+#[test]
+fn process_exit_frees_every_threads_keyrings() {
+    let mut keys = Keyrings::new();
+    let parent = person(1000, 10);
+    add_user(&mut keys, &parent, "main", THREAD_KEYRING);
+    keys.spawn_thread(&parent, 11).unwrap();
+    let thread = Caller {
+        tid: 11,
+        ..person(1000, 10)
+    };
+    add_user(&mut keys, &thread, "sibling", THREAD_KEYRING);
+    assert_eq!(usage(&keys, 1000).map(|(count, _)| count), Some(4));
+    keys.exit_process(10);
+    assert_eq!(usage(&keys, 1000), None);
+    assert!(keys.keys.is_empty());
+}
+
+/// Revoked and expired keys leave their keyrings, and their owners'
+/// quotas, once the garbage collector's delay has passed, and not before.
+#[test]
+fn garbage_collection_frees_revoked_and_expired_keys() {
+    let mut keys = Keyrings::new();
+    let caller = person(1000, 10);
+    let ring = add_ring(&mut keys, &caller, "ring", PROCESS_KEYRING);
+    let revoked = add_user(&mut keys, &caller, "revoked", ring);
+    let expiring = add_user(&mut keys, &caller, "expiring", ring);
+    let kept = add_user(&mut keys, &caller, "kept", ring);
+    keys.revoke(&caller, revoked, NOW).unwrap();
+    keys.set_timeout(&caller, expiring, 1, NOW).unwrap();
+    let before = usage(&keys, 1000).unwrap();
+    keys.collect_garbage(NOW + 2 * SECOND, 5 * SECOND);
+    assert_eq!(usage(&keys, 1000), Some(before));
+    keys.collect_garbage(NOW + 10 * SECOND, 5 * SECOND);
+    let (count, _) = usage(&keys, 1000).unwrap();
+    assert_eq!(count, before.0 - 2);
+    assert_eq!(links(&mut keys, &caller, ring), [kept]);
+}
+
 /// request_key01.
 #[test]
 fn request_key_finds_keys_in_the_callers_keyrings() {

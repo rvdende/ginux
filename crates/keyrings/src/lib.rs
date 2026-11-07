@@ -931,7 +931,7 @@ impl Keyrings {
         match self.find_named_keyring(caller, name) {
             Some(serial) if current == Some(serial) => Ok(0),
             Some(serial) => {
-                self.ensure_thread(caller.tid)?;
+                self.ensure_thread(caller.tid, caller.pid)?;
                 self.set_anchor(Anchor::Session(caller.tid), Some(serial));
                 Ok(serial)
             }
@@ -986,7 +986,9 @@ impl Keyrings {
             }
             result => result?,
         };
-        self.get_mut(handle.serial)?.state = State::Revoked;
+        let key = self.get_mut(handle.serial)?;
+        key.state = State::Revoked;
+        key.revoked_at = Some(now);
         self.discard_contents(handle.serial);
         Ok(())
     }
@@ -1245,7 +1247,7 @@ impl Keyrings {
             | request_default::REQUESTOR => {}
             _ => return Err(Error::Invalid),
         }
-        self.ensure_thread(caller.tid)?;
+        self.ensure_thread(caller.tid, caller.pid)?;
         if let Some(thread) = self.thread_mut(caller.tid) {
             thread.request_default = value;
         }
@@ -1303,7 +1305,8 @@ impl Keyrings {
             Need::Rights(LINK),
             now,
         )?;
-        self.ensure_thread(parent_tid)?;
+        // The parent has a single thread, so its id is the process's.
+        self.ensure_thread(parent_tid, parent_tid)?;
         self.set_anchor(Anchor::Session(parent_tid), Some(session.serial));
         Ok(())
     }
@@ -1455,6 +1458,14 @@ impl Keyrings {
     /// parent's session keyring and request-key default, and starts with no
     /// thread or process keyring.
     pub fn fork(&mut self, parent: &Caller, child_tid: u32) -> Result<(), Error> {
+        // Forget what a missed exit left under a reused process id.
+        self.exit_process(child_tid);
+        self.inherit(parent, child_tid, child_tid)
+    }
+
+    /// Gives thread `child_tid` of process `child_pid` the session keyring
+    /// and request-key default of `parent`.
+    fn inherit(&mut self, parent: &Caller, child_tid: u32, child_pid: u32) -> Result<(), Error> {
         // Forget what a missed exit left under a reused thread id.
         self.exit_thread(child_tid);
         let Some(record) = self.thread(parent.tid) else {
@@ -1464,7 +1475,7 @@ impl Keyrings {
         if session.is_none() && request_default == request_default::DEFAULT {
             return Ok(());
         }
-        self.ensure_thread(child_tid)?;
+        self.ensure_thread(child_tid, child_pid)?;
         if let Some(child) = self.thread_mut(child_tid) {
             child.request_default = request_default;
         }
@@ -1477,7 +1488,7 @@ impl Keyrings {
     /// not fail the clone when that keyring cannot be made, and neither
     /// does this). The process keyring is already shared.
     pub fn spawn_thread(&mut self, parent: &Caller, child_tid: u32) -> Result<(), Error> {
-        self.fork(parent, child_tid)?;
+        self.inherit(parent, child_tid, parent.pid)?;
         if self
             .thread(parent.tid)
             .is_some_and(|thread| thread.keyring.is_some())
@@ -1512,8 +1523,18 @@ impl Keyrings {
         }
     }
 
-    /// The last thread of process `pid` exited: its process keyring goes.
+    /// Process `pid` exited: its threads' keyrings and holds on session
+    /// keyrings go, then its process keyring, and with them every key only
+    /// they kept, which leaves its owner's quota.
     pub fn exit_process(&mut self, pid: u32) {
+        while let Some(tid) = self
+            .threads
+            .iter()
+            .find(|thread| thread.pid == pid)
+            .map(|thread| thread.tid)
+        {
+            self.exit_thread(tid);
+        }
         let Ok(index) = self
             .processes
             .binary_search_by_key(&pid, |process| process.pid)
@@ -1521,6 +1542,57 @@ impl Keyrings {
             return;
         };
         if let Some(serial) = self.processes.remove(index).keyring {
+            self.release(serial);
+        }
+    }
+
+    /// The key garbage collector, as Linux's runs `delay` (its gc_delay)
+    /// after a key is revoked or expires: such a key leaves every keyring,
+    /// and goes with its quota charge once no thread, process or user
+    /// keeps it either. Without memory to note the keys, it does nothing
+    /// until the next call.
+    pub fn collect_garbage(&mut self, now: u64, delay: u64) {
+        let dead = |key: &Key| {
+            key.revoked_at
+                .or(key.expiry)
+                .is_some_and(|since| now >= since.saturating_add(delay))
+        };
+        if !self.keys.iter().any(dead) {
+            return;
+        }
+        // The table is sorted by serial, and so are these.
+        let mut serials = Vec::new();
+        for key in self.keys.iter().filter(|key| dead(key)) {
+            if serials.try_reserve(1).is_err() {
+                return;
+            }
+            serials.push(key.serial);
+        }
+        let mut unlinked = Vec::new();
+        for index in 0..self.keys.len() {
+            let keyring = &mut self.keys[index];
+            let gone = keyring
+                .links
+                .iter()
+                .filter(|link| serials.binary_search(link).is_ok())
+                .count();
+            if gone == 0 || unlinked.try_reserve(gone).is_err() {
+                continue;
+            }
+            unlinked.extend(
+                keyring
+                    .links
+                    .iter()
+                    .copied()
+                    .filter(|link| serials.binary_search(link).is_ok()),
+            );
+            keyring
+                .links
+                .retain(|link| serials.binary_search(link).is_err());
+            let ring = keyring.serial;
+            self.recharge(ring);
+        }
+        for serial in unlinked {
             self.release(serial);
         }
     }

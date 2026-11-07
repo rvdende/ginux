@@ -771,7 +771,7 @@ pub(super) const LINUX_AIO_MAX_NR: u64 = 65_536;
 pub(super) const LINUX_MAX_MAP_COUNT: usize = 65_530;
 // threads-max below is linux_process::PROCESS_LIMIT.
 const _: () = assert!(crate::linux_process::PROCESS_LIMIT == 4096);
-pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 46] = [
+pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 47] = [
     // The most memory areas a process may have (LINUX_MAX_MAP_COUNT).
     (0xa000, b"sys/vm/max_map_count", b"65530\n"),
     // The random pool is always full, as Linux reports it since 5.18.
@@ -843,6 +843,9 @@ pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 46] = [
     // The key quotas of users other than root (linux_key_limits).
     (0x9a00, b"sys/kernel/keys/maxkeys", b"200\n"),
     (0x9b00, b"sys/kernel/keys/maxbytes", b"20000\n"),
+    // Seconds a revoked or expired key stays linked before the garbage
+    // collector drops it (linux_with_keys).
+    (0x9900, b"sys/kernel/keys/gc_delay", b"300\n"),
     // Link restrictions in sticky, world-writable directories (off, as
     // Linux boots; distributions turn them on): linux_check_hardlink_source
     // and linux_check_follow_link.
@@ -867,6 +870,36 @@ pub(super) const LINUX_FILE_PROC_FILESYSTEMS: u16 = LINUX_FILE_MASK | LINUX_PROC
 /// in, as /lib/modules/RELEASE/modules.builtin lists it).
 pub(super) const LINUX_PROC_MODULES_NODE: u16 = 0xba00;
 pub(super) const LINUX_FILE_PROC_MODULES: u16 = LINUX_FILE_MASK | LINUX_PROC_MODULES_NODE;
+/// The directories of /proc/sys, as paths under the root: one for each
+/// directory the `LINUX_PROC_SYSCTLS` values lie in. Directory `index` is
+/// node `LINUX_PROC_SYS_DIRECTORY_FIRST_NODE + (index << 8)`, a directory
+/// kind of the /proc/PID role, and inode `LINUX_PROC_SYS_DIRECTORY_INODES +
+/// index`.
+pub(super) const LINUX_PROC_SYS_DIRECTORIES: [&[u8]; 15] = [
+    b"proc/sys",
+    b"proc/sys/fs",
+    b"proc/sys/fs/inotify",
+    b"proc/sys/fs/mqueue",
+    b"proc/sys/kernel",
+    b"proc/sys/kernel/keys",
+    b"proc/sys/kernel/random",
+    b"proc/sys/net",
+    b"proc/sys/net/ipv4",
+    b"proc/sys/net/ipv4/conf",
+    b"proc/sys/net/ipv4/conf/all",
+    b"proc/sys/net/ipv4/conf/default",
+    b"proc/sys/net/ipv4/conf/lo",
+    b"proc/sys/user",
+    b"proc/sys/vm",
+];
+pub(super) const LINUX_PROC_SYS_DIRECTORY_FIRST_NODE: u16 = 0x7000;
+/// The inodes of /proc's files and directories: fixed ones below 64, the
+/// image's directories from 64 (a node each), and these ranges, so no two
+/// share one.
+pub(super) const LINUX_PROC_SYSCTL_INODES: u64 = 0x10_0000;
+pub(super) const LINUX_PROC_SYS_DIRECTORY_INODES: u64 = 0x10_1000;
+/// Files whose inode is their node's (`linux_proc_node_inode`).
+pub(super) const LINUX_PROC_NODE_INODES: u64 = 0x10_2000;
 /// /proc/keys and /proc/key-users: the domain's keys a reader may view,
 /// and each user's key count and quota (ginux_keyrings).
 pub(super) const LINUX_PROC_KEYS_NODE: u16 = 0x9e00;
@@ -1292,6 +1325,28 @@ const _: () = {
         }
     }
     let input_end = LINUX_INPUT_NODE_FIRST + ((crate::linux_input::DEVICE_LIMIT as u16) << 8);
+    // The /proc/sys directory nodes stay below every other node.
+    assert!(
+        LINUX_PROC_SYS_DIRECTORY_FIRST_NODE as usize + (LINUX_PROC_SYS_DIRECTORIES.len() << 8)
+            <= 0x9900
+    );
+    // Every /proc/sys value's directory is listed.
+    let mut value = 0;
+    while value < LINUX_PROC_SYSCTLS.len() {
+        let path = LINUX_PROC_SYSCTLS[value].1;
+        let mut end = path.len();
+        while end > 0 && path[end - 1] != b'/' {
+            end -= 1;
+        }
+        let mut directory = 0;
+        while directory < LINUX_PROC_SYS_DIRECTORIES.len()
+            && !is_proc_directory_of(LINUX_PROC_SYS_DIRECTORIES[directory], path, end - 1)
+        {
+            directory += 1;
+        }
+        assert!(directory < LINUX_PROC_SYS_DIRECTORIES.len());
+        value += 1;
+    }
     let total = NODES.len() + LINUX_PROC_SYSCTLS.len();
     let mut index = 0;
     while index < total {
@@ -1304,3 +1359,18 @@ const _: () = {
         index += 1;
     }
 };
+
+/// Whether `directory` ("proc/" and a path) is `/proc/` + `path[..length]`.
+const fn is_proc_directory_of(directory: &[u8], path: &[u8], length: usize) -> bool {
+    if directory.len() != 5 + length {
+        return false;
+    }
+    let mut index = 0;
+    while index < length {
+        if directory[5 + index] != path[index] {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}

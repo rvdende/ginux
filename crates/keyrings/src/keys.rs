@@ -55,6 +55,8 @@ pub(crate) struct Key {
     pub(crate) state: State,
     /// When the key expires, on the kernel's clock in nanoseconds.
     pub(crate) expiry: Option<u64>,
+    /// When it was revoked, on the same clock.
+    pub(crate) revoked_at: Option<u64>,
     /// The keyring links and anchors that keep the key.
     pub(crate) references: u32,
     /// The bytes charged to the owner's quota.
@@ -158,6 +160,7 @@ impl Key {
             permissions: new.permissions,
             state: new.state,
             expiry: new.expiry,
+            revoked_at: None,
             references: 0,
             charged: 0,
             restriction: None,
@@ -239,6 +242,8 @@ pub(crate) struct User {
 #[derive(Debug)]
 pub(crate) struct Thread {
     pub(crate) tid: u32,
+    /// The process the thread belongs to: its records go when it exits.
+    pub(crate) pid: u32,
     pub(crate) keyring: Option<i32>,
     pub(crate) session: Option<i32>,
     pub(crate) request_default: i32,
@@ -459,13 +464,15 @@ impl Keyrings {
         Ok(())
     }
 
-    pub(crate) fn ensure_thread(&mut self, tid: u32) -> Result<(), Error> {
+    /// The record of thread `tid` of process `pid`, made if missing.
+    pub(crate) fn ensure_thread(&mut self, tid: u32, pid: u32) -> Result<(), Error> {
         if let Err(index) = self.threads.binary_search_by_key(&tid, |thread| thread.tid) {
             self.threads.try_reserve(1).map_err(no_memory)?;
             self.threads.insert(
                 index,
                 Thread {
                     tid,
+                    pid,
                     keyring: None,
                     session: None,
                     request_default: crate::request_default::DEFAULT,
@@ -651,7 +658,9 @@ impl Keyrings {
         self.keys.try_reserve(1).map_err(no_memory)?;
         self.ensure_user(uid)?;
         match anchor {
-            Anchor::ThreadKeyring(tid) | Anchor::Session(tid) => self.ensure_thread(tid)?,
+            Anchor::ThreadKeyring(tid) | Anchor::Session(tid) => {
+                self.ensure_thread(tid, owner.pid)?
+            }
             Anchor::ProcessKeyring(pid) => self.ensure_process(pid)?,
             Anchor::UserKeyring(uid) | Anchor::UserSessionKeyring(uid) => self.ensure_user(uid)?,
         }
@@ -791,7 +800,7 @@ impl Keyrings {
                 if create {
                     return self.new_session(caller);
                 }
-                self.ensure_thread(caller.tid)?;
+                self.ensure_thread(caller.tid, caller.pid)?;
                 self.set_anchor(Anchor::Session(caller.tid), Some(user_session));
                 Ok(user_session)
             }
