@@ -2357,6 +2357,8 @@ fn linux_syscall_dispatch(
             .map_or_else(|error| error, |()| linux_pivot_root(first_argument, buffer)),
         LINUX_ACCT_SYSCALL => linux_acct(first_argument),
         LINUX_QUOTACTL_SYSCALL => linux_quotactl(first_argument, buffer, count, register(0)),
+        LINUX_SWAPON_SYSCALL => linux_swapon(first_argument, buffer),
+        LINUX_SWAPOFF_SYSCALL => linux_swapoff(first_argument),
         LINUX_QUOTACTL_FD_SYSCALL => linux_quotactl_fd(first_argument, buffer, count, register(0)),
         LINUX_PTRACE_SYSCALL
             if linux_privileged_operation_allowed(

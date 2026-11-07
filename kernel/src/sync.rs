@@ -112,6 +112,10 @@ impl LockRank {
     /// grow, which they may under the volumes' lock (a loop device's
     /// backing file).
     pub(crate) const TMPFS_LIMITS: Self = Self(189);
+    /// The swap areas swapon turned on: taken under the volumes and the
+    /// unlinked files (whether a file is in use), never with the tmpfs
+    /// limits; only the heap is taken while held.
+    pub(crate) const SWAPS: Self = Self(189);
     /// The kernel heap refills from the frame allocator while holding its
     /// lock, so it ranks just below it.
     pub(crate) const KERNEL_HEAP: Self = Self(190);

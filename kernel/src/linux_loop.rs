@@ -508,6 +508,53 @@ pub(crate) fn backing(id: u64) -> Result<(Handle, u64, u64, bool), Error> {
     ))
 }
 
+/// The size of this domain's loop device `minor` and its backing file and
+/// offset, if bound; no open is taken (swapon reads its header so).
+pub(crate) fn peek(minor: u32) -> Option<(Handle, u64, u64)> {
+    let mut loops = LOOPS.lock();
+    let domain = current_domain();
+    let device = loops.domain(domain).device(minor)?;
+    Some((device.bound().ok()?, device.offset, device.size()))
+}
+
+/// Discards bytes `start..start + length` of loop device `minor` (of this
+/// domain): the backing file gets a hole there, so the space is free and
+/// the range reads as zeros (BLKDISCARD, and swapon's discard).
+pub(crate) fn discard(minor: u32, start: u64, length: u64) -> Result<(), Error> {
+    let (backing, offset, size) = {
+        let mut loops = LOOPS.lock();
+        let domain = current_domain();
+        let device = loops.domain(domain).device(minor).ok_or(Error::NoDevice)?;
+        if device.write_protected() {
+            return Err(Error::Permission);
+        }
+        (device.bound()?, device.offset, device.size())
+    };
+    let end = start.saturating_add(length).min(size);
+    if start >= end {
+        return Ok(());
+    }
+    let (from, to) = (offset + start, offset + end);
+    let punched = if crate::linux_blockfs::owns(backing) {
+        matches!(
+            crate::linux_blockfs::fallocate(
+                backing,
+                crate::linux_blockfs::Allocation::PunchHole,
+                from,
+                to - from,
+            ),
+            Some(Ok(()))
+        )
+    } else {
+        linux_overlay::punch_hole(backing, from as usize, to as usize)
+    };
+    if punched {
+        Ok(())
+    } else {
+        Err(Error::Io)
+    }
+}
+
 /// Whether some loop device of any domain is bound to `backing` (or was,
 /// and is still open).
 pub(crate) fn backs(backing: Handle) -> bool {
@@ -1342,8 +1389,20 @@ fn make_device(attributes: &Attributes) {
         ("ro", format!("{}\n", u8::from(attributes.read_only))),
         ("removable", "0\n".into()),
         ("queue/logical_block_size", block_size.clone()),
-        ("queue/physical_block_size", block_size),
+        ("queue/physical_block_size", block_size.clone()),
         ("queue/dma_alignment", format!("{DMA_ALIGNMENT}\n")),
+        // A bound device discards by punching holes in its backing file,
+        // as Linux's loop does (UINT_MAX sectors at a time).
+        (
+            "queue/discard_max_bytes",
+            if attributes.bound.is_some() {
+                "4294966784\n"
+            } else {
+                "0\n"
+            }
+            .into(),
+        ),
+        ("queue/discard_granularity", block_size),
     ] {
         put_attribute(
             format!("{directory}/{name}").as_bytes(),

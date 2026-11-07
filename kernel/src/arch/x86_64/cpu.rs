@@ -27,6 +27,7 @@ mod linux_quota;
 mod linux_rtnetlink;
 mod linux_security;
 mod linux_signal;
+mod linux_swapon;
 mod linux_syscall;
 mod linux_time;
 mod linux_userfaultfd;
@@ -66,6 +67,7 @@ use linux_signal::*;
 pub(crate) use linux_signal::{
     expire_linux_waits_from_timer, linux_nanoseconds_to_next_wait_deadline, sample_linux_profile,
 };
+use linux_swapon::*;
 use linux_syscall::linux_syscall_handler;
 use linux_time::*;
 use linux_userfaultfd::*;
@@ -7611,6 +7613,7 @@ pub(crate) fn stop_configured_container() {
     crate::linux_lease::forget_domain(linux_execution_instance());
     crate::linux_core::forget_domain(linux_execution_instance());
     crate::linux_tmpfs_quota::forget_instance(linux_execution_instance());
+    crate::linux_swap::forget_instance(linux_execution_instance());
     crate::linux_pidfs::forget_instance(linux_execution_instance());
     crate::linux_fscontext::forget_instance(linux_execution_instance());
     linux_namespace::forget_instance(
@@ -20668,6 +20671,11 @@ fn release_linux_descriptor_runtime_state(state: &LinuxDescriptorRuntimeState) {
     {
         let _ = crate::linux_socket::close(socket - 1);
     }
+    // The objects whose last descriptor that was (an open loop device, a
+    // pseudo-terminal, ...) go now, as they do at close(2); a process that
+    // exits without closing its descriptors left them waiting until some
+    // other close, so a loop device it had open stayed open (busy).
+    linux_release_objects();
     for (device, id) in state
         .stdio_devices
         .iter()
@@ -32541,7 +32549,8 @@ fn linux_proc_sysctl_write_bytes(device: u16, index: usize, text: &[u8]) -> Resu
         b"sys/vm/drop_caches" => Some(1..=4),
         b"sys/vm/nr_hugepages"
         | b"sys/vm/nr_overcommit_hugepages"
-        | b"sys/vm/vfs_cache_pressure" => Some(0..=i64::from(i32::MAX)),
+        | b"sys/vm/vfs_cache_pressure"
+        | b"sys/vm/min_free_kbytes" => Some(0..=i64::from(i32::MAX)),
         b"sys/vm/hugetlb_shm_group" => Some(0..=i64::from(u32::MAX)),
         b"sys/kernel/keys/maxkeys"
         | b"sys/kernel/keys/maxbytes"
@@ -32736,6 +32745,7 @@ fn linux_proc_root_file_kind(name: &[u8]) -> Option<u16> {
         b"filesystems" => Some(LINUX_FILE_PROC_FILESYSTEMS),
         b"modules" => Some(LINUX_FILE_PROC_MODULES),
         b"keys" => Some(LINUX_FILE_PROC_KEYS),
+        b"swaps" => Some(LINUX_FILE_PROC_SWAPS),
         b"key-users" => Some(LINUX_FILE_PROC_KEY_USERS),
         b"config.gz" => Some(LINUX_FILE_PROC_CONFIG),
         b"cmdline" => Some(LINUX_FILE_PROC_CMDLINE),
@@ -32923,6 +32933,27 @@ fn linux_proc_sysvipc_read(state: u16, address: u64, count: u64, offset: u64) ->
 /// Whether a descriptor state names /proc/keys or /proc/key-users.
 fn linux_proc_keys_file(state: u16) -> bool {
     matches!(state & !3, LINUX_FILE_PROC_KEYS | LINUX_FILE_PROC_KEY_USERS)
+}
+
+/// Reads /proc/swaps from `offset`.
+fn linux_proc_swaps_read(address: u64, count: u64, offset: u64) -> u64 {
+    let Some(text) = crate::linux_swap::proc_swaps(linux_execution_instance()) else {
+        return LINUX_ENOMEM;
+    };
+    let Ok(start) = usize::try_from(offset) else {
+        return 0;
+    };
+    if start >= text.len() || count == 0 {
+        return 0;
+    }
+    let end = start
+        .saturating_add(usize::try_from(count).unwrap_or(usize::MAX))
+        .min(text.len());
+    if copy_to_linux_user(address, &text[start..end]) {
+        (end - start) as u64
+    } else {
+        LINUX_EFAULT
+    }
 }
 
 /// The text of /proc/keys (the domain's keys the caller may view) or
@@ -44827,6 +44858,7 @@ fn linux_descriptor_read(descriptor: u64, address: u64, count: u64) -> u64 {
             | LINUX_FILE_PROC_SYSVIPC_SEM
             | LINUX_FILE_PROC_KEYS
             | LINUX_FILE_PROC_KEY_USERS
+            | LINUX_FILE_PROC_SWAPS
             | LINUX_FILE_PROC_STAT
             | LINUX_FILE_PROC_DYNAMIC_STAT
             | LINUX_FILE_PROC_DYNAMIC_STATUS
@@ -45038,6 +45070,9 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
     }
     if linux_proc_keys_file(state) {
         return linux_proc_keys_read(state, address, count, offset);
+    }
+    if state & !3 == LINUX_FILE_PROC_SWAPS {
+        return linux_proc_swaps_read(address, count, offset);
     }
     if state & !3 == LINUX_FILE_PROC_TASK_STAT {
         return linux_proc_task_stat_read(descriptor, address, count, offset);
@@ -54024,6 +54059,7 @@ fn linux_proc_file(state: u16) -> bool {
             | LINUX_FILE_PROC_MODULES
             | LINUX_FILE_PROC_KEYS
             | LINUX_FILE_PROC_KEY_USERS
+            | LINUX_FILE_PROC_SWAPS
             | LINUX_FILE_PROC_CONFIG
             | LINUX_FILE_PROC_CMDLINE
             | LINUX_FILE_PROC_PID1_STAT
@@ -54289,6 +54325,7 @@ fn linux_proc_meminfo() -> &'static [u8] {
     let used = total - free;
     let huge = linux_huge_page_counts();
     let kernel_stack = activation::kernel_stack_bytes() / 1024;
+    let (swap_total, swap_free) = crate::linux_swap::totals(linux_execution_instance());
     // SAFETY: the kernel is single-processor and readers copy the bytes
     // before another /proc/meminfo read can rewrite them.
     let buffer = unsafe { &mut *core::ptr::addr_of_mut!(MEMINFO) };
@@ -54300,7 +54337,7 @@ fn linux_proc_meminfo() -> &'static [u8] {
              MemAvailable:   {free:>10} kB\nBuffers:        {zero:>10} kB\n\
              Cached:         {zero:>10} kB\nSwapCached:     {zero:>10} kB\n\
              Active:         {used:>10} kB\nInactive:       {zero:>10} kB\n\
-             SwapTotal:      {zero:>10} kB\nSwapFree:       {zero:>10} kB\n\
+             SwapTotal:      {swap_total:>10} kB\nSwapFree:       {swap_free:>10} kB\n\
              KernelStack:    {kernel_stack:>10} kB\n\
              CommitLimit:    {total:>10} kB\nCommitted_AS:   {used:>10} kB\n\
              VmallocTotal:   13743895347199 kB\n\
@@ -54466,6 +54503,7 @@ fn linux_regular_file_inode(state: u16) -> Option<u64> {
         LINUX_FILE_PROC_MODULES => return Some(linux_proc_node_inode(LINUX_FILE_PROC_MODULES)),
         LINUX_FILE_PROC_KEYS => return Some(linux_proc_node_inode(LINUX_FILE_PROC_KEYS)),
         LINUX_FILE_PROC_KEY_USERS => return Some(linux_proc_node_inode(LINUX_FILE_PROC_KEY_USERS)),
+        LINUX_FILE_PROC_SWAPS => return Some(linux_proc_node_inode(LINUX_FILE_PROC_SWAPS)),
         LINUX_FILE_PROC_CONFIG => return Some(linux_proc_node_inode(LINUX_FILE_PROC_CONFIG)),
         LINUX_FILE_PROC_CMDLINE => return Some(31),
         LINUX_FILE_PROC_PID1_STAT => return Some(32),
@@ -57299,6 +57337,7 @@ fn linux_getdents_entries(descriptor: u64, address: u64, count: u64, legacy: boo
                 (file(LINUX_FILE_PROC_MODULES), 8, &b"modules"[..]),
                 (file(LINUX_FILE_PROC_KEYS), 8, &b"keys"[..]),
                 (file(LINUX_FILE_PROC_KEY_USERS), 8, &b"key-users"[..]),
+                (file(LINUX_FILE_PROC_SWAPS), 8, &b"swaps"[..]),
                 (file(LINUX_FILE_PROC_CONFIG), 8, &b"config.gz"[..]),
                 (
                     file(LINUX_FILE_PROC_SYSRQ_TRIGGER),
@@ -60634,6 +60673,10 @@ fn linux_release_volume_device(source: crate::linux_blockfs::Source) {
 /// the domain: open as a descriptor, or a working directory. A process
 /// live on some CPU is read from its bank, any other from its saved record.
 pub(crate) fn linux_generation_in_use(generation: u32) -> bool {
+    // An active swap file keeps its volume busy.
+    if crate::linux_swap::uses_generation(generation) {
+        return true;
+    }
     let in_bank = |bank: usize| {
         let stdio = X86_RUNTIME
             .ELF_PROBE_STDIO_TMP_FILE_GENERATIONS
@@ -61725,6 +61768,9 @@ fn linux_file_size(state: u16) -> u64 {
         linux_proc_sysvipc_contents(state, &mut file).unwrap_or(0) as u64
     } else if linux_proc_keys_file(state) {
         linux_proc_keys_contents(state).map_or(0, |text| text.len() as u64)
+    } else if state & !3 == LINUX_FILE_PROC_SWAPS {
+        crate::linux_swap::proc_swaps(linux_execution_instance())
+            .map_or(0, |text| text.len() as u64)
     } else if state & !3 == LINUX_FILE_PROC_CPUINFO {
         let count = linux_available_cpu_count();
         let mut record = [0_u8; 768];

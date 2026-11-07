@@ -1373,10 +1373,10 @@ statvfs02 statvfs02
 stime01 stime01
 stime02 stime02
 string01 string01
-!swapoff01 swapoff01  # swap files are not supported
-!swapoff02 swapoff02  # swap files are not supported
+swapoff01 swapoff01  # budget=240 a 256 MiB swap file on each of ext2, ext3, ext4 and tmpfs
+swapoff02 swapoff02
 swapon01 swapon01  # auto: budget=120
-!swapon02 swapon02  # swap files are not supported
+swapon02 swapon02
 swapon03 swapon03
 swapon04 swapon04
 switch01 endian_switch01

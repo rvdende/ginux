@@ -163,6 +163,12 @@ feature rather than a fix:
   64-bit descriptors, flex_bg, uninitialized groups and metadata_csum.
   The journal is not written (changes go to their places, as on ext2,
   and the journal stays empty); one that needs replaying is refused.
+  swapon/swapoff (`kernel/src/linux_swap.rs`) take mkswap'd swap files
+  on volumes and swap partitions (loop devices, RAM disks), with
+  /proc/swaps and SwapTotal/SwapFree; SWAP_FLAG_DISCARD punches a loop
+  device's backing file. Anonymous memory is not paged out to them, so
+  their pages all show free (swapon01 fills memory in a memory cgroup
+  and reads /proc/sys/vm/min_free_kbytes, 8192).
   Disk quotas (quotactl, quotactl_fd: `crates/ext2/src/quota.rs`) are
   kept in vfsv0/vfsv1 quota files, either the ones quotacheck makes
   (mounted with usrquota/grpquota) or ext4's hidden quota inodes (the

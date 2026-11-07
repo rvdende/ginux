@@ -875,6 +875,19 @@ pub(crate) fn page_backed(handle: Handle, index: usize) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether every block of `handle`'s file from `start` for `length`
+/// bytes has its place on the disk (a swap file must have no holes).
+pub(crate) fn range_backed(handle: Handle, start: u64, length: u64) -> bool {
+    let mut table = VOLUMES.lock();
+    let Some((volume, inode)) = table.of(handle) else {
+        return false;
+    };
+    volume
+        .filesystem
+        .blocks_allocated(inode, start, length)
+        .unwrap_or(false)
+}
+
 /// page_mkwrite: before a shared mapping may write page `index` of
 /// `handle`'s file, the part of the page within the file gets disk blocks
 /// (the cached page is written to them); Err (ENOSPC, EDQUOT) when the

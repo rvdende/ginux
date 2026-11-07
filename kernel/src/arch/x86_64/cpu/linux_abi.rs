@@ -834,7 +834,7 @@ pub(super) const LINUX_AIO_MAX_NR: u64 = 65_536;
 pub(super) const LINUX_MAX_MAP_COUNT: usize = 65_530;
 // threads-max below is linux_process::PROCESS_LIMIT.
 const _: () = assert!(crate::linux_process::PROCESS_LIMIT == 4096);
-pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 58] = linux_numbered_sysctls([
+pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 59] = linux_numbered_sysctls([
     // The most memory areas a process may have (LINUX_MAX_MAP_COUNT).
     (b"sys/vm/max_map_count", b"65530\n"),
     // Writing 1, 2 or 3 drops the volumes' page caches (linux_blockfs);
@@ -850,6 +850,11 @@ pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 58] = linux_numbered_
     // How hard the kernel reclaims the dentry and inode caches; Ginux keeps
     // the value (tests save and restore it).
     (b"sys/vm/vfs_cache_pressure", b"100\n"),
+    // The reserve below which allocations must reclaim. Ginux has no
+    // watermarks; the value is the one Linux picks for 4 GiB
+    // (sqrt(lowmem KiB * 16)), kept when written. Memory tests read it to
+    // leave that much free.
+    (b"sys/vm/min_free_kbytes", b"8192\n"),
     // The random pool is always full, as Linux reports it since 5.18.
     (b"sys/kernel/random/entropy_avail", b"256\n"),
     (b"sys/kernel/random/poolsize", b"256\n"),
@@ -953,6 +958,9 @@ pub(super) const LINUX_FILE_PROC_UPTIME: u16 = LINUX_FILE_MASK | LINUX_PROC_UPTI
 pub(super) const LINUX_PROC_LOADAVG_NODE: u16 = 0xf400;
 pub(super) const LINUX_FILE_PROC_LOADAVG: u16 = LINUX_FILE_MASK | LINUX_PROC_LOADAVG_NODE;
 pub(super) const LINUX_PROC_FILESYSTEMS_NODE: u16 = 0xf300;
+/// `/proc/swaps`: the domain's swap areas (`crate::linux_swap`).
+pub(super) const LINUX_PROC_SWAPS_NODE: u16 = 0x9700;
+pub(super) const LINUX_FILE_PROC_SWAPS: u16 = LINUX_FILE_MASK | LINUX_PROC_SWAPS_NODE;
 pub(super) const LINUX_FILE_PROC_FILESYSTEMS: u16 = LINUX_FILE_MASK | LINUX_PROC_FILESYSTEMS_NODE;
 /// /proc/modules: the loaded modules, none (everything Ginux has is built
 /// in, as /lib/modules/RELEASE/modules.builtin lists it).
@@ -1369,7 +1377,7 @@ use super::PAGE_SIZE;
 /// The fixed file nodes and the `/proc/sys` nodes are distinct and clear of
 /// the `/dev/input/eventN` range, so no file is taken for another.
 const _: () = {
-    const NODES: [u16; 53] = [
+    const NODES: [u16; 54] = [
         LINUX_PROC_TASK_DIRECTORY_NODE,
         LINUX_PROC_TASK_COMM_NODE,
         LINUX_PROC_TASK_STAT_NODE,
@@ -1387,6 +1395,7 @@ const _: () = {
         LINUX_PROC_UPTIME_NODE,
         LINUX_PROC_LOADAVG_NODE,
         LINUX_PROC_FILESYSTEMS_NODE,
+        LINUX_PROC_SWAPS_NODE,
         LINUX_PROC_MODULES_NODE,
         LINUX_PROC_KEYS_NODE,
         LINUX_PROC_KEY_USERS_NODE,
