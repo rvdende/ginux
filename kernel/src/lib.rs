@@ -39,6 +39,7 @@ mod linux_kmsg;
 mod linux_landlock;
 mod linux_loop;
 mod linux_mount;
+mod linux_mount_paths;
 mod linux_mounts;
 mod linux_namespace;
 mod linux_overlay;

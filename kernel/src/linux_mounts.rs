@@ -5,12 +5,19 @@
 //! The root, /proc and /sys/fs/cgroup are the kernel's own and are not
 //! listed here. Each mount namespace of a domain has its own table: a new
 //! namespace starts with copies of its parent's mounts (new ids, the same
-//! peer groups), and its mounts go with it. A filesystem mounted over a
-//! directory shows whatever the overlay holds beneath it, and so does a
-//! bind mount: it is recorded (mountinfo, statmount, umount, propagation)
-//! but does not redirect the paths below it to its source. Unmounting a
-//! tmpfs drops what was created there unless another namespace still has
-//! it mounted.
+//! peer groups), and its mounts go with it.
+//!
+//! The mounts form Linux's tree: each sits on the mount its point was on
+//! when it was made (`parent`), mounts on one point stack, and a path is
+//! on the mount the tree walk reaches ([`crate::linux_mount_paths`], to
+//! which every change publishes the table). A new tmpfs, volume or
+//! overlay is a filesystem of its own (`superblock`), whose files are
+//! stored below its storage root, and its mount leads there (`target`);
+//! a bind mount leads to its source's storage, so it shows the source's
+//! files, and a filesystem lives while any mount of it does: the last one
+//! to go takes its files ([`Gone`]). The kernel's own filesystems (/proc,
+//! sysfs, devtmpfs, ...) are found by their paths, so mounts of them lead
+//! nowhere.
 //!
 //! Propagation is tracked as Linux shows it (peer groups, masters,
 //! unbindable), but mounts and unmounts are not yet propagated to peers.
@@ -91,9 +98,11 @@ pub(crate) struct Mount {
     pub(crate) source: Vec<u8>,
     pub(crate) filesystem: Vec<u8>,
     pub(crate) flags: u32,
-    /// The mode, owner and group the mount point directory had before the
-    /// mount's root took its place, to give back when the filesystem goes.
-    pub(crate) covered: Option<Attributes>,
+    /// The filesystem's number when it is stored below a storage root of
+    /// its own (a tmpfs, a volume, an overlay); 0 for one that is not.
+    pub(crate) superblock: u32,
+    /// The storage path the mount point leads to, if any.
+    pub(crate) target: Option<Vec<u8>>,
     /// The device the filesystem is on, as stat(2) encodes it: an
     /// anonymous 0:N, or the disk of a filesystem mounted from one.
     pub(crate) device: u32,
@@ -102,19 +111,11 @@ pub(crate) struct Mount {
     pub(crate) sharing: Sharing,
 }
 
-/// A filesystem whose files went with its last mount: the mount point
-/// gets back the attributes it had before (`covered`).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// A filesystem whose last mount went: its files go with it.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Gone {
-    pub(crate) covered: Option<Attributes>,
-}
-
-/// A directory's mode, owner and group.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Attributes {
-    pub(crate) mode: u32,
-    pub(crate) owner: u32,
-    pub(crate) group: u32,
+    pub(crate) superblock: u32,
+    pub(crate) filesystem: Vec<u8>,
 }
 
 /// The filesystem a bind mount copies when its source is not on a domain
@@ -135,6 +136,8 @@ struct Mounts {
     next_id: u32,
     /// Peer group ids start at 1, as Linux's do.
     next_group: u32,
+    /// Filesystem numbers, from 1.
+    next_superblock: u32,
 }
 
 static MOUNTS: SpinLock<Mounts> = SpinLock::new(
@@ -144,6 +147,7 @@ static MOUNTS: SpinLock<Mounts> = SpinLock::new(
         changes: Vec::new(),
         next_id: 4,
         next_group: 1,
+        next_superblock: 1,
     },
 );
 
@@ -176,22 +180,54 @@ impl Mounts {
         group
     }
 
-    /// The topmost mount at canonical `path`, as an index.
+    /// The topmost mount at canonical `path`, as an index: the mount a
+    /// path reaches there, if its point is `path`.
     fn topmost(&self, space: Space, path: &[u8]) -> Option<usize> {
-        self.mounts
-            .iter()
-            .rposition(|mount| mount.space == space && mount.path == path)
+        self.covering(space, path)
+            .filter(|index| self.mounts[*index].path == path)
     }
 
-    /// The mount canonical `path` lies on: the deepest mount point at or
-    /// above it, the newest of those mounted there.
+    /// The mount canonical `path` lies on, by the mount tree: from the root,
+    /// into the child at the first mount point on the way (the newest of
+    /// those there), until none is left.
     fn covering(&self, space: Space, path: &[u8]) -> Option<usize> {
-        self.mounts
-            .iter()
-            .enumerate()
-            .filter(|(_, mount)| mount.space == space && covers(&mount.path, path))
-            .max_by_key(|(index, mount)| (mount.path.len(), *index))
-            .map(|(index, _)| index)
+        let mut current = ROOT_ID;
+        let mut found = None;
+        loop {
+            let next = self
+                .mounts
+                .iter()
+                .enumerate()
+                .filter(|(_, mount)| {
+                    mount.space == space && mount.parent == current && covers(&mount.path, path)
+                })
+                .min_by_key(|(index, mount)| (mount.path.len(), usize::MAX - index))
+                .map(|(index, _)| index);
+            let Some(index) = next else {
+                return found;
+            };
+            current = self.mounts[index].id;
+            found = Some(index);
+        }
+    }
+
+    /// Whether a mount of `instance` other than `except` shows filesystem
+    /// `superblock`.
+    fn superblock_mounted(&self, instance: usize, superblock: u32, except: u32) -> bool {
+        self.mounts.iter().any(|mount| {
+            mount.space.instance == instance && mount.id != except && mount.superblock == superblock
+        })
+    }
+
+    /// What goes with `mount` once it is out of the table: its filesystem,
+    /// when no other mount shows it.
+    fn gone_with(&self, mount: &Mount) -> Option<Gone> {
+        (mount.superblock != 0
+            && !self.superblock_mounted(mount.space.instance, mount.superblock, mount.id))
+        .then(|| Gone {
+            superblock: mount.superblock,
+            filesystem: mount.filesystem.clone(),
+        })
     }
 
     fn sharing_of(&self, id: u32) -> Sharing {
@@ -220,8 +256,32 @@ impl Mounts {
         Ok(id)
     }
 
-    /// Counts a change to `instance`'s mount table.
+    /// Counts a change to `instance`'s mount table, and publishes its
+    /// tree to path resolution.
     fn changed(&mut self, instance: usize) {
+        let mut routes = Vec::new();
+        for mount in self
+            .mounts
+            .iter()
+            .filter(|mount| mount.space.instance == instance)
+        {
+            let (Ok(point), Ok(target)) = (
+                copy(&mount.path),
+                mount.target.as_deref().map(copy).transpose(),
+            ) else {
+                continue;
+            };
+            if routes.try_reserve(1).is_ok() {
+                routes.push(crate::linux_mount_paths::Route {
+                    space: mount.space,
+                    id: mount.id,
+                    parent: mount.parent,
+                    point,
+                    target,
+                });
+            }
+        }
+        crate::linux_mount_paths::publish(instance, routes);
         if let Some((_, count)) = self
             .changes
             .iter_mut()
@@ -241,35 +301,30 @@ impl Mounts {
                 .iter()
                 .any(|mount| mount.id != id && mount.sharing.peer_group == peer_group)
     }
-
-    /// A non-bind tmpfs mount at `path` in `instance` other than `except`.
-    fn tmpfs_mounted(&self, instance: usize, path: &[u8], except: u32) -> bool {
-        self.mounts.iter().any(|mount| {
-            mount.space.instance == instance
-                && mount.id != except
-                && mount.path == path
-                && !mount.bind
-                && drops_files(&mount.filesystem)
-        })
-    }
 }
 
-/// A filesystem whose files live only while it is mounted.
-fn drops_files(filesystem: &[u8]) -> bool {
-    matches!(filesystem, b"tmpfs" | b"ramfs" | b"devtmpfs")
+/// A number for a new filesystem stored below a root of its own
+/// (`crate::linux_mount_paths::storage_root`).
+pub(crate) fn new_superblock() -> u32 {
+    let mut table = MOUNTS.lock();
+    let superblock = table.next_superblock;
+    table.next_superblock = superblock.wrapping_add(1).max(1);
+    superblock
 }
 
 /// Mounts `filesystem` (from `source`) at canonical `path` in `space`, on
-/// top of whatever is mounted there (`covered`: the mount point's own
-/// attributes, when the mount's root replaces them); returns the mount's id.
+/// top of whatever is mounted there: filesystem `superblock` (0 for one of
+/// the kernel's own, found by its paths), stored below its storage root;
+/// returns the mount's id.
 pub(crate) fn mount(
     space: Space,
     path: &[u8],
     source: &[u8],
     filesystem: &[u8],
     flags: u32,
-    covered: Option<Attributes>,
+    superblock: u32,
 ) -> Result<u32, Error> {
+    let target = (superblock != 0).then(|| crate::linux_mount_paths::storage_root(superblock));
     let mount = Mount {
         space,
         id: 0,
@@ -279,7 +334,8 @@ pub(crate) fn mount(
         source: copy(source)?,
         filesystem: copy(filesystem)?,
         flags,
-        covered,
+        superblock,
+        target,
         device: 0,
         bind: false,
         sharing: Sharing::default(),
@@ -320,6 +376,32 @@ pub(crate) fn bind(
 ) -> Result<u32, Error> {
     let mut table = MOUNTS.lock();
     let covering = table.covering(space, source);
+    // The copy leads where the source leads: below the source mount's
+    // target, or to the root filesystem's own path.
+    let (superblock, bound) = match covering {
+        Some(index) => {
+            let mount = &table.mounts[index];
+            let rest = &source[mount.path.len()..];
+            let rest = rest.strip_prefix(b"/").unwrap_or(rest);
+            let bound = match &mount.target {
+                Some(target) => {
+                    let mut bound = copy(target)?;
+                    if !rest.is_empty() {
+                        bound
+                            .try_reserve(rest.len() + 1)
+                            .map_err(|_| Error::NoMemory)?;
+                        bound.push(b'/');
+                        bound.extend_from_slice(rest);
+                    }
+                    Some(bound)
+                }
+                None => None,
+            };
+            (mount.superblock, bound)
+        }
+        None if kernel.filesystem == b"ginux-root" => (0, Some(copy(source)?)),
+        None => (0, None),
+    };
     let (filesystem, mount_source, root, flags, device, sharing) = match covering {
         Some(index) => {
             let mount = &table.mounts[index];
@@ -387,7 +469,8 @@ pub(crate) fn bind(
                 source: copy(&mount.source)?,
                 filesystem: copy(&mount.filesystem)?,
                 flags: mount.flags,
-                covered: None,
+                superblock: mount.superblock,
+                target: mount.target.as_deref().map(copy).transpose()?,
                 device: mount.device,
                 bind: true,
                 sharing: Sharing {
@@ -406,7 +489,8 @@ pub(crate) fn bind(
         source: mount_source,
         filesystem,
         flags,
-        covered: None,
+        superblock,
+        target: bound,
         device,
         bind: true,
         sharing,
@@ -624,20 +708,50 @@ pub(crate) fn set_propagation(
     Ok(())
 }
 
-/// Removes the topmost mount at canonical `path`; returns what went with
-/// it when the files below `path` go too (a tmpfs no other namespace still
-/// has mounted there).
+/// Removes the topmost mount at canonical `path`; returns its filesystem
+/// when no other mount (of any namespace) shows it any more. The mounts on
+/// top of it, if any, now sit on what it sat on.
 pub(crate) fn unmount(space: Space, path: &[u8]) -> Result<Option<Gone>, Error> {
     let mut table = MOUNTS.lock();
     let index = table.topmost(space, path).ok_or(Error::NotMounted)?;
     let mount = table.mounts.remove(index);
+    for child in table
+        .mounts
+        .iter_mut()
+        .filter(|child| child.space == space && child.parent == mount.id)
+    {
+        child.parent = mount.parent;
+    }
+    let gone = table.gone_with(&mount);
     table.changed(space.instance);
-    Ok((!mount.bind
-        && drops_files(&mount.filesystem)
-        && !table.tmpfs_mounted(space.instance, path, mount.id))
-    .then_some(Gone {
-        covered: mount.covered,
-    }))
+    Ok(gone)
+}
+
+/// The filesystem that would go with the topmost mount at canonical `path`
+/// if it were unmounted: its number, if no other mount shows it, and its
+/// storage root.
+pub(crate) fn last_mount_of(space: Space, path: &[u8]) -> Option<(u32, Vec<u8>)> {
+    let table = MOUNTS.lock();
+    let mount = &table.mounts[table.topmost(space, path)?];
+    table.gone_with(mount).map(|gone| {
+        (
+            gone.superblock,
+            crate::linux_mount_paths::storage_root(gone.superblock),
+        )
+    })
+}
+
+/// The filesystem number and storage root of the topmost mount at
+/// canonical `path`, when it has a storage root of its own.
+pub(crate) fn superblock_at(space: Space, path: &[u8]) -> Option<(u32, Vec<u8>)> {
+    let table = MOUNTS.lock();
+    let superblock = table.mounts[table.topmost(space, path)?].superblock;
+    (superblock != 0).then(|| {
+        (
+            superblock,
+            crate::linux_mount_paths::storage_root(superblock),
+        )
+    })
 }
 
 /// Gives the namespace `to` copies of the mounts of `from` (a new mount
@@ -659,7 +773,8 @@ pub(crate) fn copy_space(from: Space, to: Space) -> Result<(), Error> {
             source: copy(&mount.source)?,
             filesystem: copy(&mount.filesystem)?,
             flags: mount.flags,
-            covered: mount.covered,
+            superblock: mount.superblock,
+            target: mount.target.as_deref().map(copy).transpose()?,
             device: mount.device,
             bind: mount.bind,
             sharing: mount.sharing,
@@ -689,10 +804,10 @@ pub(crate) fn copy_space(from: Space, to: Space) -> Result<(), Error> {
 }
 
 /// Drops the mounts of `space` (its namespace is gone) and calls `drop`
-/// with each mount point whose files go with them.
-pub(crate) fn drop_space(space: Space, mut drop: impl FnMut(&[u8], Gone)) {
+/// with each filesystem that goes with them.
+pub(crate) fn drop_space(space: Space, mut drop: impl FnMut(Gone)) {
     let mut table = MOUNTS.lock();
-    let mut gone = Vec::new();
+    let mut dropped = Vec::new();
     let mut index = 0;
     while index < table.mounts.len() {
         if table.mounts[index].space != space {
@@ -700,16 +815,27 @@ pub(crate) fn drop_space(space: Space, mut drop: impl FnMut(&[u8], Gone)) {
             continue;
         }
         let mount = table.mounts.remove(index);
-        if !mount.bind && drops_files(&mount.filesystem) && gone.try_reserve(1).is_ok() {
-            gone.push((mount.path, mount.covered));
+        if mount.superblock != 0 && dropped.try_reserve(1).is_ok() {
+            dropped.push((mount.superblock, mount.filesystem));
         }
     }
-    // Another namespace may still have the filesystem mounted there.
-    gone.retain(|(path, _)| !table.tmpfs_mounted(space.instance, path, 0));
+    // Another namespace may still have the filesystem mounted.
+    let mut gone: Vec<Gone> = Vec::new();
+    for (superblock, filesystem) in dropped {
+        if !table.superblock_mounted(space.instance, superblock, 0)
+            && !gone.iter().any(|gone| gone.superblock == superblock)
+            && gone.try_reserve(1).is_ok()
+        {
+            gone.push(Gone {
+                superblock,
+                filesystem,
+            });
+        }
+    }
     table.changed(space.instance);
     core::mem::drop(table);
-    for (path, covered) in &gone {
-        drop(path, Gone { covered: *covered });
+    for gone in gone {
+        drop(gone);
     }
 }
 
@@ -736,8 +862,8 @@ pub(crate) fn topmost_id(space: Space, path: &[u8]) -> Option<u32> {
         .map(|index| table.mounts[index].id)
 }
 
-/// The options of the mount canonical `path` lies on: the deepest mount
-/// point at or above it (0 for the root's own files).
+/// The options of the mount canonical `path` lies on, by the mount tree
+/// (0 for the root's own files).
 pub(crate) fn flags_at(space: Space, path: &[u8]) -> u32 {
     let table = MOUNTS.lock();
     table
@@ -745,8 +871,8 @@ pub(crate) fn flags_at(space: Space, path: &[u8]) -> u32 {
         .map_or(0, |index| table.mounts[index].flags)
 }
 
-/// The id of the mount canonical `path` lies on: the deepest mount point
-/// at or above it ([`ROOT_ID`] for the root's own files). Two paths on
+/// The id of the mount canonical `path` lies on, by the mount tree
+/// ([`ROOT_ID`] for the root's own files). Two paths on
 /// different mounts cannot be linked or renamed into one another (EXDEV).
 pub(crate) fn mount_id_at(space: Space, path: &[u8]) -> u32 {
     let table = MOUNTS.lock();
@@ -780,4 +906,5 @@ pub(crate) fn forget_instance(instance: usize) {
         .mounts
         .retain(|mount| mount.space.instance != instance);
     table.changes.retain(|(owner, _)| *owner != instance);
+    crate::linux_mount_paths::forget_instance(instance);
 }

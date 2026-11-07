@@ -541,7 +541,7 @@ unsafe impl Sync for OverlayRuntimeOwner {}
 static OVERLAY_RUNTIME: OverlayRuntimeOwner =
     OverlayRuntimeOwner(UnsafeCell::new([Overlay::EMPTY; INSTANCE_LIMIT]));
 
-pub(crate) fn lookup(path: &[u8]) -> Option<Metadata> {
+pub(crate) fn lookup_stored(path: &[u8]) -> Option<Metadata> {
     if let Some(found) = overlayfs::lookup(path) {
         return found;
     }
@@ -584,7 +584,7 @@ fn linked_node(path: &[u8], whiteouts: bool) -> Option<&'static mut Node> {
     None
 }
 
-pub(crate) fn hidden(path: &[u8]) -> bool {
+pub(crate) fn hidden_stored(path: &[u8]) -> bool {
     // A volume's files are its own: nothing of the image shows through.
     if blockfs::covers(path) || overlayfs::covers(path) {
         return false;
@@ -668,10 +668,14 @@ const TEMPORARY_NAME: &[u8] = b".ginux-o-tmpfile";
 /// Creates an O_TMPFILE file: a regular file with no name, made as if in
 /// `directory` (owner, group and set-group-ID inheritance from it), that
 /// linkat(2) may later name unless `linkable` is false (O_EXCL).
-pub(crate) fn create_temporary(directory: &[u8], mode: u32, linkable: bool) -> Option<Handle> {
+pub(crate) fn create_temporary_stored(
+    directory: &[u8],
+    mode: u32,
+    linkable: bool,
+) -> Option<Handle> {
     // On an overlay, the file is made in the upper layer's directory.
     if let Some(upper) = overlayfs::prepare_upper(directory) {
-        return create_temporary(&upper?, mode, linkable);
+        return create_temporary_stored(&upper?, mode, linkable);
     }
     if blockfs::covers(directory) {
         let mut probe = Vec::new();
@@ -690,7 +694,7 @@ pub(crate) fn create_temporary(directory: &[u8], mode: u32, linkable: bool) -> O
         path[directory.len()] = b'/';
     }
     path[directory.len() + separator..].copy_from_slice(TEMPORARY_NAME);
-    let handle = create_file(path, mode, &[])?;
+    let handle = create_file_stored(path, mode, &[])?;
     if !unlink(handle) {
         return None;
     }
@@ -715,15 +719,15 @@ pub(crate) enum LinkError {
 /// Gives the file `handle`, which has no name, the name `path`: the
 /// linkat(2) of an O_TMPFILE file. A named file gets a hard link from
 /// [`create_link`] instead.
-pub(crate) fn link_unnamed(path: &[u8], handle: Handle) -> Result<(), LinkError> {
-    if lookup(path).is_some() {
+pub(crate) fn link_unnamed_stored(path: &[u8], handle: Handle) -> Result<(), LinkError> {
+    if lookup_stored(path).is_some() {
         return Err(LinkError::Exists);
     }
     if let Some(upper) = overlayfs::prepare_upper(path) {
-        return link_unnamed(&upper.ok_or(LinkError::Failed)?, handle);
+        return link_unnamed_stored(&upper.ok_or(LinkError::Failed)?, handle);
     }
     if blockfs::owns(handle) {
-        if lookup(path).is_some() {
+        if lookup_stored(path).is_some() {
             return Err(LinkError::Exists);
         }
         return blockfs::link_unnamed(path, handle).unwrap_or(Err(LinkError::Gone));
@@ -732,7 +736,7 @@ pub(crate) fn link_unnamed(path: &[u8], handle: Handle) -> Result<(), LinkError>
         return Err(LinkError::CrossDevice);
     }
     valid_path(path).ok_or(LinkError::Failed)?;
-    if lookup(path).is_some() {
+    if lookup_stored(path).is_some() {
         return Err(LinkError::Exists);
     }
     let node = node(handle).ok_or(LinkError::Gone)?;
@@ -744,7 +748,7 @@ pub(crate) fn link_unnamed(path: &[u8], handle: Handle) -> Result<(), LinkError>
     let stored = stored_path(path).ok_or(LinkError::Failed)?;
     // A whiteout of the same name hides the image's entry; the file takes
     // its place by taking over the name.
-    if hidden(path) {
+    if hidden_stored(path) {
         let overlay = live_mut();
         let whiteout = node_by_path_mut(overlay, path).ok_or(LinkError::Failed)?;
         *whiteout = Node::EMPTY;
@@ -883,7 +887,7 @@ pub(crate) fn paged_file(device: u64, inode: u64) -> Option<Handle> {
 /// Makes the unnamed node behind an anonymous shared mapping. Its pages are
 /// allocated zeroed as they are first mapped (`memfd_frame`).
 pub(crate) fn create_shmem() -> Option<Handle> {
-    let handle = create_file(b"tmp/.ginux-shmem", 0o600, &[])?;
+    let handle = create_file_stored(b"tmp/.ginux-shmem", 0o600, &[])?;
     let made = node_mut(handle).is_some_and(|node| {
         let paged = make_node_paged(node);
         if paged {
@@ -1006,7 +1010,7 @@ pub(crate) fn add_file_seals(handle: Handle, seals: u32) -> Option<bool> {
     Some(true)
 }
 
-pub(crate) fn copy_path(handle: Handle, output: &mut [u8]) -> Option<usize> {
+pub(crate) fn copy_path_stored(handle: Handle, output: &mut [u8]) -> Option<usize> {
     if overlayfs::owns(handle) {
         return overlayfs::copy_path(handle, output);
     }
@@ -1029,7 +1033,7 @@ pub(crate) fn copy_path(handle: Handle, output: &mut [u8]) -> Option<usize> {
 /// directory path `directory` ("" for the root), whether or not the overlay
 /// has a node for the directory itself: files created in a directory of the
 /// image are overlay nodes below the image's directory.
-pub(crate) fn next_child_at(directory: &[u8], cursor: usize) -> Option<Option<Child>> {
+pub(crate) fn next_child_at_stored(directory: &[u8], cursor: usize) -> Option<Option<Child>> {
     if let Some(next) = overlayfs::next_child_at(directory, cursor) {
         return next;
     }
@@ -1068,7 +1072,8 @@ pub(crate) fn next_child_at(directory: &[u8], cursor: usize) -> Option<Option<Ch
             let Some(remainder) = name_below(node.path()) else {
                 continue;
             };
-            if remainder.is_empty() || remainder.contains(&b'/') {
+            // Storage roots are no directory's entries.
+            if remainder.is_empty() || remainder.contains(&b'/') || remainder.first() == Some(&0) {
                 continue;
             }
             let mut name = [0_u8; NAME_MAX];
@@ -1090,34 +1095,39 @@ pub(crate) fn next_child_at(directory: &[u8], cursor: usize) -> Option<Option<Ch
     Some(None)
 }
 
-pub(crate) fn create_file(path: &[u8], mode: u32, initial: &[u8]) -> Option<Handle> {
+pub(crate) fn create_file_stored(path: &[u8], mode: u32, initial: &[u8]) -> Option<Handle> {
     create(path, NodeKind::File, mode, initial)
 }
 
-pub(crate) fn create_directory(path: &[u8], mode: u32) -> Option<Handle> {
+pub(crate) fn create_directory_stored(path: &[u8], mode: u32) -> Option<Handle> {
     create(path, NodeKind::Directory, mode, &[])
 }
 
-pub(crate) fn create_symlink(path: &[u8], target: &[u8]) -> Option<Handle> {
+pub(crate) fn create_symlink_stored(path: &[u8], target: &[u8]) -> Option<Handle> {
     create(path, NodeKind::Symlink, 0o777, target)
 }
 
-pub(crate) fn create_fifo(path: &[u8], mode: u32) -> Option<Handle> {
+pub(crate) fn create_fifo_stored(path: &[u8], mode: u32) -> Option<Handle> {
     create(path, NodeKind::Fifo, mode, &[])
 }
 
 /// Creates the socket file a UNIX socket is bound to at `path`.
-pub(crate) fn create_socket(path: &[u8], mode: u32) -> Option<Handle> {
+pub(crate) fn create_socket_stored(path: &[u8], mode: u32) -> Option<Handle> {
     create(path, NodeKind::Socket, mode, &[])
 }
 
 /// Creates a device file at `path` for `device` (mknod S_IFCHR or S_IFBLK).
-pub(crate) fn create_device(path: &[u8], kind: NodeKind, mode: u32, device: u32) -> Option<Handle> {
+pub(crate) fn create_device_stored(
+    path: &[u8],
+    kind: NodeKind,
+    mode: u32,
+    device: u32,
+) -> Option<Handle> {
     if !matches!(kind, NodeKind::CharacterDevice | NodeKind::BlockDevice) {
         return None;
     }
     if let Some(made) = overlayfs::create(path, false, |upper| {
-        create_device(upper, kind, mode, device)
+        create_device_stored(upper, kind, mode, device)
     }) {
         return made;
     }
@@ -1185,10 +1195,10 @@ fn create(path: &[u8], kind: NodeKind, mode: u32, initial: &[u8]) -> Option<Hand
     // A new file's times are when it was made.
     let created = crate::arch::x86_64::cpu::linux_realtime_now();
     valid_path(path)?;
-    if lookup(path).is_some() {
+    if lookup_stored(path).is_some() {
         return None;
     }
-    let replace_whiteout = hidden(path);
+    let replace_whiteout = hidden_stored(path);
     let stored_path = stored_path(path)?;
     // A tmpfs with nr_inodes= has room for so many files (ENOSPC).
     if !tmpfs_quota::charge(cpu::current_linux_execution_instance(), path, 0, 1) {
@@ -1251,11 +1261,11 @@ fn create(path: &[u8], kind: NodeKind, mode: u32, initial: &[u8]) -> Option<Hand
     Some(handle)
 }
 
-pub(crate) fn whiteout(path: &[u8]) -> bool {
+pub(crate) fn whiteout_stored(path: &[u8]) -> bool {
     if valid_path(path).is_none() || blockfs::covers(path) || overlayfs::covers(path) {
         return false;
     }
-    let has_node = lookup(path).is_some() || hidden(path);
+    let has_node = lookup_stored(path).is_some() || hidden_stored(path);
     let overlay = live_mut();
     if has_node {
         let Some(node) = node_by_path_mut(overlay, path) else {
@@ -1772,10 +1782,10 @@ pub(crate) fn remove_xattr(handle: Handle, name: &[u8]) -> bool {
     append_xattr(handle, name, &[], true)
 }
 
-pub(crate) fn rename(handle: Handle, path: &[u8]) -> bool {
+pub(crate) fn rename_stored(handle: Handle, path: &[u8]) -> bool {
     if overlayfs::owns(handle) {
         let mut from = [0_u8; PATH_CAPACITY];
-        return copy_path(handle, &mut from).is_some_and(|length| {
+        return copy_path_stored(handle, &mut from).is_some_and(|length| {
             overlayfs::rename(&from[..length], path, overlayfs::RenameMode::Replace)
                 .is_some_and(|result| result.is_ok())
         });
@@ -1788,7 +1798,7 @@ pub(crate) fn rename(handle: Handle, path: &[u8]) -> bool {
     if blockfs::covers(path) {
         return false;
     }
-    if valid_path(path).is_none() || lookup(path).is_some() {
+    if valid_path(path).is_none() || lookup_stored(path).is_some() {
         return false;
     }
     let Some(source) = node(handle).filter(|source| source.linked) else {
@@ -1808,7 +1818,7 @@ pub(crate) fn rename(handle: Handle, path: &[u8]) -> bool {
         let suffix = renamed_suffix(candidate, handle, &old_path, directory)?;
         let new_path = stored_joined(&[path, suffix])
             .filter(|new_path| new_path.len() < PATH_CAPACITY)
-            .filter(|new_path| suffix.is_empty() || lookup(new_path).is_none());
+            .filter(|new_path| suffix.is_empty() || lookup_stored(new_path).is_none());
         match new_path {
             Some(new_path) if new_paths.try_reserve(1).is_ok() => {
                 new_paths.push(new_path);
@@ -1864,7 +1874,7 @@ fn renamed_suffix<'a>(
 
 /// Gives the file `target` (not a directory) another name, `path`: a hard
 /// link. Both names then reach the same data, owner and mode.
-pub(crate) fn create_link(path: &[u8], target: Handle) -> bool {
+pub(crate) fn create_link_stored(path: &[u8], target: Handle) -> bool {
     if let Some(linked) = overlayfs::create_link(path, target) {
         return linked;
     }
@@ -1877,7 +1887,7 @@ pub(crate) fn create_link(path: &[u8], target: Handle) -> bool {
     if blockfs::covers(path) {
         return false;
     }
-    if valid_path(path).is_none() || lookup(path).is_some() {
+    if valid_path(path).is_none() || lookup_stored(path).is_some() {
         return false;
     }
     let Some(file) = node(target) else {
@@ -1887,7 +1897,7 @@ pub(crate) fn create_link(path: &[u8], target: Handle) -> bool {
         return false;
     }
     let kind = file.kind;
-    let replace_whiteout = hidden(path);
+    let replace_whiteout = hidden_stored(path);
     let Some(stored_path) = stored_path(path) else {
         return false;
     };
@@ -1927,7 +1937,7 @@ pub(crate) fn create_link(path: &[u8], target: Handle) -> bool {
 /// them: removing an alias drops just that name, and removing the file's
 /// own node moves one alias's name onto it. Directories and files with one
 /// name go as `unlink` does.
-pub(crate) fn unlink_path(path: &[u8]) -> bool {
+pub(crate) fn unlink_path_stored(path: &[u8]) -> bool {
     if let Some(removed) = overlayfs::remove(path) {
         cpu::linux_reclaim_unlinked_files();
         return removed;
@@ -1993,7 +2003,7 @@ fn drop_alias(alias: Handle, file: Handle) -> bool {
 
 /// Renames the name `from` to `to`: an alias moves alone; a file's own node
 /// (or a directory, with everything under it) as `rename` does.
-pub(crate) fn rename_path(from: &[u8], to: &[u8]) -> bool {
+pub(crate) fn rename_path_stored(from: &[u8], to: &[u8]) -> bool {
     if let Some(renamed) = overlayfs::rename(from, to, overlayfs::RenameMode::Replace) {
         cpu::linux_reclaim_unlinked_files();
         return renamed.is_ok();
@@ -2008,7 +2018,7 @@ pub(crate) fn rename_path(from: &[u8], to: &[u8]) -> bool {
     if blockfs::covers(to) {
         return false;
     }
-    if valid_path(to).is_none() || lookup(to).is_some() {
+    if valid_path(to).is_none() || lookup_stored(to).is_some() {
         return false;
     }
     let Some(overlay) = live() else {
@@ -2021,7 +2031,7 @@ pub(crate) fn rename_path(from: &[u8], to: &[u8]) -> bool {
         return false;
     };
     if alias_of.is_none() {
-        return rename(handle, to);
+        return rename_stored(handle, to);
     }
     let (Some(node), Some(stored_path)) = (node_mut(handle), stored_path(to)) else {
         return false;
@@ -2034,7 +2044,7 @@ pub(crate) fn rename_path(from: &[u8], to: &[u8]) -> bool {
 /// Removes everything below the directory `path`, as unmounting a tmpfs
 /// from it drops what was created there. Open files stay readable until
 /// closed, as after unlink.
-pub(crate) fn unlink_below(path: &[u8]) {
+pub(crate) fn unlink_below_stored(path: &[u8]) {
     let overlay = live_mut();
     let mut page = overlay.first_node_page;
     let mut symlinks_removed = 0;
@@ -2083,7 +2093,7 @@ pub(crate) fn unlink(handle: Handle) -> bool {
     };
     if metadata.kind == NodeKind::Directory {
         let mut prefix = [0_u8; PATH_CAPACITY];
-        let Some(length) = copy_path(handle, &mut prefix) else {
+        let Some(length) = copy_path_stored(handle, &mut prefix) else {
             return false;
         };
         prefix[length] = b'/';
@@ -2386,13 +2396,19 @@ fn valid_path(path: &[u8]) -> Option<()> {
         && path.len() < PATH_CAPACITY
         && !path.starts_with(b"/")
         && !path.ends_with(b"/")
-        && path.split(|byte| *byte == b'/').all(|component| {
-            !component.is_empty()
-                && component.len() <= NAME_MAX
-                && component != b"."
-                && component != b".."
-                && !component.contains(&0)
-        }))
+        && path
+            .split(|byte| *byte == b'/')
+            .enumerate()
+            .all(|(index, component)| {
+                // A storage root (`crate::linux_mount_paths`) is the one
+                // name with a NUL, first and at the start.
+                let storage_root = index == 0 && component.first() == Some(&0);
+                !component.is_empty()
+                    && component.len() <= NAME_MAX
+                    && component != b"."
+                    && component != b".."
+                    && (!component.contains(&0) || storage_root && !component[1..].contains(&0))
+            }))
     .then_some(())
 }
 
@@ -2884,4 +2900,96 @@ fn live_mut() -> &'static mut Overlay {
 
 fn current_instance() -> usize {
     cpu::current_container_slot().unwrap_or(HOST_INSTANCE)
+}
+
+// ---- The paths processes see ----
+//
+// The functions above take storage paths (`crate::linux_mount_paths`):
+// the root filesystem's files are stored at their own paths, a mounted
+// filesystem's below its storage root. These take and give the paths
+// processes see, which the mounts lead to storage paths.
+
+use crate::linux_mount_paths as mount_paths;
+
+pub(crate) fn lookup(path: &[u8]) -> Option<Metadata> {
+    lookup_stored(&mount_paths::storage(path))
+}
+
+/// Whether the image's file at canonical `path` is hidden: by a whiteout,
+/// or because a mount leads the path elsewhere.
+pub(crate) fn hidden(path: &[u8]) -> bool {
+    match mount_paths::storage(path) {
+        alloc::borrow::Cow::Owned(_) => true,
+        alloc::borrow::Cow::Borrowed(path) => hidden_stored(path),
+    }
+}
+
+pub(crate) fn create_temporary(directory: &[u8], mode: u32, linkable: bool) -> Option<Handle> {
+    create_temporary_stored(&mount_paths::storage(directory), mode, linkable)
+}
+
+pub(crate) fn link_unnamed(path: &[u8], handle: Handle) -> Result<(), LinkError> {
+    link_unnamed_stored(&mount_paths::storage(path), handle)
+}
+
+/// The path that leads to `handle`'s file, into `output`.
+pub(crate) fn copy_path(handle: Handle, output: &mut [u8]) -> Option<usize> {
+    let length = copy_path_stored(handle, output)?;
+    let shown = match mount_paths::visible(&output[..length]) {
+        alloc::borrow::Cow::Borrowed(_) => return Some(length),
+        alloc::borrow::Cow::Owned(path) => path,
+    };
+    output.get_mut(..shown.len())?.copy_from_slice(&shown);
+    Some(shown.len())
+}
+
+pub(crate) fn next_child_at(directory: &[u8], cursor: usize) -> Option<Option<Child>> {
+    next_child_at_stored(&mount_paths::storage(directory), cursor)
+}
+
+pub(crate) fn create_file(path: &[u8], mode: u32, initial: &[u8]) -> Option<Handle> {
+    create_file_stored(&mount_paths::storage(path), mode, initial)
+}
+
+pub(crate) fn create_directory(path: &[u8], mode: u32) -> Option<Handle> {
+    create_directory_stored(&mount_paths::storage(path), mode)
+}
+
+pub(crate) fn create_symlink(path: &[u8], target: &[u8]) -> Option<Handle> {
+    create_symlink_stored(&mount_paths::storage(path), target)
+}
+
+pub(crate) fn create_fifo(path: &[u8], mode: u32) -> Option<Handle> {
+    create_fifo_stored(&mount_paths::storage(path), mode)
+}
+
+pub(crate) fn create_socket(path: &[u8], mode: u32) -> Option<Handle> {
+    create_socket_stored(&mount_paths::storage(path), mode)
+}
+
+pub(crate) fn create_device(path: &[u8], kind: NodeKind, mode: u32, device: u32) -> Option<Handle> {
+    create_device_stored(&mount_paths::storage(path), kind, mode, device)
+}
+
+pub(crate) fn whiteout(path: &[u8]) -> bool {
+    match mount_paths::storage(path) {
+        alloc::borrow::Cow::Owned(_) => false,
+        alloc::borrow::Cow::Borrowed(path) => whiteout_stored(path),
+    }
+}
+
+pub(crate) fn rename(handle: Handle, path: &[u8]) -> bool {
+    rename_stored(handle, &mount_paths::storage(path))
+}
+
+pub(crate) fn create_link(path: &[u8], target: Handle) -> bool {
+    create_link_stored(&mount_paths::storage(path), target)
+}
+
+pub(crate) fn unlink_path(path: &[u8]) -> bool {
+    unlink_path_stored(&mount_paths::storage(path))
+}
+
+pub(crate) fn rename_path(from: &[u8], to: &[u8]) -> bool {
+    rename_path_stored(&mount_paths::storage(from), &mount_paths::storage(to))
 }

@@ -3,10 +3,12 @@
 //! directory trees merged under a writable upper one at a mount point. It
 //! is not [`crate::linux_overlay`], the kernel's view of a domain's files
 //! (whose name comes from layering the image's files under the domain's
-//! own); an overlay mount plugs in beneath that view as a mounted volume
-//! does ([`crate::linux_blockfs`]): `linux_overlay` hands a path at or
-//! below an overlay's mount point, and a handle of an overlay's file, to
-//! this module, which works on the layers through `linux_overlay` again.
+//! own); an overlay plugs in beneath that view as a mounted volume does
+//! ([`crate::linux_blockfs`]): `linux_overlay` hands a storage path at or
+//! below an overlay's storage root ([`crate::linux_mount_paths`]), and a
+//! handle of an overlay's file, to this module, which works on the layers
+//! (storage paths too, resolved when it was mounted) through
+//! `linux_overlay` again.
 //!
 //! The layers follow Linux's on-disk format, so they mean the same to
 //! Linux and to programs that look at them: a whiteout (a character device
@@ -30,8 +32,7 @@
 //! allocated until they close ([`pinned`]).
 //!
 //! The work directory is checked and given its `work` subdirectory as
-//! Linux does, but copy-up does not stage files there. Layers must lie
-//! outside the mount point.
+//! Linux does, but copy-up does not stage files there.
 #![forbid(unsafe_code)]
 
 use alloc::collections::BTreeMap;
@@ -73,7 +74,7 @@ pub(crate) enum RenameMode {
 struct Mount {
     id: u64,
     instance: usize,
-    /// The canonical mount point.
+    /// The storage root.
     point: Vec<u8>,
     /// The writable layer, if any (without one the mount is read-only).
     upper: Option<Vec<u8>>,
@@ -213,8 +214,8 @@ pub(crate) fn owns(handle: Handle) -> bool {
     GENERATIONS.contains(&overlay::generation(handle))
 }
 
-/// The overlay mount of this domain canonical `path` lies on, if a volume
-/// mounted deeper does not take it, with the path below the mount point.
+/// The overlay of this domain storage path `path` lies on, with the path
+/// below its storage root.
 fn route(path: &[u8]) -> Option<(Mount, Vec<u8>)> {
     if !active() {
         return None;
@@ -229,9 +230,6 @@ fn route(path: &[u8]) -> Option<(Mount, Vec<u8>)> {
             .max_by_key(|mount| mount.point.len())?;
         (mount.clone(), copy(below(&mount.point, path)?)?)
     };
-    if crate::linux_blockfs::point_depth(path).is_some_and(|depth| depth > mount.point.len()) {
-        return None;
-    }
     Some((mount, relative))
 }
 
@@ -262,8 +260,9 @@ fn walk(mount: &Mount, relative: &[u8]) -> Walk {
         lower: false,
     };
     let layers: Vec<&[u8]> = mount.layers().collect();
-    let lookup =
-        |layer: &[u8], step: &[u8]| join(layer, step).and_then(|path| overlay::lookup(&path));
+    let lookup = |layer: &[u8], step: &[u8]| {
+        join(layer, step).and_then(|path| overlay::lookup_stored(&path))
+    };
     // The layers whose directory at the walk's place takes part.
     let mut live = layers.len();
     for step in prefixes(relative) {
@@ -452,7 +451,7 @@ fn copy_up_parents(mount: &Mount, relative: &[u8]) -> Result<(), Errno> {
             continue;
         }
         let path = join(upper, prefix).ok_or(ENOMEM)?;
-        let made = overlay::create_directory(&path, metadata.mode).ok_or(EIO)?;
+        let made = overlay::create_directory_stored(&path, metadata.mode).ok_or(EIO)?;
         copy_attributes(made, &metadata);
     }
     Ok(())
@@ -484,7 +483,7 @@ fn copy_up_path(mount: &Mount, relative: &[u8]) -> Result<Handle, Errno> {
     let target = join(upper, relative).ok_or(ENOMEM)?;
     let made = match source.kind {
         NodeKind::File => {
-            let made = overlay::create_file(&target, source.mode, &[]).ok_or(EIO)?;
+            let made = overlay::create_file_stored(&target, source.mode, &[]).ok_or(EIO)?;
             let mut chunk = [0_u8; COPY_CHUNK];
             let mut offset = 0;
             while offset < source.size {
@@ -493,23 +492,24 @@ fn copy_up_path(mount: &Mount, relative: &[u8]) -> Result<Handle, Errno> {
                     break;
                 }
                 if overlay::write(made, offset, &chunk[..read]) != Some(read) {
-                    let _ = overlay::unlink_path(&target);
+                    let _ = overlay::unlink_path_stored(&target);
                     return Err(EIO);
                 }
                 offset += read;
             }
             made
         }
-        NodeKind::Directory => overlay::create_directory(&target, source.mode).ok_or(EIO)?,
+        NodeKind::Directory => overlay::create_directory_stored(&target, source.mode).ok_or(EIO)?,
         NodeKind::Symlink => {
             let mut link = [0_u8; overlay::PATH_CAPACITY];
             let length = overlay::read(source.handle, 0, &mut link).ok_or(EIO)?;
-            overlay::create_symlink(&target, &link[..length]).ok_or(EIO)?
+            overlay::create_symlink_stored(&target, &link[..length]).ok_or(EIO)?
         }
-        NodeKind::Fifo => overlay::create_fifo(&target, source.mode).ok_or(EIO)?,
-        NodeKind::Socket => overlay::create_socket(&target, source.mode).ok_or(EIO)?,
+        NodeKind::Fifo => overlay::create_fifo_stored(&target, source.mode).ok_or(EIO)?,
+        NodeKind::Socket => overlay::create_socket_stored(&target, source.mode).ok_or(EIO)?,
         NodeKind::CharacterDevice | NodeKind::BlockDevice => {
-            overlay::create_device(&target, source.kind, source.mode, source.device).ok_or(EIO)?
+            overlay::create_device_stored(&target, source.kind, source.mode, source.device)
+                .ok_or(EIO)?
         }
     };
     copy_attributes(made, &source);
@@ -519,8 +519,8 @@ fn copy_up_path(mount: &Mount, relative: &[u8]) -> Result<Handle, Errno> {
 /// Removes a whiteout at the upper layer's canonical `path`; whether one
 /// was there.
 fn remove_whiteout(path: &[u8]) -> bool {
-    overlay::lookup(path).is_some_and(|metadata| is_whiteout(&metadata))
-        && overlay::unlink_path(path)
+    overlay::lookup_stored(path).is_some_and(|metadata| is_whiteout(&metadata))
+        && overlay::unlink_path_stored(path)
 }
 
 /// Leaves a whiteout at `relative` in the upper layer, hiding the lower
@@ -533,7 +533,7 @@ fn add_whiteout(mount: &Mount, relative: &[u8]) -> bool {
     else {
         return false;
     };
-    overlay::create_device(&path, NodeKind::CharacterDevice, 0, 0).is_some()
+    overlay::create_device_stored(&path, NodeKind::CharacterDevice, 0, 0).is_some()
 }
 
 /// Creates the file at canonical `path` with `make`, which makes it at the
@@ -627,7 +627,7 @@ fn remove_relative(mount: &Mount, relative: &[u8]) -> Result<(), Errno> {
             // Forgotten first, so that the file is held for the overlay's
             // descriptors when its upper file loses its name.
             forget_name(mount.id, relative, real.handle);
-            if !overlay::unlink_path(&target) {
+            if !overlay::unlink_path_stored(&target) {
                 return Err(EIO);
             }
         }
@@ -645,7 +645,7 @@ fn remove_relative(mount: &Mount, relative: &[u8]) -> Result<(), Errno> {
 fn clear_whiteouts(path: &[u8]) {
     let mut whiteouts = Vec::new();
     let mut cursor = 0;
-    while let Some(Some(child)) = overlay::next_child_at(path, cursor) {
+    while let Some(Some(child)) = overlay::next_child_at_stored(path, cursor) {
         cursor = child.next_cursor;
         if is_whiteout(&child.metadata) {
             if let Some(name) = join(path, child.name()) {
@@ -656,7 +656,7 @@ fn clear_whiteouts(path: &[u8]) {
         }
     }
     for whiteout in whiteouts {
-        let _ = overlay::unlink_path(&whiteout);
+        let _ = overlay::unlink_path_stored(&whiteout);
     }
 }
 
@@ -715,13 +715,13 @@ fn rename_upper(from: &[u8], to: &[u8], mode: RenameMode) -> Result<(), Errno> {
         };
         return crate::linux_blockfs::rename_with(from, to, mode).unwrap_or(Err(EXDEV));
     }
-    match (mode, overlay::lookup(to)) {
+    match (mode, overlay::lookup_stored(to)) {
         (RenameMode::Exchange, _) => {
             let mut temporary = copy(from).ok_or(ENOMEM)?;
             temporary.extend_from_slice(b".ginux-exchange");
-            return if overlay::rename_path(from, &temporary)
-                && overlay::rename_path(to, from)
-                && overlay::rename_path(&temporary, to)
+            return if overlay::rename_path_stored(from, &temporary)
+                && overlay::rename_path_stored(to, from)
+                && overlay::rename_path_stored(&temporary, to)
             {
                 Ok(())
             } else {
@@ -733,7 +733,7 @@ fn rename_upper(from: &[u8], to: &[u8], mode: RenameMode) -> Result<(), Errno> {
             let removed = if target.kind == NodeKind::Directory {
                 overlay::unlink(target.handle)
             } else {
-                overlay::unlink_path(to)
+                overlay::unlink_path_stored(to)
             };
             if !removed {
                 return Err(ENOTEMPTY);
@@ -741,7 +741,7 @@ fn rename_upper(from: &[u8], to: &[u8], mode: RenameMode) -> Result<(), Errno> {
         }
         (_, None) => {}
     }
-    if overlay::rename_path(from, to) {
+    if overlay::rename_path_stored(from, to) {
         Ok(())
     } else {
         Err(EIO)
@@ -843,7 +843,7 @@ pub(crate) fn create_link(path: &[u8], target: Handle) -> Option<bool> {
         (|| {
             let real = copy_up(target)?;
             let upper = prepare_upper(path)??;
-            overlay::create_link(&upper, real).then_some(())
+            overlay::create_link_stored(&upper, real).then_some(())
         })()
         .is_some(),
     )
@@ -894,7 +894,7 @@ fn list(mount: &Mount, relative: &[u8]) -> Option<Vec<Vec<u8>>> {
     for index in walk(mount, relative).merged {
         let directory = join(layers[index], relative)?;
         let mut cursor = 0;
-        while let Some(Some(child)) = overlay::next_child_at(&directory, cursor) {
+        while let Some(Some(child)) = overlay::next_child_at_stored(&directory, cursor) {
             cursor = child.next_cursor;
             let name = child.name();
             if names.iter().chain(hidden.iter()).any(|seen| seen == name) {
@@ -914,12 +914,7 @@ fn list(mount: &Mount, relative: &[u8]) -> Option<Vec<Vec<u8>>> {
 
 /// Mounts an overlay at canonical `point` of upper layer `upper` (none for
 /// a read-only one) over `lowers` (topmost first), its files on `device`.
-pub(crate) fn mount(
-    point: &[u8],
-    upper: Option<&[u8]>,
-    lowers: &[&[u8]],
-    device: u32,
-) -> Result<(), Errno> {
+pub(crate) fn mount(point: &[u8], upper: Option<&[u8]>, lowers: &[&[u8]]) -> Result<(), Errno> {
     let mut stored = Vec::new();
     stored.try_reserve_exact(lowers.len()).map_err(|_| ENOMEM)?;
     for lower in lowers {
@@ -940,10 +935,23 @@ pub(crate) fn mount(
         point,
         upper,
         lowers: stored,
-        device,
+        device: 0,
     });
     MOUNTED.fetch_add(1, Ordering::Relaxed);
     Ok(())
+}
+
+/// Gives the overlay stored at `point` the device of its mount, `device`.
+pub(crate) fn set_device(point: &[u8], device: u32) {
+    let instance = instance();
+    if let Some(mount) = OVERLAYS
+        .lock()
+        .mounts
+        .iter_mut()
+        .find(|mount| mount.instance == instance && mount.point == point)
+    {
+        mount.device = device;
+    }
 }
 
 /// The topmost overlay of this domain mounted at canonical `point`.
@@ -982,21 +990,6 @@ pub(crate) fn unmount(point: &[u8]) -> bool {
     table.listing = None;
     MOUNTED.fetch_sub(1, Ordering::Relaxed);
     true
-}
-
-/// Moves the overlays mounted at or below canonical `from` to `to`.
-pub(crate) fn move_point(from: &[u8], to: &[u8]) {
-    let instance = instance();
-    let mut table = OVERLAYS.lock();
-    for mount in table
-        .mounts
-        .iter_mut()
-        .filter(|mount| mount.instance == instance)
-    {
-        if let Some(point) = below(from, &mount.point).and_then(|rest| join(to, rest)) {
-            mount.point = point;
-        }
-    }
 }
 
 /// Drops the handles of unlinked overlay files that `in_use` says nothing

@@ -14976,7 +14976,7 @@ fn linux_clone_mount_namespace() -> Option<linux_mount::MountNamespaceHandle> {
         namespace: namespace.id(),
     };
     if crate::linux_mounts::copy_space(from, to).is_err() {
-        crate::linux_mounts::drop_space(to, |_, _| {});
+        crate::linux_mounts::drop_space(to, |_| {});
         let _ = linux_mount::retire(namespace);
         return None;
     }
@@ -40264,7 +40264,11 @@ fn linux_renameat(
             RENAME_NOREPLACE => crate::linux_overlayfs::RenameMode::NoReplace,
             _ => crate::linux_overlayfs::RenameMode::Replace,
         };
-        let result = crate::linux_overlayfs::rename(old, new, mode);
+        let result = crate::linux_overlayfs::rename(
+            &crate::linux_mount_paths::storage(old),
+            &crate::linux_mount_paths::storage(new),
+            mode,
+        );
         linux_reclaim_unlinked_files();
         return match result {
             Some(Ok(())) => 0,
@@ -40279,7 +40283,11 @@ fn linux_renameat(
             RENAME_NOREPLACE => ginux_ext2::RenameMode::NoReplace,
             _ => ginux_ext2::RenameMode::Replace,
         };
-        let result = crate::linux_blockfs::rename_with(old, new, mode);
+        let result = crate::linux_blockfs::rename_with(
+            &crate::linux_mount_paths::storage(old),
+            &crate::linux_mount_paths::storage(new),
+            mode,
+        );
         linux_reclaim_unlinked_files();
         return match result {
             Some(Ok(())) => 0,
@@ -48368,8 +48376,12 @@ fn linux_epoll_ctl(epoll: u64, operation: u64, descriptor: u64, event_address: u
         return LINUX_EINVAL;
     }
     let epoll = linux_epoll_instance(epoll);
-    // An O_PATH descriptor is no file to watch (EBADF, as in Linux).
-    if !linux_descriptor_open(descriptor) || linux_path_descriptor(descriptor) {
+    // An O_PATH descriptor is no file to watch (EBADF, as in Linux), nor
+    // a detached mount's, which is one.
+    if !linux_descriptor_open(descriptor)
+        || linux_path_descriptor(descriptor)
+        || linux_detached_mount_descriptor(descriptor).is_some()
+    {
         return LINUX_EBADF;
     }
     if !linux_descriptor_epollable(descriptor) {
@@ -48502,7 +48514,9 @@ fn linux_descriptor_epollable(descriptor: u64) -> bool {
         || linux_signalfd_descriptor(descriptor)
         || linux_inotify_descriptor(descriptor)
         || linux_fanotify_descriptor(descriptor)
+        // A filesystem context has no poll (EPERM, as in Linux).
         || linux_socket_slot(descriptor).is_some()
+            && linux_fs_context_descriptor(descriptor).is_none()
         || linux_epoll_descriptor(descriptor)
         || linux_eventfd_descriptor(descriptor)
         || linux_timerfd_descriptor(descriptor)
@@ -58831,10 +58845,15 @@ fn linux_mount_filesystem(
     let propagation = flags & (MS_SHARED | MS_PRIVATE | MS_SLAVE | MS_UNBINDABLE);
     if flags & MS_REMOUNT != 0 && propagation == 0 {
         // Remounting changes a domain mount's options; the root and the
-        // kernel's own mounts keep theirs.
+        // kernel's own mounts keep theirs. With MS_BIND it changes only
+        // the mount's own (a read-only bind mount), not its filesystem's.
+        let storage = crate::linux_mounts::superblock_at(space, canonical_target)
+            .filter(|_| flags & MS_BIND == 0)
+            .map(|(_, storage)| storage);
+        let storage = storage.as_deref().unwrap_or(b"\0");
         // A volume with a file open for writing cannot become read-only.
         if flags & MS_RDONLY != 0
-            && crate::linux_blockfs::generations_at(canonical_target).is_some_and(|generations| {
+            && crate::linux_blockfs::generations_at(storage).is_some_and(|generations| {
                 generations
                     .into_iter()
                     .any(linux_overlay_file_open_for_write)
@@ -58842,9 +58861,7 @@ fn linux_mount_filesystem(
         {
             return LINUX_EBUSY;
         }
-        if let Some(Err(error)) =
-            crate::linux_blockfs::remount(canonical_target, flags & MS_RDONLY != 0)
-        {
+        if let Some(Err(error)) = crate::linux_blockfs::remount(storage, flags & MS_RDONLY != 0) {
             return error.wrapping_neg();
         }
         // A tmpfs remount may change its size (EINVAL below what it uses).
@@ -58853,7 +58870,7 @@ fn linux_mount_filesystem(
                 if options != crate::linux_tmpfs_quota::Options::default()
                     && !crate::linux_tmpfs_quota::remounted(
                         linux_execution_instance(),
-                        canonical_target,
+                        storage,
                         options,
                     ) =>
             {
@@ -59025,40 +59042,47 @@ fn linux_mount_new(
         Err(error) if filesystem == b"tmpfs" => return error,
         Err(_) => None,
     };
-    // A new tmpfs's root is the mounter's, mode 1777, as in Linux; the
-    // directory it covers gets its own attributes back at unmount.
-    let tmpfs_root = matches!(filesystem, b"tmpfs" | b"ramfs" | b"devtmpfs")
-        .then(|| crate::linux_overlay::lookup(target))
-        .flatten()
-        .filter(|metadata| metadata.kind == crate::linux_overlay::NodeKind::Directory);
-    let covered = tmpfs_root.map(|metadata| crate::linux_mounts::Attributes {
-        mode: metadata.mode,
-        owner: metadata.owner,
-        group: metadata.group,
-    });
+    // A tmpfs or ramfs is a filesystem of its own, empty, stored below its
+    // storage root; its root is the mounter's, mode 1777, as in Linux. The
+    // kernel's own filesystems (devtmpfs's device files among them) are
+    // found by their paths.
+    let superblock = if matches!(filesystem, b"tmpfs" | b"ramfs") {
+        let superblock = crate::linux_mounts::new_superblock();
+        let storage = crate::linux_mount_paths::storage_root(superblock);
+        let Some(root) = crate::linux_overlay::create_directory_stored(&storage, 0o1777) else {
+            return LINUX_ENOMEM;
+        };
+        let (owner, group) = current_linux_credentials().map_or((0, 0), |credentials| {
+            (credentials.user.filesystem, credentials.group.filesystem)
+        });
+        let _ = crate::linux_overlay::set_mode(root, 0o1777)
+            && crate::linux_overlay::set_owner(root, owner, group);
+        if let Some(options) = tmpfs_options.filter(|_| filesystem == b"tmpfs") {
+            let _ =
+                crate::linux_tmpfs_quota::mounted(linux_execution_instance(), &storage, options);
+        }
+        superblock
+    } else {
+        0
+    };
     match crate::linux_mounts::mount(
         linux_mount_space(),
         target,
         source,
         filesystem,
         options,
-        covered,
+        superblock,
     ) {
-        Ok(_) => {
-            if let Some(metadata) = tmpfs_root {
-                let (owner, group) = current_linux_credentials().map_or((0, 0), |credentials| {
-                    (credentials.user.filesystem, credentials.group.filesystem)
+        Ok(_) => 0,
+        Err(_) => {
+            if superblock != 0 {
+                linux_filesystem_gone(crate::linux_mounts::Gone {
+                    superblock,
+                    filesystem: alloc::vec::Vec::new(),
                 });
-                let _ = crate::linux_overlay::set_mode(metadata.handle, 0o1777)
-                    && crate::linux_overlay::set_owner(metadata.handle, owner, group);
             }
-            if let Some(options) = tmpfs_options.filter(|_| filesystem == b"tmpfs") {
-                let _ =
-                    crate::linux_tmpfs_quota::mounted(linux_execution_instance(), target, options);
-            }
-            0
+            LINUX_ENOMEM
         }
-        Err(_) => LINUX_ENOMEM,
     }
 }
 
@@ -59206,7 +59230,10 @@ fn linux_mount_volume(
         crate::linux_blockfs::Source::Loop { open, .. } => crate::linux_loop::io_counters(open),
         crate::linux_blockfs::Source::Ram { .. } => None,
     };
-    if let Err(error) = crate::linux_blockfs::mount(target, source, io, read_only, fs_type) {
+    // The volume is stored below a storage root of its own.
+    let superblock = crate::linux_mounts::new_superblock();
+    let storage = crate::linux_mount_paths::storage_root(superblock);
+    if let Err(error) = crate::linux_blockfs::mount(&storage, source, io, read_only, fs_type) {
         linux_release_volume_device(source);
         return error.wrapping_neg();
     }
@@ -59217,8 +59244,9 @@ fn linux_mount_volume(
         ginux_ext2::FsType::Ext3 => b"ext3",
         ginux_ext2::FsType::Ext4 => b"ext4",
     };
-    let Ok(id) = crate::linux_mounts::mount(space, target, named, type_name, options, None) else {
-        if let Some(Ok(source)) = crate::linux_blockfs::unmount(target) {
+    let Ok(id) = crate::linux_mounts::mount(space, target, named, type_name, options, superblock)
+    else {
+        if let Some(Ok(source)) = crate::linux_blockfs::unmount(&storage) {
             linux_release_volume_device(source);
         }
         return LINUX_ENOMEM;
@@ -59322,45 +59350,30 @@ pub(crate) fn linux_reclaim_unlinked_files() {
 /// domain's memory, as an unlimited tmpfs shows. None off a tmpfs.
 fn linux_tmpfs_statfs_data(path: &[u8]) -> Option<[u8; 120]> {
     const TMPFS_MAGIC: u64 = 0x0102_1994;
-    const ST_RDONLY: u64 = 1;
-    const ST_NOSUID: u64 = 2;
-    const ST_NODEV: u64 = 4;
-    const ST_NOEXEC: u64 = 8;
-    const ST_VALID: u64 = 32;
-    const ST_RELATIME: u64 = 4096;
     let space = linux_mount_space();
     let id = crate::linux_mounts::mount_id_at(space, path);
-    let tmpfs = crate::linux_mounts::with_mount(space, id, |mount| {
-        !mount.bind && mount.filesystem == b"tmpfs"
-    })?;
+    let tmpfs = crate::linux_mounts::with_mount(space, id, |mount| mount.filesystem == b"tmpfs")?;
     if !tmpfs {
         return None;
     }
     let (total_frames, free_frames) = linux_domain_frame_counts();
-    let (blocks, free, files, free_files) =
-        match crate::linux_tmpfs_quota::usage(linux_execution_instance(), path) {
-            Some((limit, used, inodes, used_inodes)) => {
-                let blocks = limit.unwrap_or(total_frames);
-                let files = inodes.unwrap_or(total_frames);
-                (
-                    blocks,
-                    blocks.saturating_sub(used),
-                    files,
-                    files.saturating_sub(used_inodes),
-                )
-            }
-            None => (total_frames, free_frames, total_frames, free_frames),
-        };
-    let options = crate::linux_mounts::flags_at(space, path);
-    let flags = [
-        (crate::linux_mounts::READ_ONLY, ST_RDONLY),
-        (crate::linux_mounts::NO_SUID, ST_NOSUID),
-        (crate::linux_mounts::NO_DEVICES, ST_NODEV),
-        (crate::linux_mounts::NO_EXEC, ST_NOEXEC),
-    ]
-    .into_iter()
-    .filter(|(option, _)| options & option != 0)
-    .fold(ST_VALID | ST_RELATIME, |flags, (_, flag)| flags | flag);
+    let (blocks, free, files, free_files) = match crate::linux_tmpfs_quota::usage(
+        linux_execution_instance(),
+        &crate::linux_mount_paths::storage(path),
+    ) {
+        Some((limit, used, inodes, used_inodes)) => {
+            let blocks = limit.unwrap_or(total_frames);
+            let files = inodes.unwrap_or(total_frames);
+            (
+                blocks,
+                blocks.saturating_sub(used),
+                files,
+                files.saturating_sub(used_inodes),
+            )
+        }
+        None => (total_frames, free_frames, total_frames, free_frames),
+    };
+    let flags = linux_mount_statfs_flags(crate::linux_mounts::flags_at(space, path));
     let mut stat = [0_u8; 120];
     let block_size = crate::linux_tmpfs_quota::BLOCK_SIZE;
     stat[0..8].copy_from_slice(&TMPFS_MAGIC.to_ne_bytes());
@@ -59545,35 +59558,25 @@ fn linux_umount(target_address: u64, flags: u64) -> u64 {
     {
         return linux_missing_path_error(canonical);
     }
-    if let Some(generations) = crate::linux_overlayfs::generations_at(canonical) {
-        // An overlay with a file in use stays (EBUSY) unless the unmount is
-        // lazy; its layers' files stay where they are either way.
-        if flags & MNT_DETACH == 0 && generations.into_iter().any(linux_generation_in_use) {
+    let space = linux_mount_space();
+    // When this is the filesystem's last mount, a file of it still open, or
+    // a working directory on it, keeps it mounted (EBUSY), unless the
+    // unmount is lazy (MNT_DETACH): then it leaves the namespace and goes
+    // with its last close.
+    if let Some((_, storage)) = crate::linux_mounts::last_mount_of(space, canonical) {
+        let generations = crate::linux_overlayfs::generations_at(&storage)
+            .or_else(|| crate::linux_blockfs::generations_at(&storage));
+        if flags & MNT_DETACH == 0
+            && generations
+                .is_some_and(|generations| generations.into_iter().any(linux_generation_in_use))
+        {
             return LINUX_EBUSY;
         }
-        crate::linux_overlayfs::unmount(canonical);
     }
-    if let Some(generations) = crate::linux_blockfs::generations_at(canonical) {
-        // A file of the volume still open, or a working directory on it,
-        // keeps it mounted (EBUSY), unless the unmount is lazy (MNT_DETACH):
-        // then it leaves the namespace and goes with its last close.
-        if generations.into_iter().any(linux_generation_in_use) {
-            if flags & MNT_DETACH == 0 {
-                return LINUX_EBUSY;
-            }
-            crate::linux_blockfs::detach(canonical);
-        } else {
-            match crate::linux_blockfs::unmount(canonical) {
-                Some(Ok(source)) => linux_release_volume_device(source),
-                Some(Err(error)) => return error.wrapping_neg(),
-                None => {}
-            }
-        }
-    }
-    match crate::linux_mounts::unmount(linux_mount_space(), canonical) {
+    match crate::linux_mounts::unmount(space, canonical) {
         Ok(gone) => {
             if let Some(gone) = gone {
-                linux_filesystem_gone(canonical, gone);
+                linux_filesystem_gone(gone);
             }
             0
         }
@@ -59582,14 +59585,26 @@ fn linux_umount(target_address: u64, flags: u64) -> u64 {
     }
 }
 
-/// A tmpfs mounted at canonical `path` went with its last mount: its files
-/// go, and the directory it covered gets its own attributes back.
-fn linux_filesystem_gone(path: &[u8], gone: crate::linux_mounts::Gone) {
-    crate::linux_tmpfs_quota::unmounted(linux_execution_instance(), path);
-    crate::linux_overlay::unlink_below(path);
-    if let Some((covered, metadata)) = gone.covered.zip(crate::linux_overlay::lookup(path)) {
-        let _ = crate::linux_overlay::set_mode(metadata.handle, covered.mode)
-            && crate::linux_overlay::set_owner(metadata.handle, covered.owner, covered.group);
+/// A filesystem went with its last mount: a tmpfs's files go, a volume is
+/// unmounted (once its files in use are closed, when some are), an
+/// overlay's files are forgotten.
+fn linux_filesystem_gone(gone: crate::linux_mounts::Gone) {
+    let storage = crate::linux_mount_paths::storage_root(gone.superblock);
+    if crate::linux_overlayfs::unmount(&storage) {
+        return;
+    }
+    if let Some(generations) = crate::linux_blockfs::generations_at(&storage) {
+        if generations.into_iter().any(linux_generation_in_use) {
+            crate::linux_blockfs::detach(&storage);
+        } else if let Some(Ok(source)) = crate::linux_blockfs::unmount(&storage) {
+            linux_release_volume_device(source);
+        }
+        return;
+    }
+    crate::linux_tmpfs_quota::unmounted(linux_execution_instance(), &storage);
+    crate::linux_overlay::unlink_below_stored(&storage);
+    if let Some(root) = crate::linux_overlay::lookup_stored(&storage) {
+        let _ = crate::linux_overlay::unlink(root.handle);
     }
 }
 

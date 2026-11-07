@@ -47,7 +47,7 @@ fn linux_may_mount() -> bool {
 }
 
 /// The filesystem context a descriptor is open on.
-fn linux_fs_context_descriptor(descriptor: u64) -> Option<u64> {
+pub(super) fn linux_fs_context_descriptor(descriptor: u64) -> Option<u64> {
     match linux_object_descriptor(descriptor)? {
         (fscontext::CLASS_CONTEXT, id) => Some(id),
         _ => None,
@@ -461,8 +461,11 @@ fn linux_fs_context_reconfigure(id: u64) -> u64 {
 /// writable, as a remount does: a volume with a file open for writing
 /// cannot become read-only (EBUSY).
 fn linux_remount_read_only(path: &[u8], read_only: bool) -> u64 {
+    let space = linux_mount_space();
+    let storage = crate::linux_mounts::superblock_at(space, path).map(|(_, storage)| storage);
+    let storage = storage.as_deref().unwrap_or(b"\0");
     if read_only
-        && crate::linux_blockfs::generations_at(path).is_some_and(|generations| {
+        && crate::linux_blockfs::generations_at(storage).is_some_and(|generations| {
             generations
                 .into_iter()
                 .any(linux_overlay_file_open_for_write)
@@ -470,10 +473,9 @@ fn linux_remount_read_only(path: &[u8], read_only: bool) -> u64 {
     {
         return LINUX_EBUSY;
     }
-    if let Some(Err(error)) = crate::linux_blockfs::remount(path, read_only) {
+    if let Some(Err(error)) = crate::linux_blockfs::remount(storage, read_only) {
         return error.wrapping_neg();
     }
-    let space = linux_mount_space();
     if let Some(id) = crate::linux_mounts::topmost_id(space, path) {
         if let Some(flags) = crate::linux_mounts::with_mount(space, id, |mount| mount.flags) {
             let flags = if read_only {
@@ -780,13 +782,12 @@ fn linux_attach_detached(id: u64, target: &[u8], beneath: bool) -> u64 {
 }
 
 /// Moves the mount whose root is canonical `from`, with the mounts below
-/// it, to canonical `to` (move_mount, mount(2)'s MS_MOVE). A tmpfs takes
-/// its files along, a volume and an overlay their mount points.
+/// it, to canonical `to` (move_mount, mount(2)'s MS_MOVE).
 pub(super) fn linux_move_mounted_tree(from: &[u8], to: &[u8]) -> u64 {
     let space = linux_mount_space();
-    let Some(id) = crate::linux_mounts::topmost_id(space, from) else {
+    if !crate::linux_mounts::is_mount_point(space, from) {
         return LINUX_EINVAL;
-    };
+    }
     // A mount cannot move below itself.
     if to
         .strip_prefix(from)
@@ -797,57 +798,11 @@ pub(super) fn linux_move_mounted_tree(from: &[u8], to: &[u8]) -> u64 {
     if !linux_path_access(to).is_some_and(|access| access.directory) {
         return LINUX_ENOTDIR;
     }
-    let tmpfs = crate::linux_mounts::with_mount(space, id, |mount| {
-        !mount.bind
-            && matches!(
-                mount.filesystem.as_slice(),
-                b"tmpfs" | b"ramfs" | b"devtmpfs"
-            )
-    })
-    .unwrap_or(false);
-    if tmpfs && !linux_move_directory_entries(from, to) {
-        return LINUX_EIO;
-    }
-    crate::linux_blockfs::move_point(from, to);
-    crate::linux_overlayfs::move_point(from, to);
     match crate::linux_mounts::move_tree(space, from, to) {
         Ok(()) => 0,
         Err(crate::linux_mounts::Error::NotMounted) => LINUX_EINVAL,
         Err(crate::linux_mounts::Error::NoMemory) => LINUX_ENOMEM,
     }
-}
-
-/// Renames every entry the overlay has directly below canonical directory
-/// `from` to the same name below `to`.
-fn linux_move_directory_entries(from: &[u8], to: &[u8]) -> bool {
-    let mut names = alloc::vec::Vec::new();
-    let mut cursor = 0;
-    while let Some(Some(child)) = crate::linux_overlay::next_child_at(from, cursor) {
-        cursor = child.next_cursor;
-        let mut name = alloc::vec::Vec::new();
-        if name.try_reserve_exact(child.name().len()).is_err() || names.try_reserve(1).is_err() {
-            return false;
-        }
-        name.extend_from_slice(child.name());
-        names.push(name);
-    }
-    let joined = |directory: &[u8], name: &[u8]| {
-        let mut path = alloc::vec::Vec::new();
-        path.try_reserve_exact(directory.len() + 1 + name.len())
-            .ok()?;
-        path.extend_from_slice(directory);
-        if !directory.is_empty() {
-            path.push(b'/');
-        }
-        path.extend_from_slice(name);
-        Some(path)
-    };
-    names
-        .iter()
-        .all(|name| match (joined(from, name), joined(to, name)) {
-            (Some(old), Some(new)) => crate::linux_overlay::rename_path(&old, &new),
-            _ => false,
-        })
 }
 
 /// An overlay's layers, as canonical paths, from its options.
@@ -1004,23 +959,6 @@ pub(super) fn linux_mount_overlayfs(
         Ok(layers) => layers,
         Err(error) => return error,
     };
-    // The layers are reached by their paths, so none may lie below the
-    // mount point, which the overlay takes over.
-    let below_target = |layer: &[u8]| {
-        target.is_empty()
-            || layer
-                .strip_prefix(target)
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with(b"/"))
-    };
-    if layers
-        .lowers
-        .iter()
-        .chain(layers.upper.iter())
-        .chain(layers.work.iter())
-        .any(|layer| below_target(layer))
-    {
-        return LINUX_EINVAL;
-    }
     // Linux keeps its staging directory in the work directory.
     if let Some(work) = &layers.work {
         let mut staging = alloc::vec::Vec::new();
@@ -1043,17 +981,27 @@ pub(super) fn linux_mount_overlayfs(
     } else {
         options
     };
+    // The layers are where their paths lead now, the mounts below the
+    // mount point too (lowerdir may be the mount point itself).
+    let stored = |layer: &[u8]| crate::linux_mount_paths::storage(layer).into_owned();
+    let lowers: alloc::vec::Vec<alloc::vec::Vec<u8>> =
+        layers.lowers.iter().map(|lower| stored(lower)).collect();
+    let lowers: alloc::vec::Vec<&[u8]> = lowers.iter().map(|lower| &lower[..]).collect();
+    let upper = layers.upper.as_deref().map(stored);
+    let superblock = crate::linux_mounts::new_superblock();
+    let storage = crate::linux_mount_paths::storage_root(superblock);
     let space = linux_mount_space();
-    let Ok(id) = crate::linux_mounts::mount(space, target, source, b"overlay", options, None)
-    else {
-        return LINUX_ENOMEM;
-    };
-    let lowers: alloc::vec::Vec<&[u8]> = layers.lowers.iter().map(|lower| &lower[..]).collect();
-    match crate::linux_overlayfs::mount(target, layers.upper.as_deref(), &lowers, id) {
-        Ok(()) => 0,
-        Err(error) => {
-            let _ = crate::linux_mounts::unmount(space, target);
-            error.wrapping_neg()
+    if let Err(error) = crate::linux_overlayfs::mount(&storage, upper.as_deref(), &lowers) {
+        return error.wrapping_neg();
+    }
+    match crate::linux_mounts::mount(space, target, source, b"overlay", options, superblock) {
+        Ok(id) => {
+            crate::linux_overlayfs::set_device(&storage, id);
+            0
+        }
+        Err(_) => {
+            crate::linux_overlayfs::unmount(&storage);
+            LINUX_ENOMEM
         }
     }
 }

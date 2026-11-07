@@ -758,15 +758,15 @@ mount01 mount01
 mount02 mount02
 !mount03 mount03  # mount options beyond ro, nosuid, nodev, noexec and noatime are not kept
 mount04 mount04
-!mount05 mount05  # a bind mount does not show its source's files
-!mount06 mount06  # MS_MOVE does not move a mount
+mount05 mount05
+mount06 mount06
 !mount07 mount07  # MS_NOSYMFOLLOW is not kept
 mount08 mount08
 mount_setattr01 mount_setattr01
 mount_setattr02 mount_setattr02
 move_mount01 move_mount01
 move_mount02 move_mount02
-!move_mount03 move_mount03  # a bind mount (an OPEN_TREE_CLONE copy) does not show its source's files
+move_mount03 move_mount03
 move_pages01 move_pages01
 move_pages02 move_pages02
 move_pages03 move_pages03

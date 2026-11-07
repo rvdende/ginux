@@ -463,6 +463,8 @@ interior-mutable	kernel/src/linux_userfaultfd.rs	CONTEXTS	domain-runtime	allowli
 interior-mutable	kernel/src/linux_userfaultfd.rs	LIVE	domain-runtime	allowlist	none	atomic-live-context-count
 interior-mutable	kernel/src/linux_blockfs.rs	VOLUMES	domain-runtime	allowlist	none	ranked-mounted-volumes
 interior-mutable	kernel/src/linux_fscontext.rs	OBJECTS	domain-runtime	allowlist	none	ranked-fs-contexts-and-detached-mounts
+interior-mutable	kernel/src/linux_mount_paths.rs	ROUTES	domain-runtime	allowlist	none	ranked-published-mount-trees
+interior-mutable	kernel/src/linux_mount_paths.rs	REDIRECTS	domain-runtime	allowlist	none	atomic-redirecting-route-count
 interior-mutable	kernel/src/linux_overlayfs.rs	OVERLAYS	domain-runtime	allowlist	none	ranked-overlay-mounts-and-files
 interior-mutable	kernel/src/linux_overlayfs.rs	MOUNTED	domain-runtime	allowlist	none	atomic-mounted-overlay-count
 interior-mutable	kernel/src/linux_overlay.rs	UNLINKED	domain-runtime	allowlist	none	ranked-unlinked-files-awaiting-last-close

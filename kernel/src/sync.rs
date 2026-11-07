@@ -76,6 +76,11 @@ impl LockRank {
     /// heap so the list may grow while held.
     pub(crate) const MEMORY_FAILURE: Self = Self(175);
     pub(crate) const FUTEX_COORDINATION: Self = Self(180);
+    /// Each mount namespace's mount tree as path resolution walks it; every
+    /// path a file call is given passes through it, so it ranks above the
+    /// tables whose holders make and remove files, and the mount table
+    /// publishes to it while held.
+    pub(crate) const MOUNT_ROUTES: Self = Self(181);
     /// The overlay mounts (overlayfs) and the files they handed out; every
     /// path walk looks at them, so they rank above the tables whose holders
     /// make and remove files (loop devices, pseudo-terminals). Nothing else

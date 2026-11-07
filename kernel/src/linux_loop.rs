@@ -1266,7 +1266,7 @@ fn put_attribute(path: &[u8], contents: &[u8]) {
 
 fn remove_tree(path: &[u8]) {
     if linux_overlay::lookup(path).is_some() {
-        linux_overlay::unlink_below(path);
+        linux_overlay::unlink_below_stored(&crate::linux_mount_paths::storage(path));
         let _ = linux_overlay::unlink_path(path);
     }
 }
