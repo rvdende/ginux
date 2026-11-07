@@ -310,7 +310,12 @@ impl Node {
             mtime: self.mtime,
             ctime: self.ctime,
             filesystem: 0,
-            sectors: (self.size as u64).div_ceil(512),
+            // A paged file has holes: only its pages count.
+            sectors: if self.paged() {
+                (paged_frames(self, self.size.div_ceil(PAGE_SIZE)) * (PAGE_SIZE / 512)) as u64
+            } else {
+                (self.size as u64).div_ceil(512)
+            },
             block_size: PAGE_SIZE as u32,
             btime: None,
         }
@@ -2203,7 +2208,15 @@ fn charge_size(handle: Handle, offset: usize, end: usize) -> bool {
     } else {
         offset / block
     };
-    let added = end.div_ceil(block).saturating_sub(first);
+    let mut added = end.div_ceil(block).saturating_sub(first);
+    // A paged file's holes (pages never written, or punched) are free
+    // until written.
+    if node.paged() && offset < node.size {
+        let pages = offset / PAGE_SIZE..end.min(node.size).div_ceil(PAGE_SIZE);
+        added += pages
+            .filter(|index| memfd_page(node, *index, false).is_none())
+            .count();
+    }
     if added == 0 {
         return true;
     }
@@ -2219,6 +2232,129 @@ fn charge_size(handle: Handle, offset: usize, end: usize) -> bool {
         .charged
         .saturating_add(added.min(u32::MAX as usize) as u32);
     true
+}
+
+/// Punches a hole in `handle`'s file (tmpfs) from `offset` to `end`
+/// (FALLOC_FL_PUNCH_HOLE): its whole pages go, and their tmpfs blocks with
+/// them, so SEEK_HOLE finds the hole; the rest of the range is zeroed. The
+/// file becomes paged to keep its holes. A file whose frames were lent to
+/// shared mappings keeps them, zeroed.
+pub(crate) fn punch_hole(handle: Handle, offset: usize, end: usize) -> bool {
+    let Some(node) = node_mut(handle) else {
+        return false;
+    };
+    if node.kind != NodeKind::File {
+        return false;
+    }
+    let end = end.min(node.size);
+    if offset >= end {
+        return true;
+    }
+    if !make_node_paged(node) {
+        return false;
+    }
+    let mut freed = 0_u32;
+    let mut position = offset;
+    while position < end {
+        let index = position / PAGE_SIZE;
+        let within = position % PAGE_SIZE;
+        let length = (end - position).min(PAGE_SIZE - within);
+        if length == PAGE_SIZE && !node.frames_lent {
+            match take_paged_frame(node, index) {
+                Some(true) => freed += 1,
+                Some(false) => {}
+                None => return false,
+            }
+        } else if let Some(address) =
+            memfd_page(node, index, false).and_then(FrameLease::direct_map_address)
+        {
+            unsafe { core::ptr::write_bytes((address + within) as *mut u8, 0, length) };
+        }
+        position += length;
+    }
+    if freed != 0 {
+        let released = freed.min(node.charged);
+        tmpfs_quota::release(
+            cpu::current_linux_execution_instance(),
+            node.path(),
+            u64::from(released),
+            0,
+        );
+        node.charged -= released;
+    }
+    true
+}
+
+/// Where the next data (`data`) or hole of `handle`'s file at or after
+/// `offset` starts, for a paged file (whose holes are pages it lacks):
+/// `Some(None)` for ENXIO, `None` for a file whose holes are not kept.
+pub(crate) fn seek(handle: Handle, offset: usize, data: bool) -> Option<Option<usize>> {
+    let node = node_mut(handle)?;
+    if !node.paged() || blockfs::owns(handle) {
+        return None;
+    }
+    let size = node.size;
+    if offset >= size {
+        return Some(None);
+    }
+    let mut index = offset / PAGE_SIZE;
+    let pages = size.div_ceil(PAGE_SIZE);
+    while index < pages && memfd_page(node, index, false).is_some() != data {
+        index += 1;
+    }
+    let found = (index * PAGE_SIZE).max(offset);
+    Some(if found < size {
+        Some(found)
+    } else if data {
+        None
+    } else {
+        Some(size)
+    })
+}
+
+/// Frees page `index` of paged `node`: whether it had a frame (`None` if
+/// the frame could not be released).
+fn take_paged_frame(node: &mut Node, index: usize) -> Option<bool> {
+    let mut page = node.first_page;
+    if page == FrameLease::EMPTY {
+        return Some(false);
+    }
+    for _ in 0..index / FRAME_INDEX_CAPACITY {
+        page = frame_index_page_mut(page)?.next;
+        if page == FrameLease::EMPTY {
+            return Some(false);
+        }
+    }
+    let entry = &mut frame_index_page_mut(page)?.frames[index % FRAME_INDEX_CAPACITY];
+    if *entry == FrameLease::EMPTY {
+        return Some(false);
+    }
+    if !memory::scrub_and_release_frames(FrameOwner::KERNEL, core::slice::from_ref(entry)) {
+        return None;
+    }
+    *entry = FrameLease::EMPTY;
+    Some(true)
+}
+
+/// The frames paged `node` has among its first `pages` pages.
+fn paged_frames(node: &Node, pages: usize) -> usize {
+    let mut count = 0;
+    let mut page = node.first_page;
+    let mut first = 0;
+    while page != FrameLease::EMPTY && first < pages {
+        let Some(entries) = frame_index_page_mut(page) else {
+            break;
+        };
+        count += entries
+            .frames
+            .iter()
+            .take(pages - first)
+            .filter(|frame| **frame != FrameLease::EMPTY)
+            .count();
+        first += FRAME_INDEX_CAPACITY;
+        page = entries.next;
+    }
+    count
 }
 
 /// A page cache for a file of a volume (`linux_blockfs`): an unnamed paged

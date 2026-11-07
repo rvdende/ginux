@@ -222,8 +222,8 @@ faccessat202 faccessat202
 fallocate01 fallocate01
 fallocate02 fallocate02
 fallocate03 fallocate03
-!fallocate04 fallocate04  # holes punched in a tmpfs file are not tracked (SEEK_HOLE finds none)
-!fallocate05 fallocate05  # punching a hole in a tmpfs file frees no blocks and leaves no hole SEEK_HOLE finds
+fallocate04 fallocate04  # budget=120 on each of ext2, ext3, ext4 and tmpfs
+fallocate05 fallocate05  # budget=300 fills each of ext2, ext3, ext4 and tmpfs
 fallocate06 fallocate06  # budget=300 fills each of ext2, ext3, ext4 and tmpfs
 fsetxattr01 fsetxattr01
 fsetxattr02 fsetxattr02

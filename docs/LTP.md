@@ -176,8 +176,9 @@ feature rather than a fix:
   cached pages, written back at msync, fsync, sync and unmount. A tmpfs
   mounted with `size=`, `nr_blocks=` or `nr_inodes=`
   (`linux_tmpfs_quota.rs`) fills to ENOSPC instead of exhausting memory
-  (fallocate06); holes punched in its files are not tracked yet
-  (fallocate04, fallocate05).
+  (fallocate06). Punching a hole in a tmpfs file frees its whole pages
+  and their blocks (the file becomes paged, so SEEK_HOLE and st_blocks
+  see the hole: fallocate04, fallocate05).
 - **Memory details**: mmap, madvise, mremap, msync, mlock and mseal
   corner cases, `/proc/self/smaps`, `/proc/PID/pagemap`. A Linux
   process's first 4 GiB hold only the kernel's own 2 MiB regions (its

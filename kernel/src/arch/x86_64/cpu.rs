@@ -39218,19 +39218,14 @@ fn linux_fallocate(descriptor: u64, mode: u64, offset: u64, length: u64) -> u64 
         }
     }
     if mode & PUNCH_HOLE != 0 {
-        // The punched range reads back as zeros; past the end there is
-        // nothing to punch.
-        let zeros = [0_u8; 4096];
-        let mut position = offset as usize;
-        let stop = (end as usize).min(metadata.size);
-        while position < stop {
-            let chunk = (stop - position).min(zeros.len());
-            if crate::linux_overlay::write(handle, position, &zeros[..chunk]) != Some(chunk) {
-                return LINUX_EIO;
-            }
-            position += chunk;
-        }
-        return 0;
+        // The whole pages go (and their tmpfs blocks), the rest reads back
+        // as zeros; past the end there is nothing to punch.
+        return if crate::linux_overlay::punch_hole(handle, offset as usize, end as usize) {
+            let _ = crate::linux_overlay::touch_modified(handle, linux_realtime_now());
+            0
+        } else {
+            LINUX_EIO
+        };
     }
     if metadata.size < end as usize && linux_file_extension_limit(end as usize).is_err() {
         return LINUX_EFBIG;
@@ -53263,6 +53258,19 @@ fn linux_regular_file_seek(descriptor: u64, state: u16, offset: u64, whence: u64
                     }
                     Some(None) => LINUX_ENXIO,
                     None => LINUX_EIO,
+                };
+            }
+            // A paged tmpfs file (a memfd, or one with a hole punched)
+            // keeps its holes too.
+            if let Some(found) = linux_overlay_descriptor_handle(descriptor).and_then(|handle| {
+                crate::linux_overlay::seek(handle, offset as usize, whence == SEEK_DATA)
+            }) {
+                return match found {
+                    Some(next) if (offset as i64) >= 0 => {
+                        linux_descriptor_offset(descriptor).store(next as u64, Ordering::SeqCst);
+                        next as u64
+                    }
+                    _ => LINUX_ENXIO,
                 };
             }
             let size = size();
