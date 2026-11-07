@@ -41486,6 +41486,7 @@ fn linux_socket_create(family: u64, socket_type: u64, protocol: u64) -> u64 {
     const SOCK_CLOEXEC: u64 = 0x8_0000;
     const IPPROTO_ICMP: u64 = 1;
     const IPPROTO_ICMPV6: u64 = 58;
+    const IPPROTO_UDPLITE: u64 = 136;
     const AF_NETLINK: u64 = 16;
     const AF_PACKET: u64 = 17;
     let family = u64::from(family as u32);
@@ -41513,6 +41514,9 @@ fn linux_socket_create(family: u64, socket_type: u64, protocol: u64) -> u64 {
         }
         (AF_INET, SOCK_STREAM) if matches!(protocol, 0 | 6) => crate::linux_socket::Kind::Tcp,
         (AF_INET, SOCK_DGRAM) if matches!(protocol, 0 | 17) => crate::linux_socket::Kind::Udp,
+        (AF_INET | AF_INET6, SOCK_DGRAM) if protocol == IPPROTO_UDPLITE => {
+            crate::linux_socket::Kind::UdpLite
+        }
         // Ping sockets, which Linux grants to the groups in ping_group_range
         // (every group on Ubuntu), and raw ICMP sockets.
         (AF_INET, SOCK_DGRAM | SOCK_RAW) if protocol == IPPROTO_ICMP => {
@@ -41653,7 +41657,7 @@ fn linux_socket_pair(family: u64, socket_type: u64, protocol: u64, output: u64) 
         let made = matches!(
             (family, base, protocol),
             (_, SOCK_STREAM, 0 | 6)
-                | (_, SOCK_DGRAM, 0 | 17)
+                | (_, SOCK_DGRAM, 0 | 17 | 136)
                 | (AF_INET, SOCK_DGRAM | SOCK_RAW, 1)
                 | (AF_INET6, SOCK_DGRAM | SOCK_RAW, 58)
         );
@@ -42042,7 +42046,11 @@ fn linux_socket_accept(descriptor: u64, address: u64, length: u64, flags: u64) -
     // looked at (accept01).
     if matches!(
         crate::linux_socket::kind(listener_slot),
-        Some(crate::linux_socket::Kind::Udp | crate::linux_socket::Kind::Icmp)
+        Some(
+            crate::linux_socket::Kind::Udp
+                | crate::linux_socket::Kind::UdpLite
+                | crate::linux_socket::Kind::Icmp
+        )
     ) || crate::linux_socket::socket_type(listener_slot) == Some(2)
     {
         return LINUX_EOPNOTSUPP;
@@ -42196,6 +42204,7 @@ fn linux_socket_connect(descriptor: u64, address: u64, length: u64) -> u64 {
         Some(
             crate::linux_socket::Kind::Tcp
                 | crate::linux_socket::Kind::Udp
+                | crate::linux_socket::Kind::UdpLite
                 | crate::linux_socket::Kind::Icmp
         )
     ) {
@@ -42266,7 +42275,11 @@ fn linux_socket_sendto(
     if tcp && destination != 0 && !copy_from_linux_user(destination, &mut [0_u8; 16]) {
         return LINUX_EFAULT;
     }
-    if kind == Some(crate::linux_socket::Kind::Udp) && count > UDP_PAYLOAD_LIMIT {
+    if matches!(
+        kind,
+        Some(crate::linux_socket::Kind::Udp | crate::linux_socket::Kind::UdpLite)
+    ) && count > UDP_PAYLOAD_LIMIT
+    {
         return LINUX_EMSGSIZE;
     }
     let netlink = kind == Some(crate::linux_socket::Kind::Netlink);
@@ -42293,7 +42306,11 @@ fn linux_socket_sendto(
     // has room for in one call; a UDP or ICMP datagram stays within a page.
     let limit = if matches!(
         crate::linux_socket::kind(slot),
-        Some(crate::linux_socket::Kind::Udp | crate::linux_socket::Kind::Icmp)
+        Some(
+            crate::linux_socket::Kind::Udp
+                | crate::linux_socket::Kind::UdpLite
+                | crate::linux_socket::Kind::Icmp
+        )
     ) {
         PAGE_SIZE
     } else {
@@ -42486,6 +42503,7 @@ fn linux_socket_recvfrom(
             crate::linux_socket::kind(slot),
             Some(
                 crate::linux_socket::Kind::Udp
+                    | crate::linux_socket::Kind::UdpLite
                     | crate::linux_socket::Kind::Icmp
                     | crate::linux_socket::Kind::Netlink
             )
@@ -42554,7 +42572,10 @@ fn linux_socket_sendmsg(descriptor: u64, message: u64, flags: u64) -> u64 {
     };
     // A UDP datagram past the largest IPv4 payload is EMSGSIZE, however
     // its parts are laid out.
-    if kind == Some(crate::linux_socket::Kind::Udp) {
+    if matches!(
+        kind,
+        Some(crate::linux_socket::Kind::Udp | crate::linux_socket::Kind::UdpLite)
+    ) {
         const UDP_PAYLOAD_LIMIT: u64 = 65_507;
         let mut total = 0_u64;
         for index in 0..iov_count {
@@ -43162,6 +43183,7 @@ fn linux_socket_recvmsg(
             crate::linux_socket::kind(slot),
             Some(
                 crate::linux_socket::Kind::Udp
+                    | crate::linux_socket::Kind::UdpLite
                     | crate::linux_socket::Kind::Icmp
                     | crate::linux_socket::Kind::Netlink
             )
@@ -43359,7 +43381,11 @@ fn linux_socket_send_corked(
     }
     let corks = matches!(
         crate::linux_socket::kind(slot),
-        Some(crate::linux_socket::Kind::Tcp | crate::linux_socket::Kind::Udp)
+        Some(
+            crate::linux_socket::Kind::Tcp
+                | crate::linux_socket::Kind::Udp
+                | crate::linux_socket::Kind::UdpLite
+        )
     );
     if corks && flags & LINUX_MSG_MORE != 0 {
         return crate::linux_socket::cork(slot, payload);
@@ -43843,6 +43869,24 @@ fn linux_socket_setsockopt(
     if level == LINUX_SOL_ICMPV6 && crate::linux_socket::is_ipv6(slot) {
         return linux_icmpv6_setsockopt(slot, option, value, length);
     }
+    if let Some(coverage) = linux_udplite_coverage_option(level, option) {
+        if crate::linux_socket::kind(slot) != Some(crate::linux_socket::Kind::UdpLite) {
+            return LINUX_ENOPROTOOPT;
+        }
+        if length < 4 {
+            return LINUX_EINVAL;
+        }
+        let mut supplied = [0_u8; 4];
+        if !copy_from_linux_user(value, &mut supplied) {
+            return LINUX_EFAULT;
+        }
+        return crate::linux_socket::set_udplite_coverage(
+            slot,
+            coverage,
+            i32::from_ne_bytes(supplied),
+        )
+        .map_or_else(linux_socket_error, |()| 0);
+    }
     // SO_OOBINLINE: an int, read and checked as Linux does (a short length
     // EINVAL, an unreadable value EFAULT); urgent data is not kept apart.
     if level == 1 && option == 10 {
@@ -43993,6 +44037,16 @@ fn linux_socket_setsockopt(
         crate::linux_socket::set_boolean_option(slot, option, enabled)
             .map_or_else(linux_socket_error, |()| 0)
     })
+}
+
+/// UDPLITE_SEND_CSCOV (10) or UDPLITE_RECV_CSCOV (11), at SOL_UDP or
+/// SOL_UDPLITE, as Linux takes either level for them.
+fn linux_udplite_coverage_option(level: u64, option: u64) -> Option<crate::linux_socket::Coverage> {
+    match (level, option) {
+        (17 | 136, 10) => Some(crate::linux_socket::Coverage::Send),
+        (17 | 136, 11) => Some(crate::linux_socket::Coverage::Receive),
+        _ => None,
+    }
 }
 
 /// SOL_ICMPV6 (IPPROTO_ICMPV6), the level of ICMPV6_FILTER.
@@ -44286,11 +44340,16 @@ fn linux_socket_getsockopt(
             Some(
                 crate::linux_socket::Kind::Tcp
                     | crate::linux_socket::Kind::Udp
+                    | crate::linux_socket::Kind::UdpLite
                     | crate::linux_socket::Kind::Icmp
             )
         ),
         6 => kind == Some(crate::linux_socket::Kind::Tcp),
-        17 => kind == Some(crate::linux_socket::Kind::Udp),
+        17 => matches!(
+            kind,
+            Some(crate::linux_socket::Kind::Udp | crate::linux_socket::Kind::UdpLite)
+        ),
+        136 => kind == Some(crate::linux_socket::Kind::UdpLite),
         255 => kind == Some(crate::linux_socket::Kind::Icmp),
         _ => false,
     };
@@ -44371,6 +44430,7 @@ fn linux_socket_getsockopt(
         (1, 38) => match crate::linux_socket::kind(slot) {
             Some(crate::linux_socket::Kind::Tcp) => 6,
             Some(crate::linux_socket::Kind::Udp) => 17,
+            Some(crate::linux_socket::Kind::UdpLite) => 136,
             Some(crate::linux_socket::Kind::Icmp) if crate::linux_socket::is_ipv6(slot) => 58,
             Some(crate::linux_socket::Kind::Icmp) => 1,
             Some(crate::linux_socket::Kind::Unix) => 0,
@@ -44385,11 +44445,13 @@ fn linux_socket_getsockopt(
             Some(
                 crate::linux_socket::Kind::Tcp
                 | crate::linux_socket::Kind::Udp
+                | crate::linux_socket::Kind::UdpLite
                 | crate::linux_socket::Kind::Icmp,
             ) if crate::linux_socket::is_ipv6(slot) => 10,
             Some(
                 crate::linux_socket::Kind::Tcp
                 | crate::linux_socket::Kind::Udp
+                | crate::linux_socket::Kind::UdpLite
                 | crate::linux_socket::Kind::Icmp,
             ) => 2,
             Some(crate::linux_socket::Kind::Unix) => 1,
@@ -44397,6 +44459,17 @@ fn linux_socket_getsockopt(
             Some(crate::linux_socket::Kind::Packet) => 17,
             Some(crate::linux_socket::Kind::Object) => return LINUX_ENOTSOCK,
             None => return LINUX_EBADF,
+        },
+        (17 | 136, 10 | 11) => match crate::linux_socket::udplite_coverage(
+            slot,
+            if option == 10 {
+                crate::linux_socket::Coverage::Send
+            } else {
+                crate::linux_socket::Coverage::Receive
+            },
+        ) {
+            Ok(coverage) => i32::from(coverage),
+            Err(_) => return LINUX_ENOPROTOOPT,
         },
         (6, 1) => {
             if crate::linux_socket::kind(slot) != Some(crate::linux_socket::Kind::Tcp) {

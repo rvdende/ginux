@@ -67,6 +67,14 @@ const TCP_RECEIVE_BUFFER_SIZE: usize = 256 * 1024;
 const UDP_BUFFER_SIZE: usize = 16 * 1024;
 const UDP_PACKET_COUNT: usize = 16;
 const ICMP_BUFFER_SIZE: usize = 16 * 1024;
+/// IPPROTO_UDPLITE.
+const UDPLITE_PROTOCOL: u8 = 136;
+/// The packets and bytes the shared UDP-Lite raw sockets hold each way.
+const UDPLITE_PACKET_COUNT: usize = 32;
+const UDPLITE_BUFFER_SIZE: usize = 64 * 1024;
+/// The bytes of datagrams a UDP-Lite socket keeps for its reader; past it
+/// arrivals are dropped, as a full receive buffer drops them.
+const UDPLITE_RECEIVE_LIMIT: usize = 64 * 1024;
 const ICMP_PACKET_COUNT: usize = 16;
 /// The time to live of packets a socket sends unless IP_TTL sets another:
 /// Linux's default `ip_default_ttl`.
@@ -101,6 +109,14 @@ pub(crate) enum Kind {
     /// interface's ICMP packets through a smoltcp raw socket, which keeps
     /// the IP header (the reply's TTL).
     Icmp,
+    /// A UDP-Lite socket (RFC 3828, IPPROTO_UDPLITE): UDP whose checksum
+    /// may cover only the first bytes of a datagram (UDPLITE_SEND_CSCOV),
+    /// and whose receiver may ask for a least coverage
+    /// (UDPLITE_RECV_CSCOV). smoltcp has no UDP-Lite: the kernel builds
+    /// and checks its datagrams over two raw sockets the runtime shares
+    /// (`Runtime::udplite`), and each socket's datagrams wait in its
+    /// message queue with their sender.
+    UdpLite,
     Unix,
     /// Not a socket: an open file of a kernel object (a DRM render node, a
     /// GPU fence, a dma-buf) that descriptors share as they share sockets,
@@ -378,6 +394,11 @@ struct Slot {
     icmp_raw: bool,
     /// ICMP_FILTER of a raw ICMP socket: types (bit numbers) it drops.
     icmp_filter: u32,
+    /// UDPLITE_SEND_CSCOV and UDPLITE_RECV_CSCOV of a UDP-Lite socket, once
+    /// set: the bytes its checksums cover (0: all), and the least coverage
+    /// it takes of a partly covered datagram (0: none such).
+    udplite_send_coverage: Option<u16>,
+    udplite_receive_coverage: Option<u16>,
     /// ICMPV6_FILTER of a raw ICMPv6 socket, as struct icmp6_filter lays
     /// it out: eight native-endian words, bit `type % 32` of word
     /// `type / 32` set for each of the 256 types it drops.
@@ -460,6 +481,8 @@ impl Slot {
             object: (0, 0),
             icmp_raw: false,
             icmp_filter: 0,
+            udplite_send_coverage: None,
+            udplite_receive_coverage: None,
             icmpv6_filter: [0; 32],
             icmpv6_checksum: 2,
             received_ttl: 0,
@@ -566,6 +589,9 @@ struct Runtime {
     closing: Vec<Closing>,
     next_port: u16,
     local_address: u32,
+    /// The raw sockets that carry UDP-Lite over IPv4 and IPv6, made with
+    /// the first UDP-Lite socket.
+    udplite: Option<[SocketHandle; 2]>,
 }
 
 impl Runtime {
@@ -722,6 +748,35 @@ fn add_icmpv6_socket(runtime: &mut Runtime) -> Result<SocketHandle, Error> {
     )))
 }
 
+/// The runtime's UDP-Lite raw sockets (IPv4, IPv6), made on first use.
+fn udplite_sockets(runtime: &mut Runtime) -> Result<[SocketHandle; 2], Error> {
+    if let Some(handles) = runtime.udplite {
+        return Ok(handles);
+    }
+    let mut handles = [None; 2];
+    for (handle, version) in handles.iter_mut().zip([IpVersion::Ipv4, IpVersion::Ipv6]) {
+        let rx = raw::PacketBuffer::new(
+            filled(UDPLITE_PACKET_COUNT, raw::PacketMetadata::EMPTY)?,
+            filled(UDPLITE_BUFFER_SIZE, 0_u8)?,
+        );
+        let tx = raw::PacketBuffer::new(
+            filled(UDPLITE_PACKET_COUNT, raw::PacketMetadata::EMPTY)?,
+            filled(UDPLITE_BUFFER_SIZE, 0_u8)?,
+        );
+        *handle = Some(runtime.sockets.add(raw::Socket::new(
+            Some(version),
+            Some(IpProtocol::Unknown(UDPLITE_PROTOCOL)),
+            rx,
+            tx,
+        )));
+    }
+    let [Some(v4), Some(v6)] = handles else {
+        return Err(Error::Exhausted);
+    };
+    runtime.udplite = Some([v4, v6]);
+    Ok([v4, v6])
+}
+
 /// The Internet checksum (RFC 1071) of `bytes`.
 fn internet_checksum(bytes: &[u8]) -> u16 {
     let (words, rest) = bytes.as_chunks::<2>();
@@ -781,6 +836,127 @@ impl IcmpPacket {
     }
 }
 
+/// `address` as the UDP-Lite crate takes it.
+fn udplite_ip(address: IpAddress) -> ginux_udplite::Ip {
+    match address {
+        IpAddress::Ipv4(address) => ginux_udplite::Ip::V4(address.octets()),
+        IpAddress::Ipv6(address) => ginux_udplite::Ip::V6(address.octets()),
+    }
+}
+
+/// A UDP-Lite datagram a raw socket received: its addresses and ports,
+/// whether its checksum covers less than all of it (and how much), its
+/// hop limit, and where its payload is in the packet.
+struct UdpLiteDatagram {
+    source: IpEndpoint,
+    destination: IpEndpoint,
+    header: ginux_udplite::Header,
+    ttl: u8,
+    payload: core::ops::Range<usize>,
+}
+
+impl UdpLiteDatagram {
+    /// The datagram `packet` (an IPv4 or IPv6 packet) carries, or None for
+    /// one to drop (`ginux_udplite::parse` says which).
+    fn parse(packet: &[u8]) -> Option<Self> {
+        let (header, total, source, destination, ttl) = match packet.first()? >> 4 {
+            4 => {
+                let header = usize::from(packet[0] & 0xf) * 4;
+                let total = usize::from(u16::from_be_bytes([*packet.get(2)?, *packet.get(3)?]));
+                if packet.get(9) != Some(&UDPLITE_PROTOCOL) || header < 20 {
+                    return None;
+                }
+                let source: [u8; 4] = packet.get(12..16)?.try_into().ok()?;
+                let destination: [u8; 4] = packet.get(16..20)?.try_into().ok()?;
+                (
+                    header,
+                    total.min(packet.len()),
+                    IpAddress::Ipv4(Ipv4Address::from_octets(source)),
+                    IpAddress::Ipv4(Ipv4Address::from_octets(destination)),
+                    packet[8],
+                )
+            }
+            6 => {
+                let payload = usize::from(u16::from_be_bytes([*packet.get(4)?, *packet.get(5)?]));
+                if packet.get(6) != Some(&UDPLITE_PROTOCOL) {
+                    return None;
+                }
+                let source: [u8; 16] = packet.get(8..24)?.try_into().ok()?;
+                let destination: [u8; 16] = packet.get(24..40)?.try_into().ok()?;
+                (
+                    40,
+                    (40 + payload).min(packet.len()),
+                    IpAddress::Ipv6(Ipv6Address::from_octets(source)),
+                    IpAddress::Ipv6(Ipv6Address::from_octets(destination)),
+                    packet[7],
+                )
+            }
+            _ => return None,
+        };
+        let datagram = packet.get(header..total)?;
+        let parsed = ginux_udplite::parse(udplite_ip(source), udplite_ip(destination), datagram)?;
+        Some(Self {
+            source: IpEndpoint::new(source, parsed.source_port),
+            destination: IpEndpoint::new(destination, parsed.destination_port),
+            header: parsed,
+            ttl,
+            payload: header + ginux_udplite::HEADER..total,
+        })
+    }
+}
+
+/// How a UDP-Lite datagram's sender waits in a socket's message queue:
+/// the family (4 or 6), the address (16 bytes), the port, the hop limit.
+fn udplite_sender(source: IpEndpoint, ttl: u8) -> [u8; 20] {
+    let mut sender = [0_u8; 20];
+    match source.addr {
+        IpAddress::Ipv4(address) => {
+            sender[0] = 4;
+            sender[1..5].copy_from_slice(&address.octets());
+        }
+        IpAddress::Ipv6(address) => {
+            sender[0] = 6;
+            sender[1..17].copy_from_slice(&address.octets());
+        }
+    }
+    sender[17..19].copy_from_slice(&source.port.to_be_bytes());
+    sender[19] = ttl;
+    sender
+}
+
+fn udplite_sender_endpoint(sender: &[u8]) -> Option<(IpEndpoint, u8)> {
+    let address = match sender.first()? {
+        4 => IpAddress::Ipv4(Ipv4Address::from_octets(sender.get(1..5)?.try_into().ok()?)),
+        6 => IpAddress::Ipv6(Ipv6Address::from_octets(
+            sender.get(1..17)?.try_into().ok()?,
+        )),
+        _ => return None,
+    };
+    let port = u16::from_be_bytes([*sender.get(17)?, *sender.get(18)?]);
+    Some((IpEndpoint::new(address, port), *sender.get(19)?))
+}
+
+/// The IPv6 packet that carries `payload` (of protocol `next_header`) from
+/// `source` to `destination`.
+fn ipv6_packet(
+    source: Ipv6Address,
+    destination: Ipv6Address,
+    hop_limit: u8,
+    next_header: u8,
+    payload: &[u8],
+) -> Result<Vec<u8>, Error> {
+    let length = u16::try_from(payload.len()).map_err(|_| Error::Invalid)?;
+    let mut packet = filled(40 + payload.len(), 0_u8)?;
+    packet[0] = 0x60;
+    packet[4..6].copy_from_slice(&length.to_be_bytes());
+    packet[6] = next_header;
+    packet[7] = hop_limit;
+    packet[8..24].copy_from_slice(&source.octets());
+    packet[24..40].copy_from_slice(&destination.octets());
+    packet[40..].copy_from_slice(payload);
+    Ok(packet)
+}
+
 /// The IPv6 packet that carries `message` (an ICMPv6 message) from `source`
 /// to `destination`, with the checksum, which covers the IPv6
 /// pseudo-header, filled in at byte `checksum` of the message (ICMPv6's 2
@@ -830,12 +1006,24 @@ fn icmp_ipv4_packet(
     ttl: u8,
     message: &[u8],
 ) -> Result<Vec<u8>, Error> {
+    ipv4_packet(source, destination, ttl, 1, message)
+}
+
+/// The IPv4 packet that carries `message`, of protocol `protocol`, from
+/// `source` to `destination`.
+fn ipv4_packet(
+    source: u32,
+    destination: u32,
+    ttl: u8,
+    protocol: u8,
+    message: &[u8],
+) -> Result<Vec<u8>, Error> {
     let length = u16::try_from(20 + message.len()).map_err(|_| Error::Invalid)?;
     let mut packet = filled(usize::from(length), 0_u8)?;
     packet[0] = 0x45;
     packet[2..4].copy_from_slice(&length.to_be_bytes());
     packet[8] = ttl;
-    packet[9] = 1;
+    packet[9] = protocol;
     packet[12..16].copy_from_slice(&source.to_be_bytes());
     packet[16..20].copy_from_slice(&destination.to_be_bytes());
     let checksum = internet_checksum(&packet[..20]);
@@ -1067,6 +1255,7 @@ impl Sockets {
             closing: Vec::new(),
             next_port: 49_152,
             local_address: ipv4,
+            udplite: None,
         });
         Ok(())
     }
@@ -1135,6 +1324,37 @@ impl Sockets {
                 let _ = socket.recv();
             }
         }
+        // UDP-Lite datagrams go to the socket bound to their port (and
+        // address, and connected to their sender, if it is), or are lost.
+        for handle in runtime.udplite.into_iter().flatten() {
+            let socket = runtime.sockets.get_mut::<raw::Socket>(handle);
+            while let Ok(packet) = socket.recv() {
+                let Some(datagram) = UdpLiteDatagram::parse(packet) else {
+                    continue;
+                };
+                let Some(state) = self.slots.iter_mut().flatten().find(|state| {
+                    state.kind == Kind::UdpLite
+                        && state.local_port == datagram.destination.port
+                        && state.takes_datagram_to(Some(datagram.destination.addr))
+                        && state.remote.is_none_or(|remote| remote == datagram.source)
+                }) else {
+                    continue;
+                };
+                let payload = &packet[datagram.payload.clone()];
+                if !ginux_udplite::coverage_suffices(
+                    &datagram.header,
+                    state.udplite_receive_coverage,
+                ) || state.read_shutdown
+                    || state.local.len() + payload.len() > UDPLITE_RECEIVE_LIMIT
+                {
+                    continue;
+                }
+                let sender = udplite_sender(datagram.source, datagram.ttl);
+                if state.local.push_message(payload, &sender) != 0 {
+                    state.note_input();
+                }
+            }
+        }
     }
 
     fn teardown(&mut self) -> bool {
@@ -1154,6 +1374,11 @@ impl Sockets {
             Kind::Tcp => add_tcp_socket(self.runtime()?)?,
             Kind::Udp => add_udp_socket(self.runtime()?)?,
             Kind::Icmp => add_icmp_socket(self.runtime()?)?,
+            // Its datagrams go through the runtime's shared raw sockets.
+            Kind::UdpLite => {
+                udplite_sockets(self.runtime()?)?;
+                return self.insert(Slot::new(kind, current_owner()));
+            }
         };
         let mut slot = Slot::new(kind, current_owner());
         slot.handle = Some(handle);
@@ -1203,7 +1428,7 @@ impl Sockets {
         let state = self.slot(id)?;
         match state.kind {
             Kind::Tcp => Some(1),
-            Kind::Udp => Some(2),
+            Kind::Udp | Kind::UdpLite => Some(2),
             Kind::Icmp => Some(if state.icmp_raw { 3 } else { 2 }),
             Kind::Unix => Some(state.unix_type),
             Kind::Netlink => Some(3),
@@ -1846,6 +2071,18 @@ impl Sockets {
             }
             _ => remote,
         };
+        // A UDP-Lite socket's peer: its port is chosen now if bind did not.
+        if state.kind == Kind::UdpLite {
+            let local_port = match state.local_port {
+                0 => allocate_ephemeral_port(&mut runtime.next_port, slots, Kind::UdpLite, index)
+                    .ok_or(Error::Exhausted)?,
+                port => port,
+            };
+            let state = slot_in_mut(slots, id).ok_or(Error::Invalid)?;
+            state.local_port = local_port;
+            state.remote = Some(remote);
+            return Ok(());
+        }
         let handle = state.handle.ok_or(Error::Invalid)?;
         if state.listening {
             return Err(Error::Invalid);
@@ -1979,7 +2216,9 @@ impl Sockets {
                 state.remote = Some(remote);
                 Ok(())
             }
-            Kind::Unix | Kind::Object | Kind::Netlink | Kind::Packet => Err(Error::Invalid),
+            Kind::UdpLite | Kind::Unix | Kind::Object | Kind::Netlink | Kind::Packet => {
+                Err(Error::Invalid)
+            }
         }
     }
 
@@ -2066,6 +2305,9 @@ impl Sockets {
         if kind == Kind::Icmp {
             return self.send_icmp(id, input, remote.or(connected).ok_or(Error::NotConnected)?);
         }
+        if kind == Kind::UdpLite {
+            return self.send_udplite(id, input, remote.or(connected).ok_or(Error::NotConnected)?);
+        }
         if kind == Kind::Udp {
             self.bind_udp_ephemeral(id)?;
         }
@@ -2098,9 +2340,12 @@ impl Sockets {
                 }
                 sent
             }
-            Kind::Icmp | Kind::Unix | Kind::Object | Kind::Netlink | Kind::Packet => {
-                Err(Error::Invalid)
-            }
+            Kind::Icmp
+            | Kind::UdpLite
+            | Kind::Unix
+            | Kind::Object
+            | Kind::Netlink
+            | Kind::Packet => Err(Error::Invalid),
         }
     }
 
@@ -2259,6 +2504,89 @@ impl Sockets {
             .map_err(|_| Error::WouldBlock)
     }
 
+    /// Sends `input` as one UDP-Lite datagram from socket `id` to `remote`:
+    /// from its port (chosen now if it has none) and its bound address, or
+    /// loopback for a loopback destination, else the interface's address
+    /// (IPv6 reaches loopback alone). The checksum covers the first
+    /// UDPLITE_SEND_CSCOV bytes when that is less than the datagram, whose
+    /// coverage field then says so; else all of it.
+    fn send_udplite(
+        &mut self,
+        id: SlotId,
+        input: &[u8],
+        remote: IpEndpoint,
+    ) -> Result<usize, Error> {
+        let index = usize::from(id);
+        self.start_runtime()?;
+        let Self { runtime, slots, .. } = self;
+        let runtime = runtime.as_mut().ok_or(Error::Unavailable)?;
+        let handles = udplite_sockets(runtime)?;
+        let state = slot_in(slots, id).ok_or(Error::Invalid)?;
+        if state.write_shutdown {
+            return Err(Error::BrokenPipe);
+        }
+        let destination = match remote.addr {
+            IpAddress::Ipv4(address) if address.is_unspecified() => IpAddress::v4(127, 0, 0, 1),
+            IpAddress::Ipv6(address) if address.is_unspecified() => {
+                IpAddress::Ipv6(Ipv6Address::LOCALHOST)
+            }
+            address => address,
+        };
+        let source = match (state.bound, destination) {
+            (Some(bound), _) => bound,
+            (None, IpAddress::Ipv4(address)) if address.octets()[0] == 127 => {
+                IpAddress::v4(127, 0, 0, 1)
+            }
+            (None, IpAddress::Ipv4(_)) => IpAddress::Ipv4(Ipv4Address::from_octets(
+                runtime.local_address.to_be_bytes(),
+            )),
+            (None, IpAddress::Ipv6(address)) if address.is_loopback() => {
+                IpAddress::Ipv6(Ipv6Address::LOCALHOST)
+            }
+            (None, IpAddress::Ipv6(_)) => return Err(Error::Unavailable),
+        };
+        let (coverage, ttl) = (state.udplite_send_coverage, state.options.ttl);
+        let port = match state.local_port {
+            0 => allocate_ephemeral_port(&mut runtime.next_port, slots, Kind::UdpLite, index)
+                .ok_or(Error::Exhausted)?,
+            port => port,
+        };
+        slot_in_mut(slots, id).ok_or(Error::Invalid)?.local_port = port;
+        let datagram = ginux_udplite::encode(
+            udplite_ip(source),
+            udplite_ip(destination),
+            port,
+            remote.port,
+            coverage,
+            input,
+        )
+        .ok_or(Error::Invalid)?;
+        let ttl = if ttl == 0 { DEFAULT_TTL } else { ttl };
+        let (packet, handle) = match (source, destination) {
+            (IpAddress::Ipv4(source), IpAddress::Ipv4(destination)) => (
+                ipv4_packet(
+                    u32::from_be_bytes(source.octets()),
+                    u32::from_be_bytes(destination.octets()),
+                    ttl,
+                    UDPLITE_PROTOCOL,
+                    &datagram,
+                )?,
+                handles[0],
+            ),
+            (IpAddress::Ipv6(source), IpAddress::Ipv6(destination)) => (
+                ipv6_packet(source, destination, ttl, UDPLITE_PROTOCOL, &datagram)?,
+                handles[1],
+            ),
+            _ => return Err(Error::Invalid),
+        };
+        runtime
+            .sockets
+            .get_mut::<raw::Socket>(handle)
+            .send_slice(&packet)
+            .map(|()| input.len())
+            .map_err(|_| Error::WouldBlock)
+    }
+
     /// Drops the packets at the front of ICMP socket `id`'s queue that are
     /// not for it, and says whether one that is waits there: an echo reply
     /// with its identifier for a ping socket, a type its filter passes for
@@ -2362,10 +2690,12 @@ impl Sockets {
         id: SlotId,
         output: &mut [u8],
     ) -> Result<(usize, Option<IpEndpoint>), Error> {
-        if self
-            .slot(id)
-            .is_some_and(|state| matches!(state.kind, Kind::Udp | Kind::Icmp | Kind::Netlink))
-        {
+        if self.slot(id).is_some_and(|state| {
+            matches!(
+                state.kind,
+                Kind::Udp | Kind::UdpLite | Kind::Icmp | Kind::Netlink
+            )
+        }) {
             return self
                 .recv_message(id, output, false)
                 .map(|(copied, _message_length, endpoint)| (copied, endpoint));
@@ -2413,9 +2743,12 @@ impl Sockets {
                 .recv_slice(output)
                 .map(|(size, metadata)| (size, Some(metadata.endpoint)))
                 .map_err(|_| Error::WouldBlock),
-            Kind::Icmp | Kind::Unix | Kind::Object | Kind::Netlink | Kind::Packet => {
-                Err(Error::Invalid)
-            }
+            Kind::Icmp
+            | Kind::UdpLite
+            | Kind::Unix
+            | Kind::Object
+            | Kind::Netlink
+            | Kind::Packet => Err(Error::Invalid),
         }
     }
 
@@ -2510,10 +2843,12 @@ impl Sockets {
         id: SlotId,
         output: &mut [u8],
     ) -> Result<(usize, Option<IpEndpoint>), Error> {
-        if self
-            .slot(id)
-            .is_some_and(|state| matches!(state.kind, Kind::Udp | Kind::Icmp | Kind::Netlink))
-        {
+        if self.slot(id).is_some_and(|state| {
+            matches!(
+                state.kind,
+                Kind::Udp | Kind::UdpLite | Kind::Icmp | Kind::Netlink
+            )
+        }) {
             return self
                 .recv_message(id, output, true)
                 .map(|(copied, _message_length, endpoint)| (copied, endpoint));
@@ -2549,9 +2884,12 @@ impl Sockets {
                 .peek_slice(output)
                 .map(|(size, metadata)| (size, Some(metadata.endpoint)))
                 .map_err(|_| Error::WouldBlock),
-            Kind::Icmp | Kind::Unix | Kind::Object | Kind::Netlink | Kind::Packet => {
-                Err(Error::Invalid)
-            }
+            Kind::Icmp
+            | Kind::UdpLite
+            | Kind::Unix
+            | Kind::Object
+            | Kind::Netlink
+            | Kind::Packet => Err(Error::Invalid),
         }
     }
 
@@ -2609,7 +2947,7 @@ impl Sockets {
                 }
             }
         }
-        if !matches!(kind, Some(Kind::Udp | Kind::Icmp)) {
+        if !matches!(kind, Some(Kind::Udp | Kind::UdpLite | Kind::Icmp)) {
             let (copied, endpoint) = if peek_only {
                 self.peek(id, output)?
             } else {
@@ -2624,6 +2962,23 @@ impl Sockets {
         }
         if kind == Some(Kind::Icmp) {
             return self.recv_icmp(id, output, peek_only);
+        }
+        // A UDP-Lite datagram, with its sender.
+        if kind == Some(Kind::UdpLite) {
+            let state = slot_in_mut(&mut self.slots, id).ok_or(Error::Invalid)?;
+            let (copied, length, sender) = if peek_only {
+                let (copied, length, sender) =
+                    state.local.peek_message(output).ok_or(Error::WouldBlock)?;
+                (copied, length, udplite_sender_endpoint(sender))
+            } else {
+                let (copied, length, sender) =
+                    state.local.pop_message(output).ok_or(Error::WouldBlock)?;
+                (copied, length, udplite_sender_endpoint(&sender))
+            };
+            if let Some((_, ttl)) = sender {
+                state.received_ttl = ttl;
+            }
+            return Ok((copied, length, sender.map(|(endpoint, _)| endpoint)));
         }
         let handle = state.handle.ok_or(Error::Invalid)?;
         let runtime = self.runtime()?;
@@ -2686,6 +3041,13 @@ impl Sockets {
             ));
         }
         let state = self.slot(id)?;
+        if state.kind == Kind::UdpLite {
+            return Some((
+                state.read_shutdown || !state.local.messages.is_empty(),
+                true,
+                false,
+            ));
+        }
         if state.listening && !state.pending.is_empty() {
             return Some((true, false, false));
         }
@@ -2725,7 +3087,12 @@ impl Sockets {
                 let socket = runtime.sockets.get::<udp::Socket>(handle);
                 (socket.can_recv(), socket.can_send(), false)
             }
-            Kind::Icmp | Kind::Unix | Kind::Object | Kind::Netlink | Kind::Packet => return None,
+            Kind::Icmp
+            | Kind::UdpLite
+            | Kind::Unix
+            | Kind::Object
+            | Kind::Netlink
+            | Kind::Packet => return None,
         })
     }
 
@@ -2777,7 +3144,7 @@ impl Sockets {
             state.port_locked,
         );
         match kind {
-            Kind::Udp | Kind::Icmp => {
+            Kind::Udp | Kind::UdpLite | Kind::Icmp => {
                 self.slot_mut(id).ok_or(Error::Invalid)?.remote = None;
                 Ok(())
             }
@@ -3126,7 +3493,7 @@ pub(crate) fn address_form_ipv4(id: SlotId) -> Result<(), Error> {
         && !matches!(state.bound, Some(IpAddress::Ipv6(_)));
     let allowed = match state.kind {
         Kind::Tcp => over_ipv4 && !state.listening,
-        Kind::Udp => state.remote.is_none() || over_ipv4,
+        Kind::Udp | Kind::UdpLite => state.remote.is_none() || over_ipv4,
         _ => false,
     };
     if !allowed {
@@ -3337,6 +3704,45 @@ fn answer_netlink_requests(state: &mut Slot, input: &[u8]) -> Result<(), Error> 
     Ok(())
 }
 
+/// Which UDP-Lite checksum coverage option: UDPLITE_SEND_CSCOV or
+/// UDPLITE_RECV_CSCOV.
+#[derive(Clone, Copy)]
+pub(crate) enum Coverage {
+    Send,
+    Receive,
+}
+
+/// Sets a UDP-Lite coverage option of socket `id`, as Linux takes it: 1
+/// to 7 mean the 8-byte header, past 65535 is 65535 (EINVAL for a socket
+/// that is no UDP-Lite one).
+pub(crate) fn set_udplite_coverage(id: SlotId, option: Coverage, value: i32) -> Result<(), Error> {
+    let mut sockets = SOCKETS.lock();
+    let state = sockets
+        .slot_mut(id)
+        .filter(|state| state.kind == Kind::UdpLite)
+        .ok_or(Error::Invalid)?;
+    let value = ginux_udplite::coverage_option(value);
+    match option {
+        Coverage::Send => state.udplite_send_coverage = Some(value),
+        Coverage::Receive => state.udplite_receive_coverage = Some(value),
+    }
+    Ok(())
+}
+
+/// A UDP-Lite coverage option of socket `id` (0 until set).
+pub(crate) fn udplite_coverage(id: SlotId, option: Coverage) -> Result<u16, Error> {
+    let sockets = SOCKETS.lock();
+    let state = sockets
+        .slot(id)
+        .filter(|state| state.kind == Kind::UdpLite)
+        .ok_or(Error::Invalid)?;
+    Ok(match option {
+        Coverage::Send => state.udplite_send_coverage,
+        Coverage::Receive => state.udplite_receive_coverage,
+    }
+    .unwrap_or(0))
+}
+
 /// Opens an ICMP socket: a raw one (SOCK_RAW) or a ping socket.
 pub(crate) fn open_icmp(raw: bool) -> Result<SlotId, Error> {
     SOCKETS.lock().open_icmp(raw)
@@ -3427,7 +3833,7 @@ pub(crate) fn set_ttl(id: SlotId, ttl: u8) -> Result<(), Error> {
             .sockets
             .get_mut::<udp::Socket>(handle)
             .set_hop_limit(hop_limit),
-        Kind::Icmp | Kind::Unix | Kind::Object | Kind::Netlink | Kind::Packet => {}
+        Kind::Icmp | Kind::UdpLite | Kind::Unix | Kind::Object | Kind::Netlink | Kind::Packet => {}
     }
     Ok(())
 }
@@ -3924,7 +4330,12 @@ pub(crate) fn recv_message_blocking(
     if output.is_empty() {
         return Ok((0, 0, None));
     }
-    if !wait_all || matches!(kind(id), Some(Kind::Udp | Kind::Icmp | Kind::Netlink)) {
+    if !wait_all
+        || matches!(
+            kind(id),
+            Some(Kind::Udp | Kind::UdpLite | Kind::Icmp | Kind::Netlink)
+        )
+    {
         for () in attempts(id, TimeoutOption::Receive) {
             match recv_message(id, output, peek_only) {
                 Err(Error::WouldBlock | Error::InProgress) => core::hint::spin_loop(),
@@ -4051,7 +4462,7 @@ pub(crate) fn event_counts(id: SlotId) -> Option<(u32, u32)> {
     let counted = match state.kind {
         Kind::Unix | Kind::Netlink => true,
         Kind::Tcp => state.is_local(),
-        Kind::Udp | Kind::Icmp | Kind::Object | Kind::Packet => false,
+        Kind::Udp | Kind::UdpLite | Kind::Icmp | Kind::Object | Kind::Packet => false,
     };
     counted.then_some((state.input_events, state.output_events))
 }

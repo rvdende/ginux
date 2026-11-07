@@ -19,6 +19,7 @@ members = [
     "crates/runtime-memory",
     "crates/seccomp",
     "crates/tty",
+    "crates/udplite",
     "crates/usb-audio",
     "crates/usb-hid",
     "crates/virtio-gpu",

@@ -498,6 +498,7 @@ dependencies = [
  "ginux-rtnetlink",
  "ginux-seccomp",
  "ginux-tty",
+ "ginux-udplite",
  "ginux-usb-audio",
  "ginux-usb-hid",
  "ginux-virtio-gpu",
@@ -594,6 +595,10 @@ version = "0.1.0"
 
 [[package]]
 name = "ginux-tty"
+version = "0.1.0"
+
+[[package]]
+name = "ginux-udplite"
 version = "0.1.0"
 
 [[package]]

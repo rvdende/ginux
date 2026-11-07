@@ -18,6 +18,7 @@ ginux-credentials = { path = "../crates/credentials" }
 ginux-keyrings = { path = "../crates/keyrings" }
 ginux-landlock = { path = "../crates/landlock" }
 ginux-rtnetlink = { path = "../crates/rtnetlink" }
+ginux-udplite = { path = "../crates/udplite" }
 ginux-tty = { path = "../crates/tty" }
 ginux-image-store = { path = "../crates/image-store" }
 ginux-memory-areas = { path = "../crates/memory-areas" }
