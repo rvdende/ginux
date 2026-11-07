@@ -22,6 +22,7 @@ mod linux_futex;
 mod linux_hugetlb;
 mod linux_ktls;
 mod linux_numa;
+mod linux_perf;
 mod linux_poll;
 mod linux_pty;
 mod linux_quota;
@@ -61,6 +62,7 @@ use linux_futex::*;
 use linux_hugetlb::*;
 use linux_ktls::*;
 use linux_numa::*;
+use linux_perf::*;
 use linux_poll::*;
 use linux_pty::*;
 use linux_quota::*;
@@ -645,6 +647,9 @@ struct X86RuntimeOwner {
     /// Per thread, the timestamp-counter cycles it has run, charged when it
     /// leaves a CPU (`linux_charge_thread_cpu`).
     LINUX_THREAD_CPU_CYCLES: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
+    /// Per thread, the CPU it last ran on plus 1 (0: not run yet), for
+    /// perf's CPU_MIGRATIONS.
+    LINUX_THREAD_LAST_CPUS: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
     LINUX_THREAD_TLS_EXTENTS: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
     LINUX_THREAD_TLS_SIZES: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
     LINUX_THREAD_WAIT_DEADLINES: RuntimeRef<[CpuBankedAtomicU64; LINUX_THREAD_LIMIT]>,
@@ -1205,6 +1210,7 @@ static X86_RUNTIME: X86RuntimeOwner = X86RuntimeOwner {
     LINUX_THREAD_TIDS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_THREAD_TIDS),
     LINUX_THREAD_NICES: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_THREAD_NICES),
     LINUX_THREAD_CPU_CYCLES: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_THREAD_CPU_CYCLES),
+    LINUX_THREAD_LAST_CPUS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_THREAD_LAST_CPUS),
     LINUX_THREAD_TLS_EXTENTS: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_THREAD_TLS_EXTENTS),
     LINUX_THREAD_TLS_SIZES: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_THREAD_TLS_SIZES),
     LINUX_THREAD_WAIT_DEADLINES: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_THREAD_WAIT_DEADLINES),
@@ -3536,6 +3542,8 @@ static X86_RUNTIME_BACKING_LINUX_THREAD_TIDS: [CpuBankedAtomicU32; LINUX_THREAD_
     [const { CpuBankedAtomicU32::new(0) }; LINUX_THREAD_LIMIT];
 static X86_RUNTIME_BACKING_LINUX_THREAD_NICES: [CpuBankedAtomicU8; LINUX_THREAD_LIMIT] =
     [const { CpuBankedAtomicU8::new(LINUX_NICE_DEFAULT) }; LINUX_THREAD_LIMIT];
+static X86_RUNTIME_BACKING_LINUX_THREAD_LAST_CPUS: [CpuBankedAtomicU64; LINUX_THREAD_LIMIT] =
+    [const { CpuBankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
 static X86_RUNTIME_BACKING_LINUX_THREAD_CPU_CYCLES: [CpuBankedAtomicU64; LINUX_THREAD_LIMIT] =
     [const { CpuBankedAtomicU64::new(0) }; LINUX_THREAD_LIMIT];
 static X86_RUNTIME_BACKING_LINUX_THREAD_POINTERS: [CpuBankedAtomicU64; LINUX_THREAD_LIMIT] =
@@ -7630,6 +7638,7 @@ pub(crate) fn stop_configured_container() {
     activation::discard_parked(linux_execution_instance() as u32);
     crate::linux_exe::forget_instance(X86_RUNTIME.LINUX_EXECUTION_INSTANCE.load(Ordering::SeqCst));
     crate::linux_areas::forget_instance(linux_execution_instance());
+    linux_perf_forget_instance(linux_execution_instance());
     crate::linux_mounts::forget_instance(linux_execution_instance());
     crate::linux_lease::forget_domain(linux_execution_instance());
     crate::linux_core::forget_domain(linux_execution_instance());
@@ -8341,6 +8350,7 @@ fn reserve_linux_thread(
     X86_RUNTIME.LINUX_THREAD_ROBUST_LISTS[slot].store(0, Ordering::SeqCst);
     X86_RUNTIME.LINUX_THREAD_NICES[slot].store(current_linux_thread_nice(), Ordering::SeqCst);
     X86_RUNTIME.LINUX_THREAD_CPU_CYCLES[slot].store(0, Ordering::SeqCst);
+    X86_RUNTIME.LINUX_THREAD_LAST_CPUS[slot].store(0, Ordering::SeqCst);
     X86_RUNTIME.LINUX_THREAD_RSEQ_POINTERS[slot].store(0, Ordering::SeqCst);
     X86_RUNTIME.LINUX_THREAD_RSEQ_LENGTHS[slot].store(0, Ordering::SeqCst);
     X86_RUNTIME.LINUX_THREAD_RSEQ_SIGNATURES[slot].store(0, Ordering::SeqCst);
@@ -14383,9 +14393,7 @@ fn linux_privileged_operation(number: u64) -> Option<linux_user::PrivilegedOpera
         | LINUX_FINIT_MODULE_SYSCALL
         | LINUX_KEXEC_FILE_LOAD_SYSCALL => Some(PrivilegedOperation::ManageKernel),
         LINUX_SETNS_SYSCALL => Some(PrivilegedOperation::ManageNamespaces),
-        LINUX_IOPL_SYSCALL | LINUX_IOPERM_SYSCALL | LINUX_PERF_EVENT_OPEN_SYSCALL => {
-            Some(PrivilegedOperation::RawIo)
-        }
+        LINUX_IOPL_SYSCALL | LINUX_IOPERM_SYSCALL => Some(PrivilegedOperation::RawIo),
         LINUX_BPF_SYSCALL => Some(PrivilegedOperation::LoadBpf),
         LINUX_SYSLOG_SYSCALL => Some(PrivilegedOperation::ObserveKernelLog),
         LINUX_ADJTIMEX_SYSCALL
@@ -17718,12 +17726,19 @@ fn linux_mark_thread_cpu() {
 }
 
 /// Thread `slot` leaves this CPU: the cycles since it took the CPU are
-/// its, as Linux charges a task at the switch.
+/// its, as Linux charges a task at the switch. That is a context switch,
+/// and a migration when the thread ran elsewhere the time before.
 fn linux_charge_thread_cpu(slot: usize) {
     let mark = LINUX_THREAD_CPU_MARK[linux_cpu_slot()].swap(0, Ordering::Relaxed);
     let now = timer::timestamp_counter();
     if mark == 0 || now <= mark || slot >= LINUX_THREAD_LIMIT {
         return;
+    }
+    crate::cpu_time::note(crate::cpu_time::TaskEvent::ContextSwitch);
+    let cpu = linux_cpu_slot() as u64 + 1;
+    let last = X86_RUNTIME.LINUX_THREAD_LAST_CPUS[slot].swap(cpu, Ordering::Relaxed);
+    if last != 0 && last != cpu {
+        crate::cpu_time::note(crate::cpu_time::TaskEvent::Migration);
     }
     X86_RUNTIME.LINUX_THREAD_CPU_CYCLES[slot].fetch_add(now - mark, Ordering::SeqCst);
 }
@@ -19175,6 +19190,7 @@ struct LinuxThreadRuntimeState {
     owner_only: u8,
     nice: u8,
     cpu_cycles: u64,
+    last_cpu: u64,
 }
 
 impl LinuxThreadRuntimeState {
@@ -19182,6 +19198,7 @@ impl LinuxThreadRuntimeState {
         owner_only: 0,
         nice: LINUX_NICE_DEFAULT,
         cpu_cycles: 0,
+        last_cpu: 0,
         state: LINUX_THREAD_FREE,
         generation: 0,
         tid: 0,
@@ -19751,10 +19768,11 @@ fn save_current_linux_process_runtime_state(pid: u32) {
 
 fn save_current_linux_process_runtime_state_now(pid: u32) {
     let started = cfg!(feature = "linux-boot-profile").then(timer::timestamp_counter);
-    linux_process::charge_live_process_cpu(timer::timestamp_counter());
+    // The thread leaves first, so its switch is in the interval charged.
     if let Some(slot) = current_linux_thread_slot() {
         linux_charge_thread_cpu(slot);
     }
+    linux_process::charge_live_process_cpu(timer::timestamp_counter());
     adopt_linux_process_bank(pid);
     if !linux_bank_holds(linux_cpu_bank(), pid, linux_execution_instance()) {
         // The bank holds another process: its state is not this one's.
@@ -19917,6 +19935,7 @@ fn capture_linux_thread_runtime_state(slot: usize) -> LinuxThreadRuntimeState {
         owner_only: X86_RUNTIME.LINUX_THREAD_OWNER_ONLY[slot].load(Ordering::SeqCst),
         nice: X86_RUNTIME.LINUX_THREAD_NICES[slot].load(Ordering::SeqCst),
         cpu_cycles: X86_RUNTIME.LINUX_THREAD_CPU_CYCLES[slot].load(Ordering::SeqCst),
+        last_cpu: X86_RUNTIME.LINUX_THREAD_LAST_CPUS[slot].load(Ordering::SeqCst),
     }
 }
 
@@ -19938,6 +19957,7 @@ fn restore_linux_thread_runtime_state(
         X86_RUNTIME.LINUX_THREAD_TIDS[slot].store(state.tid, Ordering::SeqCst);
         X86_RUNTIME.LINUX_THREAD_NICES[slot].store(state.nice, Ordering::SeqCst);
         X86_RUNTIME.LINUX_THREAD_CPU_CYCLES[slot].store(state.cpu_cycles, Ordering::SeqCst);
+        X86_RUNTIME.LINUX_THREAD_LAST_CPUS[slot].store(state.last_cpu, Ordering::SeqCst);
         X86_RUNTIME.LINUX_THREAD_POINTERS[slot].store(state.pointer, Ordering::SeqCst);
         X86_RUNTIME.LINUX_THREAD_TLS_EXTENTS[slot].store(state.tls_extent, Ordering::SeqCst);
         X86_RUNTIME.LINUX_THREAD_TLS_SIZES[slot].store(state.tls_size, Ordering::SeqCst);
@@ -23885,6 +23905,7 @@ fn verify_linux_sysv_shared_memory_syscalls() -> bool {
     let fanotify = verify_linux_fanotify_syscalls();
     let landlock = verify_linux_landlock_syscalls();
     let numa = verify_linux_numa_syscalls();
+    let perf = verify_linux_perf_event_open();
     let io_uring = verify_linux_io_uring_syscalls();
     let scheduler_priorities = verify_linux_scheduler_priority_ranges();
     let process_priorities = verify_linux_process_priorities();
@@ -23969,6 +23990,7 @@ fn verify_linux_sysv_shared_memory_syscalls() -> bool {
         fadvise,
         runtime_boot_contracts,
         numa,
+        perf,
         mappings_released,
     ]
     .into_iter()
@@ -24010,6 +24032,7 @@ fn verify_linux_sysv_shared_memory_syscalls() -> bool {
         && fanotify
         && landlock
         && numa
+        && perf
         && io_uring
         && scheduler_priorities
         && process_priorities
@@ -32850,6 +32873,13 @@ fn linux_proc_sysctl_write_bytes(device: u16, index: usize, text: &[u8]) -> Resu
         | b"sys/vm/vfs_cache_pressure"
         | b"sys/vm/min_free_kbytes" => Some(0..=i64::from(i32::MAX)),
         b"sys/vm/hugetlb_shm_group" => Some(0..=i64::from(u32::MAX)),
+        // Any int, as Linux's proc_dointvec takes; the sample rate at
+        // least 1.
+        b"sys/kernel/perf_event_paranoid" | b"sys/kernel/perf_event_max_stack" => {
+            Some(i64::from(i32::MIN)..=i64::from(i32::MAX))
+        }
+        b"sys/kernel/perf_event_max_sample_rate" => Some(1..=i64::from(i32::MAX)),
+        b"sys/kernel/perf_event_mlock_kb" => Some(0..=i64::from(i32::MAX)),
         b"sys/kernel/keys/maxkeys"
         | b"sys/kernel/keys/maxbytes"
         | b"sys/kernel/keys/root_maxkeys"
@@ -48774,6 +48804,7 @@ pub(crate) fn linux_release_objects() {
         linux_userfaultfd_release(class, id);
         crate::linux_landlock::release(class, id);
         linux_tun_release(class, id);
+        linux_perf_release(class, id);
     }
 }
 
@@ -49199,6 +49230,8 @@ fn linux_object_syscall(number: u64, descriptor: u64, buffer: u64, count: u64) -
         (LINUX_IOCTL_SYSCALL, LINUX_TUN_CLASS) => linux_tun_ioctl(id, buffer as u32, count),
         (LINUX_READ_SYSCALL, LINUX_TUN_CLASS) => linux_tun_read(id, buffer, count),
         (LINUX_WRITE_SYSCALL, LINUX_TUN_CLASS) => linux_tun_write(id, buffer, count),
+        (LINUX_READ_SYSCALL, LINUX_PERF_CLASS) => linux_perf_read(descriptor, buffer, count),
+        (LINUX_IOCTL_SYSCALL, LINUX_PERF_CLASS) => linux_perf_ioctl(descriptor, buffer, count),
         // Host memory is coherent: there is nothing to flush.
         (LINUX_IOCTL_SYSCALL, crate::linux_drm::CLASS_DMABUF)
             if buffer & 0xffff_ffff == DMA_BUF_IOCTL_SYNC =>
@@ -62789,6 +62822,8 @@ fn linux_descriptor_link_target(
     });
     let (prefix, numbered): (&[u8], bool) = if linux_userfaultfd_descriptor(descriptor) {
         (b"anon_inode:[userfaultfd]", false)
+    } else if linux_perf_descriptor(descriptor) {
+        (b"anon_inode:[perf_event]", false)
     } else if linux_pipe_descriptor(descriptor) {
         (b"pipe:[", true)
     } else if let Some((class, _)) = block {
@@ -64547,6 +64582,8 @@ fn linux_prctl(option: u64, argument2: u64, argument3: u64, argument4: u64, argu
                 LINUX_EFAULT
             }
         }
+        LINUX_PR_TASK_PERF_EVENTS_DISABLE => linux_perf_task_events(false),
+        LINUX_PR_TASK_PERF_EVENTS_ENABLE => linux_perf_task_events(true),
         LINUX_PR_CAP_AMBIENT => {
             let no_raise = X86_RUNTIME.ELF_PROBE_SECUREBITS.load(Ordering::SeqCst)
                 & LINUX_SECBIT_NO_CAP_AMBIENT_RAISE
@@ -67936,11 +67973,24 @@ fn handle_user_fault(frame: *mut UserFaultFrame) -> u64 {
         0
     };
     let fault_metadata = frame.metadata(fault_address);
+    let linux_page_fault = fault_domain.is_none()
+        && frame.is_page_fault()
+        && X86_RUNTIME.ELF_PROBE_ACTIVE.load(Ordering::SeqCst);
+    if linux_page_fault {
+        crate::cpu_time::note(crate::cpu_time::TaskEvent::PageFault);
+    }
+    let resolved = |fault| {
+        if linux_page_fault {
+            crate::cpu_time::note(fault);
+        }
+        0
+    };
+    use crate::cpu_time::TaskEvent::{MajorFault, MinorFault};
     if fault_domain.is_none()
         && X86_RUNTIME.ELF_PROBE_ACTIVE.load(Ordering::SeqCst)
         && refresh_linux_runtime_translation(fault_metadata)
     {
-        return 0;
+        return resolved(MinorFault);
     }
     // A page a userfaultfd context resolves: the thread waits for it.
     if fault_domain.is_none()
@@ -67953,7 +68003,7 @@ fn handle_user_fault(frame: *mut UserFaultFrame) -> u64 {
     // process's own pages.
     let reclaim = linux_swapon::LinuxUserFaultReclaim::enter();
     if fault_domain.is_none() && materialize_linux_cow_page(fault_metadata) {
-        return 0;
+        return resolved(MinorFault);
     }
     // A sibling thread on another CPU may have resolved this page's
     // copy-on-write (or otherwise made it writable) between the hardware
@@ -67962,7 +68012,7 @@ fn handle_user_fault(frame: *mut UserFaultFrame) -> u64 {
     // Flush it and let the instruction run again instead of killing the
     // process over a write the mapping now allows.
     if fault_domain.is_none() && linux_retry_resolved_write_fault(fault_metadata) {
-        return 0;
+        return resolved(MinorFault);
     }
     if fault_domain.is_none()
         && X86_RUNTIME.ELF_PROBE_ACTIVE.load(Ordering::SeqCst)
@@ -67973,7 +68023,9 @@ fn handle_user_fault(frame: *mut UserFaultFrame) -> u64 {
             || linux_flip_write_execute_page(fault_metadata)
             || linux_volume_page_mkwrite(fault_metadata))
     {
-        return 0;
+        // A shared file page read back from its file is a major fault.
+        let major = LINUX_FAULT_READ_FILE.swap(false, Ordering::Relaxed);
+        return resolved(if major { MajorFault } else { MinorFault });
     }
     drop(reclaim);
     if fault_domain.is_some() && failure_policy.is_none() {
@@ -68604,6 +68656,11 @@ fn materialize_linux_cow_address(address: u64) -> bool {
     address_space::release_linux_private_page(source) || failed(7)
 }
 
+/// The fault `materialize_linux_runtime_mapping` just resolved read its
+/// page from its file (a major fault, as perf counts it); faults are
+/// handled under the kernel entry lock, one at a time.
+static LINUX_FAULT_READ_FILE: AtomicBool = AtomicBool::new(false);
+
 fn materialize_linux_runtime_mapping(fault: domain::FaultMetadata) -> bool {
     if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
         || fault.vector != 14
@@ -68616,6 +68673,7 @@ fn materialize_linux_runtime_mapping(fault: domain::FaultMetadata) -> bool {
     }
     let page_address = fault.address & !(PAGE_SIZE as u64 - 1);
     if linux_refill_shared_file_page(page_address) {
+        LINUX_FAULT_READ_FILE.store(true, Ordering::Relaxed);
         return true;
     }
     let page = address_space::current_linux_runtime_page(page_address);

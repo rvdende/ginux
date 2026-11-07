@@ -834,7 +834,7 @@ pub(super) const LINUX_AIO_MAX_NR: u64 = 65_536;
 pub(super) const LINUX_MAX_MAP_COUNT: usize = 65_530;
 // threads-max below is linux_process::PROCESS_LIMIT.
 const _: () = assert!(crate::linux_process::PROCESS_LIMIT == 4096);
-pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 60] = linux_numbered_sysctls([
+pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 64] = linux_numbered_sysctls([
     // The most memory areas a process may have (LINUX_MAX_MAP_COUNT).
     (b"sys/vm/max_map_count", b"65530\n"),
     // Writing 1, 2 or 3 drops the volumes' page caches (linux_blockfs);
@@ -890,6 +890,13 @@ pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 60] = linux_numbered_
     // Who may make io_uring rings: 0 everyone, 1 CAP_SYS_ADMIN, 2 nobody.
     (b"sys/kernel/io_uring_disabled", b"0\n"),
     (b"sys/kernel/tainted", b"0\n"),
+    // perf_event_open (cpu/linux_perf.rs): who may count what (2: a task's
+    // user-space work without CAP_PERFMON), the highest sampling rate, the
+    // locked buffer size per user and the deepest call chain.
+    (b"sys/kernel/perf_event_paranoid", b"2\n"),
+    (b"sys/kernel/perf_event_max_sample_rate", b"100000\n"),
+    (b"sys/kernel/perf_event_mlock_kb", b"516\n"),
+    (b"sys/kernel/perf_event_max_stack", b"127\n"),
     (b"sys/user/max_user_namespaces", b"3\n"),
     (b"sys/fs/pipe-max-size", b"1048576\n"),
     (b"sys/fs/aio-max-nr", b"65536\n"),
@@ -1297,6 +1304,8 @@ pub(super) const LINUX_PR_GET_TIMERSLACK: u64 = 30;
 pub(super) const LINUX_PR_SET_CHILD_SUBREAPER: u64 = 36;
 pub(super) const LINUX_PR_GET_CHILD_SUBREAPER: u64 = 37;
 pub(super) const LINUX_PR_CAP_AMBIENT: u64 = 47;
+pub(super) const LINUX_PR_TASK_PERF_EVENTS_DISABLE: u64 = 31;
+pub(super) const LINUX_PR_TASK_PERF_EVENTS_ENABLE: u64 = 32;
 /// SECBIT_NO_CAP_AMBIENT_RAISE: PR_CAP_AMBIENT_RAISE is refused.
 pub(super) const LINUX_SECBIT_NO_CAP_AMBIENT_RAISE: u32 = 1 << 6;
 pub(super) const LINUX_SECUREBITS_VALID_MASK: u32 = 0xff;

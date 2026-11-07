@@ -105,6 +105,10 @@ impl LockRank {
     /// file, volume or memory-area lock, and ranks below the heap so the
     /// tables may grow while held.
     pub(crate) const LANDLOCK: Self = Self(184);
+    /// perf events (cpu/linux_perf.rs); held only to copy or update an
+    /// event, never while counting, and below the heap so the table may
+    /// grow while held.
+    pub(crate) const PERF_EVENTS: Self = Self(178);
     /// The mounted volumes (filesystems on block devices): every path walk
     /// looks at them, so they rank above the device and file tables whose
     /// holders make and remove files (loop devices, pseudo-terminals), and

@@ -2380,6 +2380,9 @@ fn linux_syscall_dispatch(
         LINUX_IOPL_SYSCALL => linux_iopl(first_argument),
         LINUX_DELETE_MODULE_SYSCALL => linux_delete_module(first_argument),
         LINUX_SYSLOG_SYSCALL => linux_syslog(first_argument, buffer, count),
+        LINUX_PERF_EVENT_OPEN_SYSCALL => {
+            linux_perf_event_open(first_argument, buffer, count, register(0), register(2))
+        }
         number if linux_privileged_operation(number).is_some() => {
             linux_deny_privileged_operation(number)
         }

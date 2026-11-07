@@ -639,6 +639,11 @@ struct Process {
     /// included (times' tms_cutime and tms_cstime). A new child starts
     /// with none.
     children_cycles: (u64, u64),
+    /// Its task events (`cpu_time::TaskEvent`), and those of the children
+    /// it waited for (theirs included), which perf's software counters
+    /// count.
+    task_events: [u64; crate::cpu_time::TASK_EVENTS],
+    children_task_events: [u64; crate::cpu_time::TASK_EVENTS],
     /// When the process was created, in nanoseconds since boot (process
     /// accounting's start time and elapsed time).
     started_nanoseconds: u64,
@@ -1668,6 +1673,11 @@ impl ProcessTable {
                 .1
                 .saturating_add(system)
                 .saturating_add(process.children_cycles.1);
+            for event in 0..crate::cpu_time::TASK_EVENTS {
+                parent.children_task_events[event] = parent.children_task_events[event]
+                    .saturating_add(process.task_events[event])
+                    .saturating_add(process.children_task_events[event]);
+            }
         }
         if self
             .processes
@@ -2098,6 +2108,8 @@ impl ProcessTable {
             cpu_cycles: 0,
             user_cycles: 0,
             children_cycles: (0, 0),
+            task_events: [0; crate::cpu_time::TASK_EVENTS],
+            children_task_events: [0; crate::cpu_time::TASK_EVENTS],
             started_nanoseconds: crate::arch::x86_64::cpu::linux_uptime_nanoseconds(),
             posix_timers: [None; POSIX_TIMER_LIMIT],
             itimers: [None; 4],
@@ -3598,7 +3610,62 @@ fn charge_process_interval(interval: crate::cpu_time::ProcessInterval) {
     }) {
         process.cpu_cycles = process.cpu_cycles.saturating_add(interval.total);
         process.user_cycles = process.user_cycles.saturating_add(interval.user);
+        for (total, added) in process.task_events.iter_mut().zip(interval.events) {
+            *total = total.saturating_add(added);
+        }
     }
+}
+
+/// The task events of the live processes of the domain `pid` is in, the
+/// open interval on this CPU included (a CPU-wide perf event's counts).
+pub(crate) fn live_domain_task_events(pid: u32, now: u64) -> [u64; crate::cpu_time::TASK_EVENTS] {
+    let mut events = [0; crate::cpu_time::TASK_EVENTS];
+    let Some(table) = live_process_table_mut() else {
+        return events;
+    };
+    if table.handle_by_pid(pid).is_none() {
+        return events;
+    }
+    for process in table.processes.iter().flatten() {
+        for (total, added) in events.iter_mut().zip(process.task_events) {
+            *total = total.saturating_add(added);
+        }
+    }
+    if let Some(interval) = crate::cpu_time::process_interval(now, false) {
+        for (total, added) in events.iter_mut().zip(interval.events) {
+            *total = total.saturating_add(added);
+        }
+    }
+    events
+}
+
+/// The task events of `pid` (`cpu_time::TaskEvent`), its open interval on
+/// this CPU included when `running`, and with `children` those of the
+/// children it waited for.
+pub(crate) fn live_process_task_events(
+    pid: u32,
+    running: bool,
+    children: bool,
+    now: u64,
+) -> Option<[u64; crate::cpu_time::TASK_EVENTS]> {
+    let table = live_process_table_mut()?;
+    let process = table.process(table.handle_by_pid(pid)?)?;
+    let mut events = process.task_events;
+    if children {
+        for (total, added) in events.iter_mut().zip(process.children_task_events) {
+            *total = total.saturating_add(added);
+        }
+    }
+    if running {
+        if let Some(interval) =
+            crate::cpu_time::process_interval(now, false).filter(|interval| interval.pid == pid)
+        {
+            for (total, added) in events.iter_mut().zip(interval.events) {
+                *total = total.saturating_add(added);
+            }
+        }
+    }
+    Some(events)
 }
 
 /// Starts the CPU interval of process `pid`, switched in at timestamp

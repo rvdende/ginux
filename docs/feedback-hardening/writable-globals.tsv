@@ -387,6 +387,8 @@ interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_THREAD_
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_THREAD_TIDS	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_THREAD_NICES	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_THREAD_CPU_CYCLES	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
+interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_THREAD_LAST_CPUS	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
+interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_FAULT_READ_FILE	process-runtime	allowlist	none	atomic-major-fault-flag-under-kernel-entry-lock
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_THREAD_TLS_EXTENTS	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_THREAD_TLS_SIZES	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_THREAD_WAIT_DEADLINES	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
@@ -458,6 +460,7 @@ interior-mutable	kernel/src/linux_drm.rs	DRM	domain-runtime	allowlist	none	ranke
 interior-mutable	kernel/src/linux_drm.rs	MAKING_NODES	domain-runtime	allowlist	none	atomic-reentrancy-guard
 interior-mutable	kernel/src/linux_kmsg.rs	OPENS	domain-runtime	allowlist	none	ranked-kmsg-readers
 interior-mutable	kernel/src/linux_landlock.rs	STATE	domain-runtime	allowlist	none	ranked-landlock-rulesets-and-domains-owned-per-process
+interior-mutable	kernel/src/arch/x86_64/cpu/linux_perf.rs	PERF_EVENTS	domain-runtime	allowlist	none	ranked-perf-events-table-owned-per-domain
 interior-mutable	kernel/src/linux_landlock.rs	RESTRICTED	domain-runtime	allowlist	none	atomic-restricted-process-count
 interior-mutable	kernel/src/linux_lease.rs	LEASES	process-runtime	allowlist	none	ranked-lease-table
 interior-mutable	kernel/src/linux_lease.rs	COUNT	process-runtime	allowlist	none	atomic-lease-count
@@ -665,6 +668,7 @@ interior-mutable	kernel/src/cpu_time.rs	RUNS	per-cpu-arch	allowlist	none	atomic-
 interior-mutable	kernel/src/cpu_time.rs	PROCESS_PID	per-cpu-arch	allowlist	none	atomic-per-cpu-time-accounting
 interior-mutable	kernel/src/cpu_time.rs	PROCESS_SINCE	per-cpu-arch	allowlist	none	atomic-per-cpu-time-accounting
 interior-mutable	kernel/src/cpu_time.rs	PROCESS_USER_SINCE	per-cpu-arch	allowlist	none	atomic-per-cpu-time-accounting
+interior-mutable	kernel/src/cpu_time.rs	PROCESS_EVENTS	per-cpu-arch	allowlist	none	atomic-per-cpu-time-accounting
 interior-mutable	kernel/src/arch/x86_64/cpu/architecture.rs	CPU_INDEX_SOURCE	bootstrap-init	allowlist	none	atomic-boot-selected-cpu-index-source
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_SYSCTL_OVERRIDES	domain-runtime	allowlist	none	kernel-entry-serialized-domain-sysctls
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_REALTIME_OFFSET_NANOSECONDS	domain-runtime	allowlist	none	kernel-entry-serialized-domain-clock

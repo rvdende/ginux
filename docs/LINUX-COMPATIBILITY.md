@@ -42,7 +42,7 @@ Detailed bounded behavior for implemented calls lives in
 The matrix must be updated in the same commit whenever syscall dispatch or its
 documented behavior changes.
 
-Current totals: **91 Complete**, **250 Partial**, **34 Policy-denied**, **0 Missing**.
+Current totals: **91 Complete**, **251 Partial**, **33 Policy-denied**, **0 Missing**.
 
 ## Current stopping point
 
@@ -337,9 +337,28 @@ needs the capability permitted and inheritable and no
 `SECBIT_NO_CAP_AMBIENT_RAISE`), and the ambient set follows Linux's rules
 across capset, setuid and exec (kept by an exec that changes no ids, then
 permitted and effective; dropped by a set-ID one); `/proc/PID/status` shows
-`CapInh` through `CapAmb`. Credential-changing exec resets, core-dump
+`CapInh` through `CapAmb`. `PR_TASK_PERF_EVENTS_ENABLE` and `_DISABLE`
+switch the caller's perf events. Credential-changing exec resets, core-dump
 enforcement, speculation controls, and the remaining Linux option families
 are not implemented, so `prctl` remains Partial.
+
+`perf_event_open` gives software events only, as Linux in a VM without a
+PMU: the CPU and task clocks, page faults (minor and major), context
+switches and CPU migrations count (one per-task counter increment where
+each happens, folded into the process with its CPU time); alignment and
+emulation faults, which x86 has none of, and the dummy event read 0;
+hardware, cache, raw, tracepoint and breakpoint events are `ENOENT`.
+`read` formats (times, ids, groups), the enable, disable, reset and id
+ioctls and inheritance (of the children a target waited for) are there;
+sampling (`EOPNOTSUPP`) and the mmap ring buffer are not. The rule for
+what may be counted: a domain's process counts only processes of its own
+domain that it may look into (`ptrace_may_access`), within
+`/proc/sys/kernel/perf_event_paranoid`, which starts at 2 as on Linux (a
+user's own processes' user-space work); a lower value allows only what
+Linux allows at that level, and a CPU-wide event (paranoid 0 or
+`CAP_PERFMON`) counts the domain's processes, never anything outside the
+domain. Counts are per process where Linux counts the thread `pid`
+names.
 
 `arch_prctl(ARCH_SET_FS/ARCH_GET_FS)` treats the FS base as opaque architectural
 thread state rather than requiring it to identify a mapped kernel-owned TLS
@@ -850,7 +869,7 @@ therefore omitted.
 | 295 | preadv | Partial |
 | 296 | pwritev | Partial |
 | 297 | rt_tgsigqueueinfo | Partial |
-| 298 | perf_event_open | Policy-denied |
+| 298 | perf_event_open | Partial |
 | 299 | recvmmsg | Complete |
 | 300 | fanotify_init | Partial |
 | 301 | fanotify_mark | Partial |

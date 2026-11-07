@@ -26,6 +26,35 @@ static STARTED: [AtomicU64; CPU_LIMIT] = [const { AtomicU64::new(0) }; CPU_LIMIT
 static PROCESS_PID: [AtomicU32; CPU_LIMIT] = [const { AtomicU32::new(0) }; CPU_LIMIT];
 static PROCESS_SINCE: [AtomicU64; CPU_LIMIT] = [const { AtomicU64::new(0) }; CPU_LIMIT];
 static PROCESS_USER_SINCE: [AtomicU64; CPU_LIMIT] = [const { AtomicU64::new(0) }; CPU_LIMIT];
+/// The task events of each CPU's open process interval, by `TaskEvent`:
+/// one increment where they happen, added to the process with its CPU
+/// time when the interval closes.
+static PROCESS_EVENTS: [[AtomicU64; TASK_EVENTS]; CPU_LIMIT] =
+    [const { [const { AtomicU64::new(0) }; TASK_EVENTS] }; CPU_LIMIT];
+
+/// The events perf's software counters count per task.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TaskEvent {
+    /// A page fault from user mode (PERF_COUNT_SW_PAGE_FAULTS).
+    PageFault = 0,
+    /// One resolved without reading the page in (PAGE_FAULTS_MIN).
+    MinorFault = 1,
+    /// One that read the page's data from its file (PAGE_FAULTS_MAJ).
+    MajorFault = 2,
+    /// A thread left its CPU (CONTEXT_SWITCHES).
+    ContextSwitch = 3,
+    /// A thread ran on another CPU than last time (CPU_MIGRATIONS).
+    Migration = 4,
+}
+
+pub(crate) const TASK_EVENTS: usize = 5;
+
+/// `event` happened to the process this CPU runs.
+pub(crate) fn note(event: TaskEvent) {
+    if let Some(cpu) = slot() {
+        PROCESS_EVENTS[cpu][event as usize].fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 fn slot() -> Option<usize> {
     cpu::current_cpu_index_checked().filter(|cpu| *cpu < CPU_LIMIT)
@@ -73,6 +102,8 @@ pub(crate) struct ProcessInterval {
     pub(crate) pid: u32,
     pub(crate) total: u64,
     pub(crate) user: u64,
+    /// The task events in it, by `TaskEvent`.
+    pub(crate) events: [u64; TASK_EVENTS],
 }
 
 /// This CPU starts running process `pid` at timestamp `now`: its interval
@@ -92,6 +123,14 @@ pub(crate) fn start_process_interval(pid: u32, now: u64) -> Option<ProcessInterv
 pub(crate) fn process_interval(now: u64, close: bool) -> Option<ProcessInterval> {
     let cpu = slot()?;
     let user = user_cycles(cpu, now);
+    // Closing takes the interval's events, whoever's they were.
+    let events: [u64; TASK_EVENTS] = core::array::from_fn(|event| {
+        if close {
+            PROCESS_EVENTS[cpu][event].swap(0, Ordering::Relaxed)
+        } else {
+            PROCESS_EVENTS[cpu][event].load(Ordering::Relaxed)
+        }
+    });
     let (pid, since, user_since) = if close {
         (
             PROCESS_PID[cpu].swap(0, Ordering::Relaxed),
@@ -113,6 +152,7 @@ pub(crate) fn process_interval(now: u64, close: bool) -> Option<ProcessInterval>
         pid,
         total,
         user: user.saturating_sub(user_since).min(total),
+        events,
     })
 }
 
