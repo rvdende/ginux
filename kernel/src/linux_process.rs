@@ -3751,6 +3751,18 @@ pub(crate) fn set_live_process_futex_sleep(pid: u32, deadline: Option<u64>) {
     }
 }
 
+/// Whether process `pid` is parked asleep with its mark's deadline passed
+/// by `now`: due to run, to find its wait over.
+pub(crate) fn live_process_sleep_due(pid: u32, now: u64) -> bool {
+    live_process_table_mut().is_some_and(|table| {
+        table
+            .handle_by_pid(pid)
+            .and_then(|handle| table.process(handle))
+            .and_then(Process::marked_asleep_until)
+            .is_some_and(|deadline| deadline <= now)
+    })
+}
+
 /// Whether process `pid` sleeps in a futex wait nothing has ended by `now`
 /// (`Process::is_asleep`): resuming it would only find it waiting again.
 pub(crate) fn live_process_futex_asleep(pid: u32, now: u64) -> bool {

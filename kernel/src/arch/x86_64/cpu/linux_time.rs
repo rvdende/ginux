@@ -1104,7 +1104,7 @@ fn linux_sleep_live_return(
             // usleep (futex_cmp_requeue01) took the CPU from the one with
             // work when every round resumed each of them.
             let pid = current_linux_process_pid();
-            mark_linux_process_asleep(pid, deadline, LINUX_SLEEP_WAKE_MARGIN_NS);
+            mark_linux_process_asleep(pid, deadline, linux_sleep_wake_margin());
             let turn = linux_timed_wait_run_others(output, caller, number, Some(deadline));
             if let LinuxWaitTurn::Done(result) = turn {
                 // Yielded to start again: still asleep until then.

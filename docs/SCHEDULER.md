@@ -475,3 +475,58 @@ namespaces at once would see wrongly; and the alternate signal stack, kept
 per process. Next: a thread's wait in poll/epoll on the light path (today
 those calls go to the owner), and lighter rechecks of a parked process
 (each park refreshes the registry's mapping list).
+
+### Sleepers and their deadlines (2026-11-07)
+
+A single-threaded process parked in a futex wait, a wait for children
+(wait4, waitid) or nanosleep is *marked asleep* (`mark_linux_process_asleep`,
+`Process.futex_sleep`) until its wait's deadline or its own real or POSIX
+timer, whichever is first (a wait for children has none of its own). While
+the mark holds, with `waiting` set and the deadline not passed
+(`linux_process_asleep`), the runtime loop and the application processors
+pass the process over instead of resuming it to look at its wait again. A
+wake clears `waiting` (FUTEX_WAKE from another process, a child's change of
+state, a signal it takes), and each dispatch clears the mark, so every
+sleep sets it again.
+
+- **The deadlines** are kept in a min-heap (`crates/deadline-heap`, tested
+  on the host), so the earliest is found without walking every process
+  (`next_live_futex_sleep_deadline`). Entries are checked lazily against
+  the mark they were pushed for and dropped when it no longer holds; a heap
+  that overflowed is rebuilt from the process table.
+- **The tick** is brought forward to the earliest sleeper's deadline, as it
+  is for a blocked thread's (`request_linux_tick_within`, rounded up so it
+  comes at the deadline, not just before it), and the boot CPU does not
+  halt with a sleeper due before its next tick: a halt there slept through
+  the deadline whenever nothing else woke the CPU.
+- **Who resumes a due sleeper.** The boot CPU's runtime loop at its next
+  scheduling point, or an idle application processor: one takes a parked
+  (Sleeping) process when its deadline has passed, or when its affinity
+  keeps it from the boot CPU (pinned to another CPU, it otherwise slept for
+  good). An application processor with a sleeper due within a tick keeps
+  looking every few microseconds instead of backing off to a millisecond.
+  The boot CPU, finding a sleeper due that it did not run, lets the
+  kernel-entry lock go for a moment and looks again, instead of halting or
+  looking again at once with the lock held, which kept the CPU a sleeper
+  was pinned to from ever taking it (`linux_wait_for_interrupt`).
+- **Wakeup preemption.** A tick that finds a sleeper due ends the slice of
+  the process it interrupted, on any CPU, once per deadline
+  (`linux_sleeper_due_from_timer`), as Linux preempts for a woken task:
+  otherwise a process running nested in another's system call, or for a
+  whole slice, held the sleeper off for up to 50 ms (24 ms seen). The
+  yield goes to the scheduler that entered the process; if that scheduler
+  runs another first, the sleeper waits for the next scheduling point
+  rather than every tick cutting a slice short. A process nobody can take
+  the yield of carries on.
+- **The margin.** On one CPU a nanosleep is marked to 2 ms before its
+  deadline (`LINUX_SLEEP_WAKE_MARGIN_NS`) and from there looks at the clock
+  itself every round, as an unmarked sleep does: a process running nested
+  can still hold off the next scheduling point. With more CPUs an idle one
+  resumes the sleeper on time and sleeps are marked to their deadline
+  (`linux_sleep_wake_margin`). Futex and wait4 waits, which have no look
+  of their own, always are.
+
+Still to come: a sleeper is resumed to find its wait over, not handed its
+result by the wake (step 5's real wakeups), and the tick preempts only a
+process in user mode: one in a long system call holds its CPU until the
+call ends.

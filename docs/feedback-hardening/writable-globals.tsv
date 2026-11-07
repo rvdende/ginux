@@ -607,6 +607,7 @@ interior-mutable	kernel/src/linux_io_uring.rs	RINGS	process-runtime	allowlist	no
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_DOMAIN_EXEC_DEPTH	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_PREEMPTED_CONTEXT	process-runtime	allowlist	none	irq-locked-timer-preemption-handoff
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_PROCESS_SLICE	process-runtime	allowlist	none	timer-process-slice-counter
+interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_WAKEUP_PREEMPTED_DEADLINE	process-runtime	allowlist	none	timer-wakeup-preemption-deadline
 interior-mutable	kernel/src/linux_event_files.rs	EVENTFDS	domain-runtime	allowlist	none	atomic-refcounted-shared-open-files
 interior-mutable	kernel/src/linux_event_files.rs	TIMERFDS	domain-runtime	allowlist	none	atomic-refcounted-shared-open-files
 interior-mutable	kernel/src/linux_drm.rs	FAILURES_LOGGED	domain-runtime	allowlist	none	atomic-diagnostic-counter

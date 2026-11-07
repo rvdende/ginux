@@ -2893,14 +2893,18 @@ pub(crate) fn run_application_processor_runtime(cpu: usize) {
         // A process parked in a wait (Sleeping) is the boot CPU's to resume,
         // unless its affinity keeps it from the boot CPU: then nobody else
         // would, and pinned to another CPU it slept for good (a usleep after
-        // sched_setaffinity, which not even its alarm ended).
+        // sched_setaffinity, which not even its alarm ended). One asleep
+        // until a deadline that has passed is taken here too: the boot CPU
+        // may be held for milliseconds by a process it runs nested (24 ms
+        // past a sleeper's deadline), and an idle CPU resumes it on time.
         let picked = linux_process::ready_live_process_after(after, now, |pid| {
             pid != 1
                 && linux_process::live_process_status(pid).is_some_and(|status| {
                     status.state == linux_process::LiveProcessState::Running
                         || status.state == linux_process::LiveProcessState::Sleeping
-                            && linux_process::live_process_cpu_affinity(pid)
+                            && (linux_process::live_process_cpu_affinity(pid)
                                 .is_some_and(|mask| mask & 1 == 0)
+                                || linux_process::live_process_sleep_due(pid, now))
                 })
                 && !activation::is_running(linux_activation_owner(pid))
         });
@@ -2949,19 +2953,30 @@ pub(crate) fn run_application_processor_runtime(cpu: usize) {
                 deadline.saturating_sub(now) < 1_000_000_000 / timer::LINUX_WAIT_TICKS_PER_SECOND
             })
         };
-        if ticking && idle_ticks >= LINUX_SMP_IDLE_SPIN_TICKS * 64 && !sleeper_due() {
+        // With a sleeper due this CPU looks again soon, not after a wait
+        // that has backed off to about a millisecond: it may be the one
+        // to resume it.
+        let due_soon = sleeper_due();
+        if ticking && idle_ticks >= LINUX_SMP_IDLE_SPIN_TICKS * 64 && !due_soon {
             // SAFETY: interrupts are enabled only around the halt, with no
             // lock held; this CPU's tick handler returns at once from a
             // kernel-mode frame, and `cli` ends the window.
             unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) };
         } else {
-            let until = started.wrapping_add(idle_ticks);
+            let wait = if due_soon {
+                LINUX_SMP_IDLE_SPIN_TICKS
+            } else {
+                idle_ticks
+            };
+            let until = started.wrapping_add(wait);
             while timer::timestamp_counter() < until {
                 core::hint::spin_loop();
             }
         }
         crate::cpu_time::add_idle(timer::timestamp_counter().saturating_sub(started));
-        idle_ticks = (idle_ticks * 2).min(LINUX_SMP_IDLE_SPIN_TICKS * 64);
+        if !due_soon {
+            idle_ticks = (idle_ticks * 2).min(LINUX_SMP_IDLE_SPIN_TICKS * 64);
+        }
     }
     if ticking {
         timer::disarm_linux_cpu_tick();
@@ -16534,19 +16549,26 @@ pub(super) fn linux_wait_for_interrupt() {
     // deadline (`linux_process_asleep`): the tick comes at it instead of up
     // to a tick later. The tick is the boot CPU's. One already due (its
     // deadline came after the look for work) is resumed now, not after a
-    // whole tick (nanosleep01's 5 ms sleeps all ended 1.1 ms late).
+    // whole tick (nanosleep01's 5 ms sleeps all ended 1.1 ms late): this
+    // CPU looks again after a moment, with the lock let go meanwhile. The
+    // sleeper may be one only another CPU may run (pinned there), which
+    // can take it only with the lock: returning with the lock held, the
+    // boot CPU looked and returned again for good, and the sleeper never
+    // ran (`ginux-threadtest pin`'s 1 ms sleeps marked to their end).
+    let mut sleeper_due = false;
     if let Some((deadline, now)) = linux_elapsed_nanoseconds()
         .filter(|_| current_cpu_index_checked() == Some(0))
         .and_then(|now| Some((linux_process::next_live_futex_sleep_deadline()?, now)))
     {
         if deadline <= now {
-            return;
+            sleeper_due = true;
+        } else {
+            timer::request_linux_tick_within(deadline - now);
         }
-        timer::request_linux_tick_within(deadline - now);
     }
     // Other CPUs enter the kernel while this one waits.
     crate::sync::kernel_entry_leave_to_user();
-    if current_cpu_index_checked().is_some_and(|cpu| cpu != 0) {
+    if sleeper_due || current_cpu_index_checked().is_some_and(|cpu| cpu != 0) {
         let until = timer::timestamp_counter().wrapping_add(LINUX_SMP_IDLE_SPIN_TICKS);
         while timer::timestamp_counter() < until {
             core::hint::spin_loop();
@@ -17399,13 +17421,24 @@ fn linux_process_asleep(pid: u32, now: u64) -> bool {
 }
 
 /// How long before its deadline a sleep (nanosleep) stops being passed over
-/// and looks at the clock itself, every round, as an unmarked sleep does: a
-/// marked process is dispatched at a scheduling point after its deadline,
-/// which a process running nested may hold off for milliseconds, where one
-/// that looks for itself halts until its own deadline (nanosleep01's 1 to
-/// 25 ms sleeps woke 1-10 ms late marked to the end). A futex wait, which
-/// has no such look of its own, is marked to its deadline.
-pub(super) const LINUX_SLEEP_WAKE_MARGIN_NS: u64 = 2_000_000;
+/// and looks at the clock itself, every round, as an unmarked sleep does,
+/// in a domain run on one CPU: a marked process is dispatched at a
+/// scheduling point after its deadline, which a process running nested may
+/// hold off for milliseconds, where one that looks for itself halts until
+/// its own deadline (nanosleep01's 1 to 25 ms sleeps woke 1-10 ms late
+/// marked to the end). With more CPUs an idle one resumes a due sleeper
+/// (`run_application_processor_runtime`), and sleeps are marked to their
+/// deadline. A futex wait, which has no look of its own, always is.
+const LINUX_SLEEP_WAKE_MARGIN_NS: u64 = 2_000_000;
+
+/// The margin a sleep is marked asleep with (`LINUX_SLEEP_WAKE_MARGIN_NS`).
+pub(super) fn linux_sleep_wake_margin() -> u64 {
+    if linux_smp_runtime_active() && linux_available_cpu_count() > 1 {
+        0
+    } else {
+        LINUX_SLEEP_WAKE_MARGIN_NS
+    }
+}
 
 /// Marks process `pid` (current, other than init) asleep in a wait of its
 /// own until `deadline` (0: none) or a timer of its own falls due, whichever
@@ -17830,6 +17863,35 @@ static LINUX_PREEMPTED_CONTEXT: [crate::sync::IrqSpinLock<Option<LinuxPreemptedC
 /// entered.
 static LINUX_PROCESS_SLICE: [AtomicU32; CPU_ENTRY_STATE_LIMIT] =
     [const { AtomicU32::new(0) }; CPU_ENTRY_STATE_LIMIT];
+/// Per CPU, the deadline of the due sleeper its tick last ended a slice
+/// early for (`linux_sleeper_due_from_timer`).
+static LINUX_WAKEUP_PREEMPTED_DEADLINE: [AtomicU64; CPU_ENTRY_STATE_LIMIT] =
+    [const { AtomicU64::new(0) }; CPU_ENTRY_STATE_LIMIT];
+
+/// Whether a process marked asleep has reached its deadline, and this CPU's
+/// tick has not yet ended a slice for that deadline: wakeup preemption.
+/// A marked sleeper runs again at a scheduling point, and a process this
+/// CPU runs (nested in another's system call, or for a whole slice) would
+/// otherwise hold that off for up to its slice, 50 ms (sleeps woke up to
+/// 24 ms late). Once per deadline: if the yield's scheduler runs another
+/// process first, the sleeper waits for the next scheduling point, not a
+/// slice ended on every tick.
+fn linux_sleeper_due_from_timer() -> bool {
+    // User code never holds the lock; held or wanted by another CPU, that
+    // CPU is in the kernel and the next tick looks again.
+    let Some(_guard) = crate::sync::kernel_entry_try_lock() else {
+        return false;
+    };
+    let Some(now) = linux_elapsed_nanoseconds() else {
+        return false;
+    };
+    let Some(deadline) =
+        linux_process::next_live_futex_sleep_deadline().filter(|deadline| *deadline <= now)
+    else {
+        return false;
+    };
+    LINUX_WAKEUP_PREEMPTED_DEADLINE[linux_cpu_slot()].swap(deadline, Ordering::SeqCst) != deadline
+}
 
 /// This CPU's entry in a per-CPU table.
 fn linux_cpu_slot() -> usize {
@@ -17893,7 +17955,7 @@ fn linux_preempt_process_from_timer(frame: &mut UserInterruptFrame) {
     let ticks = LINUX_PROCESS_SLICE[linux_cpu_slot()].fetch_add(1, Ordering::SeqCst) + 1;
     let signal_due = !X86_RUNTIME.LINUX_SIGNAL_ACTIVE.load(Ordering::SeqCst)
         && linux_signal_due_from_timer(ticks.is_multiple_of(LINUX_SIGNAL_QUEUE_CHECK_TICKS));
-    if ticks < linux_thread_slice_ticks() && !signal_due {
+    if ticks < linux_thread_slice_ticks() && !signal_due && !linux_sleeper_due_from_timer() {
         return;
     }
     let pid = current_linux_process_pid();

@@ -24,7 +24,7 @@ use rustix::mm::{mmap, mmap_anonymous, munmap, MapFlags, ProtFlags};
 use rustix::process::{wait, WaitOptions};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitCode};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 const PAGE: usize = 4096;
 
@@ -220,9 +220,21 @@ fn fork_exec(program: &std::path::Path) -> std::io::Result<()> {
 fn returns_round(program: &std::path::Path) -> std::io::Result<(u64, u64)> {
     let mut children = Vec::with_capacity(BURST);
     for _ in 0..BURST {
-        children.push(Command::new(program).arg("idle").spawn()?);
+        children.push(
+            Command::new(program)
+                .arg("idle")
+                .stdin(std::process::Stdio::piped())
+                .spawn()?,
+        );
     }
     let during = meminfo_kib("KernelStack").unwrap_or(0);
+    // Each child waits for its stdin to close, so all are alive when the
+    // stacks are counted however long the burst took to start (with a
+    // fixed sleep, the first children's ended before the last had started
+    // once sleeps woke on time).
+    for child in &mut children {
+        drop(child.stdin.take());
+    }
     for mut child in children {
         let status = child.wait()?;
         if !status.success() {
@@ -369,7 +381,8 @@ fn main() -> ExitCode {
         Some("returns") => returns(),
         Some("slab") => slab(),
         Some("idle") => {
-            std::thread::sleep(Duration::from_millis(500));
+            // Until the parent closes stdin.
+            let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
             ExitCode::SUCCESS
         }
         Some("exit") => ExitCode::SUCCESS,
