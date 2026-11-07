@@ -11,6 +11,9 @@
 //!   status 7, which must end them all.
 //! - `segv`: a thread other than the main one writes through a null pointer
 //!   while others spin: the process dies (status 139).
+//! - `pin`: a child pinned to each CPU with sched_setaffinity runs there at
+//!   once and keeps running there across 1 ms sleeps; then the process
+//!   itself moves to the last CPU the same way.
 //!
 //! Each prints `THREADTEST OK <mode>` when it is done and exits 0.
 
@@ -210,6 +213,93 @@ fn segv() -> ExitCode {
     ExitCode::FAILURE
 }
 
+extern "C" {
+    fn fork() -> i32;
+    fn _exit(status: i32) -> !;
+    fn alarm(seconds: u32) -> u32;
+    fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
+    fn sched_getcpu() -> i32;
+    fn usleep(microseconds: u32) -> i32;
+    fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+}
+
+/// A child pinned to `cpu` runs there at once and keeps running there
+/// across sleeps; its exit status says what went wrong (0: nothing).
+fn pinned_child(cpu: usize) -> i32 {
+    // musl's cpu_set_t: 1024 bits.
+    let mut mask = [0_u64; 16];
+    mask[cpu / 64] |= 1 << (cpu % 64);
+    // SAFETY: the mask is a live cpu_set_t-sized buffer.
+    if unsafe { sched_setaffinity(0, size_of_val(&mask), mask.as_ptr()) } != 0 {
+        return 2;
+    }
+    // SAFETY: a plain query.
+    if unsafe { sched_getcpu() } != cpu as i32 {
+        return 3;
+    }
+    for _ in 0..3 {
+        // SAFETY: a plain sleep.
+        unsafe { usleep(1000) };
+        // SAFETY: a plain query.
+        if unsafe { sched_getcpu() } != cpu as i32 {
+            return 4;
+        }
+    }
+    0
+}
+
+/// `pin`: on each CPU (up to four), a forked child pinned to it with
+/// sched_setaffinity reports that CPU at once and again after each of three
+/// 1 ms sleeps, and exits; SIGALRM after 10 s ends one that never runs again.
+fn pin() -> ExitCode {
+    let cpus = thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(4);
+    let mut failures = 0;
+    for cpu in 0..cpus {
+        // SAFETY: the process is single-threaded here, so the child may run
+        // any code.
+        let child = unsafe { fork() };
+        if child == 0 {
+            // SAFETY: arms this child's own alarm, then ends it without the
+            // parent's exit code.
+            unsafe {
+                alarm(10);
+                _exit(pinned_child(cpu))
+            }
+        }
+        if child < 0 {
+            eprintln!("threadtest: fork failed");
+            return ExitCode::FAILURE;
+        }
+        let mut status = 0;
+        // SAFETY: waits for the child just made.
+        if unsafe { waitpid(child, &mut status, 0) } != child {
+            eprintln!("threadtest: waitpid failed");
+            return ExitCode::FAILURE;
+        }
+        println!("PIN cpu={cpu} status={status}");
+        failures += usize::from(status != 0);
+    }
+    // The process itself, not a fresh child, moves to the last CPU at once
+    // and stays there across a sleep, then may run anywhere again.
+    let last = cpus - 1;
+    let status = pinned_child(last);
+    println!("PIN self cpu={last} status={status}");
+    failures += usize::from(status != 0);
+    let all = [u64::MAX; 16];
+    // SAFETY: the mask is a live cpu_set_t-sized buffer.
+    if unsafe { sched_setaffinity(0, size_of_val(&all), all.as_ptr()) } != 0 {
+        eprintln!("threadtest: restoring the affinity failed");
+        failures += 1;
+    }
+    if failures != 0 {
+        return ExitCode::FAILURE;
+    }
+    println!("THREADTEST OK pin");
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let number = |index: usize, default: u64| {
@@ -226,8 +316,11 @@ fn main() -> ExitCode {
         Some("spawn") => spawn(number(1, 10) as usize),
         Some("exit") => exit(),
         Some("segv") => segv(),
+        Some("pin") => pin(),
         _ => {
-            eprintln!("usage: ginux-threadtest spin N | pingpong N | sleep | queue | spawn N | exit | segv");
+            eprintln!(
+                "usage: ginux-threadtest spin N | pingpong N | sleep | queue | spawn N | exit | segv | pin"
+            );
             ExitCode::FAILURE
         }
     }

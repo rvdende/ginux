@@ -2874,10 +2874,18 @@ pub(crate) fn run_application_processor_runtime(cpu: usize) {
             }
         }
         let now = linux_elapsed_nanoseconds().unwrap_or(0);
+        // A process parked in a wait (Sleeping) is the boot CPU's to resume,
+        // unless its affinity keeps it from the boot CPU: then nobody else
+        // would, and pinned to another CPU it slept for good (a usleep after
+        // sched_setaffinity, which not even its alarm ended).
         let picked = linux_process::ready_live_process_after(after, now, |pid| {
             pid != 1
-                && linux_process::live_process_status(pid)
-                    .is_some_and(|status| status.state == linux_process::LiveProcessState::Running)
+                && linux_process::live_process_status(pid).is_some_and(|status| {
+                    status.state == linux_process::LiveProcessState::Running
+                        || status.state == linux_process::LiveProcessState::Sleeping
+                            && linux_process::live_process_cpu_affinity(pid)
+                                .is_some_and(|mask| mask & 1 == 0)
+                })
                 && !activation::is_running(linux_activation_owner(pid))
         });
         if let Some(pid) = picked {

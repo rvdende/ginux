@@ -120,6 +120,10 @@ fn multithread() {
     shell.expect("SLEEP", "ginux-threadtest sleep", 0, Some("THREADTEST OK sleep"));
     shell.expect("QUEUE", "ginux-threadtest queue", 0, Some("THREADTEST OK queue"));
     shell.expect("SPAWN", "ginux-threadtest spawn 10", 0, Some("THREADTEST OK spawn"));
+    // A process pinned to a CPU moves there at once, and its sleeps end
+    // there: pinned to another CPU, one ran on in place and, asleep, was
+    // never resumed.
+    shell.expect("PIN", "ginux-threadtest pin", 0, Some("THREADTEST OK pin"));
     // A few rounds: the process ends while its threads run elsewhere, and
     // the race that lets one of them outlive its memory takes a few tries
     // to show on a quiet host.
