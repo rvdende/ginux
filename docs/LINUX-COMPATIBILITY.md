@@ -329,10 +329,17 @@ process-local, inherited across fork, retained across the current
 non-credential-changing exec path, and restored when Ginux switches between
 live processes. Boot verification covers valid transitions, invalid modes,
 unused-argument behavior, userspace faults, dirty upper register bits, and
-state restoration. Credential-changing exec resets, core-dump enforcement,
-parent-death signals, subreapers, capability controls, securebits, timer
-slack, speculation controls, and the remaining Linux option families are not
-implemented, so `prctl` remains Partial.
+state restoration. `PR_SET_CHILD_SUBREAPER` marks a process whose
+descendants' orphans are reparented to it (the nearest living marked
+ancestor, else init), not inherited across fork; `PR_CAP_AMBIENT` raises,
+lowers, tests and clears ambient capabilities with Linux's checks (a raise
+needs the capability permitted and inheritable and no
+`SECBIT_NO_CAP_AMBIENT_RAISE`), and the ambient set follows Linux's rules
+across capset, setuid and exec (kept by an exec that changes no ids, then
+permitted and effective; dropped by a set-ID one); `/proc/PID/status` shows
+`CapInh` through `CapAmb`. Credential-changing exec resets, core-dump
+enforcement, speculation controls, and the remaining Linux option families
+are not implemented, so `prctl` remains Partial.
 
 `arch_prctl(ARCH_SET_FS/ARCH_GET_FS)` treats the FS base as opaque architectural
 thread state rather than requiring it to identify a mapped kernel-owned TLS

@@ -1147,8 +1147,13 @@ pub(super) const LINUX_FILE_FRAMEBUFFER: u16 = LINUX_FILE_MASK | LINUX_FRAMEBUFF
 /// /dev/input/eventN uses node LINUX_INPUT_NODE_FIRST + N for N below
 /// linux_input::DEVICE_LIMIT.
 pub(super) const LINUX_INPUT_NODE_FIRST: u16 = 0xd800;
+/// The fixed `/proc/1/status`: init, with root's capability sets
+/// (every capability permitted, effective and in the bounding set).
 pub(super) const LINUX_PROC_PID1_STATUS: &[u8] =
-    b"Name:\tinit\nState:\tR (running)\nPid:\t1\nPPid:\t0\n";
+    b"Name:\tinit\nState:\tR (running)\nPid:\t1\nPPid:\t0\n\
+CapInh:\t0000000000000000\nCapPrm:\t000001ffffffffff\nCapEff:\t000001ffffffffff\n\
+CapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\n";
+const _: () = assert!(ginux_credentials::capability::ALL == 0x1ff_ffff_ffff);
 pub(super) const LINUX_PROC_PID2_RUNNING_STATUS: &[u8] =
     b"Name:\tinit\nState:\tR (running)\nPid:\t2\nPPid:\t1\n";
 pub(super) const LINUX_PROC_PID2_STOPPED_STATUS: &[u8] =
@@ -1273,6 +1278,11 @@ pub(super) const LINUX_PR_TSC_ENABLE: u64 = 1;
 pub(super) const LINUX_PR_TSC_SIGSEGV: u64 = 2;
 pub(super) const LINUX_PR_SET_TIMERSLACK: u64 = 29;
 pub(super) const LINUX_PR_GET_TIMERSLACK: u64 = 30;
+pub(super) const LINUX_PR_SET_CHILD_SUBREAPER: u64 = 36;
+pub(super) const LINUX_PR_GET_CHILD_SUBREAPER: u64 = 37;
+pub(super) const LINUX_PR_CAP_AMBIENT: u64 = 47;
+/// SECBIT_NO_CAP_AMBIENT_RAISE: PR_CAP_AMBIENT_RAISE is refused.
+pub(super) const LINUX_SECBIT_NO_CAP_AMBIENT_RAISE: u32 = 1 << 6;
 pub(super) const LINUX_SECUREBITS_VALID_MASK: u32 = 0xff;
 pub(super) const LINUX_PR_TIMING_STATISTICAL: u64 = 0;
 pub(super) const LINUX_PERSONALITY_QUERY: u32 = u32::MAX;

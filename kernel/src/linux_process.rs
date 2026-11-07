@@ -565,6 +565,10 @@ struct Process {
     oom_score_adj: i16,
     /// `/proc/PID/io`'s counts: none in a new child, kept across exec.
     io: IoAccounting,
+    /// Marked a child subreaper (PR_SET_CHILD_SUBREAPER): its
+    /// descendants' orphans are reparented to it rather than to init. Not
+    /// inherited across fork, kept across exec.
+    child_subreaper: bool,
     /// Its memory policy (set_mempolicy): inherited across fork, kept
     /// across exec, as Linux's task policy is. Linux keeps one per thread;
     /// here the process's threads share it.
@@ -1520,18 +1524,37 @@ impl ProcessTable {
     }
 
     /// Hands the children of an exiting process, running or already zombies,
-    /// to the domain's init, as Linux does, so that their exit status can
-    /// still be collected and their slots reused.
+    /// to its nearest living ancestor marked a child subreaper
+    /// (PR_SET_CHILD_SUBREAPER), or else to the domain's init, as Linux's
+    /// find_new_reaper does, so that their exit status can still be
+    /// collected and their slots reused.
     fn reparent_children_to_init(&mut self, handle: ProcessHandle) {
-        let Some(init) = self.handle_by_pid(1).filter(|init| {
-            *init != handle
-                && self.process(*init).is_some_and(|init| {
+        let alive = |table: &Self, candidate: ProcessHandle| {
+            candidate != handle
+                && table.process(candidate).is_some_and(|process| {
                     matches!(
-                        init.state,
+                        process.state,
                         ProcessState::Running | ProcessState::Stopped { .. }
                     )
                 })
-        }) else {
+        };
+        let init = self.handle_by_pid(1).filter(|init| alive(self, *init));
+        let mut subreaper = None;
+        let mut ancestor = self.process(handle).and_then(|process| process.parent);
+        for _ in 0..PROCESS_LIMIT {
+            let Some(candidate) = ancestor.filter(|candidate| Some(*candidate) != init) else {
+                break;
+            };
+            let Some(process) = self.process(candidate) else {
+                break;
+            };
+            if process.child_subreaper && alive(self, candidate) {
+                subreaper = Some(candidate);
+                break;
+            }
+            ancestor = process.parent;
+        }
+        let Some(init) = subreaper.or(init) else {
             return;
         };
         // An adopted child ends with SIGCHLD to init, whatever its clone
@@ -2043,6 +2066,7 @@ impl ProcessTable {
             stopped_in_call: false,
             oom_score_adj,
             io: IoAccounting::default(),
+            child_subreaper: false,
             memory_policy,
             killed_by_signal: 0,
             oom_victim: false,
@@ -4245,6 +4269,28 @@ pub(crate) fn live_process_oom_score_adj(pid: u32) -> Option<i16> {
         ProcessState::Running | ProcessState::Stopped { .. } | ProcessState::Zombie { .. }
     )
     .then_some(process.oom_score_adj)
+}
+
+/// Whether `pid` is marked a child subreaper (PR_GET_CHILD_SUBREAPER).
+pub(crate) fn live_process_child_subreaper(pid: u32) -> Option<bool> {
+    let table = live_process_table_mut()?;
+    let process = table.process(table.handle_by_pid(pid)?)?;
+    Some(process.child_subreaper)
+}
+
+/// Marks `pid` a child subreaper or not (PR_SET_CHILD_SUBREAPER).
+pub(crate) fn set_live_process_child_subreaper(pid: u32, marked: bool) -> bool {
+    let Some(table) = live_process_table_mut() else {
+        return false;
+    };
+    let Some(process) = table
+        .handle_by_pid(pid)
+        .and_then(|handle| table.process_mut(handle))
+    else {
+        return false;
+    };
+    process.child_subreaper = marked;
+    true
 }
 
 /// The memory policy of `pid` (set_mempolicy).

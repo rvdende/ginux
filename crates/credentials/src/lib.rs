@@ -221,6 +221,8 @@ pub mod capability {
     pub const MKNOD: u32 = 27;
     pub const MAC_OVERRIDE: u32 = 33;
     pub const SYSLOG: u32 = 34;
+    pub const PERFMON: u32 = 38;
+    pub const BPF: u32 = 39;
     /// The highest capability Linux defines (CAP_CHECKPOINT_RESTORE).
     pub const LAST: u32 = 40;
     /// Every capability.
@@ -245,6 +247,10 @@ pub struct Capabilities {
     /// The bounding set: what exec may grant and capset may make
     /// inheritable. Only PR_CAPBSET_DROP shrinks it.
     pub bounding: u64,
+    /// The ambient set (PR_CAP_AMBIENT): kept across an exec that grants
+    /// nothing, and then permitted and effective. Always within the
+    /// permitted and inheritable sets.
+    pub ambient: u64,
 }
 
 impl Capabilities {
@@ -254,6 +260,7 @@ impl Capabilities {
         permitted: capability::ALL,
         inheritable: 0,
         bounding: capability::ALL,
+        ambient: 0,
     };
     /// None held (the bounding set is still full).
     pub const NONE: Self = Self {
@@ -261,6 +268,7 @@ impl Capabilities {
         permitted: 0,
         inheritable: 0,
         bounding: capability::ALL,
+        ambient: 0,
     };
 }
 
@@ -325,6 +333,7 @@ impl Credentials {
         if old_root && !new_root {
             caps.permitted = 0;
             caps.effective = 0;
+            caps.ambient = 0;
         }
         if old.effective == 0 && new.effective != 0 {
             caps.effective = 0;
@@ -338,17 +347,76 @@ impl Credentials {
         }
     }
 
-    /// execve(2) without file capabilities: root (real or effective) gets
-    /// every capability of the bounding set permitted, effective when its
-    /// effective id is 0; any other process none.
+    /// execve(2) without file capabilities, after the set-ID bits changed
+    /// the ids (Linux's cap_bprm_creds_from_file): root (real or effective)
+    /// gets its bounding and inheritable sets permitted; the ambient set is
+    /// kept unless the exec changed the effective ids (a set-ID program),
+    /// and is permitted too. Everything permitted is effective when the
+    /// effective id is 0, otherwise only the ambient set.
     pub fn after_exec(&mut self) {
-        if self.user.real == 0 || self.user.effective == 0 {
-            let granted = capability::ALL & self.capabilities.bounding;
-            self.capabilities.permitted = granted;
-            self.capabilities.effective = if self.user.effective == 0 { granted } else { 0 };
+        let caps = &mut self.capabilities;
+        let set_id =
+            self.user.effective != self.user.real || self.group.effective != self.group.real;
+        let root = self.user.real == 0 || self.user.effective == 0;
+        if set_id {
+            caps.ambient = 0;
+        }
+        caps.permitted = if root {
+            (capability::ALL & caps.bounding) | caps.inheritable
         } else {
-            self.capabilities.permitted = 0;
-            self.capabilities.effective = 0;
+            0
+        } | caps.ambient;
+        caps.effective = if self.user.effective == 0 {
+            caps.permitted
+        } else {
+            caps.ambient
+        };
+    }
+
+    /// prctl(PR_CAP_AMBIENT, `operation`, `capability`, `rest`...): 1
+    /// (IS_SET) reads the ambient bit, 2 (RAISE) sets one that is permitted
+    /// and inheritable unless `no_raise` (SECBIT_NO_CAP_AMBIENT_RAISE), 3
+    /// (LOWER) clears one, 4 (CLEAR_ALL, with no other arguments) clears
+    /// them all. Linux's checks in Linux's order: Invalid for a
+    /// capability that does not exist, extra arguments or another
+    /// operation, Permission for a raise that is not allowed.
+    pub fn ambient(
+        &mut self,
+        operation: u64,
+        capability: u64,
+        rest: [u64; 2],
+        no_raise: bool,
+    ) -> Result<bool, Error> {
+        const IS_SET: u64 = 1;
+        const RAISE: u64 = 2;
+        const LOWER: u64 = 3;
+        const CLEAR_ALL: u64 = 4;
+        let caps = &mut self.capabilities;
+        if operation == CLEAR_ALL {
+            if capability | rest[0] | rest[1] != 0 {
+                return Err(Error::Invalid);
+            }
+            caps.ambient = 0;
+            return Ok(false);
+        }
+        if capability > u64::from(capability::LAST) || rest[0] | rest[1] != 0 {
+            return Err(Error::Invalid);
+        }
+        let bit = 1_u64 << capability;
+        match operation {
+            IS_SET => Ok(caps.ambient & bit != 0),
+            RAISE => {
+                if caps.permitted & bit == 0 || caps.inheritable & bit == 0 || no_raise {
+                    return Err(Error::Permission);
+                }
+                caps.ambient |= bit;
+                Ok(false)
+            }
+            LOWER => {
+                caps.ambient &= !bit;
+                Ok(false)
+            }
+            _ => Err(Error::Invalid),
         }
     }
 
@@ -361,6 +429,9 @@ impl Credentials {
         let old = self.capabilities;
         let new = Capabilities {
             bounding: old.bounding,
+            // What is no longer both permitted and inheritable leaves the
+            // ambient set.
+            ambient: old.ambient & new.permitted & new.inheritable,
             ..new
         };
         let inheritable_allowed = if self.has(capability::SETPCAP) {
@@ -686,6 +757,7 @@ mod tests {
             effective: 1,
             inheritable: 0,
             bounding: capability::ALL,
+            ambient: 0,
         };
         assert_eq!(caps.set_capabilities(raised), Err(Error::Permission));
         let mut bounded = Credentials::ROOT;
@@ -705,5 +777,71 @@ mod tests {
         );
         bounded.after_exec();
         assert_eq!(bounded.capabilities.permitted & 1 << capability::KILL, 0);
+    }
+
+    #[test]
+    fn ambient_capabilities_raise_lower_and_survive_exec() {
+        let bind = 1 << capability::NET_BIND_SERVICE;
+        let mut user = Credentials::ROOT;
+        user.user = Ids::all(1000);
+        user.capabilities = Capabilities {
+            effective: bind,
+            permitted: bind,
+            inheritable: 0,
+            ..Capabilities::NONE
+        };
+        let raise = |user: &mut Credentials, no_raise| {
+            user.ambient(2, u64::from(capability::NET_BIND_SERVICE), [0, 0], no_raise)
+        };
+        // Not inheritable yet, then refused by the securebit.
+        assert_eq!(raise(&mut user, false), Err(Error::Permission));
+        user.capabilities.inheritable = bind;
+        assert_eq!(raise(&mut user, true), Err(Error::Permission));
+        assert_eq!(raise(&mut user, false), Ok(false));
+        assert_eq!(raise(&mut user, false), Ok(false));
+        assert_eq!(user.capabilities.ambient, bind);
+        assert_eq!(
+            user.ambient(1, u64::from(capability::NET_BIND_SERVICE), [0, 0], false),
+            Ok(true)
+        );
+        assert_eq!(
+            user.ambient(1, u64::from(capability::NET_RAW), [0, 0], false),
+            Ok(false)
+        );
+        assert_eq!(
+            user.ambient(1, u64::from(capability::LAST) + 1, [0, 0], false),
+            Err(Error::Invalid)
+        );
+        assert_eq!(user.ambient(5, 0, [0, 0], false), Err(Error::Invalid));
+        assert_eq!(user.ambient(4, 1, [0, 0], false), Err(Error::Invalid));
+        assert_eq!(user.ambient(2, 0, [1, 0], false), Err(Error::Invalid));
+        // An exec of an ordinary program: the ambient set is permitted and
+        // effective; a set-ID one drops it.
+        let mut executed = user;
+        executed.after_exec();
+        assert_eq!(executed.capabilities.permitted, bind);
+        assert_eq!(executed.capabilities.effective, bind);
+        let mut set_id = user;
+        set_id.user.effective = 2000;
+        set_id.after_exec();
+        assert_eq!(set_id.capabilities.ambient, 0);
+        assert_eq!(set_id.capabilities.permitted, 0);
+        // Dropping it from the inheritable set drops it from the ambient.
+        let dropped = Capabilities {
+            inheritable: 0,
+            ..user.capabilities
+        };
+        assert_eq!(user.set_capabilities(dropped), Ok(()));
+        assert_eq!(user.capabilities.ambient, 0);
+        user.capabilities.inheritable = bind;
+        assert_eq!(raise(&mut user, false), Ok(false));
+        assert_eq!(
+            user.ambient(3, u64::from(capability::NET_BIND_SERVICE), [0, 0], false),
+            Ok(false)
+        );
+        assert_eq!(user.capabilities.ambient, 0);
+        assert_eq!(raise(&mut user, false), Ok(false));
+        assert_eq!(user.ambient(4, 0, [0, 0], false), Ok(false));
+        assert_eq!(user.capabilities.ambient, 0);
     }
 }

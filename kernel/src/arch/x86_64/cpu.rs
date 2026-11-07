@@ -45016,7 +45016,7 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
             linux_process::LiveProcessState::Stopped => b'T',
             linux_process::LiveProcessState::Zombie => b'Z',
         };
-        let mut file = [0_u8; 512];
+        let mut file = [0_u8; 768];
         let mut used = 0_usize;
         let mut name = [0_u8; 16];
         let generated = match state & !3 {
@@ -45051,6 +45051,7 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
                             / 1024,
                     )
                     && append_linux_bytes(&mut file, &mut used, b" kB\nVmSwap:\t0 kB\n")
+                    && append_linux_bytes(&mut file, &mut used, &linux_capability_status(pid))
                     && append_linux_bytes(
                         &mut file,
                         &mut used,
@@ -45212,6 +45213,20 @@ fn write_linux_decimal(mut value: u64, output: &mut [u8]) -> usize {
 
 /// The Uid and Gid lines of /proc/PID/status: real, effective, saved and
 /// filesystem ids (a domain has one identity, shared by its processes).
+/// The capability lines of `/proc/PID/status` for process `pid`: its
+/// inheritable, permitted, effective, bounding and ambient sets, as
+/// Linux's `%016llx`.
+fn linux_capability_status(pid: u32) -> Vec<u8> {
+    let caps = linux_process::live_process_credentials(pid)
+        .unwrap_or(linux_user::Credentials::ROOT)
+        .capabilities;
+    alloc::format!(
+        "CapInh:\t{:016x}\nCapPrm:\t{:016x}\nCapEff:\t{:016x}\nCapBnd:\t{:016x}\nCapAmb:\t{:016x}\n",
+        caps.inheritable, caps.permitted, caps.effective, caps.bounding, caps.ambient,
+    )
+    .into_bytes()
+}
+
 fn append_linux_credentials_status(output: &mut [u8], used: &mut usize) -> bool {
     let credentials = current_linux_credentials().unwrap_or(linux_user::Credentials::ROOT);
     [
@@ -62153,6 +62168,7 @@ fn linux_capset(header_address: u64, data_address: u64) -> u64 {
         permitted: sets[1] & ginux_credentials::capability::ALL,
         inheritable: sets[2] & ginux_credentials::capability::ALL,
         bounding: credentials.capabilities.bounding,
+        ambient: credentials.capabilities.ambient,
     };
     match credentials.set_capabilities(new) {
         Ok(()) if linux_process::set_live_process_credentials(current, credentials) => 0,
@@ -62632,6 +62648,44 @@ fn linux_prctl(option: u64, argument2: u64, argument3: u64, argument4: u64, argu
         LINUX_PR_GET_TIMERSLACK => {
             linux_process::live_process_timer_slack(current_linux_process_pid())
                 .unwrap_or(linux_process::DEFAULT_TIMER_SLACK)
+        }
+        // A subreaper adopts the orphans of its descendants
+        // (linux_process's reaper); a child does not inherit the mark.
+        LINUX_PR_SET_CHILD_SUBREAPER => {
+            if linux_process::set_live_process_child_subreaper(
+                current_linux_process_pid(),
+                argument2 != 0,
+            ) {
+                0
+            } else {
+                LINUX_ESRCH
+            }
+        }
+        LINUX_PR_GET_CHILD_SUBREAPER => {
+            let marked = linux_process::live_process_child_subreaper(current_linux_process_pid())
+                .unwrap_or(false);
+            if copy_to_linux_user(argument2, &i32::from(marked).to_ne_bytes()) {
+                0
+            } else {
+                LINUX_EFAULT
+            }
+        }
+        LINUX_PR_CAP_AMBIENT => {
+            let no_raise = X86_RUNTIME.ELF_PROBE_SECUREBITS.load(Ordering::SeqCst)
+                & LINUX_SECBIT_NO_CAP_AMBIENT_RAISE
+                != 0;
+            let pid = current_linux_process_pid();
+            let Some(mut credentials) = linux_process::live_process_credentials(pid) else {
+                return LINUX_ESRCH;
+            };
+            match credentials.ambient(argument2, argument3, [argument4, argument5], no_raise) {
+                Ok(set) if linux_process::set_live_process_credentials(pid, credentials) => {
+                    u64::from(set)
+                }
+                Ok(_) => LINUX_ESRCH,
+                Err(ginux_credentials::Error::Permission) => LINUX_EPERM,
+                Err(ginux_credentials::Error::Invalid) => LINUX_EINVAL,
+            }
         }
         _ => LINUX_EINVAL,
     }
