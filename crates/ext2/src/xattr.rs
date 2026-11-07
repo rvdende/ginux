@@ -10,12 +10,15 @@
 use alloc::vec::Vec;
 
 use crate::bytes::{set_u16, set_u32, u16_at, u32_at};
+use crate::checksum::{crc32c, crc32c_skipping};
 use crate::inode::Inode;
 use crate::{BlockDevice, Error, Filesystem, Result};
 
 const MAGIC: u32 = 0xea02_0000;
 const BLOCK_HEADER: usize = 32;
 const ENTRY_HEADER: usize = 16;
+/// Where a block keeps its checksum (metadata_csum).
+const BLOCK_CHECKSUM: usize = 0x10;
 
 /// The name prefixes ext2 stores as an index byte, and the prefix each
 /// stands for. The POSIX ACL names (2 and 3) need the ACL format, which is
@@ -266,7 +269,10 @@ impl<D: BlockDevice> Filesystem<D> {
                 return self.write_inode(number, inode);
             }
         };
-        if let Some(contents) = contents {
+        if let Some(mut contents) = contents {
+            if let Some(checksum) = self.xattr_block_checksum(block, &contents) {
+                set_u32(&mut contents, BLOCK_CHECKSUM, checksum);
+            }
             self.cache.replace(&mut self.device, block, contents)?;
         }
         inode.set_xattr_block(block);
@@ -314,6 +320,18 @@ impl<D: BlockDevice> Filesystem<D> {
         Ok(block)
     }
 
+    /// The checksum of attribute block `block` holding `bytes`
+    /// (metadata_csum): seeded by the block's number, over the block with
+    /// its checksum field read as zero.
+    fn xattr_block_checksum(&self, block: u32, bytes: &[u8]) -> Option<u32> {
+        let seed = crc32c(self.seed?, &u64::from(block).to_le_bytes());
+        Some(crc32c_skipping(
+            seed,
+            bytes,
+            BLOCK_CHECKSUM..BLOCK_CHECKSUM + 4,
+        ))
+    }
+
     /// Takes one reference off a shared attribute block.
     fn release_shared(&mut self, block: u32) -> Result<()> {
         let references = u32_at(self.cache.get(&mut self.device, block)?, 4);
@@ -322,7 +340,20 @@ impl<D: BlockDevice> Filesystem<D> {
             block,
             4,
             &references.saturating_sub(1).to_le_bytes(),
-        )
+        )?;
+        if self.seed.is_some() {
+            let bytes = self.cache.get(&mut self.device, block)?;
+            let bytes: Vec<u8> = bytes.to_vec();
+            if let Some(checksum) = self.xattr_block_checksum(block, &bytes) {
+                self.cache.write(
+                    &mut self.device,
+                    block,
+                    BLOCK_CHECKSUM,
+                    &checksum.to_le_bytes(),
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// Detaches inode's attribute block, freeing it unless shared.

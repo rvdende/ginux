@@ -1,13 +1,15 @@
 //! The driver against images the host's e2fsprogs makes: each test formats
-//! an image with `mke2fs`, works on it in memory, writes it back and has
-//! `e2fsck -fn` check it and `debugfs` read it. Without e2fsprogs on the
-//! host the tests have nothing to compare with and pass vacuously.
+//! an image with `mke2fs` (as ext2, and as ext4 with mke2fs's default
+//! ext4 features: extents, 64-bit, flex_bg, metadata_csum, a journal),
+//! works on it in memory, writes it back and has `e2fsck -fn` check it and
+//! `debugfs` read it. Without e2fsprogs on the host the tests have nothing
+//! to compare with and pass vacuously.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use ginux_ext2::{
-    BlockDevice, Change, Error, Filesystem, Kind, Options, RenameMode, Result, Timestamp,
+    BlockDevice, Change, Error, Filesystem, FsType, Kind, Options, RenameMode, Result, Timestamp,
     XattrMode, ROOT_INODE,
 };
 
@@ -42,42 +44,70 @@ fn tool(name: &str) -> Option<PathBuf> {
         .find(|path| path.exists())
 }
 
+/// What an image is made as.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Format {
+    Ext2,
+    Ext4,
+}
+
+impl Format {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Ext2 => "ext2",
+            Self::Ext4 => "ext4",
+        }
+    }
+
+    fn fs_type(self) -> FsType {
+        match self {
+            Self::Ext2 => FsType::Ext2,
+            Self::Ext4 => FsType::Ext4,
+        }
+    }
+}
+
 struct Image {
     path: PathBuf,
+    format: Format,
 }
 
 impl Image {
-    /// A fresh image of `megabytes` made with `mke2fs -t ext2` and `options`,
-    /// or `None` without e2fsprogs.
-    fn new(name: &str, megabytes: u64, options: &[&str]) -> Option<Self> {
+    /// A fresh image of `megabytes` made with `mke2fs -t FORMAT` and
+    /// `options`, or `None` without e2fsprogs.
+    fn new(name: &str, format: Format, megabytes: u64, options: &[&str]) -> Option<Self> {
         let mke2fs = tool("mke2fs")?;
         tool("e2fsck")?;
         tool("debugfs")?;
         let directory = std::env::temp_dir().join(format!("ginux-ext2-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join(format!("{name}.img"));
+        let path = directory.join(format!("{name}-{}.img", format.name()));
         let file = std::fs::File::create(&path).unwrap();
         file.set_len(megabytes << 20).unwrap();
         let status = Command::new(mke2fs)
-            .args(["-q", "-F", "-t", "ext2"])
+            .args(["-q", "-F", "-t", format.name()])
             .args(options)
             .arg(&path)
             .status()
             .unwrap();
         assert!(status.success(), "mke2fs failed");
-        Some(Self { path })
+        Some(Self { path, format })
     }
 
     fn mount(&self) -> Filesystem<Memory> {
+        self.mount_as(self.format.fs_type(), false).unwrap()
+    }
+
+    fn mount_as(&self, fs_type: FsType, read_only: bool) -> Result<Filesystem<Memory>> {
         let bytes = std::fs::read(&self.path).unwrap();
         Filesystem::mount(
             Memory(bytes),
             Options {
-                read_only: false,
+                read_only,
                 now: NOW,
+                fs_type,
             },
         )
-        .unwrap()
     }
 
     /// Unmounts `filesystem` into the image and checks it with e2fsck.
@@ -146,9 +176,8 @@ fn pattern(offset: u64, length: usize) -> Vec<u8> {
         .collect()
 }
 
-#[test]
-fn a_fresh_image_mounts_and_lists() {
-    let Some(image) = Image::new("fresh", 16, &[]) else {
+fn a_fresh_image_mounts_and_lists(format: Format) {
+    let Some(image) = Image::new("fresh", format, 16, &[]) else {
         return;
     };
     let mut filesystem = image.mount();
@@ -170,10 +199,9 @@ fn a_fresh_image_mounts_and_lists() {
     image.store(filesystem);
 }
 
-#[test]
-fn file_data_survives_every_level_of_the_block_map() {
+fn file_data_survives_every_level_of_the_block_map(format: Format) {
     // 1 KiB blocks: the triple indirect blocks start past 64 MiB.
-    let Some(image) = Image::new("data", 96, &["-b", "1024"]) else {
+    let Some(image) = Image::new("data", format, 96, &["-b", "1024"]) else {
         return;
     };
     let mut filesystem = image.mount();
@@ -206,10 +234,11 @@ fn file_data_survives_every_level_of_the_block_map() {
         .all(|extent| extent.logical < 1 << 20 || extent.logical >= 70 << 20));
     image.store(filesystem);
     let listing = image.debugfs("stat /data");
-    assert!(
-        listing.contains("TIND"),
-        "no triple indirect block:\n{listing}"
-    );
+    let mapping = match format {
+        Format::Ext2 => "TIND",
+        Format::Ext4 => "EXTENTS",
+    };
+    assert!(listing.contains(mapping), "no {mapping}:\n{listing}");
 
     // Shrinking frees the far blocks and zeroes the rest of the last one.
     let mut filesystem = image.mount();
@@ -228,9 +257,8 @@ fn file_data_survives_every_level_of_the_block_map() {
     image.store(filesystem);
 }
 
-#[test]
-fn debugfs_reads_what_was_written() {
-    let Some(image) = Image::new("contents", 16, &[]) else {
+fn debugfs_reads_what_was_written(format: Format) {
+    let Some(image) = Image::new("contents", format, 16, &[]) else {
         return;
     };
     let mut filesystem = image.mount();
@@ -241,6 +269,7 @@ fn debugfs_reads_what_was_written() {
     filesystem.write(file, 0, b"hello, ext2\n").unwrap();
     image.store(filesystem);
     assert_eq!(image.debugfs("cat /dir/hello"), "hello, ext2\n");
+    let _ = format;
     let stat = image.debugfs("stat /dir/hello");
     assert!(
         stat.contains("User:  1000") && stat.contains("Group:   100"),
@@ -248,9 +277,8 @@ fn debugfs_reads_what_was_written() {
     );
 }
 
-#[test]
-fn directories_grow_and_shrink() {
-    let Some(image) = Image::new("directories", 16, &["-b", "1024"]) else {
+fn directories_grow_and_shrink(format: Format) {
+    let Some(image) = Image::new("directories", format, 16, &["-b", "1024"]) else {
         return;
     };
     let mut filesystem = image.mount();
@@ -289,9 +317,8 @@ fn directories_grow_and_shrink() {
     image.store(filesystem);
 }
 
-#[test]
-fn links_symlinks_and_devices() {
-    let Some(image) = Image::new("links", 16, &[]) else {
+fn links_symlinks_and_devices(format: Format) {
+    let Some(image) = Image::new("links", format, 16, &[]) else {
         return;
     };
     let mut filesystem = image.mount();
@@ -348,9 +375,8 @@ fn links_symlinks_and_devices() {
     image.store(filesystem);
 }
 
-#[test]
-fn renames_move_names_and_directories() {
-    let Some(image) = Image::new("rename", 16, &[]) else {
+fn renames_move_names_and_directories(format: Format) {
+    let Some(image) = Image::new("rename", format, 16, &[]) else {
         return;
     };
     let mut filesystem = image.mount();
@@ -399,9 +425,8 @@ fn renames_move_names_and_directories() {
     image.store(filesystem);
 }
 
-#[test]
-fn attributes_and_extended_attributes() {
-    let Some(image) = Image::new("xattr", 16, &["-I", "256"]) else {
+fn attributes_and_extended_attributes(format: Format) {
+    let Some(image) = Image::new("xattr", format, 16, &["-I", "256"]) else {
         return;
     };
     let mut filesystem = image.mount();
@@ -474,9 +499,8 @@ fn attributes_and_extended_attributes() {
     image.store(filesystem);
 }
 
-#[test]
-fn a_full_disk_writes_short_then_fails() {
-    let Some(image) = Image::new("full", 4, &["-b", "1024"]) else {
+fn a_full_disk_writes_short_then_fails(format: Format) {
+    let Some(image) = Image::new("full", format, 4, &["-b", "1024"]) else {
         return;
     };
     let mut filesystem = image.mount();
@@ -510,14 +534,17 @@ fn a_full_disk_writes_short_then_fails() {
     image.store(filesystem);
 }
 
-#[test]
-fn files_mke2fs_made_read_back() {
-    let directory = std::env::temp_dir().join(format!("ginux-ext2-src-{}", std::process::id()));
+fn files_mke2fs_made_read_back(format: Format) {
+    let directory = std::env::temp_dir().join(format!(
+        "ginux-ext2-src-{}-{}",
+        std::process::id(),
+        format.name()
+    ));
     std::fs::create_dir_all(directory.join("sub")).unwrap();
     std::fs::write(directory.join("sub/text"), pattern(0, 100_000)).unwrap();
     let _ = std::os::unix::fs::symlink("sub/text", directory.join("link"));
     let source = directory.to_string_lossy().into_owned();
-    let Some(image) = Image::new("populated", 16, &["-d", &source]) else {
+    let Some(image) = Image::new("populated", format, 16, &["-d", &source]) else {
         return;
     };
     let mut filesystem = image.mount();
@@ -531,4 +558,366 @@ fn files_mke2fs_made_read_back() {
     assert_eq!(&buffer[..length], b"sub/text");
     image.store(filesystem);
     let _ = std::fs::remove_dir_all(directory);
+}
+
+macro_rules! in_every_format {
+    ($($test:ident),* $(,)?) => {
+        mod ext2 {
+            $(
+                #[test]
+                fn $test() {
+                    super::$test(super::Format::Ext2);
+                }
+            )*
+        }
+        mod ext4 {
+            $(
+                #[test]
+                fn $test() {
+                    super::$test(super::Format::Ext4);
+                }
+            )*
+        }
+    };
+}
+
+in_every_format!(
+    a_fresh_image_mounts_and_lists,
+    file_data_survives_every_level_of_the_block_map,
+    debugfs_reads_what_was_written,
+    directories_grow_and_shrink,
+    links_symlinks_and_devices,
+    renames_move_names_and_directories,
+    attributes_and_extended_attributes,
+    a_full_disk_writes_short_then_fails,
+    files_mke2fs_made_read_back
+);
+
+#[test]
+fn ext4_images_have_the_features_mke2fs_gives_ext4() {
+    let Some(image) = Image::new("features", Format::Ext4, 16, &[]) else {
+        return;
+    };
+    let features = image.debugfs("features");
+    for feature in ["extent", "64bit", "flex_bg", "metadata_csum", "has_journal"] {
+        assert!(features.contains(feature), "{features}");
+    }
+}
+
+#[test]
+fn mount_types_take_the_features_linux_does() {
+    let Some(ext4) = Image::new("types", Format::Ext4, 16, &[]) else {
+        return;
+    };
+    for fs_type in [FsType::Ext2, FsType::Ext3] {
+        assert_eq!(ext4.mount_as(fs_type, false).err(), Some(Error::Invalid));
+        assert_eq!(ext4.mount_as(fs_type, true).err(), Some(Error::Invalid));
+    }
+    let Some(ext2) = Image::new("types", Format::Ext2, 16, &[]) else {
+        return;
+    };
+    // ext3 needs a journal; the ext4 driver takes an ext2 filesystem.
+    assert_eq!(
+        ext2.mount_as(FsType::Ext3, false).err(),
+        Some(Error::Invalid)
+    );
+    let filesystem = ext2.mount_as(FsType::Ext4, false).unwrap();
+    ext2.store(filesystem);
+    let mke2fs = tool("mke2fs").unwrap();
+    let status = Command::new(mke2fs)
+        .args(["-q", "-F", "-t", "ext3"])
+        .arg(&ext2.path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    for fs_type in [FsType::Ext2, FsType::Ext3, FsType::Ext4] {
+        let mut filesystem = ext2.mount_as(fs_type, false).unwrap();
+        create_file(&mut filesystem, ROOT_INODE, &format!("{fs_type:?}"));
+        ext2.store(filesystem);
+    }
+}
+
+#[test]
+fn fragmented_files_grow_deep_extent_trees() {
+    // 1 KiB blocks: a tree block holds 84 extents, so 400 runs need two
+    // levels below the inode.
+    let Some(image) = Image::new("fragments", Format::Ext4, 32, &["-b", "1024"]) else {
+        return;
+    };
+    let mut filesystem = image.mount();
+    let file = create_file(&mut filesystem, ROOT_INODE, "fragments");
+    for index in (0..800_u64).step_by(2) {
+        let data = pattern(index * 1024, 1024);
+        filesystem.write(file, index * 1024, &data).unwrap();
+    }
+    assert_eq!(filesystem.extents(file, 0, u64::MAX).unwrap().len(), 400);
+    image.store(filesystem);
+    let listing = image.debugfs("stat /fragments");
+    assert!(listing.contains("EXTENTS"), "{listing}");
+
+    // Filling the holes (elsewhere on the disk) and reading it all back.
+    let mut filesystem = image.mount();
+    for index in (1..800_u64).step_by(2) {
+        let data = pattern(index * 1024, 1024);
+        filesystem.write(file, index * 1024, &data).unwrap();
+    }
+    let mut buffer = vec![0; 800 * 1024];
+    assert_eq!(filesystem.read(file, 0, &mut buffer).unwrap(), buffer.len());
+    assert_eq!(buffer, pattern(0, 800 * 1024));
+    image.store(filesystem);
+
+    // Shrinking it a run at a time frees the tree as it goes.
+    let mut filesystem = image.mount();
+    let free = filesystem.statfs().free_blocks;
+    for size in [700_u64, 333, 5, 0] {
+        filesystem.truncate(file, size * 1024 + 10).unwrap();
+        image.store(filesystem);
+        filesystem = image.mount();
+    }
+    filesystem.truncate(file, 0).unwrap();
+    assert_eq!(filesystem.stat(file).unwrap().blocks, 0);
+    assert!(filesystem.statfs().free_blocks > free);
+    image.store(filesystem);
+}
+
+#[test]
+fn preallocated_blocks_read_as_zeros_until_written() {
+    let Some(image) = Image::new("fallocate", Format::Ext4, 32, &[]) else {
+        return;
+    };
+    let mut filesystem = image.mount();
+    let file = create_file(&mut filesystem, ROOT_INODE, "file");
+    filesystem.write(file, 0, &[1; 100]).unwrap();
+    filesystem.allocate(file, 0, 1 << 20, false).unwrap();
+    let stat = filesystem.stat(file).unwrap();
+    assert_eq!(stat.size, 1 << 20);
+    assert_eq!(stat.blocks, (1 << 20) / 512);
+    let mut buffer = vec![9; 8192];
+    filesystem.read(file, 4096, &mut buffer).unwrap();
+    assert!(buffer.iter().all(|byte| *byte == 0));
+    // Past the size with KEEP_SIZE: allocated, the size stays.
+    filesystem.allocate(file, 1 << 20, 1 << 20, true).unwrap();
+    assert_eq!(filesystem.stat(file).unwrap().size, 1 << 20);
+    assert_eq!(filesystem.stat(file).unwrap().blocks, (2 << 20) / 512);
+    // A write in the middle of an unwritten block zeroes the rest of it.
+    filesystem.write(file, 10_000, b"middle").unwrap();
+    let mut block = vec![9; 4096];
+    filesystem.read(file, 8192, &mut block).unwrap();
+    assert_eq!(&block[10_000 - 8192..10_006 - 8192], b"middle");
+    assert_eq!(block.iter().filter(|byte| **byte != 0).count(), 6);
+    image.store(filesystem);
+    let listing = image.debugfs("stat /file");
+    assert!(listing.contains("[u]"), "{listing}");
+
+    // Punching frees the whole blocks and zeroes the edges.
+    let mut filesystem = image.mount();
+    filesystem.write(file, 0, &pattern(0, 1 << 20)).unwrap();
+    let before = filesystem.stat(file).unwrap().blocks;
+    filesystem.punch_hole(file, 1000, 3 * 4096).unwrap();
+    assert_eq!(filesystem.stat(file).unwrap().blocks, before - 2 * 8);
+    let mut buffer = vec![9; 5 * 4096];
+    filesystem.read(file, 0, &mut buffer).unwrap();
+    let mut expected = pattern(0, 5 * 4096);
+    expected[1000..1000 + 3 * 4096].fill(0);
+    assert_eq!(buffer, expected);
+    // Truncating drops what was preallocated past the end.
+    filesystem.truncate(file, 4096).unwrap();
+    assert_eq!(filesystem.stat(file).unwrap().blocks, 8);
+    image.store(filesystem);
+}
+
+/// What LTP's fallocate04 does: punch, zero, collapse and insert ranges of
+/// a file of lettered blocks, checking the data and the space after each.
+#[test]
+fn ranges_punch_zero_collapse_and_insert() {
+    for block_size in [1024_u64, 4096] {
+        let size = block_size.to_string();
+        let Some(image) = Image::new(
+            &format!("ranges-{block_size}"),
+            Format::Ext4,
+            32,
+            &["-b", &size],
+        ) else {
+            return;
+        };
+        let mut filesystem = image.mount();
+        let file = create_file(&mut filesystem, ROOT_INODE, "file");
+        let blocks = 16_u64;
+        let length = blocks * block_size;
+        let mut expected: Vec<u8> = (0..blocks)
+            .flat_map(|index| vec![b'a' + index as u8; block_size as usize])
+            .collect();
+        filesystem.allocate(file, 0, length, false).unwrap();
+        filesystem.write(file, 0, &expected).unwrap();
+        let used =
+            |filesystem: &mut Filesystem<Memory>| filesystem.stat(file).unwrap().blocks * 512;
+        let check = |filesystem: &mut Filesystem<Memory>, expected: &[u8]| {
+            let mut buffer = vec![0; expected.len()];
+            filesystem.read(file, 0, &mut buffer).unwrap();
+            assert_eq!(buffer, expected);
+        };
+
+        let before = used(&mut filesystem);
+        filesystem.punch_hole(file, block_size, block_size).unwrap();
+        assert_eq!(filesystem.seek(file, 0, false).unwrap(), Some(block_size));
+        assert_eq!(
+            filesystem.seek(file, block_size, true).unwrap(),
+            Some(2 * block_size)
+        );
+        assert_eq!(used(&mut filesystem), before - block_size);
+        expected[block_size as usize..2 * block_size as usize].fill(0);
+        check(&mut filesystem, &expected);
+
+        let before = used(&mut filesystem);
+        filesystem
+            .zero_range(file, block_size - 1, block_size + 2, false)
+            .unwrap();
+        assert_eq!(used(&mut filesystem), before + block_size);
+        expected[block_size as usize - 1..2 * block_size as usize + 1].fill(0);
+        check(&mut filesystem, &expected);
+
+        let before = used(&mut filesystem);
+        filesystem
+            .collapse_range(file, block_size, block_size)
+            .unwrap();
+        assert_eq!(used(&mut filesystem), before - block_size);
+        expected.drain(block_size as usize..2 * block_size as usize);
+        check(&mut filesystem, &expected);
+        assert_eq!(filesystem.stat(file).unwrap().size, length - block_size);
+
+        filesystem
+            .insert_range(file, block_size, block_size)
+            .unwrap();
+        filesystem
+            .zero_range(file, block_size, block_size, false)
+            .unwrap();
+        let zeros = vec![0; block_size as usize];
+        expected.splice(block_size as usize..block_size as usize, zeros);
+        check(&mut filesystem, &expected);
+        assert_eq!(filesystem.stat(file).unwrap().size, length);
+        assert_eq!(
+            filesystem.collapse_range(file, 0, length),
+            Err(Error::Invalid)
+        );
+        assert_eq!(
+            filesystem.insert_range(file, 1, block_size),
+            Err(Error::Invalid)
+        );
+        assert_eq!(filesystem.seek(file, length, true).unwrap(), None);
+        assert_eq!(filesystem.seek(file, 0, true).unwrap(), Some(0));
+        image.store(filesystem);
+    }
+}
+
+#[test]
+fn indexed_directories_change_as_linear_ones() {
+    let directory = std::env::temp_dir().join(format!("ginux-ext4-index-{}", std::process::id()));
+    std::fs::create_dir_all(directory.join("big")).unwrap();
+    for index in 0..400 {
+        std::fs::write(
+            directory.join(format!("big/entry-with-a-long-name-{index:04}")),
+            b"x",
+        )
+        .unwrap();
+    }
+    let source = directory.to_string_lossy().into_owned();
+    for format in [Format::Ext2, Format::Ext4] {
+        let Some(image) = Image::new("indexed", format, 16, &["-b", "1024", "-d", &source]) else {
+            return;
+        };
+        // e2fsck -D indexes every directory of more than a block.
+        let status = Command::new(tool("e2fsck").unwrap())
+            .args(["-fyD"])
+            .arg(&image.path)
+            .output()
+            .unwrap()
+            .status;
+        assert!(
+            status.code().is_some_and(|code| code <= 1),
+            "e2fsck -D: {status}"
+        );
+        assert!(image.debugfs("htree /big").contains("Root node dump"));
+        let mut filesystem = image.mount();
+        let big = filesystem.lookup(ROOT_INODE, b"big").unwrap();
+        assert_eq!(names(&mut filesystem, big).len(), 402);
+        for index in (0..400).step_by(3) {
+            let name = format!("entry-with-a-long-name-{index:04}");
+            let inode = filesystem.unlink(big, name.as_bytes(), NOW).unwrap();
+            assert!(filesystem.release(inode, NOW).unwrap());
+        }
+        create_file(&mut filesystem, big, "new");
+        assert_eq!(names(&mut filesystem, big).len(), 402 - 134 + 1);
+        image.store(filesystem);
+    }
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+/// What LTP's fallocate05 and fallocate06 do on a full filesystem: writes
+/// into preallocated blocks need no space, and punching frees some.
+#[test]
+fn preallocated_blocks_take_writes_on_a_full_disk() {
+    for block_size in [1024_u64, 4096] {
+        let size = block_size.to_string();
+        let Some(image) = Image::new(
+            &format!("full-prealloc-{block_size}"),
+            Format::Ext4,
+            16,
+            &["-b", &size],
+        ) else {
+            return;
+        };
+        let mut filesystem = image.mount();
+        let file = create_file(&mut filesystem, ROOT_INODE, "file");
+        let written = 16 * block_size;
+        filesystem
+            .write(file, 0, &pattern(0, written as usize))
+            .unwrap();
+        // Misaligned, as fallocate06 has it.
+        let offset = written + block_size / 2;
+        let length = 256 * block_size;
+        filesystem.allocate(file, offset, length, false).unwrap();
+        // Fill the disk.
+        let filler = create_file(&mut filesystem, ROOT_INODE, "filler");
+        let chunk = vec![7; 1 << 20];
+        let mut at = 0;
+        loop {
+            match filesystem.write(filler, at, &chunk) {
+                Ok(count) if count == chunk.len() => at += count as u64,
+                Ok(count) => {
+                    at += count as u64;
+                }
+                Err(error) => {
+                    assert_eq!(error, Error::NoSpace);
+                    break;
+                }
+            }
+        }
+        let data = pattern(offset, length as usize);
+        assert_eq!(filesystem.write(file, offset, &data).unwrap(), data.len());
+        // Preallocate past the end until the disk is full.
+        let mut extra = 0;
+        while filesystem
+            .allocate(file, offset + length + extra, block_size, false)
+            .is_ok()
+        {
+            extra += block_size;
+        }
+        let end = offset + length + extra;
+        if extra > 0 {
+            let more = pattern(offset + length, extra as usize);
+            assert_eq!(
+                filesystem.write(file, offset + length, &more).unwrap(),
+                more.len()
+            );
+        }
+        let hole = 8 * block_size;
+        filesystem.punch_hole(file, 0, hole).unwrap();
+        assert_eq!(filesystem.write(file, end, b"0123456789").unwrap(), 10);
+        assert_eq!(filesystem.seek(file, 0, false).unwrap(), Some(0));
+        assert_eq!(filesystem.seek(file, 0, true).unwrap(), Some(hole));
+        let mut back = vec![0; data.len()];
+        filesystem.read(file, offset, &mut back).unwrap();
+        assert_eq!(back, data);
+        image.store(filesystem);
+    }
 }

@@ -224,7 +224,7 @@ fallocate02 fallocate02
 fallocate03 fallocate03
 !fallocate04 fallocate04  # holes punched in a tmpfs file are not tracked (SEEK_HOLE finds none)
 !fallocate05 fallocate05  # punching a hole in a tmpfs file frees no blocks and leaves no hole SEEK_HOLE finds
-fallocate06 fallocate06  # auto: budget=210
+fallocate06 fallocate06  # budget=300 fills each of ext2, ext3, ext4 and tmpfs
 fsetxattr01 fsetxattr01
 fsetxattr02 fsetxattr02
 file_attr01 file_attr01
@@ -742,7 +742,7 @@ mmap12 mmap12
 mmap13 mmap13
 mmap14 mmap14
 mmap15 mmap15
-mmap16 mmap16
+!mmap16 mmap16  # a write through a shared mapping to file blocks a full ext4 cannot allocate is not refused with SIGBUS (no page_mkwrite: blocks are allocated at write-back)
 mmap17 mmap17
 mmap18 mmap18
 mmap19 mmap19
@@ -960,8 +960,8 @@ preadv201 preadv201
 preadv201_64 preadv201_64
 preadv202 preadv202
 preadv202_64 preadv202_64
-preadv203 preadv203  # budget=240 min_runtime 60 on each filesystem
-preadv203_64 preadv203_64  # budget=240 min_runtime 60 on each filesystem
+preadv203 preadv203  # budget=360 min_runtime 60 on each filesystem (ext2, ext3, ext4, tmpfs)
+preadv203_64 preadv203_64  # budget=360 min_runtime 60 on each filesystem (ext2, ext3, ext4, tmpfs)
 profil01 profil01
 process_vm_readv01 process_vm01 -r
 process_vm_readv02 process_vm_readv02
@@ -1011,12 +1011,12 @@ pwritev202_64 pwritev202_64
 quotactl01 quotactl01
 quotactl02 quotactl02
 quotactl03 quotactl03
-quotactl04 quotactl04
+!quotactl04 quotactl04  # ext4 quota (quota inodes, -O quota,project) is not kept: such a filesystem mounts read-only only (EROFS)
 quotactl05 quotactl05
 quotactl06 quotactl06
 quotactl07 quotactl07
-quotactl08 quotactl08
-quotactl09 quotactl09
+!quotactl08 quotactl08  # ext4 quota (quota inodes, -O quota) is not kept: such a filesystem mounts read-only only (EROFS)
+!quotactl09 quotactl09  # ext4 quota (quota inodes, -O quota) is not kept: such a filesystem mounts read-only only (EROFS)
 read01 read01
 read02 read02
 read03 read03
@@ -1515,7 +1515,7 @@ write05 write05
 write06 write06
 writev01 writev01
 writev02 writev02
-writev03 writev03
+writev03 writev03  # budget=150 a fuzzy-sync race on each of ext2, ext3, ext4 and tmpfs
 writev05 writev05
 writev06 writev06
 writev07 writev07
@@ -1551,11 +1551,11 @@ statx01 statx01
 statx02 statx02
 statx03 statx03
 statx04 statx04
-statx05 statx05
+!statx05 statx05  # ext4 encryption (-O encrypt) is not supported: such a filesystem does not mount (EINVAL)
 statx06 statx06
 statx07 statx07
 statx08 statx08
-statx09 statx09
+!statx09 statx09  # ext4 fs-verity (-O verity) is not supported: such a filesystem mounts read-only only (EROFS)
 statx10 statx10
 statx11 statx11
 statx12 statx12

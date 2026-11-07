@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
-//! A read-write ext2 filesystem on a block device, as `mke2fs -t ext2`
-//! makes it and Linux mounts it.
+//! A read-write ext2, ext3 and ext4 filesystem on a block device, as
+//! `mke2fs -t ext2/ext3/ext4` makes it and Linux mounts it.
 //!
 //! The on-disk format is the specification (the ext2 and ext4 layout
 //! documents): a superblock at byte 1024, block groups each with a block
@@ -9,9 +9,20 @@
 //! blocks, linear directories of variable-length entries, fast and slow
 //! symlinks, and extended attributes in an attribute block. Inodes larger
 //! than 128 bytes keep nanosecond times and a creation time in their extra
-//! fields, as Linux's ext4 driver does for ext2. Features beyond those
-//! (journals that need recovery, extents, 64-bit groups, checksums) are
-//! refused at mount time.
+//! fields, as Linux's ext4 driver does for ext2.
+//!
+//! The ext4 features `mke2fs -t ext4` turns on are kept too: extent trees
+//! (with unwritten extents, so fallocate's modes work), 64-bit group
+//! descriptors, flex_bg, huge_file, uninitialized groups (whose bitmaps
+//! are built when first needed) and metadata_csum (crc32c checksums of the
+//! superblock, descriptors, bitmaps, inodes, extent, directory and
+//! attribute blocks). A journal (ext3, ext4) is not written: changes go to
+//! their places directly, as on ext2, so the journal stays empty and
+//! Linux finds nothing to replay; one that holds transactions to replay
+//! is refused at mount time, as are features this driver does not know
+//! (and, for writing, read-only-compatible ones) and more than 2^32
+//! blocks. Hash-indexed directories are read as the linear directories
+//! they also are, and become plain linear ones when they change.
 //!
 //! The filesystem works on inode numbers; mapping paths to inodes, open
 //! files and permissions are the caller's. An inode whose last name goes
@@ -32,14 +43,16 @@ extern crate alloc;
 extern crate std;
 
 mod cache;
+mod checksum;
 mod directory;
+mod extent;
 mod filesystem;
 mod inode;
 mod layout;
 mod xattr;
 
 pub use directory::Entry;
-pub use filesystem::{Change, Extent, Filesystem, Options, RenameMode, Statfs};
+pub use filesystem::{Change, Extent, Filesystem, FsType, Options, RenameMode, Statfs};
 pub use inode::{Kind, Stat};
 pub use xattr::XattrMode;
 

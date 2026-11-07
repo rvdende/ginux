@@ -23003,7 +23003,7 @@ fn linux_domain_mount_by_unique_id(unique: u64) -> Option<u32> {
 /// The superblock magic statfs and statmount report for `filesystem`.
 fn linux_filesystem_magic(filesystem: &[u8]) -> u64 {
     match filesystem {
-        b"ext2" => u64::from(ginux_ext2::MAGIC),
+        b"ext2" | b"ext3" | b"ext4" => u64::from(ginux_ext2::MAGIC),
         b"tmpfs" | b"devtmpfs" => 0x0102_1994,
         b"ramfs" => 0x8584_58f6,
         b"proc" => 0x9fa0,
@@ -37284,7 +37284,8 @@ fn linux_open_file_at(
             },
             |target| u32::try_from(target.saturating_add(1)).unwrap_or(0),
         );
-    let descriptor_flags = (flags & (LINUX_O_APPEND | LINUX_O_NONBLOCK | LINUX_O_PATH)) as u32;
+    let descriptor_flags =
+        (flags & (LINUX_O_APPEND | LINUX_O_NONBLOCK | LINUX_O_PATH | LINUX_O_NOATIME)) as u32;
     if descriptor < LINUX_AUX_DESCRIPTOR_FIRST {
         let index = descriptor as usize;
         X86_RUNTIME.ELF_PROBE_STDIO_DEVICE_DESCRIPTORS[index].store(state, Ordering::SeqCst);
@@ -37993,7 +37994,7 @@ fn linux_open_by_handle_at(mount_descriptor: u64, handle_address: u64, flags: u6
         Ordering::SeqCst,
     );
     X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index].store(
-        (flags & (LINUX_O_APPEND | LINUX_O_NONBLOCK | LINUX_O_PATH)) as u32,
+        (flags & (LINUX_O_APPEND | LINUX_O_NONBLOCK | LINUX_O_PATH | LINUX_O_NOATIME)) as u32,
         Ordering::SeqCst,
     );
     linux_descriptor_offset(descriptor).store(0, Ordering::SeqCst);
@@ -39059,15 +39060,30 @@ fn linux_fallocate(descriptor: u64, mode: u64, offset: u64, length: u64) -> u64 
     if state & 3 != LINUX_DESCRIPTOR_OUTPUT && state & 3 != 3 {
         return LINUX_EBADF;
     }
-    // As tmpfs: allocation, with or without FALLOC_FL_KEEP_SIZE, and
-    // FALLOC_FL_PUNCH_HOLE with KEEP_SIZE, which zeroes the range.
+    // tmpfs: allocation, with or without FALLOC_FL_KEEP_SIZE, and
+    // FALLOC_FL_PUNCH_HOLE with KEEP_SIZE, which zeroes the range; ext4
+    // volumes zero, collapse and insert ranges too.
     const KEEP_SIZE: u64 = 1;
     const PUNCH_HOLE: u64 = 2;
+    const COLLAPSE_RANGE: u64 = 8;
+    const ZERO_RANGE: u64 = 0x10;
+    const INSERT_RANGE: u64 = 0x20;
+    const UNSHARE_RANGE: u64 = 0x40;
     if offset > i64::MAX as u64 || length == 0 || length > i64::MAX as u64 {
         return LINUX_EINVAL;
     }
-    if !matches!(mode, 0 | KEEP_SIZE | 3) {
+    // The flag combinations vfs_fallocate refuses for every filesystem.
+    if mode & !(KEEP_SIZE | PUNCH_HOLE | COLLAPSE_RANGE | ZERO_RANGE | INSERT_RANGE | UNSHARE_RANGE)
+        != 0
+        || mode & PUNCH_HOLE != 0 && mode & KEEP_SIZE == 0
+    {
         return LINUX_EOPNOTSUPP;
+    }
+    if mode & PUNCH_HOLE != 0 && mode & ZERO_RANGE != 0
+        || mode & COLLAPSE_RANGE != 0 && mode != COLLAPSE_RANGE
+        || mode & INSERT_RANGE != 0 && mode != INSERT_RANGE
+    {
+        return LINUX_EINVAL;
     }
     let Some(end) = offset
         .checked_add(length)
@@ -39085,9 +39101,26 @@ fn linux_fallocate(descriptor: u64, mode: u64, offset: u64, length: u64) -> u64 
     if metadata.kind != crate::linux_overlay::NodeKind::File {
         return LINUX_EISDIR;
     }
-    // ext2's block maps cannot hold preallocated, unwritten blocks: Linux
-    // allocates only for extent-mapped files.
     if crate::linux_blockfs::owns(handle) {
+        use crate::linux_blockfs::Allocation;
+        let keep_size = mode & KEEP_SIZE != 0;
+        let allocation = match mode & !KEEP_SIZE {
+            0 => Allocation::Allocate { keep_size },
+            PUNCH_HOLE => Allocation::PunchHole,
+            ZERO_RANGE => Allocation::ZeroRange { keep_size },
+            COLLAPSE_RANGE => Allocation::CollapseRange,
+            INSERT_RANGE => Allocation::InsertRange,
+            _ => return LINUX_EOPNOTSUPP,
+        };
+        // Block maps (ext2's, and ext4 files without extents) hold no
+        // unwritten blocks: ginux_ext2 answers EOPNOTSUPP for them.
+        return match crate::linux_blockfs::fallocate(handle, allocation, offset, length) {
+            Some(Ok(())) => 0,
+            Some(Err(error)) => error.wrapping_neg(),
+            None => LINUX_EIO,
+        };
+    }
+    if !matches!(mode, 0 | KEEP_SIZE | 3) {
         return LINUX_EOPNOTSUPP;
     }
     // Allocating changes no data, so only F_SEAL_GROW stops it (and only
@@ -40745,6 +40778,14 @@ fn linux_statx_from_metadata(metadata: crate::linux_overlay::Metadata) -> [u8; 2
     let attributes = u64::from(metadata.attributes) & supported;
     statx[8..16].copy_from_slice(&attributes.to_ne_bytes());
     statx[56..64].copy_from_slice(&supported.to_ne_bytes());
+    // The creation time, where the filesystem keeps one (ext4's inodes).
+    if let Some((seconds, nanoseconds)) = metadata.btime {
+        const STATX_BTIME: u32 = 0x800;
+        let mask = u32::from_ne_bytes(statx[..4].try_into().unwrap_or_default()) | STATX_BTIME;
+        statx[..4].copy_from_slice(&mask.to_ne_bytes());
+        statx[80..88].copy_from_slice(&seconds.to_ne_bytes());
+        statx[88..92].copy_from_slice(&(nanoseconds as u32).to_ne_bytes());
+    }
     statx
 }
 
@@ -44080,7 +44121,9 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
         let Ok(start) = usize::try_from(offset) else {
             return LINUX_EINVAL;
         };
-        return linux_overlay_copy_to_user(handle, start, address, count);
+        let result = linux_overlay_copy_to_user(handle, start, address, count);
+        linux_volume_file_accessed(descriptor, handle, result);
+        return result;
     }
     if let Some(entry) = linux_rootfs_entry(descriptor) {
         if !matches!(state & 3, LINUX_DESCRIPTOR_INPUT | 3) {
@@ -53558,9 +53601,25 @@ fn linux_regular_file_seek(descriptor: u64, state: u16, offset: u64, whence: u64
         0 => 0_i128,
         1 => i128::from(linux_descriptor_offset(descriptor).load(Ordering::SeqCst)),
         2 => i128::from(size()),
-        // Holes are not tracked: the whole file is data, with the implicit
-        // hole at its end, as Linux's generic llseek has it.
+        // A volume's file has its holes; elsewhere holes are not tracked:
+        // the whole file is data, with the implicit hole at its end, as
+        // Linux's generic llseek has it.
         SEEK_DATA | SEEK_HOLE => {
+            if let Some(handle) = linux_overlay_descriptor_handle(descriptor)
+                .filter(|handle| crate::linux_blockfs::owns(*handle))
+            {
+                if (offset as i64) < 0 {
+                    return LINUX_ENXIO;
+                }
+                return match crate::linux_blockfs::seek(handle, offset, whence == SEEK_DATA) {
+                    Some(Some(next)) => {
+                        linux_descriptor_offset(descriptor).store(next, Ordering::SeqCst);
+                        next
+                    }
+                    Some(None) => LINUX_ENXIO,
+                    None => LINUX_EIO,
+                };
+            }
             let size = size();
             if (offset as i64) < 0 || offset >= size {
                 return LINUX_ENXIO;
@@ -53624,7 +53683,19 @@ fn linux_overlay_read(descriptor: u64, state: u16, address: u64, count: u64) -> 
             Ordering::SeqCst,
         );
     }
+    linux_volume_file_accessed(descriptor, handle, result);
     Some(result)
+}
+
+/// A read of a volume's file through `descriptor` that ended in `result`
+/// marks it accessed, unless the descriptor was opened O_NOATIME.
+fn linux_volume_file_accessed(descriptor: u64, handle: crate::linux_overlay::Handle, result: u64) {
+    if result < LINUX_RETURN_TO_KERNEL
+        && crate::linux_blockfs::owns(handle)
+        && !linux_socket_flags(descriptor).is_some_and(|flags| flags & LINUX_O_NOATIME as u32 != 0)
+    {
+        crate::linux_blockfs::touch_accessed(handle);
+    }
 }
 
 fn linux_tmp_write(descriptor: u64, state: u16, address: u64, count: u64) -> u64 {
@@ -58902,6 +58973,8 @@ fn linux_mountable_filesystem(filesystem: &[u8]) -> bool {
     matches!(
         filesystem,
         b"ext2"
+            | b"ext3"
+            | b"ext4"
             | b"tmpfs"
             | b"proc"
             | b"sysfs"
@@ -58930,11 +59003,11 @@ fn linux_mount_new(
     options: u32,
     data: &[u8],
 ) -> u64 {
-    if filesystem == b"ext2" {
+    if let Some(fs_type) = linux_volume_type(filesystem) {
         let Some(source) = source else {
             return LINUX_EINVAL;
         };
-        return linux_mount_volume(source, target, options);
+        return linux_mount_volume(source, target, options, fs_type);
     }
     if filesystem == b"overlay" {
         return linux_mount_overlayfs(target, source.unwrap_or(b"none"), options, data);
@@ -59051,10 +59124,26 @@ fn linux_volume_device(
     }
 }
 
-/// mount(2) of the ext2 filesystem on the block device at `source` on
-/// canonical `target`, a directory, with the domain mount options
-/// `options` (`linux_mounts`).
-fn linux_mount_volume(source: &[u8], target: &[u8], options: u32) -> u64 {
+/// The ext filesystem type a mount type names (all are served by
+/// ginux_ext2, which takes the features each type's Linux driver does).
+fn linux_volume_type(filesystem: &[u8]) -> Option<ginux_ext2::FsType> {
+    match filesystem {
+        b"ext2" => Some(ginux_ext2::FsType::Ext2),
+        b"ext3" => Some(ginux_ext2::FsType::Ext3),
+        b"ext4" => Some(ginux_ext2::FsType::Ext4),
+        _ => None,
+    }
+}
+
+/// mount(2) of the ext2, ext3 or ext4 filesystem (`fs_type`) on the block
+/// device at `source` on canonical `target`, a directory, with the domain
+/// mount options `options` (`linux_mounts`).
+fn linux_mount_volume(
+    source: &[u8],
+    target: &[u8],
+    options: u32,
+    fs_type: ginux_ext2::FsType,
+) -> u64 {
     let mut source_name = [0_u8; crate::linux_overlay::PATH_CAPACITY + 1];
     let (device, source_name_length) = match linux_volume_device(source, &mut source_name) {
         Ok(found) => found,
@@ -59117,13 +59206,18 @@ fn linux_mount_volume(source: &[u8], target: &[u8], options: u32) -> u64 {
         crate::linux_blockfs::Source::Loop { open, .. } => crate::linux_loop::io_counters(open),
         crate::linux_blockfs::Source::Ram { .. } => None,
     };
-    if let Err(error) = crate::linux_blockfs::mount(target, source, io, read_only) {
+    if let Err(error) = crate::linux_blockfs::mount(target, source, io, read_only, fs_type) {
         linux_release_volume_device(source);
         return error.wrapping_neg();
     }
     let named = &source_name[..source_name_length];
     let space = linux_mount_space();
-    let Ok(id) = crate::linux_mounts::mount(space, target, named, b"ext2", options, None) else {
+    let type_name: &[u8] = match fs_type {
+        ginux_ext2::FsType::Ext2 => b"ext2",
+        ginux_ext2::FsType::Ext3 => b"ext3",
+        ginux_ext2::FsType::Ext4 => b"ext4",
+    };
+    let Ok(id) = crate::linux_mounts::mount(space, target, named, type_name, options, None) else {
         if let Some(Ok(source)) = crate::linux_blockfs::unmount(target) {
             linux_release_volume_device(source);
         }

@@ -13,6 +13,13 @@ pub(crate) const BLOCK_POINTERS: usize = 15;
 pub(crate) const FAST_SYMLINK_MAX: usize = 60;
 /// The base inode, before the extra fields.
 const GOOD_OLD_INODE_SIZE: usize = 128;
+/// Inode flags: the data is mapped by an extent tree (ext4), and a
+/// directory has a hash index.
+pub(crate) const EXTENTS_FL: u32 = 0x8_0000;
+pub(crate) const INDEX_FL: u32 = 0x1000;
+/// Where the inode's checksum halves live (metadata_csum).
+const CHECKSUM_LO: usize = 0x7c;
+const CHECKSUM_HI: usize = 0x82;
 
 const MODE_TYPE: u16 = 0o170000;
 
@@ -96,6 +103,8 @@ pub struct Stat {
 #[derive(Clone)]
 pub(crate) struct Inode {
     raw: Vec<u8>,
+    /// Which inode this is (its checksums depend on it).
+    number: u32,
 }
 
 /// Where a time's seconds live, and its extra field (epoch bits and
@@ -120,8 +129,12 @@ impl Time {
 }
 
 impl Inode {
-    pub(crate) fn from_raw(raw: Vec<u8>) -> Self {
-        Self { raw }
+    pub(crate) fn from_raw(raw: Vec<u8>, number: u32) -> Self {
+        Self { raw, number }
+    }
+
+    pub(crate) fn number(&self) -> u32 {
+        self.number
     }
 
     pub(crate) fn raw(&self) -> &[u8] {
@@ -331,6 +344,37 @@ impl Inode {
         &mut self.raw
     }
 
+    pub(crate) fn uses_extents(&self) -> bool {
+        self.flags() & EXTENTS_FL != 0
+    }
+
+    /// The seed of the checksums of what the inode owns (itself, its
+    /// extent and directory blocks): the filesystem's `seed` over its
+    /// number and generation.
+    pub(crate) fn checksum_seed(&self, seed: u32) -> u32 {
+        let crc = crate::checksum::crc32c(seed, &self.number.to_le_bytes());
+        crate::checksum::crc32c(crc, &self.generation().to_le_bytes())
+    }
+
+    /// Whether the inode has room for the upper half of its checksum.
+    fn has_checksum_hi(&self) -> bool {
+        self.raw.len() > GOOD_OLD_INODE_SIZE && self.extra_isize() >= 4
+    }
+
+    /// Stores the inode's own checksum (metadata_csum).
+    pub(crate) fn set_checksum(&mut self, seed: u32) {
+        let seed = self.checksum_seed(seed);
+        set_u16(&mut self.raw, CHECKSUM_LO, 0);
+        if self.has_checksum_hi() {
+            set_u16(&mut self.raw, CHECKSUM_HI, 0);
+        }
+        let crc = crate::checksum::crc32c(seed, &self.raw);
+        set_u16(&mut self.raw, CHECKSUM_LO, crc as u16);
+        if self.has_checksum_hi() {
+            set_u16(&mut self.raw, CHECKSUM_HI, (crc >> 16) as u16);
+        }
+    }
+
     pub(crate) fn stat(&self, inode: u32) -> Option<Stat> {
         let kind = self.kind()?;
         Some(Stat {
@@ -375,7 +419,7 @@ mod tests {
 
     #[test]
     fn times_keep_nanoseconds_and_epochs_in_large_inodes() {
-        let mut inode = Inode::from_raw(vec![0; 256]);
+        let mut inode = Inode::from_raw(vec![0; 256], 12);
         inode.set_extra_isize(32);
         for time in [
             Timestamp::new(0, 0),
@@ -386,7 +430,7 @@ mod tests {
             inode.set_time(Time::Modify, time);
             assert_eq!(inode.time(Time::Modify), Some(time));
         }
-        let mut small = Inode::from_raw(vec![0; 128]);
+        let mut small = Inode::from_raw(vec![0; 128], 12);
         small.set_time(Time::Modify, Timestamp::new(7, 9));
         assert_eq!(small.time(Time::Modify), Some(Timestamp::new(7, 0)));
         assert_eq!(small.time(Time::Create), None);
@@ -394,7 +438,7 @@ mod tests {
 
     #[test]
     fn devices_round_trip_both_encodings() {
-        let mut inode = Inode::from_raw(vec![0; 128]);
+        let mut inode = Inode::from_raw(vec![0; 128], 12);
         for (major, minor) in [(1, 3), (7, 0), (259, 70000), (8, 300)] {
             inode.set_device(encode_device(major, minor));
             assert_eq!(decode_device(inode.device()), (major, minor));

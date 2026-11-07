@@ -1,12 +1,37 @@
 //! Directories: blocks of variable-length entries (inode, record length,
-//! name length, file type, name), searched linearly.
+//! name length, file type, name), searched linearly. With metadata_csum
+//! each block ends in a 12-byte checksum entry (an empty entry of type
+//! 0xde holding the block's checksum), which entries never take.
 
 use crate::bytes::{set_u16, set_u32, u16_at, u32_at};
-use crate::inode::Kind;
+use crate::checksum::crc32c;
+use crate::inode::{Inode, Kind, INDEX_FL};
 use crate::{BlockDevice, Error, Filesystem, Result, NAME_MAX};
 
 /// The fixed part of an entry.
 const HEADER: usize = 8;
+/// The checksum entry ending a directory block, and its file type.
+const TAIL: usize = 12;
+const TAIL_TYPE: u8 = 0xde;
+
+fn has_tail(bytes: &[u8]) -> bool {
+    let Some(at) = bytes.len().checked_sub(TAIL) else {
+        return false;
+    };
+    u32_at(bytes, at) == 0
+        && usize::from(u16_at(bytes, at + 4)) == TAIL
+        && bytes[at + 6] == 0
+        && bytes[at + 7] == TAIL_TYPE
+}
+
+/// Where a block's entries end: before its checksum entry, if it has one.
+fn entries_end(bytes: &[u8], checksums: bool) -> usize {
+    if checksums && has_tail(bytes) {
+        bytes.len() - TAIL
+    } else {
+        bytes.len()
+    }
+}
 
 /// One name in a directory.
 #[derive(Clone)]
@@ -93,6 +118,89 @@ struct Found {
 }
 
 impl<D: BlockDevice> Filesystem<D> {
+    /// The bytes of a directory block its entries may use.
+    pub(crate) fn directory_space(&self) -> usize {
+        self.block_size as usize - if self.seed.is_some() { TAIL } else { 0 }
+    }
+
+    /// Ends a new block of `directory` with its checksum entry.
+    pub(crate) fn seal_new_directory_block(&self, directory: &Inode, block: &mut [u8]) {
+        let Some(seed) = self.seed else {
+            return;
+        };
+        let at = block.len() - TAIL;
+        block[at..].fill(0);
+        set_u16(block, at + 4, TAIL as u16);
+        block[at + 7] = TAIL_TYPE;
+        let checksum = crc32c(directory.checksum_seed(seed), &block[..at]);
+        set_u32(block, at + 8, checksum);
+    }
+
+    /// Brings the checksum of block `block` of `directory` up to date after
+    /// a change (a block without a checksum entry, an htree node, has its
+    /// checksum elsewhere and is left).
+    fn seal_directory_block(&mut self, directory: u32, block: u32) -> Result<()> {
+        let Some(seed) = self.seed else {
+            return Ok(());
+        };
+        let seed = self.read_inode(directory)?.checksum_seed(seed);
+        let bytes = self.cache.get(&mut self.device, block)?;
+        if !has_tail(bytes) {
+            return Ok(());
+        }
+        let at = bytes.len() - TAIL;
+        let checksum = crc32c(seed, &bytes[..at]);
+        self.cache
+            .write(&mut self.device, block, at + 8, &checksum.to_le_bytes())
+    }
+
+    /// Makes hash-indexed `directory` a plain linear directory before it
+    /// changes, with metadata_csum: the index blocks' (and the root's)
+    /// last entries give up the space of a checksum entry, which every
+    /// block then ends in. (Without checksums, clearing the index flag is
+    /// all it takes: the index blocks read as empty entries.)
+    fn drop_index(&mut self, directory: u32) -> Result<()> {
+        if self.seed.is_none() {
+            return Ok(());
+        }
+        let mut inode = self.read_inode(directory)?;
+        if inode.flags() & INDEX_FL == 0 {
+            return Ok(());
+        }
+        for block in self.directory_blocks(directory)? {
+            let bytes = self.cache.get(&mut self.device, block)?;
+            if has_tail(bytes) {
+                continue;
+            }
+            let mut at = 0;
+            let mut last = None;
+            while at < bytes.len() {
+                let record = record(bytes, at)?;
+                last = Some((at, record));
+                at += record.length;
+            }
+            let (at, last) = last.ok_or(Error::Corrupt)?;
+            let used = if last.inode == 0 {
+                HEADER
+            } else {
+                entry_size(last.name_length)
+            };
+            if last.length < used + TAIL {
+                return Err(Error::NoSpace);
+            }
+            let mut contents = alloc::vec::Vec::new();
+            contents
+                .try_reserve_exact(bytes.len())
+                .map_err(|_| Error::NoMemory)?;
+            contents.extend_from_slice(bytes);
+            set_u16(&mut contents, at + 4, (last.length - TAIL) as u16);
+            self.seal_new_directory_block(&inode, &mut contents);
+            self.cache.replace(&mut self.device, block, contents)?;
+        }
+        inode.set_flags(inode.flags() & !INDEX_FL);
+        self.write_inode(directory, &inode)
+    }
+
     /// The data blocks of directory `directory`, in order (holes skipped).
     fn directory_blocks(&mut self, directory: u32) -> Result<alloc::vec::Vec<u32>> {
         let mut inode = self.read_inode(directory)?;
@@ -216,12 +324,15 @@ impl<D: BlockDevice> Filesystem<D> {
         inode: u32,
         kind: Kind,
     ) -> Result<()> {
+        self.drop_index(directory)?;
         let needed = entry_size(name.len());
+        let checksums = self.seed.is_some();
         for block in self.directory_blocks(directory)? {
             let bytes = self.cache.get(&mut self.device, block)?;
+            let end = entries_end(bytes, checksums);
             let mut at = 0;
             let mut gap = None;
-            while at < bytes.len() {
+            while at < end {
                 let record = record(bytes, at)?;
                 let used = if record.inode == 0 {
                     0
@@ -239,19 +350,20 @@ impl<D: BlockDevice> Filesystem<D> {
             };
             if used == 0 {
                 let (bytes, length) = encode(inode, record.length, name, kind);
-                return self
-                    .cache
-                    .write(&mut self.device, block, at, &bytes[..length]);
+                self.cache
+                    .write(&mut self.device, block, at, &bytes[..length])?;
+            } else {
+                let (bytes, length) = encode(inode, record.length - used, name, kind);
+                self.cache
+                    .write(&mut self.device, block, at + used, &bytes[..length])?;
+                self.cache.write(
+                    &mut self.device,
+                    block,
+                    at + 4,
+                    &(used as u16).to_le_bytes(),
+                )?;
             }
-            let (bytes, length) = encode(inode, record.length - used, name, kind);
-            self.cache
-                .write(&mut self.device, block, at + used, &bytes[..length])?;
-            return self.cache.write(
-                &mut self.device,
-                block,
-                at + 4,
-                &(used as u16).to_le_bytes(),
-            );
+            return self.seal_directory_block(directory, block);
         }
         // No room: the directory grows by a block holding just this entry.
         let mut directory_inode = self.read_inode(directory)?;
@@ -262,8 +374,9 @@ impl<D: BlockDevice> Filesystem<D> {
             .map_block(&mut directory_inode, index, Some(goal))?
             .ok_or(Error::Io)?;
         let mut contents = self.zeroed_block()?;
-        let (bytes, length) = encode(inode, self.block_size as usize, name, kind);
+        let (bytes, length) = encode(inode, self.directory_space(), name, kind);
         contents[..length].copy_from_slice(&bytes[..length]);
+        self.seal_new_directory_block(&directory_inode, &mut contents);
         self.cache.replace(&mut self.device, block, contents)?;
         directory_inode.set_size((index + 1) * block_size);
         self.write_inode(directory, &directory_inode)
@@ -272,6 +385,7 @@ impl<D: BlockDevice> Filesystem<D> {
     /// Removes the entry `name` from `directory`: the entry before it in
     /// its block takes its space, or, first in the block, it is cleared.
     pub(crate) fn remove_entry(&mut self, directory: u32, name: &[u8]) -> Result<()> {
+        self.drop_index(directory)?;
         let found = self.find(directory, name)?.ok_or(Error::NotFound)?;
         match found.previous {
             Some((previous, length)) => {
@@ -281,15 +395,16 @@ impl<D: BlockDevice> Filesystem<D> {
                     found.block,
                     previous + 4,
                     &merged.to_le_bytes(),
-                )
+                )?;
             }
             None => self.cache.write(
                 &mut self.device,
                 found.block,
                 found.at,
                 &0_u32.to_le_bytes(),
-            ),
+            )?,
         }
+        self.seal_directory_block(directory, found.block)
     }
 
     /// Points the existing entry `name` of `directory` at `inode`.
@@ -300,6 +415,7 @@ impl<D: BlockDevice> Filesystem<D> {
         inode: u32,
         kind: Kind,
     ) -> Result<()> {
+        self.drop_index(directory)?;
         let found = self.find(directory, name)?.ok_or(Error::NotFound)?;
         self.cache.write(
             &mut self.device,
@@ -312,6 +428,7 @@ impl<D: BlockDevice> Filesystem<D> {
             found.block,
             found.at + 7,
             &[kind.entry_type()],
-        )
+        )?;
+        self.seal_directory_block(directory, found.block)
     }
 }

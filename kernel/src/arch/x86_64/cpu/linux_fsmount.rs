@@ -403,7 +403,7 @@ fn linux_fs_context_create(id: u64) -> u64 {
         return LINUX_EBUSY;
     }
     let checked = match filesystem.as_slice() {
-        b"ext2" => match source {
+        b"ext2" | b"ext3" | b"ext4" => match source {
             None => Err(LINUX_EINVAL),
             Some(source) => {
                 let mut name = [0_u8; crate::linux_overlay::PATH_CAPACITY + 1];

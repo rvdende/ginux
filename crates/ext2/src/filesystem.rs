@@ -1,22 +1,38 @@
-//! A mounted ext2 filesystem: allocation, block maps, file data, and the
-//! operations that change the namespace.
+//! A mounted ext2, ext3 or ext4 filesystem: allocation, block maps, file
+//! data, and the operations that change the namespace.
 
 use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::bytes::{set_u32, u32_at};
 use crate::cache::BlockCache;
-use crate::inode::{Inode, Kind, Stat, Time, BLOCK_POINTERS, DIRECT_BLOCKS, FAST_SYMLINK_MAX};
+use crate::checksum::crc32c;
+use crate::extent::{self, ExtentMap, Run};
+use crate::inode::{
+    Inode, Kind, Stat, Time, BLOCK_POINTERS, DIRECT_BLOCKS, EXTENTS_FL, FAST_SYMLINK_MAX, INDEX_FL,
+};
 use crate::layout::{
-    GroupDescriptor, Superblock, DESCRIPTOR_SIZE, RO_COMPAT_LARGE_FILE, SUPERBLOCK_OFFSET,
-    SUPERBLOCK_SIZE,
+    GroupDescriptor, Superblock, COMPAT_HAS_JOURNAL, GROUP_BLOCK_UNINIT, GROUP_INODE_UNINIT,
+    INCOMPAT_FILETYPE, INCOMPAT_RECOVER, RO_COMPAT_LARGE_FILE, RO_COMPAT_SPARSE_SUPER,
+    SUPERBLOCK_OFFSET, SUPERBLOCK_SIZE,
 };
 use crate::{BlockDevice, Error, Result, Timestamp, NAME_MAX, ROOT_INODE};
 
-/// The most names an inode may have (`EXT2_LINK_MAX`).
-pub(crate) const LINK_MAX: u16 = 32000;
+/// The most names an inode may have: `EXT2_LINK_MAX`, and ext4's.
+const EXT2_LINK_MAX: u16 = 32000;
+const EXT4_LINK_MAX: u16 = 65000;
 /// The largest file Linux allows anywhere (`MAX_LFS_FILESIZE` on 64-bit).
 const MAX_LFS_FILESIZE: u64 = i64::MAX as u64;
+
+/// The filesystem type a mount asks for. Linux's ext2 driver takes only
+/// ext2's features; ext3 (served by the ext4 driver) needs a journal and
+/// takes no ext4 feature; ext4 takes every feature this driver knows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FsType {
+    Ext2,
+    Ext3,
+    Ext4,
+}
 
 /// How to mount.
 #[derive(Clone, Copy, Debug)]
@@ -24,6 +40,30 @@ pub struct Options {
     pub read_only: bool,
     /// The time of the mount, recorded in the superblock.
     pub now: Timestamp,
+    pub fs_type: FsType,
+}
+
+/// Whether `superblock` may be mounted as `fs_type` (Linux's
+/// `ext2_feature_set_ok`/`ext3_feature_set_ok`).
+fn type_allows(superblock: &Superblock, fs_type: FsType, read_only: bool) -> bool {
+    // What ext2 and ext3 know: in incompat the file type (and ext3 a
+    // journal to recover), in ro_compat sparse_super and large_file.
+    let (incompat, ro_compat) = match fs_type {
+        FsType::Ext4 => return true,
+        FsType::Ext2 => (
+            INCOMPAT_FILETYPE,
+            RO_COMPAT_SPARSE_SUPER | RO_COMPAT_LARGE_FILE,
+        ),
+        FsType::Ext3 => (
+            INCOMPAT_FILETYPE | INCOMPAT_RECOVER,
+            RO_COMPAT_SPARSE_SUPER | RO_COMPAT_LARGE_FILE,
+        ),
+    };
+    if fs_type == FsType::Ext3 && superblock.compat() & COMPAT_HAS_JOURNAL == 0 {
+        return false;
+    }
+    superblock.incompat() & !incompat == 0
+        && (read_only || superblock.ro_compat() & !ro_compat == 0)
 }
 
 /// What a rename does about the destination name.
@@ -84,12 +124,22 @@ pub struct Filesystem<D: BlockDevice> {
     /// The free counts or state changed since the superblock was written.
     superblock_dirty: bool,
     next_generation: u32,
+    /// The seed of every metadata checksum, with metadata_csum.
+    pub(crate) seed: Option<u32>,
+    descriptor_size: usize,
+    link_max: u16,
 }
 
 impl<D: BlockDevice> Filesystem<D> {
-    /// Mounts the filesystem on `device`. EINVAL if it is not ext2 or uses
-    /// a feature this driver does not know; a filesystem that only cannot
-    /// be written (an unknown read-only feature) mounts read-only only.
+    /// Mounts the filesystem on `device`. EINVAL if it is not ext2/3/4,
+    /// uses a feature this driver does not know or one `options.fs_type`
+    /// does not take; a filesystem that only cannot be written (an unknown
+    /// read-only feature) mounts read-only only.
+    ///
+    /// A journal (ext3, ext4) is left as it is: changes go straight to
+    /// their places, as on ext2, and the journal stays empty. One that
+    /// holds transactions to replay (a filesystem not cleanly unmounted by
+    /// a journalling driver) is refused, EINVAL.
     pub fn mount(mut device: D, options: Options) -> Result<Self> {
         let mut raw = vec![0; SUPERBLOCK_SIZE];
         if device.size() < SUPERBLOCK_OFFSET + SUPERBLOCK_SIZE as u64 {
@@ -97,6 +147,9 @@ impl<D: BlockDevice> Filesystem<D> {
         }
         device.read_at(SUPERBLOCK_OFFSET, &mut raw)?;
         let superblock = Superblock::parse(raw)?;
+        if !type_allows(&superblock, options.fs_type, options.read_only) {
+            return Err(Error::Invalid);
+        }
         if !options.read_only && !superblock.writable() {
             return Err(Error::ReadOnly);
         }
@@ -110,7 +163,8 @@ impl<D: BlockDevice> Filesystem<D> {
         {
             return Err(Error::Invalid);
         }
-        let table_bytes = group_count as usize * DESCRIPTOR_SIZE;
+        let descriptor_size = superblock.descriptor_size();
+        let table_bytes = group_count as usize * descriptor_size;
         let mut table = Vec::new();
         table
             .try_reserve_exact(table_bytes)
@@ -118,12 +172,10 @@ impl<D: BlockDevice> Filesystem<D> {
         table.resize(table_bytes, 0);
         let table_start = u64::from(superblock.first_data_block() + 1) * u64::from(block_size);
         device.read_at(table_start, &mut table)?;
-        let groups: Vec<GroupDescriptor> = table
-            .as_chunks::<DESCRIPTOR_SIZE>()
-            .0
-            .iter()
-            .map(|bytes| GroupDescriptor::parse(bytes))
-            .collect();
+        let groups = table
+            .chunks_exact(descriptor_size)
+            .map(|bytes| GroupDescriptor::parse(bytes, descriptor_size))
+            .collect::<Result<Vec<_>>>()?;
         let blocks = superblock.blocks_count();
         let inode_table_blocks = (superblock.inodes_per_group() as usize * superblock.inode_size())
             .div_ceil(block_size as usize) as u32;
@@ -135,6 +187,13 @@ impl<D: BlockDevice> Filesystem<D> {
         }) {
             return Err(Error::Corrupt);
         }
+        let seed = superblock
+            .metadata_csum()
+            .then(|| superblock.checksum_seed());
+        let link_max = match options.fs_type {
+            FsType::Ext2 => EXT2_LINK_MAX,
+            FsType::Ext3 | FsType::Ext4 => EXT4_LINK_MAX,
+        };
         let mut filesystem = Self {
             device,
             superblock,
@@ -144,6 +203,9 @@ impl<D: BlockDevice> Filesystem<D> {
             read_only: options.read_only,
             superblock_dirty: false,
             next_generation: options.now.seconds as u32,
+            seed,
+            descriptor_size,
+            link_max,
         };
         if !filesystem.read_only {
             filesystem
@@ -198,7 +260,7 @@ impl<D: BlockDevice> Filesystem<D> {
 
     fn write_superblock(&mut self) -> Result<()> {
         self.device
-            .write_at(SUPERBLOCK_OFFSET, self.superblock.raw())?;
+            .write_at(SUPERBLOCK_OFFSET, self.superblock.encode())?;
         self.superblock_dirty = false;
         Ok(())
     }
@@ -212,7 +274,8 @@ impl<D: BlockDevice> Filesystem<D> {
         &self.device
     }
 
-    pub fn statfs(&self) -> Statfs {
+    pub fn statfs(&mut self) -> Statfs {
+        let overhead = self.overhead();
         let superblock = &self.superblock;
         let free = u64::from(superblock.free_blocks());
         let uuid = superblock.uuid();
@@ -220,7 +283,7 @@ impl<D: BlockDevice> Filesystem<D> {
             |at: usize| u32::from_le_bytes([uuid[at], uuid[at + 1], uuid[at + 2], uuid[at + 3]]);
         Statfs {
             block_size: self.block_size,
-            blocks: u64::from(superblock.blocks_count()).saturating_sub(self.overhead()),
+            blocks: u64::from(superblock.blocks_count()).saturating_sub(overhead),
             free_blocks: free,
             available_blocks: free.saturating_sub(u64::from(superblock.reserved_blocks())),
             inodes: u64::from(superblock.inodes_count()),
@@ -231,24 +294,60 @@ impl<D: BlockDevice> Filesystem<D> {
     }
 
     /// Blocks the filesystem keeps for itself: the boot block, each
-    /// group's superblock and descriptor copies, bitmaps and inode table.
-    fn overhead(&self) -> u64 {
+    /// group's superblock and descriptor copies, bitmaps and inode table,
+    /// and the journal, as Linux's ext4 counts them (or the count mke2fs
+    /// recorded).
+    fn overhead(&mut self) -> u64 {
+        let recorded = self.superblock.overhead_blocks();
+        if recorded != 0 {
+            return u64::from(recorded);
+        }
+        let journal = match self.superblock.journal_inode() {
+            Some(number) => self
+                .read_inode(number)
+                .map_or(0, |inode| inode.size() / u64::from(self.block_size)),
+            None => 0,
+        };
         let superblock = &self.superblock;
-        let descriptor_blocks =
-            (self.groups.len() * DESCRIPTOR_SIZE).div_ceil(self.block_size as usize) as u64;
-        let reserved_descriptors = u64::from(crate::bytes::u16_at(superblock.raw(), 206));
+        let (descriptor_blocks, reserved_descriptors) = superblock.descriptor_blocks();
         let inode_table = (superblock.inodes_per_group() as u64 * superblock.inode_size() as u64)
             .div_ceil(u64::from(self.block_size));
         let copies = (0..self.groups.len() as u32)
             .filter(|group| superblock.has_superblock_copy(*group))
             .count() as u64;
         u64::from(superblock.first_data_block())
-            + copies * (1 + descriptor_blocks + reserved_descriptors)
+            + copies * (1 + u64::from(descriptor_blocks) + u64::from(reserved_descriptors))
             + self.groups.len() as u64 * (2 + inode_table)
+            + journal
+    }
+
+    /// The largest file the filesystem holds (Linux's `s_maxbytes`): what
+    /// extents can map with the extents feature, else what block maps can.
+    pub fn max_file_size(&self) -> u64 {
+        if self.superblock.extents() {
+            // 32-bit file block numbers; i_blocks counts 2^32 sectors at
+            // most without huge_file.
+            let blocks = if self.superblock.huge_file() {
+                u64::from(u32::MAX)
+            } else {
+                u64::from(u32::MAX) / u64::from(self.block_size / 512)
+            };
+            return (blocks * u64::from(self.block_size)).min(MAX_LFS_FILESIZE);
+        }
+        self.block_map_limit()
+    }
+
+    /// The largest file `inode`'s mapping can hold.
+    fn file_size_limit(&self, inode: &Inode) -> u64 {
+        if inode.uses_extents() {
+            self.max_file_size()
+        } else {
+            self.block_map_limit()
+        }
     }
 
     /// The largest file the block maps (and `i_blocks`) can describe.
-    pub fn max_file_size(&self) -> u64 {
+    fn block_map_limit(&self) -> u64 {
         let pointers = u64::from(self.block_size / 4);
         let data_blocks =
             DIRECT_BLOCKS as u64 + pointers + pointers * pointers + pointers * pointers * pointers;
@@ -270,7 +369,7 @@ impl<D: BlockDevice> Filesystem<D> {
         }
     }
 
-    fn valid_block(&self, block: u32) -> Result<u32> {
+    pub(crate) fn valid_block(&self, block: u32) -> Result<u32> {
         if block >= self.superblock.first_data_block() && block < self.superblock.blocks_count() {
             Ok(block)
         } else {
@@ -304,13 +403,22 @@ impl<D: BlockDevice> Filesystem<D> {
         let mut raw = Vec::new();
         raw.try_reserve_exact(size).map_err(|_| Error::NoMemory)?;
         raw.extend_from_slice(&bytes[offset..offset + size]);
-        Ok(Inode::from_raw(raw))
+        Ok(Inode::from_raw(raw, number))
     }
 
     pub(crate) fn write_inode(&mut self, number: u32, inode: &Inode) -> Result<()> {
         let (block, offset) = self.inode_location(number)?;
-        self.cache
-            .write(&mut self.device, block, offset, inode.raw())
+        match self.seed {
+            Some(seed) => {
+                let mut sealed = inode.clone();
+                sealed.set_checksum(seed);
+                self.cache
+                    .write(&mut self.device, block, offset, sealed.raw())
+            }
+            None => self
+                .cache
+                .write(&mut self.device, block, offset, inode.raw()),
+        }
     }
 
     /// An inode in use: one with a type (a freed inode keeps its mode, so
@@ -355,21 +463,117 @@ impl<D: BlockDevice> Filesystem<D> {
     }
 
     /// The group whose inode `number` is.
-    fn group_of_inode(&self, number: u32) -> u32 {
+    pub(crate) fn group_of_inode(&self, number: u32) -> u32 {
         (number.saturating_sub(1)) / self.superblock.inodes_per_group()
     }
 
+    /// The first block of group `group`.
+    pub(crate) fn group_start(&self, group: u32) -> u32 {
+        self.superblock.first_data_block() + group * self.superblock.blocks_per_group()
+    }
+
     fn write_group(&mut self, group: u32) -> Result<()> {
-        let encoded = self.groups[group as usize].encode();
-        let byte = group as usize * DESCRIPTOR_SIZE;
+        let (encoded, size) = self.groups[group as usize].encode(group, self.seed);
+        let byte = group as usize * self.descriptor_size;
         let block =
             self.superblock.first_data_block() + 1 + (byte / self.block_size as usize) as u32;
         self.cache.write(
             &mut self.device,
             block,
             byte % self.block_size as usize,
-            &encoded,
+            &encoded[..size],
         )
+    }
+
+    /// A zeroed bitmap block with the bits past `used` set, as Linux pads
+    /// a group's bitmaps.
+    fn padded_bitmap(&self, used: u32) -> Result<Vec<u8>> {
+        let mut bitmap = self.zeroed_block()?;
+        for bit in used..self.block_size * 8 {
+            bitmap[(bit / 8) as usize] |= 1 << (bit % 8);
+        }
+        Ok(bitmap)
+    }
+
+    /// The inode bitmap of `group`, written out first if the group's has
+    /// never been (INODE_UNINIT: no inode of it was ever used).
+    fn inode_bitmap(&mut self, group: u32) -> Result<u32> {
+        let descriptor = self.groups.get(group as usize).ok_or(Error::Corrupt)?;
+        let bitmap = descriptor.inode_bitmap;
+        if self.seed.is_some() && descriptor.flags & GROUP_INODE_UNINIT != 0 {
+            let contents = self.padded_bitmap(self.superblock.inodes_per_group())?;
+            self.cache.replace(&mut self.device, bitmap, contents)?;
+            self.groups[group as usize].flags &= !GROUP_INODE_UNINIT;
+            self.seal_inode_bitmap(group)?;
+            self.write_group(group)?;
+        }
+        Ok(bitmap)
+    }
+
+    /// The block bitmap of `group`, built first if the group's has never
+    /// been written (BLOCK_UNINIT): its own superblock and descriptor
+    /// copies and whatever group metadata lies in it are in use.
+    fn block_bitmap(&mut self, group: u32) -> Result<u32> {
+        let descriptor = self.groups.get(group as usize).ok_or(Error::Corrupt)?;
+        let bitmap = descriptor.block_bitmap;
+        if self.seed.is_none() || descriptor.flags & GROUP_BLOCK_UNINIT == 0 {
+            return Ok(bitmap);
+        }
+        let start = self.group_start(group);
+        let in_group = self
+            .superblock
+            .blocks_per_group()
+            .min(self.superblock.blocks_count() - start);
+        let mut contents = self.padded_bitmap(in_group)?;
+        let mut mark = |block: u32| {
+            if (start..start + in_group).contains(&block) {
+                let bit = block - start;
+                contents[(bit / 8) as usize] |= 1 << (bit % 8);
+            }
+        };
+        if self.superblock.has_superblock_copy(group) {
+            let (table, reserved) = self.superblock.descriptor_blocks();
+            for block in start..start + 1 + table + reserved {
+                mark(block);
+            }
+        }
+        let table_blocks = (self.superblock.inodes_per_group() as usize
+            * self.superblock.inode_size())
+        .div_ceil(self.block_size as usize) as u32;
+        for other in &self.groups {
+            mark(other.block_bitmap);
+            mark(other.inode_bitmap);
+            for block in other.inode_table..other.inode_table.saturating_add(table_blocks) {
+                mark(block);
+            }
+        }
+        self.cache.replace(&mut self.device, bitmap, contents)?;
+        self.groups[group as usize].flags &= !GROUP_BLOCK_UNINIT;
+        self.seal_block_bitmap(group)?;
+        self.write_group(group)?;
+        Ok(bitmap)
+    }
+
+    /// Brings group `group`'s block bitmap checksum up to date (the
+    /// caller writes the descriptor).
+    fn seal_block_bitmap(&mut self, group: u32) -> Result<()> {
+        if let Some(seed) = self.seed {
+            let bitmap = self.groups[group as usize].block_bitmap;
+            let length = (self.superblock.blocks_per_group() / 8) as usize;
+            let bytes = self.cache.get(&mut self.device, bitmap)?;
+            self.groups[group as usize].block_bitmap_checksum = crc32c(seed, &bytes[..length]);
+        }
+        Ok(())
+    }
+
+    fn seal_inode_bitmap(&mut self, group: u32) -> Result<()> {
+        if let Some(seed) = self.seed {
+            let bitmap = self.groups[group as usize].inode_bitmap;
+            let length = (self.superblock.inodes_per_group() / 8) as usize;
+            let bytes = self.cache.get(&mut self.device, bitmap)?;
+            self.groups[group as usize].inode_bitmap_checksum = crc32c(seed, &bytes[..length]);
+        }
+        Ok(())
     }
 
     /// Allocates an inode for a new file of `kind`, near `parent`'s group
@@ -393,7 +597,7 @@ impl<D: BlockDevice> Filesystem<D> {
             if self.groups[group as usize].free_inodes == 0 {
                 continue;
             }
-            let bitmap = self.groups[group as usize].inode_bitmap;
+            let bitmap = self.inode_bitmap(group)?;
             let first = if group == 0 {
                 self.superblock.first_inode() - 1
             } else {
@@ -404,12 +608,19 @@ impl<D: BlockDevice> Filesystem<D> {
             else {
                 continue;
             };
-            self.set_bit(bitmap, bit, true)?;
+            self.change_bits(bitmap, bit, 1, true)?;
             let descriptor = &mut self.groups[group as usize];
             descriptor.free_inodes -= 1;
             if kind == Kind::Directory {
                 descriptor.used_directories = descriptor.used_directories.saturating_add(1);
             }
+            // The inodes past the last one used are never read (with
+            // checksums, e2fsck and Linux skip them).
+            let unused_from = per_group - u32::from(descriptor.unused_inodes);
+            if self.seed.is_some() && bit >= unused_from {
+                descriptor.unused_inodes = (per_group - bit - 1) as u16;
+            }
+            self.seal_inode_bitmap(group)?;
             self.write_group(group)?;
             let free = self.superblock.free_inodes() - 1;
             self.superblock.set_free_inodes(free);
@@ -422,20 +633,14 @@ impl<D: BlockDevice> Filesystem<D> {
     fn free_inode(&mut self, number: u32, directory: bool) -> Result<()> {
         let group = self.group_of_inode(number);
         let bit = (number - 1) % self.superblock.inodes_per_group();
-        let bitmap = self
-            .groups
-            .get(group as usize)
-            .ok_or(Error::Corrupt)?
-            .inode_bitmap;
-        if !test_bit(self.cache.get(&mut self.device, bitmap)?, bit) {
-            return Err(Error::Corrupt);
-        }
-        self.set_bit(bitmap, bit, false)?;
+        let bitmap = self.inode_bitmap(group)?;
+        self.change_bits(bitmap, bit, 1, false)?;
         let descriptor = &mut self.groups[group as usize];
         descriptor.free_inodes = descriptor.free_inodes.saturating_add(1);
         if directory {
             descriptor.used_directories = descriptor.used_directories.saturating_sub(1);
         }
+        self.seal_inode_bitmap(group)?;
         self.write_group(group)?;
         let free = self.superblock.free_inodes() + 1;
         self.superblock.set_free_inodes(free);
@@ -443,68 +648,120 @@ impl<D: BlockDevice> Filesystem<D> {
         Ok(())
     }
 
-    fn set_bit(&mut self, bitmap: u32, bit: u32, set: bool) -> Result<()> {
-        let byte = (bit / 8) as usize;
-        let mut value = self.cache.get(&mut self.device, bitmap)?[byte];
-        if set {
-            value |= 1 << (bit % 8);
-        } else {
-            value &= !(1 << (bit % 8));
+    /// Sets or clears bits `start..start + count` of the bitmap in block
+    /// `bitmap`; EUCLEAN if one already was.
+    fn change_bits(&mut self, bitmap: u32, start: u32, count: u32, set: bool) -> Result<()> {
+        if count == 0 {
+            return Ok(());
         }
-        self.cache.write(&mut self.device, bitmap, byte, &[value])
+        let first = (start / 8) as usize;
+        let last = ((start + count - 1) / 8) as usize;
+        let current = self
+            .cache
+            .get(&mut self.device, bitmap)?
+            .get(first..=last)
+            .ok_or(Error::Corrupt)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(current.len())
+            .map_err(|_| Error::NoMemory)?;
+        bytes.extend_from_slice(current);
+        for bit in start..start + count {
+            let (byte, mask) = ((bit / 8) as usize - first, 1 << (bit % 8));
+            if (bytes[byte] & mask != 0) == set {
+                return Err(Error::Corrupt);
+            }
+            bytes[byte] ^= mask;
+        }
+        self.cache.write(&mut self.device, bitmap, first, &bytes)
     }
 
     // ---- blocks ----
 
     /// Allocates a block, preferring group `goal`; the caller fills it.
     pub(crate) fn allocate_block(&mut self, goal: u32) -> Result<u32> {
+        let goal = self.group_start(goal.min(self.groups.len() as u32 - 1));
+        Ok(self.allocate_blocks(goal, 1)?.0)
+    }
+
+    /// Allocates up to `count` (at least one) blocks in a row, the first
+    /// free at or after block `goal` (wrapping around the disk); returns
+    /// the first and how many.
+    pub(crate) fn allocate_blocks(&mut self, goal: u32, count: u32) -> Result<(u32, u32)> {
         if self.superblock.free_blocks() == 0 {
             return Err(Error::NoSpace);
         }
-        let count = self.groups.len() as u32;
+        let groups = self.groups.len() as u32;
         let per_group = self.superblock.blocks_per_group();
         let first_data = self.superblock.first_data_block();
         let total = self.superblock.blocks_count();
-        for step in 0..count {
-            let group = (goal.min(count - 1) + step) % count;
+        let goal = goal.clamp(first_data, total - 1) - first_data;
+        let (start_group, start_bit) = (goal / per_group, goal % per_group);
+        // The goal's group from the goal, the others, then the goal's group
+        // from its start.
+        for step in 0..=groups {
+            let group = (start_group + step) % groups;
+            let from = if step == 0 { start_bit } else { 0 };
             if self.groups[group as usize].free_blocks == 0 {
                 continue;
             }
             let in_group = per_group.min(total - first_data - group * per_group);
-            let bitmap = self.groups[group as usize].block_bitmap;
-            let Some(bit) = find_clear_bit(self.cache.get(&mut self.device, bitmap)?, 0, in_group)
-            else {
+            let bitmap = self.block_bitmap(group)?;
+            let bytes = self.cache.get(&mut self.device, bitmap)?;
+            let Some(bit) = find_clear_bit(bytes, from, in_group) else {
                 continue;
             };
-            self.set_bit(bitmap, bit, true)?;
-            self.groups[group as usize].free_blocks -= 1;
+            let free = u32::from(self.groups[group as usize].free_blocks);
+            let mut length = 1;
+            while length < count.min(free)
+                && bit + length < in_group
+                && !test_bit(bytes, bit + length)
+            {
+                length += 1;
+            }
+            self.change_bits(bitmap, bit, length, true)?;
+            self.groups[group as usize].free_blocks -= length as u16;
+            self.seal_block_bitmap(group)?;
             self.write_group(group)?;
-            let free = self.superblock.free_blocks() - 1;
+            let free = self.superblock.free_blocks().saturating_sub(length);
             self.superblock.set_free_blocks(free);
             self.superblock_dirty = true;
-            return Ok(first_data + group * per_group + bit);
+            return Ok((first_data + group * per_group + bit, length));
         }
         Err(Error::NoSpace)
     }
 
     pub(crate) fn free_block(&mut self, block: u32) -> Result<()> {
-        let block = self.valid_block(block)?;
-        let relative = block - self.superblock.first_data_block();
+        self.free_run(block, 1)
+    }
+
+    /// Frees blocks `block..block + count`.
+    pub(crate) fn free_run(&mut self, mut block: u32, mut count: u32) -> Result<()> {
         let per_group = self.superblock.blocks_per_group();
-        let group = relative / per_group;
-        let bit = relative % per_group;
-        let bitmap = self.groups[group as usize].block_bitmap;
-        if !test_bit(self.cache.get(&mut self.device, bitmap)?, bit) {
-            return Err(Error::Corrupt);
+        while count > 0 {
+            let block_checked = self.valid_block(block)?;
+            let relative = block_checked - self.superblock.first_data_block();
+            let group = relative / per_group;
+            let bit = relative % per_group;
+            let length = count.min(per_group - bit);
+            if u64::from(block) + u64::from(length) > u64::from(self.superblock.blocks_count()) {
+                return Err(Error::Corrupt);
+            }
+            let bitmap = self.block_bitmap(group)?;
+            self.change_bits(bitmap, bit, length, false)?;
+            for freed in block..block + length {
+                self.cache.forget(freed);
+            }
+            let descriptor = &mut self.groups[group as usize];
+            descriptor.free_blocks = descriptor.free_blocks.saturating_add(length as u16);
+            self.seal_block_bitmap(group)?;
+            self.write_group(group)?;
+            let free = self.superblock.free_blocks() + length;
+            self.superblock.set_free_blocks(free);
+            self.superblock_dirty = true;
+            block += length;
+            count -= length;
         }
-        self.set_bit(bitmap, bit, false)?;
-        self.cache.forget(block);
-        let descriptor = &mut self.groups[group as usize];
-        descriptor.free_blocks = descriptor.free_blocks.saturating_add(1);
-        self.write_group(group)?;
-        let free = self.superblock.free_blocks() + 1;
-        self.superblock.set_free_blocks(free);
-        self.superblock_dirty = true;
         Ok(())
     }
 
@@ -518,7 +775,7 @@ impl<D: BlockDevice> Filesystem<D> {
         Ok(block)
     }
 
-    fn sectors_per_block(&self) -> u64 {
+    pub(crate) fn sectors_per_block(&self) -> u64 {
         u64::from(self.block_size / 512)
     }
 
@@ -568,6 +825,9 @@ impl<D: BlockDevice> Filesystem<D> {
         index: u64,
         allocate: Option<u32>,
     ) -> Result<Option<(u32, bool)>> {
+        if inode.uses_extents() {
+            return self.map_extent(inode, index, allocate.is_some());
+        }
         let (root, offsets, depth) = self.block_path(index)?;
         let mut block = inode.block(root);
         let mut fresh = false;
@@ -611,9 +871,65 @@ impl<D: BlockDevice> Filesystem<D> {
         Ok(Some((block, fresh)))
     }
 
+    /// `map_block` for an extent-mapped inode.
+    fn map_extent(
+        &mut self,
+        inode: &mut Inode,
+        index: u64,
+        allocate: bool,
+    ) -> Result<Option<(u32, bool)>> {
+        let index = u32::try_from(index).map_err(|_| Error::FileTooBig)?;
+        if let Some(run) = self.find_run(inode, index)? {
+            if !run.unwritten {
+                return Ok(Some((run.block(index), false)));
+            }
+        }
+        if !allocate {
+            return Ok(None);
+        }
+        let mut map = self.load_extents(inode)?;
+        let result = self.map_for_write(inode, &mut map, index, 1);
+        self.store_extents(inode, &mut map)?;
+        result.map(Some)
+    }
+
+    /// The block for writing file block `index` of `map`: allocated (with
+    /// up to `want` blocks after it, which the hole must have room for) or
+    /// made written. The second value says it is new: the caller writes
+    /// all of it.
+    fn map_for_write(
+        &mut self,
+        inode: &mut Inode,
+        map: &mut ExtentMap,
+        index: u32,
+        want: u32,
+    ) -> Result<(u32, bool)> {
+        match map.find(index) {
+            Some(run) if !run.unwritten => Ok((run.block(index), false)),
+            Some(run) => {
+                map.mark_written(index)?;
+                if let Err(error) = self.reserve_tree(inode, map) {
+                    map.mark_unwritten(u64::from(index), u64::from(index) + 1)?;
+                    return Err(error);
+                }
+                Ok((run.block(index), true))
+            }
+            None => {
+                let run = self.allocate_run(inode, map, index, want, false)?;
+                Ok((run.physical, true))
+            }
+        }
+    }
+
     /// Frees every data block of `inode` from file block `keep` on, and the
     /// indirect blocks that leaves empty.
     pub(crate) fn free_blocks_from(&mut self, inode: &mut Inode, keep: u64) -> Result<()> {
+        if inode.uses_extents() {
+            let mut map = self.load_extents(inode)?;
+            let freed = map.remove(keep, u64::MAX)?;
+            self.store_extents(inode, &mut map)?;
+            return self.release_runs(inode, &freed);
+        }
         let pointers = u64::from(self.block_size / 4);
         let mut freed = 0_u64;
         for index in (keep.min(DIRECT_BLOCKS as u64) as usize)..DIRECT_BLOCKS {
@@ -756,7 +1072,7 @@ impl<D: BlockDevice> Filesystem<D> {
             Some(Kind::File) => {}
             _ => return Err(Error::Invalid),
         }
-        let limit = self.max_file_size();
+        let limit = self.file_size_limit(&inode);
         if data.is_empty() {
             return Ok(0);
         }
@@ -765,7 +1081,11 @@ impl<D: BlockDevice> Filesystem<D> {
         }
         let data = &data[..(data.len() as u64).min(limit - offset) as usize];
         let goal = self.group_of_inode(number);
-        let result = self.write_data(&mut inode, goal, offset, data);
+        let result = if inode.uses_extents() {
+            self.write_extents(&mut inode, offset, data)
+        } else {
+            self.write_data(&mut inode, goal, offset, data)
+        };
         let written = match result {
             Ok(written) | Err((written, _)) if written > 0 => written,
             Ok(written) => written,
@@ -785,6 +1105,368 @@ impl<D: BlockDevice> Filesystem<D> {
         }
         self.write_inode(number, &inode)?;
         Ok(written)
+    }
+
+    /// `write_data` for an extent-mapped inode: the map is loaded once,
+    /// holes are allocated a run at a time, and the map is stored once.
+    fn write_extents(
+        &mut self,
+        inode: &mut Inode,
+        offset: u64,
+        data: &[u8],
+    ) -> core::result::Result<usize, (usize, Error)> {
+        let mut map = self.load_extents(inode).map_err(|error| (0, error))?;
+        let result = self.write_mapped(inode, &mut map, offset, data);
+        // What got allocated is recorded, even after a failure.
+        let stored = self.store_extents(inode, &mut map);
+        match (result, stored) {
+            (Ok(written), Ok(())) => Ok(written),
+            (Err(failure), _) => Err(failure),
+            (Ok(_), Err(error)) => Err((0, error)),
+        }
+    }
+
+    fn write_mapped(
+        &mut self,
+        inode: &mut Inode,
+        map: &mut ExtentMap,
+        offset: u64,
+        data: &[u8],
+    ) -> core::result::Result<usize, (usize, Error)> {
+        let block_size = u64::from(self.block_size);
+        let end_block = (offset + data.len() as u64).div_ceil(block_size);
+        // File blocks this write allocated: each is written whole.
+        let mut fresh = 0..0;
+        let mut done = 0;
+        while done < data.len() {
+            let position = offset + done as u64;
+            let index = position / block_size;
+            let within = (position % block_size) as usize;
+            let chunk = (data.len() - done).min(block_size as usize - within);
+            let source = &data[done..done + chunk];
+            let index = u32::try_from(index).map_err(|_| (done, Error::FileTooBig))?;
+            let hole_end = map
+                .next_start(index)
+                .map_or(end_block, |start| u64::from(start).min(end_block));
+            let want = hole_end.saturating_sub(u64::from(index)).max(1) as u32;
+            let (block, new) = self
+                .map_for_write(inode, map, index, want)
+                .map_err(|error| (done, error))?;
+            if new {
+                if let Some(run) = map.find(index) {
+                    fresh = index..(run.end().min(hole_end) as u32).max(index + 1);
+                }
+            }
+            let whole = new || fresh.contains(&index);
+            let start = u64::from(block) * block_size;
+            let result = if whole && chunk < block_size as usize {
+                self.zeroed_block().and_then(|mut contents| {
+                    contents[within..within + chunk].copy_from_slice(source);
+                    self.device.write_at(start, &contents)
+                })
+            } else {
+                self.device.write_at(start + within as u64, source)
+            };
+            result.map_err(|error| (done, error))?;
+            done += chunk;
+        }
+        Ok(done)
+    }
+
+    /// Allocates the blocks of inode `number` (extent-mapped) from
+    /// `offset` for `length` bytes as unwritten extents, which read as
+    /// zeros (fallocate(2)); with `keep_size` the size stays, else it grows
+    /// to cover them. The caller sets the times.
+    pub fn allocate(
+        &mut self,
+        number: u32,
+        offset: u64,
+        length: u64,
+        keep_size: bool,
+    ) -> Result<()> {
+        self.check_writable()?;
+        let mut inode = self.live_inode(number)?;
+        match inode.kind() {
+            Some(Kind::Directory) => return Err(Error::IsDirectory),
+            Some(Kind::File) => {}
+            _ => return Err(Error::Invalid),
+        }
+        if !inode.uses_extents() {
+            return Err(Error::Unsupported);
+        }
+        let end = offset.checked_add(length).ok_or(Error::FileTooBig)?;
+        if end > self.max_file_size() {
+            return Err(Error::FileTooBig);
+        }
+        let block_size = u64::from(self.block_size);
+        let mut map = self.load_extents(&inode)?;
+        let mut index = offset / block_size;
+        let last = end.div_ceil(block_size);
+        let mut result = Ok(());
+        while index < last {
+            let at = index as u32;
+            if let Some(run) = map.find(at) {
+                index = run.end();
+                continue;
+            }
+            let hole_end = map
+                .next_start(at)
+                .map_or(last, |start| u64::from(start).min(last));
+            match self.allocate_run(&mut inode, &mut map, at, (hole_end - index) as u32, true) {
+                Ok(run) => index += u64::from(run.length),
+                Err(error) => {
+                    result = Err(error);
+                    break;
+                }
+            }
+        }
+        self.store_extents(&mut inode, &mut map)?;
+        if result.is_ok() && !keep_size && end > inode.size() {
+            inode.set_size(end);
+            if end > i32::MAX as u64 {
+                self.superblock.add_ro_compat(RO_COMPAT_LARGE_FILE);
+                self.superblock_dirty = true;
+            }
+        }
+        self.write_inode(number, &inode)?;
+        result
+    }
+
+    /// Punches a hole in inode `number` (extent-mapped) from `offset` for
+    /// `length` bytes (FALLOC_FL_PUNCH_HOLE): the whole blocks in it are
+    /// freed and the rest of it is zeroed; the size stays. The caller sets
+    /// the times.
+    pub fn punch_hole(&mut self, number: u32, offset: u64, length: u64) -> Result<()> {
+        self.check_writable()?;
+        let mut inode = self.live_inode(number)?;
+        match inode.kind() {
+            Some(Kind::Directory) => return Err(Error::IsDirectory),
+            Some(Kind::File) => {}
+            _ => return Err(Error::Invalid),
+        }
+        if !inode.uses_extents() {
+            return Err(Error::Unsupported);
+        }
+        let size = inode.size();
+        if offset >= size || length == 0 {
+            return Ok(());
+        }
+        let block_size = u64::from(self.block_size);
+        // Past the end of the file the hole reaches the end of its last
+        // block (Linux's goes to the page's end).
+        let end = offset
+            .saturating_add(length)
+            .min(size.div_ceil(block_size) * block_size);
+        let first_whole = offset.div_ceil(block_size);
+        let last_whole = end / block_size;
+        // The partial blocks at either end are zeroed where written.
+        for (from, to) in [
+            (offset, end.min(first_whole * block_size)),
+            ((last_whole * block_size).max(offset), end),
+        ] {
+            if from >= to {
+                continue;
+            }
+            if let Some((block, _)) = self.map_block(&mut inode, from / block_size, None)? {
+                let zeros = vec![0_u8; (to - from) as usize];
+                self.device
+                    .write_at(u64::from(block) * block_size + from % block_size, &zeros)?;
+            }
+            if first_whole > last_whole {
+                break;
+            }
+        }
+        if first_whole < last_whole {
+            let mut map = self.load_extents(&inode)?;
+            let freed = map.remove(first_whole, last_whole)?;
+            self.reserve_tree(&mut inode, &mut map)?;
+            self.store_extents(&mut inode, &mut map)?;
+            self.release_runs(&mut inode, &freed)?;
+        }
+        self.write_inode(number, &inode)
+    }
+
+    /// An extent-mapped regular file, for the fallocate modes.
+    fn extent_file(&mut self, number: u32) -> Result<Inode> {
+        self.check_writable()?;
+        let inode = self.live_inode(number)?;
+        match inode.kind() {
+            Some(Kind::Directory) => return Err(Error::IsDirectory),
+            Some(Kind::File) => {}
+            _ => return Err(Error::Invalid),
+        }
+        if !inode.uses_extents() {
+            return Err(Error::Unsupported);
+        }
+        Ok(inode)
+    }
+
+    /// Zeroes `offset..offset + length` of inode `number` (extent-mapped,
+    /// FALLOC_FL_ZERO_RANGE): its whole blocks become unwritten, holes in
+    /// it are allocated unwritten, and the partial blocks at its ends are
+    /// zeroed; with `keep_size` the size stays, else it grows to cover the
+    /// range. The caller sets the times.
+    pub fn zero_range(
+        &mut self,
+        number: u32,
+        offset: u64,
+        length: u64,
+        keep_size: bool,
+    ) -> Result<()> {
+        let inode = self.extent_file(number)?;
+        let end = offset.checked_add(length).ok_or(Error::FileTooBig)?;
+        if end > self.max_file_size() {
+            return Err(Error::FileTooBig);
+        }
+        let block_size = u64::from(self.block_size);
+        let first_whole = offset.div_ceil(block_size);
+        let last_whole = end / block_size;
+        drop(inode);
+        self.zero_partial_blocks(number, offset, end)?;
+        let mut inode = self.live_inode(number)?;
+        if first_whole < last_whole {
+            let mut map = self.load_extents(&inode)?;
+            map.mark_unwritten(first_whole, last_whole)?;
+            self.reserve_tree(&mut inode, &mut map)?;
+            self.store_extents(&mut inode, &mut map)?;
+            self.write_inode(number, &inode)?;
+        }
+        // The holes, edges too, are allocated (unwritten) as fallocate does.
+        self.allocate(number, offset, length, keep_size)
+    }
+
+    /// Zeroes the parts of `offset..end` of inode `number` that lie in
+    /// blocks only partly inside it, where those blocks are written.
+    fn zero_partial_blocks(&mut self, number: u32, offset: u64, end: u64) -> Result<()> {
+        let mut inode = self.live_inode(number)?;
+        let block_size = u64::from(self.block_size);
+        let first_whole = offset.div_ceil(block_size);
+        let last_whole = end / block_size;
+        for (from, to) in [
+            (offset, end.min(first_whole * block_size)),
+            ((last_whole * block_size).max(offset), end),
+        ] {
+            if from < to {
+                if let Some((block, _)) = self.map_block(&mut inode, from / block_size, None)? {
+                    let zeros = vec![0_u8; (to - from) as usize];
+                    self.device
+                        .write_at(u64::from(block) * block_size + from % block_size, &zeros)?;
+                }
+            }
+            if first_whole > last_whole {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes blocks `offset..offset + length` (block-aligned, before the
+    /// end) from inode `number`, moving the rest of the file down
+    /// (FALLOC_FL_COLLAPSE_RANGE). The caller sets the times.
+    pub fn collapse_range(&mut self, number: u32, offset: u64, length: u64) -> Result<()> {
+        let mut inode = self.extent_file(number)?;
+        let block_size = u64::from(self.block_size);
+        let end = offset.checked_add(length).ok_or(Error::Invalid)?;
+        if !offset.is_multiple_of(block_size) || !length.is_multiple_of(block_size) || length == 0 {
+            return Err(Error::Invalid);
+        }
+        if end >= inode.size() {
+            return Err(Error::Invalid);
+        }
+        let (first, last) = (offset / block_size, end / block_size);
+        let mut map = self.load_extents(&inode)?;
+        let freed = map.remove(first, last)?;
+        map.shift(last as u32, -((last - first) as i64))?;
+        self.reserve_tree(&mut inode, &mut map)?;
+        self.store_extents(&mut inode, &mut map)?;
+        self.release_runs(&mut inode, &freed)?;
+        inode.set_size(inode.size() - length);
+        self.write_inode(number, &inode)
+    }
+
+    /// Opens a hole of `length` bytes at `offset` (block-aligned, before
+    /// the end) of inode `number`, moving the rest of the file up
+    /// (FALLOC_FL_INSERT_RANGE). The caller sets the times.
+    pub fn insert_range(&mut self, number: u32, offset: u64, length: u64) -> Result<()> {
+        let mut inode = self.extent_file(number)?;
+        let block_size = u64::from(self.block_size);
+        if !offset.is_multiple_of(block_size) || !length.is_multiple_of(block_size) || length == 0 {
+            return Err(Error::Invalid);
+        }
+        if offset >= inode.size() {
+            return Err(Error::Invalid);
+        }
+        let size = inode.size().checked_add(length).ok_or(Error::FileTooBig)?;
+        if size > self.max_file_size() {
+            return Err(Error::FileTooBig);
+        }
+        let mut map = self.load_extents(&inode)?;
+        map.shift((offset / block_size) as u32, (length / block_size) as i64)?;
+        self.reserve_tree(&mut inode, &mut map)?;
+        self.store_extents(&mut inode, &mut map)?;
+        inode.set_size(size);
+        if size > i32::MAX as u64 {
+            self.superblock.add_ro_compat(RO_COMPAT_LARGE_FILE);
+            self.superblock_dirty = true;
+        }
+        self.write_inode(number, &inode)
+    }
+
+    /// Where the next data (`data`) or hole of inode `number` at or after
+    /// byte `offset` starts (SEEK_DATA, SEEK_HOLE); `None` at or past the
+    /// end of the file (ENXIO). Unwritten blocks are holes; the end of the
+    /// file is one.
+    pub fn seek(&mut self, number: u32, offset: u64, data: bool) -> Result<Option<u64>> {
+        let mut inode = self.live_inode(number)?;
+        let size = inode.size();
+        if offset >= size {
+            return Ok(None);
+        }
+        let block_size = u64::from(self.block_size);
+        let last = size.div_ceil(block_size);
+        let mut index = offset / block_size;
+        if inode.uses_extents() {
+            let map = self.load_extents(&inode)?;
+            while index < last {
+                let at = index as u32;
+                match map.find(at) {
+                    Some(run) if !run.unwritten => {
+                        if data {
+                            break;
+                        }
+                        index = run.end();
+                    }
+                    Some(run) => {
+                        if !data {
+                            break;
+                        }
+                        index = run.end();
+                    }
+                    None => {
+                        if !data {
+                            break;
+                        }
+                        index = map.next_start(at).map_or(last, u64::from);
+                    }
+                }
+            }
+        } else {
+            while index < last {
+                let mapped = self.map_block(&mut inode, index, None)?.is_some();
+                if mapped == data {
+                    break;
+                }
+                index += 1;
+            }
+        }
+        let found = (index * block_size).max(offset);
+        Ok(if found < size {
+            Some(found)
+        } else if data {
+            None
+        } else {
+            Some(size)
+        })
     }
 
     /// Writes `data` at `offset`; on failure, how much got written first.
@@ -836,7 +1518,7 @@ impl<D: BlockDevice> Filesystem<D> {
             Some(Kind::File) => {}
             _ => return Err(Error::Invalid),
         }
-        if size > self.max_file_size() {
+        if size > self.file_size_limit(&inode) {
             return Err(Error::FileTooBig);
         }
         let block_size = u64::from(self.block_size);
@@ -955,9 +1637,16 @@ impl<D: BlockDevice> Filesystem<D> {
         now: Timestamp,
     ) -> Result<(u32, Inode)> {
         let number = self.allocate_inode(parent, kind)?;
-        let mut inode = Inode::from_raw(vec![0; self.superblock.inode_size()]);
+        let mut inode = Inode::from_raw(vec![0; self.superblock.inode_size()], number);
         if self.superblock.inode_size() > 128 {
             inode.set_extra_isize(self.superblock.want_extra_isize());
+        }
+        // With extents, files, directories and symlinks map their data
+        // with them, from an empty tree (a fast symlink drops it again).
+        if self.superblock.extents() && matches!(kind, Kind::File | Kind::Directory | Kind::Symlink)
+        {
+            inode.set_flags(EXTENTS_FL);
+            extent::empty_root(inode.block_bytes_mut());
         }
         inode.set_mode(kind.mode_bits() | (mode & 0o7777) as u16);
         inode.set_owner(owner, group);
@@ -978,7 +1667,7 @@ impl<D: BlockDevice> Filesystem<D> {
         inode.set_links(count.clamp(0, i32::from(u16::MAX)) as u16);
         // The directory's own index no longer matches once a plain entry
         // changes it (EXT2_INDEX_FL).
-        inode.set_flags(inode.flags() & !0x1000);
+        inode.set_flags(inode.flags() & !INDEX_FL);
         inode.set_time(Time::Modify, now);
         inode.set_time(Time::Change, now);
         self.write_inode(number, &inode)
@@ -1011,7 +1700,7 @@ impl<D: BlockDevice> Filesystem<D> {
         if self.find_entry(parent, name)?.is_some() {
             return Err(Error::Exists);
         }
-        if kind == Kind::Directory && parent_inode.links() >= LINK_MAX {
+        if kind == Kind::Directory && parent_inode.links() >= self.link_max {
             return Err(Error::TooManyLinks);
         }
         let (number, mut inode) = self.new_inode(parent, kind, mode, owner, group, now)?;
@@ -1027,11 +1716,10 @@ impl<D: BlockDevice> Filesystem<D> {
                     return Err(error);
                 }
             };
-            let contents = self.empty_directory_block(number, parent)?;
+            let contents = self.empty_directory_block(&inode, parent)?;
             self.cache.replace(&mut self.device, block, contents)?;
-            inode.set_block(0, block);
+            self.attach_first_block(&mut inode, block)?;
             inode.set_size(u64::from(self.block_size));
-            inode.set_sectors(self.sectors_per_block());
         }
         self.write_inode(number, &inode)?;
         if let Err(error) = self.add_entry(parent, name, number, kind) {
@@ -1079,6 +1767,8 @@ impl<D: BlockDevice> Filesystem<D> {
         let (number, mut inode) =
             self.new_inode(parent, Kind::Symlink, 0o777, owner, group, now)?;
         if target.len() < FAST_SYMLINK_MAX {
+            inode.set_flags(inode.flags() & !EXTENTS_FL);
+            inode.block_bytes_mut().fill(0);
             inode.block_bytes_mut()[..target.len()].copy_from_slice(target);
         } else {
             let block = match self.allocate_block(self.group_of_inode(number)) {
@@ -1092,8 +1782,7 @@ impl<D: BlockDevice> Filesystem<D> {
             contents[..target.len()].copy_from_slice(target);
             self.device
                 .write_at(u64::from(block) * u64::from(self.block_size), &contents)?;
-            inode.set_block(0, block);
-            inode.set_sectors(self.sectors_per_block());
+            self.attach_first_block(&mut inode, block)?;
         }
         inode.set_size(target.len() as u64);
         self.write_inode(number, &inode)?;
@@ -1119,7 +1808,7 @@ impl<D: BlockDevice> Filesystem<D> {
         if kind == Kind::Directory {
             return Err(Error::Unsupported);
         }
-        if inode.links() >= LINK_MAX {
+        if inode.links() >= self.link_max {
             return Err(Error::TooManyLinks);
         }
         if self.find_entry(parent, name)?.is_some() {
@@ -1263,7 +1952,7 @@ impl<D: BlockDevice> Filesystem<D> {
         if moving_directory
             && old_parent != new_parent
             && replaced.is_none()
-            && new_parent_inode.links() >= LINK_MAX
+            && new_parent_inode.links() >= self.link_max
         {
             return Err(Error::TooManyLinks);
         }
@@ -1395,19 +2084,39 @@ impl<D: BlockDevice> Filesystem<D> {
         Ok(true)
     }
 
-    /// The first block of a new directory: `.` and `..`.
-    fn empty_directory_block(&self, number: u32, parent: u32) -> Result<Vec<u8>> {
+    /// Makes `block` the only block of a new inode's data (block 0), in
+    /// its block map or extent tree.
+    fn attach_first_block(&mut self, inode: &mut Inode, block: u32) -> Result<()> {
+        if inode.uses_extents() {
+            let mut map = ExtentMap::new();
+            map.insert(Run {
+                logical: 0,
+                physical: block,
+                length: 1,
+                unwritten: false,
+            })?;
+            self.store_extents(inode, &mut map)?;
+        } else {
+            inode.set_block(0, block);
+        }
+        inode.set_sectors(inode.sectors() + self.sectors_per_block());
+        Ok(())
+    }
+
+    /// The first block of new directory `directory`: `.` and `..`.
+    fn empty_directory_block(&self, directory: &Inode, parent: u32) -> Result<Vec<u8>> {
         let mut block = self.zeroed_block()?;
-        set_u32(&mut block, 0, number);
+        set_u32(&mut block, 0, directory.number());
         crate::bytes::set_u16(&mut block, 4, 12);
         block[6] = 1;
         block[7] = Kind::Directory.entry_type();
         block[8] = b'.';
         set_u32(&mut block, 12, parent);
-        crate::bytes::set_u16(&mut block, 16, (self.block_size - 12) as u16);
+        crate::bytes::set_u16(&mut block, 16, (self.directory_space() - 12) as u16);
         block[18] = 2;
         block[19] = Kind::Directory.entry_type();
         block[20..22].copy_from_slice(b"..");
+        self.seal_new_directory_block(directory, &mut block);
         Ok(block)
     }
 }

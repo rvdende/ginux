@@ -41,6 +41,8 @@ use crate::sync::{LockRank, SpinLock};
 const GENERATIONS: core::ops::Range<u32> = 0x4000_0000..0x8000_0000;
 /// The `FS_*_FL` inode flags `FS_IOC_GETFLAGS` shows and sets on ext2.
 const USER_FLAGS: u32 = 0x0003_dfff;
+/// FS_NOATIME_FL: reads leave the access time.
+const NOATIME_FL: u32 = 0x80;
 
 /// The block device a volume lives on.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -476,6 +478,7 @@ impl Volume {
             filesystem: self.source.device(),
             sectors: stat.blocks,
             block_size: self.filesystem.block_size(),
+            btime: stat.crtime.map(time),
         })
     }
 
@@ -826,6 +829,35 @@ pub(crate) fn read(handle: Handle, offset: usize, output: &mut [u8]) -> Option<u
     }
 }
 
+/// Marks `handle`'s file accessed after a read(2) of it, as Linux's
+/// relatime does: when the access time is not past the last change, or
+/// is a day old (not for an FS_NOATIME_FL file or a read-only volume).
+pub(crate) fn touch_accessed(handle: Handle) {
+    let mut table = VOLUMES.lock();
+    let Some((volume, inode)) = table.of(handle) else {
+        return;
+    };
+    let filesystem = &mut volume.filesystem;
+    let Ok(stat) = filesystem.stat(inode) else {
+        return;
+    };
+    let now = now();
+    if stat.flags & NOATIME_FL == 0
+        && !filesystem.read_only()
+        && (stat.atime <= stat.mtime
+            || stat.atime <= stat.ctime
+            || now.seconds - stat.atime.seconds >= 24 * 60 * 60)
+    {
+        let _ = filesystem.change(
+            inode,
+            &Change {
+                atime: Some(now),
+                ..Change::default()
+            },
+        );
+    }
+}
+
 /// The frame holding page `index` of `handle`'s file in the page cache
 /// (cached first if `load`): what a shared mapping of the page maps.
 pub(crate) fn cached_frame(handle: Handle, index: usize, load: bool) -> Option<memory::FrameLease> {
@@ -937,6 +969,76 @@ pub(crate) fn write(handle: Handle, offset: usize, input: &[u8]) -> Option<usize
     Some(written)
 }
 
+/// What fallocate(2) asks of a volume's file.
+#[derive(Clone, Copy)]
+pub(crate) enum Allocation {
+    /// Allocate (FALLOC_FL_KEEP_SIZE: without growing the file).
+    Allocate {
+        keep_size: bool,
+    },
+    PunchHole,
+    ZeroRange {
+        keep_size: bool,
+    },
+    CollapseRange,
+    InsertRange,
+}
+
+/// fallocate(2) on `handle`'s file, from `offset` for `length` bytes;
+/// marks it modified when it changes the data or the size.
+pub(crate) fn fallocate(
+    handle: Handle,
+    allocation: Allocation,
+    offset: u64,
+    length: u64,
+) -> Option<Result<(), Errno>> {
+    let now = now();
+    let mut table = VOLUMES.lock();
+    let (volume, inode) = table.of(handle)?;
+    // What mappings changed reaches the disk before the blocks move.
+    volume.write_back(inode);
+    let size = volume.filesystem.stat(inode).ok()?.size;
+    let filesystem = &mut volume.filesystem;
+    let result = match allocation {
+        Allocation::Allocate { keep_size } => filesystem.allocate(inode, offset, length, keep_size),
+        Allocation::PunchHole => filesystem.punch_hole(inode, offset, length),
+        Allocation::ZeroRange { keep_size } => {
+            filesystem.zero_range(inode, offset, length, keep_size)
+        }
+        Allocation::CollapseRange => filesystem.collapse_range(inode, offset, length),
+        Allocation::InsertRange => filesystem.insert_range(inode, offset, length),
+    };
+    let new_size = volume.filesystem.stat(inode).ok()?.size;
+    // Shifted ranges move every page after them.
+    let end = match allocation {
+        Allocation::CollapseRange | Allocation::InsertRange => size.max(new_size),
+        _ => offset.saturating_add(length).min(size.max(new_size)),
+    };
+    volume.refresh_cache(inode, offset as usize, end as usize);
+    let changed = !matches!(allocation, Allocation::Allocate { .. }) || new_size != size;
+    if result.is_ok() && changed {
+        let _ = volume.filesystem.change(
+            inode,
+            &Change {
+                mtime: Some(now),
+                ctime: Some(now),
+                ..Change::default()
+            },
+        );
+    }
+    Some(result.map_err(errno))
+}
+
+/// Where the next data (`data`) or hole of `handle`'s file at or after
+/// `offset` starts (lseek's SEEK_DATA and SEEK_HOLE); `None` within for
+/// ENXIO.
+pub(crate) fn seek(handle: Handle, offset: u64, data: bool) -> Option<Option<u64>> {
+    let mut table = VOLUMES.lock();
+    let (volume, inode) = table.of(handle)?;
+    volume.write_back(inode);
+    volume.filesystem.seek(inode, offset, data).ok()
+}
+
 pub(crate) fn truncate(handle: Handle, size: usize) -> Option<bool> {
     let mut table = VOLUMES.lock();
     let (volume, inode) = table.of(handle)?;
@@ -956,11 +1058,13 @@ pub(crate) fn change(handle: Handle, change: &Change) -> Option<bool> {
     Some(volume.filesystem.change(inode, change).is_ok())
 }
 
+/// chmod(2): the mode, and the change time.
 pub(crate) fn set_mode(handle: Handle, mode: u32) -> Option<bool> {
     change(
         handle,
         &Change {
             mode: Some(mode),
+            ctime: Some(now()),
             ..Change::default()
         },
     )
@@ -985,12 +1089,14 @@ pub(crate) fn set_attributes(handle: Handle, attributes: u32) -> Option<bool> {
     )
 }
 
+/// chown(2): the owner and group, and the change time.
 pub(crate) fn set_owner(handle: Handle, owner: u32, group: u32) -> Option<bool> {
     change(
         handle,
         &Change {
             owner: Some(owner),
             group: Some(group),
+            ctime: Some(now()),
             ..Change::default()
         },
     )
@@ -1365,6 +1471,7 @@ pub(crate) fn mount(
     source: Source,
     io: Option<Arc<crate::linux_loop::IoCounters>>,
     read_only: bool,
+    fs_type: ginux_ext2::FsType,
 ) -> Result<(), Errno> {
     let mut stored = Vec::new();
     stored.try_reserve_exact(point.len()).map_err(|_| ENOMEM)?;
@@ -1374,6 +1481,7 @@ pub(crate) fn mount(
         Options {
             read_only,
             now: now(),
+            fs_type,
         },
     )
     .map_err(|error| match error {

@@ -3,24 +3,51 @@
 use alloc::vec::Vec;
 
 use crate::bytes::{set_u16, set_u32, u16_at, u32_at};
+use crate::checksum::crc32c;
 use crate::{Error, Result, MAGIC};
 
 /// Where the superblock starts, whatever the block size.
 pub(crate) const SUPERBLOCK_OFFSET: u64 = 1024;
 pub(crate) const SUPERBLOCK_SIZE: usize = 1024;
-/// An ext2 group descriptor (without the 64-bit feature).
+/// A group descriptor without the 64-bit feature, and the most with it.
 pub(crate) const DESCRIPTOR_SIZE: usize = 32;
+pub(crate) const DESCRIPTOR_SIZE_MAX: usize = 64;
+/// Where the superblock keeps its own checksum.
+const SUPERBLOCK_CHECKSUM: usize = 0x3fc;
 
 /// `s_state`: unmounted cleanly.
 const STATE_VALID: u16 = 1;
 
+// s_feature_compat: nothing in it stops a driver. A journal is kept but
+// not written (see `Filesystem::mount`).
+pub(crate) const COMPAT_HAS_JOURNAL: u32 = 0x4;
 // s_feature_incompat: a driver must know each of these to mount at all.
 pub(crate) const INCOMPAT_FILETYPE: u32 = 0x2;
-const INCOMPAT_SUPPORTED: u32 = INCOMPAT_FILETYPE;
+/// The journal holds transactions not yet written to their places.
+pub(crate) const INCOMPAT_RECOVER: u32 = 0x4;
+pub(crate) const INCOMPAT_EXTENTS: u32 = 0x40;
+pub(crate) const INCOMPAT_64BIT: u32 = 0x80;
+pub(crate) const INCOMPAT_FLEX_BG: u32 = 0x200;
+pub(crate) const INCOMPAT_CSUM_SEED: u32 = 0x2000;
+const INCOMPAT_SUPPORTED: u32 =
+    INCOMPAT_FILETYPE | INCOMPAT_EXTENTS | INCOMPAT_64BIT | INCOMPAT_FLEX_BG | INCOMPAT_CSUM_SEED;
 // s_feature_ro_compat: a driver must know each of these to write.
 pub(crate) const RO_COMPAT_SPARSE_SUPER: u32 = 0x1;
 pub(crate) const RO_COMPAT_LARGE_FILE: u32 = 0x2;
-const RO_COMPAT_SUPPORTED: u32 = RO_COMPAT_SPARSE_SUPER | RO_COMPAT_LARGE_FILE;
+pub(crate) const RO_COMPAT_HUGE_FILE: u32 = 0x8;
+pub(crate) const RO_COMPAT_DIR_NLINK: u32 = 0x20;
+pub(crate) const RO_COMPAT_EXTRA_ISIZE: u32 = 0x40;
+pub(crate) const RO_COMPAT_METADATA_CSUM: u32 = 0x400;
+const RO_COMPAT_SUPPORTED: u32 = RO_COMPAT_SPARSE_SUPER
+    | RO_COMPAT_LARGE_FILE
+    | RO_COMPAT_HUGE_FILE
+    | RO_COMPAT_DIR_NLINK
+    | RO_COMPAT_EXTRA_ISIZE
+    | RO_COMPAT_METADATA_CSUM;
+
+/// Group descriptor flags (`bg_flags`).
+pub(crate) const GROUP_INODE_UNINIT: u16 = 0x1;
+pub(crate) const GROUP_BLOCK_UNINIT: u16 = 0x2;
 
 /// The superblock, kept as its raw bytes so that the fields this driver
 /// does not use are written back unchanged.
@@ -52,17 +79,46 @@ impl Superblock {
         {
             return Err(Error::Invalid);
         }
-        // Directory entries are read with their file type byte.
+        // Directory entries are read with their file type byte; a journal
+        // that needs replaying is not replayed here.
         if superblock.incompat() & !INCOMPAT_SUPPORTED != 0
             || superblock.incompat() & INCOMPAT_FILETYPE == 0
+            || superblock.incompat() & INCOMPAT_RECOVER != 0
+        {
+            return Err(Error::Invalid);
+        }
+        // More than 2^32 blocks does not fit this driver's block numbers.
+        if superblock.is_64bit() {
+            let size = superblock.descriptor_size();
+            if superblock.u32(0x150) != 0
+                || !(DESCRIPTOR_SIZE..=DESCRIPTOR_SIZE_MAX).contains(&size)
+                || !size.is_power_of_two()
+            {
+                return Err(Error::Invalid);
+            }
+        }
+        // metadata_csum is crc32c (s_checksum_type 1), and the superblock's
+        // own checksum must hold.
+        if superblock.metadata_csum()
+            && (superblock.raw[0x175] != 1
+                || u32_at(&superblock.raw, SUPERBLOCK_CHECKSUM) != superblock.checksum())
         {
             return Err(Error::Invalid);
         }
         Ok(superblock)
     }
 
-    pub(crate) fn raw(&self) -> &[u8] {
+    /// The superblock's bytes, with its checksum brought up to date.
+    pub(crate) fn encode(&mut self) -> &[u8] {
+        if self.metadata_csum() {
+            let checksum = self.checksum();
+            set_u32(&mut self.raw, SUPERBLOCK_CHECKSUM, checksum);
+        }
         &self.raw
+    }
+
+    fn checksum(&self) -> u32 {
+        crc32c(!0, &self.raw[..SUPERBLOCK_CHECKSUM])
     }
 
     fn u32(&self, at: usize) -> u32 {
@@ -87,6 +143,9 @@ impl Superblock {
 
     pub(crate) fn set_free_blocks(&mut self, count: u32) {
         set_u32(&mut self.raw, 12, count);
+        if self.is_64bit() {
+            set_u32(&mut self.raw, 0x158, 0);
+        }
     }
 
     pub(crate) fn free_inodes(&self) -> u32 {
@@ -138,12 +197,66 @@ impl Superblock {
         }
     }
 
+    pub(crate) fn compat(&self) -> u32 {
+        self.u32(92)
+    }
+
     pub(crate) fn incompat(&self) -> u32 {
         self.u32(96)
     }
 
     pub(crate) fn ro_compat(&self) -> u32 {
         self.u32(100)
+    }
+
+    pub(crate) fn has_journal(&self) -> bool {
+        self.compat() & COMPAT_HAS_JOURNAL != 0
+    }
+
+    pub(crate) fn extents(&self) -> bool {
+        self.incompat() & INCOMPAT_EXTENTS != 0
+    }
+
+    pub(crate) fn is_64bit(&self) -> bool {
+        self.incompat() & INCOMPAT_64BIT != 0
+    }
+
+    pub(crate) fn metadata_csum(&self) -> bool {
+        self.ro_compat() & RO_COMPAT_METADATA_CSUM != 0
+    }
+
+    pub(crate) fn huge_file(&self) -> bool {
+        self.ro_compat() & RO_COMPAT_HUGE_FILE != 0
+    }
+
+    /// The bytes a group descriptor takes.
+    pub(crate) fn descriptor_size(&self) -> usize {
+        if self.is_64bit() {
+            usize::from(u16_at(&self.raw, 0xfe))
+        } else {
+            DESCRIPTOR_SIZE
+        }
+    }
+
+    /// The seed of every metadata checksum: stored, or the UUID's.
+    pub(crate) fn checksum_seed(&self) -> u32 {
+        if self.incompat() & INCOMPAT_CSUM_SEED != 0 {
+            self.u32(0x270)
+        } else {
+            crc32c(!0, &self.raw[104..120])
+        }
+    }
+
+    /// The blocks mke2fs counted as the filesystem's own (s_overhead_clusters),
+    /// 0 if it did not.
+    pub(crate) fn overhead_blocks(&self) -> u32 {
+        self.u32(0x248)
+    }
+
+    /// The inode of an internal journal.
+    pub(crate) fn journal_inode(&self) -> Option<u32> {
+        let number = self.u32(0xe0);
+        (self.has_journal() && number != 0).then_some(number)
     }
 
     /// Whether every feature that writing depends on is known.
@@ -206,6 +319,14 @@ impl Superblock {
             power == group
         })
     }
+
+    /// Blocks of the descriptor table, and the blocks reserved after it for
+    /// growth (`s_reserved_gdt_blocks`).
+    pub(crate) fn descriptor_blocks(&self) -> (u32, u32) {
+        let table = (self.group_count() as usize * self.descriptor_size())
+            .div_ceil(self.block_size() as usize) as u32;
+        (table, u32::from(u16_at(&self.raw, 206)))
+    }
 }
 
 /// One block group's descriptor.
@@ -217,25 +338,52 @@ pub(crate) struct GroupDescriptor {
     pub(crate) free_blocks: u16,
     pub(crate) free_inodes: u16,
     pub(crate) used_directories: u16,
-    raw: [u8; DESCRIPTOR_SIZE],
+    pub(crate) flags: u16,
+    /// Inodes at the end of the group's table never used (with checksums).
+    pub(crate) unused_inodes: u16,
+    pub(crate) block_bitmap_checksum: u32,
+    pub(crate) inode_bitmap_checksum: u32,
+    size: usize,
+    raw: [u8; DESCRIPTOR_SIZE_MAX],
 }
 
 impl GroupDescriptor {
-    pub(crate) fn parse(bytes: &[u8]) -> Self {
-        let mut raw = [0; DESCRIPTOR_SIZE];
-        raw.copy_from_slice(&bytes[..DESCRIPTOR_SIZE]);
-        Self {
+    /// The descriptor in `bytes` (`size` bytes of it); EUCLEAN for one
+    /// whose numbers do not fit 32 bits.
+    pub(crate) fn parse(bytes: &[u8], size: usize) -> Result<Self> {
+        let mut raw = [0; DESCRIPTOR_SIZE_MAX];
+        raw[..size].copy_from_slice(&bytes[..size]);
+        let wide = size >= DESCRIPTOR_SIZE_MAX;
+        let high_u32 = |at: usize| if wide { u32_at(&raw, at) } else { 0 };
+        let high_u16 = |at: usize| if wide { u16_at(&raw, at) } else { 0 };
+        if high_u32(0x20) | high_u32(0x24) | high_u32(0x28) != 0
+            || high_u16(0x2c) | high_u16(0x2e) | high_u16(0x30) | high_u16(0x32) != 0
+        {
+            return Err(Error::Corrupt);
+        }
+        Ok(Self {
             block_bitmap: u32_at(&raw, 0),
             inode_bitmap: u32_at(&raw, 4),
             inode_table: u32_at(&raw, 8),
             free_blocks: u16_at(&raw, 12),
             free_inodes: u16_at(&raw, 14),
             used_directories: u16_at(&raw, 16),
+            flags: u16_at(&raw, 0x12),
+            unused_inodes: u16_at(&raw, 0x1c),
+            block_bitmap_checksum: u32::from(u16_at(&raw, 0x18)) | u32::from(high_u16(0x38)) << 16,
+            inode_bitmap_checksum: u32::from(u16_at(&raw, 0x1a)) | u32::from(high_u16(0x3a)) << 16,
+            size,
             raw,
-        }
+        })
     }
 
-    pub(crate) fn encode(&self) -> [u8; DESCRIPTOR_SIZE] {
+    /// The descriptor's bytes; with `seed`, its checksum (metadata_csum) for
+    /// group `group` too.
+    pub(crate) fn encode(
+        &self,
+        group: u32,
+        seed: Option<u32>,
+    ) -> ([u8; DESCRIPTOR_SIZE_MAX], usize) {
         let mut raw = self.raw;
         set_u32(&mut raw, 0, self.block_bitmap);
         set_u32(&mut raw, 4, self.inode_bitmap);
@@ -243,7 +391,20 @@ impl GroupDescriptor {
         set_u16(&mut raw, 12, self.free_blocks);
         set_u16(&mut raw, 14, self.free_inodes);
         set_u16(&mut raw, 16, self.used_directories);
-        raw
+        if let Some(seed) = seed {
+            set_u16(&mut raw, 0x12, self.flags);
+            set_u16(&mut raw, 0x1c, self.unused_inodes);
+            set_u16(&mut raw, 0x18, self.block_bitmap_checksum as u16);
+            set_u16(&mut raw, 0x1a, self.inode_bitmap_checksum as u16);
+            if self.size >= DESCRIPTOR_SIZE_MAX {
+                set_u16(&mut raw, 0x38, (self.block_bitmap_checksum >> 16) as u16);
+                set_u16(&mut raw, 0x3a, (self.inode_bitmap_checksum >> 16) as u16);
+            }
+            let crc = crc32c(seed, &group.to_le_bytes());
+            let crc = crate::checksum::crc32c_skipping(crc, &raw[..self.size], 0x1e..0x20);
+            set_u16(&mut raw, 0x1e, crc as u16);
+        }
+        (raw, self.size)
     }
 }
 

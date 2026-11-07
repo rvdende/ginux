@@ -151,15 +151,19 @@ feature rather than a fix:
   /dev/loopN backed by overlay files, /sys/block/loopN with its stat
   counters) and RAM disks (`linux_ramdisk.rs`, /dev/ramN) pass
   ioctl_loop01-07.
-- **Block-device filesystems**: ext2 (`crates/ext2`, mounted through
-  `kernel/src/linux_blockfs.rs`) on a loop device or RAM disk, so the
-  tests that format and mount a device (`.needs_device`,
-  `.mount_device`, `.all_filesystems`) run, on ext2 and tmpfs.
+- **Block-device filesystems**: ext2, ext3 and ext4 (`crates/ext2`,
+  mounted through `kernel/src/linux_blockfs.rs`) on a loop device or RAM
+  disk, so the tests that format and mount a device (`.needs_device`,
+  `.mount_device`, `.all_filesystems`) run, on ext2, ext3, ext4 and
+  tmpfs. ext4 has what `mke2fs -t ext4` turns on: extents (fallocate's
+  allocate, punch, zero, collapse and insert modes, SEEK_DATA/SEEK_HOLE),
+  64-bit descriptors, flex_bg, uninitialized groups and metadata_csum.
+  The journal is not written (changes go to their places, as on ext2,
+  and the journal stays empty); one that needs replaying is refused.
   The LTP tree carries e2fsprogs from the builder (mkfs.ext2/3/4, e2fsck,
   tune2fs, debugfs, chattr, e4crypt: `tools/ltp/container-build.sh`),
-  which `tests/ltp/setup.sh` installs into the domain. mkfs.ext3 and
-  mkfs.ext4 exist too, but the kernel answers ENODEV for those types, so
-  LTP skips them. ioctl_loop05 runs through
+  which `tests/ltp/setup.sh` installs into the domain. xfs, btrfs, vfat,
+  exfat and ntfs are not there (ENODEV), so LTP skips them. ioctl_loop05 runs through
   `/opt/ltp/disk-tmpdir.sh`, which gives it a TMPDIR on an ext2 volume of
   its own (the domain's /tmp is the overlay, device 0). The device tests
   still skipped in `syscalls.list` say what they lack.

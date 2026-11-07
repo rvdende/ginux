@@ -77,6 +77,9 @@ pub(crate) struct Metadata {
     pub(crate) sectors: u64,
     /// The preferred I/O size (stat's st_blksize): the filesystem's block.
     pub(crate) block_size: u32,
+    /// When the file was made (statx's stx_btime), where the filesystem
+    /// keeps it.
+    pub(crate) btime: Option<(i64, i64)>,
 }
 
 pub(crate) struct Child {
@@ -302,6 +305,7 @@ impl Node {
             filesystem: 0,
             sectors: (self.size as u64).div_ceil(512),
             block_size: PAGE_SIZE as u32,
+            btime: None,
         }
     }
 }
