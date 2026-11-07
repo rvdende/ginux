@@ -6,7 +6,16 @@
 use crate::bytes::{set_u16, set_u32, u16_at, u32_at};
 use crate::checksum::crc32c;
 use crate::inode::{Inode, Kind, INDEX_FL};
-use crate::{BlockDevice, Error, Filesystem, Result, NAME_MAX};
+use crate::{BlockDevice, Error, Filesystem, Result, NAME_MAX, ROOT_INODE};
+
+/// How a directory entry's reference is broken.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Damage {
+    /// The number is not one an entry may name: the directory is at fault.
+    Number,
+    /// The inode named has no links or no file type: it is at fault.
+    Inode,
+}
 
 /// The fixed part of an entry.
 const HEADER: usize = 8;
@@ -263,6 +272,24 @@ impl<D: BlockDevice> Filesystem<D> {
         self.find_entry(directory, name)?
             .map(|(inode, _)| inode)
             .ok_or(Error::NotFound)
+    }
+
+    /// What is wrong with a directory entry naming inode `number`, as
+    /// Linux's ext4 lookup finds it (EFSCORRUPTED): `None` for a sound
+    /// reference. An entry may name the root or an inode from the first
+    /// unreserved one up; the inode must have links and a file type.
+    pub fn damaged_reference(&mut self, number: u32) -> Option<Damage> {
+        if number != ROOT_INODE
+            && (number < self.superblock.first_inode() || number > self.superblock.inodes_count())
+        {
+            return Some(Damage::Number);
+        }
+        match self.read_inode(number) {
+            Ok(inode) if inode.links() == 0 || inode.kind().is_none() => Some(Damage::Inode),
+            Ok(_) => None,
+            Err(Error::Corrupt) => Some(Damage::Inode),
+            Err(_) => None,
+        }
     }
 
     /// The first entry of `directory` at or after byte `offset`, and the

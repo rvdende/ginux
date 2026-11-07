@@ -501,6 +501,8 @@ pub(super) const LINUX_ELOOP: u64 = u64::MAX - 39;
 /// The longest pathname a system call takes, terminator included (PATH_MAX).
 pub(super) const LINUX_PATH_MAX: usize = 4096;
 pub(super) const LINUX_ESTALE: u64 = u64::MAX - 115;
+/// EFSCORRUPTED: a filesystem's structures are damaged (ext4's lookups).
+pub(super) const LINUX_EUCLEAN: u64 = u64::MAX - 116;
 pub(super) const LINUX_ENOKEY: u64 = u64::MAX - 125;
 pub(super) const LINUX_EKEYREVOKED: u64 = u64::MAX - 127;
 pub(super) const LINUX_ENODATA: u64 = u64::MAX - 60;

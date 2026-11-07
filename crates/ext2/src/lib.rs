@@ -52,7 +52,7 @@ mod layout;
 mod quota;
 mod xattr;
 
-pub use directory::Entry;
+pub use directory::{Damage, Entry};
 pub use filesystem::{Change, Extent, Filesystem, FsType, Options, RenameMode, Statfs};
 pub use inode::{Kind, Stat};
 pub use quota::{Dquot, DquotChange, QuotaFormat, QuotaInfo, QuotaKind, QuotaOptions};

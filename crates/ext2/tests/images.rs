@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use ginux_ext2::{
-    BlockDevice, Change, DquotChange, Error, Filesystem, FsType, Kind, Options, QuotaKind,
+    BlockDevice, Change, Damage, DquotChange, Error, Filesystem, FsType, Kind, Options, QuotaKind,
     QuotaOptions, RenameMode, Result, Timestamp, XattrMode, ROOT_INODE,
 };
 
@@ -570,6 +570,41 @@ fn files_mke2fs_made_read_back(format: Format) {
     let _ = std::fs::remove_dir_all(directory);
 }
 
+/// An inode with no file type and an entry naming a reserved inode, as
+/// debugfs makes them (fanotify22): lookups see the damage ext4 reports.
+fn damaged_references_are_found(format: Format) {
+    let Some(image) = Image::new("damaged", format, 16, &[]) else {
+        return;
+    };
+    let mut filesystem = image.mount();
+    let base = filesystem
+        .create(ROOT_INODE, b"base", Kind::Directory, 0o777, 0, 0, 0, NOW)
+        .unwrap();
+    let bad = filesystem
+        .create(base, b"bad_dir", Kind::Directory, 0o777, 0, 0, 0, NOW)
+        .unwrap();
+    assert_eq!(filesystem.damaged_reference(bad), None);
+    assert_eq!(filesystem.damaged_reference(ROOT_INODE), None);
+    image.store(filesystem);
+    for request in ["sif base/bad_dir mode 0xff", "ln <1> base/bad_link"] {
+        let status = Command::new(tool("debugfs").unwrap())
+            .args(["-w", "-R", request])
+            .arg(&image.path)
+            .output()
+            .unwrap()
+            .status;
+        assert!(status.success(), "debugfs {request} failed");
+    }
+    let mut filesystem = image.mount();
+    assert_eq!(filesystem.lookup(ROOT_INODE, b"base"), Ok(base));
+    assert_eq!(filesystem.lookup(base, b"bad_dir"), Ok(bad));
+    assert_eq!(filesystem.damaged_reference(bad), Some(Damage::Inode));
+    let link = filesystem.lookup(base, b"bad_link").unwrap();
+    assert_eq!(link, 1);
+    assert_eq!(filesystem.damaged_reference(link), Some(Damage::Number));
+    assert_eq!(filesystem.damaged_reference(base), None);
+}
+
 macro_rules! in_every_format {
     ($($test:ident),* $(,)?) => {
         mod ext2 {
@@ -600,7 +635,8 @@ in_every_format!(
     renames_move_names_and_directories,
     attributes_and_extended_attributes,
     a_full_disk_writes_short_then_fails,
-    files_mke2fs_made_read_back
+    files_mke2fs_made_read_back,
+    damaged_references_are_found
 );
 
 #[test]

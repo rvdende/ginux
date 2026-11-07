@@ -286,13 +286,20 @@ impl<D: BlockDevice> Filesystem<D> {
         &self.device
     }
 
-    pub fn statfs(&mut self) -> Statfs {
-        let overhead = self.overhead();
-        let superblock = &self.superblock;
-        let free = u64::from(superblock.free_blocks());
-        let uuid = superblock.uuid();
+    /// statfs's f_fsid: the filesystem's UUID folded to two words, as
+    /// Linux's ext4 gives it.
+    pub fn id(&self) -> [u32; 2] {
+        let uuid = self.superblock.uuid();
         let word =
             |at: usize| u32::from_le_bytes([uuid[at], uuid[at + 1], uuid[at + 2], uuid[at + 3]]);
+        [word(0) ^ word(8), word(4) ^ word(12)]
+    }
+
+    pub fn statfs(&mut self) -> Statfs {
+        let overhead = self.overhead();
+        let id = self.id();
+        let superblock = &self.superblock;
+        let free = u64::from(superblock.free_blocks());
         Statfs {
             block_size: self.block_size,
             blocks: u64::from(superblock.blocks_count()).saturating_sub(overhead),
@@ -301,7 +308,7 @@ impl<D: BlockDevice> Filesystem<D> {
             inodes: u64::from(superblock.inodes_count()),
             free_inodes: u64::from(superblock.free_inodes()),
             name_max: NAME_MAX as u32,
-            id: [word(0) ^ word(8), word(4) ^ word(12)],
+            id,
         }
     }
 

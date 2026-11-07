@@ -32085,8 +32085,15 @@ fn linux_proc_sysctl_write_bytes(device: u16, index: usize, text: &[u8]) -> Resu
             Err(LINUX_EINVAL)
         };
     }
-    if LINUX_PROC_SYSCTLS[index].1 == b"sys/vm/drop_caches" && value & 1 != 0 {
-        crate::linux_blockfs::drop_caches();
+    if LINUX_PROC_SYSCTLS[index].1 == b"sys/vm/drop_caches" {
+        if value & 1 != 0 {
+            crate::linux_blockfs::drop_caches();
+        }
+        // 2 drops the inode and dentry caches, and the evictable fanotify
+        // marks with them.
+        if value & 2 != 0 {
+            crate::linux_fanotify::evict(linux_execution_instance());
+        }
     }
     // The pool gets as many huge pages as memory allows, which reads back.
     let value = if LINUX_PROC_SYSCTLS[index].1 == b"sys/vm/nr_hugepages" {
@@ -36616,10 +36623,46 @@ fn linux_openat_path(
     flags: u64,
     mode: u64,
 ) -> u64 {
-    linux_landlock_opened(
+    let opened = linux_landlock_opened(
         linux_open_file_at(directory, path, path_length, flags, mode, false),
         flags,
-    )
+    );
+    if opened == LINUX_ENOENT {
+        if let Some(error) = linux_volume_damage(directory, &path[..path_length]) {
+            return error;
+        }
+    }
+    opened
+}
+
+/// Whether a lookup of `path` (from `directory`) that found nothing met a
+/// damaged volume on the way: a directory entry naming no valid inode, or
+/// an inode with no links or file type. Then, as ext4 does, the
+/// filesystem reports the error (fanotify's FAN_FS_ERROR, on the inode at
+/// fault) and the call fails with EFSCORRUPTED.
+fn linux_volume_damage(directory: u64, path: &[u8]) -> Option<u64> {
+    const EFSCORRUPTED: i32 = 117;
+    if !crate::linux_blockfs::any_mounted() {
+        return None;
+    }
+    let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    let length = linux_canonical_path_at(u64::from(directory as u32), path, &mut canonical).ok()?;
+    let storage = crate::linux_mount_paths::storage(&canonical[..length]);
+    let (fsid, handle) = crate::linux_blockfs::damage_at(&storage)?;
+    linux_fanotify_fs_error(fsid, Some(linux_handle_identity(handle)), EFSCORRUPTED);
+    Some(LINUX_EUCLEAN)
+}
+
+/// Whether mount(2)'s option string at `data_address` holds `option`
+/// among its comma-separated options.
+fn linux_mount_data_has(data_address: u64, option: &[u8]) -> bool {
+    let mut data = [0_u8; 512];
+    data_address != 0
+        && copy_linux_c_string(data_address, &mut data).is_ok_and(|length| {
+            data[..length]
+                .split(|byte| *byte == b',')
+                .any(|given| given == option)
+        })
 }
 
 /// `linux_openat_path`'s open, without what Landlock marks on the
@@ -37793,6 +37836,25 @@ fn linux_path_descriptor(descriptor: u64) -> bool {
     linux_socket_flags(descriptor).is_some_and(|flags| flags & LINUX_O_PATH as u32 != 0)
 }
 
+/// The file handle (and fanotify file identifier) of overlay node
+/// `handle`: a volume's file by its volume's tag and inode, which stay its
+/// own across remounts as ext4's handles do (kind 3); any other node by
+/// its generation (kind 1).
+pub(super) fn linux_handle_identity(handle: crate::linux_overlay::Handle) -> u64 {
+    if let Some((tag, inode)) = crate::linux_blockfs::stable_identity(handle) {
+        return (u64::from(tag) << 8 | 3) << 32 | u64::from(inode);
+    }
+    u64::from(1_u32) << 32 | u64::from(crate::linux_overlay::generation(handle))
+}
+
+/// [`linux_handle_identity`] of the overlay node with `generation`.
+fn linux_generation_identity(generation: u32) -> u64 {
+    crate::linux_overlay::from_generation(generation).map_or(
+        u64::from(1_u32) << 32 | u64::from(generation),
+        linux_handle_identity,
+    )
+}
+
 fn linux_name_to_handle_at(
     directory: u64,
     path_address: u64,
@@ -37827,21 +37889,21 @@ fn linux_name_to_handle_at(
         if flags & LINUX_AT_EMPTY_PATH == 0 {
             return LINUX_ENOENT;
         }
+        let rootfs = |handle: u16| u64::from(2_u32) << 32 | u64::from(handle);
         if directory as u32 == LINUX_AT_FDCWD {
             let overlay = X86_RUNTIME.ELF_PROBE_OVERLAY_CWD.load(Ordering::SeqCst);
             if overlay != 0 {
-                Some((1_u32, overlay))
+                Some(linux_generation_identity(overlay))
             } else {
-                Some((
-                    2,
-                    u32::from(X86_RUNTIME.ELF_PROBE_ROOTFS_CWD.load(Ordering::SeqCst)),
+                Some(rootfs(
+                    X86_RUNTIME.ELF_PROBE_ROOTFS_CWD.load(Ordering::SeqCst),
                 ))
             }
         } else if let Some(handle) = linux_overlay_descriptor_handle(directory) {
-            Some((1, crate::linux_overlay::generation(handle)))
+            Some(linux_handle_identity(handle))
         } else {
             let handle = linux_rootfs_descriptor(directory);
-            (handle != 0).then_some((2, u32::from(handle)))
+            (handle != 0).then(|| rootfs(handle))
         }
     } else {
         let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
@@ -37853,15 +37915,15 @@ fn linux_name_to_handle_at(
         };
         match resolved {
             Ok(canonical_length) => crate::linux_overlay::lookup(&canonical[..canonical_length])
-                .map(|metadata| (1_u32, crate::linux_overlay::generation(metadata.handle)))
+                .map(|metadata| linux_handle_identity(metadata.handle))
                 .or_else(|| {
                     linux_rootfs_path_at(directory, &path[..length])
-                        .map(|(handle, _)| (2_u32, u32::from(handle)))
+                        .map(|(handle, _)| u64::from(2_u32) << 32 | u64::from(handle))
                 }),
             Err(error) => return error,
         }
     };
-    let Some((kind, identifier)) = identity else {
+    let Some(identity) = identity else {
         return if length == 0 {
             LINUX_EBADF
         } else {
@@ -37890,7 +37952,7 @@ fn linux_name_to_handle_at(
     }
     let mut output = [0_u8; 16];
     output[..8].copy_from_slice(&header);
-    output[8..16].copy_from_slice(&(u64::from(kind) << 32 | u64::from(identifier)).to_ne_bytes());
+    output[8..16].copy_from_slice(&identity.to_ne_bytes());
     if copy_to_linux_user(handle_address, &output) {
         0
     } else {
@@ -37957,8 +38019,13 @@ fn linux_open_by_handle_at(mount_descriptor: u64, handle_address: u64, flags: u6
     let mut overlay = None;
     let mut oci = 0_u16;
     let node_kind = match kind {
-        1 => {
-            let Some(handle) = crate::linux_overlay::from_generation(identifier) else {
+        _ if kind == 1 || kind & 0xff == 3 => {
+            let handle = if kind == 1 {
+                crate::linux_overlay::from_generation(identifier)
+            } else {
+                crate::linux_blockfs::from_stable_identity(kind >> 8, identifier)
+            };
+            let Some(handle) = handle else {
                 return LINUX_ESTALE;
             };
             let Some(metadata) = crate::linux_overlay::metadata(handle) else {
@@ -50537,7 +50604,7 @@ pub(super) fn linux_inotify_after(call: LinuxInotifyCall, result: u64) {
     // descriptor.
     let fanotify = |descriptor: u64, path: &Option<LinuxInotifyPath>, mask: u32| {
         if let Some(path) = path {
-            linux_fanotify_descriptor_event(u64::from(descriptor as u32), path, mask);
+            linux_fanotify_descriptor_event(u64::from(descriptor as u32), path, None, mask);
         }
     };
     match call.number {
@@ -50546,7 +50613,26 @@ pub(super) fn linux_inotify_after(call: LinuxInotifyCall, result: u64) {
             if linux_descriptor_flag(&X86_RUNTIME.ELF_PROBE_DESCRIPTOR_CREATED, result) {
                 created(&path, false);
             }
-            fanotify(result, &path, FAN_OPEN);
+            // The descriptor's path is the file's on its filesystem; the
+            // name opened tells the mount (a bind mount's).
+            if let Some(path) = &path {
+                let opened = (crate::linux_fanotify::active()
+                    && crate::linux_fanotify::mount_marks())
+                .then(|| {
+                    let (directory, name) = match call.number {
+                        LINUX_OPEN_SYSCALL | LINUX_CREAT_SYSCALL => (at, arguments[0]),
+                        _ => (arguments[0], arguments[1]),
+                    };
+                    linux_inotify_path_at(directory, name)
+                })
+                .flatten();
+                linux_fanotify_descriptor_event(
+                    u64::from(result as u32),
+                    path,
+                    opened.as_deref(),
+                    FAN_OPEN,
+                );
+            }
             object(path, IN_OPEN);
         }
         LINUX_READ_SYSCALL
@@ -58705,8 +58791,18 @@ fn linux_mount_filesystem(
         {
             return LINUX_EBUSY;
         }
-        if let Some(Err(error)) = crate::linux_blockfs::remount(storage, flags & MS_RDONLY != 0) {
-            return error.wrapping_neg();
+        match crate::linux_blockfs::remount(storage, flags & MS_RDONLY != 0) {
+            Some(Err(error)) => return error.wrapping_neg(),
+            // ext4's "abort" (a debugging option): the filesystem stops as
+            // if it met an error, ESHUTDOWN on no inode in particular,
+            // which fanotify reports as FAN_FS_ERROR.
+            Some(Ok(())) if linux_mount_data_has(data_address, b"abort") => {
+                const ESHUTDOWN: i32 = 108;
+                if let Some(statfs) = crate::linux_blockfs::statfs_at(storage) {
+                    linux_fanotify_fs_error(statfs.id, None, ESHUTDOWN);
+                }
+            }
+            _ => {}
         }
         // A tmpfs remount may change its size (EINVAL below what it uses).
         match linux_tmpfs_mount_options(data_address) {
@@ -59220,25 +59316,85 @@ pub(crate) fn linux_reclaim_unlinked_files() {
 /// bind mount of it), none for other filesystems: the filesystem's
 /// anonymous device and the tmpfs magic, the same for every mount of one
 /// tmpfs (fanotify's filesystem marks and identifiers report it too).
-fn linux_tmpfs_fsid(path: &[u8]) -> Option<[u8; 8]> {
-    const TMPFS_MAGIC: u32 = 0x0102_1994;
+/// The filesystems a mount makes in memory, each stored below a storage
+/// root of its own (crate::linux_mount_paths).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LinuxMemoryFilesystem {
+    Tmpfs,
+    Ramfs,
+    Hugetlbfs,
+}
+
+/// The in-memory filesystem the mount holding canonical `path` has, and
+/// its device; None for a path on any other filesystem.
+fn linux_memory_filesystem_at(path: &[u8]) -> Option<(LinuxMemoryFilesystem, u32)> {
     let space = linux_mount_space();
     let id = crate::linux_mounts::mount_id_at(space, path);
-    let device = crate::linux_mounts::with_mount(space, id, |mount| {
-        (mount.filesystem == b"tmpfs").then_some(mount.device)
-    })??;
+    crate::linux_mounts::with_mount(space, id, |mount| {
+        let filesystem = match &mount.filesystem[..] {
+            b"tmpfs" => LinuxMemoryFilesystem::Tmpfs,
+            b"ramfs" => LinuxMemoryFilesystem::Ramfs,
+            b"hugetlbfs" => LinuxMemoryFilesystem::Hugetlbfs,
+            _ => return None,
+        };
+        Some((filesystem, mount.device))
+    })?
+}
+
+/// statfs's f_fsid of the in-memory filesystem holding canonical `path`
+/// (a bind mount of one too): each has its own, from its device, as
+/// Linux's simple_statfs and hugetlbfs give it (a tmpfs's carries its
+/// magic as well). None off such a filesystem.
+fn linux_tmpfs_fsid(path: &[u8]) -> Option<[u8; 8]> {
+    const TMPFS_MAGIC: u32 = 0x0102_1994;
+    let (filesystem, device) = linux_memory_filesystem_at(path)?;
     let mut fsid = [0_u8; 8];
     fsid[..4].copy_from_slice(&device.to_ne_bytes());
-    fsid[4..].copy_from_slice(&TMPFS_MAGIC.to_ne_bytes());
+    if filesystem == LinuxMemoryFilesystem::Tmpfs {
+        fsid[4..].copy_from_slice(&TMPFS_MAGIC.to_ne_bytes());
+    }
     Some(fsid)
+}
+
+/// statfs(2)'s answer for canonical `path` when a ramfs or hugetlbfs
+/// mount holds it, as Linux's simple_statfs and hugetlbfs_statfs give it:
+/// the magic, the page size (the huge page size for hugetlbfs), the fsid,
+/// and no counts (hugetlbfs has no size limit here; its inodes are
+/// unlimited, -1).
+fn linux_memory_statfs_data(
+    filesystem: LinuxMemoryFilesystem,
+    path: &[u8],
+    fsid: [u8; 8],
+) -> [u8; 120] {
+    const RAMFS_MAGIC: u64 = 0x8584_58f6;
+    const HUGETLBFS_MAGIC: u64 = 0x9584_58f6;
+    let (magic, block_size) = if filesystem == LinuxMemoryFilesystem::Hugetlbfs {
+        (HUGETLBFS_MAGIC, LINUX_HUGE_PAGE_SIZE)
+    } else {
+        (RAMFS_MAGIC, PAGE_SIZE as u64)
+    };
+    let flags = linux_mount_statfs_flags(crate::linux_mounts::flags_at(linux_mount_space(), path));
+    let mut stat = [0_u8; 120];
+    stat[0..8].copy_from_slice(&magic.to_ne_bytes());
+    stat[8..16].copy_from_slice(&block_size.to_ne_bytes());
+    stat[56..64].copy_from_slice(&fsid);
+    stat[64..72].copy_from_slice(&(crate::linux_overlay::NAME_MAX as u64).to_ne_bytes());
+    stat[72..80].copy_from_slice(&block_size.to_ne_bytes());
+    stat[80..88].copy_from_slice(&flags.to_ne_bytes());
+    stat
 }
 
 /// statfs(2)'s answer for canonical `path` when a tmpfs mount holds it:
 /// tmpfs's magic, and its size limits and use where it has them, else the
-/// domain's memory, as an unlimited tmpfs shows. None off a tmpfs.
+/// domain's memory, as an unlimited tmpfs shows; a ramfs's or hugetlbfs's
+/// (`linux_memory_statfs_data`). None off those.
 fn linux_tmpfs_statfs_data(path: &[u8]) -> Option<[u8; 120]> {
     const TMPFS_MAGIC: u64 = 0x0102_1994;
     let fsid = linux_tmpfs_fsid(path)?;
+    let (filesystem, _) = linux_memory_filesystem_at(path)?;
+    if filesystem != LinuxMemoryFilesystem::Tmpfs {
+        return Some(linux_memory_statfs_data(filesystem, path, fsid));
+    }
     let space = linux_mount_space();
     let (total_frames, free_frames) = linux_domain_frame_counts();
     let (blocks, free, files, free_files) = match crate::linux_tmpfs_quota::usage(

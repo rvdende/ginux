@@ -5,4 +5,3 @@
 # (tests/qemu/ltp.sh --update-baseline); LTP_STRICT=1 ignores it.
 # From target/ltp-results.txt (2026-11-03), list=tests/ltp/syscalls.list ltp=20260930 kernel=468a6a67.
 futex_cmp_requeue01 TFAIL
-fanotify22 TFAIL

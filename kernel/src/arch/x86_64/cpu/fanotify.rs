@@ -279,8 +279,7 @@ pub(super) fn linux_fanotify_node(path: &[u8]) -> Option<LinuxFanotifyNode> {
     // else the image's entry by handle.
     let overlay = crate::linux_overlay::lookup(path);
     let (directory, openable, handle, links) = if let Some(metadata) = overlay {
-        let handle =
-            u64::from(1_u32) << 32 | u64::from(crate::linux_overlay::generation(metadata.handle));
+        let handle = linux_handle_identity(metadata.handle);
         (
             metadata.kind == NodeKind::Directory,
             matches!(metadata.kind, NodeKind::File | NodeKind::Directory),
@@ -344,24 +343,49 @@ fn linux_fanotify_notify(notice: &Notice) {
     }
 }
 
+/// Filesystem `id` (statfs's f_fsid words) met error `error` (an errno)
+/// on the object with file handle `object`, or on none in particular
+/// (Linux's fsnotify_sb_error).
+pub(super) fn linux_fanotify_fs_error(id: [u32; 2], object: Option<u64>, error: i32) {
+    if !fanotify::active() {
+        return;
+    }
+    let mut fsid = [0_u8; 8];
+    fsid[..4].copy_from_slice(&id[0].to_ne_bytes());
+    fsid[4..].copy_from_slice(&id[1].to_ne_bytes());
+    if fanotify::fs_error(
+        linux_execution_instance(),
+        fsid,
+        object.map(u64::to_ne_bytes),
+        error,
+        linux_fanotify_cause(),
+    ) {
+        wake_linux_descriptor_waits();
+    }
+}
+
 /// Events `mask` happened to the file or directory at canonical `path`:
 /// through an open file (`opened`: a path, which mount marks and groups
 /// reporting descriptors hear), or to it by name (an attribute change, a
 /// truncate).
 fn linux_fanotify_file_event(path: &[u8], mask: u32, opened: bool) {
-    linux_fanotify_file_event_of(path, mask, opened, || linux_fanotify_node(path));
+    linux_fanotify_file_event_of(path, mask, opened.then_some(path), || {
+        linux_fanotify_node(path)
+    });
 }
 
 /// `linux_fanotify_file_event` with the object from `object`, asked only
-/// when some mark may hear the event.
+/// when some mark may hear the event; `opened` is the canonical path the
+/// file was opened by, which tells its mount (a bind mount's path, where
+/// `path` is the file's on its filesystem).
 fn linux_fanotify_file_event_of(
     path: &[u8],
     mask: u32,
-    opened: bool,
+    opened: Option<&[u8]>,
     object: impl FnOnce() -> Option<LinuxFanotifyNode>,
 ) {
     if !fanotify::active()
-        || !opened && !fanotify::identifier_groups()
+        || opened.is_none() && !fanotify::identifier_groups()
         || !fanotify::may_hear(linux_execution_instance(), mask)
     {
         return;
@@ -380,9 +404,9 @@ fn linux_fanotify_file_event_of(
             }
         })
         .flatten();
-    let mount = opened.then(|| {
+    let mount = opened.map(|opened| {
         if fanotify::mount_marks() {
-            crate::linux_mounts::mount_id_at(linux_mount_space(), path)
+            crate::linux_mounts::mount_id_at(linux_mount_space(), opened)
         } else {
             0
         }
@@ -425,8 +449,7 @@ fn linux_fanotify_handle_node(handle: crate::linux_overlay::Handle) -> Option<Li
     let mut path = [0_u8; crate::linux_overlay::PATH_CAPACITY];
     let length = crate::linux_overlay::copy_path(handle, &mut path)?;
     let path = &path[..length];
-    let identifier =
-        u64::from(1_u32) << 32 | u64::from(crate::linux_overlay::generation(metadata.handle));
+    let identifier = linux_handle_identity(metadata.handle);
     Some(LinuxFanotifyNode {
         path: linux_heap_path(path)?,
         directory: metadata.kind == NodeKind::Directory,
@@ -457,8 +480,7 @@ pub(super) fn linux_fanotify_descriptor_node(
     let Some(metadata) = crate::linux_overlay::metadata(handle) else {
         return linux_fanotify_node(path);
     };
-    let identifier =
-        u64::from(1_u32) << 32 | u64::from(crate::linux_overlay::generation(metadata.handle));
+    let identifier = linux_handle_identity(metadata.handle);
     Some(LinuxFanotifyNode {
         path: linux_heap_path(path)?,
         directory: metadata.kind == NodeKind::Directory,
@@ -471,9 +493,14 @@ pub(super) fn linux_fanotify_descriptor_node(
 }
 
 /// Events `mask` happened through open file `descriptor` of canonical
-/// `path`.
-pub(super) fn linux_fanotify_descriptor_event(descriptor: u64, path: &[u8], mask: u32) {
-    linux_fanotify_file_event_of(path, mask, true, || {
+/// `path`, opened by canonical path `opened` when that is known.
+pub(super) fn linux_fanotify_descriptor_event(
+    descriptor: u64,
+    path: &[u8],
+    opened: Option<&[u8]>,
+    mask: u32,
+) {
+    linux_fanotify_file_event_of(path, mask, Some(opened.unwrap_or(path)), || {
         linux_fanotify_descriptor_node(descriptor, path)
     });
 }
@@ -482,7 +509,7 @@ pub(super) fn linux_fanotify_descriptor_event(descriptor: u64, path: &[u8], mask
 /// (a closed descriptor's, described before it closed).
 pub(super) fn linux_fanotify_node_event(object: LinuxFanotifyNode, mask: u32) {
     let path = object.path.clone();
-    linux_fanotify_file_event_of(&path, mask, true, || Some(object));
+    linux_fanotify_file_event_of(&path, mask, Some(&path), || Some(object));
 }
 
 /// Events `mask` happened to canonical `path` by name (FAN_ATTRIB, a
@@ -956,6 +983,7 @@ pub(super) fn linux_fanotify_mark(
         ignore: ignore != 0,
         ignore_flags: ignore == FAN_MARK_IGNORE,
         survive_modify: flags & FAN_MARK_IGNORED_SURV_MODIFY != 0,
+        evictable: flags & FAN_MARK_EVICTABLE != 0,
         unset,
     };
     let command = if command == FAN_MARK_ADD {
@@ -970,6 +998,7 @@ pub(super) fn linux_fanotify_mark(
         Err(fanotify::Error::NoMemory) => LINUX_ENOMEM,
         Err(fanotify::Error::TooMany | fanotify::Error::NoSpace) => LINUX_ENOSPC,
         Err(fanotify::Error::Invalid) => LINUX_EINVAL,
+        Err(fanotify::Error::Exists) => LINUX_EEXIST,
     }
 }
 
@@ -1074,9 +1103,8 @@ pub(super) fn linux_fanotify_read(descriptor: u64, address: u64, count: u64) -> 
                 opened => Some(opened as i32),
             }
         };
-        let size = EVENT_METADATA_SIZE
-            + event.records.len()
-            + if pidfd_mode { PIDFD_INFO_SIZE } else { 0 };
+        let pidfd_size = if pidfd_mode { PIDFD_INFO_SIZE } else { 0 };
+        let size = EVENT_METADATA_SIZE + event.records.len() + pidfd_size + event.trailer.len();
         let mut metadata = [0_u8; EVENT_METADATA_SIZE];
         metadata[..4].copy_from_slice(&(size as u32).to_ne_bytes());
         metadata[4] = METADATA_VERSION;
@@ -1099,6 +1127,12 @@ pub(super) fn linux_fanotify_read(descriptor: u64, address: u64, count: u64) -> 
                     &record,
                 );
         }
+        copied = copied
+            && (event.trailer.is_empty()
+                || copy_to_linux_user(
+                    at + (EVENT_METADATA_SIZE + event.records.len() + pidfd_size) as u64,
+                    &event.trailer,
+                ));
         if !copied {
             if let Some(event_descriptor) = event_descriptor {
                 let _ = linux_descriptor_close(event_descriptor as u64);

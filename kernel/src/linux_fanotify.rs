@@ -144,8 +144,11 @@ const FILEID_INVALID: i32 = 0xff;
 const INFO_FID: u8 = 1;
 const INFO_DFID_NAME: u8 = 2;
 const INFO_DFID: u8 = 3;
+const INFO_ERROR: u8 = 5;
 const INFO_OLD_DFID_NAME: u8 = 10;
 const INFO_NEW_DFID_NAME: u8 = 12;
+/// The size of struct fanotify_event_info_error.
+const ERROR_INFO_SIZE: usize = 12;
 /// The size of struct fanotify_event_info_pidfd.
 pub(crate) const PIDFD_INFO_SIZE: usize = 8;
 
@@ -166,6 +169,9 @@ pub(crate) enum Error {
     /// Too many marks.
     NoSpace,
     NoMemory,
+    /// A mark cannot change that way: made evictable, or its ignore mask's
+    /// kind or survival given up.
+    Exists,
 }
 
 /// What a mark is on.
@@ -198,6 +204,9 @@ pub(crate) struct Change {
     pub(crate) ignore_flags: bool,
     /// FAN_MARK_IGNORED_SURV_MODIFY: a modification leaves the ignore mask.
     pub(crate) survive_modify: bool,
+    /// FAN_MARK_EVICTABLE: the mark does not keep its inode cached, so
+    /// dropping the caches removes it.
+    pub(crate) evictable: bool,
     /// Flags a removal takes off too (Linux's umask: the event flags a
     /// legacy ignore mask or a mark that cannot hear children never keeps).
     pub(crate) unset: u32,
@@ -213,6 +222,7 @@ struct Mark {
     ignore: u32,
     ignore_flags: bool,
     survive_modify: bool,
+    evictable: bool,
 }
 
 /// Where a mark stands to the object of an event (Linux's iteration
@@ -231,18 +241,23 @@ enum Place {
 
 /// Whether the object at `path` with `handle` is the one marked at
 /// `marked` with `marked_handle`: the same handle, or else the same path,
-/// unless both are overlay nodes that differ (another file now at the
-/// path: one recreated there, or an overlay mounted over the marked one).
+/// unless both are overlay nodes or both volume files that differ
+/// (another file now at the path: one recreated there, or an overlay
+/// mounted over the marked one).
 fn same_object(
     marked: &[u8],
     marked_handle: Option<[u8; 8]>,
     path: &[u8],
     handle: Option<[u8; 8]>,
 ) -> bool {
-    let overlay = |handle: [u8; 8]| u64::from_ne_bytes(handle) >> 32 == 1;
+    // Whether a handle names one object for good (cpu.rs's
+    // linux_handle_identity): an overlay node by generation (kind 1), a
+    // volume file by inode (kind 3); the image's entries (kind 2) are
+    // found by path.
+    let lasting = |handle: [u8; 8]| (u64::from_ne_bytes(handle) >> 32) as u8 & 1 != 0;
     match (marked_handle, handle) {
         (Some(first), Some(second)) if first == second => true,
-        (Some(first), Some(second)) if overlay(first) && overlay(second) => false,
+        (Some(first), Some(second)) if lasting(first) && lasting(second) => false,
         _ => marked == path,
     }
 }
@@ -417,6 +432,15 @@ enum Info {
         name: Vec<u8>,
         second_name: Vec<u8>,
     },
+    /// A filesystem's errors (FAN_FS_ERROR): the first error and the
+    /// object it was found on (none for the filesystem as a whole), and
+    /// how many errors the event stands for.
+    Error {
+        fsid: [u8; 8],
+        object: Option<[u8; 8]>,
+        error: i32,
+        count: u32,
+    },
 }
 
 struct Event {
@@ -457,6 +481,8 @@ impl Event {
             (old @ Info::Name { directory, .. }, new @ Info::Name { .. }) => {
                 directory.is_some() && old == new
             }
+            // A filesystem's errors are one event.
+            (Info::Error { fsid, .. }, Info::Error { fsid: new_fsid, .. }) => fsid == new_fsid,
             _ => false,
         }
     }
@@ -473,6 +499,8 @@ pub(crate) struct Delivery {
     /// The info records that follow the metadata (the identifier records;
     /// the pidfd record, FAN_REPORT_PIDFD, is the reader's to add).
     pub(crate) records: Vec<u8>,
+    /// The records after the pidfd record: an error event's error record.
+    pub(crate) trailer: Vec<u8>,
 }
 
 struct Group {
@@ -549,6 +577,9 @@ impl Group {
                 .find(|queued| queued.merges_with(&event))
             {
                 queued.mask |= event.mask;
+                if let Info::Error { count, .. } = &mut queued.info {
+                    *count = count.saturating_add(1);
+                }
                 return;
             }
         }
@@ -989,6 +1020,16 @@ pub(crate) fn mark(
     match (command, index) {
         (Command::Add, Some(index)) => {
             let mark = &mut group.marks[index];
+            // A kept mark is not made evictable, a FAN_MARK_IGNORE mask
+            // not made legacy, and one that survives modification keeps
+            // doing so (Linux's fanotify_may_update_existing_mark).
+            if change.evictable && !mark.evictable
+                || change.ignore && !change.ignore_flags && mark.ignore_flags
+                || change.ignore_flags && !change.survive_modify && mark.survive_modify
+            {
+                return Err(Error::Exists);
+            }
+            mark.evictable &= change.evictable;
             count_mark(mark, false);
             if change.ignore {
                 mark.ignore |= change.mask;
@@ -1017,6 +1058,7 @@ pub(crate) fn mark(
                 ignore,
                 ignore_flags: change.ignore && change.ignore_flags,
                 survive_modify: change.ignore && change.survive_modify,
+                evictable: change.evictable,
             };
             count_mark(&mark, true);
             group.marks.push(mark);
@@ -1038,6 +1080,27 @@ pub(crate) fn mark(
         (Command::Remove, None) => return Err(Error::NotFound),
     }
     Ok(())
+}
+
+/// /proc/sys/vm/drop_caches dropped the inode caches: domain `domain`'s
+/// evictable marks go with the inodes they did not keep.
+pub(crate) fn evict(domain: usize) {
+    if !active() {
+        return;
+    }
+    let mut state = STATE.lock();
+    for group in state
+        .groups
+        .iter_mut()
+        .filter(|group| group.domain == domain)
+    {
+        group.marks.retain(|mark| {
+            if mark.evictable {
+                count_mark(mark, false);
+            }
+            !mark.evictable
+        });
+    }
 }
 
 /// Where canonical `path` is after `from` moved to `to`: itself, or `to`
@@ -1399,6 +1462,58 @@ pub(crate) fn notify(domain: usize, notice: &Notice, cause: Cause) -> bool {
     queued
 }
 
+/// Filesystem `fsid` met error `error` (an errno) on the object with
+/// file handle `object`, or on no object in particular (Linux's
+/// fsnotify_sb_error): the groups with a filesystem mark on it that asks
+/// for FAN_FS_ERROR hear it, as one queued event per filesystem that
+/// counts the errors. Returns whether one was queued.
+pub(crate) fn fs_error(
+    domain: usize,
+    fsid: [u8; 8],
+    object: Option<[u8; 8]>,
+    error: i32,
+    cause: Cause,
+) -> bool {
+    if !active() {
+        return false;
+    }
+    let mut state = STATE.lock();
+    let mut queued = false;
+    for group in state
+        .groups
+        .iter_mut()
+        .filter(|group| group.domain == domain && group.fid_mode() != 0)
+    {
+        let heard = group.marks.iter().any(|mark| {
+            mark.kind == MarkKind::Filesystem(fsid)
+                && mark.mask & FAN_FS_ERROR != 0
+                && mark.ignore & FAN_FS_ERROR == 0
+        });
+        if !heard {
+            continue;
+        }
+        let pid = if group.report_tid() {
+            cause.tid
+        } else {
+            cause.pid
+        };
+        group.queue(Event {
+            mask: FAN_FS_ERROR,
+            info: Info::Error {
+                fsid,
+                object,
+                error,
+                count: 1,
+            },
+            ondir: false,
+            pid,
+            request: None,
+        });
+        queued = true;
+    }
+    queued
+}
+
 /// What a permission check decides.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Permission {
@@ -1604,6 +1719,12 @@ fn records(info: &Info, mask: u32, fid_mode: u32) -> Result<Vec<u8>, Error> {
                 push_record(&mut records, info_type, *fsid, *object, name)?;
             }
         }
+        // An error event reports its object even when it has none (a
+        // handle of type FILEID_INVALID).
+        Info::Error { fsid, object, .. } => {
+            let (info_type, name) = object_type(false);
+            push_record(&mut records, info_type, *fsid, *object, name)?;
+        }
         Info::Name {
             fsid,
             directory,
@@ -1643,6 +1764,22 @@ fn records(info: &Info, mask: u32, fid_mode: u32) -> Result<Vec<u8>, Error> {
     Ok(records)
 }
 
+/// The records of `info` that follow the pidfd record: struct
+/// fanotify_event_info_error for an error event.
+fn trailer(info: &Info) -> Result<Vec<u8>, Error> {
+    let mut trailer = Vec::new();
+    if let Info::Error { error, count, .. } = info {
+        trailer
+            .try_reserve_exact(ERROR_INFO_SIZE)
+            .map_err(|_| Error::NoMemory)?;
+        trailer.extend_from_slice(&[INFO_ERROR, 0]);
+        trailer.extend_from_slice(&(ERROR_INFO_SIZE as u16).to_ne_bytes());
+        trailer.extend_from_slice(&error.to_ne_bytes());
+        trailer.extend_from_slice(&count.to_ne_bytes());
+    }
+    Ok(trailer)
+}
+
 /// read(2) on group `id` with room for `room` bytes: the queued events
 /// that fit, oldest first (each with a pidfd record more when the group
 /// reports pidfds). A first event that does not fit is EINVAL and stays
@@ -1660,7 +1797,8 @@ pub(crate) fn take(domain: usize, id: u64, room: usize) -> Result<Vec<Delivery>,
     let mut used = 0;
     while let Some(event) = group.queue.front() {
         let records = records(&event.info, event.mask, fid_mode)?;
-        let size = EVENT_METADATA_SIZE + records.len() + pidfd;
+        let trailer = trailer(&event.info)?;
+        let size = EVENT_METADATA_SIZE + records.len() + pidfd + trailer.len();
         if used + size > room {
             if taken.is_empty() {
                 return Err(Error::Invalid);
@@ -1681,6 +1819,7 @@ pub(crate) fn take(domain: usize, id: u64, room: usize) -> Result<Vec<Delivery>,
             pid: event.pid,
             request: event.request,
             records,
+            trailer,
         });
     }
     Ok(taken)
@@ -1734,8 +1873,8 @@ pub(crate) struct MarkView {
     pub(crate) path: Vec<u8>,
     pub(crate) mask: u32,
     pub(crate) ignore: u32,
-    /// The mark's FAN_MARK_* flags: FAN_MARK_IGNORED_SURV_MODIFY and
-    /// FAN_MARK_IGNORE.
+    /// The mark's FAN_MARK_* flags: FAN_MARK_IGNORED_SURV_MODIFY,
+    /// FAN_MARK_EVICTABLE and FAN_MARK_IGNORE.
     pub(crate) flags: u32,
 }
 
@@ -1743,6 +1882,7 @@ pub(crate) struct MarkView {
 /// fdinfo lists them.
 pub(crate) fn view(domain: usize, id: u64) -> Option<(u32, u32, Vec<MarkView>)> {
     const FAN_MARK_IGNORED_SURV_MODIFY: u32 = 0x40;
+    const FAN_MARK_EVICTABLE: u32 = 0x200;
     const FAN_MARK_IGNORE: u32 = 0x400;
     let mut state = STATE.lock();
     let group = state.group(domain, id)?;
@@ -1760,6 +1900,10 @@ pub(crate) fn view(domain: usize, id: u64) -> Option<(u32, u32, Vec<MarkView>)> 
                 0
             } | if mark.ignore_flags {
                 FAN_MARK_IGNORE
+            } else {
+                0
+            } | if mark.evictable {
+                FAN_MARK_EVICTABLE
             } else {
                 0
             },

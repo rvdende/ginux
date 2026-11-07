@@ -453,6 +453,13 @@ impl Volume {
         }
     }
 
+    /// 24 bits of the filesystem's fsid, which file handles carry to tell
+    /// volumes apart: they stay with the filesystem across mounts.
+    fn tag(&self) -> u32 {
+        let id = self.filesystem.id();
+        (id[0] ^ id[1].rotate_left(12)) & 0xff_ffff
+    }
+
     /// Whether paths of `instance` reach the volume.
     fn visible(&self, instance: usize) -> bool {
         self.instance == instance && !self.detached
@@ -1759,6 +1766,69 @@ pub(crate) fn volume_of(handle: Handle) -> Option<(u64, u64)> {
     let mut table = VOLUMES.lock();
     let (volume, _) = table.of(handle)?;
     Some((volume.id, volume.filesystem.max_file_size()))
+}
+
+/// A volume file's identity that outlasts its mount, as ext4's file
+/// handles name a file: its volume's tag and its inode.
+pub(crate) fn stable_identity(handle: Handle) -> Option<(u32, u32)> {
+    let mut table = VOLUMES.lock();
+    let (volume, inode) = table.of(handle)?;
+    Some((volume.tag(), inode))
+}
+
+/// The file with identity `tag` and `inode` ([`stable_identity`]) on a
+/// volume of this domain, if it is still there.
+pub(crate) fn from_stable_identity(tag: u32, inode: u32) -> Option<Handle> {
+    let instance = instance();
+    let mut table = VOLUMES.lock();
+    let index = table
+        .volumes
+        .iter()
+        .position(|volume| volume.visible(instance) && volume.tag() == tag)?;
+    let volume = &mut table.volumes[index];
+    if volume.filesystem.damaged_reference(inode).is_some() {
+        return None;
+    }
+    Some(table.handle(index, inode))
+}
+
+/// What a lookup of canonical `path` on a volume found broken, as ext4
+/// reports a corrupted filesystem: the volume's fsid and the inode at
+/// fault (a directory whose entry names no valid inode, or the inode an
+/// entry names that has no links or file type), with its handle. `None`
+/// when the path is not on a volume or nothing on the way is damaged.
+pub(crate) fn damage_at(path: &[u8]) -> Option<([u32; 2], Handle)> {
+    let mut table = VOLUMES.lock();
+    let index = volume_index(&table, path)?;
+    let volume = &mut table.volumes[index];
+    let relative = below(&volume.point, path)?;
+    let mut inode = ginux_ext2::ROOT_INODE;
+    let mut fault = None;
+    for name in relative.split(|byte| *byte == b'/') {
+        if name.is_empty() {
+            continue;
+        }
+        let child = volume.filesystem.lookup(inode, name).ok()?;
+        match volume.filesystem.damaged_reference(child) {
+            Some(ginux_ext2::Damage::Number) => fault = Some(inode),
+            Some(ginux_ext2::Damage::Inode) => fault = Some(child),
+            None => {
+                inode = child;
+                continue;
+            }
+        }
+        break;
+    }
+    let fault = fault?;
+    let fsid = volume.filesystem.id();
+    Some((fsid, table.handle(index, fault)))
+}
+
+/// statfs(2) of the volume mounted at canonical `point`.
+pub(crate) fn statfs_at(point: &[u8]) -> Option<ginux_ext2::Statfs> {
+    let mut table = VOLUMES.lock();
+    let index = mounted_at(&table, point)?;
+    Some(table.volumes[index].filesystem.statfs())
 }
 
 /// statfs(2) of the volume `handle`'s file is on.
