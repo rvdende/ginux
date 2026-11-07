@@ -2562,9 +2562,15 @@ fn linux_light_syscall_allowed(number: u64, registers: LinuxSyscallFrame) -> boo
     !linux_syscall_creates_process(number, registers.rdi, registers.rdi)
 }
 
-/// A light thread's fatal fault: `signal` goes to the process, which the
-/// owner delivers (a handler, or the end of the process); the thread is
-/// kept for the owner at the faulting instruction.
+/// A light thread's fatal fault: the thread is kept for the owner at the
+/// faulting instruction. A fault signal is the faulting thread's alone, as
+/// Linux forces it on the current task: the owner runs the instruction
+/// again and the fault it raises there is delivered to that thread, with
+/// its own code and address. Queued for the process, the owner delivered it
+/// to whichever thread it ran (userfaultfd06's SIGBUS went to the thread
+/// that poisoned the page, whose handler then longjmp'd onto the faulting
+/// thread's stack). A trap is past its instruction, so it is queued for
+/// the thread; running out of memory (SIGKILL) ends the whole process.
 fn fault_linux_light_thread(
     frame: &UserFaultFrame,
     fault: domain::FaultMetadata,
@@ -2574,7 +2580,21 @@ fn fault_linux_light_thread(
         return u64::MAX;
     };
     let pid = current_linux_process_pid();
-    let _ = linux_queue_process_signal(pid, signal, LINUX_SI_KERNEL, Some(fault.address));
+    if signal == LINUX_SIGKILL {
+        let _ = linux_queue_process_signal(pid, signal, LINUX_SI_KERNEL, Some(fault.address));
+    } else if matches!(fault.vector, 1 | 3) {
+        let Some(process_slot) = linux_process::live_process_slot(pid) else {
+            return u64::MAX;
+        };
+        let _ = linux_queue_saved_thread_signal(
+            pid,
+            process_slot,
+            slot,
+            signal,
+            LINUX_SI_KERNEL,
+            Some(fault.address),
+        );
+    }
     let Some(handle) = linux_thread_handle(slot) else {
         return u64::MAX;
     };
