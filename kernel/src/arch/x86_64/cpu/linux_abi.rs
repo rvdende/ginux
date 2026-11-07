@@ -767,7 +767,7 @@ pub(super) const LINUX_FILE_PROC_TASK_STAT: u16 = LINUX_FILE_MASK | LINUX_PROC_T
 pub(super) const LINUX_AIO_MAX_NR: u64 = 65_536;
 /// `/proc/sys/vm/max_map_count`: the most memory areas a process may have.
 pub(super) const LINUX_MAX_MAP_COUNT: usize = 65_530;
-pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 39] = [
+pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 42] = [
     // The most memory areas a process may have (LINUX_MAX_MAP_COUNT).
     (0xa000, b"sys/vm/max_map_count", b"65530\n"),
     // The random pool is always full, as Linux reports it since 5.18.
@@ -809,6 +809,11 @@ pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 39] = [
     // The most descriptors a process may have (LINUX_NR_OPEN); unsharing a
     // descriptor table holding one above it fails (unshare03).
     (LINUX_PROC_NR_OPEN_NODE, b"sys/fs/nr_open", b"1048576\n"),
+    // IPv4 interface tags (devconf "tag"), which each network namespace
+    // has its own of (clone09): every interface's, new ones', the loopback's.
+    (0xbd00, b"sys/net/ipv4/conf/all/tag", b"0\n"),
+    (0xbe00, b"sys/net/ipv4/conf/default/tag", b"0\n"),
+    (0xbf00, b"sys/net/ipv4/conf/lo/tag", b"0\n"),
     (0xd000, b"sys/fs/pipe-user-pages-soft", b"16384\n"),
     // Seconds a lease holder has to give up its lease (fcntl33 saves it).
     (0xa500, b"sys/fs/lease-break-time", b"45\n"),

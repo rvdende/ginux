@@ -13462,6 +13462,7 @@ fn linux_socket_ioctl(descriptor: u64, request: u64, argument: u64) -> Option<u6
     const SIOCGIFADDR: u64 = 0x8915;
     const SIOCGIFNETMASK: u64 = 0x891b;
     const SIOCGIFMTU: u64 = 0x8921;
+    const SIOCSIFMTU: u64 = 0x8922;
     const SIOCGIFHWADDR: u64 = 0x8927;
     const SIOCGIFINDEX: u64 = 0x8933;
     const IFREQ_SIZE: usize = 40;
@@ -13476,6 +13477,7 @@ fn linux_socket_ioctl(descriptor: u64, request: u64, argument: u64) -> Option<u6
             | SIOCGIFADDR
             | SIOCGIFNETMASK
             | SIOCGIFMTU
+            | SIOCSIFMTU
             | SIOCGIFHWADDR
             | SIOCGIFINDEX
     ) {
@@ -13494,7 +13496,7 @@ fn linux_socket_ioctl(descriptor: u64, request: u64, argument: u64) -> Option<u6
             LINUX_EFAULT
         });
     }
-    let interfaces = crate::linux_socket::interfaces();
+    let interfaces = linux_network_interfaces();
     let sockaddr_in = |address: u32| {
         let mut sockaddr = [0_u8; 16];
         sockaddr[..2].copy_from_slice(&2_u16.to_ne_bytes());
@@ -13560,17 +13562,38 @@ fn linux_socket_ioctl(descriptor: u64, request: u64, argument: u64) -> Option<u6
             ifreq[..interface.name.len()].copy_from_slice(interface.name);
         }
         SIOCGIFFLAGS => ifreq[16..18].copy_from_slice(&interface.flags.to_ne_bytes()),
-        // Changing an interface takes CAP_NET_ADMIN; Ginux keeps them up.
-        SIOCSIFFLAGS => {
-            return Some(
-                if current_linux_credentials().is_some_and(|credentials| {
-                    credentials.has(ginux_credentials::capability::NET_ADMIN)
-                }) {
-                    0
-                } else {
-                    LINUX_EPERM
-                },
-            );
+        // Changing an interface takes CAP_NET_ADMIN. The domain's own stay
+        // as the kernel set them up; a network namespace's loopback goes up
+        // and down and takes another MTU.
+        SIOCSIFFLAGS | SIOCSIFMTU => {
+            if !current_linux_credentials().is_some_and(|credentials| {
+                credentials.has(ginux_credentials::capability::NET_ADMIN)
+            }) {
+                return Some(LINUX_EPERM);
+            }
+            let flags = u16::from_ne_bytes(ifreq[16..18].try_into().unwrap());
+            let mtu = i32::from_ne_bytes(ifreq[16..20].try_into().unwrap());
+            if request == SIOCSIFMTU && !(68..=65_536).contains(&mtu) {
+                return Some(LINUX_EINVAL);
+            }
+            let network = current_linux_namespaces().net;
+            if network != 0 {
+                let changed = linux_namespace::set_loopback(
+                    linux_execution_instance(),
+                    network,
+                    |loopback| {
+                        if request == SIOCSIFMTU {
+                            loopback.mtu = mtu;
+                        } else {
+                            loopback.up = flags & LINUX_IFF_UP != 0;
+                        }
+                    },
+                );
+                if !changed {
+                    return Some(LINUX_ENODEV);
+                }
+            }
+            return Some(0);
         }
         SIOCGIFADDR => ifreq[16..32].copy_from_slice(&sockaddr_in(interface.ipv4)),
         SIOCGIFNETMASK => {
@@ -13591,6 +13614,66 @@ fn linux_socket_ioctl(descriptor: u64, request: u64, argument: u64) -> Option<u6
     } else {
         LINUX_EFAULT
     })
+}
+
+/// Whether the current process's network namespace reaches `endpoint`
+/// (INADDR_ANY is the local host, as connect takes it).
+fn linux_endpoint_reachable(endpoint: smoltcp::wire::IpEndpoint) -> bool {
+    match endpoint.addr {
+        smoltcp::wire::IpAddress::Ipv4(address) if address.is_unspecified() => {
+            linux_network_reaches(0x7f00_0001)
+        }
+        smoltcp::wire::IpAddress::Ipv4(address) => {
+            linux_network_reaches(u32::from_be_bytes(address.octets()))
+        }
+        #[allow(unreachable_patterns)]
+        _ => current_linux_namespaces().net == 0,
+    }
+}
+
+/// IFF_UP: an interface carries traffic.
+const LINUX_IFF_UP: u16 = 0x1;
+
+/// The interfaces the current process's network namespace has: the
+/// domain's (loopback and eth0), or a namespace's own loopback alone,
+/// with 127.0.0.1 only while it is up.
+fn linux_network_interfaces() -> [Option<crate::linux_socket::InterfaceInfo>; 2] {
+    const IFF_LOOPBACK: u16 = 0x8;
+    const IFF_RUNNING: u16 = 0x40;
+    const ARPHRD_LOOPBACK: u16 = 772;
+    let network = current_linux_namespaces().net;
+    if network == 0 {
+        return crate::linux_socket::interfaces();
+    }
+    let loopback = linux_namespace::loopback(linux_execution_instance(), network).map(|loopback| {
+        crate::linux_socket::InterfaceInfo {
+            name: b"lo",
+            index: 1,
+            ipv4: if loopback.up { 0x7f00_0001 } else { 0 },
+            prefix: if loopback.up { 8 } else { 0 },
+            flags: IFF_LOOPBACK
+                | if loopback.up {
+                    LINUX_IFF_UP | IFF_RUNNING
+                } else {
+                    0
+                },
+            mtu: loopback.mtu,
+            hardware: (ARPHRD_LOOPBACK, [0; 6]),
+        }
+    });
+    [loopback, None]
+}
+
+/// Whether the current process's network namespace reaches IPv4 address
+/// `address` (host order): the domain's reaches what its interfaces do; a
+/// namespace made inside it only its loopback's 127.0.0.0/8, and only while
+/// that is up.
+fn linux_network_reaches(address: u32) -> bool {
+    let network = current_linux_namespaces().net;
+    network == 0
+        || address >> 24 == 127
+            && linux_namespace::loopback(linux_execution_instance(), network)
+                .is_some_and(|loopback| loopback.up)
 }
 
 fn linux_generic_ioctl(descriptor: u64, request: u64, argument: u64) -> Option<u64> {
@@ -14157,8 +14240,8 @@ fn linux_proc_namespace_at(path: &[u8]) -> Option<Result<linux_namespace::Refere
         b"pid_for_children" => other(Kind::Pid, set.pid_for_children),
         b"time" => other(Kind::Time, set.time),
         b"time_for_children" => other(Kind::Time, set.time_for_children),
-        // One network and one cgroup namespace per domain so far.
-        b"net" => other(Kind::Net, 0),
+        b"net" => other(Kind::Net, set.net),
+        // One cgroup namespace per domain so far.
         b"cgroup" => other(Kind::Cgroup, 0),
         _ => Err(LINUX_ENOENT),
     })
@@ -14329,13 +14412,9 @@ fn linux_namespace_ioctl(descriptor: u64, request: u64, argument: u64) -> u64 {
 /// `kind` asks for, EPERM without CAP_SYS_ADMIN over it). A pidfd joins
 /// the namespaces of `kind` its process is in.
 fn linux_setns(descriptor: u64, kind: u64) -> u64 {
-    const CLONE_NEWNET: u64 = 0x4000_0000;
     const CLONE_NEWCGROUP: u64 = 0x0200_0000;
-    const JOINABLE: u64 = LINUX_CLONE_NEWNS
-        | LINUX_CLONE_NEWUSER
-        | LINUX_CLONE_NEW_KEPT
-        | CLONE_NEWNET
-        | CLONE_NEWCGROUP;
+    const JOINABLE: u64 =
+        LINUX_CLONE_NEWNS | LINUX_CLONE_NEWUSER | LINUX_CLONE_NEW_KEPT | CLONE_NEWCGROUP;
     let descriptor = u64::from(descriptor as u32);
     let kind = u64::from(kind as u32);
     if !linux_descriptor_open(descriptor) {
@@ -14440,16 +14519,15 @@ fn linux_setns_join(reference: linux_namespace::Reference) -> u64 {
             }
             return 0;
         }
-        // One network and one cgroup namespace per domain: joining it
-        // changes nothing.
-        Kind::Net | Kind::Cgroup => {
+        // One cgroup namespace per domain: joining it changes nothing.
+        Kind::Cgroup => {
             return if linux_namespace_capable(None) {
                 0
             } else {
                 LINUX_EPERM
             };
         }
-        Kind::Uts | Kind::Ipc | Kind::Pid | Kind::Time => {}
+        Kind::Uts | Kind::Ipc | Kind::Pid | Kind::Time | Kind::Net => {}
     }
     if !linux_namespace::exists(instance, reference.kind, reference.id) {
         return LINUX_EINVAL;
@@ -14464,6 +14542,7 @@ fn linux_setns_join(reference: linux_namespace::Reference) -> u64 {
     match reference.kind {
         Kind::Uts => set.uts = reference.id,
         Kind::Ipc => set.ipc = reference.id,
+        Kind::Net => set.net = reference.id,
         // Children are born into a PID namespace at or below the caller's.
         Kind::Pid => {
             if !linux_namespace::pid_within(instance, set.pid, reference.id) {
@@ -14486,10 +14565,14 @@ fn linux_setns_join(reference: linux_namespace::Reference) -> u64 {
     0
 }
 
-/// CLONE_NEWUTS, CLONE_NEWIPC, CLONE_NEWPID and CLONE_NEWTIME: the
-/// namespaces `linux_namespace` keeps.
-const LINUX_CLONE_NEW_KEPT: u64 =
-    LINUX_CLONE_NEWUTS | LINUX_CLONE_NEWIPC | LINUX_CLONE_NEWPID | LINUX_CLONE_NEWTIME;
+/// CLONE_NEWUTS, CLONE_NEWIPC, CLONE_NEWPID, CLONE_NEWTIME and
+/// CLONE_NEWNET: the namespaces `linux_namespace` keeps.
+const LINUX_CLONE_NEW_KEPT: u64 = LINUX_CLONE_NEWUTS
+    | LINUX_CLONE_NEWIPC
+    | LINUX_CLONE_NEWPID
+    | LINUX_CLONE_NEWTIME
+    | LINUX_CLONE_NEWNET;
+const LINUX_CLONE_NEWNET: u64 = 0x4000_0000;
 const LINUX_CLONE_NEWTIME: u64 = 0x80;
 /// The namespaces clone(2) (not clone3) may make for a new process; its
 /// CLONE_NEWTIME bit is the exit signal's.
@@ -14497,7 +14580,8 @@ const LINUX_CLONE_PROCESS_NAMESPACES: u64 = LINUX_CLONE_NEWNS
     | LINUX_CLONE_NEWUSER
     | LINUX_CLONE_NEWUTS
     | LINUX_CLONE_NEWIPC
-    | LINUX_CLONE_NEWPID;
+    | LINUX_CLONE_NEWPID
+    | LINUX_CLONE_NEWNET;
 const LINUX_CLONE_NEWUTS: u64 = 0x0400_0000;
 const LINUX_CLONE_NEWIPC: u64 = 0x0800_0000;
 const LINUX_CLONE_NEWPID: u64 = 0x2000_0000;
@@ -14633,6 +14717,9 @@ fn linux_create_namespaces(
             set.pid = set.pid_for_children;
         }
     }
+    if flags & LINUX_CLONE_NEWNET != 0 {
+        set.net = linux_namespace::create_net(instance, owner).map_err(failed)?;
+    }
     if flags & LINUX_CLONE_NEWTIME != 0 {
         set.time_for_children =
             linux_namespace::create_time(instance, owner, set.time_for_children).map_err(failed)?;
@@ -14647,13 +14734,12 @@ fn linux_create_namespaces(
 /// (its filesystem context, signal handlers, address space, SysV semaphore
 /// undo) does nothing; a descriptor table a CLONE_FILES child was given
 /// becomes its own (EMFILE if it holds a descriptor above nr_open); a new
-/// user, mount, UTS or IPC namespace replaces the caller's, and a new PID
-/// or time namespace is where its children will be born. Network and
-/// cgroup namespaces are not implemented yet.
+/// user, mount, UTS, IPC or network namespace replaces the caller's, and a
+/// new PID or time namespace is where its children will be born. Cgroup
+/// namespaces are not implemented yet.
 fn linux_unshare(flags: u64) -> u64 {
     const CLONE_NEWCGROUP: u64 = 0x0200_0000;
-    const CLONE_NEWNET: u64 = 0x4000_0000;
-    const UNIMPLEMENTED: u64 = CLONE_NEWCGROUP | CLONE_NEWNET;
+    const UNIMPLEMENTED: u64 = CLONE_NEWCGROUP;
     const SHARED_WITH_THREADS: u64 = LINUX_CLONE_THREAD | LINUX_CLONE_SIGHAND | LINUX_CLONE_VM;
     const KNOWN: u64 = UNIMPLEMENTED
         | LINUX_CLONE_NEW_KEPT
@@ -31625,6 +31711,13 @@ fn linux_set_uts_name(kind: usize, address: u64, length: u64) -> u64 {
 
 /// The number the current domain wrote to `/proc/sys` value `index`, if any.
 fn linux_proc_sysctl_override(index: usize) -> Option<i64> {
+    // A network namespace made in the domain has /proc/sys/net of its own.
+    if let Some(number) = linux_net_sysctl_number(index) {
+        let network = current_linux_namespaces().net;
+        if network != 0 {
+            return linux_namespace::net_sysctl(linux_execution_instance(), network, number);
+        }
+    }
     let slot = current_container_slot()?;
     let value = LINUX_SYSCTL_OVERRIDES[slot][index].load(Ordering::Acquire);
     (value != LINUX_SYSCTL_UNSET).then_some(value)
@@ -31748,8 +31841,35 @@ fn linux_proc_sysctl_write_bytes(device: u16, index: usize, text: &[u8]) -> Resu
     if LINUX_PROC_SYSCTLS[index].1 == b"sys/kernel/io_uring_disabled" && !(0..=2).contains(&value) {
         return Err(LINUX_EINVAL);
     }
+    if let Some(number) = linux_net_sysctl_number(index) {
+        let network = current_linux_namespaces().net;
+        if network != 0 {
+            return if linux_namespace::set_net_sysctl(
+                linux_execution_instance(),
+                network,
+                number,
+                value,
+            ) {
+                Ok(text.len())
+            } else {
+                Err(LINUX_EIO)
+            };
+        }
+    }
     LINUX_SYSCTL_OVERRIDES[slot][index].store(value, Ordering::Release);
     Ok(text.len())
+}
+
+/// Where among the /proc/sys/net values, which each network namespace
+/// keeps for itself, `LINUX_PROC_SYSCTLS` value `index` is.
+fn linux_net_sysctl_number(index: usize) -> Option<usize> {
+    let is_net = |path: &[u8]| path.starts_with(b"sys/net/");
+    is_net(LINUX_PROC_SYSCTLS.get(index)?.1).then(|| {
+        LINUX_PROC_SYSCTLS[..index]
+            .iter()
+            .filter(|(_, path, _)| is_net(path))
+            .count()
+    })
 }
 
 /// The text of the /proc/sys value a descriptor state names, as a read
@@ -40350,6 +40470,10 @@ fn linux_socket_bind(descriptor: u64, address: u64, length: u64) -> u64 {
     {
         return LINUX_EACCES;
     }
+    // A network namespace's sockets bind only to its own addresses.
+    if address != 0 && !linux_network_reaches(address) {
+        return LINUX_EADDRNOTAVAIL;
+    }
     crate::linux_socket::bind(slot, address, port).map_or_else(linux_socket_error, |_| 0)
 }
 
@@ -40547,6 +40671,9 @@ fn linux_socket_connect(descriptor: u64, address: u64, length: u64) -> u64 {
         Ok(endpoint) => endpoint,
         Err(error) => return error,
     };
+    if !linux_endpoint_reachable(endpoint) {
+        return LINUX_ENETUNREACH;
+    }
     match crate::linux_socket::connect(slot, endpoint) {
         Ok(()) => 0,
         Err(crate::linux_socket::Error::InProgress) if !linux_socket_nonblocking(descriptor) => {
@@ -41625,6 +41752,9 @@ fn linux_socket_send_corked(
     payload: &[u8],
     remote: Option<smoltcp::wire::IpEndpoint>,
 ) -> Result<usize, crate::linux_socket::Error> {
+    if remote.is_some_and(|remote| !linux_endpoint_reachable(remote)) {
+        return Err(crate::linux_socket::Error::Unavailable);
+    }
     let corks = matches!(
         crate::linux_socket::kind(slot),
         Some(crate::linux_socket::Kind::Tcp | crate::linux_socket::Kind::Udp)
@@ -41959,8 +42089,16 @@ fn linux_socket_setsockopt(
         (0, 7) => None,
         (0, 11) => Some(crate::linux_socket::BooleanOption::ReceiveErrors),
         (0, 12) => Some(crate::linux_socket::BooleanOption::ReceiveTtl),
+        // IP_HDRINCL: raw sockets only.
+        (0, 3) => {
+            if !crate::linux_socket::is_raw(slot) {
+                return LINUX_ENOPROTOOPT;
+            }
+            Some(crate::linux_socket::BooleanOption::HeaderIncluded)
+        }
         (1, 2) => Some(crate::linux_socket::BooleanOption::ReuseAddress),
         (1, 9) => Some(crate::linux_socket::BooleanOption::KeepAlive),
+        (1, 11) => Some(crate::linux_socket::BooleanOption::NoCheck),
         (1, 16) => Some(crate::linux_socket::BooleanOption::PassCredentials),
         (1, 29) => Some(crate::linux_socket::BooleanOption::Timestamp),
         // These options are advisory for the current in-kernel socket
@@ -42105,12 +42243,22 @@ fn linux_socket_getsockopt(
             Ok(value) => value,
             Err(error) => return error,
         },
+        (0, 3) if crate::linux_socket::is_raw(slot) => {
+            match read_boolean(crate::linux_socket::BooleanOption::HeaderIncluded) {
+                Ok(value) => value,
+                Err(error) => return error,
+            }
+        }
         // ICMP_FILTER of a raw ICMP socket.
         (255, 1) => match crate::linux_socket::icmp_filter(slot) {
             Ok(filter) => filter as i32,
             Err(_) => return LINUX_EOPNOTSUPP,
         },
         (1, 2) => match read_boolean(crate::linux_socket::BooleanOption::ReuseAddress) {
+            Ok(value) => value,
+            Err(error) => return error,
+        },
+        (1, 11) => match read_boolean(crate::linux_socket::BooleanOption::NoCheck) {
             Ok(value) => value,
             Err(error) => return error,
         },

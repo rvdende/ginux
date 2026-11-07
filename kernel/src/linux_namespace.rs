@@ -1,11 +1,15 @@
 //! The namespaces a process has besides its user and mount ones (which
 //! `linux_user` and `linux_mount` keep): UTS (its host and domain name),
-//! IPC (its System V objects), PID (the process ids it sees) and time (the
-//! offsets of its monotonic and boot-time clocks).
+//! IPC (its System V objects), PID (the process ids it sees), time (the
+//! offsets of its monotonic and boot-time clocks) and network (its
+//! interfaces and /proc/sys/net values).
 //!
 //! A domain's processes start in its initial namespace of each kind,
 //! number 0, which holds no entry here: the domain-wide host name, System V
-//! instance, process ids and clocks. clone and unshare make new ones,
+//! instance, process ids, clocks and network (the domain's network service
+//! with its loopback and eth0). A network namespace made inside the domain
+//! has only a loopback interface of its own, down until a process brings
+//! it up, and its own /proc/sys/net values. clone and unshare make new ones,
 //! setns joins one through a /proc/PID/ns descriptor, and a namespace goes
 //! once no process is in it, none will be born into it, and no PID
 //! namespace below it is left. Namespaces never reach past their domain:
@@ -27,6 +31,9 @@ pub(crate) const PID_LEVEL_LIMIT: usize = 32;
 pub(crate) const IPC_INSTANCE_LIMIT: usize = 16;
 /// The first System V instance an IPC namespace gets.
 pub(crate) const IPC_INSTANCE_FIRST: usize = control_abi::DOMAIN_LIMIT + 1;
+/// The /proc/sys/net values a network namespace keeps (the caller numbers
+/// them).
+pub(crate) const NET_SYSCTL_LIMIT: usize = 8;
 /// The most UTS name bytes (Linux's __NEW_UTS_LEN).
 pub(crate) const UTS_NAME_CAPACITY: usize = 64;
 
@@ -153,6 +160,7 @@ pub(crate) struct Set {
     pub(crate) time: u32,
     /// Where its children are born; unshare(CLONE_NEWTIME) moves it.
     pub(crate) time_for_children: u32,
+    pub(crate) net: u32,
 }
 
 impl Set {
@@ -172,6 +180,7 @@ impl Set {
             Kind::Ipc => self.ipc == id,
             Kind::Pid => self.pid == id || self.pid_for_children == id,
             Kind::Time => self.time == id || self.time_for_children == id,
+            Kind::Net => self.net == id,
             _ => false,
         }
     }
@@ -212,6 +221,20 @@ enum Data {
         /// A process entered it: the offsets no longer change.
         frozen: bool,
     },
+    Net {
+        loopback: Loopback,
+        /// The /proc/sys/net values written in it, by the caller's number
+        /// (`None`: the built-in one).
+        sysctls: [Option<i64>; NET_SYSCTL_LIMIT],
+    },
+}
+
+/// A network namespace's loopback interface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Loopback {
+    /// IFF_UP: it carries 127.0.0.0/8.
+    pub(crate) up: bool,
+    pub(crate) mtu: i32,
 }
 
 #[derive(Clone, Copy)]
@@ -230,6 +253,7 @@ impl Namespace {
             Data::Ipc { .. } => Kind::Ipc,
             Data::Pid { .. } => Kind::Pid,
             Data::Time { .. } => Kind::Time,
+            Data::Net { .. } => Kind::Net,
         }
     }
 }
@@ -273,15 +297,16 @@ static NAMESPACES: SpinLock<Namespaces> = SpinLock::new(
     },
 );
 
-/// How many PID, IPC and time namespaces exist beyond the initial ones:
-/// while none does, the calls that translate need not look.
-static LIVE_COUNTS: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
+/// How many PID, IPC, time and network namespaces exist beyond the
+/// initial ones: while none does, the calls that translate need not look.
+static LIVE_COUNTS: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
 
 fn count_slot(kind: Kind) -> Option<usize> {
     match kind {
         Kind::Pid => Some(0),
         Kind::Ipc => Some(1),
         Kind::Time => Some(2),
+        Kind::Net => Some(3),
         _ => None,
     }
 }
@@ -675,6 +700,70 @@ pub(crate) fn freeze_time(instance: usize, id: u32) {
     }) = NAMESPACES.lock().find_mut(instance, id)
     {
         *frozen = true;
+    }
+}
+
+/// A new network namespace owned by `owner`: a loopback interface, down,
+/// and the built-in /proc/sys/net values.
+pub(crate) fn create_net(
+    instance: usize,
+    owner: linux_user::UserNamespaceHandle,
+) -> Result<u32, Error> {
+    NAMESPACES.lock().insert(
+        instance,
+        owner,
+        Data::Net {
+            loopback: Loopback {
+                up: false,
+                mtu: 65_536,
+            },
+            sysctls: [None; NET_SYSCTL_LIMIT],
+        },
+    )
+}
+
+/// Network namespace `id`'s loopback interface.
+pub(crate) fn loopback(instance: usize, id: u32) -> Option<Loopback> {
+    match NAMESPACES.lock().find(instance, id)?.data {
+        Data::Net { loopback, .. } => Some(loopback),
+        _ => None,
+    }
+}
+
+/// Changes network namespace `id`'s loopback interface.
+pub(crate) fn set_loopback(instance: usize, id: u32, change: impl FnOnce(&mut Loopback)) -> bool {
+    match NAMESPACES.lock().find_mut(instance, id) {
+        Some(Namespace {
+            data: Data::Net { loopback, .. },
+            ..
+        }) => {
+            change(loopback);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The /proc/sys/net value number `index` written in network namespace
+/// `id`, if one was.
+pub(crate) fn net_sysctl(instance: usize, id: u32, index: usize) -> Option<i64> {
+    match NAMESPACES.lock().find(instance, id)?.data {
+        Data::Net { sysctls, .. } => *sysctls.get(index)?,
+        _ => None,
+    }
+}
+
+/// Writes the /proc/sys/net value number `index` of network namespace `id`.
+pub(crate) fn set_net_sysctl(instance: usize, id: u32, index: usize, value: i64) -> bool {
+    match NAMESPACES.lock().find_mut(instance, id) {
+        Some(Namespace {
+            data: Data::Net { sysctls, .. },
+            ..
+        }) => sysctls
+            .get_mut(index)
+            .map(|slot| *slot = Some(value))
+            .is_some(),
+        _ => false,
     }
 }
 

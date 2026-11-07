@@ -4,7 +4,6 @@
 # the run. Rewrite it from a run with LTP_UPDATE_BASELINE=1
 # (tests/qemu/ltp.sh --update-baseline); LTP_STRICT=1 ignores it.
 # From target/ltp-results.txt (2026-11-03), list=tests/ltp/syscalls.list ltp=20260930 kernel=468a6a67.
-clone09 TBROK
 ioctl_loop05 TBROK
 msgstress01 TBROK
 prot_hsymlinks TBROK

@@ -142,6 +142,11 @@ pub(crate) enum BooleanOption {
     Timestamp,
     /// IP_RECVTTL: received datagrams carry their TTL (an IP_TTL message).
     ReceiveTtl,
+    /// IP_HDRINCL: a raw socket's caller writes the IPv4 header itself.
+    HeaderIncluded,
+    /// SO_NO_CHECK: UDP may send without a checksum; smoltcp always sums,
+    /// which receivers accept either way.
+    NoCheck,
 }
 
 #[derive(Clone, Copy)]
@@ -160,6 +165,8 @@ struct Options {
     pass_credentials: bool,
     timestamp: bool,
     receive_ttl: bool,
+    header_included: bool,
+    no_check: bool,
     /// IP_TTL; 0 for DEFAULT_TTL.
     ttl: u8,
     receive_timeout_us: u64,
@@ -296,6 +303,10 @@ impl LocalQueue {
 struct Slot {
     /// The domain (container slot) that opened the socket.
     owner: u8,
+    /// The network namespace of the domain it was made in (0: the
+    /// domain's own): its local connections, TCP ports and abstract Unix
+    /// names are that namespace's.
+    network: u32,
     references: u16,
     kind: Kind,
     /// The smoltcp socket of a TCP or UDP socket.
@@ -371,6 +382,7 @@ impl Slot {
     fn new(kind: Kind, owner: u8) -> Self {
         Self {
             owner,
+            network: current_network(),
             references: 1,
             kind,
             handle: None,
@@ -543,6 +555,24 @@ static SOCKETS: SpinLock<Sockets> = SpinLock::new(
     },
 );
 
+/// Whether two Unix sockets of network namespaces `first` and `second`
+/// may share name `path`: abstract names (a leading NUL) are each network
+/// namespace's own, as in Linux; filesystem ones are the domain's.
+fn same_unix_namespace(path: &[u8], first: u32, second: u32) -> bool {
+    path.first() != Some(&0) || first == second
+}
+
+/// The network namespace of the process this CPU runs (0: the domain's own).
+fn current_network() -> u32 {
+    if !crate::linux_namespace::any(crate::linux_namespace::Kind::Net) {
+        return 0;
+    }
+    crate::linux_process::live_process_namespaces(
+        crate::arch::x86_64::cpu::current_linux_process_id(),
+    )
+    .map_or(0, |set| set.net)
+}
+
 fn current_owner() -> u8 {
     crate::arch::x86_64::cpu::current_container_slot().unwrap_or(crate::control_abi::DOMAIN_LIMIT)
         as u8
@@ -690,17 +720,35 @@ fn append_local_data(
 }
 
 /// Whether `address` (host order) is one of the interface's own.
+/// The address a socket of network namespace `network` has: the domain's
+/// own, or 127.0.0.1 in a namespace made inside it (its only one).
+fn own_address(runtime: &Runtime, network: u32) -> u32 {
+    if network == 0 {
+        runtime.local_address
+    } else {
+        0x7f00_0001
+    }
+}
+
 fn is_local_address(runtime: &Runtime, address: u32) -> bool {
     address >> 24 == 127 || address == runtime.local_address
 }
 
 fn port_in_use(slots: &[Option<Slot>], kind: Kind, port: u16, except: usize) -> bool {
+    // TCP ports are each network namespace's own; UDP ones are shared, as
+    // smoltcp's one interface delivers by port alone.
+    let network = slots
+        .get(except)
+        .and_then(Option::as_ref)
+        .map_or(0, |slot| slot.network);
     port != 0
         && slots.iter().enumerate().any(|(index, slot)| {
             index != except
-                && slot
-                    .as_ref()
-                    .is_some_and(|slot| slot.kind == kind && slot.local_port == port)
+                && slot.as_ref().is_some_and(|slot| {
+                    slot.kind == kind
+                        && slot.local_port == port
+                        && (kind != Kind::Tcp || slot.network == network)
+                })
         })
 }
 
@@ -942,12 +990,14 @@ impl Sockets {
         if state.peer.is_some() || !state.unix_path.is_empty() {
             return Err(Error::Invalid);
         }
-        let owner = state.owner;
+        let (owner, network) = (state.owner, state.network);
         let in_use = self.slots.iter().enumerate().any(|(candidate, slot)| {
             candidate != usize::from(id)
-                && slot
-                    .as_ref()
-                    .is_some_and(|slot| slot.owner == owner && slot.unix_path == path)
+                && slot.as_ref().is_some_and(|slot| {
+                    slot.owner == owner
+                        && slot.unix_path == path
+                        && same_unix_namespace(path, slot.network, network)
+                })
         });
         if in_use {
             return Err(Error::AddressInUse);
@@ -972,7 +1022,7 @@ impl Sockets {
         if state.peer.is_some() {
             return Err(Error::Invalid);
         }
-        let (owner, unix_type) = (state.owner, state.unix_type);
+        let (owner, unix_type, network) = (state.owner, state.unix_type, state.network);
         let peer = self
             .slots
             .iter()
@@ -984,6 +1034,7 @@ impl Sockets {
                             && slot.kind == Kind::Unix
                             && slot.unix_type == unix_type
                             && slot.unix_path == path
+                            && same_unix_namespace(path, slot.network, network)
                     })
             })
             .map(|(candidate, _)| candidate as SlotId)
@@ -994,6 +1045,7 @@ impl Sockets {
                         && slot.kind == Kind::Unix
                         && slot.unix_type != unix_type
                         && slot.unix_path == path
+                        && same_unix_namespace(path, slot.network, network)
                 });
                 if other_type {
                     Error::WrongType
@@ -1251,6 +1303,8 @@ impl Sockets {
             BooleanOption::PassCredentials => options.pass_credentials = enabled,
             BooleanOption::Timestamp => options.timestamp = enabled,
             BooleanOption::ReceiveTtl => options.receive_ttl = enabled,
+            BooleanOption::HeaderIncluded => options.header_included = enabled,
+            BooleanOption::NoCheck => options.no_check = enabled,
         }
         if state.kind == Kind::Tcp {
             if let Some(handle) = state.handle {
@@ -1265,7 +1319,9 @@ impl Sockets {
                     | BooleanOption::ReceiveErrors
                     | BooleanOption::PassCredentials
                     | BooleanOption::Timestamp
-                    | BooleanOption::ReceiveTtl => {}
+                    | BooleanOption::ReceiveTtl
+                    | BooleanOption::HeaderIncluded
+                    | BooleanOption::NoCheck => {}
                 }
             }
         }
@@ -1282,6 +1338,8 @@ impl Sockets {
             BooleanOption::PassCredentials => options.pass_credentials,
             BooleanOption::Timestamp => options.timestamp,
             BooleanOption::ReceiveTtl => options.receive_ttl,
+            BooleanOption::HeaderIncluded => options.header_included,
+            BooleanOption::NoCheck => options.no_check,
         })
     }
 
@@ -1388,7 +1446,7 @@ impl Sockets {
         if state.kind != Kind::Tcp {
             return Err(Error::Invalid);
         }
-        let (current_port, handle) = (state.local_port, state.handle);
+        let (current_port, handle, network) = (state.local_port, state.handle, state.network);
         self.start_runtime()?;
         let Self { runtime, slots, .. } = self;
         let runtime = runtime.as_mut().ok_or(Error::Unavailable)?;
@@ -1398,11 +1456,15 @@ impl Sockets {
         } else {
             current_port
         };
-        runtime
-            .sockets
-            .get_mut::<tcp::Socket>(handle.ok_or(Error::Invalid)?)
-            .listen(local_port)
-            .map_err(|_| Error::Invalid)?;
+        // A network namespace made in a domain is not on the domain's
+        // interfaces: its listeners take only its local connections.
+        if network == 0 {
+            runtime
+                .sockets
+                .get_mut::<tcp::Socket>(handle.ok_or(Error::Invalid)?)
+                .listen(local_port)
+                .map_err(|_| Error::Invalid)?;
+        }
         let state = slot_in_mut(slots, id).ok_or(Error::Invalid)?;
         state.local_port = local_port;
         state.listening = true;
@@ -1534,20 +1596,26 @@ impl Sockets {
                 });
             }
         }
-        let (kind, current_port) = (state.kind, state.local_port);
+        let (kind, current_port, owner, network) =
+            (state.kind, state.local_port, state.owner, state.network);
         let local_port = if current_port == 0 {
             allocate_ephemeral_port(&mut runtime.next_port, slots, kind, index)
                 .ok_or(Error::Exhausted)?
         } else {
             current_port
         };
+        // A network namespace made in a domain reaches only its own
+        // loopback: its TCP connections are all local ones.
         if kind == Kind::Tcp
-            && matches!(remote.addr, IpAddress::Ipv4(address)
-                if is_local_address(runtime, u32::from_be_bytes(address.octets())))
+            && (network != 0
+                || matches!(remote.addr, IpAddress::Ipv4(address)
+                    if is_local_address(runtime, u32::from_be_bytes(address.octets()))))
         {
             let listener = slots.iter().position(|candidate| {
                 candidate.as_ref().is_some_and(|candidate| {
                     candidate.kind == Kind::Tcp
+                        && candidate.owner == owner
+                        && candidate.network == network
                         && candidate.listening
                         && candidate.local_port == remote.port
                         && candidate.pending.len() < candidate.backlog
@@ -1561,7 +1629,7 @@ impl Sockets {
                 let listener = listener as SlotId;
                 let listener_state = slot_in(slots, listener).ok_or(Error::Invalid)?;
                 let mut accepted = Slot::new(Kind::Tcp, listener_state.owner);
-                accepted.remote = Some(endpoint(runtime.local_address, local_port));
+                accepted.remote = Some(endpoint(own_address(runtime, network), local_port));
                 accepted.local_port = listener_state.local_port;
                 accepted.peer = Some(id);
                 accepted.options = listener_state.options;
@@ -1787,6 +1855,20 @@ impl Sockets {
         let runtime = runtime.as_mut().ok_or(Error::Unavailable)?;
         let state = slot_in(slots, id).ok_or(Error::Invalid)?;
         let (raw, handle, ttl) = (state.icmp_raw, state.handle, state.options.ttl);
+        // With IP_HDRINCL a raw socket's message is the whole packet: an
+        // IPv4 header of at least 20 bytes that the packet holds.
+        if raw && state.options.header_included {
+            let header = usize::from(input.first().copied().unwrap_or(0) & 0xf) * 4;
+            if input.len() < 20 || input[0] >> 4 != 4 || header < 20 || header > input.len() {
+                return Err(Error::Invalid);
+            }
+            return runtime
+                .sockets
+                .get_mut::<raw::Socket>(handle.ok_or(Error::Invalid)?)
+                .send_slice(input)
+                .map(|()| input.len())
+                .map_err(|_| Error::WouldBlock);
+        }
         let mut message = filled(input.len(), 0_u8)?;
         message.copy_from_slice(input);
         if !raw {
@@ -2281,7 +2363,7 @@ impl Sockets {
         let state = self.slot(id).filter(|state| state.kind != Kind::Unix)?;
         let runtime = self.runtime.as_ref()?;
         Some((
-            endpoint(runtime.local_address, state.local_port),
+            endpoint(own_address(runtime, state.network), state.local_port),
             state.remote,
         ))
     }
@@ -2928,6 +3010,14 @@ pub(crate) fn duplicate(id: SlotId) -> bool {
 
 pub(crate) fn kind(id: SlotId) -> Option<Kind> {
     SOCKETS.lock().slot(id).map(|state| state.kind)
+}
+
+/// Whether socket `id` is a raw one (SOCK_RAW).
+pub(crate) fn is_raw(id: SlotId) -> bool {
+    SOCKETS
+        .lock()
+        .slot(id)
+        .is_some_and(|state| state.kind == Kind::Icmp && state.icmp_raw)
 }
 
 /// Opens an object slot for `class` and `id`, with one reference.
