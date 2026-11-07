@@ -1034,6 +1034,9 @@ fn linux_syscall_dispatch(
             if let Some(result) = linux_fiemap_ioctl(first_argument, buffer, count) {
                 return result;
             }
+            if linux_pidfd_descriptor(first_argument) {
+                return linux_pidfd_ioctl(first_argument, buffer, count);
+            }
             if linux_namespace_descriptor(first_argument) {
                 return linux_namespace_ioctl(first_argument, buffer, count);
             }

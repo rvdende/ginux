@@ -73,6 +73,9 @@ impl LockRank {
     /// heap so the list may grow while held.
     pub(crate) const MEMORY_FAILURE: Self = Self(175);
     pub(crate) const FUTEX_COORDINATION: Self = Self(180);
+    /// The wait statuses of reaped processes that pidfds report; ranks
+    /// below the heap so the list may grow while held.
+    pub(crate) const PIDFS_EXITS: Self = Self(184);
     /// The mounted volumes (filesystems on block devices): every path walk
     /// looks at them, so they rank above the device and file tables whose
     /// holders make and remove files (loop devices, pseudo-terminals), and

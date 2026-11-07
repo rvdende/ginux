@@ -40,6 +40,7 @@ mod linux_mount;
 mod linux_mounts;
 mod linux_namespace;
 mod linux_overlay;
+mod linux_pidfs;
 mod linux_process;
 mod linux_profile;
 mod linux_pty;

@@ -7509,6 +7509,7 @@ pub(crate) fn stop_configured_container() {
     crate::linux_areas::forget_instance(linux_execution_instance());
     crate::linux_mounts::forget_instance(linux_execution_instance());
     crate::linux_tmpfs_quota::forget_instance(linux_execution_instance());
+    crate::linux_pidfs::forget_instance(linux_execution_instance());
     linux_namespace::forget_instance(
         linux_execution_instance(),
         crate::linux_sysv_ipc::release_instance,
@@ -16564,9 +16565,11 @@ fn linux_wait4(pid: u64, status_address: u64, options: u64, rusage: u64) -> u64 
     }
     if reaped {
         let child_maxrss = linux_process::live_process_maxrss(waited);
+        let identity = linux_pidfd_identity(waited);
         if linux_process::wait_live_child(parent_pid, waited) != Some((waited, exit_status)) {
             return LINUX_ECHILD;
         }
+        linux_pidfd_record_exit(waited, identity, encoded);
         if let Some(child_maxrss) = child_maxrss {
             linux_process::add_waited_child_maxrss(parent_pid, child_maxrss);
         }
@@ -16722,9 +16725,17 @@ fn linux_waitid(id_type: u64, id: u64, information: u64, options: u64, rusage: u
     if options & LINUX_WNOWAIT == 0 {
         if reaped {
             let child_maxrss = linux_process::live_process_maxrss(pid);
+            let identity = linux_pidfd_identity(pid);
             if linux_process::wait_live_child(parent, pid) != Some((pid, exit_status)) {
                 return LINUX_ECHILD;
             }
+            // The wait4 status of the exit siginfo reports.
+            let encoded = match code {
+                LINUX_CLD_EXITED => status << 8,
+                LINUX_CLD_KILLED => status,
+                _ => status | 0x80,
+            };
+            linux_pidfd_record_exit(pid, identity, encoded);
             if let Some(child_maxrss) = child_maxrss {
                 linux_process::add_waited_child_maxrss(parent, child_maxrss);
             }
@@ -49329,6 +49340,131 @@ fn linux_pidfd_process(descriptor: u64) -> Option<u32> {
     let pid = identity as u32;
     let generation = (identity >> 32) as u32;
     (pid != 0 && linux_process::live_process_generation(pid) == Some(generation)).then_some(pid)
+}
+
+/// Process `pid`'s slot generation and PID namespace, read before a wait
+/// reaps it, for `linux_pidfd_record_exit`.
+fn linux_pidfd_identity(pid: u32) -> Option<(u32, u32)> {
+    let generation = linux_process::live_process_generation(pid)?;
+    let namespace = linux_process::live_process_namespaces(pid).map_or(0, |set| set.pid);
+    Some((generation, namespace))
+}
+
+/// Keeps reaped process `pid`'s wait status for its pidfds
+/// (PIDFD_INFO_EXIT); `identity` is from `linux_pidfd_identity`.
+fn linux_pidfd_record_exit(pid: u32, identity: Option<(u32, u32)>, status: u32) {
+    if let Some((generation, namespace)) = identity {
+        crate::linux_pidfs::reaped(
+            linux_execution_instance(),
+            pid,
+            generation,
+            namespace,
+            status,
+        );
+    }
+}
+
+/// ioctl on a pidfd: PIDFD_GET_INFO (Linux 6.15's: the process's ids and
+/// credentials while it is unreaped, its wait status once reaped when
+/// PIDFD_INFO_EXIT asks); other requests are ENOTTY.
+fn linux_pidfd_ioctl(descriptor: u64, request: u64, argument: u64) -> u64 {
+    const PIDFS_IOCTL_MAGIC: u64 = 0xff;
+    const PIDFD_GET_INFO_NUMBER: u64 = 11;
+    const PIDFD_INFO_PID: u64 = 1 << 0;
+    const PIDFD_INFO_CREDS: u64 = 1 << 1;
+    const PIDFD_INFO_EXIT: u64 = 1 << 3;
+    /// struct pidfd_info's first version (up to the spare fields), the
+    /// least a caller may pass, and its size now.
+    const PIDFD_INFO_SIZE_VER0: usize = 64;
+    const PIDFD_INFO_SIZE: usize = 72;
+    let request = u64::from(request as u32);
+    if (request >> 8) & 0xff != PIDFS_IOCTL_MAGIC || request & 0xff != PIDFD_GET_INFO_NUMBER {
+        return LINUX_ENOTTY;
+    }
+    let size = ((request >> 16) & 0x3fff) as usize;
+    if argument == 0 || size < PIDFD_INFO_SIZE_VER0 {
+        return LINUX_EINVAL;
+    }
+    let mut mask = [0_u8; 8];
+    if !copy_from_linux_user(argument, &mut mask) {
+        return LINUX_EFAULT;
+    }
+    let mask = u64::from_ne_bytes(mask);
+    let identity = linux_descriptor_offset(descriptor).load(Ordering::SeqCst);
+    let (pid, generation) = (identity as u32, (identity >> 32) as u32);
+    let caller = current_linux_process_pid();
+    let observer = current_linux_namespaces().pid;
+    let instance = linux_execution_instance();
+    let live = linux_process::live_process_generation(pid) == Some(generation);
+    let exit = (!live)
+        .then(|| crate::linux_pidfs::exit(instance, pid, generation))
+        .flatten();
+    // Only processes in the caller's PID namespace or below it.
+    let namespace = if live {
+        linux_process::live_process_namespaces(pid).map_or(0, |set| set.pid)
+    } else {
+        exit.map_or(0, |exit| exit.namespace)
+    };
+    if !linux_namespace::pid_within(instance, observer, namespace) {
+        return LINUX_ESRCH;
+    }
+    let mut info = [0_u8; PIDFD_INFO_SIZE];
+    let mut reported = 0;
+    if !live {
+        // A reaped process tells only how it ended, and only when asked.
+        let Some(exit) = exit.filter(|_| mask & PIDFD_INFO_EXIT != 0) else {
+            return LINUX_ESRCH;
+        };
+        reported |= PIDFD_INFO_EXIT;
+        info[60..64].copy_from_slice(&exit.status.to_ne_bytes());
+    } else {
+        let Some(credentials) = linux_process::live_process_credentials(pid) else {
+            return LINUX_ESRCH;
+        };
+        let parent = linux_process::live_process_parent_pid(pid).unwrap_or(0);
+        let seen = linux_pid_seen_by(caller, pid);
+        if seen == 0 {
+            return LINUX_ESRCH;
+        }
+        let parent = if parent == 0 {
+            0
+        } else {
+            linux_pid_seen_by(caller, parent)
+        };
+        let words = [
+            seen,
+            seen,
+            parent,
+            credentials.user.real,
+            credentials.group.real,
+            credentials.user.effective,
+            credentials.group.effective,
+            credentials.user.saved,
+            credentials.group.saved,
+            credentials.user.filesystem,
+            credentials.group.filesystem,
+        ];
+        for (index, word) in words.iter().enumerate() {
+            info[16 + index * 4..20 + index * 4].copy_from_slice(&word.to_ne_bytes());
+        }
+        reported |= PIDFD_INFO_PID | PIDFD_INFO_CREDS;
+    }
+    info[..8].copy_from_slice(&reported.to_ne_bytes());
+    // As copy_struct_to_user: a shorter struct gets its part, a longer
+    // one zeros past ours.
+    if !copy_to_linux_user(argument, &info[..size.min(PIDFD_INFO_SIZE)]) {
+        return LINUX_EFAULT;
+    }
+    let zeros = [0_u8; 256];
+    let mut offset = PIDFD_INFO_SIZE;
+    while offset < size {
+        let length = (size - offset).min(zeros.len());
+        if !copy_to_linux_user(argument + offset as u64, &zeros[..length]) {
+            return LINUX_EFAULT;
+        }
+        offset += length;
+    }
+    0
 }
 
 fn linux_signalfd_descriptor(descriptor: u64) -> bool {
