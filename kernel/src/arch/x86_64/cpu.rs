@@ -34404,9 +34404,23 @@ fn linux_rootfs_execve_source(
     let overlay_bytes = overlay_image
         .as_mut()
         .map(|(image, size)| &image.bytes_mut()[..*size]);
+    // The image's program at the path: where a bind mount of a root
+    // filesystem directory leads it, if one does.
+    let mut bound = [0_u8; crate::linux_overlay::PATH_CAPACITY + 1];
+    let image_path =
+        match crate::linux_overlay::image_location(path.strip_prefix(b"/").unwrap_or(path)) {
+            alloc::borrow::Cow::Owned(image)
+                if domain_exec_slot.is_none() && image.len() < bound.len() =>
+            {
+                bound[0] = b'/';
+                bound[1..=image.len()].copy_from_slice(&image);
+                &bound[..=image.len()]
+            }
+            _ => path,
+        };
     let plan_at = |base| match overlay_bytes {
         Some(image) => crate::published_rootfs::process_plan_for_image(image, base),
-        None => crate::published_rootfs::process_plan_at(path, base),
+        None => crate::published_rootfs::process_plan_at(image_path, base),
     };
     // A program loads low, below the heap, when it fits there. Larger
     // position-independent programs such as cargo load high instead; a
@@ -34434,7 +34448,7 @@ fn linux_rootfs_execve_source(
             return LINUX_ENOEXEC;
         }
         use crate::published_rootfs::ProcessPlanFailure;
-        let failure = match crate::published_rootfs::process_plan_failure(path) {
+        let failure = match crate::published_rootfs::process_plan_failure(image_path) {
             ProcessPlanFailure::RootfsUnavailable => 1,
             ProcessPlanFailure::ExecutableNotFound => 2,
             ProcessPlanFailure::NotRegularFile => 3,
@@ -34449,7 +34463,7 @@ fn linux_rootfs_execve_source(
         serial_write("ginux: Linux exec plan rejection code: ");
         serial_write_u64(failure);
         if let Some((length, head, kind, headers)) =
-            crate::published_rootfs::executable_diagnostic(path)
+            crate::published_rootfs::executable_diagnostic(image_path)
         {
             serial_write(" length/head/type/phnum: ");
             for value in [length as u64, head, u64::from(kind), u64::from(headers)] {
@@ -34458,7 +34472,9 @@ fn linux_rootfs_execve_source(
             }
         }
         serial_write("\r\n");
-        if let Some((headers, count)) = crate::published_rootfs::executable_program_headers(path) {
+        if let Some((headers, count)) =
+            crate::published_rootfs::executable_program_headers(image_path)
+        {
             serial_write("ginux: Linux exec program type/flags: ");
             for header in &headers[..count] {
                 serial_write_u64(*header);
@@ -34468,7 +34484,7 @@ fn linux_rootfs_execve_source(
         }
         // PATH searches in libc try the next directory only on ENOENT, so a
         // missing file must not be reported as ENOEXEC.
-        return match crate::published_rootfs::process_plan_failure(path) {
+        return match crate::published_rootfs::process_plan_failure(image_path) {
             ProcessPlanFailure::ExecutableNotFound => {
                 linux_missing_path_error(path.strip_prefix(b"/").unwrap_or(path))
             }
@@ -34487,7 +34503,7 @@ fn linux_rootfs_execve_source(
         Some(image) => Some(crate::published_rootfs::launch_arguments_for_image(
             path, image,
         )),
-        None => crate::published_rootfs::launch_arguments(path),
+        None => crate::published_rootfs::launch_arguments(image_path),
     };
     let Some(launch_arguments) = launch_arguments else {
         return LINUX_ENOEXEC;
@@ -36442,6 +36458,7 @@ fn linux_rootfs_path_at(
     if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
         return None;
     }
+    let (at, requested) = (directory, path);
     let mut rooted = [0_u8; LINUX_PATH_MAX + crate::linux_overlay::PATH_CAPACITY];
     let path = linux_rooted_path(path, &mut rooted)?;
     let directory = if path.starts_with(b"/") {
@@ -36451,10 +36468,44 @@ fn linux_rootfs_path_at(
     } else {
         linux_rootfs_descriptor(directory)
     };
-    (directory != 0)
+    let found = (directory != 0)
         .then(|| crate::published_rootfs::lookup_at(directory, path))
         .flatten()
-        .filter(|(handle, _)| !linux_rootfs_handle_hidden(*handle))
+        .filter(|(handle, _)| !linux_rootfs_handle_hidden(*handle));
+    found.or_else(|| linux_rootfs_bound_lookup(at, requested, false))
+}
+
+/// The image's file at the root filesystem path a bind mount leads
+/// `path` (from `directory`, a rootfs handle as `linux_rootfs_path_at`
+/// takes it) to, when it leads it elsewhere: /mnt/x where /usr is bound
+/// on /mnt is the image's /usr/x. The final symlink is followed unless
+/// `metadata`. None for a path no bind of a root filesystem directory
+/// leads, which the lookup by the path itself answered.
+fn linux_rootfs_bound_lookup(
+    directory: u64,
+    path: &[u8],
+    metadata: bool,
+) -> Option<(u16, Option<crate::published_rootfs::Entry<'static>>)> {
+    if !crate::linux_mount_paths::root_bound() || path.is_empty() {
+        return None;
+    }
+    let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    let length = if path.starts_with(b"/") {
+        linux_root_prefix(&mut canonical)
+    } else {
+        linux_walk_start(directory, &mut canonical).ok()?
+    };
+    let length = linux_walk_path_components(&mut canonical, length, path, &mut 0, true).ok()?;
+    let alloc::borrow::Cow::Owned(image) = crate::linux_overlay::image_path(&canonical[..length])?
+    else {
+        return None;
+    };
+    let found = if metadata {
+        crate::published_rootfs::lookup_metadata_at(crate::published_rootfs::ROOT_HANDLE, &image)
+    } else {
+        crate::published_rootfs::lookup_at(crate::published_rootfs::ROOT_HANDLE, &image)
+    };
+    found.filter(|(handle, _)| !linux_rootfs_handle_hidden(*handle))
 }
 
 fn linux_rootfs_handle_hidden(handle: u16) -> bool {
@@ -37003,10 +37054,10 @@ fn linux_walk_step(prefix: &[u8]) -> LinuxWalkStep {
             _ => LinuxWalkStep::NotDirectory,
         };
     }
-    if crate::linux_overlay::hidden(prefix) {
+    let Some(image) = crate::linux_overlay::image_path(prefix) else {
         return LinuxWalkStep::Unknown;
-    }
-    match crate::published_rootfs::lookup_at(crate::published_rootfs::ROOT_HANDLE, prefix) {
+    };
+    match crate::published_rootfs::lookup_at(crate::published_rootfs::ROOT_HANDLE, &image) {
         Some((_, Some(entry))) => match entry.kind {
             crate::published_rootfs::EntryKind::Directory => {
                 LinuxWalkStep::Directory(ginux_credentials::FileAccess {
@@ -37075,11 +37126,9 @@ fn linux_path_access(path: &[u8]) -> Option<ginux_credentials::FileAccess> {
             directory: metadata.kind == crate::linux_overlay::NodeKind::Directory,
         });
     }
-    if crate::linux_overlay::hidden(path) {
-        return None;
-    }
+    let image = crate::linux_overlay::image_path(path)?;
     let (_, entry) =
-        crate::published_rootfs::lookup_at(crate::published_rootfs::ROOT_HANDLE, path)?;
+        crate::published_rootfs::lookup_at(crate::published_rootfs::ROOT_HANDLE, &image)?;
     let entry = entry?;
     Some(ginux_credentials::FileAccess {
         owner: entry.owner,
@@ -37181,11 +37230,13 @@ fn linux_overlay_parent_exists(path: &[u8]) -> bool {
             | b"sys/fs/pstore"
     ) || crate::linux_overlay::lookup(parent)
         .is_some_and(|metadata| metadata.kind == crate::linux_overlay::NodeKind::Directory)
-        || crate::published_rootfs::lookup_at(crate::published_rootfs::ROOT_HANDLE, parent)
-            .is_some_and(|(_, entry)| {
-                entry
-                    .is_none_or(|entry| entry.kind == crate::published_rootfs::EntryKind::Directory)
-            })
+        || crate::published_rootfs::lookup_at(
+            crate::published_rootfs::ROOT_HANDLE,
+            &crate::linux_overlay::image_location(parent),
+        )
+        .is_some_and(|(_, entry)| {
+            entry.is_none_or(|entry| entry.kind == crate::published_rootfs::EntryKind::Directory)
+        })
 }
 
 fn linux_rootfs_metadata_path_at(
@@ -37195,6 +37246,7 @@ fn linux_rootfs_metadata_path_at(
     if !X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) {
         return None;
     }
+    let (at, requested) = (directory, path);
     let mut rooted = [0_u8; LINUX_PATH_MAX + crate::linux_overlay::PATH_CAPACITY];
     let path = linux_rooted_path(path, &mut rooted)?;
     let directory = if path.starts_with(b"/") {
@@ -37204,10 +37256,11 @@ fn linux_rootfs_metadata_path_at(
     } else {
         linux_rootfs_descriptor(directory)
     };
-    (directory != 0)
+    let found = (directory != 0)
         .then(|| crate::published_rootfs::lookup_metadata_at(directory, path))
         .flatten()
-        .filter(|(handle, _)| !linux_rootfs_handle_hidden(*handle))
+        .filter(|(handle, _)| !linux_rootfs_handle_hidden(*handle));
+    found.or_else(|| linux_rootfs_bound_lookup(at, requested, true))
 }
 
 fn linux_rootfs_descriptor(descriptor: u64) -> u16 {
@@ -38220,10 +38273,8 @@ fn linux_exact_symlink(
         }
         return crate::linux_overlay::read(metadata.handle, 0, target);
     }
-    if crate::linux_overlay::hidden(path) {
-        return None;
-    }
-    let entry = crate::published_rootfs::exact_entry(path)
+    let image = crate::linux_overlay::image_path(path)?;
+    let entry = crate::published_rootfs::exact_entry(&image)
         .filter(|entry| entry.kind == crate::published_rootfs::EntryKind::Symlink)?;
     let length = entry.link.len();
     target.get_mut(..length)?.copy_from_slice(entry.link);
@@ -39579,9 +39630,12 @@ fn linux_unlinkat(directory: u64, path_address: u64, flags: u64) -> u64 {
     let Some(metadata) = crate::linux_overlay::lookup(&canonical[..length]) else {
         // A name only the image has: removing it whites it out, after the
         // checks the overlay's own names get below.
-        let image_directory = crate::published_rootfs::exact_entry(&canonical[..length])
+        let image = crate::linux_overlay::image_path(&canonical[..length]);
+        let image_directory = image
+            .as_deref()
+            .and_then(crate::published_rootfs::exact_entry)
             .map(|entry| entry.kind == crate::published_rootfs::EntryKind::Directory);
-        if !crate::linux_overlay::hidden(&canonical[..length]) {
+        if image.is_some() {
             match (image_directory, flags == LINUX_AT_REMOVEDIR) {
                 (Some(false), true) => return LINUX_ENOTDIR,
                 (Some(true), false) => return LINUX_EISDIR,
@@ -39599,21 +39653,18 @@ fn linux_unlinkat(directory: u64, path_address: u64, flags: u64) -> u64 {
                 _ => {}
             }
         }
-        return if crate::linux_overlay::hidden(&canonical[..length]) {
-            LINUX_ENOENT
-        } else if crate::published_rootfs::lookup_at(
-            crate::published_rootfs::ROOT_HANDLE,
-            &canonical[..length],
-        )
-        .is_some()
-        {
-            if crate::linux_overlay::whiteout(&canonical[..length]) {
+        return if let Some(image) = image {
+            if crate::published_rootfs::lookup_at(crate::published_rootfs::ROOT_HANDLE, &image)
+                .is_none()
+            {
+                linux_missing_path_error(&canonical[..length])
+            } else if crate::linux_overlay::whiteout(&canonical[..length]) {
                 0
             } else {
                 LINUX_ENOSPC
             }
         } else {
-            linux_missing_path_error(&canonical[..length])
+            LINUX_ENOENT
         };
     };
     if metadata.attributes & (LINUX_FS_IMMUTABLE_FL | LINUX_FS_APPEND_FL) != 0 {
@@ -39637,7 +39688,7 @@ fn linux_unlinkat(directory: u64, path_address: u64, flags: u64) -> u64 {
     }
     let lower_exists = crate::published_rootfs::lookup_at(
         crate::published_rootfs::ROOT_HANDLE,
-        &canonical[..length],
+        &crate::linux_overlay::image_location(&canonical[..length]),
     )
     .is_some();
     // The image's entries below a directory the overlay also has are its
@@ -39957,11 +40008,12 @@ fn linux_copy_up_path(path: &[u8]) -> Result<crate::linux_overlay::Handle, u64> 
     }
     // A missing file is ENOENT, or ENOTDIR when a directory on the way is
     // a file (chmod06).
-    if crate::linux_overlay::hidden(path) {
+    let Some(image) = crate::linux_overlay::image_path(path) else {
         return Err(linux_missing_path_error(path));
-    }
-    let (_, entry) = crate::published_rootfs::lookup_at(crate::published_rootfs::ROOT_HANDLE, path)
-        .ok_or_else(|| linux_missing_path_error(path))?;
+    };
+    let (_, entry) =
+        crate::published_rootfs::lookup_at(crate::published_rootfs::ROOT_HANDLE, &image)
+            .ok_or_else(|| linux_missing_path_error(path))?;
     let entry = entry.ok_or(LINUX_EROFS)?;
     linux_copy_up_entry(path, entry)
 }
@@ -40284,7 +40336,7 @@ fn linux_xattr_path_handle(
     }
     if crate::published_rootfs::lookup_at(
         crate::published_rootfs::ROOT_HANDLE,
-        &canonical[..length],
+        &crate::linux_overlay::image_location(&canonical[..length]),
     )
     .is_some()
     {
@@ -40972,11 +41024,12 @@ fn linux_renameat(
     }
     if flags == RENAME_NOREPLACE
         && (target.is_some()
-            || crate::published_rootfs::lookup_at(
-                crate::published_rootfs::ROOT_HANDLE,
-                &new_canonical[..new_length],
-            )
-            .is_some())
+            || crate::linux_overlay::image_path(&new_canonical[..new_length]).is_some_and(
+                |image| {
+                    crate::published_rootfs::lookup_at(crate::published_rootfs::ROOT_HANDLE, &image)
+                        .is_some()
+                },
+            ))
     {
         return LINUX_EEXIST;
     }
@@ -51410,7 +51463,7 @@ fn linux_inotify_add_watch(descriptor: u64, path_address: u64, mask: u64) -> u64
     let overlay = crate::linux_overlay::lookup(&canonical[..length]);
     let oci = crate::published_rootfs::lookup_metadata_at(
         crate::published_rootfs::ROOT_HANDLE,
-        &canonical[..length],
+        &crate::linux_overlay::image_location(&canonical[..length]),
     );
     let virtual_device = LinuxCharacterDevice::from_canonical(&canonical[..length]).is_some()
         || LinuxCharacterDevice::from_path(&path[..path_length]).is_some();
@@ -51527,9 +51580,13 @@ fn linux_descriptor_canonical_path(descriptor: u64) -> Option<LinuxInotifyPath> 
 fn linux_inotify_exists(path: &[u8]) -> bool {
     path.is_empty()
         || crate::linux_overlay::lookup(path).is_some()
-        || crate::published_rootfs::lookup_metadata_at(crate::published_rootfs::ROOT_HANDLE, path)
+        || crate::linux_overlay::image_path(path).is_some_and(|image| {
+            crate::published_rootfs::lookup_metadata_at(
+                crate::published_rootfs::ROOT_HANDLE,
+                &image,
+            )
             .is_some_and(|(_, entry)| entry.is_some())
-            && !crate::linux_overlay::hidden(path)
+        })
 }
 
 /// Whether canonical `path` names a directory.
@@ -51540,10 +51597,13 @@ fn linux_inotify_is_directory(path: &[u8]) -> bool {
     if let Some(metadata) = crate::linux_overlay::lookup(path) {
         return metadata.kind == crate::linux_overlay::NodeKind::Directory;
     }
-    crate::published_rootfs::lookup_metadata_at(crate::published_rootfs::ROOT_HANDLE, path)
-        .is_some_and(|(_, entry)| {
-            entry.is_none_or(|entry| entry.kind == crate::published_rootfs::EntryKind::Directory)
-        })
+    crate::published_rootfs::lookup_metadata_at(
+        crate::published_rootfs::ROOT_HANDLE,
+        &crate::linux_overlay::image_location(path),
+    )
+    .is_some_and(|(_, entry)| {
+        entry.is_none_or(|entry| entry.kind == crate::published_rootfs::EntryKind::Directory)
+    })
 }
 
 /// An event on an overlay node, by its path (the cgroup events files).
@@ -56916,16 +56976,14 @@ const LINUX_DIRENT_OVERLAY_PHASE: u64 = 1 << 40;
 /// The image's directory at canonical `path`, unless the overlay hides it:
 /// the lower half of a directory the overlay also has.
 fn linux_image_directory(path: &[u8]) -> Option<u16> {
-    if crate::linux_overlay::hidden(path) {
-        return None;
-    }
-    if !path.is_empty()
-        && crate::published_rootfs::exact_entry(path)?.kind
+    let image = crate::linux_overlay::image_path(path)?;
+    if !image.is_empty()
+        && crate::published_rootfs::exact_entry(&image)?.kind
             != crate::published_rootfs::EntryKind::Directory
     {
         return None;
     }
-    crate::published_rootfs::lookup_at(crate::published_rootfs::ROOT_HANDLE, path)
+    crate::published_rootfs::lookup_at(crate::published_rootfs::ROOT_HANDLE, &image)
         .map(|(handle, _)| handle)
 }
 
@@ -56944,7 +57002,7 @@ fn linux_merged_directory_empty(path: &[u8]) -> bool {
         let mut child_path = [0_u8; crate::linux_overlay::PATH_CAPACITY];
         if linux_child_path(path, child.name, &mut child_path).is_some_and(|child_path| {
             crate::linux_overlay::lookup(child_path).is_none()
-                && !crate::linux_overlay::hidden(child_path)
+                && crate::linux_overlay::image_path(child_path).is_some()
         }) {
             return false;
         }
@@ -57083,7 +57141,7 @@ fn linux_getdents_entries(descriptor: u64, address: u64, count: u64, legacy: boo
                     let shown = linux_child_path(directory_path, child.name, &mut child_path)
                         .is_some_and(|child_path| {
                             crate::linux_overlay::lookup(child_path).is_none()
-                                && !crate::linux_overlay::hidden(child_path)
+                                && crate::linux_overlay::image_path(child_path).is_some()
                         });
                     let kind = match child.entry.kind {
                         crate::published_rootfs::EntryKind::Directory => 4,
@@ -60842,10 +60900,14 @@ fn linux_lent_file_mapped(handle: crate::linux_overlay::Handle) -> bool {
     if frames.is_empty() {
         return false;
     }
-    if crate::linux_areas::inode_shared_mapped(linux_execution_instance(), handle.inode()) {
-        return true;
-    }
-    let maps = |root: u64| address_space::linux_root_maps_any(root, &frames);
+    crate::linux_areas::inode_shared_mapped(linux_execution_instance(), handle.inode())
+        || linux_frames_mapped(&frames)
+}
+
+/// Whether a page table of the domain may map one of `frames` (physical
+/// page addresses, sorted): every process's, retiring ones included.
+pub(crate) fn linux_frames_mapped(frames: &[u64]) -> bool {
+    let maps = |root: u64| address_space::linux_root_maps_any(root, frames);
     scheduler::current_address_space_root().is_some_and(maps)
         || linux_process::any_live_process_root(maps)
 }

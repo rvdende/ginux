@@ -287,11 +287,9 @@ pub(super) fn linux_fanotify_node(path: &[u8]) -> Option<LinuxFanotifyNode> {
             metadata.links,
         )
     } else {
-        if crate::linux_overlay::hidden(path) {
-            return None;
-        }
+        let image = crate::linux_overlay::image_path(path)?;
         let (rootfs, entry) =
-            crate::published_rootfs::lookup_at(crate::published_rootfs::ROOT_HANDLE, path)
+            crate::published_rootfs::lookup_at(crate::published_rootfs::ROOT_HANDLE, &image)
                 .filter(|(handle, _)| !linux_rootfs_handle_hidden(*handle))?;
         let kind = entry.map(|entry| entry.kind);
         let directory = matches!(kind, None | Some(EntryKind::Directory));

@@ -104,6 +104,7 @@ dd if=/dev/zero of="$volume_image" bs=1048576 count=1 2>/dev/null
         "printf 'LIBC_RUNTIME_OK\\n'" \
         "test -f /bin/busybox && printf 'STAT_ABI_OK\\n'" \
         "mknod /tmp/ginux-fifo p && test -p /tmp/ginux-fifo && rm /tmp/ginux-fifo && printf 'MKNOD_FIFO_OK\\n'" \
+        "mkdir -p /mnt/etc-bind /mnt/bin-bind && mount --bind /etc /mnt/etc-bind && mount --bind /bin /mnt/bin-bind && cmp /etc/alpine-release /mnt/etc-bind/alpine-release && ls /mnt/etc-bind | grep -qx alpine-release && (cd /mnt/etc-bind && test -f ./alpine-release) && /mnt/bin-bind/busybox true && umount /mnt/bin-bind /mnt/etc-bind && ! test -e /mnt/etc-bind/alpine-release && printf 'BIND_IMAGE_OK\\n'" \
         "while IFS= read -r line; do echo \"\$line\"; done < /etc/os-release" \
         'echo /*' \
         'echo /etc/os-*' \
@@ -133,6 +134,7 @@ dd if=/dev/zero of="$volume_image" bs=1048576 count=1 2>/dev/null
     wait_for_line 'LIBC_RUNTIME_OK'
     wait_for_line 'STAT_ABI_OK'
     wait_for_line 'MKNOD_FIFO_OK'
+    wait_for_line 'BIND_IMAGE_OK'
     wait_for_line 'NAME="Alpine Linux"'
     wait_for_line '/'
     wait_for_line 'ROOT_CWD_STATUS=0'

@@ -49,6 +49,9 @@ static ROUTES: SpinLock<Vec<Route>> = SpinLock::new(LockRank::MOUNT_ROUTES, Vec:
 /// How many routes lead somewhere, across all domains: none spares every
 /// path the table.
 static REDIRECTS: AtomicUsize = AtomicUsize::new(0);
+/// How many routes lead to a root filesystem path (bind mounts of its
+/// directories), across all domains.
+static ROOT_BINDS: AtomicUsize = AtomicUsize::new(0);
 
 /// The id of the root mount (`crate::linux_mounts::ROOT_ID`).
 const ROOT_ID: u32 = crate::linux_mounts::ROOT_ID;
@@ -241,18 +244,37 @@ pub(crate) fn publish(instance: usize, routes: Vec<Route>) {
     if table.try_reserve(routes.len()).is_ok() {
         table.extend(routes);
     }
+    count_routes(&table);
+}
+
+fn count_routes(table: &[Route]) {
     REDIRECTS.store(
         table.iter().filter(|route| route.target.is_some()).count(),
         Ordering::Relaxed,
     );
+    ROOT_BINDS.store(
+        table
+            .iter()
+            .filter(|route| {
+                route
+                    .target
+                    .as_deref()
+                    .is_some_and(|target| !is_storage(target))
+            })
+            .count(),
+        Ordering::Relaxed,
+    );
+}
+
+/// Whether some mount leads paths to a root filesystem directory (a bind
+/// mount of one), whose image files then show at other paths.
+pub(crate) fn root_bound() -> bool {
+    ROOT_BINDS.load(Ordering::Relaxed) != 0
 }
 
 /// Drops `instance`'s routes when its domain stops.
 pub(crate) fn forget_instance(instance: usize) {
     let mut table = ROUTES.lock();
     table.retain(|route| route.space.instance != instance);
-    REDIRECTS.store(
-        table.iter().filter(|route| route.target.is_some()).count(),
-        Ordering::Relaxed,
-    );
+    count_routes(&table);
 }

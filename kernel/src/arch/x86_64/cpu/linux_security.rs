@@ -352,11 +352,9 @@ fn linux_landlock_file_type(path: &[u8]) -> Option<u32> {
             NodeKind::BlockDevice => S_IFBLK,
         });
     }
-    if crate::linux_overlay::hidden(path) {
-        return None;
-    }
+    let image = crate::linux_overlay::image_path(path)?;
     let (_, entry) =
-        crate::published_rootfs::lookup_metadata_at(crate::published_rootfs::ROOT_HANDLE, path)?;
+        crate::published_rootfs::lookup_metadata_at(crate::published_rootfs::ROOT_HANDLE, &image)?;
     Some(match entry.map(|entry| entry.kind) {
         None | Some(crate::published_rootfs::EntryKind::Directory) => S_IFDIR,
         Some(crate::published_rootfs::EntryKind::Symlink) => 0o120_000,

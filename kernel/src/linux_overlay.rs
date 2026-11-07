@@ -1015,6 +1015,7 @@ pub(crate) fn create_shmem() -> Option<Handle> {
 /// it once the pages of the mappings just unregistered are out of every
 /// page table.
 pub(crate) fn release_unmapped_shmem() {
+    release_orphan_caches();
     let Some(overlay) = live() else {
         return;
     };
@@ -2504,16 +2505,16 @@ pub(crate) fn page_cached(handle: Handle, index: usize) -> bool {
         .is_some_and(|node| memfd_page(node, index, false).is_some())
 }
 
-/// Frees a page cache whose frames were never handed out to be mapped
-/// (false for one that was: it stays until the overlay goes, as shared
-/// files do).
+/// Frees page cache `handle` of `file`, unless a process maps the file
+/// shared or a page table still maps one of the cache's frames (false).
 pub(crate) fn release_page_cache(handle: Handle, file: Handle) -> bool {
     if live().is_some_and(|overlay| handle_mapped(overlay, file)) {
         return false;
     }
-    let Some(node) =
-        node_mut(handle).filter(|node| node.origin == Origin::Pseudo && !node.frames_lent)
-    else {
+    if lent_frames(handle).is_some_and(|frames| cpu::linux_frames_mapped(&frames)) {
+        return false;
+    }
+    let Some(node) = node_mut(handle).filter(|node| node.origin == Origin::Pseudo) else {
         return false;
     };
     if !release_node_data(node) {
@@ -2521,6 +2522,43 @@ pub(crate) fn release_page_cache(handle: Handle, file: Handle) -> bool {
     }
     forget_node(node);
     true
+}
+
+/// Page caches whose volume forgot them while a mapping still held their
+/// frames: (instance, cache, file), freed once nothing maps them
+/// ([`release_orphan_caches`]).
+static ORPHAN_CACHES: SpinLock<Vec<(usize, Handle, Handle)>> =
+    SpinLock::new(LockRank::UNLINKED_FILES, Vec::new());
+
+/// Frees page cache `handle` of `file`, which its volume no longer
+/// keeps: now, or once nothing maps it any more.
+pub(crate) fn release_or_orphan_page_cache(handle: Handle, file: Handle) {
+    if release_page_cache(handle, file) {
+        return;
+    }
+    let mut orphans = ORPHAN_CACHES.lock();
+    if orphans.try_reserve(1).is_ok() {
+        orphans.push((current_instance(), handle, file));
+    }
+}
+
+/// Frees the orphaned page caches of this domain that nothing maps any
+/// more.
+fn release_orphan_caches() {
+    let instance = current_instance();
+    let candidates: Vec<(Handle, Handle)> = ORPHAN_CACHES
+        .lock()
+        .iter()
+        .filter(|(owner, _, _)| *owner == instance)
+        .map(|(_, cache, file)| (*cache, *file))
+        .collect();
+    for (cache, file) in candidates {
+        if node(cache).is_none() || release_page_cache(cache, file) {
+            ORPHAN_CACHES
+                .lock()
+                .retain(|(owner, orphan, _)| *owner != instance || *orphan != cache);
+        }
+    }
 }
 
 /// Drops the pages of page cache `handle` (of file `file`) that no
@@ -2687,6 +2725,9 @@ pub(crate) fn teardown() -> bool {
     blockfs::forget_instance();
     let instance = current_instance();
     UNLINKED.lock().retain(|(owner, _)| *owner != instance);
+    ORPHAN_CACHES
+        .lock()
+        .retain(|(owner, _, _)| *owner != instance);
     crate::linux_loop::forget_domain();
     crate::linux_ramdisk::forget_domain();
     let overlay = live_mut();
@@ -3283,6 +3324,33 @@ pub(crate) fn hidden(path: &[u8]) -> bool {
     match mount_paths::storage(path) {
         alloc::borrow::Cow::Owned(_) => true,
         alloc::borrow::Cow::Borrowed(path) => hidden_stored(path),
+    }
+}
+
+/// The path of the image's file that canonical `path` shows, if it shows
+/// one: `path` itself, or the image path a bind mount of a root filesystem
+/// directory leads it to (a bind of /usr on /mnt shows /usr's files at
+/// /mnt). None where the overlay hides the image (a whiteout, or a mount
+/// of another filesystem over it).
+pub(crate) fn image_path(path: &[u8]) -> Option<alloc::borrow::Cow<'_, [u8]>> {
+    match mount_paths::storage(path) {
+        alloc::borrow::Cow::Borrowed(path) => {
+            (!hidden_stored(path)).then_some(alloc::borrow::Cow::Borrowed(path))
+        }
+        alloc::borrow::Cow::Owned(stored) => (!mount_paths::is_storage(&stored)
+            && !hidden_stored(&stored))
+        .then_some(alloc::borrow::Cow::Owned(stored)),
+    }
+}
+
+/// Where the image would have canonical `path`'s file, hidden or not: the
+/// root filesystem path a bind mount leads it to, else `path` itself.
+pub(crate) fn image_location(path: &[u8]) -> alloc::borrow::Cow<'_, [u8]> {
+    match mount_paths::storage(path) {
+        alloc::borrow::Cow::Owned(stored) if !mount_paths::is_storage(&stored) => {
+            alloc::borrow::Cow::Owned(stored)
+        }
+        _ => alloc::borrow::Cow::Borrowed(path),
     }
 }
 

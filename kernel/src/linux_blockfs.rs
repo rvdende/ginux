@@ -453,7 +453,7 @@ impl Volume {
     fn forget_cache(&mut self, inode: u32, generation: u32) {
         if let Some(cache) = self.caches.remove(&inode) {
             let file = Handle::volume(generation, u64::from(inode));
-            let _ = crate::linux_overlay::release_page_cache(cache.pages, file);
+            crate::linux_overlay::release_or_orphan_page_cache(cache.pages, file);
         }
     }
 

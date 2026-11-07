@@ -473,10 +473,12 @@ interior-mutable	kernel/src/linux_mounts.rs	EXPIRY_MARKS	domain-runtime	allowlis
 interior-mutable	kernel/src/linux_mounts.rs	STRICT_ATIME_MOUNTS	domain-runtime	allowlist	none	atomic-strictatime-mount-count
 interior-mutable	kernel/src/linux_mount_paths.rs	ROUTES	domain-runtime	allowlist	none	ranked-published-mount-trees
 interior-mutable	kernel/src/linux_mount_paths.rs	REDIRECTS	domain-runtime	allowlist	none	atomic-redirecting-route-count
+interior-mutable	kernel/src/linux_mount_paths.rs	ROOT_BINDS	domain-runtime	allowlist	none	atomic-root-bind-route-count
 interior-mutable	kernel/src/linux_overlayfs.rs	OVERLAYS	domain-runtime	allowlist	none	ranked-overlay-mounts-and-files
 interior-mutable	kernel/src/linux_overlayfs.rs	MOUNTED	domain-runtime	allowlist	none	atomic-mounted-overlay-count
 interior-mutable	kernel/src/linux_cgroup.rs	CGROUPS	domain-runtime	allowlist	none	explicit-memory-cgroup-slot-owner-root
 interior-mutable	kernel/src/linux_overlay.rs	UNLINKED	domain-runtime	allowlist	none	ranked-unlinked-files-awaiting-last-close
+interior-mutable	kernel/src/linux_overlay.rs	ORPHAN_CACHES	domain-runtime	allowlist	none	ranked-page-caches-awaiting-last-mapping
 interior-mutable	kernel/src/linux_tmpfs_quota.rs	LIMITS	domain-runtime	allowlist	none	ranked-tmpfs-size-limits
 interior-mutable	kernel/src/linux_tmpfs_quota.rs	COUNT	domain-runtime	allowlist	none	atomic-limit-count-fast-path
 interior-mutable	kernel/src/linux_pidfs.rs	EXITS	domain-runtime	allowlist	none	ranked-reaped-process-exit-statuses
