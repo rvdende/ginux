@@ -309,7 +309,8 @@ impl Node {
             atime: self.atime,
             mtime: self.mtime,
             ctime: self.ctime,
-            filesystem: 0,
+            // A tmpfs's files show its device.
+            filesystem: crate::linux_mount_paths::device_of(&self.path),
             // A paged file has holes: only its pages count.
             sectors: if self.paged() {
                 (paged_frames(self, self.size.div_ceil(PAGE_SIZE)) * (PAGE_SIZE / 512)) as u64
@@ -1692,6 +1693,22 @@ pub(crate) fn touch_modified(handle: Handle, time: (i64, i64)) -> bool {
     };
     node.mtime = time;
     node.ctime = time;
+    true
+}
+
+/// Sets `handle`'s access time alone, as a read does: an overlay file's
+/// in the layer it reads from, with no copy-up.
+pub(crate) fn touch_accessed(handle: Handle, time: (i64, i64)) -> bool {
+    if overlayfs::owns(handle) {
+        return overlayfs::real(handle).is_some_and(|real| touch_accessed(real, time));
+    }
+    if blockfs::owns(handle) {
+        return blockfs::touch_accessed(handle, time).unwrap_or(false);
+    }
+    let Some(node) = node_mut(handle) else {
+        return false;
+    };
+    node.atime = time;
     true
 }
 

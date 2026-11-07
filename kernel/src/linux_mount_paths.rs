@@ -72,6 +72,29 @@ pub(crate) fn storage_root(number: u32) -> Vec<u8> {
     root
 }
 
+/// The anonymous device (0:N, as stat(2) encodes it) of filesystem
+/// number `number`: minors from 2^16 up, past the mount ids other mounts'
+/// devices are.
+pub(crate) fn storage_device(number: u32) -> u32 {
+    let minor = 0x1_0000_u32.wrapping_add(number) & 0xf_ffff;
+    (minor & 0xff) | ((minor & !0xff) << 12)
+}
+
+/// The device of the files stored below storage path `path`, 0 for the
+/// root filesystem's.
+pub(crate) fn device_of(path: &[u8]) -> u32 {
+    let Some(rest) = path.strip_prefix(&[0]) else {
+        return 0;
+    };
+    let digits = rest.iter().take_while(|byte| byte.is_ascii_digit());
+    let number = digits.fold(0_u32, |number, digit| {
+        number
+            .wrapping_mul(10)
+            .wrapping_add(u32::from(digit - b'0'))
+    });
+    storage_device(number)
+}
+
 /// Whether `path` is a storage path below some filesystem's storage root,
 /// which no process can name.
 pub(crate) fn is_storage(path: &[u8]) -> bool {

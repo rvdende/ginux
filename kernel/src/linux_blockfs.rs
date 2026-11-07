@@ -41,8 +41,6 @@ use crate::sync::{LockRank, SpinLock};
 const GENERATIONS: core::ops::Range<u32> = 0x4000_0000..0x8000_0000;
 /// The `FS_*_FL` inode flags `FS_IOC_GETFLAGS` shows and sets on ext2.
 const USER_FLAGS: u32 = 0x0003_dfff;
-/// FS_NOATIME_FL: reads leave the access time.
-const NOATIME_FL: u32 = 0x80;
 
 /// The block device a volume lives on.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -821,35 +819,6 @@ pub(crate) fn read(handle: Handle, offset: usize, output: &mut [u8]) -> Option<u
     }
 }
 
-/// Marks `handle`'s file accessed after a read(2) of it, as Linux's
-/// relatime does: when the access time is not past the last change, or
-/// is a day old (not for an FS_NOATIME_FL file or a read-only volume).
-pub(crate) fn touch_accessed(handle: Handle) {
-    let mut table = VOLUMES.lock();
-    let Some((volume, inode)) = table.of(handle) else {
-        return;
-    };
-    let filesystem = &mut volume.filesystem;
-    let Ok(stat) = filesystem.stat(inode) else {
-        return;
-    };
-    let now = now();
-    if stat.flags & NOATIME_FL == 0
-        && !filesystem.read_only()
-        && (stat.atime <= stat.mtime
-            || stat.atime <= stat.ctime
-            || now.seconds - stat.atime.seconds >= 24 * 60 * 60)
-    {
-        let _ = filesystem.change(
-            inode,
-            &Change {
-                atime: Some(now),
-                ..Change::default()
-            },
-        );
-    }
-}
-
 /// The frame holding page `index` of `handle`'s file in the page cache
 /// (cached first if `load`): what a shared mapping of the page maps.
 pub(crate) fn cached_frame(handle: Handle, index: usize, load: bool) -> Option<memory::FrameLease> {
@@ -1100,6 +1069,17 @@ pub(crate) fn touch_modified(handle: Handle, now: (i64, i64)) -> Option<bool> {
         &Change {
             mtime: Some(timestamp(now)),
             ctime: Some(timestamp(now)),
+            ..Change::default()
+        },
+    )
+}
+
+/// Sets `handle`'s access time alone (a read's update).
+pub(crate) fn touch_accessed(handle: Handle, time: (i64, i64)) -> Option<bool> {
+    change(
+        handle,
+        &Change {
+            atime: Some(timestamp(time)),
             ..Change::default()
         },
     )

@@ -14509,10 +14509,22 @@ fn linux_namespace_ioctl(descriptor: u64, request: u64, argument: u64) -> u64 {
     const NS_GET_PARENT: u32 = 0xb702;
     const NS_GET_NSTYPE: u32 = 0xb703;
     const NS_GET_OWNER_UID: u32 = 0xb704;
+    const NS_GET_MNTNS_ID: u32 = 0x8008_b705;
     let Some(reference) = linux_namespace_reference(descriptor) else {
         return LINUX_EBADF;
     };
     let related = match request as u32 {
+        // A mount namespace's id, as statmount's mnt_ns_id shows it.
+        NS_GET_MNTNS_ID => {
+            if reference.kind != linux_namespace::Kind::Mount {
+                return LINUX_EINVAL;
+            }
+            return if copy_to_linux_user(argument, &u64::from(reference.id).to_ne_bytes()) {
+                0
+            } else {
+                LINUX_EFAULT
+            };
+        }
         NS_GET_USERNS => linux_namespace_owner(reference),
         NS_GET_PARENT => match reference.kind {
             linux_namespace::Kind::User => linux_namespace_owner(reference),
@@ -23142,9 +23154,13 @@ fn linux_statmount(request_address: u64, output_address: u64, capacity: u64, fla
         Ok(request) => request,
         Err(error) => return error,
     };
-    if requested & !SUPPORTED != 0 {
-        return LINUX_EINVAL;
+    // Bits Linux does not know are left out of the answer; a string asked
+    // for needs room past the structure (Linux's prepare_kstatmount).
+    if requested & (MNT_ROOT | MNT_POINT | FS_TYPE | MNT_OPTS) != 0 && capacity == FIXED_SIZE as u64
+    {
+        return LINUX_EOVERFLOW;
     }
+    let requested = requested & SUPPORTED;
     let Some(root_id) = linux_mount::current_unique_mount_id(1) else {
         return LINUX_EINVAL;
     };
@@ -23174,15 +23190,7 @@ fn linux_statmount(request_address: u64, output_address: u64, capacity: u64, fla
             Some(Err(error)) => return error,
             None => return LINUX_ENOENT,
         };
-        output[..4].copy_from_slice(&(used as u32).to_ne_bytes());
-        if capacity < used as u64 {
-            return LINUX_EOVERFLOW;
-        }
-        return if copy_to_linux_user(output_address, &output[..used]) {
-            0
-        } else {
-            LINUX_EFAULT
-        };
+        return linux_statmount_copy(&mut output, used, capacity, output_address);
     }
     if requested & SB_BASIC != 0 {
         output[16..20].copy_from_slice(&0_u32.to_ne_bytes());
@@ -23240,11 +23248,25 @@ fn linux_statmount(request_address: u64, output_address: u64, capacity: u64, fla
     {
         return LINUX_EOVERFLOW;
     }
-    output[..4].copy_from_slice(&(used as u32).to_ne_bytes());
-    if capacity < used as u64 {
+    linux_statmount_copy(&mut output, used, capacity, output_address)
+}
+
+/// Copies statmount's answer, `output[..used]` (the structure, then its
+/// strings), to the caller's `capacity` bytes at `address` as Linux does:
+/// the strings must fit with room to spare (EOVERFLOW), the structure is
+/// cut to a smaller buffer, and `size` says how much was copied.
+fn linux_statmount_copy(output: &mut [u8], used: usize, capacity: u64, address: u64) -> u64 {
+    const FIXED_SIZE: usize = 512;
+    let strings = used - FIXED_SIZE;
+    if strings != 0 && used as u64 >= capacity {
         return LINUX_EOVERFLOW;
     }
-    if copy_to_linux_user(output_address, &output[..used]) {
+    let header = (capacity as usize).min(FIXED_SIZE);
+    output[..4].copy_from_slice(&((header + strings) as u32).to_ne_bytes());
+    if strings != 0 && !copy_to_linux_user(address + FIXED_SIZE as u64, &output[FIXED_SIZE..used]) {
+        return LINUX_EFAULT;
+    }
+    if copy_to_linux_user(address, &output[..header]) {
         0
     } else {
         LINUX_EFAULT
@@ -23379,12 +23401,19 @@ fn linux_statmount_domain(
     Ok(used)
 }
 
+/// listmount(2): the unique ids of the mounts below a mount (all of them,
+/// not just its children, the mount itself left out), or below the
+/// caller's root with LSMT_ROOT (its root mount included), in id order or
+/// reversed, after `last` when continuing a listing.
 fn linux_listmount(request_address: u64, output_address: u64, count: u64, flags: u64) -> u64 {
     const LSMT_ROOT: u64 = u64::MAX;
     const LISTMOUNT_REVERSE: u64 = 1;
-    const LIMIT: usize = 64;
-    if flags & !LISTMOUNT_REVERSE != 0 || count == 0 {
+    const MAXIMUM: u64 = 1_000_000;
+    if flags & !LISTMOUNT_REVERSE != 0 {
         return LINUX_EINVAL;
+    }
+    if count > MAXIMUM {
+        return LINUX_EOVERFLOW;
     }
     let (parent, last) = match linux_mount_id_request(request_address) {
         Ok(request) => request,
@@ -23401,88 +23430,82 @@ fn linux_listmount(request_address: u64, output_address: u64, count: u64, flags:
         return LINUX_EINVAL;
     };
     let space = linux_mount_space();
-    let parent_mount = linux_domain_mount_by_unique_id(parent);
-    if !matches!(parent, LSMT_ROOT)
-        && parent != root
-        && parent != proc_mount
-        && parent_mount.is_none()
-    {
-        return LINUX_ENOENT;
-    }
-    if !matches!(parent, LSMT_ROOT) && !linux_mounts_visible() {
-        return LINUX_EPERM;
-    }
-    // Where the mounts listed lie: under the parent mount (or the
-    // caller's root), not the parent itself, by unique id.
+    let unique = |local: u32| linux_mount::current_unique_mount_id(u64::from(local)).unwrap_or(0);
+    // Where the listing starts: a mount's root, or the caller's root.
     let mut root_path = [0_u8; crate::linux_overlay::PATH_CAPACITY];
     let root_length = linux_root_prefix(&mut root_path);
-    let below = |point: &[u8], path: &[u8]| {
-        point.is_empty()
+    let (origin, directory): (u32, alloc::vec::Vec<u8>) = if parent == LSMT_ROOT {
+        let path = &root_path[..root_length];
+        let mut directory = alloc::vec::Vec::new();
+        if directory.try_reserve_exact(path.len()).is_err() {
+            return LINUX_ENOMEM;
+        }
+        directory.extend_from_slice(path);
+        (crate::linux_mounts::root_mount_at(space, path), directory)
+    } else if parent == root {
+        (crate::linux_mounts::ROOT_ID, alloc::vec::Vec::new())
+    } else if parent == proc_mount {
+        (2, b"proc".to_vec())
+    } else {
+        let Some(local) = linux_domain_mount_by_unique_id(parent) else {
+            return LINUX_ENOENT;
+        };
+        let Some(Some(directory)) = crate::linux_mounts::with_mount(space, local, |mount| {
+            let mut path = alloc::vec::Vec::new();
+            path.try_reserve_exact(mount.path.len()).ok()?;
+            path.extend_from_slice(&mount.path);
+            Some(path)
+        }) else {
+            return LINUX_ENOENT;
+        };
+        (local, directory)
+    };
+    if parent != LSMT_ROOT && !linux_mounts_visible() {
+        return LINUX_EPERM;
+    }
+    let under = |path: &[u8]| {
+        directory.is_empty()
             || path
-                .strip_prefix(point)
+                .strip_prefix(directory.as_slice())
                 .is_some_and(|rest| rest.is_empty() || rest.starts_with(b"/"))
     };
-    let parent_path = parent_mount
-        .and_then(|local| {
-            crate::linux_mounts::with_mount(space, local, |mount| {
-                let mut path = Vec::new();
-                path.try_reserve_exact(mount.path.len()).ok()?;
-                path.extend_from_slice(&mount.path);
-                Some((local, path))
-            })
-        })
-        .flatten();
-    let mut candidates = [0_u64; LIMIT];
-    let mut found = 0;
-    let mut add = |id: u64| {
-        if found < LIMIT {
-            candidates[found] = id;
-            found += 1;
-        }
-    };
-    if parent == LSMT_ROOT {
-        add(root);
+    let mut candidates: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    // The kernel's own root and /proc mounts.
+    if origin == crate::linux_mounts::ROOT_ID && under(b"") && parent != root {
+        candidates.push(root);
     }
-    if parent == LSMT_ROOT || parent == root {
-        add(proc_mount);
+    if origin == crate::linux_mounts::ROOT_ID && under(b"proc") {
+        candidates.push(proc_mount);
     }
-    crate::linux_mounts::for_each(space, |mount| {
-        let listed = match &parent_path {
-            Some((local, path)) => {
-                mount.id != *local
-                    && below(path, &mount.path)
-                    && (mount.path != *path || mount.id > *local)
-            }
-            None if parent == proc_mount => below(b"proc", &mount.path),
-            None if parent == LSMT_ROOT => below(&root_path[..root_length], &mount.path),
-            None => true,
-        };
-        if listed {
-            add(linux_mount::current_unique_mount_id(u64::from(mount.id)).unwrap_or(0));
+    crate::linux_mounts::for_each_below(space, origin, &directory, |local| {
+        if candidates.try_reserve(1).is_ok() {
+            candidates.push(unique(local));
         }
     });
-    let candidates = &mut candidates[..found];
+    candidates.retain(|mount| *mount != 0 && *mount != parent);
     candidates.sort_unstable();
     if flags & LISTMOUNT_REVERSE != 0 {
         candidates.reverse();
     }
-    let mut output = [0_u8; LIMIT * 8];
-    let mut returned = 0_usize;
-    for &mount in candidates.iter() {
+    let mut returned = 0_u64;
+    for &mount in &candidates {
+        if returned >= count {
+            break;
+        }
         let after_cursor = if flags & LISTMOUNT_REVERSE != 0 {
             last == 0 || mount < last
         } else {
             mount > last
         };
-        if mount != 0 && after_cursor && (returned as u64) < count.min(LIMIT as u64) {
-            output[returned * 8..returned * 8 + 8].copy_from_slice(&mount.to_ne_bytes());
-            returned += 1;
+        if !after_cursor {
+            continue;
         }
+        if !copy_to_linux_user(output_address + returned * 8, &mount.to_ne_bytes()) {
+            return LINUX_EFAULT;
+        }
+        returned += 1;
     }
-    if returned != 0 && !copy_to_linux_user(output_address, &output[..returned * 8]) {
-        return LINUX_EFAULT;
-    }
-    returned as u64
+    returned
 }
 
 fn verify_linux_sysv_shared_memory_syscalls() -> bool {
@@ -28082,6 +28105,12 @@ fn linux_runtime_mmap(
             if protection & LINUX_PROT_EXEC != 0
                 && crate::linux_overlay::file_seals(handle)
                     .is_some_and(|seals| seals & LINUX_F_SEAL_EXEC != 0)
+            {
+                return LINUX_EPERM;
+            }
+            // A file of a noexec mount cannot be mapped executable.
+            if protection & LINUX_PROT_EXEC != 0
+                && linux_handle_mount_flags(handle) & crate::linux_mounts::NO_EXEC != 0
             {
                 return LINUX_EPERM;
             }
@@ -33814,6 +33843,12 @@ fn linux_rootfs_execve_source(
         {
             return error;
         }
+        // Nothing on a noexec mount runs (EACCES, before ETXTBSY).
+        if linux_mount_flags(path.strip_prefix(b"/").unwrap_or(path)) & crate::linux_mounts::NO_EXEC
+            != 0
+        {
+            return LINUX_EACCES;
+        }
         // A file some process has open for writing cannot be executed
         // (execve04).
         if unlinked
@@ -34268,7 +34303,12 @@ fn linux_rootfs_execve_source(
     }
     release_linux_process_shared_mappings(current_linux_process_pid());
     linux_record_exec_image(&plan, path);
-    linux_apply_exec_credentials(exec_file);
+    // A set-user-ID or set-group-ID program on a nosuid mount runs with the
+    // caller's ids.
+    let nosuid = linux_mount_flags(path.strip_prefix(b"/").unwrap_or(path))
+        & crate::linux_mounts::NO_SUID
+        != 0;
+    linux_apply_exec_credentials(exec_file.filter(|_| !nosuid));
     // The new program has no rseq area yet: its C library registers its
     // own (Linux's rseq_execve), which the old image's would refuse.
     if let Some(slot) = current_linux_thread_slot() {
@@ -36093,6 +36133,7 @@ fn linux_canonical_path_at(
         linux_walk_start(directory, output)?
     };
     let length = linux_walk_path_components(output, length, path, &mut 0, true)?;
+    crate::linux_mounts::note_walk(linux_mount_space(), &output[..length]);
     if length == 0 {
         return Err(LINUX_EISDIR);
     }
@@ -36316,6 +36357,11 @@ fn linux_overlay_lookup_following(
 /// owner, or when the directory's owner owns it too; anyone else gets
 /// EACCES. Root is held to it like everyone.
 fn linux_check_follow_link(path: &[u8], link_owner: u32) -> Result<(), u64> {
+    // A nosymfollow mount's symlinks are not followed (readlink still
+    // reads them).
+    if linux_mount_flags(path) & crate::linux_mounts::NO_SYMFOLLOW != 0 {
+        return Err(LINUX_ELOOP);
+    }
     if linux_proc_sysctl_value(b"sys/fs/protected_symlinks").unwrap_or(0) == 0 {
         return Ok(());
     }
@@ -36844,7 +36890,8 @@ fn linux_open_file_at(
                 X86_RUNTIME.ELF_PROBE_STDIO_DEVICE_DESCRIPTORS[reopened as usize]
                     .store((state & !3) | reopened_access, Ordering::SeqCst);
                 X86_RUNTIME.ELF_PROBE_STDIO_SOCKET_FLAGS[reopened as usize].store(
-                    (flags & (LINUX_O_APPEND | LINUX_O_NONBLOCK | LINUX_O_PATH)) as u32,
+                    (flags & (LINUX_O_APPEND | LINUX_O_NONBLOCK | LINUX_O_PATH | LINUX_O_NOATIME))
+                        as u32,
                     Ordering::SeqCst,
                 );
             } else {
@@ -36852,7 +36899,8 @@ fn linux_open_file_at(
                 X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index]
                     .store((state & !3) | reopened_access, Ordering::SeqCst);
                 X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index].store(
-                    (flags & (LINUX_O_APPEND | LINUX_O_NONBLOCK | LINUX_O_PATH)) as u32,
+                    (flags & (LINUX_O_APPEND | LINUX_O_NONBLOCK | LINUX_O_PATH | LINUX_O_NOATIME))
+                        as u32,
                     Ordering::SeqCst,
                 );
             }
@@ -44154,7 +44202,9 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
             return LINUX_EINVAL;
         };
         let result = linux_overlay_copy_to_user(handle, start, address, count);
-        linux_volume_file_accessed(descriptor, handle, result);
+        if result < LINUX_RETURN_TO_KERNEL {
+            linux_note_read(descriptor, handle);
+        }
         return result;
     }
     if let Some(entry) = linux_rootfs_entry(descriptor) {
@@ -44485,7 +44535,9 @@ fn linux_regular_file_read_kernel(
         if metadata.kind != crate::linux_overlay::NodeKind::File {
             return Err(LINUX_EISDIR);
         }
-        return crate::linux_overlay::read(handle, offset, output).ok_or(LINUX_EIO);
+        let read = crate::linux_overlay::read(handle, offset, output).ok_or(LINUX_EIO)?;
+        linux_note_read(descriptor, handle);
+        return Ok(read);
     }
     if let Some(entry) = linux_rootfs_entry(descriptor) {
         if entry.kind == crate::published_rootfs::EntryKind::Directory {
@@ -53319,24 +53371,13 @@ fn linux_overlay_read(descriptor: u64, state: u16, address: u64, count: u64) -> 
     };
     let result = linux_overlay_copy_to_user(handle, start, address, count);
     if result < LINUX_RETURN_TO_KERNEL {
+        linux_note_read(descriptor, handle);
         linux_descriptor_offset(descriptor).store(
             start.saturating_add(result as usize) as u64,
             Ordering::SeqCst,
         );
     }
-    linux_volume_file_accessed(descriptor, handle, result);
     Some(result)
-}
-
-/// A read of a volume's file through `descriptor` that ended in `result`
-/// marks it accessed, unless the descriptor was opened O_NOATIME.
-fn linux_volume_file_accessed(descriptor: u64, handle: crate::linux_overlay::Handle, result: u64) {
-    if result < LINUX_RETURN_TO_KERNEL
-        && crate::linux_blockfs::owns(handle)
-        && !linux_socket_flags(descriptor).is_some_and(|flags| flags & LINUX_O_NOATIME as u32 != 0)
-    {
-        crate::linux_blockfs::touch_accessed(handle);
-    }
 }
 
 fn linux_tmp_write(descriptor: u64, state: u16, address: u64, count: u64) -> u64 {
@@ -55358,7 +55399,21 @@ fn linux_getdents64(descriptor: u64, address: u64, count: u64) -> u64 {
     linux_getdents(descriptor, address, count, false)
 }
 
+/// getdents(2): reading a directory updates its access time, as the mount
+/// it is on says (linux_note_accessed).
 fn linux_getdents(descriptor: u64, address: u64, count: u64, legacy: bool) -> u64 {
+    let result = linux_getdents_entries(descriptor, address, count, legacy);
+    if result < LINUX_RETURN_TO_KERNEL {
+        if let Some(handle) = linux_overlay_descriptor_handle(u64::from(descriptor as u32)) {
+            if !linux_descriptor_noatime(u64::from(descriptor as u32)) {
+                linux_note_accessed(handle, true);
+            }
+        }
+    }
+    result
+}
+
+fn linux_getdents_entries(descriptor: u64, address: u64, count: u64, legacy: bool) -> u64 {
     let descriptor = u64::from(descriptor as u32);
     if !linux_descriptor_open(descriptor) {
         return LINUX_EBADF;
@@ -59094,6 +59149,65 @@ fn linux_mount_statfs_flags(options: u32) -> u64 {
     )
 }
 
+/// The options of the mount canonical `path` is on.
+fn linux_mount_flags(path: &[u8]) -> u32 {
+    crate::linux_mounts::flags_at(linux_mount_space(), path)
+}
+
+/// The options of the mount the file `handle` is reached through.
+fn linux_handle_mount_flags(handle: crate::linux_overlay::Handle) -> u32 {
+    let mut path = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    crate::linux_overlay::copy_path(handle, &mut path)
+        .map_or(0, |length| linux_mount_flags(&path[..length]))
+}
+
+/// Whether `descriptor` was opened with O_NOATIME.
+fn linux_descriptor_noatime(descriptor: u64) -> bool {
+    linux_socket_flags(descriptor).is_some_and(|flags| flags & LINUX_O_NOATIME as u32 != 0)
+}
+
+/// A read of `descriptor`, open on the file `handle`, updates its access
+/// time unless it was opened with O_NOATIME, even when it read nothing,
+/// as Linux's file_accessed.
+fn linux_note_read(descriptor: u64, handle: crate::linux_overlay::Handle) {
+    if !linux_descriptor_noatime(descriptor) {
+        linux_note_accessed(handle, false);
+    }
+}
+
+/// Updates the access time of the file `handle` that a read (or, with
+/// `directory`, a listing) just read, as Linux's atime rules and the
+/// file's mount say: never on a noatime or read-only mount (nor a
+/// directory on a nodiratime one) or for an FS_NOATIME_FL file; always on
+/// a strictatime mount; else (relatime) when the access time is no later
+/// than the change or modification time, or a day old.
+fn linux_note_accessed(handle: crate::linux_overlay::Handle, directory: bool) {
+    const FS_NOATIME_FL: u32 = 0x80;
+    const DAY: i64 = 24 * 60 * 60;
+    let Some(metadata) = crate::linux_overlay::metadata(handle) else {
+        return;
+    };
+    if metadata.attributes & FS_NOATIME_FL != 0 {
+        return;
+    }
+    let now = linux_realtime_now();
+    let stale = metadata.atime <= metadata.mtime
+        || metadata.atime <= metadata.ctime
+        || now.0.saturating_sub(metadata.atime.0) >= DAY;
+    if !stale && !crate::linux_mounts::any_strict_atime() {
+        return;
+    }
+    let flags = linux_handle_mount_flags(handle);
+    use crate::linux_mounts::{NO_ATIME, NO_DIRATIME, READ_ONLY, STRICT_ATIME};
+    if flags & (NO_ATIME | READ_ONLY) != 0
+        || directory && flags & NO_DIRATIME != 0
+        || !stale && flags & STRICT_ATIME == 0
+    {
+        return;
+    }
+    let _ = crate::linux_overlay::touch_accessed(handle, now);
+}
+
 /// The root and the mounts the kernel makes itself (/proc, cgroup2).
 fn linux_kernel_mount_point(canonical: &[u8]) -> bool {
     matches!(canonical, b"" | b"proc" | b"sys/fs/cgroup")
@@ -59191,7 +59305,7 @@ fn linux_umount(target_address: u64, flags: u64) -> u64 {
         Err(error) => return error,
     };
     let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
-    let length = match linux_canonical_path_at(
+    let mut length = match linux_canonical_path_at(
         u64::from(LINUX_AT_FDCWD),
         &target[..target_length],
         &mut canonical,
@@ -59200,6 +59314,13 @@ fn linux_umount(target_address: u64, flags: u64) -> u64 {
         Err(LINUX_EISDIR) => return LINUX_EBUSY,
         Err(error) => return error,
     };
+    // The last symlink is followed, unless UMOUNT_NOFOLLOW.
+    if flags & UMOUNT_NOFOLLOW == 0 {
+        length = match linux_overlay_lookup_following(&mut canonical, length, true) {
+            Ok((length, ..)) => length,
+            Err(error) => return error,
+        };
+    }
     let canonical = &canonical[..length];
     if linux_path_access(canonical).is_none()
         && !linux_kernel_mount_point(canonical)
@@ -59208,6 +59329,16 @@ fn linux_umount(target_address: u64, flags: u64) -> u64 {
         return linux_missing_path_error(canonical);
     }
     let space = linux_mount_space();
+    // MNT_EXPIRE unmounts only a mount it marked before and nothing used
+    // since (EAGAIN while it marks it).
+    if flags & MNT_EXPIRE != 0 {
+        match crate::linux_mounts::expire(space, canonical) {
+            Ok(true) => {}
+            Ok(false) => return LINUX_EAGAIN,
+            Err(_) if linux_kernel_mount_point(canonical) => return LINUX_EINVAL,
+            Err(_) => return LINUX_EINVAL,
+        }
+    }
     // When this is the filesystem's last mount, a file of it still open, or
     // a working directory on it, keeps it mounted (EBUSY), unless the
     // unmount is lazy (MNT_DETACH): then it leaves the namespace and goes

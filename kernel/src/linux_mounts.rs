@@ -24,6 +24,7 @@
 #![forbid(unsafe_code)]
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::sync::{LockRank, SpinLock};
 
@@ -109,6 +110,10 @@ pub(crate) struct Mount {
     /// A bind mount: it shows a filesystem another mount made.
     pub(crate) bind: bool,
     pub(crate) sharing: Sharing,
+    /// umount2's MNT_EXPIRE marked the mount: the number of path walks
+    /// through it since (one more MNT_EXPIRE with nothing else using it
+    /// unmounts it).
+    expiry: Option<u32>,
 }
 
 /// A filesystem whose last mount went: its files go with it.
@@ -251,9 +256,114 @@ impl Mounts {
         }
         let id = mount.id;
         let instance = mount.space.instance;
+        let parent = mount.parent;
         self.mounts.push(mount);
+        self.propagate(self.mounts.len() - 1, parent)?;
         self.changed(instance);
         Ok(id)
+    }
+
+    /// Mount propagation: the mount at `index`, just attached on mount
+    /// `parent`, gets a copy on each other member of `parent`'s peer group
+    /// (a peer of the new mount's own group) and on each mount that
+    /// receives from that group (a slave of it), at the same place below
+    /// it. A copy goes under whatever that mount already has there, as
+    /// Linux tucks a propagated mount beneath an existing one.
+    fn propagate(&mut self, index: usize, parent: u32) -> Result<(), Error> {
+        let Some(origin) = self.mounts.iter().find(|mount| mount.id == parent) else {
+            return Ok(());
+        };
+        let group = origin.sharing.peer_group;
+        if group == 0 {
+            return Ok(());
+        }
+        let (space, origin_point, origin_root) =
+            (origin.space, copy(&origin.path)?, copy(&origin.root)?);
+        let mount = &self.mounts[index];
+        let Some(rest) = mount.path.strip_prefix(origin_point.as_slice()) else {
+            return Ok(());
+        };
+        let rest = copy(rest)?;
+        let receivers: Vec<(u32, Vec<u8>, bool)> = self
+            .mounts
+            .iter()
+            .filter(|receiver| {
+                receiver.space == space
+                    && receiver.id != parent
+                    && receiver.id != mount.id
+                    && receiver.root == origin_root
+                    && (receiver.sharing.peer_group == group || receiver.sharing.master == group)
+            })
+            .map(|receiver| {
+                (
+                    receiver.id,
+                    receiver.path.clone(),
+                    receiver.sharing.peer_group == group,
+                )
+            })
+            .collect();
+        for (receiver, point, peer) in receivers {
+            let id = self.allocate_id();
+            let mount = &self.mounts[index];
+            let mut path = point;
+            path.try_reserve(rest.len()).map_err(|_| Error::NoMemory)?;
+            if path.is_empty() {
+                path.extend_from_slice(rest.strip_prefix(b"/").unwrap_or(&rest));
+            } else {
+                path.extend_from_slice(&rest);
+            }
+            let sharing = if peer {
+                mount.sharing
+            } else {
+                Sharing {
+                    peer_group: 0,
+                    master: mount.sharing.peer_group,
+                    unbindable: false,
+                }
+            };
+            let copy_of = Mount {
+                space,
+                id,
+                parent: receiver,
+                path,
+                root: copy(&mount.root)?,
+                source: copy(&mount.source)?,
+                filesystem: copy(&mount.filesystem)?,
+                flags: mount.flags,
+                superblock: mount.superblock,
+                target: mount.target.as_deref().map(copy).transpose()?,
+                device: mount.device,
+                bind: true,
+                sharing,
+                expiry: None,
+            };
+            if let Some(below) = self.mounts.iter_mut().find(|child| {
+                child.space == space && child.parent == receiver && child.path == copy_of.path
+            }) {
+                below.parent = id;
+            }
+            self.mounts.try_reserve(1).map_err(|_| Error::NoMemory)?;
+            self.mounts.push(copy_of);
+        }
+        Ok(())
+    }
+
+    /// Whether mount `id` lies below mount `ancestor` in the tree (or is it).
+    fn descends_from(&self, space: Space, mut id: u32, ancestor: u32) -> bool {
+        for _ in 0..=self.mounts.len() {
+            if id == ancestor {
+                return true;
+            }
+            match self
+                .mounts
+                .iter()
+                .find(|mount| mount.space == space && mount.id == id)
+            {
+                Some(mount) => id = mount.parent,
+                None => return false,
+            }
+        }
+        false
     }
 
     /// Counts a change to `instance`'s mount table, and publishes its
@@ -282,6 +392,13 @@ impl Mounts {
             }
         }
         crate::linux_mount_paths::publish(instance, routes);
+        STRICT_ATIME_MOUNTS.store(
+            self.mounts
+                .iter()
+                .filter(|mount| mount.flags & STRICT_ATIME != 0)
+                .count(),
+            Ordering::Relaxed,
+        );
         if let Some((_, count)) = self
             .changes
             .iter_mut()
@@ -301,6 +418,16 @@ impl Mounts {
                 .iter()
                 .any(|mount| mount.id != id && mount.sharing.peer_group == peer_group)
     }
+}
+
+/// Mounts with strictatime, across all domains: while there are none, a
+/// read whose relatime rule leaves the access time alone needs no mount
+/// lookup.
+static STRICT_ATIME_MOUNTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether any mount has strictatime.
+pub(crate) fn any_strict_atime() -> bool {
+    STRICT_ATIME_MOUNTS.load(Ordering::Relaxed) != 0
 }
 
 /// A number for a new filesystem stored below a root of its own
@@ -339,12 +466,23 @@ pub(crate) fn mount(
         device: 0,
         bind: false,
         sharing: Sharing::default(),
+        expiry: None,
     };
     let mut table = MOUNTS.lock();
     let id = table.attach(mount)?;
-    if let Some(mount) = table.mounts.last_mut() {
-        // Each new filesystem is an anonymous device of its own.
-        mount.device = id;
+    // Each new filesystem is an anonymous device of its own: one stored
+    // below a storage root the device its files show.
+    let device = if superblock != 0 {
+        crate::linux_mount_paths::storage_device(superblock)
+    } else {
+        id
+    };
+    if let Some(mount) = table
+        .mounts
+        .iter_mut()
+        .find(|mount| mount.space == space && mount.id == id)
+    {
+        mount.device = device;
     }
     Ok(id)
 }
@@ -477,6 +615,7 @@ pub(crate) fn bind(
                     unbindable: false,
                     ..mount.sharing
                 },
+                expiry: None,
             });
         }
     }
@@ -494,6 +633,7 @@ pub(crate) fn bind(
         device,
         bind: true,
         sharing,
+        expiry: None,
     })?;
     for mount in below {
         table.attach(mount)?;
@@ -715,6 +855,9 @@ pub(crate) fn unmount(space: Space, path: &[u8]) -> Result<Option<Gone>, Error> 
     let mut table = MOUNTS.lock();
     let index = table.topmost(space, path).ok_or(Error::NotMounted)?;
     let mount = table.mounts.remove(index);
+    if mount.expiry.is_some() {
+        EXPIRY_MARKS.fetch_sub(1, Ordering::Relaxed);
+    }
     for child in table
         .mounts
         .iter_mut()
@@ -778,6 +921,7 @@ pub(crate) fn copy_space(from: Space, to: Space) -> Result<(), Error> {
             device: mount.device,
             bind: mount.bind,
             sharing: mount.sharing,
+            expiry: None,
         });
     }
     table
@@ -847,6 +991,88 @@ pub(crate) fn changes(instance: usize) -> u32 {
         .iter()
         .find(|(owner, _)| *owner == instance)
         .map_or(0, |(_, count)| *count)
+}
+
+/// Mounts MNT_EXPIRE has marked, across all domains: while there are
+/// none, path walks skip noting their use.
+static EXPIRY_MARKS: AtomicUsize = AtomicUsize::new(0);
+
+/// umount2's MNT_EXPIRE on the topmost mount at canonical `path`: the
+/// first call marks it and is EAGAIN; one after which nothing but this
+/// call's own path walk used the mount (`walks` of them) lets it go.
+pub(crate) fn expire(space: Space, path: &[u8]) -> Result<bool, Error> {
+    let mut table = MOUNTS.lock();
+    let index = table.topmost(space, path).ok_or(Error::NotMounted)?;
+    let mount = &mut table.mounts[index];
+    match mount.expiry {
+        Some(walks) if walks <= 1 => {
+            mount.expiry = None;
+            EXPIRY_MARKS.fetch_sub(1, Ordering::Relaxed);
+            Ok(true)
+        }
+        Some(_) => {
+            mount.expiry = Some(0);
+            Ok(false)
+        }
+        None => {
+            mount.expiry = Some(0);
+            EXPIRY_MARKS.fetch_add(1, Ordering::Relaxed);
+            Ok(false)
+        }
+    }
+}
+
+/// A path walk reached canonical `path`: the mount it lies on is in use,
+/// which an MNT_EXPIRE mark counts.
+pub(crate) fn note_walk(space: Space, path: &[u8]) {
+    if EXPIRY_MARKS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let mut table = MOUNTS.lock();
+    if let Some(index) = table.covering(space, path) {
+        if let Some(walks) = &mut table.mounts[index].expiry {
+            *walks = walks.saturating_add(1);
+        }
+    }
+}
+
+/// The unique-id order listing of listmount(2): calls `listed` with the
+/// local id of each mount of `space` that lies at or below canonical
+/// `directory` of mount `origin` (by the tree and the path).
+pub(crate) fn for_each_below(
+    space: Space,
+    origin: u32,
+    directory: &[u8],
+    mut listed: impl FnMut(u32),
+) {
+    let table = MOUNTS.lock();
+    for mount in table.mounts.iter().filter(|mount| mount.space == space) {
+        if table.descends_from(space, mount.id, origin) && covers(directory, &mount.path) {
+            listed(mount.id);
+        }
+    }
+}
+
+/// The mount a process's root at canonical `path` is on: the one the
+/// path reaches, or below the mounts stacked on it since at that point,
+/// the first of them (a root stays on the mount it was made on).
+pub(crate) fn root_mount_at(space: Space, path: &[u8]) -> u32 {
+    let table = MOUNTS.lock();
+    let Some(mut index) = table.covering(space, path) else {
+        return ROOT_ID;
+    };
+    while table.mounts[index].path == path {
+        let parent = table.mounts[index].parent;
+        match table
+            .mounts
+            .iter()
+            .position(|mount| mount.space == space && mount.id == parent && mount.path == path)
+        {
+            Some(below) => index = below,
+            None => break,
+        }
+    }
+    table.mounts[index].id
 }
 
 /// Something is mounted at canonical `path`.

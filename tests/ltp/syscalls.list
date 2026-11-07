@@ -657,8 +657,8 @@ link08 link08
 linkat01 linkat01
 linkat02 linkat02
 listen01 listen01
-!listmount01 listmount01  # listmount does not list the test's mounts below the root as Linux does
-!listmount02 listmount02  # listmount does not list the test's mounts below the root as Linux does
+listmount01 listmount01
+listmount02 listmount02
 listmount03 listmount03
 listmount04 listmount04
 listxattr01 listxattr01
@@ -756,11 +756,11 @@ modify_ldt01 modify_ldt01
 modify_ldt02 modify_ldt02
 mount01 mount01
 mount02 mount02
-!mount03 mount03  # mount options beyond ro, nosuid, nodev, noexec and noatime are not kept
+mount03 mount03
 mount04 mount04
 mount05 mount05
 mount06 mount06
-!mount07 mount07  # MS_NOSYMFOLLOW is not kept
+mount07 mount07
 mount08 mount08
 mount_setattr01 mount_setattr01
 mount_setattr02 mount_setattr02
@@ -1354,14 +1354,14 @@ stat03_64 stat03_64
 stat04 stat04
 stat04_64 stat04_64
 statmount01 statmount01
-!statmount02 statmount02  # a tmpfs mount's statmount device differs from its files' st_dev
+statmount02 statmount02
 statmount03 statmount03
-!statmount04 statmount04  # mount propagation does not copy mounts to peers
+statmount04 statmount04
 statmount05 statmount05
 statmount06 statmount06
-!statmount07 statmount07  # statmount's mask checks are not Linux's (EOVERFLOW)
+statmount07 statmount07
 statmount08 statmount08
-!statmount09 statmount09  # the NS_GET_MNTNS_ID ioctl is missing
+statmount09 statmount09
 statfs01 statfs01
 statfs01_64 statfs01_64
 statfs02 statfs02
@@ -1453,7 +1453,7 @@ umount01 umount01
 umount02 umount02
 umount03 umount03
 umount2_01 umount2_01
-!umount2_02 umount2_02  # MNT_EXPIRE is not supported
+umount2_02 umount2_02
 userfaultfd01 userfaultfd01
 userfaultfd02 userfaultfd02
 userfaultfd03 userfaultfd03

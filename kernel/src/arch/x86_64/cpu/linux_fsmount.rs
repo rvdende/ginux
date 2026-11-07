@@ -995,8 +995,11 @@ pub(super) fn linux_mount_overlayfs(
         return error.wrapping_neg();
     }
     match crate::linux_mounts::mount(space, target, source, b"overlay", options, superblock) {
-        Ok(id) => {
-            crate::linux_overlayfs::set_device(&storage, id);
+        Ok(_) => {
+            crate::linux_overlayfs::set_device(
+                &storage,
+                crate::linux_mount_paths::storage_device(superblock),
+            );
             0
         }
         Err(_) => {
