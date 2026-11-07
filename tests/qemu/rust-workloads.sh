@@ -11,7 +11,9 @@ repo_root=$(cd "$(dirname "$0")/../.." && pwd)
 output_file=$(mktemp "${TMPDIR:-/tmp}/ginux-rust-workloads.XXXXXX")
 volume_image=$(mktemp "${TMPDIR:-/tmp}/ginux-rust-workloads-volume.XXXXXX")
 qemu_pid_file=$(mktemp "${TMPDIR:-/tmp}/ginux-rust-workloads-pid.XXXXXX")
-http_port="${GINUX_WORKLOAD_HTTP_PORT:-18181}"
+# A free port the host picks, unless one is given: runs in parallel (other
+# worktrees, other suites) would otherwise collide on a fixed one.
+http_port="${GINUX_WORKLOAD_HTTP_PORT:-$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')}"
 qemu_pid=""
 http_pid=""
 
