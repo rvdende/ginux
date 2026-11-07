@@ -29039,26 +29039,63 @@ fn linux_runtime_munmap(address: u64, length: u64) -> u64 {
     })
 }
 
+/// Visits the pages of [start, end) that have a page-table entry slot (their
+/// 2 MiB span has a leaf table), in order, until `visit` says false. The
+/// other pages hold no entry: nothing to seal, map or release (a lazily
+/// reserved anonymous page lives in its memory area only).
+fn for_each_linux_tabled_page(start: u64, end: u64, mut visit: impl FnMut(u64) -> bool) -> bool {
+    const SPAN: u64 = 1 << 21;
+    let mut cursor = start;
+    // The walk aligns down to the span: once the cursor has reached an end
+    // inside a span, that span would be found again.
+    while cursor < end {
+        let Some(span) = address_space::next_current_linux_leaf_table(cursor, end) else {
+            break;
+        };
+        let span_end = span.saturating_add(SPAN).min(end);
+        let mut page = span.max(cursor);
+        while page < span_end {
+            if !visit(page) {
+                return false;
+            }
+            page += PAGE_SIZE as u64;
+        }
+        cursor = span_end;
+    }
+    true
+}
+
 fn linux_runtime_munmap_pages(address: u64, length: u64) -> u64 {
-    let Some((_, pages)) = linux_runtime_mapping_range(address, length) else {
+    let Some((end, _)) = linux_runtime_mapping_range(address, length) else {
         return LINUX_EINVAL;
     };
-    if (0..pages).any(|page| {
-        address_space::current_linux_runtime_page(address + (page * PAGE_SIZE) as u64).sealed
+    let pid = current_linux_process_pid();
+    // Only pages with page tables can be sealed or hold frames: an unmap
+    // walks those, not every page of the range. fork14's cleanup unmapped
+    // hundreds of 1 GiB mappings no page of which was touched, a hundred
+    // million pages walked one by one, each with four table walks and two
+    // searches of the shared mappings.
+    if !for_each_linux_tabled_page(address, end, |page| {
+        !address_space::current_linux_runtime_page(page).sealed
     }) {
         return LINUX_EPERM;
     }
+    // A shared mapping's page is written back to its file before it goes;
+    // the process's shared mappings in the range are found once each.
     let mut unshared = false;
-    for page in 0..pages {
-        let page_address = address + (page * PAGE_SIZE) as u64;
-        let _ = linux_flush_shared_mapping_page(current_linux_process_pid(), page_address);
-        unshared |=
-            crate::linux_overlay::remove_shared_mapping(current_linux_process_pid(), page_address);
-        if !release_linux_runtime_page(address_space::remove_current_linux_runtime_page(
-            page_address,
-        )) {
-            return LINUX_EINVAL;
+    let mut after = address.checked_sub(1);
+    while let Some((page, _, _)) = crate::linux_overlay::next_shared_mapping(pid, after) {
+        if page >= end {
+            break;
         }
+        let _ = linux_flush_shared_mapping_page(pid, page);
+        unshared |= crate::linux_overlay::remove_shared_mapping(pid, page);
+        after = Some(page);
+    }
+    if !for_each_linux_tabled_page(address, end, |page| {
+        release_linux_runtime_page(address_space::remove_current_linux_runtime_page(page))
+    }) {
+        return LINUX_EINVAL;
     }
     // Shared memory can only have lost its last mapping here if a shared
     // mapping went: looking through every overlay node on each munmap made
@@ -29067,10 +29104,7 @@ fn linux_runtime_munmap_pages(address: u64, length: u64) -> u64 {
     if unshared {
         crate::linux_overlay::release_unmapped_shmem();
     }
-    if !address_space::prune_current_linux_page_tables(
-        address,
-        address + (pages * PAGE_SIZE) as u64,
-    ) {
+    if !address_space::prune_current_linux_page_tables(address, end) {
         return LINUX_EINVAL;
     }
     0

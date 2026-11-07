@@ -7689,6 +7689,44 @@ pub(crate) fn retire_linux_child_address_space(root: memory::FrameLease) -> bool
     memory::scrub_and_release_frames(memory::FrameOwner::KERNEL, core::slice::from_ref(&root))
 }
 
+/// The first 2 MiB span at or after `address` (aligned down to its span)
+/// and below `end` that has a leaf table in the current address space, as
+/// `current_linux_leaf` would find one; None when no span up to `end` has
+/// one. A directory entry with nothing below passes over its whole span (1
+/// GiB or 512 GiB) at once, so an unmap of a vast mapping touched in few
+/// places costs about as much as the tables it has.
+pub(crate) fn next_current_linux_leaf_table(address: u64, end: u64) -> Option<u64> {
+    const SPANS: [u64; 3] = [1 << 39, 1 << 30, 1 << 21];
+    let mut address = address & !(SPANS[2] - 1);
+    'spans: while address < end {
+        let mut table = current_root();
+        for (level, span) in SPANS.into_iter().enumerate() {
+            let shift = 39 - 9 * level as u32;
+            let index = ((address >> shift) & 0x1ff) as usize;
+            let present = memory::frame_addresses_owned_by(
+                memory::FrameOwner::KERNEL,
+                &[table & ADDRESS_MASK],
+            )
+            .then(|| mapped_frame::<u64>(table & ADDRESS_MASK))
+            .flatten()
+            // SAFETY: the walk reached this table through present user
+            // entries of the address space's own tables; index < 512.
+            .map(|entries| unsafe { entries.add(index).read() })
+            .filter(|entry| {
+                entry & (PRESENT | USER) == PRESENT | USER
+                    && (level == 0 || entry & LARGE_PAGE == 0)
+            });
+            let Some(entry) = present else {
+                address = (address & !(span - 1)).checked_add(span)?;
+                continue 'spans;
+            };
+            table = entry & ADDRESS_MASK;
+        }
+        return Some(address);
+    }
+    None
+}
+
 fn linux_leaf_in_root(root: u64, address: u64) -> Option<PageEntry> {
     let indexes = [
         ((address >> 39) & 0x1ff) as usize,
