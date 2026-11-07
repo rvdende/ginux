@@ -842,6 +842,9 @@ pub(super) fn expire_linux_waits() -> u32 {
         return 0;
     };
     let mut expired = 0;
+    // Of `expired`, the timerfd reads the timer made readable: a read that
+    // returns the expirations, which the descriptor wakes complete too.
+    let mut timerfd_reads = 0;
     for slot in 0..LINUX_THREAD_LIMIT {
         let deadline = X86_RUNTIME.LINUX_THREAD_WAIT_DEADLINES[slot].load(Ordering::SeqCst);
         if deadline == 0
@@ -882,6 +885,7 @@ pub(super) fn expire_linux_waits() -> u32 {
         {
             if complete_linux_timerfd_read_wait(slot) {
                 expired += 1;
+                timerfd_reads += 1;
             }
             continue;
         }
@@ -917,6 +921,16 @@ pub(super) fn expire_linux_waits() -> u32 {
     X86_RUNTIME
         .LINUX_TIMED_WAITS_ACTIVE
         .store(active, Ordering::Release);
+    // Waits that timed out count whichever path ended them (the tick, a
+    // system call's entry, a parked call waking), and a timerfd read does
+    // not: the descriptor wakes, which the tick runs first, complete it as
+    // a read, and this only when the clock passed the timer's deadline
+    // between their look and this one. A vCPU the host held up there made
+    // the boot verification count 9 expiries for 8 (an intermittent `make
+    // test` failure).
+    X86_RUNTIME
+        .LINUX_TIMER_WAIT_EXPIRY_COUNT
+        .fetch_add(expired - timerfd_reads, Ordering::SeqCst);
     expired
 }
 
@@ -1149,9 +1163,6 @@ pub(crate) fn expire_linux_waits_from_timer(frame: &mut UserInterruptFrame) {
         linux_preempt_process_from_timer(frame);
         return;
     }
-    X86_RUNTIME
-        .LINUX_TIMER_WAIT_EXPIRY_COUNT
-        .fetch_add(expired, Ordering::SeqCst);
     let Some(interrupted) = frame.user_context(USER_CODE_SELECTOR, USER_DATA_SELECTOR) else {
         return;
     };
