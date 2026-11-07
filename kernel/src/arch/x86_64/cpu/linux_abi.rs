@@ -769,6 +769,8 @@ pub(super) const LINUX_FILE_PROC_TASK_STAT: u16 = LINUX_FILE_MASK | LINUX_PROC_T
 pub(super) const LINUX_AIO_MAX_NR: u64 = 65_536;
 /// `/proc/sys/vm/max_map_count`: the most memory areas a process may have.
 pub(super) const LINUX_MAX_MAP_COUNT: usize = 65_530;
+// threads-max below is linux_process::PROCESS_LIMIT.
+const _: () = assert!(crate::linux_process::PROCESS_LIMIT == 4096);
 pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 46] = [
     // The most memory areas a process may have (LINUX_MAX_MAP_COUNT).
     (0xa000, b"sys/vm/max_map_count", b"65530\n"),
@@ -830,7 +832,9 @@ pub(super) const LINUX_PROC_SYSCTLS: [(u16, &[u8], &[u8]); 46] = [
     // Values tests read to size themselves (nodes below the input range).
     (0xc000, b"sys/kernel/osrelease", b"6.12.0-ginux.0.1\n"),
     (0xc100, b"sys/kernel/msgmni", b"32000\n"),
-    (0xc200, b"sys/kernel/threads-max", b"126000\n"),
+    // As many tasks as a domain may have processes (linux_process::
+    // PROCESS_LIMIT): what tests size their forks by.
+    (0xc200, b"sys/kernel/threads-max", b"4096\n"),
     (0xc300, b"sys/fs/inotify/max_queued_events", b"16384\n"),
     (0xc400, b"sys/fs/inotify/max_user_instances", b"128\n"),
     (0xc500, b"sys/fs/inotify/max_user_watches", b"65536\n"),

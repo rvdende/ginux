@@ -35,14 +35,16 @@ const FRAMEBUFFER_PDPT_INDEX: usize = ENTRY_COUNT - 2;
 const FRAMEBUFFER_WINDOW_BASE: usize = DIRECT_MAP_BASE + FRAMEBUFFER_PDPT_INDEX * (1 << 30);
 const DEVICE_PDPT_INDEX: usize = ENTRY_COUNT - 3;
 const DEVICE_WINDOW_BASE: usize = DIRECT_MAP_BASE + DEVICE_PDPT_INDEX * (1 << 30);
-/// 1 GiB of kernel virtual space for kernel stacks, mapped a page at a time
-/// so that unmapped guard pages can sit between them (see
-/// `map_kernel_stack_page`). It lies below the device window, so the direct
-/// map stops below it.
-const KERNEL_STACK_PDPT_INDEX: usize = ENTRY_COUNT - 4;
+/// Kernel virtual space for kernel stacks, mapped a page at a time so that
+/// unmapped guard pages can sit between them (see `map_kernel_stack_page`):
+/// one page directory per GiB, enough for a stack for each of thousands of
+/// processes. It lies below the device window, so the direct map stops
+/// below it.
+const KERNEL_STACK_DIRECTORY_COUNT: usize = 4;
+const KERNEL_STACK_PDPT_INDEX: usize = ENTRY_COUNT - 3 - KERNEL_STACK_DIRECTORY_COUNT;
 pub(crate) const KERNEL_STACK_WINDOW_BASE: usize =
     DIRECT_MAP_BASE + KERNEL_STACK_PDPT_INDEX * (1 << 30);
-pub(crate) const KERNEL_STACK_WINDOW_SIZE: usize = 1 << 30;
+pub(crate) const KERNEL_STACK_WINDOW_SIZE: usize = KERNEL_STACK_DIRECTORY_COUNT << 30;
 /// Register ranges the device window maps for drivers beyond the reference
 /// devices, such as USB host controllers.
 pub(crate) const MAX_DEVICE_REGIONS: usize = 4;
@@ -475,7 +477,7 @@ struct PagingOwner {
     /// The kernel stack window's page directory. Unlike the other tables it
     /// stays writable after boot: page tables for stacks are added to it
     /// while the kernel runs.
-    kernel_stack_directory: UnsafeCell<PageTable>,
+    kernel_stack_directories: UnsafeCell<[PageTable; KERNEL_STACK_DIRECTORY_COUNT]>,
     /// What a Linux process's first PML4 entry starts from: the kernel's
     /// identity entries for only the 2 MiB regions it still reaches by
     /// physical address while a process's tables are loaded (its own
@@ -507,7 +509,9 @@ static PAGING: PagingOwner = PagingOwner {
     framebuffer_directory: UnsafeCell::new(PageTable([0; ENTRY_COUNT])),
     device_directory: UnsafeCell::new(PageTable([0; ENTRY_COUNT])),
     device_table: UnsafeCell::new(PageTable([0; ENTRY_COUNT])),
-    kernel_stack_directory: UnsafeCell::new(PageTable([0; ENTRY_COUNT])),
+    kernel_stack_directories: UnsafeCell::new(
+        [PageTable([0; ENTRY_COUNT]); KERNEL_STACK_DIRECTORY_COUNT],
+    ),
     linux_low_pdpt: UnsafeCell::new(PageTable([0; ENTRY_COUNT])),
     linux_low_directories: UnsafeCell::new([PageTable([0; ENTRY_COUNT]); DIRECTORY_COUNT]),
     direct_map_limit: AtomicUsize::new(0),
@@ -1148,12 +1152,15 @@ pub(crate) unsafe fn install_initial_identity_map(
         device_msix_mmio_mapping,
     ];
     let devices = map_device_window(direct_pdpt, device_regions, &reference_mmio)?;
-    let stack_directory =
-        core::ptr::addr_of_mut!((*PAGING.kernel_stack_directory.get()).0).cast::<u64>();
-    zero_entries(stack_directory);
-    direct_pdpt
-        .add(KERNEL_STACK_PDPT_INDEX)
-        .write(stack_directory as u64 | PRESENT | WRITABLE);
+    for index in 0..KERNEL_STACK_DIRECTORY_COUNT {
+        let stack_directory =
+            core::ptr::addr_of_mut!((*PAGING.kernel_stack_directories.get())[index].0)
+                .cast::<u64>();
+        zero_entries(stack_directory);
+        direct_pdpt
+            .add(KERNEL_STACK_PDPT_INDEX + index)
+            .write(stack_directory as u64 | PRESENT | WRITABLE);
+    }
 
     let fine_tables = PAGING.fine_page_tables.get().cast::<PageTable>();
     let mut fine_regions = [usize::MAX; MAX_FINE_TABLES];
@@ -1602,8 +1609,13 @@ pub(crate) fn map_kernel_stack_page(
     {
         return false;
     }
-    let directory = PAGING.kernel_stack_directory.get().cast::<u64>();
-    let directory_index = offset / LARGE_PAGE_SIZE as usize;
+    let directory = PAGING
+        .kernel_stack_directories
+        .get()
+        .cast::<PageTable>()
+        .wrapping_add(offset >> 30)
+        .cast::<u64>();
+    let directory_index = (offset % (1 << 30)) / LARGE_PAGE_SIZE as usize;
     // SAFETY: the directory is this owner's, installed in the shared direct
     // PDPT at boot and left writable; the caller serializes writers.
     let entry = unsafe { directory.add(directory_index).read() };

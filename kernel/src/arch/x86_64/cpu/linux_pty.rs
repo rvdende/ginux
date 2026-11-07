@@ -127,7 +127,7 @@ fn linux_session_has_terminal(session: u32) -> bool {
 
 /// Whether a live process belongs to `session`.
 fn linux_session_alive(session: u32) -> bool {
-    (0..linux_process::PROCESS_LIMIT).any(|slot| {
+    (0..linux_process::live_process_slots()).any(|slot| {
         linux_process::live_process_pid_at(slot)
             .is_some_and(|pid| linux_process::live_process_session(pid) == Some(session))
     })
@@ -139,7 +139,7 @@ fn linux_pty_signal_group(group: u32, signal: u64) {
     if group == 0 {
         return;
     }
-    for slot in 0..linux_process::PROCESS_LIMIT {
+    for slot in 0..linux_process::live_process_slots() {
         if let Some(pid) = linux_process::live_process_pid_at(slot)
             .filter(|&pid| linux_process::live_process_group(pid) == Some(group))
         {
@@ -670,12 +670,12 @@ fn linux_pty_job_control(
             }
             let wanted = wanted as u32;
             let members = || {
-                (0..linux_process::PROCESS_LIMIT)
+                (0..linux_process::live_process_slots())
                     .filter_map(linux_process::live_process_pid_at)
                     .filter(move |&pid| linux_process::live_process_group(pid) == Some(wanted))
             };
             if members().next().is_none()
-                && !(0..linux_process::PROCESS_LIMIT)
+                && !(0..linux_process::live_process_slots())
                     .any(|slot| linux_process::live_process_pid_at(slot) == Some(wanted))
             {
                 return LINUX_ESRCH;

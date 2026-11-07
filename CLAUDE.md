@@ -49,10 +49,16 @@ through a Linux ABI personality. It is not a rewrite of Linux:
 3. **A real task and memory model:** per-process memory-area tracking (VMAs),
    a shared page cache, and dynamically sized tables in place of the fixed
    arrays (32 threads per process, kept in per-thread arrays that the
-   scheduler's task struct should replace; 256 processes per domain, set
-   by the u8 runtime slot ids). The socket table (which pipes share), the
-   scheduler's thread table and each process's address-space lists grow
-   on demand. Pages have a map count in the frame allocator
+   scheduler's task struct should replace). The socket table (which pipes
+   share), the scheduler's thread table, each process's address-space
+   lists and the per-process-slot tables grow on demand: a domain holds
+   up to `linux_process::PROCESS_LIMIT` (4096) processes (u16 slots, a
+   pid index, signal queues, records and kernel stacks allocated as slots
+   are first used; records of slots above 256 are freed with their
+   process). Waits still recheck by being resumed; a single-threaded
+   process asleep in a futex wait is skipped until woken, signalled or
+   due (`linux_process_asleep`), and real wakeups for the other waits are
+   step 5 of docs/SCHEDULER.md. Pages have a map count in the frame allocator
    (`memory::share_frames`): every address space that maps another's frame
    takes a count, and releasing drops one. Anonymous MAP_SHARED memory is
    an unnamed overlay shmem node, freed with its last mapping. Move large

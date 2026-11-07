@@ -10,9 +10,10 @@ use crate::{
     address_space, arch::x86_64::cpu, control_abi, linux_namespace, linux_user, memory, scheduler,
 };
 
-/// Processes a domain's table holds, zombies included. The table grows on
-/// demand up to this (slots are u8).
-pub(crate) const PROCESS_LIMIT: usize = 256;
+/// Processes a domain's table holds, zombies included. The table, and every
+/// table kept per process slot, grows on demand up to this (slots are u16):
+/// the bound is what a domain's memory allows, not what was reserved.
+pub(crate) const PROCESS_LIMIT: usize = 4096;
 /// Processes with an address space at once: a zombie releases its runtime
 /// slot when it exits, so many unreaped zombies need table slots only.
 /// Processes of one domain that can exist at once (as many as its process
@@ -21,6 +22,9 @@ pub(crate) const PROCESS_LIMIT: usize = 256;
 pub(crate) const PROCESS_RUNTIME_LIMIT: usize = PROCESS_LIMIT;
 const PAGE_SIZE: usize = 4096;
 const FORK_PRIVATE_PAGE_LIMIT: usize = 2;
+/// Process slots up to which a fork checks its new frames against every
+/// process's lists (`ProcessTable::resources_available`).
+const FORK_CHECK_ALL_LIMIT: usize = 256;
 const PRESENT: u64 = 1 << 0;
 const WRITABLE: u64 = 1 << 1;
 const USER: u64 = 1 << 2;
@@ -40,8 +44,10 @@ struct ProcessRuntimeOwner(UnsafeCell<ProcessRuntimeState>);
 
 unsafe impl Sync for ProcessRuntimeOwner {}
 
+/// Each instance's address-space storage by runtime slot, as long as the
+/// highest slot used so far.
 struct ProcessAddressSpaceStorageOwner(
-    UnsafeCell<[*mut ProcessAddressSpaceStorage; PROCESS_INSTANCE_LIMIT * PROCESS_RUNTIME_LIMIT]>,
+    UnsafeCell<[Vec<*mut ProcessAddressSpaceStorage>; PROCESS_INSTANCE_LIMIT]>,
 );
 
 unsafe impl Sync for ProcessAddressSpaceStorageOwner {}
@@ -104,7 +110,7 @@ fn process_scratch() -> &'static ProcessScratchState {
 // count-bounded and the live prefixes are written before publication.
 static PROCESS_ADDRESS_SPACE_STORAGE: ProcessAddressSpaceStorageOwner =
     ProcessAddressSpaceStorageOwner(UnsafeCell::new(
-        [core::ptr::null_mut(); PROCESS_INSTANCE_LIMIT * PROCESS_RUNTIME_LIMIT],
+        [const { Vec::new() }; PROCESS_INSTANCE_LIMIT],
     ));
 
 static PROCESS_RUNTIME: ProcessRuntimeOwner =
@@ -169,7 +175,7 @@ const LIVE_PROCESS_CHILD_PROGRAM: [u8; 16] = [
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ProcessHandle {
-    slot: u8,
+    slot: u16,
     generation: u32,
     pid: u32,
 }
@@ -273,7 +279,7 @@ impl ProcessExecutionContext {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct ProcessAddressSpace {
-    storage_slot: u8,
+    storage_slot: u16,
     hierarchy_count: u32,
     mapping_count: u32,
     /// The process changed its mappings after this snapshot, so its lists
@@ -318,11 +324,15 @@ fn address_space_storage(storage_slot: usize) -> Option<&'static mut ProcessAddr
     if storage_slot >= PROCESS_RUNTIME_LIMIT {
         return None;
     }
-    let index = current_process_instance() * PROCESS_RUNTIME_LIMIT + storage_slot;
     // SAFETY: the table is only touched here, and the recursive kernel-entry
     // boundary serializes process lifecycle operations.
-    let table = unsafe { &mut *PROCESS_ADDRESS_SPACE_STORAGE.0.get() };
-    let entry = table.get_mut(index)?;
+    let tables = unsafe { &mut *PROCESS_ADDRESS_SPACE_STORAGE.0.get() };
+    let table = tables.get_mut(current_process_instance())?;
+    if table.len() <= storage_slot {
+        table.try_reserve(storage_slot + 1 - table.len()).ok()?;
+        table.resize(storage_slot + 1, core::ptr::null_mut());
+    }
+    let entry = table.get_mut(storage_slot)?;
     if entry.is_null() {
         *entry = alloc::boxed::Box::into_raw(alloc::boxed::Box::default());
     }
@@ -363,7 +373,7 @@ impl ProcessAddressSpace {
         }
         address_space_storage(storage_slot)?.store(hierarchy, mappings)?;
         Some(Self {
-            storage_slot: storage_slot as u8,
+            storage_slot: u16::try_from(storage_slot).ok()?,
             hierarchy_count: u32::try_from(hierarchy.len()).ok()?,
             mapping_count: u32::try_from(mappings.len()).ok()?,
             stale: false,
@@ -380,7 +390,7 @@ impl ProcessAddressSpace {
         }
         address_space_storage(storage_slot)?.store(hierarchy, mappings)?;
         Some(Self {
-            storage_slot: storage_slot as u8,
+            storage_slot: u16::try_from(storage_slot).ok()?,
             hierarchy_count: u32::try_from(hierarchy.len()).ok()?,
             mapping_count: u32::try_from(mappings.len()).ok()?,
             stale: false,
@@ -516,7 +526,7 @@ struct Process {
     child_namespaces: Option<linux_namespace::Set>,
     /// Its user and group ids: inherited across fork, kept across exec.
     credentials: linux_user::Credentials,
-    runtime_slot: Option<u8>,
+    runtime_slot: Option<u16>,
     address_space: Option<ProcessAddressSpace>,
     retiring_address_space: Option<ProcessAddressSpace>,
     context: Option<ProcessExecutionContext>,
@@ -581,6 +591,9 @@ struct Process {
     /// none. A child whose signal is not SIGCHLD is a "clone" child, which
     /// only a wait with __WCLONE or __WALL reports.
     exit_signal: u8,
+    /// The cgroup it was placed in (CLONE_INTO_CGROUP), by the cgroup
+    /// directory's generation, or 0 for the domain's root.
+    cgroup_generation: u32,
     /// The process that cloned this one when that is not its parent
     /// (CLONE_PARENT): the fork transaction that runs it first resumes that
     /// one, not the parent.
@@ -591,6 +604,11 @@ struct Process {
     /// Gave up the CPU in a blocking system call and has not been dispatched
     /// since: Linux's interruptible sleep ('S').
     waiting: bool,
+    /// Asleep in a futex wait of its own (a single-threaded process's) until
+    /// woken (which clears `waiting`) or this deadline (0: none), in
+    /// nanoseconds since boot: the wait's, or a timer of its own due
+    /// sooner. Not worth resuming before then.
+    futex_sleep: Option<u64>,
     /// CPU time used, in timestamp-counter cycles, and the part of it in
     /// user mode (the rest is system time).
     cpu_cycles: u64,
@@ -702,6 +720,9 @@ struct ProcessTable {
     /// Indexed by a handle's slot; grows on demand up to PROCESS_LIMIT and
     /// never shrinks, so slots stay valid.
     processes: Vec<Option<Process>>,
+    /// The slot of every process by pid, sorted by pid: a lookup by pid
+    /// would otherwise walk thousands of slots.
+    pid_slots: Vec<(u32, u16)>,
     /// The generation each slot last handed out, parallel to `processes`.
     generations: Vec<u32>,
     /// Each slot's supplementary groups, sorted, parallel to `processes`:
@@ -721,6 +742,9 @@ struct ProcessTable {
     /// Some process was cloned sharing runtime state with another (see
     /// `live_processes_share_state`).
     sharing: bool,
+    /// The pid the boot CPU's runtime loop last ran from the run queue: the
+    /// next turn goes to the ready process after it (`next_ready_live_process`).
+    dispatch_cursor: u32,
     init: Option<ProcessHandle>,
 }
 
@@ -742,6 +766,7 @@ impl ProcessTable {
         Self {
             owner_domain: 0,
             processes: Vec::new(),
+            pid_slots: Vec::new(),
             generations: Vec::new(),
             groups: Vec::new(),
             roots: Vec::new(),
@@ -749,6 +774,7 @@ impl ProcessTable {
             next_pid: 1,
             next_shared_id: 1,
             sharing: false,
+            dispatch_cursor: 0,
             init: None,
         }
     }
@@ -795,13 +821,26 @@ impl ProcessTable {
         }
     }
 
+    /// The lowest runtime slot no process holds: one pass marks the slots
+    /// in use, as a table of thousands of processes would otherwise be
+    /// scanned once per slot tried.
     fn free_runtime_slot(&self) -> Option<usize> {
-        (0..PROCESS_RUNTIME_LIMIT).find(|slot| {
-            self.processes
-                .iter()
-                .flatten()
-                .all(|process| process.runtime_slot != u8::try_from(*slot).ok())
-        })
+        let mut used = [0_u64; PROCESS_RUNTIME_LIMIT.div_ceil(64)];
+        for slot in self
+            .processes
+            .iter()
+            .flatten()
+            .filter_map(|process| process.runtime_slot)
+        {
+            if let Some(word) = used.get_mut(usize::from(slot) / 64) {
+                *word |= 1 << (slot % 64);
+            }
+        }
+        used.iter()
+            .enumerate()
+            .find(|(_, word)| **word != u64::MAX)
+            .map(|(index, word)| index * 64 + word.trailing_ones() as usize)
+            .filter(|slot| *slot < PROCESS_RUNTIME_LIMIT)
     }
 
     fn prepare_fork(&mut self, parent: ProcessHandle) -> Option<ProcessHandle> {
@@ -1246,16 +1285,30 @@ impl ProcessTable {
                 .binary_search(&(frame.address(), frame.generation()))
                 .is_ok()
         };
-        let unpublished = self.processes.iter().flatten().all(|process| {
-            process.address_space.into_iter().all(|space| {
-                !space.hierarchy().iter().any(candidate)
-                    && !space.mappings().iter().any(|mapping| {
-                        !mapping.shared
-                            && !memory::frame_lease_is_runtime(mapping.frame)
-                            && candidate(&mapping.frame)
-                    })
-            })
-        });
+        // Every process's lists are checked while the table is small; past
+        // that, the parent's, which the child's frames are copies of: every
+        // process's at every fork made forking a thousand children take
+        // seconds per hundred (futex_cmp_requeue01), and a frame lease of
+        // the frame's current generation in another list would be the
+        // allocator issuing it twice, not a stale list.
+        let checked = |process: &&Process| {
+            self.processes.len() <= FORK_CHECK_ALL_LIMIT || process.handle.pid == parent_pid
+        };
+        let unpublished = self
+            .processes
+            .iter()
+            .flatten()
+            .filter(checked)
+            .all(|process| {
+                process.address_space.into_iter().all(|space| {
+                    !space.hierarchy().iter().any(candidate)
+                        && !space.mappings().iter().any(|mapping| {
+                            !mapping.shared
+                                && !memory::frame_lease_is_runtime(mapping.frame)
+                                && candidate(&mapping.frame)
+                        })
+                })
+            });
         let refuse = |stage: u32| {
             process_runtime()
                 .fork_execution_stage
@@ -1351,6 +1404,7 @@ impl ProcessTable {
             return false;
         }
         self.processes[usize::from(handle.slot)] = None;
+        self.forget_pid_slot(handle.pid);
         self.groups[usize::from(handle.slot)] = Vec::new();
         self.roots[usize::from(handle.slot)] = Vec::new();
         linux_namespace::forget_pid(cpu::current_linux_execution_instance(), handle.pid);
@@ -1515,6 +1569,7 @@ impl ProcessTable {
             })
         })?;
         let process = self.processes[slot].take()?;
+        self.forget_pid_slot(process.handle.pid);
         self.groups[slot] = Vec::new();
         self.roots[slot] = Vec::new();
         let ProcessState::Zombie { status } = process.state else {
@@ -1726,8 +1781,8 @@ impl ProcessTable {
     }
 
     fn reap_all_zombies(&mut self) -> bool {
-        for process in &mut self.processes {
-            let Some(candidate) = process.as_ref() else {
+        for slot in 0..self.processes.len() {
+            let Some(candidate) = self.processes[slot].as_ref() else {
                 continue;
             };
             if matches!(candidate.state, ProcessState::Zombie { .. }) {
@@ -1737,18 +1792,32 @@ impl ProcessTable {
                 {
                     return false;
                 }
-                *process = None;
+                let pid = candidate.handle.pid;
+                self.processes[slot] = None;
+                self.forget_pid_slot(pid);
             }
         }
         true
     }
 
     fn handle_by_pid(&self, pid: u32) -> Option<ProcessHandle> {
+        let index = self
+            .pid_slots
+            .binary_search_by_key(&pid, |(pid, _)| *pid)
+            .ok()?;
+        let slot = usize::from(self.pid_slots[index].1);
         self.processes
-            .iter()
-            .flatten()
-            .find(|process| process.handle.pid == pid)
+            .get(slot)?
+            .as_ref()
+            .filter(|process| process.handle.pid == pid)
             .map(|process| process.handle)
+    }
+
+    /// Forgets slot `slot`'s process (`pid`) in the pid index.
+    fn forget_pid_slot(&mut self, pid: u32) {
+        if let Ok(index) = self.pid_slots.binary_search_by_key(&pid, |(pid, _)| *pid) {
+            self.pid_slots.remove(index);
+        }
     }
 
     fn set_return_value(&mut self, handle: ProcessHandle, value: u64) -> bool {
@@ -1782,7 +1851,9 @@ impl ProcessTable {
     }
 
     fn dispatch(&mut self, handle: ProcessHandle) -> Option<LiveProcessDispatch> {
-        self.process_mut(handle)?.waiting = false;
+        let process = self.process_mut(handle)?;
+        process.waiting = false;
+        process.futex_sleep = None;
         let process = self.process(handle)?;
         let address_space = process.address_space.as_ref()?;
         let context = process.context?;
@@ -1823,11 +1894,12 @@ impl ProcessTable {
             }
             None => return None,
         };
+        self.pid_slots.try_reserve(1).ok()?;
         let generation = self.generations[slot].checked_add(1)?;
         let pid = self.next_pid;
         self.next_pid = self.next_pid.checked_add(1)?;
         let handle = ProcessHandle {
-            slot: u8::try_from(slot).ok()?,
+            slot: u16::try_from(slot).ok()?,
             generation,
             pid,
         };
@@ -1922,9 +1994,11 @@ impl ProcessTable {
             shares_parent_vm: false,
             shared,
             exit_signal: DEFAULT_EXIT_SIGNAL,
+            cgroup_generation: 0,
             cloned_by: None,
             vfork_child: 0,
             waiting: false,
+            futex_sleep: None,
             cpu_cycles: 0,
             user_cycles: 0,
             children_cycles: (0, 0),
@@ -1935,6 +2009,8 @@ impl ProcessTable {
             children_maxrss_kib: 0,
             deadline_parameters: [0; 3],
         });
+        let index = self.pid_slots.partition_point(|(other, _)| *other < pid);
+        self.pid_slots.insert(index, (pid, handle.slot));
         Some(handle)
     }
 
@@ -2734,6 +2810,7 @@ pub(crate) fn install_live_process_registry(
         // The tables start const-initialized, so the vectors are valid here;
         // emptying them keeps their memory for the next domain.
         (*table).processes.clear();
+        (*table).pid_slots.clear();
         (*table).generations.clear();
         (*table).groups.clear();
         (*table).roots.clear();
@@ -3108,6 +3185,7 @@ pub(crate) fn force_stop_runtime_process_registry() -> bool {
             return false;
         }
         table.processes[slot] = None;
+        table.forget_pid_slot(process.handle.pid);
         table.groups[slot] = Vec::new();
         table.roots[slot] = Vec::new();
         if table
@@ -3484,6 +3562,41 @@ pub(crate) fn set_live_process_waiting(pid: u32, waiting: bool) {
         {
             process.waiting = waiting;
         }
+    }
+}
+
+/// Records that process `pid` sleeps in a futex wait until `deadline` (0:
+/// none), or no longer (None).
+pub(crate) fn set_live_process_futex_sleep(pid: u32, deadline: Option<u64>) {
+    if let Some(table) = live_process_table_mut() {
+        if let Some(process) = table
+            .handle_by_pid(pid)
+            .and_then(|handle| table.process_mut(handle))
+        {
+            process.futex_sleep = deadline;
+        }
+    }
+}
+
+/// Whether process `pid` sleeps in a futex wait nothing has ended by `now`
+/// (`Process::is_asleep`): resuming it would only find it waiting again.
+pub(crate) fn live_process_futex_asleep(pid: u32, now: u64) -> bool {
+    live_process_table_mut().is_some_and(|table| {
+        table
+            .handle_by_pid(pid)
+            .and_then(|handle| table.process(handle))
+            .is_some_and(|process| process.is_asleep(now))
+    })
+}
+
+impl Process {
+    /// Asleep in a futex wait that no wake (which clears `waiting`), signal
+    /// it takes (likewise) or deadline has ended by `now`.
+    fn is_asleep(&self, now: u64) -> bool {
+        self.waiting
+            && self
+                .futex_sleep
+                .is_some_and(|deadline| deadline == 0 || now < deadline)
     }
 }
 
@@ -4341,6 +4454,12 @@ pub(crate) fn live_process_generation(pid: u32) -> Option<u32> {
     Some(table.handle_by_pid(pid)?.generation)
 }
 
+/// How many slots the process table has now (`live_process_pid_at` is
+/// None at and past them).
+pub(crate) fn live_process_slots() -> usize {
+    live_process_table_mut().map_or(0, |table| table.processes.len())
+}
+
 pub(crate) fn live_process_pid_at(slot: usize) -> Option<u32> {
     let table = live_process_table_mut()?;
     table
@@ -4354,19 +4473,21 @@ pub(crate) fn live_process_pid_at(slot: usize) -> Option<u32> {
 /// lists them (zombies included, processes still being made or ended not).
 pub(crate) fn next_live_pid(from: u32) -> Option<u32> {
     let table = live_process_table_mut()?;
-    table
-        .processes
-        .iter()
-        .flatten()
-        .filter(|process| {
-            !matches!(
-                process.state,
-                ProcessState::Preparing | ProcessState::Exiting
-            )
-        })
-        .map(|process| process.handle.pid)
-        .filter(|pid| *pid >= from)
-        .min()
+    let start = table.pid_slots.partition_point(|(pid, _)| *pid < from);
+    table.pid_slots[start..].iter().find_map(|(pid, slot)| {
+        table
+            .processes
+            .get(usize::from(*slot))?
+            .as_ref()
+            .filter(|process| {
+                process.handle.pid == *pid
+                    && !matches!(
+                        process.state,
+                        ProcessState::Preparing | ProcessState::Exiting
+                    )
+            })
+            .map(|_| *pid)
+    })
 }
 
 pub(crate) fn live_process_count() -> Option<u16> {
@@ -4524,12 +4645,10 @@ pub(crate) fn share_live_process_resource(
 }
 
 /// The other processes that share `resource` with process `pid` and have
-/// not ended (a zombie holds nothing any more): their pids and how many.
-pub(crate) fn live_processes_sharing(
-    pid: u32,
-    resource: SharedResource,
-) -> ([u32; PROCESS_LIMIT], usize) {
-    let mut sharing = ([0; PROCESS_LIMIT], 0);
+/// not ended (a zombie holds nothing any more), by pid; empty when memory
+/// for the list runs out.
+pub(crate) fn live_processes_sharing(pid: u32, resource: SharedResource) -> Vec<u32> {
+    let mut sharing = Vec::new();
     let Some(table) = live_process_table_mut() else {
         return sharing;
     };
@@ -4547,10 +4666,11 @@ pub(crate) fn live_processes_sharing(
                 process.state,
                 ProcessState::Running | ProcessState::Stopped { .. }
             )
-            && sharing.1 < PROCESS_LIMIT
         {
-            sharing.0[sharing.1] = process.handle.pid;
-            sharing.1 += 1;
+            if sharing.try_reserve(1).is_err() {
+                return Vec::new();
+            }
+            sharing.push(process.handle.pid);
         }
     }
     sharing
@@ -4562,7 +4682,24 @@ pub(crate) fn live_process_resource_shared(pid: u32, resource: SharedResource) -
         resource,
         SharedResource::Memory | SharedResource::Io | SharedResource::SemaphoreUndo
     ) || live_processes_share_state();
-    tracked && live_processes_sharing(pid, resource).1 != 0
+    let Some(table) = live_process_table_mut().filter(|_| tracked) else {
+        return false;
+    };
+    let Some(id) = table
+        .handle_by_pid(pid)
+        .and_then(|handle| table.process(handle))
+        .map(|process| process.shared[resource as usize])
+    else {
+        return false;
+    };
+    table.processes.iter().flatten().any(|process| {
+        process.handle.pid != pid
+            && process.shared[resource as usize] == id
+            && matches!(
+                process.state,
+                ProcessState::Running | ProcessState::Stopped { .. }
+            )
+    })
 }
 
 /// Whether any process of the domain was ever cloned to share runtime
@@ -4570,6 +4707,34 @@ pub(crate) fn live_process_resource_shared(pid: u32, resource: SharedResource) -
 /// until then no system call needs to keep any in step.
 pub(crate) fn live_processes_share_state() -> bool {
     live_process_table_mut().is_some_and(|table| table.sharing)
+}
+
+/// Places process `pid` in the cgroup of generation `generation` (0: the
+/// root) and gives back the one it was in.
+pub(crate) fn replace_live_process_cgroup(pid: u32, generation: u32) -> Option<u32> {
+    let table = live_process_table_mut()?;
+    let process = table
+        .handle_by_pid(pid)
+        .and_then(|handle| table.process_mut(handle))?;
+    Some(core::mem::replace(
+        &mut process.cgroup_generation,
+        generation,
+    ))
+}
+
+/// Whether a running process other than `except` is in the cgroup of
+/// generation `generation`.
+pub(crate) fn live_cgroup_populated(generation: u32, except: u32) -> bool {
+    live_process_table_mut().is_some_and(|table| {
+        table.processes.iter().flatten().any(|process| {
+            process.handle.pid != except
+                && process.cgroup_generation == generation
+                && matches!(
+                    process.state,
+                    ProcessState::Running | ProcessState::Stopped { .. }
+                )
+        })
+    })
 }
 
 /// The signal process `pid`'s end sends its parent (clone's exit signal).
@@ -5683,13 +5848,19 @@ pub(crate) fn release_live_process(pid: u32) -> bool {
 /// looking for one to run.
 pub(crate) fn ready_live_process_after(
     after: u32,
+    now: u64,
     mut accept: impl FnMut(u32) -> bool,
 ) -> Option<u32> {
     let table = live_process_table_mut()?;
     let run_queue = scheduler::active_process_scheduler_workspace()?;
+    // A process asleep in a futex wait (`Process::is_asleep`) is passed
+    // over here, before `accept`'s costlier tests and without a place in
+    // the list: a thousand of them would otherwise be sorted and tested on
+    // every pass.
     let mut ready: Vec<u32> = Vec::new();
     for process in table.processes.iter().flatten() {
         if process.state == ProcessState::Running
+            && !process.is_asleep(now)
             && process
                 .scheduler_thread
                 .is_some_and(|thread| run_queue.is_ready_here(thread))
@@ -5703,6 +5874,15 @@ pub(crate) fn ready_live_process_after(
     (0..ready.len())
         .map(|offset| ready[(start + offset) % ready.len()])
         .find(|pid| accept(*pid))
+}
+
+/// The ready process to run next in turn, after the one the last call
+/// chose, that `accept` takes; it becomes the turn's.
+pub(crate) fn next_ready_live_process(now: u64, accept: impl FnMut(u32) -> bool) -> Option<u32> {
+    let after = live_process_table_mut()?.dispatch_cursor;
+    let next = ready_live_process_after(after, now, accept)?;
+    live_process_table_mut()?.dispatch_cursor = next;
+    Some(next)
 }
 
 /// Ends process `pid`, current on this CPU, with `status`: it leaves the

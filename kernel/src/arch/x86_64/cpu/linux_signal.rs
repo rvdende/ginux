@@ -1528,18 +1528,15 @@ fn linux_terminate_by_signal(signal: u64, may_dump: bool) -> u64 {
     LINUX_RETURN_TO_KERNEL
 }
 
-pub(super) fn linux_signal_targets(
-    selector: i32,
-) -> Result<([u32; linux_process::PROCESS_LIMIT], usize), u64> {
+pub(super) fn linux_signal_targets(selector: i32) -> Result<(Vec<u32>, usize), u64> {
     let current = current_linux_process_pid();
     let group = match selector {
         0 => linux_process::live_process_group(current),
         value if value < -1 => Some(value.unsigned_abs()),
         _ => None,
     };
-    let mut targets = [0_u32; linux_process::PROCESS_LIMIT];
-    let mut count = 0;
-    for slot in 0..linux_process::PROCESS_LIMIT {
+    let mut targets = Vec::new();
+    for slot in 0..linux_process::live_process_slots() {
         let Some(pid) = linux_process::live_process_pid_at(slot) else {
             continue;
         };
@@ -1550,19 +1547,20 @@ pub(super) fn linux_signal_targets(
             _ => group.is_some_and(|group| linux_process::live_process_group(pid) == Some(group)),
         };
         if selected {
-            targets[count] = pid;
-            count += 1;
+            targets.try_reserve(1).map_err(|_| LINUX_ENOMEM)?;
+            targets.push(pid);
         }
     }
     // A thread id names its process, as Linux's find_vpid does: here, one
     // of the caller's own threads.
-    if count == 0
+    if targets.is_empty()
         && selector > 0
         && linux_tgkill_target(u64::from(current), selector as u64).is_ok()
     {
-        targets[0] = current;
-        count = 1;
+        targets.try_reserve(1).map_err(|_| LINUX_ENOMEM)?;
+        targets.push(current);
     }
+    let count = targets.len();
     (count != 0).then_some((targets, count)).ok_or(LINUX_ESRCH)
 }
 
@@ -2663,7 +2661,7 @@ pub(super) fn linux_tkill_target(thread: u64) -> Result<LinuxThreadSignalTarget,
     if let Some(target) = linux_thread_handle_by_tid(u64::from(tid)) {
         return Ok(LinuxThreadSignalTarget::Active(target));
     }
-    (0..linux_process::PROCESS_LIMIT)
+    (0..linux_process::live_process_slots())
         .filter_map(linux_process::live_process_pid_at)
         .find_map(|pid| linux_saved_thread_target(pid, tid))
         .ok_or(LINUX_ESRCH)

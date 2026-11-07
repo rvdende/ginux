@@ -495,8 +495,6 @@ struct X86RuntimeOwner {
     LINUX_PPOLL_WAIT_BLOCK_COUNT: RuntimeRef<BankedAtomicU32>,
     LINUX_PPOLL_WAIT_TIMEOUT_COUNT: RuntimeRef<BankedAtomicU32>,
     LINUX_PPOLL_WAIT_WAKE_COUNT: RuntimeRef<BankedAtomicU32>,
-    LINUX_PROCESS_CGROUP_GENERATIONS:
-        RuntimeRef<[BankedAtomicU32; linux_process::PROCESS_RUNTIME_LIMIT]>,
     LINUX_PROCESS_CHILD_EXECUTED: RuntimeRef<CpuBankedAtomicBool>,
     LINUX_PROCESS_CHILD_EXEC_PID: RuntimeRef<CpuBankedAtomicU32>,
     LINUX_PROCESS_CHILD_EXITED: RuntimeRef<CpuBankedAtomicBool>,
@@ -1025,9 +1023,6 @@ static X86_RUNTIME: X86RuntimeOwner = X86RuntimeOwner {
     LINUX_PPOLL_WAIT_BLOCK_COUNT: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_PPOLL_WAIT_BLOCK_COUNT),
     LINUX_PPOLL_WAIT_TIMEOUT_COUNT: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_PPOLL_WAIT_TIMEOUT_COUNT),
     LINUX_PPOLL_WAIT_WAKE_COUNT: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_PPOLL_WAIT_WAKE_COUNT),
-    LINUX_PROCESS_CGROUP_GENERATIONS: RuntimeRef(
-        &X86_RUNTIME_BACKING_LINUX_PROCESS_CGROUP_GENERATIONS,
-    ),
     LINUX_PROCESS_CHILD_EXECUTED: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_PROCESS_CHILD_EXECUTED),
     LINUX_PROCESS_CHILD_EXEC_PID: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_PROCESS_CHILD_EXEC_PID),
     LINUX_PROCESS_CHILD_EXITED: RuntimeRef(&X86_RUNTIME_BACKING_LINUX_PROCESS_CHILD_EXITED),
@@ -2836,7 +2831,8 @@ pub(crate) fn run_application_processor_runtime(cpu: usize) {
                 continue;
             }
         }
-        let picked = linux_process::ready_live_process_after(after, |pid| {
+        let now = linux_elapsed_nanoseconds().unwrap_or(0);
+        let picked = linux_process::ready_live_process_after(after, now, |pid| {
             pid != 1
                 && linux_process::live_process_status(pid)
                     .is_some_and(|status| status.state == linux_process::LiveProcessState::Running)
@@ -3014,7 +3010,7 @@ fn settle_linux_process_exit(pid: u32, status: u8) -> bool {
     }
     discard_linux_process_extended_state(pid);
     wake_linux_descriptor_waits();
-    exited && linux_process::release_live_process_runtime_slot(pid)
+    exited && release_linux_process_runtime_slot(pid)
 }
 
 pub(crate) fn linux_startup_random() -> Option<[u8; 16]> {
@@ -3239,9 +3235,6 @@ static X86_RUNTIME_BACKING_LINUX_PROCESS_CHILD_STATUS: CpuBankedAtomicU8 =
     CpuBankedAtomicU8::new(0);
 static X86_RUNTIME_BACKING_LINUX_CURRENT_PROCESS_PID: CpuBankedAtomicU32 =
     CpuBankedAtomicU32::new(1);
-static X86_RUNTIME_BACKING_LINUX_PROCESS_CGROUP_GENERATIONS: [BankedAtomicU32;
-    linux_process::PROCESS_RUNTIME_LIMIT] =
-    [const { BankedAtomicU32::new(0) }; linux_process::PROCESS_RUNTIME_LIMIT];
 static X86_RUNTIME_BACKING_LINUX_PROCESS_SCHEDULER_NESTING: CpuBankedAtomicU32 =
     CpuBankedAtomicU32::new(0);
 static X86_RUNTIME_BACKING_LINUX_PROCESS_WAIT_COUNT: BankedAtomicU32 = BankedAtomicU32::new(0);
@@ -7169,7 +7162,7 @@ fn execute_deferred_live_fork() -> bool {
         threads.fill(LinuxThreadRuntimeState::EMPTY);
     }
     discard_linux_process_extended_state(child.pid);
-    if !linux_process::release_live_process_runtime_slot(child.pid) {
+    if !release_linux_process_runtime_slot(child.pid) {
         return false;
     }
     wake_linux_descriptor_waits();
@@ -10265,9 +10258,6 @@ pub(crate) fn verify_linux_elf_entry(execution: &LinuxElfExecution<'_>) -> Linux
     X86_RUNTIME
         .LINUX_FORK_OWN_PAGES
         .store(false, Ordering::SeqCst);
-    for generation in &X86_RUNTIME.LINUX_PROCESS_CGROUP_GENERATIONS {
-        generation.store(0, Ordering::SeqCst);
-    }
     X86_RUNTIME
         .LINUX_PROCESS_CHILD_EXITED
         .store(false, Ordering::SeqCst);
@@ -15952,21 +15942,16 @@ fn linux_init_exit_kill_others_live_return(
     caller: LinuxUserContext,
     number: u64,
 ) -> Option<u64> {
-    let living: ([u32; linux_process::PROCESS_LIMIT], usize) = match linux_signal_targets(-1) {
-        Ok((targets, count)) => {
-            let mut living = [0_u32; linux_process::PROCESS_LIMIT];
-            let mut found = 0;
-            for pid in targets[..count].iter().copied() {
-                if linux_process::live_process_status(pid)
+    let living: (Vec<u32>, usize) = match linux_signal_targets(-1) {
+        Ok((mut targets, _)) => {
+            targets.retain(|pid| {
+                linux_process::live_process_status(*pid)
                     .is_some_and(|status| status.state != linux_process::LiveProcessState::Zombie)
-                {
-                    living[found] = pid;
-                    found += 1;
-                }
-            }
-            (living, found)
+            });
+            let found = targets.len();
+            (targets, found)
         }
-        Err(_) => ([0; linux_process::PROCESS_LIMIT], 0),
+        Err(_) => (Vec::new(), 0),
     };
     let rounds = X86_RUNTIME
         .LINUX_INIT_EXIT_KILL_ROUNDS
@@ -15988,7 +15973,7 @@ fn linux_init_exit_kill_others_live_return(
             wait_for_linux_process_threads_to_leave(pid);
             if linux_process::force_exit_live_process(pid, 128 + LINUX_SIGKILL as u8) {
                 retire_linux_process_record(pid);
-                let _ = linux_process::release_live_process_runtime_slot(pid);
+                let _ = release_linux_process_runtime_slot(pid);
                 release_linux_process_shared_mappings(pid);
             }
         }
@@ -17021,6 +17006,7 @@ fn run_other_linux_processes_deferring(
 /// for its own parent, as a forked child waiting for a reply on a
 /// socketpair does, so the rest of the run queue gets a turn first.
 fn run_one_other_linux_process(pid: u32) -> bool {
+    let now = linux_elapsed_nanoseconds().unwrap_or(0);
     let mut descendant = None;
     let mut ancestor = pid;
     for _ in 0..linux_process::PROCESS_RUNTIME_LIMIT {
@@ -17030,6 +17016,9 @@ fn run_one_other_linux_process(pid: u32) -> bool {
         descendant = Some(child);
         ancestor = child;
     }
+    // One asleep in a futex wait nothing has ended only waits again: of a
+    // thousand such waiters, each turn would resume every one.
+    let descendant = descendant.filter(|child| !linux_process_asleep(*child, now));
     let last_blocked = X86_RUNTIME
         .LINUX_PROCESS_LAST_BLOCKED_PID
         .swap(0, Ordering::SeqCst);
@@ -17037,8 +17026,16 @@ fn run_one_other_linux_process(pid: u32) -> bool {
     let killed = linux_killed_process(pid);
     killed.is_some_and(|killed| run_scheduled_linux_process(pid, Some(killed)))
         || preferred.is_some_and(|child| run_scheduled_linux_process(pid, Some(child)))
-        || run_next_scheduled_linux_process(pid)
+        || linux_process::next_ready_live_process(now, |other| other != pid)
+            .is_some_and(|next| run_scheduled_linux_process(pid, Some(next)))
         || descendant.is_some_and(|child| run_scheduled_linux_process(pid, Some(child)))
+}
+
+/// Whether process `pid` sleeps in a futex wait that nothing has ended by
+/// `now` (`linux_process::live_process_futex_asleep`; its timers are in
+/// the deadline it sleeps to): resuming it would only find it waiting again.
+fn linux_process_asleep(pid: u32, now: u64) -> bool {
+    linux_process::live_process_futex_asleep(pid, now)
 }
 
 /// The key activations of process `pid` in the running domain have: the
@@ -18914,16 +18911,35 @@ struct LinuxProcessRecord {
     extended_state_valid: [bool; LINUX_THREAD_LIMIT],
 }
 
-const LINUX_PROCESS_RECORD_COUNT: usize =
-    LINUX_PROCESS_RUNTIME_INSTANCE_LIMIT * linux_process::PROCESS_RUNTIME_LIMIT;
+/// A process slot's record, once allocated: where it is and the frames it
+/// was allocated from.
+#[derive(Clone, Copy)]
+struct LinuxProcessRecordSlot {
+    record: *mut LinuxProcessRecord,
+    first: memory::FrameLease,
+}
+
+impl LinuxProcessRecordSlot {
+    const EMPTY: Self = Self {
+        record: core::ptr::null_mut(),
+        first: memory::FrameLease::EMPTY,
+    };
+}
+
+/// Process slots whose records stay allocated once their process ended,
+/// for the next process to reuse: a domain's usual processes. A record of
+/// a slot above them is freed with its process, so a burst of thousands
+/// of processes does not keep its records.
+const LINUX_PROCESS_RECORDS_KEPT: usize = 256;
 
 struct X86MutableRuntimeOwner {
     container_extended_states: UnsafeCell<[ExtendedState; control_abi::DOMAIN_LIMIT]>,
-    /// One record per process slot of every domain instance. A record is
-    /// over 100 KiB, so it is allocated from the frame allocator the first
-    /// time a process occupies its slot instead of being reserved in the
-    /// kernel image for every slot of every domain.
-    process_records: UnsafeCell<[*mut LinuxProcessRecord; LINUX_PROCESS_RECORD_COUNT]>,
+    /// One record per process slot of every domain instance, each table as
+    /// long as the highest slot used. A record is over 100 KiB, so it is
+    /// allocated from the frame allocator the first time a process
+    /// occupies its slot instead of being reserved in the kernel image.
+    process_records:
+        UnsafeCell<[Vec<LinuxProcessRecordSlot>; LINUX_PROCESS_RUNTIME_INSTANCE_LIMIT]>,
     /// The running process's signal context, per CPU (`linux_cpu_bank`):
     /// CPUs run different processes, each with its handler's saved context.
     signal_context: [UnsafeCell<LinuxSignalContext>; LINUX_CPU_BANK_LIMIT],
@@ -18937,7 +18953,7 @@ static X86_MUTABLE_RUNTIME: X86MutableRuntimeOwner = X86MutableRuntimeOwner {
     container_extended_states: UnsafeCell::new(
         [ExtendedState([0; EXTENDED_STATE_SIZE]); control_abi::DOMAIN_LIMIT],
     ),
-    process_records: UnsafeCell::new([core::ptr::null_mut(); LINUX_PROCESS_RECORD_COUNT]),
+    process_records: UnsafeCell::new([const { Vec::new() }; LINUX_PROCESS_RUNTIME_INSTANCE_LIMIT]),
     signal_context: [const { UnsafeCell::new(LinuxSignalContext::ZERO) }; LINUX_CPU_BANK_LIMIT],
 };
 
@@ -18956,9 +18972,13 @@ fn linux_process_record(instance: usize, slot: usize) -> Option<&'static mut Lin
     }
     // SAFETY: the table is only reached through these accessors, which the
     // recursive kernel-entry boundary serializes.
-    let table = unsafe { &mut *X86_MUTABLE_RUNTIME.process_records.get() };
-    let entry = &mut table[instance * linux_process::PROCESS_RUNTIME_LIMIT + slot];
-    if entry.is_null() {
+    let table = unsafe { &mut (*X86_MUTABLE_RUNTIME.process_records.get())[instance] };
+    if table.len() <= slot {
+        table.try_reserve(slot + 1 - table.len()).ok()?;
+        table.resize(slot + 1, LinuxProcessRecordSlot::EMPTY);
+    }
+    let entry = &mut table[slot];
+    if entry.record.is_null() {
         let length = size_of::<LinuxProcessRecord>();
         let (first, _) = memory::allocate_contiguous_extent(
             memory::FrameOwner::KERNEL,
@@ -18979,29 +18999,56 @@ fn linux_process_record(instance: usize, slot: usize) -> Option<&'static mut Lin
                 threads.add(thread).write(LinuxThreadRuntimeState::EMPTY);
             }
         }
-        *entry = record;
+        *entry = LinuxProcessRecordSlot { record, first };
     }
     // SAFETY: the pointer addresses a live, kernel-owned record, and callers
     // do not hold two references to one slot.
-    Some(unsafe { &mut **entry })
+    Some(unsafe { &mut *entry.record })
+}
+
+/// Releases process `pid`'s runtime slot once it has ended (see
+/// `linux_process::release_live_process_runtime_slot`), and the slot's
+/// record with it when the slot is above those kept.
+fn release_linux_process_runtime_slot(pid: u32) -> bool {
+    let slot = linux_process::live_process_runtime_slot(pid);
+    if !linux_process::release_live_process_runtime_slot(pid) {
+        return false;
+    }
+    let instance = current_container_slot().unwrap_or(control_abi::DOMAIN_LIMIT);
+    let Some(slot) = slot.filter(|slot| *slot >= LINUX_PROCESS_RECORDS_KEPT) else {
+        return true;
+    };
+    // SAFETY: as in linux_process_record; the process that used the slot
+    // has ended and its record was emptied, so nothing refers to it.
+    let tables = unsafe { &mut *X86_MUTABLE_RUNTIME.process_records.get() };
+    let Some(entry) = tables
+        .get_mut(instance)
+        .and_then(|table| table.get_mut(slot))
+        .filter(|entry| !entry.record.is_null())
+    else {
+        return true;
+    };
+    let pages = size_of::<LinuxProcessRecord>().div_ceil(PAGE_SIZE);
+    let released =
+        memory::scrub_and_release_contiguous_extent(memory::FrameOwner::KERNEL, entry.first, pages);
+    if released {
+        *entry = LinuxProcessRecordSlot::EMPTY;
+    }
+    released
 }
 
 /// The records already allocated for the current domain instance.
 fn allocated_linux_process_records() -> impl Iterator<Item = &'static mut LinuxProcessRecord> {
     let instance = current_container_slot().unwrap_or(control_abi::DOMAIN_LIMIT);
-    let range = if instance < LINUX_PROCESS_RUNTIME_INSTANCE_LIMIT {
-        instance * linux_process::PROCESS_RUNTIME_LIMIT
-            ..(instance + 1) * linux_process::PROCESS_RUNTIME_LIMIT
-    } else {
-        0..0
-    };
     // SAFETY: as in linux_process_record; every non-null entry is a live
     // record.
-    let table = unsafe { &*X86_MUTABLE_RUNTIME.process_records.get() };
-    table[range]
+    let tables = unsafe { &*X86_MUTABLE_RUNTIME.process_records.get() };
+    tables
+        .get(instance)
+        .map_or(&[][..], Vec::as_slice)
         .iter()
-        .filter(|record| !record.is_null())
-        .map(|record| unsafe { &mut **record })
+        .filter(|entry| !entry.record.is_null())
+        .map(|entry| unsafe { &mut *entry.record })
 }
 
 fn linux_current_process_record(pid: u32) -> Option<&'static mut LinuxProcessRecord> {
@@ -19946,8 +19993,7 @@ fn push_linux_shared_runtime_state() {
     }
     let source: *const LinuxProcessRuntimeState = state;
     let copy_to_sharers = |resource, copy: &dyn Fn(&mut LinuxProcessRuntimeState)| {
-        let (sharers, count) = linux_process::live_processes_sharing(pid, resource);
-        for peer in sharers[..count].iter().copied() {
+        for peer in linux_process::live_processes_sharing(pid, resource) {
             if let Some(destination) = linux_process_runtime_state(peer).filter(|state| state.valid)
             {
                 copy(destination);
@@ -32901,7 +32947,7 @@ fn linux_pivot_root(new_root_address: u64, put_old_address: u64) -> u64 {
     // moves to the new root.
     let namespace = linux_mount::current_handle();
     let caller = current_linux_process_pid();
-    for slot in 0..linux_process::PROCESS_LIMIT {
+    for slot in 0..linux_process::live_process_slots() {
         let Some(pid) = linux_process::live_process_pid_at(slot) else {
             continue;
         };
@@ -35383,7 +35429,7 @@ fn linux_overlay_file_open_for_write(generation: u32) -> bool {
         return true;
     }
     let me = current_linux_process_pid();
-    (0..linux_process::PROCESS_LIMIT)
+    (0..linux_process::live_process_slots())
         .filter_map(linux_process::live_process_pid_at)
         .filter(|pid| *pid != me)
         .any(|pid| {
@@ -37929,46 +37975,13 @@ fn linux_assign_process_cgroup(pid: u32, generation: u32) -> bool {
     if generation == 0 {
         return true;
     }
-    let Some(slot) = linux_process::live_process_runtime_slot(pid) else {
-        return false;
-    };
-    let Some(cell) = X86_RUNTIME.LINUX_PROCESS_CGROUP_GENERATIONS.get(slot) else {
-        return false;
-    };
-    cell.store(generation, Ordering::SeqCst);
-    linux_update_cgroup_files(generation, true, pid)
+    linux_process::replace_live_process_cgroup(pid, generation).is_some()
+        && linux_update_cgroup_files(generation, true, pid)
 }
 
 fn linux_release_process_cgroup(pid: u32) {
-    let Some(slot) = linux_process::live_process_runtime_slot(pid) else {
-        return;
-    };
-    let Some(cell) = X86_RUNTIME.LINUX_PROCESS_CGROUP_GENERATIONS.get(slot) else {
-        return;
-    };
-    let generation = cell.swap(0, Ordering::SeqCst);
-    if generation == 0 {
-        return;
-    }
-    let still_populated = (0..linux_process::PROCESS_LIMIT).any(|process_slot| {
-        let Some(other_pid) = linux_process::live_process_pid_at(process_slot) else {
-            return false;
-        };
-        if other_pid == pid
-            || linux_process::live_process_status(other_pid)
-                .is_none_or(|status| !status.state.is_running())
-        {
-            return false;
-        }
-        linux_process::live_process_runtime_slot(other_pid)
-            .and_then(|runtime_slot| {
-                X86_RUNTIME
-                    .LINUX_PROCESS_CGROUP_GENERATIONS
-                    .get(runtime_slot)
-            })
-            .is_some_and(|other| other.load(Ordering::SeqCst) == generation)
-    });
-    if !still_populated {
+    let generation = linux_process::replace_live_process_cgroup(pid, 0).unwrap_or(0);
+    if generation != 0 && !linux_process::live_cgroup_populated(generation, pid) {
         let _ = linux_update_cgroup_files(generation, false, 0);
     }
 }
@@ -51426,7 +51439,7 @@ fn linux_tty_ioctl(request: u64, argument: u64) -> u64 {
             }
             let group = i32::from_ne_bytes(bytes);
             if group <= 0
-                || !(0..linux_process::PROCESS_LIMIT).any(|slot| {
+                || !(0..linux_process::live_process_slots()).any(|slot| {
                     linux_process::live_process_pid_at(slot).is_some_and(|candidate| {
                         linux_process::live_process_group(candidate) == Some(group as u32)
                             && linux_process::live_process_session(candidate) == Some(session)
@@ -56047,10 +56060,7 @@ const LINUX_PRIO_PROCESS: u32 = 0;
 const LINUX_PRIO_PGRP: u32 = 1;
 const LINUX_PRIO_USER: u32 = 2;
 
-fn linux_priority_targets(
-    which: u64,
-    who: u64,
-) -> Result<([u32; linux_process::PROCESS_LIMIT], usize), u64> {
+fn linux_priority_targets(which: u64, who: u64) -> Result<(Vec<u32>, usize), u64> {
     let which = which as u32;
     let who = who as u32;
     if which > LINUX_PRIO_USER {
@@ -56066,9 +56076,8 @@ fn linux_priority_targets(
         LINUX_PRIO_USER if who == 0 => current_credentials.user.real,
         _ => who,
     };
-    let mut targets = [0_u32; linux_process::PROCESS_LIMIT];
-    let mut count = 0;
-    for slot in 0..linux_process::PROCESS_LIMIT {
+    let mut targets = Vec::new();
+    for slot in 0..linux_process::live_process_slots() {
         let Some(pid) = linux_process::live_process_pid_at(slot) else {
             continue;
         };
@@ -56080,10 +56089,11 @@ fn linux_priority_targets(
             _ => false,
         };
         if selected {
-            targets[count] = pid;
-            count += 1;
+            targets.try_reserve(1).map_err(|_| LINUX_ENOMEM)?;
+            targets.push(pid);
         }
     }
+    let count = targets.len();
     if count == 0 {
         Err(LINUX_ESRCH)
     } else {
@@ -56176,14 +56186,13 @@ fn linux_getpriority(which: u64, who: u64) -> u64 {
         Ok(targets) => targets,
         Err(error) => return error,
     };
-    let mut best = 39_u8;
-    for pid in targets[..count].iter().copied() {
-        let Some(nice) = linux_process_nice(pid) else {
-            return LINUX_ESRCH;
-        };
-        best = best.min(nice);
-    }
-    u64::from(40 - best)
+    // A zombie among them has no nice left and counts for nothing, as
+    // setpriority skips it too.
+    let best = targets[..count]
+        .iter()
+        .filter_map(|pid| linux_process_nice(*pid))
+        .min();
+    best.map_or(LINUX_ESRCH, |best| u64::from(40 - best))
 }
 
 fn linux_setpriority(which: u64, who: u64, priority: u64) -> u64 {
@@ -57987,7 +57996,7 @@ pub(crate) fn linux_generation_in_use(generation: u32) -> bool {
     }
     let me = current_linux_process_pid();
     let instance = linux_execution_instance();
-    (0..linux_process::PROCESS_LIMIT)
+    (0..linux_process::live_process_slots())
         .filter_map(linux_process::live_process_pid_at)
         .filter(|pid| *pid != me)
         .any(|pid| {

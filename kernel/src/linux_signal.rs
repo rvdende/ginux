@@ -3,6 +3,8 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
+use alloc::vec::Vec;
+
 use crate::{control_abi, linux_process, memory};
 
 pub(crate) const THREAD_LIMIT: usize = 16;
@@ -101,8 +103,9 @@ const _: [(); PAGE_SIZE] = [(); core::mem::size_of::<Page>()];
 struct SignalRuntimeOwner {
     locks: [AtomicBool; INSTANCE_LIMIT],
     pending_counts: [AtomicU64; INSTANCE_LIMIT],
-    process_queues: UnsafeCell<[[Queue; linux_process::PROCESS_LIMIT]; INSTANCE_LIMIT]>,
-    thread_queues: UnsafeCell<[[Queue; THREAD_QUEUE_LIMIT]; INSTANCE_LIMIT]>,
+    /// Each instance's process queues and thread queues, by slot: as long
+    /// as the highest slot used so far, grown as slots are first used.
+    queues: UnsafeCell<[[Vec<Queue>; 2]; INSTANCE_LIMIT]>,
 }
 
 unsafe impl Sync for SignalRuntimeOwner {}
@@ -110,8 +113,7 @@ unsafe impl Sync for SignalRuntimeOwner {}
 static SIGNAL_RUNTIME: SignalRuntimeOwner = SignalRuntimeOwner {
     locks: [const { AtomicBool::new(false) }; INSTANCE_LIMIT],
     pending_counts: [const { AtomicU64::new(0) }; INSTANCE_LIMIT],
-    process_queues: UnsafeCell::new([[Queue::EMPTY; linux_process::PROCESS_LIMIT]; INSTANCE_LIMIT]),
-    thread_queues: UnsafeCell::new([[Queue::EMPTY; THREAD_QUEUE_LIMIT]; INSTANCE_LIMIT]),
+    queues: UnsafeCell::new([const { [Vec::new(), Vec::new()] }; INSTANCE_LIMIT]),
 };
 
 struct Guard {
@@ -130,23 +132,40 @@ impl Guard {
         Ok(Self { instance })
     }
 
+    /// The queue of `slot`, the table grown to it first; None past the
+    /// limit or without memory. The caller holds no other queue of this
+    /// guard's while it uses the one returned, which a growth would move.
     fn queue(&self, scope: Scope, slot: usize) -> Option<&'static mut Queue> {
-        match scope {
-            Scope::Process if slot < linux_process::PROCESS_LIMIT => Some(unsafe {
-                &mut *SIGNAL_RUNTIME
-                    .process_queues
-                    .get()
-                    .cast::<Queue>()
-                    .add(self.instance * linux_process::PROCESS_LIMIT + slot)
-            }),
-            Scope::Thread if slot < THREAD_QUEUE_LIMIT => Some(unsafe {
-                &mut *SIGNAL_RUNTIME
-                    .thread_queues
-                    .get()
-                    .cast::<Queue>()
-                    .add(self.instance * THREAD_QUEUE_LIMIT + slot)
-            }),
-            _ => None,
+        let (index, limit) = match scope {
+            Scope::Process => (0, linux_process::PROCESS_LIMIT),
+            Scope::Thread => (1, THREAD_QUEUE_LIMIT),
+        };
+        if slot >= limit {
+            return None;
+        }
+        // SAFETY: the guard holds the instance's lock, which serializes
+        // every access to its tables.
+        let queues = unsafe { &mut (*SIGNAL_RUNTIME.queues.get())[self.instance][index] };
+        if queues.len() <= slot {
+            queues.try_reserve(slot + 1 - queues.len()).ok()?;
+            queues.resize(slot + 1, Queue::EMPTY);
+        }
+        queues.get_mut(slot)
+    }
+
+    /// Gives back the empty queues at the end of a table.
+    fn trim(&self, scope: Scope) {
+        let index = usize::from(scope == Scope::Thread);
+        // SAFETY: as in `queue`; no queue of the guard is in use.
+        let queues = unsafe { &mut (*SIGNAL_RUNTIME.queues.get())[self.instance][index] };
+        while queues
+            .last()
+            .is_some_and(|queue| queue.pages == 0 && queue.pending == 0)
+        {
+            queues.pop();
+        }
+        if queues.capacity() > queues.len().saturating_mul(2).max(64) {
+            queues.shrink_to_fit();
         }
     }
 }
@@ -416,6 +435,7 @@ pub(crate) fn clear(instance: usize, scope: Scope, slot: usize) -> Result<(), Er
     if pending != 0 {
         SIGNAL_RUNTIME.pending_counts[instance].fetch_sub(pending, Ordering::AcqRel);
     }
+    guard.trim(scope);
     Ok(())
 }
 

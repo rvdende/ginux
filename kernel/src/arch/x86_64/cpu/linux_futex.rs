@@ -360,7 +360,32 @@ pub(super) fn linux_futex_live_return(
             });
         }
         linux_trace_futex(1, address, key);
+        // A process with no other thread sleeps until a wake, a signal or
+        // its deadline: until then nothing need resume it to look again.
+        let single_threaded = (0..LINUX_THREAD_LIMIT).all(|slot| {
+            Some(slot) == current_linux_thread_slot()
+                || X86_RUNTIME.LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) == LINUX_THREAD_FREE
+        });
+        // It sleeps until the wait's deadline or a timer of its own, which
+        // only its call notices, whichever is due first.
+        let wake_deadline = [
+            deadline,
+            X86_RUNTIME
+                .ELF_PROBE_REAL_TIMER_DEADLINE
+                .load(Ordering::SeqCst),
+            X86_RUNTIME
+                .ELF_PROBE_POSIX_TIMER_DEADLINE
+                .load(Ordering::SeqCst),
+        ]
+        .into_iter()
+        .filter(|deadline| *deadline != 0)
+        .min()
+        .unwrap_or(0);
         let result = loop {
+            // Each dispatch clears it: set again for every sleep.
+            if single_threaded {
+                linux_process::set_live_process_futex_sleep(pid, Some(wake_deadline));
+            }
             match run_other_linux_processes(output, caller, LINUX_FUTEX_SYSCALL) {
                 // Yielded: the call starts again and finds its wait.
                 Some(LinuxBlockedWait::Return(LINUX_RETURN_TO_KERNEL)) => {
@@ -388,6 +413,7 @@ pub(super) fn linux_futex_live_return(
                 }
             }
         };
+        linux_process::set_live_process_futex_sleep(pid, None);
         let wait = take_linux_process_futex_wait(&mut LINUX_FUTEX_COORDINATION.lock(), pid, tid);
         linux_trace_futex(
             6,

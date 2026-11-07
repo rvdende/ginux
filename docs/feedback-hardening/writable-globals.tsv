@@ -294,7 +294,6 @@ interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_POLL_WA
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_PPOLL_WAIT_BLOCK_COUNT	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_PPOLL_WAIT_TIMEOUT_COUNT	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_PPOLL_WAIT_WAKE_COUNT	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
-interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_PROCESS_CGROUP_GENERATIONS	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_PROCESS_CHILD_EXECUTED	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_PROCESS_CHILD_EXEC_PID	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_PROCESS_CHILD_EXITED	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
