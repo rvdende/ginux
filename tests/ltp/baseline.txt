@@ -10,10 +10,10 @@ clone08 TBROK
 clone09 TBROK
 clone10 TBROK
 clone301 TBROK
-ioctl02 TBROK
 ioctl_loop05 TBROK
 kcmp03 TFAIL
 msgstress01 TBROK
 prot_hsymlinks TBROK
 userfaultfd03 TBROK
 futex_cmp_requeue01 TBROK
+add_key05 TBROK

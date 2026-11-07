@@ -32,6 +32,18 @@ kernel/mm/hwpoison-inject.ko
 kernel/net/dns_resolver/dns_resolver.ko
 kernel/security/keys/encrypted-keys/encrypted-keys.ko
 EOF
+# The shadow user tools (useradd, userdel, ...) a distribution has and
+# busybox lacks, from the LTP tree (tools/ltp/container-build.sh). Files the
+# image already has are kept (busybox's cp -n skips whole directories, so
+# each file is copied on its own).
+overlay=/opt/ltp/distro/shadow
+if [ -d "$overlay" ] && ! command -v useradd >/dev/null 2>&1; then
+    for file in $(cd "$overlay" && find . -type f); do
+        file=${file#./}
+        [ -e "/$file" ] && continue
+        mkdir -p "/${file%/*}" && cp -a "$overlay/$file" "/$file" || fail "shadow tools: $file"
+    done
+fi
 wget -q -O /opt/ltp/ltp-runner "$base/ltp-runner" || fail "runner download"
 chmod +x /opt/ltp/ltp-runner || fail chmod
 wget -q -O /opt/ltp/runlist.txt "$base/runlist.txt" || fail "run list download"

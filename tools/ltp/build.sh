@@ -20,6 +20,8 @@
 # (tree in target/ltp-build-NAME) whose library skips the oom_score_adj
 # check that stops every new-API test on Ginux today; see
 # tools/ltp/no-oom-protection.c. Run it with tests/qemu/ltp.sh --variant NAME.
+# --variant harness is a plain copy (build/ltp-harness) for trying changes
+# to these scripts without touching build/ltp, which other runs may use.
 #
 # Outputs, in build/ltp:
 #   ltp/                stripped install tree (LTPROOT in the guest)

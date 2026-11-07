@@ -12,7 +12,7 @@ trap fix_owner EXIT
 
 apk add --no-cache --quiet \
     build-base linux-headers autoconf automake bash perl pkgconf \
-    tar gzip xz findutils libaio-dev libcap-dev libcap-static
+    tar gzip xz findutils libaio-dev libcap-dev libcap-static shadow
 
 # The guest-side runner that tests/qemu/ltp.sh starts in the domain.
 gcc -static-pie -fPIE -O2 -Wall -Wextra -Werror -o /out/ltp-runner.new /scripts/ltp-runner.c
@@ -31,7 +31,9 @@ src="/work/ltp-full-$LTP_VERSION"
 cflags="-O2 -pipe -fPIE"
 ldflags="-static-pie"
 case "${VARIANT:-}" in
-    "") ;;
+    # harness: a copy of the default build for trying harness changes
+    # without touching build/ltp.
+    "" | harness) ;;
     no-oom-protection)
         # See tools/ltp/no-oom-protection.c: a diagnostic build only.
         gcc -c -O2 -fPIE -Wall -Wextra -Werror -o /work/no-oom-protection.o \
@@ -61,6 +63,10 @@ make -j"$JOBS" -C lib >/work/make-lib.log 2>&1 ||
     { tail -n 40 /work/make-lib.log; exit 1; }
 make -j"$JOBS" -k -C libs >/work/make-libs.log 2>&1 || true
 make -j"$JOBS" -k -C testcases/lib >/work/make-testcases-lib.log 2>&1 || true
+# The old API's shell commands (tst_resm, tst_brkm, tst_exit, ...), which
+# old-API shell tests such as ioctl02's test_ioctl call.
+make -j"$JOBS" -C tools/apicmds >/work/make-apicmds.log 2>&1 ||
+    { tail -n 40 /work/make-apicmds.log; exit 1; }
 
 # LTP's directory loop stops at the first directory that fails, so every
 # leaf directory is built on its own, in parallel, with -k: a test that does
@@ -84,7 +90,25 @@ rm -rf /work/install
 xargs -I{} sh -c 'make -k -C "$1" install DESTDIR=/work/install || true' sh {} \
     </work/leaf-dirs.txt >/work/install.log 2>&1
 make -k -C testcases/lib install DESTDIR=/work/install >>/work/install.log 2>&1 || true
+make -C tools/apicmds install DESTDIR=/work/install >>/work/install.log 2>&1
 root=/work/install/opt/ltp
+
+# useradd and friends, which tests run as on a distribution that has them
+# (add_key05, prot_hsymlinks); the domain's Alpine has only busybox's
+# adduser. The builder is the same Alpine release as the domain image, so
+# its shadow tools and the two libraries they need are copied as a small
+# overlay that tests/ltp/setup.sh installs into the domain.
+overlay="$root/distro/shadow"
+mkdir -p "$overlay/usr/sbin" "$overlay/usr/lib" "$overlay/etc"
+for tool in useradd userdel usermod groupadd groupdel groupmod; do
+    cp -a "/usr/sbin/$tool" "$overlay/usr/sbin/$tool"
+done
+for library in $(ldd /usr/sbin/useradd /usr/sbin/userdel /usr/sbin/usermod \
+    /usr/sbin/groupadd /usr/sbin/groupdel /usr/sbin/groupmod |
+    awk '$3 ~ "^/usr/lib/" { print $3 }' | LC_ALL=C sort -u); do
+    cp -L "$library" "$overlay/usr/lib/${library##*/}"
+done
+cp /etc/login.defs "$overlay/etc/login.defs"
 
 # Map each test binary to its syscall directory, for grouping results.
 while IFS= read -r dir; do

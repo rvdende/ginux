@@ -429,7 +429,16 @@ getdents01 CRASH 0.42 domain down: ginux: Linux init execution failed; domain ma
   `prot_hsymlinks`). Each directory builds on its own with `make -k`, so a
   test that does not build under musl is skipped, not patched
   (`build/ltp/build-failures.txt`: today `fmtmsg01`, `timer_create01`,
-  `timer_create03`). The build tree stays in `target/ltp-build`, so reruns are
+  `timer_create03`). It also builds the old API's shell commands
+  (`tools/apicmds`: `tst_resm`, `tst_brkm`, `tst_exit`, ... in
+  `testcases/bin`, which `ioctl02`'s `test_ioctl` calls) and copies the
+  builder's shadow tools (`useradd`, `userdel`, `usermod`, `groupadd`,
+  `groupdel`, `groupmod`, with `libbsd` and `libmd`) to `distro/shadow` in
+  the tree; `tests/ltp/setup.sh` installs them into the domain, whose Alpine
+  has only busybox's `adduser`, so `add_key05`, `prot_hsymlinks` and
+  `setpriority01` add their users as on a distribution. `--variant harness`
+  is a plain copy in `build/ltp-harness` for trying harness changes without
+  touching `build/ltp`. The build tree stays in `target/ltp-build`, so reruns are
   incremental, and a rerun with nothing changed returns at once: stamps in
   `build/ltp` (`.tree-inputs`, `.runner-inputs`) hash the release, builder
   image, variant and `tools/ltp` scripts, and Docker starts only when one of
