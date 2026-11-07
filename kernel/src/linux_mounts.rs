@@ -388,6 +388,7 @@ impl Mounts {
                     parent: mount.parent,
                     point,
                     target,
+                    bind: mount.bind,
                 });
             }
         }
@@ -1142,4 +1143,5 @@ pub(crate) fn forget_instance(instance: usize) {
         .retain(|mount| mount.space.instance != instance);
     table.changes.retain(|(owner, _)| *owner != instance);
     crate::linux_mount_paths::forget_instance(instance);
+    crate::linux_path_views::forget_instance(instance);
 }

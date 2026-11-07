@@ -43,6 +43,8 @@ pub(crate) struct Route {
     /// The storage path the mount point leads to, or `None` for a mount
     /// whose files are found by the paths themselves.
     pub(crate) target: Option<Vec<u8>>,
+    /// A bind mount, which shows files that other paths show too.
+    pub(crate) bind: bool,
 }
 
 static ROUTES: SpinLock<Vec<Route>> = SpinLock::new(LockRank::MOUNT_ROUTES, Vec::new());
@@ -52,6 +54,8 @@ static REDIRECTS: AtomicUsize = AtomicUsize::new(0);
 /// How many routes lead to a root filesystem path (bind mounts of its
 /// directories), across all domains.
 static ROOT_BINDS: AtomicUsize = AtomicUsize::new(0);
+/// How many bind mounts lead somewhere, across all domains.
+static BINDS: AtomicUsize = AtomicUsize::new(0);
 
 /// The id of the root mount (`crate::linux_mounts::ROOT_ID`).
 const ROOT_ID: u32 = crate::linux_mounts::ROOT_ID;
@@ -271,6 +275,35 @@ fn count_routes(table: &[Route]) {
             .count(),
         Ordering::Relaxed,
     );
+    BINDS.store(
+        table
+            .iter()
+            .filter(|route| route.bind && route.target.is_some())
+            .count(),
+        Ordering::Relaxed,
+    );
+}
+
+/// Whether some bind mount leads somewhere: a file may then show at
+/// several paths.
+pub(crate) fn bound() -> bool {
+    BINDS.load(Ordering::Relaxed) != 0
+}
+
+/// The bind mount canonical `path` of the current process is on, as its
+/// point and the storage path it leads to; None off one.
+pub(crate) fn bind_of(path: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    if !bound() {
+        return None;
+    }
+    let space = current_space();
+    let routes = ROUTES.lock();
+    let route = &routes[resolve(&routes, space, path)?];
+    if !route.bind {
+        return None;
+    }
+    let target = route.target.as_deref()?;
+    Some((join(&route.point, &[])?, join(target, &[])?))
 }
 
 /// Whether some mount leads paths to a root filesystem directory (a bind

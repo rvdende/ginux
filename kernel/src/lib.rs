@@ -55,6 +55,7 @@ mod linux_mounts;
 mod linux_namespace;
 mod linux_overlay;
 mod linux_overlayfs;
+mod linux_path_views;
 mod linux_pidfs;
 mod linux_process;
 mod linux_profile;

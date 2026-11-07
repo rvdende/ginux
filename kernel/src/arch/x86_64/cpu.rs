@@ -6915,6 +6915,7 @@ fn execute_deferred_live_fork() -> bool {
         return false;
     }
     crate::linux_areas::fork(linux_execution_instance(), parent_pid, child.pid);
+    crate::linux_path_views::fork(linux_execution_instance(), parent_pid, child.pid);
     if !linux_landlock_fork(parent_pid, child.pid) {
         return false;
     }
@@ -32279,6 +32280,33 @@ fn linux_readlink_at(
             LINUX_EFAULT
         };
     }
+    // The process's own /proc/self/cwd: its working directory as getcwd
+    // shows it.
+    if matches!(path, b"/proc/self/cwd" | b"/proc/thread-self/cwd")
+        || path
+            .strip_prefix(b"/proc/")
+            .and_then(|rest| rest.strip_suffix(b"/cwd"))
+            .is_some_and(|digits| {
+                core::str::from_utf8(digits)
+                    .ok()
+                    .and_then(|digits| digits.parse::<u32>().ok())
+                    == Some(current_linux_process_pid())
+            })
+    {
+        let mut shown = [0_u8; crate::linux_overlay::PATH_CAPACITY + 16];
+        let length = match linux_cwd_path(&mut shown) {
+            Ok(length) => length,
+            Err(error) => return error,
+        };
+        let output_length = usize::try_from(output_size)
+            .unwrap_or(usize::MAX)
+            .min(length);
+        return if copy_to_linux_user(output_address, &shown[..output_length]) {
+            output_length as u64
+        } else {
+            LINUX_EFAULT
+        };
+    }
     if directory as u32 != LINUX_AT_FDCWD
         && linux_rootfs_descriptor(directory) == 0
         && linux_overlay_descriptor_handle(directory).is_none()
@@ -33838,7 +33866,11 @@ fn linux_normalized_relative_path(path: &[u8]) -> bool {
             .all(|component| !component.is_empty() && component != b"." && component != b"..")
 }
 
-fn linux_getcwd(address: u64, capacity: u64) -> u64 {
+/// The working directory's path as getcwd(2) and /proc/self/cwd show
+/// it, into `shown`; returns its length.
+fn linux_cwd_path(
+    shown: &mut [u8; crate::linux_overlay::PATH_CAPACITY + 16],
+) -> Result<usize, u64> {
     let state = X86_RUNTIME.ELF_PROBE_CWD.load(Ordering::SeqCst);
     let mut output = [0_u8; crate::linux_overlay::PATH_CAPACITY + 1];
     output[0] = b'/';
@@ -33846,16 +33878,15 @@ fn linux_getcwd(address: u64, capacity: u64) -> u64 {
     let overlay_cwd = X86_RUNTIME.ELF_PROBE_OVERLAY_CWD.load(Ordering::SeqCst);
     let length = if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) && overlay_cwd != 0 {
         let Some(handle) = crate::linux_overlay::from_generation(overlay_cwd) else {
-            return LINUX_ENOENT;
+            return Err(LINUX_ENOENT);
         };
-        let Some(path_length) = crate::linux_overlay::copy_path(handle, &mut output[1..]) else {
-            return LINUX_ENOENT;
+        let Some(path_length) = linux_shown_overlay_path(handle, &mut output[1..]) else {
+            return Err(LINUX_ENOENT);
         };
         1 + path_length
     } else if X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst) && rootfs_cwd != 0 {
-        let Some(path_length) = crate::published_rootfs::copy_path(rootfs_cwd, &mut output[1..])
-        else {
-            return LINUX_ENOENT;
+        let Some(path_length) = linux_shown_rootfs_path(rootfs_cwd, &mut output[1..]) else {
+            return Err(LINUX_ENOENT);
         };
         1 + path_length
     } else if state == LINUX_ROOT_DIRECTORY {
@@ -33865,10 +33896,10 @@ fn linux_getcwd(address: u64, capacity: u64) -> u64 {
         4
     } else {
         let Some(path) = linux_measured_directory_path(state) else {
-            return LINUX_ENOENT;
+            return Err(LINUX_ENOENT);
         };
         let Some(destination) = output.get_mut(1..1 + path.len()) else {
-            return LINUX_ERANGE;
+            return Err(LINUX_ERANGE);
         };
         destination.copy_from_slice(path);
         1 + path.len()
@@ -33877,7 +33908,6 @@ fn linux_getcwd(address: u64, capacity: u64) -> u64 {
     // it is "(unreachable)" followed by its path, as Linux reports it.
     let mut root = [0_u8; crate::linux_overlay::PATH_CAPACITY];
     let root_length = linux_root_prefix(&mut root);
-    let mut shown = [0_u8; crate::linux_overlay::PATH_CAPACITY + 16];
     let length = if root_length == 0 {
         shown[..length].copy_from_slice(&output[..length]);
         length
@@ -33896,6 +33926,15 @@ fn linux_getcwd(address: u64, capacity: u64) -> u64 {
         shown[..UNREACHABLE.len()].copy_from_slice(UNREACHABLE);
         shown[UNREACHABLE.len()..UNREACHABLE.len() + length].copy_from_slice(&output[..length]);
         UNREACHABLE.len() + length
+    };
+    Ok(length)
+}
+
+fn linux_getcwd(address: u64, capacity: u64) -> u64 {
+    let mut shown = [0_u8; crate::linux_overlay::PATH_CAPACITY + 16];
+    let length = match linux_cwd_path(&mut shown) {
+        Ok(length) => length,
+        Err(error) => return error,
     };
     shown[length] = 0;
     let required = length + 1;
@@ -34145,14 +34184,21 @@ fn linux_chdir(path_address: u64) -> u64 {
                 Err(_) => None,
             };
         if let Some(length) = canonical_length {
-            let found = match linux_overlay_lookup_following(&mut canonical, length, true) {
-                Ok((_, _, found)) => found,
-                Err(error) => return error,
-            };
+            let (followed, found) =
+                match linux_overlay_lookup_following(&mut canonical, length, true) {
+                    Ok((followed, _, found)) => (followed, found),
+                    Err(error) => return error,
+                };
             if let Some(metadata) = found {
                 if metadata.kind != crate::linux_overlay::NodeKind::Directory {
                     return LINUX_ENOTDIR;
                 }
+                linux_note_path_view(
+                    &canonical[..followed],
+                    crate::linux_path_views::Key::Overlay(crate::linux_overlay::generation(
+                        metadata.handle,
+                    )),
+                );
                 // Changing into a directory needs search permission on it.
                 if let Err(error) = linux_check_access(
                     Some(linux_overlay_file_access(metadata)),
@@ -34188,6 +34234,12 @@ fn linux_chdir(path_address: u64) -> u64 {
         };
         if entry.is_some_and(|entry| entry.kind != crate::published_rootfs::EntryKind::Directory) {
             return LINUX_ENOTDIR;
+        }
+        if let Some(length) = canonical_length {
+            linux_note_path_view(
+                &canonical[..length],
+                crate::linux_path_views::Key::Image(handle),
+            );
         }
         X86_RUNTIME
             .ELF_PROBE_ROOTFS_CWD
@@ -37059,7 +37111,7 @@ fn linux_walk_start(
             .flatten();
         if overlay != 0 {
             let handle = crate::linux_overlay::from_generation(overlay).ok_or(LINUX_ENOENT)?;
-            crate::linux_overlay::copy_path(handle, output).ok_or(LINUX_ENOENT)?
+            linux_shown_overlay_path(handle, output).ok_or(LINUX_ENOENT)?
         } else if let Some(path) = kernel_directory {
             // A kernel directory (/proc/sys/kernel) is the working
             // directory: the walk starts from its path.
@@ -37067,7 +37119,7 @@ fn linux_walk_start(
             destination.copy_from_slice(path);
             path.len()
         } else {
-            crate::published_rootfs::copy_path(
+            linux_shown_rootfs_path(
                 X86_RUNTIME.ELF_PROBE_ROOTFS_CWD.load(Ordering::SeqCst),
                 output,
             )
@@ -37078,7 +37130,7 @@ fn linux_walk_start(
         if metadata.kind != crate::linux_overlay::NodeKind::Directory {
             return Err(LINUX_ENOTDIR);
         }
-        crate::linux_overlay::copy_path(handle, output).ok_or(LINUX_EBADF)?
+        linux_shown_overlay_path(handle, output).ok_or(LINUX_EBADF)?
     } else {
         let handle = linux_rootfs_descriptor(directory);
         if handle == 0 {
@@ -37101,9 +37153,85 @@ fn linux_walk_start(
             destination.copy_from_slice(path);
             path.len()
         } else {
-            crate::published_rootfs::copy_path(handle, output).ok_or(LINUX_ENOTDIR)?
+            linux_shown_rootfs_path(handle, output).ok_or(LINUX_ENOTDIR)?
         }
     })
+}
+
+/// The path the current process is shown for overlay file `handle`:
+/// through the bind mount it reached it by (`crate::linux_path_views`),
+/// else its own.
+fn linux_shown_overlay_path(
+    handle: crate::linux_overlay::Handle,
+    output: &mut [u8],
+) -> Option<usize> {
+    if crate::linux_path_views::any() {
+        let mut stored = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+        if let Some(shown) =
+            crate::linux_overlay::copy_path_stored(handle, &mut stored).and_then(|length| {
+                crate::linux_path_views::shown(
+                    linux_execution_instance(),
+                    current_linux_process_pid(),
+                    crate::linux_path_views::Key::Overlay(crate::linux_overlay::generation(handle)),
+                    &stored[..length],
+                )
+            })
+        {
+            output.get_mut(..shown.len())?.copy_from_slice(&shown);
+            return Some(shown.len());
+        }
+    }
+    crate::linux_overlay::copy_path(handle, output)
+}
+
+/// The path the current process is shown for image file `handle`, as
+/// `linux_shown_overlay_path` gives an overlay file's.
+fn linux_shown_rootfs_path(handle: u16, output: &mut [u8]) -> Option<usize> {
+    let length = crate::published_rootfs::copy_path(handle, output)?;
+    if let Some(shown) = crate::linux_path_views::shown(
+        linux_execution_instance(),
+        current_linux_process_pid(),
+        crate::linux_path_views::Key::Image(handle),
+        &output[..length],
+    ) {
+        output.get_mut(..shown.len())?.copy_from_slice(&shown);
+        return Some(shown.len());
+    }
+    Some(length)
+}
+
+/// Notes the bind mount the current process reached `key`'s file through
+/// at canonical `path`, or that it reached it through none.
+fn linux_note_path_view(path: &[u8], key: crate::linux_path_views::Key) {
+    let mount = crate::linux_mount_paths::bind_of(path);
+    crate::linux_path_views::record(
+        linux_execution_instance(),
+        current_linux_process_pid(),
+        key,
+        mount
+            .as_ref()
+            .map(|(point, target)| (point.as_slice(), target.as_slice())),
+    );
+}
+
+/// Notes the bind mount, if any, through which `path` (from `directory`)
+/// reached the file just opened as `descriptor`.
+fn linux_note_descriptor_view(directory: u64, path: &[u8], descriptor: u64) {
+    if !crate::linux_mount_paths::bound() && !crate::linux_path_views::any() {
+        return;
+    }
+    let key = if let Some(handle) = linux_overlay_descriptor_handle(descriptor) {
+        crate::linux_path_views::Key::Overlay(crate::linux_overlay::generation(handle))
+    } else {
+        match linux_rootfs_descriptor(descriptor) {
+            0 => return,
+            handle => crate::linux_path_views::Key::Image(handle),
+        }
+    };
+    let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
+    if let Ok(length) = linux_canonical_path_at(directory, path, &mut canonical) {
+        linux_note_path_view(&canonical[..length], key);
+    }
 }
 
 /// Walks `path`'s components onto the canonical path `output[..length]`,
@@ -37651,6 +37779,9 @@ fn linux_openat_path(
         linux_open_file_at(directory, path, path_length, flags, mode, false),
         flags,
     );
+    if opened < LINUX_RETURN_TO_KERNEL {
+        linux_note_descriptor_view(directory, &path[..path_length], opened);
+    }
     if opened == LINUX_ENOENT {
         if let Some(error) = linux_volume_damage(directory, &path[..path_length]) {
             return error;
@@ -62777,12 +62908,11 @@ fn linux_descriptor_path(
     }
     output[0] = b'/';
     if let Some(handle) = linux_overlay_descriptor_handle(descriptor) {
-        return crate::linux_overlay::copy_path(handle, &mut output[1..]).map(|length| length + 1);
+        return linux_shown_overlay_path(handle, &mut output[1..]).map(|length| length + 1);
     }
     let rootfs = linux_rootfs_descriptor(descriptor);
     if rootfs != 0 {
-        return crate::published_rootfs::copy_path(rootfs, &mut output[1..])
-            .map(|length| length + 1);
+        return linux_shown_rootfs_path(rootfs, &mut output[1..]).map(|length| length + 1);
     }
     let state = linux_device_descriptor(descriptor);
     linux_measured_directory_path(state).and_then(|path| {
@@ -63375,6 +63505,7 @@ const LINUX_KEY_GC_DELAY_SECONDS: u64 = 300;
 /// their owners' quotas. Skipped (left to the next fork that reuses the
 /// id) when a lock ranked above the keys' is held.
 fn release_linux_process_keys(pid: u32) {
+    crate::linux_path_views::forget(linux_execution_instance(), pid);
     if crate::sync::rank_available(crate::sync::LockRank::KEYRINGS) {
         let _ = crate::linux_keyring::with(|keys| {
             keys.exit_process(pid);

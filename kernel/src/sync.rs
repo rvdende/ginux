@@ -29,6 +29,9 @@ impl LockRank {
     /// The executables behind /proc/PID/exe; ranks below the heap so the
     /// list may grow while held.
     pub(crate) const EXECUTABLES: Self = Self(110);
+    /// The mounts processes reached their open files through; ranks below
+    /// the heap so the table may grow while held.
+    pub(crate) const PATH_VIEWS: Self = Self(111);
     /// Each domain's keys; ranks below the heap so the keys may grow while
     /// held.
     pub(crate) const KEYRINGS: Self = Self(115);
