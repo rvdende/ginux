@@ -534,11 +534,12 @@ fn linux_tick_apic() -> Option<LocalApic> {
 }
 
 /// The APIC count for `nanoseconds` of the Linux tick's clock, at least one
-/// and at most a full tick.
+/// and at most a full tick. Rounded up: a tick a little before a deadline
+/// finds nothing due, and the CPU then waits for the next one.
 fn linux_tick_count_for(nanoseconds: u64) -> u32 {
     let counter_hz = TIMER.interrupt_counter_hz.load(Ordering::Relaxed);
     let reload = TIMER.linux_wait_reload.load(Ordering::Relaxed).max(1);
-    let count = u128::from(nanoseconds) * u128::from(counter_hz) / 1_000_000_000;
+    let count = (u128::from(nanoseconds) * u128::from(counter_hz)).div_ceil(1_000_000_000);
     u32::try_from(count).unwrap_or(u32::MAX).clamp(1, reload)
 }
 

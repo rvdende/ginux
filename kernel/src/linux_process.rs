@@ -3679,17 +3679,19 @@ pub(crate) fn live_process_futex_asleep(pid: u32, now: u64) -> bool {
     })
 }
 
-/// The earliest deadline after `now` a process asleep in a futex wait
-/// (`Process::is_asleep`) is due at: a CPU that halts until its next tick
-/// would resume it late.
-pub(crate) fn next_live_futex_sleep_deadline(now: u64) -> Option<u64> {
+/// The earliest deadline a process marked asleep in a wait of its own
+/// (`Process::is_asleep`) is due at, passed already or not: a CPU that
+/// halts until its next tick would resume it late, and one that halts with
+/// it due (its deadline came between the look for work and the halt) a
+/// whole tick late.
+pub(crate) fn next_live_futex_sleep_deadline() -> Option<u64> {
     live_process_table_mut()?
         .processes
         .iter()
         .flatten()
         .filter(|process| process.state == ProcessState::Running && process.waiting)
         .filter_map(|process| process.futex_sleep)
-        .filter(|deadline| *deadline > now)
+        .filter(|deadline| *deadline != 0)
         .min()
 }
 

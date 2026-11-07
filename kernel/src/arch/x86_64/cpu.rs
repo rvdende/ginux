@@ -2921,8 +2921,8 @@ pub(crate) fn run_application_processor_runtime(cpu: usize) {
                 return true;
             };
             let now = linux_elapsed_nanoseconds().unwrap_or(0);
-            linux_process::next_live_futex_sleep_deadline(now).is_some_and(|deadline| {
-                deadline - now < 1_000_000_000 / timer::LINUX_WAIT_TICKS_PER_SECOND
+            linux_process::next_live_futex_sleep_deadline().is_some_and(|deadline| {
+                deadline.saturating_sub(now) < 1_000_000_000 / timer::LINUX_WAIT_TICKS_PER_SECOND
             })
         };
         if ticking && idle_ticks >= LINUX_SMP_IDLE_SPIN_TICKS * 64 && !sleeper_due() {
@@ -16480,13 +16480,18 @@ fn take_linux_child_yield(pid: u32) -> bool {
 /// device), then turns them off again.
 pub(super) fn linux_wait_for_interrupt() {
     let started = timer::timestamp_counter();
-    // A process asleep in a futex wait is not resumed to look at its
+    // A process asleep in a wait of its own is not resumed to look at its
     // deadline (`linux_process_asleep`): the tick comes at it instead of up
-    // to a tick later. The tick is the boot CPU's.
+    // to a tick later. The tick is the boot CPU's. One already due (its
+    // deadline came after the look for work) is resumed now, not after a
+    // whole tick (nanosleep01's 5 ms sleeps all ended 1.1 ms late).
     if let Some((deadline, now)) = linux_elapsed_nanoseconds()
         .filter(|_| current_cpu_index_checked() == Some(0))
-        .and_then(|now| Some((linux_process::next_live_futex_sleep_deadline(now)?, now)))
+        .and_then(|now| Some((linux_process::next_live_futex_sleep_deadline()?, now)))
     {
+        if deadline <= now {
+            return;
+        }
         timer::request_linux_tick_within(deadline - now);
     }
     // Other CPUs enter the kernel while this one waits.
@@ -17006,7 +17011,7 @@ fn linux_waitid_live(
     loop {
         // Asleep until a child changes state or a signal comes (see
         // linux_wait4_live).
-        mark_linux_process_asleep(pid, 0);
+        mark_linux_process_asleep(pid, 0, 0);
         let turn = run_other_linux_processes(output, caller, LINUX_WAITID_SYSCALL);
         match turn {
             Some(LinuxBlockedWait::Recheck) => {}
@@ -17070,7 +17075,7 @@ fn linux_wait4_live(
         // waiting for its test was dispatched some twenty times for each
         // of futex_cmp_requeue01's thousand forks, which then took longer
         // than the children's five-second waits.
-        mark_linux_process_asleep(waiter, 0);
+        mark_linux_process_asleep(waiter, 0, 0);
         match run_other_linux_processes(output, caller, LINUX_WAIT4_SYSCALL) {
             Some(LinuxBlockedWait::Recheck) => {}
             // Yielded to start again from user mode: still waiting.
@@ -17343,14 +17348,24 @@ fn linux_process_asleep(pid: u32, now: u64) -> bool {
     linux_process::live_process_futex_asleep(pid, now)
 }
 
+/// How long before its deadline a sleep (nanosleep) stops being passed over
+/// and looks at the clock itself, every round, as an unmarked sleep does: a
+/// marked process is dispatched at a scheduling point after its deadline,
+/// which a process running nested may hold off for milliseconds, where one
+/// that looks for itself halts until its own deadline (nanosleep01's 1 to
+/// 25 ms sleeps woke 1-10 ms late marked to the end). A futex wait, which
+/// has no such look of its own, is marked to its deadline.
+pub(super) const LINUX_SLEEP_WAKE_MARGIN_NS: u64 = 2_000_000;
+
 /// Marks process `pid` (current, other than init) asleep in a wait of its
 /// own until `deadline` (0: none) or a timer of its own falls due, whichever
-/// comes first: the scheduler passes over it until then, or until a wake
-/// clears its `waiting` (a futex wake, a signal it takes, a child's change
-/// of state for a wait for children). Each dispatch clears the mark, so a
-/// wait sets it again for every sleep. Only a single-threaded process
-/// sleeps so; another thread of it may have work to do.
-pub(super) fn mark_linux_process_asleep(pid: u32, deadline: u64) {
+/// comes first, less `margin`: the scheduler passes over it until then, or
+/// until a wake clears its `waiting` (a futex wake, a signal it takes, a
+/// child's change of state for a wait for children). A wait due within the
+/// margin is left unmarked. Each dispatch clears the mark, so a wait sets it
+/// again for every sleep. Only a single-threaded process sleeps so; another
+/// thread of it may have work to do.
+pub(super) fn mark_linux_process_asleep(pid: u32, deadline: u64, margin: u64) {
     if pid == 1 {
         return;
     }
@@ -17375,6 +17390,19 @@ pub(super) fn mark_linux_process_asleep(pid: u32, deadline: u64) {
     .filter(|deadline| *deadline != 0)
     .min()
     .unwrap_or(0);
+    let wake = if wake == 0 {
+        0
+    } else {
+        let now = linux_elapsed_nanoseconds().unwrap_or(u64::MAX);
+        match wake.checked_sub(margin) {
+            Some(early) if early > now => early,
+            // Due within the margin: it looks for itself.
+            _ => {
+                linux_process::set_live_process_futex_sleep(pid, None);
+                return;
+            }
+        }
+    };
     linux_process::set_live_process_futex_sleep(pid, Some(wake));
 }
 

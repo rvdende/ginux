@@ -455,7 +455,7 @@ pub(super) fn linux_futex_live_return(
             // A process with no other thread sleeps until a wake, a signal
             // or its deadline: until then nothing need resume it to look
             // again.
-            mark_linux_process_asleep(pid, deadline);
+            mark_linux_process_asleep(pid, deadline, 0);
             match run_other_linux_processes(output, caller, LINUX_FUTEX_SYSCALL) {
                 // Yielded: the call starts again and finds its wait.
                 Some(LinuxBlockedWait::Return(LINUX_RETURN_TO_KERNEL)) => {

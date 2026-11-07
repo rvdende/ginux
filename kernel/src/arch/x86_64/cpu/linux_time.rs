@@ -1094,15 +1094,23 @@ fn linux_sleep_live_return(
                     return LINUX_EFAULT;
                 }
             }
-            // A sleep is not marked asleep (mark_linux_process_asleep): left
-            // for a wake at its deadline, a 1 ms usleep took some 60 ms, and
-            // futex_cmp_requeue01's state polls outlasted its children's
-            // waits. Resumed each round, it looks at the clock itself.
+            // Passed over until shortly before its deadline, then resumed
+            // each round to look at the clock itself (see
+            // mark_linux_process_asleep): a thousand children sleeping in
+            // usleep (futex_cmp_requeue01) took the CPU from the one with
+            // work when every round resumed each of them.
+            let pid = current_linux_process_pid();
+            mark_linux_process_asleep(pid, deadline, LINUX_SLEEP_WAKE_MARGIN_NS);
             let turn = linux_timed_wait_run_others(output, caller, number, Some(deadline));
             if let LinuxWaitTurn::Done(result) = turn {
+                // Yielded to start again: still asleep until then.
+                if result != LINUX_RETURN_TO_KERNEL && result != number {
+                    linux_process::set_live_process_futex_sleep(pid, None);
+                }
                 return result;
             }
             if let Some(target) = ready_linux_thread_handle() {
+                linux_process::set_live_process_futex_sleep(pid, None);
                 break 'target target;
             }
             // Wake at the deadline, not on the next tick after it, whether
