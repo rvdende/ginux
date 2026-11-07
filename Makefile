@@ -373,6 +373,8 @@ check: manifest architecture-check linux-compat-check
 	@cargo test --package ginux-tty
 	@cargo clippy --package ginux-drm --all-targets -- -D warnings
 	@cargo test --package ginux-drm
+	@cargo clippy --package ginux-ext2 --all-targets -- -D warnings
+	@cargo test --package ginux-ext2
 	@cargo clippy --package ginux-usb-audio --all-targets -- -D warnings
 	@cargo test --package ginux-usb-audio
 	@cargo clippy --package ginux-usb-hid --all-targets -- -D warnings

@@ -464,6 +464,10 @@ name = "ginux-drm"
 version = "0.1.0"
 
 [[package]]
+name = "ginux-ext2"
+version = "0.1.0"
+
+[[package]]
 name = "ginux-image-store"
 version = "0.1.0"
 dependencies = [
