@@ -26362,7 +26362,9 @@ fn verify_linux_mount_query_syscalls() -> bool {
                 && u32::from_ne_bytes(basic[56..60].try_into().unwrap()) == 2
         };
     // As Linux: a mask bit statmount does not know is dropped, not
-    // refused, and listmount with no room lists nothing.
+    // refused, and listmount with no room lists nothing. listmount reads
+    // the request's `param` as the last id listed, which must be 0 or a
+    // unique id (above 2^31): the mask left there is EINVAL.
     request[16..24].copy_from_slice(&0x102_u64.to_ne_bytes());
     let lenient = proc_valid
         && copy_to_linux_user(mapping, &request)
@@ -26370,6 +26372,11 @@ fn verify_linux_mount_query_syscalls() -> bool {
         && {
             let mut mask = [0_u8; 8];
             copy_from_linux_user(mapping + 520, &mut mask) && u64::from_ne_bytes(mask) == 2
+        }
+        && linux_listmount(mapping, mapping + 64, 0, 0) == LINUX_EINVAL
+        && {
+            request[16..24].copy_from_slice(&0_u64.to_ne_bytes());
+            copy_to_linux_user(mapping, &request)
         }
         && linux_listmount(mapping, mapping + 64, 0, 0) == 0;
     let unmapped = linux_runtime_munmap(mapping, PAGE_SIZE as u64) == 0;
