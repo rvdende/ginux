@@ -13,7 +13,13 @@
 //! one per 512 KiB slot: the stack's pages at the top of its slot and the
 //! rest of the slot unmapped, so kernel work that overflows its stack faults
 //! on a guard page (reported as a double fault) instead of overwriting the
-//! memory below it. Stacks are reused, never unmapped.
+//! memory below it. A finished activation's stack is kept for the next one,
+//! as many as are live or [`SPARE_STACKS`]; past that (after a burst of
+//! thousands of processes) its frames go back to the frame allocator, and
+//! its slot is mapped again only once every other CPU has loaded CR3 since
+//! (or sits halted idle, and reloads it before it runs anything), dropping
+//! any translation it still held of the slot's pages; the CPU mapping it
+//! drops its own.
 //!
 //! A kernel context parks on its stack by switching to another: the switch
 //! saves the callee-saved registers and the stack pointer, loads another
@@ -37,6 +43,8 @@ use crate::sync::{LockRank, SpinLock};
 const STACK_SIZE: usize = 256 * 1024;
 /// Window space per stack; everything below the stack in its slot is guard.
 const SLOT_SIZE: usize = 512 * 1024;
+/// Finished activations' stacks kept mapped for the next ones.
+const SPARE_STACKS: usize = 64;
 const PAGE_SIZE: usize = 4096;
 
 struct KernelStack {
@@ -45,6 +53,23 @@ struct KernelStack {
 }
 
 impl KernelStack {
+    /// The window slot the stack is in.
+    fn slot(&self) -> usize {
+        (self.top - paging::KERNEL_STACK_WINDOW_BASE) / SLOT_SIZE - 1
+    }
+
+    /// Unmaps the stack and gives its frames back.
+    fn release(self) {
+        for page in 1..=STACK_SIZE / PAGE_SIZE {
+            let address = self.top - page * PAGE_SIZE;
+            if let Some(frame) = paging::unmap_kernel_stack_page(address)
+                .and_then(|physical| memory::live_frame_lease(FrameOwner::KERNEL, physical))
+            {
+                let _ = memory::release_frames(FrameOwner::KERNEL, [frame]);
+            }
+        }
+    }
+
     /// Maps a new stack into window slot `slot` from fresh frames.
     fn new(slot: usize) -> Option<Self> {
         let end = slot.checked_add(1)?.checked_mul(SLOT_SIZE)?;
@@ -75,6 +100,9 @@ impl KernelStack {
 /// allocator, both used while it is held.
 struct StackPool {
     free: Vec<KernelStack>,
+    /// Slots whose stacks went back to the frame allocator, with each CPU's
+    /// CR3 loads when they did (`smp::flushed_since`).
+    retired: Vec<(usize, [u64; crate::arch::x86_64::smp::CPU_LIMIT])>,
     next_slot: usize,
 }
 
@@ -82,9 +110,37 @@ static STACK_POOL: SpinLock<StackPool> = SpinLock::new(
     LockRank::KERNEL_STACKS,
     StackPool {
         free: Vec::new(),
+        retired: Vec::new(),
         next_slot: 0,
     },
 );
+
+/// Gives a finished activation's stack back, `live` activations being left:
+/// stacks are kept for the next ones while no more of them wait than
+/// `SPARE_STACKS` or as many as are live (which may finish and start again
+/// any moment), and the rest are unmapped with their frames freed.
+fn return_stack(stack: KernelStack, live: usize) {
+    let mut pool = STACK_POOL.lock();
+    pool.free.push(stack);
+    let keep = SPARE_STACKS.max(live);
+    while pool.free.len() > keep && pool.retired.try_reserve(1).is_ok() {
+        let Some(stack) = pool.free.pop() else {
+            break;
+        };
+        let slot = stack.slot();
+        stack.release();
+        let loads = crate::arch::x86_64::smp::root_loads();
+        pool.retired.push((slot, loads));
+    }
+}
+
+/// The memory kernel stacks hold, in bytes: the live activations' and the
+/// spare ones kept mapped (/proc/meminfo's KernelStack).
+pub(super) fn kernel_stack_bytes() -> usize {
+    let live = ACTIVATIONS.lock().len();
+    let spare = STACK_POOL.lock().free.len();
+    (live + spare) * STACK_SIZE
+}
 
 /// Whether the first activation has checked stack switching yet.
 static SWITCHING_VERIFIED: core::sync::atomic::AtomicBool =
@@ -225,15 +281,16 @@ unsafe fn run(activation: *mut Activation) -> Outcome {
     match state {
         State::Parked => Outcome::Parked,
         State::Finished => {
-            let finished = {
+            let (finished, live) = {
                 let mut activations = ACTIVATIONS.lock();
-                activations
+                let finished = activations
                     .iter()
                     .position(|candidate| core::ptr::eq(&raw const **candidate, activation))
-                    .map(|index| activations.remove(index))
+                    .map(|index| activations.remove(index));
+                (finished, activations.len())
             };
             if let Some(finished) = finished {
-                STACK_POOL.lock().free.push(finished.stack);
+                return_stack(finished.stack, live);
             }
             Outcome::Finished
         }
@@ -406,6 +463,16 @@ fn take_stack() -> Option<KernelStack> {
     let mut pool = STACK_POOL.lock();
     if let Some(stack) = pool.free.pop() {
         return Some(stack);
+    }
+    // A retired slot every CPU has flushed is mapped anew; else a slot not
+    // used yet.
+    if let Some(index) = pool
+        .retired
+        .iter()
+        .position(|(_, loads)| crate::arch::x86_64::smp::flushed_since(loads))
+    {
+        let (slot, _) = pool.retired.swap_remove(index);
+        return KernelStack::new(slot);
     }
     let slot = pool.next_slot;
     let stack = KernelStack::new(slot)?;

@@ -8,7 +8,7 @@ use crate::{
     sync::{LockRank, SpinLock},
 };
 
-const CPU_LIMIT: usize = 4;
+pub(crate) const CPU_LIMIT: usize = 4;
 pub(crate) const TRAMPOLINE_PHYSICAL: usize = 0x8000;
 const TRAMPOLINE_VECTOR: u8 = (TRAMPOLINE_PHYSICAL >> 12) as u8;
 const STARTUP_WAIT_LIMIT: usize = 20_000_000;
@@ -434,6 +434,57 @@ fn saved_local_apic() -> Option<LocalApic> {
     LocalApic::from_saved(0, mode, APIC_BASE.load(Ordering::Acquire))
 }
 
+/// How often each CPU has loaded CR3 (counted after the load), which
+/// drops every translation it held of the kernel stack window: none of
+/// them are global.
+static ROOT_LOADS: [AtomicU64; CPU_LIMIT] = [const { AtomicU64::new(0) }; CPU_LIMIT];
+
+/// Application processors halted in their idle loop, which reload CR3
+/// before they run anything when woken: they use no kernel stack window
+/// translation they held before.
+static IDLE: [AtomicBool; CPU_LIMIT] = [const { AtomicBool::new(false) }; CPU_LIMIT];
+
+/// Counts a CR3 load this CPU just made.
+pub(crate) fn note_root_loaded() {
+    if let Some(loads) = ROOT_LOADS.get(cpu::current_cpu_index()) {
+        loads.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Reloads CR3 with the root it holds, dropping this CPU's translations
+/// of the kernel stack window, and counts it.
+fn reload_root() {
+    // SAFETY: loading CR3 with the value it holds changes no mapping; it
+    // only drops the non-global translations.
+    unsafe {
+        asm!(
+            "mov {root}, cr3",
+            "mov cr3, {root}",
+            root = out(reg) _,
+            options(nostack, preserves_flags)
+        );
+    }
+    note_root_loaded();
+}
+
+/// Each CPU's CR3 loads so far, for [`flushed_since`].
+pub(crate) fn root_loads() -> [u64; CPU_LIMIT] {
+    core::array::from_fn(|cpu| ROOT_LOADS[cpu].load(Ordering::Acquire))
+}
+
+/// Whether every online CPU other than this one has loaded CR3 since
+/// `loads` (`root_loads`) were counted or is halted idle, so none still
+/// uses a translation of a kernel stack window page unmapped before then
+/// (this CPU drops its own as it maps the page again).
+pub(crate) fn flushed_since(loads: &[u64; CPU_LIMIT]) -> bool {
+    let current = cpu::current_cpu_index();
+    (0..online_count().min(CPU_LIMIT)).all(|target| {
+        target == current
+            || IDLE[target].load(Ordering::Acquire)
+            || ROOT_LOADS[target].load(Ordering::Acquire) > loads[target]
+    })
+}
+
 /// Records that this CPU is about to load `root` into CR3. Called before the
 /// load, so a CPU changing that root's tables from now on interrupts this one.
 pub(crate) fn note_active_root(root: u64) {
@@ -512,6 +563,11 @@ extern "sysv64" fn interprocessor_interrupt_handler() {
     if cpu >= CPU_LIMIT {
         return;
     }
+    // Woken from its idle halt to run something, as the idle loop does
+    // once it returns.
+    if IDLE[cpu].load(Ordering::Acquire) {
+        reload_root();
+    }
     let generation = IPI_GENERATION[cpu].load(Ordering::Acquire);
     match IPI_COMMAND[cpu].swap(COMMAND_NONE, Ordering::AcqRel) {
         COMMAND_PING => {}
@@ -589,6 +645,10 @@ extern "sysv64" fn application_processor_main(cpu_index: u32) -> ! {
         if cpu::linux_runtime_wants_cpu(cpu) {
             cpu::run_application_processor_runtime(cpu);
         }
+        IDLE[cpu].store(true, Ordering::Release);
         unsafe { asm!("sti; hlt; cli", options(nomem, nostack)) };
+        // Whatever woke it, stale kernel stack translations go first.
+        reload_root();
+        IDLE[cpu].store(false, Ordering::Release);
     }
 }

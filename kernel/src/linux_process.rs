@@ -5353,6 +5353,19 @@ pub(crate) fn live_process_root(pid: u32) -> Option<memory::FrameLease> {
     Some(table.process(handle)?.address_space?.root())
 }
 
+/// Whether `visit` holds for the page-table root of some process of the
+/// domain (zombies whose memory has not gone yet included).
+pub(crate) fn any_live_process_root(mut visit: impl FnMut(u64) -> bool) -> bool {
+    live_process_table_mut().is_some_and(|table| {
+        table.processes.iter().flatten().any(|process| {
+            [&process.address_space, &process.retiring_address_space]
+                .into_iter()
+                .flatten()
+                .any(|space| visit(space.root().address()))
+        })
+    })
+}
+
 pub(crate) fn dispatch_live_init_with_return(value: u64) -> Option<LiveProcessDispatch> {
     let table = live_process_table_mut()?;
     let init = table.init?;

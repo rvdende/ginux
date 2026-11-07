@@ -4250,6 +4250,37 @@ fn visit_linux_leaf_pages(root: u64, visit: &mut impl FnMut(memory::FrameLease) 
     walk(root, 0, visit)
 }
 
+/// Whether the user half of `root` maps any of `frames` (physical page
+/// addresses, sorted), or might: a table that cannot be read, or a large
+/// page over one of them, counts as mapping it.
+pub(crate) fn linux_root_maps_any(root: u64, frames: &[u64]) -> bool {
+    fn walk(table_address: u64, level: usize, frames: &[u64]) -> bool {
+        let Some(table) = mapped_frame::<u64>(table_address) else {
+            return true;
+        };
+        let end = if level == 0 { 256 } else { ENTRY_COUNT };
+        (0..end).any(|index| {
+            let value = unsafe { table.add(index).read() };
+            if value & PRESENT == 0 || value & USER == 0 {
+                return false;
+            }
+            let address = value & ADDRESS_MASK;
+            if level == 3 {
+                return frames.binary_search(&address).is_ok();
+            }
+            if value & LARGE_PAGE != 0 {
+                let size = if level == 1 { 1_u64 << 30 } else { 1 << 21 };
+                let first = frames.partition_point(|frame| *frame < address);
+                return frames
+                    .get(first)
+                    .is_some_and(|frame| *frame < address + size);
+            }
+            walk(address, level + 1, frames)
+        })
+    }
+    !frames.is_empty() && walk(root & ADDRESS_MASK, 0, frames)
+}
+
 /// Counts one more mapping of every private page the user half of `root`
 /// maps, for an address space that copied another's page tables.
 fn share_linux_leaf_pages(root: u64) -> bool {
@@ -15178,6 +15209,7 @@ fn current_root() -> u64 {
 unsafe fn activate(root: u64) {
     crate::arch::x86_64::smp::note_active_root(root);
     asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
+    crate::arch::x86_64::smp::note_root_loaded();
 }
 
 fn mapped_frame<T>(frame: u64) -> Option<*mut T> {

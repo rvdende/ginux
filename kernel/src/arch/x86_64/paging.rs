@@ -1592,8 +1592,8 @@ unsafe fn map_device_window(
 /// when the table exists). Returns false if `address` is outside the window,
 /// unaligned, or already mapped.
 ///
-/// The caller serializes calls. Pages are only ever added to the window,
-/// never removed, so no other CPU can hold a stale translation for them.
+/// The caller serializes calls. A page `unmap_kernel_stack_page` removed
+/// is mapped again only once every CPU has dropped its translation of it.
 pub(crate) fn map_kernel_stack_page(
     address: usize,
     physical: u64,
@@ -1647,8 +1647,52 @@ pub(crate) fn map_kernel_stack_page(
         entries
             .add(index)
             .write(physical | PRESENT | WRITABLE | NO_EXECUTE);
+        // This CPU may still hold the page's translation from before an
+        // unmap on another CPU.
+        asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
     }
     true
+}
+
+/// Unmaps page `address` of the kernel stack window and returns the
+/// frame it mapped, dropping this CPU's translation of it. Other CPUs may
+/// still hold one until they next load CR3 (the window's translations are
+/// not global), so the caller maps nothing at `address` again before every
+/// CPU has (`crate::arch::x86_64::smp::flushed_since`). The page table
+/// stays.
+///
+/// The caller serializes calls, as for `map_kernel_stack_page`.
+pub(crate) fn unmap_kernel_stack_page(address: usize) -> Option<u64> {
+    let offset = address.checked_sub(KERNEL_STACK_WINDOW_BASE)?;
+    if offset >= KERNEL_STACK_WINDOW_SIZE || !offset.is_multiple_of(PAGE_SIZE) {
+        return None;
+    }
+    let directory = PAGING
+        .kernel_stack_directories
+        .get()
+        .cast::<PageTable>()
+        .wrapping_add(offset >> 30)
+        .cast::<u64>();
+    let directory_index = (offset % (1 << 30)) / LARGE_PAGE_SIZE as usize;
+    // SAFETY: as in `map_kernel_stack_page`.
+    let entry = unsafe { directory.add(directory_index).read() };
+    if entry & PRESENT == 0 {
+        return None;
+    }
+    let entries = direct_map_range_address(entry & ADDRESS_MASK as u64, PAGE_SIZE)? as *mut u64;
+    let index = (offset % LARGE_PAGE_SIZE as usize) / PAGE_SIZE;
+    // SAFETY: the table frame is mapped through the direct map and written
+    // only under the caller's serialization; invlpg drops only this CPU's
+    // translation of the page.
+    unsafe {
+        let value = entries.add(index).read();
+        if value & PRESENT == 0 {
+            return None;
+        }
+        entries.add(index).write(0);
+        asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags));
+        Some(value & ADDRESS_MASK as u64)
+    }
 }
 
 /// Programs this CPU's page attribute table, which is per CPU: entry 0 stays

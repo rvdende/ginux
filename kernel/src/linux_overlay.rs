@@ -344,6 +344,9 @@ struct Overlay {
     /// Linked symlinks, so path walks skip looking for them when there are
     /// none.
     symlinks: usize,
+    /// How many path hints there may be before `note_path` forgets the
+    /// names no node has any more.
+    path_hint_limit: usize,
 }
 
 impl Overlay {
@@ -353,6 +356,7 @@ impl Overlay {
         next_generation: 0x8000_0000,
         next_inode: 0x10_000,
         symlinks: 0,
+        path_hint_limit: PATH_HINT_FLOOR,
     };
 }
 
@@ -459,6 +463,51 @@ pub(crate) fn next_shared_mapping(pid: u32, after: Option<u64>) -> Option<(u64, 
         page = mappings.next;
     }
     selected
+}
+
+/// Drops the shared mappings `pid` has registered from `start` up to
+/// `end`, in one pass over the registrations, and returns them (address,
+/// file, offset). munmap and MAP_FIXED looked each page up instead, so a
+/// gigabyte took 262,144 passes over a list long since grown by thousands
+/// of processes' mappings (fork14 after msgstress01: minutes).
+pub(crate) fn take_shared_mappings(pid: u32, start: u64, end: u64) -> Vec<(u64, Handle, usize)> {
+    collect_shared_mappings(pid, start, end, true)
+}
+
+/// The shared mappings `pid` has registered from `start` up to `end`
+/// (address, file, offset), in address order, found in one pass.
+pub(crate) fn shared_mappings_in(pid: u32, start: u64, end: u64) -> Vec<(u64, Handle, usize)> {
+    collect_shared_mappings(pid, start, end, false)
+}
+
+fn collect_shared_mappings(
+    pid: u32,
+    start: u64,
+    end: u64,
+    remove: bool,
+) -> Vec<(u64, Handle, usize)> {
+    let mut taken = Vec::new();
+    let overlay = live_mut();
+    let mut page = overlay.first_mapping_page;
+    while page != FrameLease::EMPTY {
+        let Some(mappings) = mapping_page_mut(page) else {
+            break;
+        };
+        for mapping in mappings.mappings.iter_mut().filter(|mapping| {
+            mapping.active && mapping.pid == pid && (start..end).contains(&mapping.address)
+        }) {
+            if taken.try_reserve(1).is_err() {
+                return taken;
+            }
+            taken.push((mapping.address, mapping.handle, mapping.offset));
+            if remove {
+                *mapping = SharedMapping::EMPTY;
+            }
+        }
+        page = mappings.next;
+    }
+    taken.sort_unstable_by_key(|(address, _, _)| *address);
+    taken
 }
 
 pub(crate) fn remove_shared_mapping(pid: u32, address: u64) -> bool {
@@ -814,7 +863,7 @@ pub(crate) fn link_unnamed_stored(path: &[u8], handle: Handle) -> Result<(), Lin
     if hidden_stored(path) {
         let overlay = live_mut();
         let whiteout = node_by_path_mut(overlay, path).ok_or(LinkError::Failed)?;
-        *whiteout = Node::EMPTY;
+        forget_node(whiteout);
     }
     let node = node_mut(handle).ok_or(LinkError::Gone)?;
     note_path(path);
@@ -980,7 +1029,7 @@ pub(crate) fn release_unmapped_shmem() {
                 && !handle_mapped(overlay, node.handle)
                 && release_node_data(node)
             {
-                *node = Node::EMPTY;
+                forget_node(node);
             }
         }
         page = nodes.next;
@@ -2077,7 +2126,7 @@ fn drop_alias(alias: Handle, file: Handle) -> bool {
     let Some(node) = node_mut(alias) else {
         return false;
     };
-    *node = Node::EMPTY;
+    forget_node(node);
     if let Some(node) = node_mut(file) {
         node.links = node.links.saturating_sub(1).max(1);
     }
@@ -2146,7 +2195,7 @@ pub(crate) fn unlink_below_stored(path: &[u8]) {
                 continue;
             }
             if node.alias_of.is_some() {
-                *node = Node::EMPTY;
+                forget_node(node);
             } else {
                 if node.kind == NodeKind::Symlink && !node.whiteout {
                     symlinks_removed += 1;
@@ -2398,7 +2447,7 @@ pub(crate) fn create_page_cache(size: usize) -> Option<Handle> {
         ..Node::EMPTY
     };
     if !make_node_paged(node) {
-        *node = Node::EMPTY;
+        forget_node(node);
         return None;
     }
     node.size = size;
@@ -2470,7 +2519,7 @@ pub(crate) fn release_page_cache(handle: Handle, file: Handle) -> bool {
     if !release_node_data(node) {
         return false;
     }
-    *node = Node::EMPTY;
+    forget_node(node);
     true
 }
 
@@ -2515,6 +2564,45 @@ pub(crate) fn mapped_shared(handle: Handle) -> bool {
     live().is_some_and(|overlay| handle_mapped(overlay, handle))
 }
 
+/// The frames (physical addresses, sorted) of a paged file whose frames
+/// were handed out to be mapped, which page tables may still hold; None
+/// for any other file.
+pub(crate) fn lent_frames(handle: Handle) -> Option<Vec<u64>> {
+    let node = node(handle).filter(|node| node.paged() && node.frames_lent)?;
+    let mut frames = Vec::new();
+    let mut page = node.first_page;
+    while page != FrameLease::EMPTY {
+        let entries = frame_index_page_mut(page)?;
+        for frame in entries
+            .frames
+            .iter()
+            .filter(|frame| **frame != FrameLease::EMPTY)
+        {
+            frames.try_reserve(1).ok()?;
+            frames.push(frame.address());
+        }
+        page = entries.next;
+    }
+    frames.sort_unstable();
+    Some(frames)
+}
+
+/// The unlinked files of the domain that wait for page tables to let go
+/// of their frames (see [`lent_frames`]).
+pub(crate) fn unlinked_lent() -> Vec<Handle> {
+    let instance = current_instance();
+    let unlinked = UNLINKED.lock();
+    let mut handles = Vec::new();
+    for (_, handle) in unlinked.iter().filter(|(owner, handle)| {
+        *owner == instance && node(*handle).is_some_and(|node| node.paged() && node.frames_lent)
+    }) {
+        if handles.try_reserve(1).is_ok() {
+            handles.push(*handle);
+        }
+    }
+    handles
+}
+
 /// Files that lost their last name, whose data [`reclaim_unlinked`] frees
 /// once nothing has them open: per domain instance.
 static UNLINKED: SpinLock<Vec<(usize, Handle)>> =
@@ -2530,7 +2618,8 @@ fn note_unlinked(handle: Handle) {
 /// Frees the files of this domain that lost their last name and that
 /// nothing has open any more, as Linux frees an inode at its last close:
 /// `in_use` says whether a descriptor, a working directory or a loop device
-/// still holds one. Files with paged data (mapped shared) are left alone.
+/// still holds one, or a page table still maps a frame of one whose
+/// frames were handed out.
 pub(crate) fn reclaim_unlinked(in_use: impl Fn(Handle) -> bool) {
     let instance = current_instance();
     let candidates: Vec<Handle> = UNLINKED
@@ -2568,12 +2657,7 @@ pub(crate) fn reclaim_unlinked(in_use: impl Fn(Handle) -> bool) {
         }
         // A paged file's frames, once handed out, may be mapped (shared, or
         // copy-on-write into private mappings) where no registration says
-        // so; such a file stays until the overlay goes. One paged only to
-        // be read and written at random (a loop device's) goes.
-        if node.paged() && node.frames_lent {
-            settled.push(handle);
-            continue;
-        }
+        // so: `in_use` looks for them in page tables (`lent_frames`).
         if in_use(handle) {
             continue;
         }
@@ -2587,7 +2671,7 @@ pub(crate) fn reclaim_unlinked(in_use: impl Fn(Handle) -> bool) {
                 u64::from(node.charged),
                 1,
             );
-            *node = Node::EMPTY;
+            forget_node(node);
             settled.push(handle);
         }
     }
@@ -3039,6 +3123,13 @@ fn path_hints() -> &'static mut BTreeMap<u64, usize> {
     unsafe { &mut *PATH_HINTS.0.get().cast::<BTreeMap<u64, usize>>().add(index) }
 }
 
+/// Frees node slot `node`, and its node hint: a hint per file ever made
+/// grew the heap for good (linkat02's 65,000 links, 2.6 MB a run).
+fn forget_node(node: &mut Node) {
+    node_hints().remove(&node.handle.inode);
+    *node = Node::EMPTY;
+}
+
 /// FNV-1a of `path`; two paths may share a key, which costs a scan.
 fn path_key(path: &[u8]) -> u64 {
     path.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
@@ -3046,10 +3137,31 @@ fn path_key(path: &[u8]) -> u64 {
     })
 }
 
-/// Records that a node now has the name `path`.
+/// Records that a node now has the name `path`. Names that went with
+/// their nodes are forgotten once the hints have doubled since they were
+/// last counted (a run of tests in fresh temporary directories gave them a
+/// key per file ever made, for good): the hints are made again from the
+/// names the nodes have.
 fn note_path(path: &[u8]) {
-    path_hints().entry(path_key(path)).or_insert(0);
+    let hints = path_hints();
+    hints.entry(path_key(path)).or_insert(0);
+    let overlay = live_mut();
+    if hints.len() <= overlay.path_hint_limit {
+        return;
+    }
+    let mut rebuilt = BTreeMap::new();
+    rebuilt.insert(path_key(path), 0);
+    let _ = for_each_node(overlay, |node| {
+        rebuilt.insert(path_key(node.path()), core::ptr::from_ref(node) as usize);
+        None::<()>
+    });
+    overlay.path_hint_limit = rebuilt.len().saturating_mul(2).max(PATH_HINT_FLOOR);
+    *hints = rebuilt;
 }
+
+/// The fewest path hints [`note_path`] lets build up before it counts them
+/// again.
+const PATH_HINT_FLOOR: usize = 4096;
 
 fn node_mut(handle: Handle) -> Option<&'static mut Node> {
     let overlay = live_mut();

@@ -322,6 +322,24 @@ pub(crate) fn file_writably_mapped(instance: usize, device: u64, inode: u64) -> 
         })
 }
 
+/// Whether some process of `instance` maps a file with inode number
+/// `inode` shared, on any device.
+pub(crate) fn inode_shared_mapped(instance: usize, inode: u64) -> bool {
+    PROCESSES
+        .lock()
+        .iter()
+        .filter(|process| process.instance == instance)
+        .any(|process| {
+            process.areas.iter().any(|area| {
+                area.shared
+                    && matches!(
+                        area.backing,
+                        Backing::File { inode: mapped, .. } if mapped == inode
+                    )
+            })
+        })
+}
+
 /// Records that `pid` moved or resized the mapping of `old_length` bytes
 /// at `old_start` to `new_length` bytes at `new_start` (mremap).
 pub(crate) fn remap(

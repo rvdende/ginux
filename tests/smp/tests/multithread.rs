@@ -16,6 +16,9 @@
 //!    CPUs, which must end them;
 //! 7. `segv`: a thread faults while others spin; the process dies (139).
 //!    Steps 6 and 7 run `EXIT_ROUNDS` times.
+//! 8. `ginux-memtest returns` (userland/memtest): memory comes back after
+//!    bursts of processes, fork-and-exec children and shared mappings of
+//!    removed files.
 //!
 //! Every wait fails at once on a kernel failure line, a wrong status, or a
 //! step that does not finish within its budget.
@@ -86,7 +89,7 @@ fn multithread() {
     guest.send("domain new threads");
     at = guest.wait_for("ginux> ", at, Duration::from_secs(20));
     guest.send(&format!(
-        "domain set threads image=builtin://rust init=/sbin/init cpu={cpus}"
+        "domain set threads image=builtin://rust init=/sbin/init memory-mib=1024 cpu={cpus}"
     ));
     at = guest.wait_for("settings accepted", at, Duration::from_secs(20));
     guest.send("domain start threads --attach");
@@ -123,6 +126,10 @@ fn multithread() {
     for round in 0..EXIT_ROUNDS {
         shell.expect(&format!("EXIT{round}"), "ginux-threadtest exit", 7, Some("THREADTEST OK exit"));
         shell.expect(&format!("SEGV{round}"), "ginux-threadtest segv", 139, None);
+    }
+    let returns = shell.expect("RETURNS", "ginux-memtest returns", 0, Some("RETURNS OK"));
+    for line in returns.lines().filter(|line| line.starts_with("RETURNS ")) {
+        eprintln!("multithread: {line}");
     }
     // The shell still works after all that.
     shell.expect("AFTER", "echo still''alive", 0, Some("stillalive"));

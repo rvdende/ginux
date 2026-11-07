@@ -28314,13 +28314,11 @@ fn linux_runtime_mmap(
         return mapped;
     }
     if replace {
-        for page in 0..pages {
-            let page_address = mapping + (page * PAGE_SIZE) as u64;
-            let _ = crate::linux_overlay::remove_shared_mapping(
-                current_linux_process_pid(),
-                page_address,
-            );
-        }
+        let _ = crate::linux_overlay::take_shared_mappings(
+            current_linux_process_pid(),
+            mapping,
+            mapping + (pages * PAGE_SIZE) as u64,
+        );
     }
     for (installed, page) in (0..pages).enumerate() {
         let page_address = mapping + (page * PAGE_SIZE) as u64;
@@ -28514,18 +28512,23 @@ fn linux_map_shared_memfd(
     replace: bool,
     size: Option<usize>,
 ) -> u64 {
-    let pid = current_linux_process_pid();
+    if replace {
+        let end = mapping + (pages * PAGE_SIZE) as u64;
+        for (address, handle, offset) in
+            crate::linux_overlay::take_shared_mappings(current_linux_process_pid(), mapping, end)
+        {
+            let _ = linux_flush_shared_file_page(address, handle, offset);
+        }
+    }
     for page in 0..pages {
         let address = mapping + (page * PAGE_SIZE) as u64;
-        if replace {
-            let _ = linux_flush_shared_mapping_page(pid, address);
-            let _ = crate::linux_overlay::remove_shared_mapping(pid, address);
-            if !release_linux_runtime_page(address_space::remove_current_linux_runtime_page(
+        if replace
+            && !release_linux_runtime_page(address_space::remove_current_linux_runtime_page(
                 address,
-            )) {
-                let _ = rollback_linux_runtime_mapping(mapping, page);
-                return LINUX_ENOMEM;
-            }
+            ))
+        {
+            let _ = rollback_linux_runtime_mapping(mapping, page);
+            return LINUX_ENOMEM;
         }
         if size.is_some_and(|size| start + page * PAGE_SIZE >= size.next_multiple_of(PAGE_SIZE)) {
             if address_space::reserve_current_linux_past_eof_page(address, protection, false)
@@ -28863,6 +28866,7 @@ fn release_linux_process_shared_mappings(pid: u32) {
     crate::linux_overlay::release_unmapped_shmem();
     crate::linux_areas::forget(linux_execution_instance(), pid);
     crate::linux_userfaultfd::forget(linux_execution_instance(), pid, 0, 1 << 47);
+    linux_reclaim_unmapped_files();
 }
 
 /// Records the segments exec mapped for the new program: the executable's
@@ -29510,9 +29514,12 @@ fn linux_msync(address: u64, length: u64, flags: u64) -> u64 {
         if !address_space::current_linux_runtime_page(page_address).occupied {
             return LINUX_ENOMEM;
         }
-        if crate::linux_overlay::shared_mapping(current_linux_process_pid(), page_address).is_some()
-            && !linux_flush_shared_mapping_page(current_linux_process_pid(), page_address)
-        {
+    }
+    let end = address + (pages * PAGE_SIZE) as u64;
+    for (page_address, handle, offset) in
+        crate::linux_overlay::shared_mappings_in(current_linux_process_pid(), address, end)
+    {
+        if !linux_flush_shared_file_page(page_address, handle, offset) {
             return LINUX_EIO;
         }
     }
@@ -29523,6 +29530,16 @@ fn linux_flush_shared_mapping_page(pid: u32, address: u64) -> bool {
     let Some((handle, offset)) = crate::linux_overlay::shared_mapping(pid, address) else {
         return true;
     };
+    linux_flush_shared_file_page(address, handle, offset)
+}
+
+/// Writes the page the current process maps at `address`, page `offset`
+/// of `handle` shared, back to the file.
+fn linux_flush_shared_file_page(
+    address: u64,
+    handle: crate::linux_overlay::Handle,
+    offset: usize,
+) -> bool {
     let Some(metadata) = crate::linux_overlay::metadata(handle) else {
         return false;
     };
@@ -34575,6 +34592,8 @@ fn linux_rootfs_execve_source(
         let Some([replacement]) = memory::allocate_frames::<1>(memory::FrameOwner::KERNEL) else {
             return false;
         };
+        let shared = address_space::current_linux_runtime_page(address as u64).shared;
+        let mut old = None;
         let installed = address_space::prepare_linux_frame(replacement.address(), &[])
             && address_space::install_current_linux_runtime_page(
                 address as u64,
@@ -34583,6 +34602,7 @@ fn linux_rootfs_execve_source(
                 false,
                 true,
             )
+            .inspect(|frame| old = *frame)
             .is_some()
             && linux_process::replace_live_process_mapping_for_exec(
                 pid,
@@ -34594,8 +34614,17 @@ fn linux_rootfs_execve_source(
             );
         if !installed {
             let _ = memory::scrub_and_release_frames(memory::FrameOwner::KERNEL, &[replacement]);
+            return false;
         }
-        installed
+        // The old program's private page loses this mapping, as a segment
+        // page does above: freed unless a fork parent or child still maps
+        // it. Dropping it here instead left one mapping count on it for
+        // good, and the page with it (16 heap pages and the stack's, every
+        // exec).
+        old.filter(|frame| {
+            !shared && memory::frame_leases_releasable(memory::FrameOwner::KERNEL, &[*frame])
+        })
+        .is_none_or(address_space::release_linux_private_page)
     };
     let heap_base = X86_RUNTIME.ELF_PROBE_BRK_LIMIT.load(Ordering::SeqCst) as usize
         - LINUX_RUNTIME_HEAP_PAGES * PAGE_SIZE;
@@ -54259,6 +54288,7 @@ fn linux_proc_meminfo() -> &'static [u8] {
     let (total, free) = (total * 4, free * 4);
     let used = total - free;
     let huge = linux_huge_page_counts();
+    let kernel_stack = activation::kernel_stack_bytes() / 1024;
     // SAFETY: the kernel is single-processor and readers copy the bytes
     // before another /proc/meminfo read can rewrite them.
     let buffer = unsafe { &mut *core::ptr::addr_of_mut!(MEMINFO) };
@@ -54271,6 +54301,7 @@ fn linux_proc_meminfo() -> &'static [u8] {
              Cached:         {zero:>10} kB\nSwapCached:     {zero:>10} kB\n\
              Active:         {used:>10} kB\nInactive:       {zero:>10} kB\n\
              SwapTotal:      {zero:>10} kB\nSwapFree:       {zero:>10} kB\n\
+             KernelStack:    {kernel_stack:>10} kB\n\
              CommitLimit:    {total:>10} kB\nCommitted_AS:   {used:>10} kB\n\
              VmallocTotal:   13743895347199 kB\n\
              HugePages_Total:   {huge_total:>5}\nHugePages_Free:    {huge_free:>5}\n\
@@ -60666,12 +60697,47 @@ pub(crate) fn linux_reclaim_unlinked_files() {
     };
     crate::linux_overlayfs::reclaim(linux_generation_in_use);
     crate::linux_overlay::reclaim_unlinked(|handle| {
-        in_use(crate::linux_overlay::generation(handle)) || crate::linux_loop::backs(handle)
+        in_use(crate::linux_overlay::generation(handle))
+            || crate::linux_loop::backs(handle)
+            || linux_lent_file_mapped(handle)
     });
     if crate::linux_blockfs::has_orphans() {
         for source in crate::linux_blockfs::reclaim(in_use) {
             linux_release_volume_device(source);
         }
+    }
+}
+
+/// Whether a page table may still map a frame of overlay file `handle`
+/// that was handed out to be mapped (a shared mapping's): a memory area
+/// mapping it shared says so cheaply, and failing that every page table
+/// of the domain is searched, as an area can be missing where the page
+/// tables still map it.
+fn linux_lent_file_mapped(handle: crate::linux_overlay::Handle) -> bool {
+    let Some(frames) = crate::linux_overlay::lent_frames(handle) else {
+        return false;
+    };
+    if frames.is_empty() {
+        return false;
+    }
+    if crate::linux_areas::inode_shared_mapped(linux_execution_instance(), handle.inode()) {
+        return true;
+    }
+    let maps = |root: u64| address_space::linux_root_maps_any(root, &frames);
+    scheduler::current_address_space_root().is_some_and(maps)
+        || linux_process::any_live_process_root(maps)
+}
+
+/// Frees the unlinked files whose frames a mapping just let go of, once
+/// no memory area maps them shared any more (the page tables are checked
+/// then too).
+fn linux_reclaim_unmapped_files() {
+    let instance = linux_execution_instance();
+    if crate::linux_overlay::unlinked_lent()
+        .into_iter()
+        .any(|handle| !crate::linux_areas::inode_shared_mapped(instance, handle.inode()))
+    {
+        linux_reclaim_unlinked_files();
     }
 }
 
@@ -67475,6 +67541,7 @@ pub(crate) fn activate_user_root(root: u64) -> bool {
         asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
         asm!("mov {}, cr3", out(reg) active, options(nomem, nostack, preserves_flags));
     }
+    super::smp::note_root_loaded();
     active & ADDRESS_MASK == root
 }
 
