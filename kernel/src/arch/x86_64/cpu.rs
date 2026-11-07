@@ -12,6 +12,7 @@ use super::{paging, timer};
 mod activation;
 mod architecture;
 mod execution;
+mod fanotify;
 mod linux_abi;
 mod linux_fsmount;
 mod linux_futex;
@@ -40,6 +41,7 @@ use execution::{
     save_linux_process_extended_state, save_linux_thread_extended_state,
     switch_linux_thread_extended_state, ExtendedState, EXTENDED_STATE_SIZE,
 };
+use fanotify::*;
 pub(crate) use linux_abi::*;
 use linux_fsmount::*;
 use linux_futex::*;
@@ -3028,6 +3030,7 @@ fn settle_linux_process_exit(pid: u32, status: u8) -> bool {
     linux_release_process_cgroup(pid);
     release_linux_process_shared_mappings(pid);
     release_linux_process_keys(pid);
+    linux_fanotify_exit(pid);
     if let Some(state) = linux_process_runtime_state(pid) {
         release_linux_process_descriptors(pid, state);
         *state = LinuxProcessRuntimeState::EMPTY;
@@ -7213,6 +7216,7 @@ fn execute_deferred_live_fork() -> bool {
     linux_release_process_cgroup(child.pid);
     release_linux_process_shared_mappings(child.pid);
     release_linux_process_keys(child.pid);
+    linux_fanotify_exit(child.pid);
     let mut left_namespace = None;
     if let Some(child_state_slot) = linux_process_runtime_state(child.pid) {
         release_linux_process_descriptors(child.pid, child_state_slot);
@@ -16126,6 +16130,7 @@ fn linux_init_exit_kill_others_live_return(
                 let _ = release_linux_process_runtime_slot(pid);
                 release_linux_process_shared_mappings(pid);
                 release_linux_process_keys(pid);
+                linux_fanotify_exit(pid);
                 linux_landlock_exit(pid);
             }
         }
@@ -18762,6 +18767,7 @@ fn release_linux_runtime_mmaps(expected_base: u64) -> bool {
     let address_cleared = X86_RUNTIME.ELF_PROBE_MMAP.swap(0, Ordering::SeqCst) == expected_base;
     release_linux_process_shared_mappings(pid);
     release_linux_process_keys(pid);
+    linux_fanotify_exit(pid);
     shared_flushed
         && address_valid
         && address_cleared
@@ -32432,9 +32438,12 @@ fn linux_proc_fdinfo_target(path: &[u8]) -> Option<u64> {
             .then(|| value.checked_mul(10)?.checked_add(u64::from(byte - b'0')))
             .flatten()
     })?;
-    // A pidfd's (its process) and an inotify descriptor's (its watches).
-    (linux_pidfd_descriptor(descriptor) || linux_inotify_descriptor(descriptor))
-        .then_some(descriptor)
+    // A pidfd's (its process), an inotify descriptor's (its watches) and a
+    // fanotify group's (its marks).
+    (linux_pidfd_descriptor(descriptor)
+        || linux_inotify_descriptor(descriptor)
+        || linux_fanotify_descriptor(descriptor))
+    .then_some(descriptor)
 }
 
 /// The command name (comm) of process `pid`, in `name`: the running
@@ -43913,6 +43922,22 @@ fn linux_regular_file_read_at(descriptor: u64, address: u64, count: u64, offset:
                 LINUX_EFAULT
             };
         }
+        if let Some(file) = linux_fanotify_fdinfo(target) {
+            let Ok(start) = usize::try_from(offset) else {
+                return 0;
+            };
+            if start >= file.len() || count == 0 {
+                return 0;
+            }
+            let end = start
+                .saturating_add(usize::try_from(count).unwrap_or(usize::MAX))
+                .min(file.len());
+            return if copy_to_linux_user(address, &file[start..end]) {
+                (end - start) as u64
+            } else {
+                LINUX_EFAULT
+            };
+        }
         let Some(pid) = linux_pidfd_process(target) else {
             return LINUX_ENOENT;
         };
@@ -49888,438 +49913,6 @@ fn linux_inotify_descriptor(descriptor: u64) -> bool {
     linux_device_descriptor(descriptor) & !3 == LINUX_DEVICE_INOTIFY
 }
 
-fn linux_fanotify_descriptor(descriptor: u64) -> bool {
-    linux_device_descriptor(descriptor) & !3 == LINUX_DEVICE_FANOTIFY
-}
-
-/// The group a descriptor stands for: its domain and its open file
-/// description's id.
-fn linux_fanotify_key(descriptor: u64) -> Option<(usize, u64)> {
-    if !linux_fanotify_descriptor(descriptor) {
-        return None;
-    }
-    linux_descriptor_open_file_id(descriptor).map(|id| (linux_execution_instance(), id))
-}
-
-fn linux_fanotify_init(flags: u64, event_flags: u64) -> u64 {
-    const FAN_CLOEXEC: u32 = 0x1;
-    const FAN_NONBLOCK: u32 = 0x2;
-    const CLASS_BITS: u32 = 0xc;
-    const FAN_UNLIMITED_QUEUE: u32 = 0x10;
-    const FAN_UNLIMITED_MARKS: u32 = 0x20;
-    const FAN_REPORT_PIDFD: u32 = 0x80;
-    const FAN_REPORT_FID: u32 = 0x200;
-    const FAN_REPORT_DIR_FID: u32 = 0x400;
-    const FAN_REPORT_NAME: u32 = 0x800;
-    const FAN_REPORT_TARGET_FID: u32 = 0x1000;
-    const FID_BITS: u32 =
-        FAN_REPORT_FID | FAN_REPORT_DIR_FID | FAN_REPORT_NAME | FAN_REPORT_TARGET_FID;
-    const INIT_FLAGS: u32 = FAN_CLOEXEC
-        | FAN_NONBLOCK
-        | CLASS_BITS
-        | FID_BITS
-        | crate::linux_fanotify::FAN_REPORT_TID
-        | FAN_REPORT_PIDFD
-        | FAN_UNLIMITED_QUEUE
-        | FAN_UNLIMITED_MARKS;
-    const ADMIN_FLAGS: u32 = CLASS_BITS | FAN_UNLIMITED_QUEUE | FAN_UNLIMITED_MARKS;
-    const O_DSYNC: u32 = 0x1000;
-    const O_SYNC: u32 = 0x10_1000;
-    const EVENT_FLAGS: u32 = 3
-        | LINUX_O_APPEND as u32
-        | LINUX_O_NONBLOCK as u32
-        | O_SYNC
-        | O_DSYNC
-        | LINUX_O_CLOEXEC as u32
-        | LINUX_O_LARGEFILE as u32
-        | LINUX_O_NOATIME as u32;
-    let flags = flags as u32;
-    let event_flags = event_flags as u32;
-    let fid_mode = flags & FID_BITS;
-    // Without CAP_SYS_ADMIN only a notification group reporting file
-    // handles may be made, as in Linux (the kernel outside a process is
-    // root).
-    let privileged = current_linux_credentials()
-        .is_none_or(|credentials| credentials.has(ginux_credentials::capability::SYS_ADMIN));
-    if !privileged && (flags & ADMIN_FLAGS != 0 || fid_mode == 0) {
-        return LINUX_EPERM;
-    }
-    if flags & !INIT_FLAGS != 0
-        || flags & FAN_REPORT_PIDFD != 0 && flags & crate::linux_fanotify::FAN_REPORT_TID != 0
-        || event_flags & !EVENT_FLAGS != 0
-        || event_flags & 3 == 3
-        || fid_mode != 0 && flags & CLASS_BITS != 0
-        || fid_mode & FAN_REPORT_NAME != 0 && fid_mode & FAN_REPORT_DIR_FID == 0
-        || fid_mode & FAN_REPORT_TARGET_FID != 0
-            && fid_mode & (FAN_REPORT_NAME | FAN_REPORT_FID) != FAN_REPORT_NAME | FAN_REPORT_FID
-        || flags & CLASS_BITS == CLASS_BITS
-    {
-        return LINUX_EINVAL;
-    }
-    // Events with file handles or pidfds are not reported yet: such a
-    // group is refused as by a kernel without them.
-    if fid_mode != 0 || flags & FAN_REPORT_PIDFD != 0 {
-        return LINUX_EINVAL;
-    }
-    let Some(descriptor) = (LINUX_AUX_DESCRIPTOR_FIRST..LINUX_AUX_DESCRIPTOR_LIMIT)
-        .find(|descriptor| linux_aux_descriptor_free(*descriptor))
-    else {
-        return LINUX_EMFILE;
-    };
-    let index = (descriptor - LINUX_AUX_DESCRIPTOR_FIRST) as usize;
-    X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index]
-        .store(LINUX_DEVICE_FANOTIFY | 3, Ordering::SeqCst);
-    X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index].store(
-        if flags & FAN_NONBLOCK != 0 {
-            LINUX_O_NONBLOCK as u32
-        } else {
-            0
-        },
-        Ordering::SeqCst,
-    );
-    let created = match linux_descriptor_open_file_id(descriptor) {
-        Some(id) => crate::linux_fanotify::create(
-            linux_execution_instance(),
-            id,
-            current_linux_process_pid(),
-            (flags, event_flags | LINUX_O_LARGEFILE as u32),
-        ),
-        None => Err(crate::linux_fanotify::Error::NoMemory),
-    };
-    if let Err(error) = created {
-        X86_RUNTIME.ELF_PROBE_DEVICE_DESCRIPTORS[index].store(0, Ordering::SeqCst);
-        X86_RUNTIME.ELF_PROBE_SOCKET_FLAGS[index].store(0, Ordering::SeqCst);
-        return match error {
-            crate::linux_fanotify::Error::TooMany => LINUX_EMFILE,
-            _ => LINUX_ENOMEM,
-        };
-    }
-    set_linux_descriptor_close_on_exec(descriptor, flags & FAN_CLOEXEC != 0);
-    descriptor
-}
-
-/// Whether canonical `path` names something fanotify reports with a
-/// descriptor: a regular file (false) or a directory (true).
-fn linux_fanotify_object_kind(path: &[u8]) -> Option<bool> {
-    if path.is_empty() {
-        return Some(true);
-    }
-    if let Some(metadata) = crate::linux_overlay::lookup(path) {
-        return match metadata.kind {
-            crate::linux_overlay::NodeKind::File => Some(false),
-            crate::linux_overlay::NodeKind::Directory => Some(true),
-            _ => None,
-        };
-    }
-    if crate::linux_overlay::hidden(path) {
-        return None;
-    }
-    let (_, entry) =
-        crate::published_rootfs::lookup_metadata_at(crate::published_rootfs::ROOT_HANDLE, path)?;
-    match entry.map(|entry| entry.kind) {
-        None | Some(crate::published_rootfs::EntryKind::Directory) => Some(true),
-        Some(
-            crate::published_rootfs::EntryKind::File | crate::published_rootfs::EntryKind::Hardlink,
-        ) => Some(false),
-        Some(crate::published_rootfs::EntryKind::Symlink) => None,
-    }
-}
-
-/// The object at canonical `path` as fanotify's marks see it, when it is
-/// one fanotify reports.
-fn linux_fanotify_object(path: &[u8]) -> Option<crate::linux_fanotify::Object<'_>> {
-    let directory = linux_fanotify_object_kind(path)?;
-    let mount = if crate::linux_fanotify::mount_marks() {
-        crate::linux_mounts::mount_id_at(linux_mount_space(), path)
-    } else {
-        0
-    };
-    Some(crate::linux_fanotify::Object {
-        path,
-        directory,
-        mount,
-    })
-}
-
-/// The process and thread making the current call.
-fn linux_fanotify_cause() -> crate::linux_fanotify::Cause {
-    let pid = current_linux_process_pid();
-    crate::linux_fanotify::Cause {
-        pid,
-        tid: current_linux_tid().unwrap_or(pid),
-    }
-}
-
-/// Events `mask` happened to the file or directory at canonical `path`.
-fn linux_fanotify_event(path: &[u8], mask: u32) {
-    if !crate::linux_fanotify::active() {
-        return;
-    }
-    let Some(object) = linux_fanotify_object(path) else {
-        return;
-    };
-    if crate::linux_fanotify::notify(
-        linux_execution_instance(),
-        object,
-        mask,
-        linux_fanotify_cause(),
-    ) {
-        wake_linux_descriptor_waits();
-    }
-}
-
-/// Before system call `number` with `arguments`: an open (FAN_OPEN_PERM)
-/// or a read (FAN_ACCESS_PERM) of a file that a permission mark covers
-/// waits until the groups that heard of it answer. Returns the call's
-/// result when it does not go on: EPERM when a group denied it, or a
-/// restart while one has not answered.
-fn linux_fanotify_permission_check(
-    number: u64,
-    arguments: [u64; 3],
-    output: *mut LinuxSyscallFrame,
-    caller: LinuxUserContext,
-) -> Option<u64> {
-    use crate::linux_fanotify::{Permission, FAN_ACCESS_PERM, FAN_OPEN_PERM};
-    let at = u64::from(LINUX_AT_FDCWD);
-    let (path, mask) = match number {
-        LINUX_READ_SYSCALL
-        | LINUX_PREAD64_SYSCALL
-        | LINUX_READV_SYSCALL
-        | LINUX_PREADV_SYSCALL
-        | LINUX_PREADV2_SYSCALL => {
-            if linux_device_descriptor(u64::from(arguments[0] as u32)) & LINUX_DESCRIPTOR_INPUT == 0
-            {
-                return None;
-            }
-            (
-                linux_inotify_descriptor_path(arguments[0])?,
-                FAN_ACCESS_PERM,
-            )
-        }
-        // Only a file already there is asked about: one the call creates
-        // is not there to check yet.
-        LINUX_OPEN_SYSCALL | LINUX_CREAT_SYSCALL | LINUX_OPENAT_SYSCALL => {
-            let (directory, address, flags) = match number {
-                LINUX_OPEN_SYSCALL => (at, arguments[0], arguments[1]),
-                LINUX_CREAT_SYSCALL => (at, arguments[0], 0),
-                _ => (arguments[0], arguments[1], arguments[2]),
-            };
-            let path = linux_inotify_path_at(directory, address)?;
-            if flags & LINUX_O_NOFOLLOW != 0 {
-                (path, FAN_OPEN_PERM)
-            } else {
-                let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
-                canonical.get_mut(..path.len())?.copy_from_slice(&path);
-                let length = linux_overlay_lookup_following(&mut canonical, path.len(), true)
-                    .ok()?
-                    .0;
-                (linux_heap_path(&canonical[..length])?, FAN_OPEN_PERM)
-            }
-        }
-        _ => return None,
-    };
-    let object =
-        linux_fanotify_object(&path).filter(|object| mask == FAN_OPEN_PERM || !object.directory)?;
-    match crate::linux_fanotify::permission(
-        linux_execution_instance(),
-        object,
-        mask,
-        linux_fanotify_cause(),
-    ) {
-        Permission::Allowed => None,
-        Permission::Denied => Some(LINUX_EPERM),
-        Permission::Asked => {
-            wake_linux_descriptor_waits();
-            Some(linux_retry_later_live_return(output, caller, number))
-        }
-        Permission::Waiting => Some(linux_retry_later_live_return(output, caller, number)),
-    }
-}
-
-fn linux_fanotify_mark(
-    descriptor: u64,
-    flags: u64,
-    mask: u64,
-    directory: u64,
-    path_address: u64,
-) -> u64 {
-    use crate::linux_fanotify::{
-        Change, Command, MarkKind, EVENT_FLAGS, FAN_EVENT_ON_CHILD, FAN_FS_ERROR, FAN_ONDIR,
-        INODE_EVENTS, PATH_EVENTS, PERMISSION_EVENTS, VALID_MASK,
-    };
-    const FAN_MARK_ADD: u32 = 0x1;
-    const FAN_MARK_REMOVE: u32 = 0x2;
-    const FAN_MARK_DONT_FOLLOW: u32 = 0x4;
-    const FAN_MARK_ONLYDIR: u32 = 0x8;
-    const FAN_MARK_MOUNT: u32 = 0x10;
-    const FAN_MARK_IGNORED_MASK: u32 = 0x20;
-    const FAN_MARK_IGNORED_SURV_MODIFY: u32 = 0x40;
-    const FAN_MARK_FLUSH: u32 = 0x80;
-    const FAN_MARK_FILESYSTEM: u32 = 0x100;
-    const FAN_MARK_EVICTABLE: u32 = 0x200;
-    const FAN_MARK_IGNORE: u32 = 0x400;
-    const TYPE_BITS: u32 = FAN_MARK_MOUNT | FAN_MARK_FILESYSTEM;
-    const COMMAND_BITS: u32 = FAN_MARK_ADD | FAN_MARK_REMOVE | FAN_MARK_FLUSH;
-    const IGNORE_BITS: u32 = FAN_MARK_IGNORED_MASK | FAN_MARK_IGNORE;
-    const VALID_FLAGS: u32 = TYPE_BITS
-        | COMMAND_BITS
-        | IGNORE_BITS
-        | FAN_MARK_DONT_FOLLOW
-        | FAN_MARK_ONLYDIR
-        | FAN_MARK_IGNORED_SURV_MODIFY
-        | FAN_MARK_EVICTABLE;
-    const CLASS_BITS: u32 = 0xc;
-    let descriptor = u64::from(descriptor as u32);
-    let flags = flags as u32;
-    // Only the lower 32 bits of the mask mean anything yet.
-    let Ok(mut mask) = u32::try_from(mask) else {
-        return LINUX_EINVAL;
-    };
-    let mark_type = flags & TYPE_BITS;
-    let command = flags & COMMAND_BITS;
-    let ignore = flags & IGNORE_BITS;
-    if flags & !VALID_FLAGS != 0
-        || mark_type == TYPE_BITS
-        || match command {
-            FAN_MARK_ADD | FAN_MARK_REMOVE => mask == 0,
-            FAN_MARK_FLUSH => flags & !(TYPE_BITS | FAN_MARK_FLUSH) != 0,
-            _ => true,
-        }
-        || mask & !VALID_MASK != 0
-        || ignore == IGNORE_BITS
-    {
-        return LINUX_EINVAL;
-    }
-    // A legacy ignore mask has no event flags.
-    if ignore == FAN_MARK_IGNORED_MASK {
-        mask &= !EVENT_FLAGS;
-    }
-    if !linux_descriptor_open(descriptor) {
-        return LINUX_EBADF;
-    }
-    let Some((domain, group)) = linux_fanotify_key(descriptor) else {
-        return LINUX_EINVAL;
-    };
-    let Some((group_flags, _)) = crate::linux_fanotify::flags(domain, group) else {
-        return LINUX_EINVAL;
-    };
-    // Permission events need a content class; an error event a filesystem
-    // mark; an evictable mark an inode; and the events without a file to
-    // open a group reporting file handles, which Ginux does not make.
-    if mask & PERMISSION_EVENTS != 0 && group_flags & CLASS_BITS == 0
-        || mask & FAN_FS_ERROR != 0 && mark_type != FAN_MARK_FILESYSTEM
-        || flags & FAN_MARK_EVICTABLE != 0 && mark_type != 0
-        || mask & !(PATH_EVENTS | PERMISSION_EVENTS | EVENT_FLAGS) != 0
-    {
-        return LINUX_EINVAL;
-    }
-    if command == FAN_MARK_FLUSH {
-        return match crate::linux_fanotify::flush(
-            domain,
-            group,
-            mark_type == FAN_MARK_MOUNT,
-            mark_type == FAN_MARK_FILESYSTEM,
-        ) {
-            Ok(()) => 0,
-            Err(_) => LINUX_EINVAL,
-        };
-    }
-    let mut canonical = [0_u8; crate::linux_overlay::PATH_CAPACITY];
-    let length = if path_address == 0 {
-        // No path: the mark goes on what `directory` refers to.
-        let directory = u64::from(directory as u32);
-        if let Some(path) = (directory != u64::from(LINUX_AT_FDCWD))
-            .then(|| linux_descriptor_canonical_path(directory))
-            .flatten()
-        {
-            canonical[..path.len()].copy_from_slice(&path);
-            path.len()
-        } else {
-            match linux_walk_start(directory, &mut canonical) {
-                Ok(length) => length,
-                Err(error) => return error,
-            }
-        }
-    } else {
-        let mut path = [0_u8; LINUX_PATH_MAX];
-        let path_length = match copy_linux_c_string(path_address, &mut path) {
-            Ok(length) => length,
-            Err(error) => return error,
-        };
-        let length = match linux_canonical_path_at(directory, &path[..path_length], &mut canonical)
-        {
-            Ok(length) => length,
-            // The root has an empty canonical path.
-            Err(LINUX_EISDIR) => 0,
-            Err(error) => return error,
-        };
-        if flags & FAN_MARK_DONT_FOLLOW == 0 {
-            match linux_overlay_lookup_following(&mut canonical, length, true) {
-                Ok((length, ..)) => length,
-                Err(error) => return error,
-            }
-        } else {
-            length
-        }
-    };
-    let path = &canonical[..length];
-    let exists = linux_inotify_exists(path)
-        || LinuxCharacterDevice::from_canonical(path).is_some()
-        || linux_api_directory(path);
-    if !exists {
-        return LINUX_ENOENT;
-    }
-    let is_directory = linux_inotify_is_directory(path) || linux_api_directory(path);
-    if flags & FAN_MARK_ONLYDIR != 0 && !is_directory {
-        return LINUX_ENOTDIR;
-    }
-    let inode = mark_type == 0;
-    if command == FAN_MARK_ADD {
-        // FAN_MARK_IGNORE is strict about events only a directory has.
-        let directory_only = FAN_ONDIR | FAN_EVENT_ON_CHILD | INODE_EVENTS;
-        if ignore == FAN_MARK_IGNORE && inode && !is_directory && mask & directory_only != 0 {
-            return LINUX_ENOTDIR;
-        }
-        if ignore == FAN_MARK_IGNORE
-            && flags & FAN_MARK_IGNORED_SURV_MODIFY == 0
-            && (!inode || is_directory)
-        {
-            return if inode { LINUX_EISDIR } else { LINUX_EINVAL };
-        }
-    }
-    // Only a directory's inode mark hears its entries.
-    if !inode || !is_directory {
-        mask &= !FAN_EVENT_ON_CHILD;
-    }
-    let kind = match mark_type {
-        FAN_MARK_MOUNT => {
-            MarkKind::Mount(crate::linux_mounts::mount_id_at(linux_mount_space(), path))
-        }
-        FAN_MARK_FILESYSTEM => {
-            MarkKind::Filesystem(crate::linux_mounts::mount_id_at(linux_mount_space(), path))
-        }
-        _ => MarkKind::Inode,
-    };
-    let change = Change {
-        mask,
-        ignore: ignore != 0,
-        ignore_flags: ignore == FAN_MARK_IGNORE,
-        survive_modify: flags & FAN_MARK_IGNORED_SURV_MODIFY != 0,
-    };
-    let command = if command == FAN_MARK_ADD {
-        Command::Add
-    } else {
-        Command::Remove
-    };
-    match crate::linux_fanotify::mark(domain, group, command, kind, path, change) {
-        Ok(()) => 0,
-        Err(crate::linux_fanotify::Error::NotFound) => LINUX_ENOENT,
-        Err(crate::linux_fanotify::Error::NoMemory) => LINUX_ENOMEM,
-        Err(crate::linux_fanotify::Error::TooMany) => LINUX_ENOSPC,
-        Err(crate::linux_fanotify::Error::Invalid) => LINUX_EINVAL,
-    }
-}
-
 /// The kernel's own directories under /sys that are there without the
 /// overlay holding them (mount points for their filesystems).
 fn linux_api_directory(path: &[u8]) -> bool {
@@ -50333,138 +49926,6 @@ fn linux_api_directory(path: &[u8]) -> bool {
             | b"sys/kernel/security"
             | b"sys/fs/pstore"
     )
-}
-
-/// Opens canonical `path` for a listener, with its group's event_f_flags;
-/// what the listener does with it raises no events.
-fn linux_fanotify_open(path: &[u8], flags: u32) -> Option<i32> {
-    let mut absolute = [0_u8; LINUX_PATH_MAX];
-    let length = path.len() + 1;
-    absolute.get_mut(1..length)?.copy_from_slice(path);
-    absolute[0] = b'/';
-    let descriptor = linux_openat_path(
-        u64::from(LINUX_AT_FDCWD),
-        absolute,
-        length,
-        u64::from(flags),
-        0,
-    );
-    let event_descriptor = i32::try_from(descriptor).ok()?;
-    let flags = usize::try_from(descriptor)
-        .ok()
-        .and_then(|index| X86_RUNTIME.ELF_PROBE_STDIO_SOCKET_FLAGS.get(index))
-        .or_else(|| {
-            X86_RUNTIME
-                .ELF_PROBE_SOCKET_FLAGS
-                .get(linux_socket_descriptor_index(descriptor)?)
-        });
-    if let Some(flags) = flags {
-        flags.fetch_or(LINUX_PRIVATE_NONOTIFY_DESCRIPTOR, Ordering::SeqCst);
-    }
-    Some(event_descriptor)
-}
-
-/// read(2) on a group: as many queued events as fit, each with a
-/// descriptor of its object opened for the reader.
-fn linux_fanotify_read(descriptor: u64, address: u64, count: u64) -> Option<u64> {
-    use crate::linux_fanotify::EVENT_METADATA_SIZE;
-    const METADATA_VERSION: u8 = 3;
-    let (domain, group) = linux_fanotify_key(descriptor)?;
-    let (_, event_flags) = crate::linux_fanotify::flags(domain, group)?;
-    let capacity = usize::try_from(count).unwrap_or(usize::MAX) / EVENT_METADATA_SIZE;
-    if capacity == 0 {
-        return Some(if crate::linux_fanotify::ready(domain, group) {
-            LINUX_EINVAL
-        } else {
-            LINUX_EAGAIN
-        });
-    }
-    let events = match crate::linux_fanotify::take(domain, group, capacity) {
-        Ok(events) => events,
-        Err(_) => return Some(LINUX_ENOMEM),
-    };
-    if events.is_empty() {
-        return Some(LINUX_EAGAIN);
-    }
-    let mut written = 0_u64;
-    for event in events {
-        // An object that cannot be opened (one unlinked meanwhile) is
-        // reported without a descriptor (FAN_NOFD).
-        let event_descriptor = event
-            .path
-            .as_deref()
-            .and_then(|path| linux_fanotify_open(path, event_flags));
-        let mut metadata = [0_u8; EVENT_METADATA_SIZE];
-        metadata[..4].copy_from_slice(&(EVENT_METADATA_SIZE as u32).to_ne_bytes());
-        metadata[4] = METADATA_VERSION;
-        metadata[6..8].copy_from_slice(&(EVENT_METADATA_SIZE as u16).to_ne_bytes());
-        metadata[8..16].copy_from_slice(&u64::from(event.mask).to_ne_bytes());
-        metadata[16..20].copy_from_slice(&event_descriptor.unwrap_or(-1).to_ne_bytes());
-        metadata[20..24].copy_from_slice(&event.pid.to_ne_bytes());
-        let copied = copy_to_linux_user(address + written, &metadata);
-        if !copied {
-            if let Some(event_descriptor) = event_descriptor {
-                let _ = linux_descriptor_close(event_descriptor as u64);
-            }
-        }
-        if let Some(request) = event.request {
-            crate::linux_fanotify::delivered(
-                domain,
-                group,
-                request,
-                event_descriptor.filter(|_| copied),
-            );
-        }
-        if !copied {
-            return Some(if written == 0 { LINUX_EFAULT } else { written });
-        }
-        written += EVENT_METADATA_SIZE as u64;
-    }
-    Some(written)
-}
-
-/// write(2) on a group: a struct fanotify_response answering a
-/// permission event.
-fn linux_fanotify_write(descriptor: u64, address: u64, count: u64) -> Option<u64> {
-    const RESPONSE_SIZE: u64 = 8;
-    let (domain, group) = linux_fanotify_key(descriptor)?;
-    if count < RESPONSE_SIZE {
-        return Some(LINUX_EINVAL);
-    }
-    let mut response = [0_u8; RESPONSE_SIZE as usize];
-    if !copy_from_linux_user(address, &mut response) {
-        return Some(LINUX_EFAULT);
-    }
-    let event_descriptor = i32::from_ne_bytes(response[..4].try_into().unwrap());
-    let answer = u32::from_ne_bytes(response[4..].try_into().unwrap());
-    Some(
-        match crate::linux_fanotify::respond(domain, group, event_descriptor, answer) {
-            Ok(()) => RESPONSE_SIZE,
-            Err(crate::linux_fanotify::Error::NotFound) => LINUX_ENOENT,
-            Err(_) => LINUX_EINVAL,
-        },
-    )
-}
-
-fn linux_fanotify_ready(descriptor: u64) -> bool {
-    linux_fanotify_key(descriptor)
-        .is_some_and(|(domain, group)| crate::linux_fanotify::ready(domain, group))
-}
-
-/// Closing a group's descriptor: the group goes when its creator closes
-/// its last descriptor of it.
-fn linux_fanotify_release(descriptor: u64) {
-    let Some((domain, group)) = linux_fanotify_key(descriptor) else {
-        return;
-    };
-    if (0..LINUX_DESCRIPTOR_TABLE_LIMIT).any(|candidate| {
-        candidate != descriptor
-            && linux_fanotify_descriptor(candidate)
-            && linux_descriptor_open_file_id(candidate) == Some(group)
-    }) {
-        return;
-    }
-    crate::linux_fanotify::release(domain, Some(group), current_linux_process_pid());
 }
 
 fn linux_inotify_instance(descriptor: u64) -> Option<usize> {
@@ -50723,6 +50184,9 @@ pub(super) struct LinuxInotifyCall {
     second: Option<LinuxInotifyPath>,
     directory: bool,
     writer: bool,
+    /// The objects at `first` and `second` as fanotify names them, before
+    /// the call removes or renames them.
+    nodes: [Option<LinuxFanotifyNode>; 2],
 }
 
 /// Before system call `number` with `arguments`, when inotify has watches.
@@ -50769,10 +50233,15 @@ pub(super) fn linux_inotify_before(number: u64, arguments: [u64; 6]) -> Option<L
                 second: None,
                 directory,
                 writer,
+                nodes: [None, None],
             });
         }
         _ => (None, None, false),
     };
+    let nodes = [
+        linux_fanotify_before(first.as_deref()),
+        linux_fanotify_before(second.as_deref()),
+    ];
     Some(LinuxInotifyCall {
         number,
         arguments,
@@ -50780,13 +50249,14 @@ pub(super) fn linux_inotify_before(number: u64, arguments: [u64; 6]) -> Option<L
         second,
         directory,
         writer: false,
+        nodes,
     })
 }
 
 /// After the call: the inotify and fanotify events its result stands for.
 pub(super) fn linux_inotify_after(call: LinuxInotifyCall, result: u64) {
     use crate::linux_fanotify::{
-        FAN_ACCESS, FAN_CLOSE_NOWRITE, FAN_CLOSE_WRITE, FAN_MODIFY, FAN_OPEN,
+        FAN_ACCESS, FAN_ATTRIB, FAN_CLOSE_NOWRITE, FAN_CLOSE_WRITE, FAN_MODIFY, FAN_OPEN,
     };
     use crate::linux_inotify::{
         IN_ACCESS, IN_ATTRIB, IN_CLOSE_NOWRITE, IN_CLOSE_WRITE, IN_MODIFY, IN_OPEN,
@@ -50813,7 +50283,23 @@ pub(super) fn linux_inotify_after(call: LinuxInotifyCall, result: u64) {
     let created = |path: &Option<LinuxInotifyPath>, directory: bool| {
         if let Some(path) = path {
             crate::linux_inotify::created(domain, path, directory);
+            linux_fanotify_created(path, false);
         }
+    };
+    // A new name of a file: its link count changes, then its directory
+    // gains the entry.
+    let linked = |path: &Option<LinuxInotifyPath>| {
+        if let Some(path) = path {
+            crate::linux_inotify::created(domain, path, false);
+            linux_fanotify_created(path, true);
+        }
+    };
+    // An attribute change, which fanotify hears by name (no open file).
+    let changed = |path: Option<LinuxInotifyPath>, mask: u32| {
+        if let Some(path) = &path {
+            linux_fanotify_change(path, mask);
+        }
+        path
     };
     let fanotify = |path: &Option<LinuxInotifyPath>, mask: u32| {
         if let Some(path) = path {
@@ -50851,15 +50337,20 @@ pub(super) fn linux_inotify_after(call: LinuxInotifyCall, result: u64) {
             fanotify(&path, FAN_MODIFY);
             object(path, IN_MODIFY);
         }
-        LINUX_FTRUNCATE_SYSCALL | LINUX_FALLOCATE_SYSCALL => {
+        LINUX_FALLOCATE_SYSCALL => {
             let path = linux_inotify_descriptor_path(arguments[0]);
             fanotify(&path, FAN_MODIFY);
             object(path, IN_MODIFY);
         }
+        // A truncate changes the file's size by name, as Linux's
+        // notify_change reports it: not through the open file.
+        LINUX_FTRUNCATE_SYSCALL => {
+            let path = linux_inotify_descriptor_path(arguments[0]);
+            object(changed(path, FAN_MODIFY), IN_MODIFY);
+        }
         LINUX_TRUNCATE_SYSCALL => {
             let path = linux_inotify_path_at(at, arguments[0]);
-            fanotify(&path, FAN_MODIFY);
-            object(path, IN_MODIFY);
+            object(changed(path, FAN_MODIFY), IN_MODIFY);
         }
         LINUX_CHMOD_SYSCALL
         | LINUX_CHOWN_SYSCALL
@@ -50869,13 +50360,15 @@ pub(super) fn linux_inotify_after(call: LinuxInotifyCall, result: u64) {
         | LINUX_SETXATTR_SYSCALL
         | LINUX_LSETXATTR_SYSCALL
         | LINUX_REMOVEXATTR_SYSCALL => {
-            object(linux_inotify_path_at(at, arguments[0]), IN_ATTRIB);
+            let path = linux_inotify_path_at(at, arguments[0]);
+            object(changed(path, FAN_ATTRIB), IN_ATTRIB);
         }
         LINUX_FCHMODAT_SYSCALL
         | LINUX_FCHMODAT2_SYSCALL
         | LINUX_FCHOWNAT_SYSCALL
         | LINUX_FUTIMESAT_SYSCALL => {
-            object(linux_inotify_path_at(arguments[0], arguments[1]), IN_ATTRIB);
+            let path = linux_inotify_path_at(arguments[0], arguments[1]);
+            object(changed(path, FAN_ATTRIB), IN_ATTRIB);
         }
         LINUX_UTIMENSAT_SYSCALL => {
             let path = if arguments[1] == 0 {
@@ -50883,28 +50376,49 @@ pub(super) fn linux_inotify_after(call: LinuxInotifyCall, result: u64) {
             } else {
                 linux_inotify_path_at(arguments[0], arguments[1])
             };
-            object(path, IN_ATTRIB);
+            object(changed(path, FAN_ATTRIB), IN_ATTRIB);
         }
         LINUX_FCHMOD_SYSCALL | LINUX_FCHOWN_SYSCALL | LINUX_FSETXATTR_SYSCALL => {
-            object(linux_inotify_descriptor_path(arguments[0]), IN_ATTRIB);
+            let path = linux_inotify_descriptor_path(arguments[0]);
+            object(changed(path, FAN_ATTRIB), IN_ATTRIB);
         }
         LINUX_MKDIR_SYSCALL => created(&linux_inotify_path_at(at, arguments[0]), true),
         LINUX_MKDIRAT_SYSCALL => created(&linux_inotify_path_at(arguments[0], arguments[1]), true),
         LINUX_MKNOD_SYSCALL => created(&linux_inotify_path_at(at, arguments[0]), false),
         LINUX_MKNODAT_SYSCALL => created(&linux_inotify_path_at(arguments[0], arguments[1]), false),
-        LINUX_SYMLINK_SYSCALL | LINUX_LINK_SYSCALL => {
-            created(&linux_inotify_path_at(at, arguments[1]), false);
-        }
+        LINUX_SYMLINK_SYSCALL => created(&linux_inotify_path_at(at, arguments[1]), false),
+        LINUX_LINK_SYSCALL => linked(&linux_inotify_path_at(at, arguments[1])),
         LINUX_SYMLINKAT_SYSCALL => {
             created(&linux_inotify_path_at(arguments[1], arguments[2]), false);
         }
-        LINUX_LINKAT_SYSCALL => created(&linux_inotify_path_at(arguments[2], arguments[3]), false),
+        LINUX_LINKAT_SYSCALL => linked(&linux_inotify_path_at(arguments[2], arguments[3])),
         LINUX_UNLINK_SYSCALL | LINUX_UNLINKAT_SYSCALL | LINUX_RMDIR_SYSCALL => {
+            if let Some(victim) = &call.nodes[0] {
+                linux_fanotify_removed(victim);
+            }
+            // Marks on what is gone go with it.
+            if let Some(path) = call
+                .first
+                .as_deref()
+                .filter(|path| !linux_inotify_exists(path))
+            {
+                crate::linux_fanotify::removed(domain, path);
+            }
             if let Some(path) = call.first {
                 crate::linux_inotify::deleted(domain, &path, call.directory);
             }
         }
         LINUX_RENAME_SYSCALL | LINUX_RENAMEAT_SYSCALL | LINUX_RENAMEAT2_SYSCALL => {
+            const RENAME_EXCHANGE: u64 = 2;
+            let exchange =
+                call.number == LINUX_RENAMEAT2_SYSCALL && arguments[4] & RENAME_EXCHANGE != 0;
+            // Marks follow what moved, before it hears it moved.
+            if let (Some(from), Some(to)) = (&call.first, &call.second) {
+                crate::linux_fanotify::renamed(domain, from, to, exchange);
+            }
+            if let (Some(source), Some(to)) = (&call.nodes[0], &call.second) {
+                linux_fanotify_renamed(source, to, call.nodes[1].as_ref(), exchange);
+            }
             if let (Some(from), Some(to)) = (call.first, call.second) {
                 crate::linux_inotify::renamed(domain, &from, &to, call.directory);
             }
@@ -59345,17 +58859,30 @@ pub(crate) fn linux_reclaim_unlinked_files() {
     }
 }
 
+/// statfs's f_fsid of the tmpfs canonical `path` lies on (through any
+/// bind mount of it), none for other filesystems: the filesystem's
+/// anonymous device and the tmpfs magic, the same for every mount of one
+/// tmpfs (fanotify's filesystem marks and identifiers report it too).
+fn linux_tmpfs_fsid(path: &[u8]) -> Option<[u8; 8]> {
+    const TMPFS_MAGIC: u32 = 0x0102_1994;
+    let space = linux_mount_space();
+    let id = crate::linux_mounts::mount_id_at(space, path);
+    let device = crate::linux_mounts::with_mount(space, id, |mount| {
+        (mount.filesystem == b"tmpfs").then_some(mount.device)
+    })??;
+    let mut fsid = [0_u8; 8];
+    fsid[..4].copy_from_slice(&device.to_ne_bytes());
+    fsid[4..].copy_from_slice(&TMPFS_MAGIC.to_ne_bytes());
+    Some(fsid)
+}
+
 /// statfs(2)'s answer for canonical `path` when a tmpfs mount holds it:
 /// tmpfs's magic, and its size limits and use where it has them, else the
 /// domain's memory, as an unlimited tmpfs shows. None off a tmpfs.
 fn linux_tmpfs_statfs_data(path: &[u8]) -> Option<[u8; 120]> {
     const TMPFS_MAGIC: u64 = 0x0102_1994;
+    let fsid = linux_tmpfs_fsid(path)?;
     let space = linux_mount_space();
-    let id = crate::linux_mounts::mount_id_at(space, path);
-    let tmpfs = crate::linux_mounts::with_mount(space, id, |mount| mount.filesystem == b"tmpfs")?;
-    if !tmpfs {
-        return None;
-    }
     let (total_frames, free_frames) = linux_domain_frame_counts();
     let (blocks, free, files, free_files) = match crate::linux_tmpfs_quota::usage(
         linux_execution_instance(),
@@ -59383,7 +58910,7 @@ fn linux_tmpfs_statfs_data(path: &[u8]) -> Option<[u8; 120]> {
     stat[32..40].copy_from_slice(&free.to_ne_bytes());
     stat[40..48].copy_from_slice(&files.to_ne_bytes());
     stat[48..56].copy_from_slice(&free_files.to_ne_bytes());
-    stat[56..60].copy_from_slice(&id.to_ne_bytes());
+    stat[56..64].copy_from_slice(&fsid);
     stat[64..72].copy_from_slice(&(crate::linux_overlay::NAME_MAX as u64).to_ne_bytes());
     stat[72..80].copy_from_slice(&block_size.to_ne_bytes());
     stat[80..88].copy_from_slice(&flags.to_ne_bytes());

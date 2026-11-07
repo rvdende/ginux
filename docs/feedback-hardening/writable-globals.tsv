@@ -579,6 +579,7 @@ interior-mutable	kernel/src/linux_fanotify.rs	STATE	process-runtime	allowlist	no
 interior-mutable	kernel/src/linux_fanotify.rs	MARKS	process-runtime	allowlist	none	diagnostic-counter
 interior-mutable	kernel/src/linux_fanotify.rs	PERMISSION_MARKS	process-runtime	allowlist	none	diagnostic-counter
 interior-mutable	kernel/src/linux_fanotify.rs	MOUNT_MARKS	process-runtime	allowlist	none	diagnostic-counter
+interior-mutable	kernel/src/linux_fanotify.rs	FID_GROUPS	process-runtime	allowlist	none	diagnostic-counter
 interior-mutable	kernel/src/linux_io_uring.rs	RINGS	process-runtime	allowlist	none	ranked-io-uring-table
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	X86_RUNTIME_BACKING_LINUX_DOMAIN_EXEC_DEPTH	process-runtime	allowlist	none	explicit-x86-runtime-owner-backing
 interior-mutable	kernel/src/arch/x86_64/cpu.rs	LINUX_PREEMPTED_CONTEXT	process-runtime	allowlist	none	irq-locked-timer-preemption-handoff

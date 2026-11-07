@@ -139,8 +139,10 @@ feature rather than a fix:
   executable at a time and flips on the access that needs the other
   (mincore02 passes).
 - **io_uring and fanotify** (`kernel/src/linux_io_uring.rs`,
-  `linux_fanotify.rs`): rings and groups of their own, permission events;
-  io_uring04 (RDS sockets) and fanotify25 (kprobes) report TCONF.
+  `linux_fanotify.rs`): rings and groups of their own, permission events,
+  identifier (FID) and pidfd reporting; io_uring04 (RDS sockets) and
+  fanotify25 (kprobes) report TCONF, and fanotify13 breaks on bind mounts
+  that do not redirect paths yet.
 - **perf events**: not offered (the tests report TCONF).
 - **Keys** (`crates/keyrings`): user, logon, keyring, asymmetric (RSA
   X.509 and PKCS#8), dns_resolver and encrypted keys, KEYCTL_DH_COMPUTE
