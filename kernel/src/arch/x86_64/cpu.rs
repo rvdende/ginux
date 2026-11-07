@@ -16977,17 +16977,34 @@ fn linux_waitid_live(
     if result != LINUX_ENOSYS {
         return result;
     }
-    if linux_process::live_running_child_pid(current_linux_process_pid()).is_none() {
+    let pid = current_linux_process_pid();
+    if linux_process::live_running_child_pid(pid).is_none() {
         return LINUX_ECHILD;
     }
     loop {
-        match run_other_linux_processes(output, caller, LINUX_WAITID_SYSCALL) {
+        // Asleep until a child changes state or a signal comes (see
+        // linux_wait4_live).
+        mark_linux_process_asleep(pid, 0);
+        let turn = run_other_linux_processes(output, caller, LINUX_WAITID_SYSCALL);
+        match turn {
             Some(LinuxBlockedWait::Recheck) => {}
-            Some(LinuxBlockedWait::Return(result)) => return result,
-            None => return LINUX_ECHILD,
+            // Yielded to start again from user mode: still waiting, so the
+            // mark stays until a wake or the dispatch that restarts it.
+            Some(LinuxBlockedWait::Return(LINUX_RETURN_TO_KERNEL)) => {
+                return LINUX_RETURN_TO_KERNEL;
+            }
+            Some(LinuxBlockedWait::Return(result)) => {
+                linux_process::set_live_process_futex_sleep(pid, None);
+                return result;
+            }
+            None => {
+                linux_process::set_live_process_futex_sleep(pid, None);
+                return LINUX_ECHILD;
+            }
         }
         let result = linux_waitid(id_type, id, information, options, rusage);
         if result != LINUX_ENOSYS {
+            linux_process::set_live_process_futex_sleep(pid, None);
             return result;
         }
     }
@@ -17015,18 +17032,37 @@ fn linux_wait4_live(
             result
         }
     };
+    let waiter = current_linux_process_pid();
     loop {
         let result = linux_wait4(pid, status_address, options, rusage);
         if options as u32 as u64 & LINUX_WNOHANG != 0 {
             return seen(linux_wait_nohang_live_return(result, caller));
         }
         if result != LINUX_ENOSYS {
+            linux_process::set_live_process_futex_sleep(waiter, None);
             return seen(result);
         }
+        // Asleep until a child (or tracee) changes state, which clears
+        // `waiting` (linux_process's child wakes), or a signal it takes:
+        // resumed in every scheduling round to look again, an LTP harness
+        // waiting for its test was dispatched some twenty times for each
+        // of futex_cmp_requeue01's thousand forks, which then took longer
+        // than the children's five-second waits.
+        mark_linux_process_asleep(waiter, 0);
         match run_other_linux_processes(output, caller, LINUX_WAIT4_SYSCALL) {
             Some(LinuxBlockedWait::Recheck) => {}
-            Some(LinuxBlockedWait::Return(result)) => return result,
-            None => return LINUX_ECHILD,
+            // Yielded to start again from user mode: still waiting.
+            Some(LinuxBlockedWait::Return(LINUX_RETURN_TO_KERNEL)) => {
+                return LINUX_RETURN_TO_KERNEL;
+            }
+            Some(LinuxBlockedWait::Return(result)) => {
+                linux_process::set_live_process_futex_sleep(waiter, None);
+                return result;
+            }
+            None => {
+                linux_process::set_live_process_futex_sleep(waiter, None);
+                return LINUX_ECHILD;
+            }
         }
     }
 }
@@ -17185,6 +17221,15 @@ fn run_other_linux_processes_deferring(
         if matches!(number, LINUX_WAIT4_SYSCALL | LINUX_WAITID_SYSCALL) {
             return Some(LinuxBlockedWait::Recheck);
         }
+        // A sleep writes the time it has left before a signal interrupts
+        // it (the next round delivers the signal first thing): asleep since
+        // its last round, the time it wrote then was stale (nanosleep02).
+        if matches!(
+            number,
+            LINUX_NANOSLEEP_SYSCALL | LINUX_CLOCK_NANOSLEEP_SYSCALL
+        ) {
+            return Some(LinuxBlockedWait::Recheck);
+        }
         let mut interrupted = caller;
         interrupted.rax = LINUX_EINTR;
         let delivered = linux_deliver_pending_signal_restarting(
@@ -17274,6 +17319,41 @@ fn run_one_other_linux_process(pid: u32) -> bool {
 /// the deadline it sleeps to): resuming it would only find it waiting again.
 fn linux_process_asleep(pid: u32, now: u64) -> bool {
     linux_process::live_process_futex_asleep(pid, now)
+}
+
+/// Marks process `pid` (current, other than init) asleep in a wait of its
+/// own until `deadline` (0: none) or a timer of its own falls due, whichever
+/// comes first: the scheduler passes over it until then, or until a wake
+/// clears its `waiting` (a futex wake, a signal it takes, a child's change
+/// of state for a wait for children). Each dispatch clears the mark, so a
+/// wait sets it again for every sleep. Only a single-threaded process
+/// sleeps so; another thread of it may have work to do.
+pub(super) fn mark_linux_process_asleep(pid: u32, deadline: u64) {
+    if pid == 1 {
+        return;
+    }
+    let single_threaded = (0..LINUX_THREAD_LIMIT).all(|slot| {
+        Some(slot) == current_linux_thread_slot()
+            || X86_RUNTIME.LINUX_THREAD_STATES[slot].load(Ordering::SeqCst) == LINUX_THREAD_FREE
+    });
+    if !single_threaded {
+        return;
+    }
+    // Its own timers only its call notices: it wakes for the first due.
+    let wake = [
+        deadline,
+        X86_RUNTIME
+            .ELF_PROBE_REAL_TIMER_DEADLINE
+            .load(Ordering::SeqCst),
+        X86_RUNTIME
+            .ELF_PROBE_POSIX_TIMER_DEADLINE
+            .load(Ordering::SeqCst),
+    ]
+    .into_iter()
+    .filter(|deadline| *deadline != 0)
+    .min()
+    .unwrap_or(0);
+    linux_process::set_live_process_futex_sleep(pid, Some(wake));
 }
 
 /// The key activations of process `pid` in the running domain have: the

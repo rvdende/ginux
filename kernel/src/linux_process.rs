@@ -619,10 +619,11 @@ struct Process {
     /// Gave up the CPU in a blocking system call and has not been dispatched
     /// since: Linux's interruptible sleep ('S').
     waiting: bool,
-    /// Asleep in a futex wait of its own (a single-threaded process's) until
-    /// woken (which clears `waiting`) or this deadline (0: none), in
-    /// nanoseconds since boot: the wait's, or a timer of its own due
-    /// sooner. Not worth resuming before then.
+    /// Asleep in a wait of its own (a single-threaded process's futex wait
+    /// or wait for its children) until woken (which clears `waiting`:
+    /// a futex wake, a signal, a child's change of state) or this deadline
+    /// (0: none), in nanoseconds since boot: the wait's, or a timer of its
+    /// own due sooner. Not worth resuming before then.
     futex_sleep: Option<u64>,
     /// CPU time used, in timestamp-counter cycles, and the part of it in
     /// user mode (the rest is system time).
@@ -1472,6 +1473,25 @@ impl ProcessTable {
         }
     }
 
+    /// Clears `waiting` of whoever waits for `handle` to change state: its
+    /// parent and its tracer. A process asleep in a wait for its children
+    /// (`Process::is_asleep`) is skipped by the scheduler until then; any
+    /// other wait it is in only looks again.
+    fn wake_state_waiters(&mut self, handle: ProcessHandle) {
+        let Some((parent, tracer)) = self
+            .process(handle)
+            .map(|process| (process.parent, process.tracer))
+        else {
+            return;
+        };
+        let tracer = (tracer != 0).then(|| self.handle_by_pid(tracer)).flatten();
+        for waiter in [parent, tracer].into_iter().flatten() {
+            if let Some(process) = self.process_mut(waiter) {
+                process.waiting = false;
+            }
+        }
+    }
+
     fn exit(&mut self, handle: ProcessHandle, status: u8) -> bool {
         let Some(process) = self.process_mut(handle) else {
             return false;
@@ -1492,6 +1512,7 @@ impl ProcessTable {
         process.retiring_address_space = None;
         process.wait_event = None;
         process.state = ProcessState::Zombie { status };
+        self.wake_state_waiters(handle);
         self.reparent_children_to_init(handle);
         true
     }
@@ -1513,10 +1534,18 @@ impl ProcessTable {
         };
         // An adopted child ends with SIGCHLD to init, whatever its clone
         // asked of its first parent, as in Linux.
+        let mut adopted = false;
         for process in self.processes.iter_mut().flatten() {
             if process.parent == Some(handle) {
                 process.parent = Some(init);
                 process.exit_signal = DEFAULT_EXIT_SIGNAL;
+                adopted = true;
+            }
+        }
+        // Init may wait for children already gone.
+        if adopted {
+            if let Some(init) = self.process_mut(init) {
+                init.waiting = false;
             }
         }
     }
@@ -1537,6 +1566,7 @@ impl ProcessTable {
         process.context = None;
         process.wait_event = None;
         process.state = ProcessState::Zombie { status };
+        self.wake_state_waiters(handle);
         self.reparent_children_to_init(handle);
         true
     }
@@ -1568,6 +1598,7 @@ impl ProcessTable {
         process.retiring_address_space = None;
         process.wait_event = None;
         process.state = ProcessState::Zombie { status };
+        self.wake_state_waiters(handle);
         self.reparent_children_to_init(handle);
         true
     }
@@ -1739,6 +1770,7 @@ impl ProcessTable {
             process.state = ProcessState::Stopped { signal };
         }
         process.wait_event = Some(ProcessWaitEvent::Stopped { signal });
+        self.wake_state_waiters(handle);
         true
     }
 
@@ -1754,6 +1786,7 @@ impl ProcessTable {
             return false;
         }
         process.wait_event = Some(ProcessWaitEvent::Continued);
+        self.wake_state_waiters(handle);
         true
     }
 

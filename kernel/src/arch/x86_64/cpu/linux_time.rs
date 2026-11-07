@@ -1094,6 +1094,10 @@ fn linux_sleep_live_return(
                     return LINUX_EFAULT;
                 }
             }
+            // A sleep is not marked asleep (mark_linux_process_asleep): left
+            // for a wake at its deadline, a 1 ms usleep took some 60 ms, and
+            // futex_cmp_requeue01's state polls outlasted its children's
+            // waits. Resumed each round, it looks at the clock itself.
             let turn = linux_timed_wait_run_others(output, caller, number, Some(deadline));
             if let LinuxWaitTurn::Done(result) = turn {
                 return result;
