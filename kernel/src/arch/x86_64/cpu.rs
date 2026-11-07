@@ -2867,11 +2867,36 @@ pub(crate) fn run_application_processor_runtime(cpu: usize) {
         drop(guard);
         // Nothing to run: leave the kernel to the other CPUs for a while,
         // longer each time nothing turns up (up to about a millisecond), so
-        // idle CPUs do not hold up busy ones' system calls.
+        // idle CPUs do not hold up busy ones' system calls. Once the wait
+        // is that long, a CPU with its own tick halts until the tick (a
+        // millisecond) instead: spinning, every idle CPU of every domain
+        // kept a host CPU busy, which starved the CPUs that had work on a
+        // loaded host (futex_cmp_requeue01's thousand forks then took
+        // seconds).
         let started = timer::timestamp_counter();
-        let until = started.wrapping_add(idle_ticks);
-        while timer::timestamp_counter() < until {
-            core::hint::spin_loop();
+        // A sleeper due before the tick is resumed by a CPU that looks
+        // again by then, not one halted past it (futex_wait05's 1 ms waits);
+        // with the lock busy, another CPU is at work and this one looks
+        // again soon.
+        let sleeper_due = || {
+            let Some(_guard) = crate::sync::kernel_entry_try_lock() else {
+                return true;
+            };
+            let now = linux_elapsed_nanoseconds().unwrap_or(0);
+            linux_process::next_live_futex_sleep_deadline(now).is_some_and(|deadline| {
+                deadline - now < 1_000_000_000 / timer::LINUX_WAIT_TICKS_PER_SECOND
+            })
+        };
+        if ticking && idle_ticks >= LINUX_SMP_IDLE_SPIN_TICKS * 64 && !sleeper_due() {
+            // SAFETY: interrupts are enabled only around the halt, with no
+            // lock held; this CPU's tick handler returns at once from a
+            // kernel-mode frame, and `cli` ends the window.
+            unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) };
+        } else {
+            let until = started.wrapping_add(idle_ticks);
+            while timer::timestamp_counter() < until {
+                core::hint::spin_loop();
+            }
         }
         crate::cpu_time::add_idle(timer::timestamp_counter().saturating_sub(started));
         idle_ticks = (idle_ticks * 2).min(LINUX_SMP_IDLE_SPIN_TICKS * 64);
@@ -2922,9 +2947,9 @@ impl Drop for LinuxProcessPin {
     }
 }
 
-/// Timestamp-counter ticks an idle application processor waits before it
-/// looks for a process again (application processors have no timer tick
-/// yet).
+/// Timestamp-counter ticks an idle application processor first waits
+/// before it looks for a process again; the wait doubles while it stays
+/// idle, up to 64 times this, after which it halts until its tick.
 const LINUX_SMP_IDLE_SPIN_TICKS: u64 = 50_000;
 
 /// Runs process `pid`, ready and run by no other CPU, on this CPU, which
@@ -6710,13 +6735,17 @@ fn execute_deferred_live_fork() -> bool {
     let own_pages = X86_RUNTIME
         .LINUX_FORK_OWN_PAGES
         .swap(false, Ordering::SeqCst);
-    let Some(mut child) = linux_process::begin_live_fork(
+    let begin_started = crate::linux_profile::span_start();
+    let begun = linux_process::begin_live_fork(
         parent_pid,
         false,
         share_vm || child_stack != 0 && !own_pages,
         (child_stack != 0).then_some(child_stack),
         !parent_first,
-    ) else {
+    );
+    crate::linux_profile::span_since(crate::linux_profile::Span::ForkBegin, begin_started);
+    let prepare_started = crate::linux_profile::span_start();
+    let Some(mut child) = begun else {
         release_staged_linux_fork_descriptors(parent_pid, shares_descriptors);
         X86_RUNTIME
             .LINUX_FORK_CHILD_TID_ADDRESS
@@ -6994,8 +7023,15 @@ fn execute_deferred_live_fork() -> bool {
             && (!X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
                 || sync_live_linux_process_address_space(child.pid))
             && restore_linux_process_extended_state(child.pid)
-            && run_dispatched_linux_process(&child_dispatch)
+            && {
+                crate::linux_profile::span_since(
+                    crate::linux_profile::Span::ForkPrepare,
+                    prepare_started,
+                );
+                run_dispatched_linux_process(&child_dispatch)
+            }
     });
+    let finish_started = crate::linux_profile::span_start();
     while X86_RUNTIME.LINUX_RUNTIME_MODE.load(Ordering::SeqCst)
         && !linux_child_exited(child.pid)
         && X86_RUNTIME.LINUX_FORK_REQUESTED.load(Ordering::SeqCst)
@@ -7096,6 +7132,7 @@ fn execute_deferred_live_fork() -> bool {
         X86_RUNTIME
             .LINUX_CURRENT_PROCESS_PID
             .store(parent_pid, Ordering::SeqCst);
+        crate::linux_profile::span_since(crate::linux_profile::Span::ForkFinish, finish_started);
         let parent_resumed = sync_live_linux_process_address_space(parent_pid)
             && run_dispatched_linux_process(&parent);
         if parent_resumed {
@@ -15276,6 +15313,33 @@ fn linux_request_process_fork(
     clear_sighand: bool,
     own_pages: bool,
 ) -> u64 {
+    crate::linux_profile::span(crate::linux_profile::Span::ForkRequest, || {
+        linux_request_process_fork_now(
+            runtime_mode,
+            caller,
+            clone_flags,
+            child_stack,
+            share_vm,
+            pidfd_address,
+            cgroup_generation,
+            clear_sighand,
+            own_pages,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn linux_request_process_fork_now(
+    runtime_mode: bool,
+    caller: LinuxUserContext,
+    clone_flags: u64,
+    child_stack: u64,
+    share_vm: bool,
+    pidfd_address: u64,
+    cgroup_generation: u32,
+    clear_sighand: bool,
+    own_pages: bool,
+) -> u64 {
     // The child's new UTS, IPC, PID and time namespaces are made now, in
     // the caller, so a failure is the call's; the fork takes them.
     if clone_flags & LINUX_CLONE_NEW_KEPT != 0 {
@@ -16317,6 +16381,15 @@ fn take_linux_child_yield(pid: u32) -> bool {
 /// device), then turns them off again.
 pub(super) fn linux_wait_for_interrupt() {
     let started = timer::timestamp_counter();
+    // A process asleep in a futex wait is not resumed to look at its
+    // deadline (`linux_process_asleep`): the tick comes at it instead of up
+    // to a tick later. The tick is the boot CPU's.
+    if let Some((deadline, now)) = linux_elapsed_nanoseconds()
+        .filter(|_| current_cpu_index_checked() == Some(0))
+        .and_then(|now| Some((linux_process::next_live_futex_sleep_deadline(now)?, now)))
+    {
+        timer::request_linux_tick_within(deadline - now);
+    }
     // Other CPUs enter the kernel while this one waits.
     crate::sync::kernel_entry_leave_to_user();
     if current_cpu_index_checked().is_some_and(|cpu| cpu != 0) {
@@ -18739,6 +18812,10 @@ struct LinuxDescriptorRuntimeState {
     stdio_offsets: [u64; 3],
     open_file_ids: [u64; LINUX_DEVICE_DESCRIPTOR_COUNT],
     stdio_open_file_ids: [u64; 3],
+    /// The highest of the open-file ids above (0 for none): an offset
+    /// change of a file opened since the table was saved need not look
+    /// through it (`sync_saved_linux_open_file_offset`).
+    max_open_file_id: u64,
     epoll_descriptor: u16,
     epoll_events: [u32; LINUX_DESCRIPTOR_TABLE_LIMIT as usize],
     epoll_data: [u64; LINUX_DESCRIPTOR_TABLE_LIMIT as usize],
@@ -18786,6 +18863,7 @@ impl LinuxDescriptorRuntimeState {
         stdio_offsets: [0; 3],
         open_file_ids: [0; LINUX_DEVICE_DESCRIPTOR_COUNT],
         stdio_open_file_ids: [0; 3],
+        max_open_file_id: 0,
         epoll_descriptor: 0,
         epoll_events: [0; LINUX_DESCRIPTOR_TABLE_LIMIT as usize],
         epoll_data: [0; LINUX_DESCRIPTOR_TABLE_LIMIT as usize],
@@ -19370,6 +19448,10 @@ fn stage_linux_fork_child_runtime_state(
         if current < LINUX_THREAD_LIMIT {
             (*child_threads)[current].tid = child_pid;
             (*child_threads)[current].state = LINUX_THREAD_RUNNING;
+            // A new task's CPU time starts at zero: inherited, the parent's
+            // (a test runner's minutes) counted against the child's
+            // RLIMIT_CPU and CPU-clock timers (setrlimit06).
+            (*child_threads)[current].cpu_cycles = 0;
         }
         (*child).last_preempted_thread_slot = LINUX_THREAD_SLOT_NONE;
         (*child).next_tid = child_pid.saturating_add(1);
@@ -20202,7 +20284,7 @@ fn assign_linux_open_file_ids() {
 // fence instead of a sequentially consistent store per element.
 fn capture_linux_descriptor_runtime_state() -> LinuxDescriptorRuntimeState {
     core::sync::atomic::fence(Ordering::SeqCst);
-    LinuxDescriptorRuntimeState {
+    let mut state = LinuxDescriptorRuntimeState {
         console: X86_RUNTIME
             .ELF_PROBE_CONSOLE_DESCRIPTORS
             .load(Ordering::Relaxed),
@@ -20263,7 +20345,16 @@ fn capture_linux_descriptor_runtime_state() -> LinuxDescriptorRuntimeState {
         runtime_timerfd_active: linux_descriptor_bitmap(
             &X86_RUNTIME.LINUX_RUNTIME_TIMERFD_ACTIVE.snapshot(),
         ),
-    }
+        max_open_file_id: 0,
+    };
+    state.max_open_file_id = state
+        .open_file_ids
+        .iter()
+        .chain(&state.stdio_open_file_ids)
+        .copied()
+        .max()
+        .unwrap_or(0);
+    state
 }
 
 /// One bit per descriptor, set where `flags` is non-zero.
@@ -53711,19 +53802,32 @@ struct LinuxDescriptorOffset {
     descriptor: u64,
 }
 
+/// The offset cells of the current table's descriptors that share open
+/// file `id`, in descriptor order. The banked tables are looked up once,
+/// not once per descriptor: that lookup was most of a read's cost.
+fn linux_open_file_offset_cells(id: u64) -> impl Iterator<Item = &'static AtomicU64> {
+    let stdio_ids: &'static [AtomicU64] = &X86_RUNTIME.ELF_PROBE_STDIO_OPEN_FILE_IDS[..];
+    let stdio_offsets: &'static [AtomicU64] = &X86_RUNTIME.ELF_PROBE_STDIO_OFFSETS[..];
+    let ids: &'static [AtomicU64] = &X86_RUNTIME.ELF_PROBE_OPEN_FILE_IDS[..];
+    let offsets: &'static [AtomicU64] = &X86_RUNTIME.ELF_PROBE_DESCRIPTOR_OFFSETS[..];
+    stdio_ids
+        .iter()
+        .zip(stdio_offsets)
+        .chain(ids.iter().zip(offsets))
+        .take(LINUX_DESCRIPTOR_TABLE_LIMIT as usize)
+        .filter(move |(cell, _)| cell.load(Ordering::SeqCst) == id)
+        .map(|(_, offset)| offset)
+}
+
 impl LinuxDescriptorOffset {
     fn load(self, ordering: Ordering) -> u64 {
         let Some(id) = linux_descriptor_open_file_id(self.descriptor) else {
             return linux_legacy_descriptor_offset(self.descriptor).load(ordering);
         };
-        for descriptor in 0..LINUX_DESCRIPTOR_TABLE_LIMIT {
-            if linux_descriptor_open_file_id_cell(descriptor)
-                .is_some_and(|cell| cell.load(Ordering::SeqCst) == id)
-            {
-                return linux_legacy_descriptor_offset(descriptor).load(ordering);
-            }
-        }
-        linux_legacy_descriptor_offset(self.descriptor).load(ordering)
+        linux_open_file_offset_cells(id)
+            .next()
+            .unwrap_or_else(|| linux_legacy_descriptor_offset(self.descriptor))
+            .load(ordering)
     }
 
     fn store(self, value: u64, ordering: Ordering) {
@@ -53731,21 +53835,20 @@ impl LinuxDescriptorOffset {
             linux_legacy_descriptor_offset(self.descriptor).store(value, ordering);
             return;
         };
-        for descriptor in 0..LINUX_DESCRIPTOR_TABLE_LIMIT {
-            if linux_descriptor_open_file_id_cell(descriptor)
-                .is_some_and(|cell| cell.load(Ordering::SeqCst) == id)
-            {
-                linux_legacy_descriptor_offset(descriptor).store(value, ordering);
-            }
+        for offset in linux_open_file_offset_cells(id) {
+            offset.store(value, ordering);
         }
         sync_saved_linux_open_file_offset(id, value);
     }
 }
 
 fn sync_saved_linux_open_file_offset(id: u64, value: u64) {
+    // Every saved table is looked at only if it can hold the id: with a
+    // thousand processes, looking through each one's descriptors on every
+    // read made a read of a file opened since take a millisecond.
     for record in allocated_linux_process_records() {
         let state = &mut record.runtime;
-        if !state.valid {
+        if !state.valid || id > state.descriptors.max_open_file_id {
             continue;
         }
         for descriptor in 0..state.descriptors.stdio_open_file_ids.len() {

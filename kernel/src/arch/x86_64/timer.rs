@@ -21,7 +21,7 @@ const INVARIANT_TSC: u32 = 1 << 8;
 const HERTZ_PER_MHZ: u64 = 1_000_000;
 const SCHEDULER_PROOF_INITIAL_PREEMPTIONS_PER_SECOND: u64 = 1_000;
 const SCHEDULER_PROOF_RELOAD_PREEMPTIONS_PER_SECOND: u64 = 10_000;
-const LINUX_WAIT_TICKS_PER_SECOND: u64 = 1_000;
+pub(crate) const LINUX_WAIT_TICKS_PER_SECOND: u64 = 1_000;
 // TCG and heavily loaded hosts can take longer than 100 ms to deliver a valid
 // emulated device completion. Keep the timeout bounded without mistaking host
 // scheduling latency for a driver failure.

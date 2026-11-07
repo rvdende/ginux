@@ -293,11 +293,23 @@ pub(super) fn clone_linux_process_extended_state(parent: u32, child: u32) -> boo
     let Some(child) = linux_process_record(child_instance, child_slot) else {
         return false;
     };
-    // SAFETY: parent and child are different slots, so the records do not
-    // overlap; both are live kernel-owned allocations.
+    // The child has one thread, the forking one, in the same slot (see
+    // stage_linux_fork_child_runtime_state): its state is all that is
+    // copied, not every slot's (128 KiB on each fork).
+    let Some(thread) = current_linux_thread_slot() else {
+        // SAFETY: parent and child are different slots, so the records do
+        // not overlap; both are live kernel-owned allocations.
+        unsafe {
+            child.extended_states = (*parent).extended_states;
+            child.extended_state_valid = (*parent).extended_state_valid;
+        }
+        return true;
+    };
+    child.extended_state_valid = [false; LINUX_THREAD_LIMIT];
+    // SAFETY: as above.
     unsafe {
-        child.extended_states = (*parent).extended_states;
-        child.extended_state_valid = (*parent).extended_state_valid;
+        child.extended_states[thread] = (*parent).extended_states[thread];
+        child.extended_state_valid[thread] = (*parent).extended_state_valid[thread];
     }
     true
 }

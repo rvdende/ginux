@@ -45,8 +45,16 @@ pub(crate) enum Span {
     UserFault,
     SaveProcess,
     RestoreProcess,
+    /// A fork system call's request (`linux_request_process_fork`).
+    ForkRequest,
+    /// The fork transaction's making of the child (`begin_live_fork`).
+    ForkBegin,
+    /// Its setup of the child's runtime state, until the child first runs.
+    ForkPrepare,
+    /// A fork transaction's end, the child's run excepted.
+    ForkFinish,
 }
-const SPANS: [&str; 10] = [
+const SPANS: [&str; 14] = [
     "gpu-claim-wait",
     "gpu-submit",
     "drm-file-ioctl",
@@ -57,6 +65,10 @@ const SPANS: [&str; 10] = [
     "user-fault",
     "save-process",
     "restore-process",
+    "fork-request",
+    "fork-begin",
+    "fork-prepare",
+    "fork-finish",
 ];
 static SPAN_COUNTS: [AtomicU32; SPANS.len()] = [const { AtomicU32::new(0) }; SPANS.len()];
 static SPAN_CYCLES: [AtomicU64; SPANS.len()] = [const { AtomicU64::new(0) }; SPANS.len()];
@@ -73,6 +85,26 @@ pub(crate) fn span<R>(span: Span, operation: impl FnOnce() -> R) -> R {
     SPAN_CYCLES[span as usize].fetch_add(cycles, Ordering::Relaxed);
     result
 }
+
+/// Where a span timed by hand starts (`span_since`): a timestamp while a
+/// profile runs, else 0.
+pub(crate) fn span_start() -> u64 {
+    if REMAINING.load(Ordering::Relaxed) == 0 {
+        return 0;
+    }
+    crate::arch::x86_64::timer::timestamp_counter()
+}
+
+/// Ends a span `span_start` began, for code with several ways out.
+pub(crate) fn span_since(span: Span, started: u64) {
+    if started == 0 {
+        return;
+    }
+    let cycles = crate::arch::x86_64::timer::timestamp_counter().wrapping_sub(started);
+    SPAN_COUNTS[span as usize].fetch_add(1, Ordering::Relaxed);
+    SPAN_CYCLES[span as usize].fetch_add(cycles, Ordering::Relaxed);
+}
+
 static OVERFLOW: AtomicU32 = AtomicU32::new(0);
 /// Each entry's key, `pid << 1 | kernel` (0 when free), its instruction
 /// and its count.

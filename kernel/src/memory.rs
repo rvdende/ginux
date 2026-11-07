@@ -313,25 +313,74 @@ impl FrameAllocator {
         None
     }
 
-    /// Finds `count` consecutive free frames, searching upward or downward.
+    /// The free bits of bitmap word `word`, with the bits past the last
+    /// frame clear.
+    fn free_word(&self, word: usize) -> u64 {
+        // SAFETY: word < words(), which the bitmap covers.
+        let bits = unsafe { self.free.add(word).read() };
+        let valid = self.frames - word * 64;
+        if valid >= 64 {
+            bits
+        } else {
+            bits & ((1 << valid) - 1)
+        }
+    }
+
+    /// Finds `count` consecutive free frames, searching upward (the lowest
+    /// run) or downward (the highest), a bitmap word at a time: frame by
+    /// frame, every large heap allocation walked the fragmented low memory
+    /// of a busy domain, a millisecond each, several per fork.
     fn free_run(&self, count: usize, highest_first: bool) -> Option<usize> {
         if count == 0 || count > self.frames {
             return None;
         }
+        // Bit p of the result is set where frames p..p + count of the word
+        // are all free (count < 64).
+        let windows = |bits: u64| {
+            let (mut mask, mut span) = (bits, 1);
+            while span < count {
+                let shift = (count - span).min(span);
+                mask &= mask >> shift;
+                span += shift;
+            }
+            mask
+        };
+        // Free frames next to the word being looked at, on the side the
+        // search came from.
         let mut run = 0;
         if highest_first {
-            for index in (0..self.frames).rev() {
-                run = if self.is_free(index) { run + 1 } else { 0 };
-                if run == count {
-                    return Some(index);
+            for word in (0..self.words()).rev() {
+                let bits = self.free_word(word);
+                let top = (!bits).leading_zeros() as usize;
+                if run + top >= count {
+                    return Some(word * 64 + 64 + run - count);
                 }
+                if top == 64 {
+                    run += 64;
+                    continue;
+                }
+                let inside = if count < 64 { windows(bits) } else { 0 };
+                if inside != 0 {
+                    return Some(word * 64 + 63 - inside.leading_zeros() as usize);
+                }
+                run = (!bits).trailing_zeros() as usize;
             }
         } else {
-            for index in 0..self.frames {
-                run = if self.is_free(index) { run + 1 } else { 0 };
-                if run == count {
-                    return Some(index + 1 - count);
+            for word in 0..self.words() {
+                let bits = self.free_word(word);
+                let bottom = (!bits).trailing_zeros() as usize;
+                if run + bottom >= count {
+                    return Some(word * 64 - run);
                 }
+                if bottom == 64 {
+                    run += 64;
+                    continue;
+                }
+                let inside = if count < 64 { windows(bits) } else { 0 };
+                if inside != 0 {
+                    return Some(word * 64 + inside.trailing_zeros() as usize);
+                }
+                run = (!bits).leading_zeros() as usize;
             }
         }
         None

@@ -153,6 +153,24 @@ impl Guard {
         queues.get_mut(slot)
     }
 
+    /// The queue of `slot` if the table reaches it, without growing it: a
+    /// slot past the end has an empty queue. Err past the limit. Readers
+    /// and clears use this, so they neither grow the table nor (through a
+    /// clear's trim) shrink it back on every call: a fork clearing its
+    /// child's 17 queues did both, half a megabyte each time, at slot 1000.
+    fn existing(&self, scope: Scope, slot: usize) -> Result<Option<&'static mut Queue>, Error> {
+        let (index, limit) = match scope {
+            Scope::Process => (0, linux_process::PROCESS_LIMIT),
+            Scope::Thread => (1, THREAD_QUEUE_LIMIT),
+        };
+        if slot >= limit {
+            return Err(Error::Invalid);
+        }
+        // SAFETY: as in `queue`.
+        let queues = unsafe { &mut (*SIGNAL_RUNTIME.queues.get())[self.instance][index] };
+        Ok(queues.get_mut(slot))
+    }
+
     /// Gives back the empty queues at the end of a table.
     fn trim(&self, scope: Scope) {
         let index = usize::from(scope == Scope::Thread);
@@ -329,7 +347,9 @@ pub(crate) fn any_pending(instance: usize) -> bool {
 
 pub(crate) fn pending_mask(instance: usize, scope: Scope, slot: usize) -> Result<u64, Error> {
     let guard = Guard::acquire(instance)?;
-    let queue = guard.queue(scope, slot).ok_or(Error::Invalid)?;
+    let Some(queue) = guard.existing(scope, slot)? else {
+        return Ok(0);
+    };
     let mut mask = 0_u64;
     walk(queue, |_, item| {
         for entry in item.entries.iter().filter(|entry| entry.occupied != 0) {
@@ -348,7 +368,9 @@ pub(crate) fn peek(
     requested: u64,
 ) -> Result<Option<Pending>, Error> {
     let guard = Guard::acquire(instance)?;
-    let queue = guard.queue(scope, slot).ok_or(Error::Invalid)?;
+    let Some(queue) = guard.existing(scope, slot)? else {
+        return Ok(None);
+    };
     let mut selected: Option<Entry> = None;
     if !walk(queue, |_, item| {
         for entry in item.entries.iter().copied() {
@@ -381,7 +403,9 @@ pub(crate) fn dequeue(
     requested: u64,
 ) -> Result<Option<Pending>, Error> {
     let guard = Guard::acquire(instance)?;
-    let queue = guard.queue(scope, slot).ok_or(Error::Invalid)?;
+    let Some(queue) = guard.existing(scope, slot)? else {
+        return Ok(None);
+    };
     let mut selected: Option<(memory::FrameLease, usize, Entry)> = None;
     if !walk(queue, |frame, item| {
         for (index, entry) in item.entries.iter().copied().enumerate() {
@@ -418,7 +442,13 @@ pub(crate) fn dequeue(
 
 pub(crate) fn clear(instance: usize, scope: Scope, slot: usize) -> Result<(), Error> {
     let guard = Guard::acquire(instance)?;
-    let queue = guard.queue(scope, slot).ok_or(Error::Invalid)?;
+    let Some(queue) = guard.existing(scope, slot)? else {
+        return Ok(());
+    };
+    if queue.pages == 0 && queue.pending == 0 {
+        // Already empty: nothing to free, and the table keeps its length.
+        return Ok(());
+    }
     let mut current = queue.head;
     for _ in 0..queue.pages {
         let next = page(current).ok_or(Error::Invalid)?.header.next;

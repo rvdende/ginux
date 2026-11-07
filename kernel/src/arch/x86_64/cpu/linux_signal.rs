@@ -2697,7 +2697,15 @@ pub(super) fn linux_queue_saved_thread_signal(
         },
         signal >= 32,
     ) {
-        Ok(_) => 0,
+        Ok(_) => {
+            // As a process-directed signal does (`linux_queue_process_signal`):
+            // a process asleep in a futex wait is resumed to take it, not
+            // left until the wait's deadline.
+            if linux_target_signal_mask(pid) & (1 << (signal - 1)) == 0 {
+                linux_process::set_live_process_waiting(pid, false);
+            }
+            0
+        }
         Err(crate::linux_signal::Error::NoMemory) => LINUX_EAGAIN,
         Err(crate::linux_signal::Error::Invalid) => LINUX_EINVAL,
     }
