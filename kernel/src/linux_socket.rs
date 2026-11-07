@@ -84,6 +84,10 @@ const ICMP_PACKET_COUNT: usize = 16;
 /// Linux's default `ip_default_ttl`.
 const DEFAULT_TTL: u8 = 64;
 const BLOCKING_POLL_LIMIT: usize = 20_000;
+/// How long a blocking connect without SO_SNDTIMEO waits for its
+/// handshake: past smoltcp's one-second pause between ARP requests (the
+/// interface's, after any other request) and the exchange that follows.
+const CONNECT_WAIT_MICROSECONDS: u64 = 4_000_000;
 /// Bytes a local stream (a pipe or a socketpair) queues for a writer that
 /// must not block: Linux's default pipe capacity. A blocking writer is not
 /// held to it yet, because it cannot wait for its reader to run.
@@ -4523,7 +4527,12 @@ pub(crate) fn timeout_option(id: SlotId, option: TimeoutOption) -> Result<u64, E
 /// or `BLOCKING_POLL_LIMIT` attempts without one. The first attempt is
 /// always made.
 fn attempts(id: SlotId, option: TimeoutOption) -> impl Iterator<Item = ()> {
-    let deadline = timed_deadline(id, option);
+    attempts_until(timed_deadline(id, option))
+}
+
+/// Attempts until `deadline` on the monotonic clock (the first always), or
+/// `BLOCKING_POLL_LIMIT` of them without one.
+fn attempts_until(deadline: Option<u64>) -> impl Iterator<Item = ()> {
     let mut made = 0_usize;
     core::iter::from_fn(move || {
         made += 1;
@@ -4775,7 +4784,11 @@ pub(crate) fn recv_blocking(
 }
 
 pub(crate) fn complete_connect(id: SlotId) -> Result<(), Error> {
-    for () in attempts(id, TimeoutOption::Send) {
+    // Without SO_SNDTIMEO the wait is a time, not a count of polls, which
+    // a connect that waits on ARP outlasts.
+    let deadline = timed_deadline(id, TimeoutOption::Send)
+        .or_else(|| clock_microseconds().map(|now| now.saturating_add(CONNECT_WAIT_MICROSECONDS)));
+    for () in attempts_until(deadline) {
         let Some((_, writable, error)) = readiness(id) else {
             return Err(Error::Invalid);
         };
