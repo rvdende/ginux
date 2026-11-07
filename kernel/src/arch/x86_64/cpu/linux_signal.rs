@@ -394,6 +394,31 @@ pub(super) fn linux_dynamic_pending_masks() -> Option<(u64, u64)> {
     ))
 }
 
+/// Whether a signal is queued that the current thread may have to take: one
+/// sent to the thread itself or to its process. A signal queued for another
+/// process of the domain is that process's to take, not this thread's (a
+/// heartbeat for LTP's parent, held blocked inside its fork, once sent every
+/// light-path call of the busy child to the owner for the whole test).
+pub(super) fn linux_current_signals_queued() -> bool {
+    let instance = linux_signal_instance();
+    if !crate::linux_signal::any_pending(instance) {
+        return false;
+    }
+    // Without a process slot or thread to name, assume a signal is there:
+    // the owner's path sorts it out.
+    let Some(process) = linux_process::live_process_slot(current_linux_process_pid()) else {
+        return true;
+    };
+    let Some(thread) = current_linux_thread_slot() else {
+        return true;
+    };
+    crate::linux_signal::queued(
+        instance,
+        crate::linux_signal::Scope::Thread,
+        linux_thread_signal_queue_slot(process, thread),
+    ) || crate::linux_signal::queued(instance, crate::linux_signal::Scope::Process, process)
+}
+
 pub(super) fn linux_peek_dynamic_signal(
     requested: u64,
 ) -> Option<(crate::linux_signal::Scope, crate::linux_signal::Pending)> {

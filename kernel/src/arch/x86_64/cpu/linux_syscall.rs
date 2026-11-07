@@ -277,7 +277,7 @@ fn linux_syscall_dispatch(
                 .load(Ordering::SeqCst)
             || X86_RUNTIME.LINUX_SIGNAL_ACTIVE.load(Ordering::SeqCst)
             || X86_RUNTIME.ELF_PROBE_PENDING_SIGNALS.load(Ordering::SeqCst) != 0
-            || current_container_slot().is_some_and(crate::linux_signal::any_pending)
+            || linux_current_signals_queued()
         {
             let caller = LinuxUserContext {
                 registers: saved_registers,

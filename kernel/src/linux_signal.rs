@@ -345,6 +345,23 @@ pub(crate) fn any_pending(instance: usize) -> bool {
         .is_some_and(|count| count.load(Ordering::Acquire) != 0)
 }
 
+/// Whether the queue of `slot` holds a signal, blocked or not. Cheap when
+/// the instance has nothing queued anywhere; otherwise one lock and a look
+/// at the queue's count (a slot never used has no queue and holds none).
+pub(crate) fn queued(instance: usize, scope: Scope, slot: usize) -> bool {
+    if !any_pending(instance) {
+        return false;
+    }
+    let Ok(_guard) = Guard::acquire(instance) else {
+        return false;
+    };
+    let index = usize::from(scope == Scope::Thread);
+    // SAFETY: the guard holds the instance's lock, which serializes every
+    // access to its tables; this only reads one queue's count.
+    let queues = unsafe { &(*SIGNAL_RUNTIME.queues.get())[instance][index] };
+    queues.get(slot).is_some_and(|queue| queue.pending != 0)
+}
+
 pub(crate) fn pending_mask(instance: usize, scope: Scope, slot: usize) -> Result<u64, Error> {
     let guard = Guard::acquire(instance)?;
     let Some(queue) = guard.existing(scope, slot)? else {

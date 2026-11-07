@@ -17835,19 +17835,21 @@ fn linux_preempted_owner_switches_to_kept_thread(
     preempted: &LinuxPreemptedContext,
 ) -> Option<u64> {
     let current = current_linux_thread_handle()?;
-    // A thread kept for the owner first; else any ready sibling, every
-    // other preemption, so the process's other threads share this CPU with
-    // the other processes (a process pinned to one CPU has no other CPU to
-    // run its ready threads on: its bank is live only while the owner runs).
+    // A thread kept for the owner, else any ready sibling, every other
+    // preemption: the process's threads share this CPU with the other
+    // processes (a process pinned to one CPU has no other CPU to run its
+    // ready threads on: its bank is live only while the owner runs). A
+    // kept thread does not take every slice either when the process can
+    // yield: a busy child whose sibling always waited for the owner kept
+    // the CPU from the parent it ran inside, which never left its fork
+    // (bind06's LTP parent, with its heartbeat signal held blocked there).
     let cpu = linux_cpu_slot();
+    let switched_last = LINUX_PREEMPTION_SWITCHED[cpu].swap(false, Ordering::Relaxed);
     let target = match kept_ready_linux_thread_handle() {
+        Some(_) if switched_last && linux_preemption_yield_taken(preempted.pid) => return None,
         Some(target) => target,
-        None => {
-            if LINUX_PREEMPTION_SWITCHED[cpu].swap(false, Ordering::Relaxed) {
-                return None;
-            }
-            ready_linux_thread_handle()?
-        }
+        None if switched_last => return None,
+        None => ready_linux_thread_handle()?,
     };
     LINUX_PREEMPTION_SWITCHED[cpu].store(true, Ordering::Relaxed);
     let general = preempted.general;
